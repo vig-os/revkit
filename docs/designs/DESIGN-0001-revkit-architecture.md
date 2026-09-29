@@ -82,7 +82,7 @@ gzip -9, with the full library imported.
 | Links | `starlight-links-validator` + revkit set checks | C3 | Broken links fail the build; the set/orphan rules are ours |
 | Local daemon | `revkit serve` on `Bun.serve` + SSE | A1–A3, E1 | Serves the built site plus a small JSON API; no Vite needed for asks/comments |
 | Agent bridge | **MCP server** (`revkit mcp`) + a Claude Code skill | A1–A3, B6 | Tools: `ask`, `await_answer`, `threads`, `reply`, `resolve`, `publish` |
-| Hosting | **Cloudflare Pages + Worker + D1** per org | B1–B5, D2 | Static preview per PR. The Worker handles auth, the thread API and the GitHub bridge; D1 stores threads and invites |
+| Hosting | **Cloudflare Worker (static assets from R2) + D1 + Durable Objects** per org | B1–B5, D2 | Static preview per PR. The Worker handles auth, the thread API and the GitHub bridge; D1 stores threads and invites |
 | GitHub bridge | **GitHub App**, user-to-server tokens | B2–B4 | Comments and reviews post **as the reviewer**, with real attribution and review requests |
 | Guest auth | Self-minted invite links (v1), Authentik OIDC (later, #4) | B5 | See §6 |
 
@@ -314,7 +314,7 @@ Rules:
 sequenceDiagram
   participant A as Author/Agent
   participant CI as GitHub Actions
-  participant CF as Cloudflare (Pages+Worker+D1)
+  participant CF as Cloudflare (Worker+R2+D1)
   participant R as Reviewer
   participant GH as GitHub API
   A->>CI: push PR (docs changed)
@@ -352,6 +352,54 @@ Details:
 - **Authentik** (OIDC) comes later: [#4](https://github.com/vig-os/revkit/issues/4).
 - **GitHub Pages** remains an option only for **public, read-only** previews. It can't authenticate, and on the
   org's Free plan it can't serve private repos.
+
+### 6.1 Setup tooling: `revkit deploy`
+
+This is a guided, idempotent CLI. It is state-lookup-first, and it previews its plan before applying anything. The
+setup doc is generated from the same step list, guarded by `derived-docs`, so docs and script can't drift.
+
+**Topology.** One **Cloudflare Worker per org**, not a Pages project per repo. Workers cover everything Pages does
+here (preview URLs, D1/R2/KV bindings) and add **Durable Objects**, which give hosted mode the same live event stream
+as the local daemon (§5.3). The Worker uses:
+
+- R2, holding one built site per `<repo>/pr-<n>/`;
+- D1 for threads, invites and sessions;
+- a Durable Object per doc for live fan-out.
+
+Previews are served at `pr-<n>--<repo>.<domain>`, so there is one auth surface and a new PR is just an upload.
+
+**Per org, once:** `revkit deploy init --org <org>`
+
+1. **Preflight + auth.**
+   - `gh`: an org owner, needed for App creation.
+   - Cloudflare: `wrangler login` (browser OAuth), or a scoped API token (Workers, D1, R2 edit; DNS if a custom
+     domain is used).
+2. **Cloudflare resources.** The Worker, D1, the R2 bucket, the Durable Object namespace, and an optional custom
+   domain.
+3. **GitHub App** from a manifest (the `gh-app-provision` pattern):
+   - permissions: `pull_requests: write`, `contents: read`;
+   - the OAuth callback and the webhook (review-comment events, for two-way sync) point at the Worker;
+   - credentials are written to Worker secrets and never printed.
+4. **CI upload credential.**
+   - A Cloudflare token that can only write R2 objects to that bucket.
+   - It becomes an **org secret declared via a PR to vig-os/org-config**, so the org's plan/apply review approves it.
+5. **Result and check.** It writes `revkit.org.toml` (Worker URL, App id, domain) and runs a smoke test: deploy a
+   sample doc, sign in, post a comment, see it land on GitHub.
+
+**Per repo:** `revkit enable`, or the `/revkit:deploy` skill.
+
+- Installs the App on the repo.
+- Adds `revkit-preview.yml`: build, upload, upsert a PR comment with the link and the requested reviewers.
+  - It is its own workflow because devkit's `ci.yml` is managed; folding it into `CI Summary` needs
+    vig-os/devkit#1761.
+- Opens the org-config PR that grants the repo the upload secret.
+
+**Properties.**
+
+- `revkit deploy status` shows current state.
+- Reruns fill gaps; `revkit deploy destroy` tears everything down.
+- The two human steps (Cloudflare OAuth, App manifest confirm) pause with a link, and an agent-driven run stops there
+  and resumes after confirmation.
 
 ## 7. Distribution as a flake (D1)
 
