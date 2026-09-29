@@ -13,7 +13,7 @@
 // deliberately not scoped here (per the plan).
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import type { Link, Nodes } from "mdast";
 import type { Diagnostic } from "../diagnostics.ts";
 import { lineOf, parseSourceFor, walkMdast } from "../mdx-parse.ts";
@@ -89,6 +89,7 @@ export function checkLinksFile(
   absoluteFilePath: string,
   reportPath: string,
   cache: SlugCache = new Map(),
+  repoRoot?: string,
 ): Diagnostic[] {
   const root = parseSourceFor(absoluteFilePath, source);
   const findings: Diagnostic[] = [];
@@ -110,6 +111,29 @@ export function checkLinksFile(
       : [href.slice(0, boundary), hashIndex === -1 ? "" : href.slice(hashIndex + 1)];
 
     const targetAbsolute = resolve(sourceDir, pathPart);
+
+    // Refuse relative traversals that escape the repo root — a link
+    // like `../../../../../../etc/passwd` is broken by intent, not by
+    // typo. When `repoRoot` is not supplied (bare unit-test call), fall
+    // back to the existence check alone.
+    if (repoRoot !== undefined) {
+      const trimmedRoot = repoRoot.endsWith(sep) ? repoRoot.slice(0, -1) : repoRoot;
+      const rel = relative(trimmedRoot, targetAbsolute);
+      if (rel.startsWith("..") || rel === "" && sourceDir !== trimmedRoot) {
+        // `rel === ""` means the link resolves TO the repo root, which
+        // is a directory not a file — flagged below in any case.
+      }
+      if (rel.startsWith("..")) {
+        findings.push({
+          file: reportPath,
+          line: lineOf(node),
+          rule: "links",
+          message: `broken link: ${href} escapes the repo root (resolved to ${targetAbsolute}); links must resolve inside the workspace.`,
+        });
+        return;
+      }
+    }
+
     if (!existsSync(targetAbsolute)) {
       findings.push({
         file: reportPath,

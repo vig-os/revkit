@@ -158,11 +158,14 @@ export async function runCheck(
     findings.push(...checkVocabularyFile(source, file.relative, vocab));
   }
 
-  // 4) links — relative links + heading anchors.
+  // 4) links — relative links + heading anchors. Confined to repoRoot:
+  //    a `../../..` traversal that escapes the workspace is flagged.
   const slugCache = new Map<string, Set<string>>();
   for (const file of contentFiles) {
     const source = await readFile(file.absolute);
-    findings.push(...checkLinksFile(source, file.absolute, file.relative, slugCache));
+    findings.push(
+      ...checkLinksFile(source, file.absolute, file.relative, slugCache, repoRoot),
+    );
   }
 
   // 5) plot-structure — schema + confined sibling files.

@@ -218,28 +218,35 @@
                   pass_filenames = false;
                 };
                 # `revkit check` (M1 item 4, ADR-0005) runs the five
-                # authoring guards over the whole workspace. The staged
-                # subset is not enough — a rule like `links` needs the
-                # target files present to resolve anchors, and vocab loads
-                # once from `vocab/terms.yaml`. Runs on any content-shaped
-                # stage change; `pass_filenames = false` because the CLI
-                # walks itself with the same excludes.
+                # authoring guards. The hook always walks the whole
+                # workspace (`--staged` would be too narrow — links
+                # resolve across files, vocab loads once from
+                # `vocab/terms.yaml`) and the CLI walks itself with the
+                # same excludes, so `pass_filenames = false`. Also
+                # opts in to `--online` when `gh auth status` succeeds
+                # in the dev shell, else falls back to offline with a
+                # visible warning — the workflow at
+                # `.github/workflows/revkit-guards.yml` runs `--online`
+                # unconditionally with `GITHUB_TOKEN`. `.(md|mdx|astro|
+                # tsx|jsx|json|ya?ml|vue|svelte|html|htm)` (case-
+                # insensitive) is the surface no-hand-rolled-ui and
+                # component-registry look at.
                 revkit-check = {
                   enable = true;
-                  entry = "bun packages/cli/bin/revkit.js check";
+                  entry = "packages/cli/bin/revkit-check-hook.sh";
                   language = "system";
-                  files = "\\.(md|mdx|astro|tsx|jsx|json|ya?ml)$";
+                  files = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$";
                   pass_filenames = false;
                 };
                 # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
-                # changes for tokens, keys and cookies. `--staged` narrows
-                # to the pre-commit index. `-v` surfaces which file each
-                # finding came from; `--redact` keeps the secret itself out
-                # of the log so a false positive on a public value is not
-                # leaked twice.
+                # changes for tokens, keys and cookies. `git --staged`
+                # is the current-generation subcommand (`gitleaks protect`
+                # is deprecated). `--redact` keeps a false-positive on a
+                # public value from being leaked twice; `-v` names the
+                # file each finding came from.
                 gitleaks = {
                   enable = true;
-                  entry = "gitleaks protect --staged --redact -v";
+                  entry = "gitleaks git --staged --redact -v";
                   language = "system";
                   pass_filenames = false;
                 };

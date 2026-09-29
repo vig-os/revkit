@@ -1,0 +1,58 @@
+# revkit authoring guards — online lane.
+#
+# `just test` in the devkit-managed `ci.yml` runs `revkit check` offline
+# because the `Tests` job exports no gh token. This dedicated workflow
+# runs `revkit check --online` so the ADR-0005 escape-hatch enforcement
+# (issue must be open and labeled `component-request`) is verified in CI,
+# not only locally by `packages/cli/bin/revkit-check-hook.sh`.
+#
+# Outside `CI Summary` until vig-os/devkit#1761 lets a consumer fold a
+# custom check in. `pull_request` only — never `pull_request_target`
+# (ADR-0014) — and the token scope is read-only (`contents: read`,
+# `issues: read`).
+name: revkit-guards
+
+"on":
+  pull_request:
+    # Run on any changed file — `revkit check` walks the whole workspace
+    # and returns fast on a repo of this size (~200ms).
+    branches: [dev, main]
+
+concurrency:
+  group: revkit-guards-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  check-online:
+    name: revkit check --online
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix (upstream CppNix, flakes enabled)
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build dev shell and run revkit check --online
+        # nix develop enters the flake's dev-shell (Bun, gh, gitleaks
+        # and the guardrails gates land on PATH); the CLI walks the
+        # workspace itself, so no filename plumbing here.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail
+            bun install --frozen-lockfile
+            bun packages/cli/bin/revkit.js check --online
+          '

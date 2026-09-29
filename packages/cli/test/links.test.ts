@@ -69,6 +69,25 @@ describe("links", () => {
     expect(checkLinksFile(source, join(dir, "a.md"), "a.md")).toEqual([]);
   });
 
+  test("`../../../../../etc/passwd` escapes the repo root and is refused", async () => {
+    const dir = makeTempDir();
+    const repoRoot = dir;
+    const contentDir = join(dir, "sub");
+    await mkdir(contentDir, { recursive: true });
+    writeFileSync(join(contentDir, "a.md"), "[out](../../../../../../etc/passwd)\n");
+    const source = "[out](../../../../../../etc/passwd)\n";
+    const diagnostics = checkLinksFile(
+      source,
+      join(contentDir, "a.md"),
+      "sub/a.md",
+      new Map(),
+      repoRoot,
+    );
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.rule).toBe("links");
+    expect(diagnostics[0]?.message).toContain("escapes the repo root");
+  });
+
   test("site-absolute route (`/foo/bar/`) is not checked as a file path", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "a.md"), "[route](/foo/bar/)\n");

@@ -27,19 +27,40 @@ const EXCLUDED_DIRS: ReadonlySet<string> = new Set([
   ".github_data",
 ]);
 
-/** Extensions any rule looks at. `.json` and `.yaml`/`.yml` cover
- * plots/vocab; `.md`/`.mdx` cover content; `.astro`/`.tsx`/`.jsx` cover
- * the no-hand-rolled-UI rule. Sorted for stable listing. */
+/** Extensions any rule looks at. `.json`/`.yaml`/`.yml` cover
+ * plots/vocab; `.md`/`.mdx` cover content; `.astro`/`.tsx`/`.jsx`/
+ * `.vue`/`.svelte`/`.html`/`.htm` cover the no-hand-rolled-UI rule's
+ * UI-shape allowlist; `.js`/`.ts`/`.mjs`/`.cjs`/`.mts`/`.cts` cover the
+ * "no code modules in content directories" branch. Matched
+ * case-insensitively by `extnameLower`. Sorted for a stable
+ * listing. */
 const CONSIDERED_EXTENSIONS: ReadonlySet<string> = new Set([
   ".astro",
+  ".cjs",
+  ".cts",
+  ".htm",
+  ".html",
+  ".js",
   ".json",
   ".jsx",
   ".md",
   ".mdx",
+  ".mjs",
+  ".mts",
+  ".svelte",
+  ".ts",
   ".tsx",
+  ".vue",
   ".yaml",
   ".yml",
 ]);
+
+/** Case-insensitive extension helper. macOS/Windows filesystems are
+ * case-preserving, so a stray `Component.TSX` would slip past a
+ * case-sensitive extension check on a Linux CI. */
+function extnameLower(path: string): string {
+  return extname(path).toLowerCase();
+}
 
 /** Absolute path list ordered so a diagnostic run reads top-down (docs
  * first, then site content, then everything else). Rules do their own
@@ -61,7 +82,7 @@ export function walkForCheckables(repoRoot: string): string[] {
         if (EXCLUDED_DIRS.has(entry.name)) continue;
         stack.push(path);
       } else if (entry.isFile()) {
-        if (CONSIDERED_EXTENSIONS.has(extname(entry.name))) {
+        if (CONSIDERED_EXTENSIONS.has(extnameLower(entry.name))) {
           collected.push(path);
         }
       }
