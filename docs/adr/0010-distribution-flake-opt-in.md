@@ -1,13 +1,14 @@
 # ADR-0010: Distribution: revkit as an opt-in flake
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: D1
 
 ## Context
 
-Any repo, and devkit consumers in particular, should adopt revkit in one line (D1) without every TS repo carrying Astro.
+Any repo, and devkit consumers in particular, should adopt revkit in one line (D1) without every TS repo carrying
+Astro.
 
 ## Decision
 
@@ -18,3 +19,7 @@ patterns) is proposed as a devkit **default** once proven (#1).
 ## Consequences
 
 Version pinning follows devkit's lockstep policy.
+
+## Acceptance (2026-09-29)
+
+- Versioning and release per ADR-0021 (SemVer via the devkit release train).

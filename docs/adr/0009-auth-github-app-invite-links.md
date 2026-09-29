@@ -1,6 +1,6 @@
 # ADR-0009: Auth: GitHub App user-to-server, invite links, Authentik later
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: B2, B3, B5
@@ -19,3 +19,11 @@ Authentik OIDC is a follow-up (#4).
 ## Consequences
 
 Invite minting requires write access.
+
+## Acceptance (2026-09-29)
+
+- **Share types** (`revkit invite --type`): `personal` is the default (14 days, bound to the first browser that opens
+  it, can comment); `team` (30 days, several browsers, can comment) and `view` (30 days, several browsers, read-only)
+  are opt-in. All are revocable and scoped to the repo, optionally one PR.
+- Guest data per ADR-0015. App webhook events: `installation`, `installation_repositories`, `pull_request`,
+  `pull_request_review`, `pull_request_review_comment`, `issue_comment`.

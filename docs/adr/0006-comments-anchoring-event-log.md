@@ -1,6 +1,6 @@
 # ADR-0006: Comments: dual anchors, revision re-anchoring, append-only log
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: A2, A6, A7, A8, B2, B4
@@ -21,3 +21,11 @@ only for unsent drafts.
 
 Suggested edits (A6) extend comments with patches. Co-editing (A7) will need a superseding CRDT ADR (Yjs + CodeMirror
 6).
+
+## Acceptance (2026-09-29)
+
+- Fuzzy re-anchoring uses **diff-match-patch** `match_main` with a context-weighted score; below the threshold the
+  comment is orphaned, never guessed.
+- The revision id is the **SHA-256 of the source normalised to LF line endings**.
+- Local threads (`bun:sqlite`) export/import to D1 with the same schema (`revkit threads export|import`), so a local
+  review can be published to a hosted PR.
