@@ -20,7 +20,6 @@
       "name": "@revkit/components",
       "version": "0.0.0",
       "devDependencies": {
-        "@types/bun": "1.4.2",
         "solid-js": "1.9.15",
         "typescript": "5.9.3",
       },
@@ -46,6 +45,7 @@
         "@astrojs/check": "0.9.10",
         "@axe-core/playwright": "4.13.0",
         "@playwright/test": "1.59.1",
+        "@types/bun": "1.4.2",
         "@types/node": "26.6.3",
         "typescript": "5.9.3",
       },

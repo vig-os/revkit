@@ -1,5 +1,7 @@
-// M1 smoke test: the site builds, the landing page loads, has a heading, and
-// axe-core (ADR-0017) finds no serious/critical accessibility violations.
+// M1 smoke test: the site builds, the landing page loads, the registered
+// Callout component from `@revkit/components` renders through the Astro +
+// Solid pipeline, and axe-core (ADR-0017) finds no serious/critical
+// accessibility violations.
 //
 // This is intentionally small — the full e2e suite (comment rail, question
 // kinds, re-anchoring across a rebuild) is ADR-0016's job in M2/M3.
@@ -11,6 +13,22 @@ test("landing page renders with a heading", async ({ page }) => {
   const heading = page.getByRole("heading", { level: 1 }).first();
   await expect(heading).toBeVisible();
   await expect(heading).toContainText(/revkit/i);
+});
+
+test("landing page renders the Callout from @revkit/components", async ({ page }) => {
+  await page.goto("/");
+
+  // The Callout renders `<div role="note" data-callout-kind="info"
+  // class="revkit-callout revkit-callout--info">…</div>` (see
+  // packages/components/src/Callout.tsx). Assert the semantic role, the tone
+  // markers and the body text so a regression in the registry, in the Astro
+  // integration, or in the MDX pipeline all trip this test.
+  const callout = page.locator('[role="note"][data-callout-kind="info"]');
+  await expect(callout).toBeVisible();
+  await expect(callout).toHaveClass(/\brevkit-callout\b/);
+  await expect(callout).toHaveClass(/\brevkit-callout--info\b/);
+  await expect(callout.locator(".revkit-callout__title")).toHaveText("M1 preview");
+  await expect(callout.locator(".revkit-callout__body")).toContainText("M1 scaffold");
 });
 
 test("landing page has no serious/critical axe violations", async ({ page }) => {

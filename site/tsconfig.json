@@ -3,8 +3,8 @@
   "compilerOptions": {
     "jsx": "preserve",
     "jsxImportSource": "solid-js",
-    "types": ["astro/client", "node"]
+    "types": ["astro/client", "node", "bun"]
   },
-  "include": [".astro/types.d.ts", "**/*"],
-  "exclude": ["dist", "node_modules", "test-results", "playwright-report", "tests"]
+  "include": [".astro/types.d.ts", "**/*", "tests/**/*"],
+  "exclude": ["dist", "node_modules", "test-results", "playwright-report", "blob-report"]
 }

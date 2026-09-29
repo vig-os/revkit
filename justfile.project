@@ -1,4 +1,3 @@
-
 # Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
 # Bugs / missing tools: https://github.com/vig-os/devkit/issues
 
@@ -61,16 +60,29 @@ precommit:
 # Playwright smoke. Bun test runs per-package rather than at the workspace
 # root because it would otherwise walk `site/tests/*.spec.ts` — which are
 # Playwright specs and refuse to load in bun test. Playwright's own suite
-# builds the site once and runs Chromium (WebKit is opt-in via
-# REVKIT_ENABLE_WEBKIT=1, see site/playwright.config.ts).
+# builds the site once and runs Chromium always plus WebKit on CI (locally
+# opt-in via REVKIT_ENABLE_WEBKIT=1, see site/playwright.config.ts).
 [group('test')]
 test *args:
     @if [ ! -f package.json ]; then \
       echo "just test: no package.json — skipping"; \
     else \
       cd packages/cli && bun test {{ args }} && cd ../.. && \
-      cd packages/components && bun test {{ args }} && cd ../.. && \
       just e2e; \
+    fi
+
+# Run bun unit tests with coverage. Reports to the terminal by default;
+# `just test-cov --coverage-reporter=lcov` writes an lcov file. Only the CLI
+# ships unit tests today (the Callout component is exercised by the
+# Playwright smoke against the built site — see
+# packages/components/src/Callout.tsx); the recipe walks every package that
+# grows unit tests over time, so new ones join without a recipe edit.
+[group('test')]
+test-cov *args:
+    @if [ ! -f package.json ]; then \
+      echo "just test-cov: no package.json — skipping"; \
+    else \
+      cd packages/cli && bun test --coverage {{ args }}; \
     fi
 
 # Run the Playwright browser suite by itself (skips the bun unit tests).
@@ -96,11 +108,15 @@ sync *args="--frozen-lockfile":
       echo "just sync: no package.json — skipping"; \
     fi
 
-# Update all workspace dependencies (bumps bun.lock; commit the change).
+# Manual dependency bump. Renovate owns routine bumps (ADR-0001): it opens
+# PRs that update the exact pins in package.json + bun.lock, so this recipe
+# is an escape hatch, not the normal path. Prints the reminder and runs
+# `bun update --latest` — with exact pins, plain `bun update` is a no-op.
 [group('deps')]
-update:
-    bun update
-    @just sync
+update *args="--latest":
+    @echo "Note: Renovate owns routine dependency bumps (ADR-0001); use this only for a manual escape."
+    bun update {{ args }}
+    @just sync --no-frozen-lockfile
 
 # -------------------------------------------------------------------------------
 # BUILD / DEV
@@ -174,14 +190,3 @@ cf *args:
     [[ "$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file")" == "600" ]] || { echo "$env_file must be mode 600" >&2; exit 1; }
     set -a; . "$env_file"; set +a
     WRANGLER_SEND_METRICS=false exec wrangler {{ args }}
-
-# ===============================================================================
-# BASE RECIPES appended by init-workspace on upgrade (vig-os/devcontainer#877).
-# Since 0.4.0 these live in justfile.project (preserved on upgrade); the shipped
-# ci.yml requires sync/precommit/test. Review, keep, or fold into your own.
-# ===============================================================================
-
-# Run tests with coverage (same exit-5 rule as `test` above)
-[group('test')]
-test-cov *args:
-    @if [ ! -f pyproject.toml ]; then echo "just test-cov: no pyproject.toml — skipping"; elif uv run pytest --cov --cov-report=term-missing {{ args }}; then :; else rc=$?; if [ "$rc" -eq 5 ] && [ ! -d tests ]; then echo "just test-cov: no tests collected and no tests/ directory — skipping"; else exit "$rc"; fi; fi

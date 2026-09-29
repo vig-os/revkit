@@ -10,14 +10,12 @@
     "./Callout": "./src/Callout.tsx"
   },
   "scripts": {
-    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "solid-js": "1.9.15"
   },
   "devDependencies": {
-    "@types/bun": "1.4.2",
     "solid-js": "1.9.15",
     "typescript": "5.9.3"
   }

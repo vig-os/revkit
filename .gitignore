@@ -60,9 +60,10 @@ coverage/
 # regenerates on every upgrade, so entries added HERE are appended to that
 # regenerated .gitignore and survive. Put durable repo-root ignores below (not
 # in the managed .gitignore, where hand edits are lost).
-
-# Bun / Node
-node_modules/
+#
+# `node_modules/` and `*.tsbuildinfo` come from the managed node.gitignore
+# fragment (appended by init-workspace when DEVKIT_LANGUAGES lists `node`),
+# so they are deliberately NOT repeated here.
 
 # Astro build artefacts
 site/dist/
@@ -73,9 +74,6 @@ test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
-
-# TypeScript incremental build info
-*.tsbuildinfo
 
 # flake-hooks opt-in (#1092): the generated .pre-commit-config.yaml is a
 # /nix/store symlink — never commit it.

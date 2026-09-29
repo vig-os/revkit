@@ -5,14 +5,16 @@
 //   `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true` is also exported there
 //   so the driver does not try to check host packages on NixOS.
 // - `webServer` builds the site once and serves the static output through
-//   `astro preview`, so the smoke covers the same artefact CI would deploy.
-// - Chromium runs everywhere; WebKit runs when `REVKIT_ENABLE_WEBKIT=1` is
-//   set (the nix-provided webkit build sometimes misses shared libs on a
-//   NixOS host, and forcing it would fail M1's CI unnecessarily — the M2
-//   e2e suite enables it explicitly once the wiring is proven).
+//   `tests/server.ts` — a tiny Bun static server — because Astro 7's
+//   `astro preview` daemonises and Playwright's `webServer` cannot manage a
+//   command that returns before its server is ready.
+// - Chromium always runs; WebKit runs on CI (Ubuntu runner) and locally when
+//   `REVKIT_ENABLE_WEBKIT=1`. The nix-provided WebKit fails to start on
+//   NixOS hosts (missing shared libs — tracked as #19); CI's Ubuntu runner
+//   is the primary WebKit gate until #19 is fixed.
 import { defineConfig, devices } from "@playwright/test";
 
-const enableWebKit = process.env.REVKIT_ENABLE_WEBKIT === "1";
+const enableWebKit = process.env.REVKIT_ENABLE_WEBKIT === "1" || !!process.env.CI;
 
 export default defineConfig({
   testDir: "./tests",
@@ -40,10 +42,6 @@ export default defineConfig({
       : []),
   ],
   webServer: {
-    // Astro 7's `astro preview` daemonises (see astro CLI reference), which
-    // Playwright's `webServer` cannot manage. We build the site, then serve
-    // `dist/` in the foreground with a tiny Bun static server — so the smoke
-    // still exercises the built artefact, not the dev server.
     command: "bun run build && bun tests/server.ts",
     url: "http://127.0.0.1:4321",
     reuseExistingServer: !process.env.CI,
