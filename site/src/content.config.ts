@@ -14,6 +14,7 @@ import { docsSchema, i18nSchema } from "@astrojs/starlight/schema";
 import type { Loader } from "astro/loaders";
 import { file, glob } from "astro/loaders";
 import { parse as parseYaml } from "yaml";
+import { plotsLoader } from "./content/loaders/plots.ts";
 import { repoDocsLoader } from "./content/loaders/repo-docs.ts";
 import { askSchema } from "./content/schemas/asks.ts";
 import { plotSpecSchema } from "./content/schemas/plots.ts";
@@ -63,21 +64,21 @@ export const collections = {
     schema: vocabEntrySchema,
   }),
   plots: defineCollection({
-    // Plots live in `plots/<name>/spec.vl.json` with a sibling data file.
-    // The glob loader emits one entry per spec; the schema enforces the
-    // "no inline data" rule at build time (ADR-0004, C4).
-    loader: glob({
-      base: "../plots",
-      pattern: "**/spec.vl.json",
-    }),
+    // Plots live in `plots/<name>/spec.vl.json` with a sibling data file
+    // (ADR-0004, C4). The loader wraps glob() and adds a build-time check
+    // that every `data.url` references an existing sibling file — the
+    // filesystem check the schema cannot enforce on its own.
+    loader: plotsLoader(),
     schema: plotSpecSchema,
   }),
   asks: defineCollection({
-    // Question specs the agent writes at `asks/<id>.json` (DESIGN-0001 §5.1).
-    // Kept out of git in normal operation (DESIGN-0001 §3) but validated when
-    // present so an audit run catches malformed specs.
+    // Runtime asks the daemon writes at `.revkit/asks/<id>.json`, gitignored
+    // (ADR-0007 acceptance). The id is the filename, never a body field.
+    // The collection is empty in a fresh checkout — it validates promoted
+    // asks (via `revkit ask --keep`, wired up in M2) so a stale spec still
+    // fails the build with a clear message.
     loader: glob({
-      base: "../asks",
+      base: "../.revkit/asks",
       pattern: "*.json",
     }),
     schema: askSchema,

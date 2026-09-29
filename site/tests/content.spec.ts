@@ -5,6 +5,8 @@
 //
 // Each page assertion also runs an axe-core scan (ADR-0017) so the shared
 // docs surface stays WCAG 2.2 AA-clean as pages are added.
+import { readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
@@ -23,7 +25,16 @@ async function expectNoBlockingViolations(page: import("@playwright/test").Page)
   ).toEqual([]);
 }
 
-test("ADR page renders its title and status", async ({ page }) => {
+/** Count the ADR source files at the repo's `docs/adr/` — the ADR index
+ * table on the built site is derived from this same set, so deriving the
+ * expected row count keeps the test correct as ADRs are added or removed
+ * (rather than a hardcoded number that drifts silently). */
+const ADR_SOURCE_DIR = fileURLToPath(new URL("../../docs/adr/", import.meta.url));
+const adrSourceFileCount = readdirSync(ADR_SOURCE_DIR).filter((name) =>
+  /^\d{4}-.*\.md$/.test(name),
+).length;
+
+test("ADR page renders its title, body status line and sidebar badge", async ({ page }) => {
   await page.goto("/adr/0001-static-first-site-stack/");
   const heading = page.getByRole("heading", { level: 1 }).first();
   await expect(heading).toHaveText(/ADR-0001: Static-first site stack/);
@@ -31,21 +42,64 @@ test("ADR page renders its title and status", async ({ page }) => {
   // page body as the first bullet — the loader deliberately preserves the
   // ADR structure so the status is visible without a schema-side render.
   await expect(page.locator("main").getByText(/Status: Accepted/)).toBeVisible();
+  // The loader also lifts the status into a Starlight sidebar badge — the
+  // signal a scanner sees before opening the page. The current ADR's link
+  // has `aria-current="page"` and carries the "Accepted" badge next to it.
+  const sidebarLink = page.locator('nav a[aria-current="page"]');
+  await expect(sidebarLink).toContainText("ADR-0001");
+  await expect(sidebarLink.locator(".sl-badge")).toHaveText("Accepted");
   await expectNoBlockingViolations(page);
 });
 
-test("ADR index page renders a table with 24 ADR rows", async ({ page }) => {
+test("ADR index page renders a table with one row per ADR file on disk", async ({ page }) => {
   await page.goto("/adr/readme/");
   await expect(page.getByRole("heading", { level: 1 }).first()).toHaveText(
     "Architecture decision records",
   );
-  // 25 rows total: one header row + one per ADR (0001..0024). Counting the
-  // ADR-linked rows only avoids picking up the header, so the test asserts
-  // the domain fact rather than the markup shape.
   const dataRows = page.locator("main table tbody tr");
-  await expect(dataRows).toHaveCount(24);
+  await expect(dataRows).toHaveCount(adrSourceFileCount);
   await expect(page.locator("main").getByRole("link", { name: /^0001$/ })).toBeVisible();
   await expectNoBlockingViolations(page);
+});
+
+test("ADR index links click through to the sibling ADR page (link rewriting)", async ({ page }) => {
+  await page.goto("/adr/readme/");
+  // The ADR README source uses relative `.md` hrefs (e.g.
+  // `0002-solid-islands-component-registry.md`); the loader must rewrite
+  // those to the built site's route. Click one and assert the destination
+  // renders — a residual `.md` href would land on a 404.
+  const target = page.locator('main').getByRole("link", { name: /^0002$/ }).first();
+  await expect(target).toHaveAttribute("href", "/adr/0002-solid-islands-component-registry/");
+  await Promise.all([page.waitForURL("**/adr/0002-solid-islands-component-registry/"), target.click()]);
+  await expect(page.getByRole("heading", { level: 1 }).first()).toContainText(
+    "Solid islands and a single component registry",
+  );
+});
+
+test("no rendered page contains an internal `.md` href", async ({ request }) => {
+  // Regression guard for C3 (links + sets): any residual `.md` href from
+  // the repo docs would 404 in the built site. Walk every rendered page
+  // this suite already touches; the loader also fails a build if a rewrite
+  // is missed, so this check catches the render-time regression bucket.
+  const pageRoutes = [
+    "/adr/readme/",
+    "/adr/0001-static-first-site-stack/",
+    "/designs/design-0001-revkit-architecture/",
+    "/feature-matrix/",
+  ];
+  for (const route of pageRoutes) {
+    const response = await request.get(route);
+    expect(response.ok(), `route ${route} did not respond OK`).toBe(true);
+    const html = await response.text();
+    // Skip fenced code snippets by stripping `<code>` blocks before scan —
+    // otherwise a documented example like `docs/adr/0003.mdx` would trip
+    // the check.
+    const scannable = html.replace(/<code[\s\S]*?<\/code>/g, "");
+    const residual = [...scannable.matchAll(/href="([^"]+\.md(?:#[^"]*)?)"/g)]
+      .map((match) => match[1])
+      .filter((href) => !/^https?:/i.test(href));
+    expect(residual, `route ${route} has residual .md hrefs`).toEqual([]);
+  }
 });
 
 test("DESIGN-0001 page renders", async ({ page }) => {

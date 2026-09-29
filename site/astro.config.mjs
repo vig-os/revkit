@@ -52,15 +52,15 @@ export default defineConfig({
       // Every rendered code block (Expressive Code and Mermaid-as-code) is a
       // horizontally scrollable region, and WCAG 2.2 SC 2.1.1 (Keyboard,
       // ADR-0017) requires such a region to be reachable by keyboard. The
-      // <pre> element is not tabbable on its own, so a five-line inline
-      // script adds `tabindex=0` at load — this is the standard workaround
-      // upstream Starlight/Expressive-Code have not yet adopted. Ships as
-      // `is:inline` so it stays in the document and never triggers an
-      // island hydration.
+      // <pre> element is not tabbable on its own, so a small script adds
+      // `tabindex=0` at load — a workaround Starlight and Expressive-Code
+      // have not yet adopted upstream. Starlight `head` entries render the
+      // exact tag given: no `type="module"` here means the browser executes
+      // it inline (no Astro `is:inline` directive — that is a JSX-time
+      // marker Starlight would emit as a literal HTML attribute).
       head: [
         {
           tag: "script",
-          attrs: { "is:inline": true },
           content:
             "document.addEventListener('DOMContentLoaded', function () { document.querySelectorAll('pre[data-language]').forEach(function (element) { element.tabIndex = 0; }); });",
         },
