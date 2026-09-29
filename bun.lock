@@ -11,6 +11,15 @@
       "bin": {
         "revkit": "./bin/revkit.js",
       },
+      "dependencies": {
+        "@revkit/site": "workspace:*",
+        "@types/mdast": "4.0.4",
+        "remark-math": "6.0.0",
+        "remark-mdx": "3.1.1",
+        "remark-parse": "11.0.0",
+        "unified": "11.0.5",
+        "yaml": "2.9.1",
+      },
       "devDependencies": {
         "@types/bun": "1.4.2",
         "typescript": "5.9.3",

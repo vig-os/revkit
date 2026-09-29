@@ -56,14 +56,18 @@ precommit:
 # TESTING
 # -------------------------------------------------------------------------------
 
-# Run unit tests (bun test) in each package that has them, then the site's
+# Run unit tests (bun test) in each package that has them, then `revkit
+# check` over the whole repo (ADR-0005 M1 item 4), then the site's
 # Playwright smoke. Bun test runs per-package rather than at the workspace
 # root because it would otherwise walk `site/tests/*.spec.ts` — which are
 # Playwright specs and refuse to load in bun test. The site's own bun tests
 # live under `src/content/schemas/` (outside the Playwright testDir) so both
 # runners coexist without a collision. Playwright's own suite builds the
 # site once and runs Chromium; WebKit is opt-in via REVKIT_ENABLE_WEBKIT=1
-# (see site/playwright.config.ts) pending #19.
+# (see site/playwright.config.ts) pending #19. `revkit check` runs
+# `--online` when GITHUB_TOKEN is exported (CI test lane does not export
+# it today; the offline pass still validates every allow annotation's
+# shape).
 [group('test')]
 test *args:
     @if [ ! -f package.json ]; then \
@@ -71,7 +75,21 @@ test *args:
     else \
       cd packages/cli && bun test {{ args }} && cd ../.. && \
       cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
+      just check && \
       just e2e; \
+    fi
+
+# Run the revkit authoring guards over the workspace (ADR-0005). Offline
+# by default; passes `--online` when GITHUB_TOKEN is available so `revkit
+# escalate` annotations get verified against GitHub in CI when the
+# workflow forwards the token. A pre-commit hook (see flake.nix's `hooks`
+# block) invokes the same command on any content-shaped stage change.
+[group('quality')]
+check *args:
+    @if [ -n "${GITHUB_TOKEN:-}" ]; then \
+      bun packages/cli/bin/revkit.js check --online {{ args }}; \
+    else \
+      bun packages/cli/bin/revkit.js check {{ args }}; \
     fi
 
 # Run bun unit tests with coverage. Reports to the terminal by default;

@@ -217,6 +217,32 @@
                   files = adrFiles;
                   pass_filenames = false;
                 };
+                # `revkit check` (M1 item 4, ADR-0005) runs the five
+                # authoring guards over the whole workspace. The staged
+                # subset is not enough — a rule like `links` needs the
+                # target files present to resolve anchors, and vocab loads
+                # once from `vocab/terms.yaml`. Runs on any content-shaped
+                # stage change; `pass_filenames = false` because the CLI
+                # walks itself with the same excludes.
+                revkit-check = {
+                  enable = true;
+                  entry = "bun packages/cli/bin/revkit.js check";
+                  language = "system";
+                  files = "\\.(md|mdx|astro|tsx|jsx|json|ya?ml)$";
+                  pass_filenames = false;
+                };
+                # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
+                # changes for tokens, keys and cookies. `--staged` narrows
+                # to the pre-commit index. `-v` surfaces which file each
+                # finding came from; `--redact` keeps the secret itself out
+                # of the log so a false positive on a public value is not
+                # leaked twice.
+                gitleaks = {
+                  enable = true;
+                  entry = "gitleaks protect --staged --redact -v";
+                  language = "system";
+                  pass_filenames = false;
+                };
               };
 
             # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
