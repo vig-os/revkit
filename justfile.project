@@ -147,3 +147,20 @@ claude-plugin ref="":
     claude plugin marketplace add "vig-os/devkit@${ref}" --sparse .claude-plugin plugins --scope local
     claude plugin install devkit@vigos-devkit --scope local
     echo "devkit plugin @${ref} installed (local scope): /devkit:status, /devkit:upgrade, ..."
+
+# -------------------------------------------------------------------------------
+# CLOUDFLARE
+# -------------------------------------------------------------------------------
+
+# Run wrangler with the local Cloudflare credentials (ADR-0014). The token is
+# loaded from ~/.config/revkit/cf.env (mode 600) for this one call only and is
+# never exported into the dev shell. Example: `just cf whoami`.
+[group('cloudflare')]
+cf *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    env_file="${REVKIT_CF_ENV:-$HOME/.config/revkit/cf.env}"
+    [[ -f "$env_file" ]] || { echo "missing $env_file (see CLAUDE.md, Secrets)" >&2; exit 1; }
+    [[ "$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file")" == "600" ]] || { echo "$env_file must be mode 600" >&2; exit 1; }
+    set -a; . "$env_file"; set +a
+    WRANGLER_SEND_METRICS=false exec wrangler {{ args }}
