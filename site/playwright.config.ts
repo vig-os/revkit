@@ -8,13 +8,14 @@
 //   `tests/server.ts` — a tiny Bun static server — because Astro 7's
 //   `astro preview` daemonises and Playwright's `webServer` cannot manage a
 //   command that returns before its server is ready.
-// - Chromium always runs; WebKit runs on CI (Ubuntu runner) and locally when
-//   `REVKIT_ENABLE_WEBKIT=1`. The nix-provided WebKit fails to start on
-//   NixOS hosts (missing shared libs — tracked as #19); CI's Ubuntu runner
-//   is the primary WebKit gate until #19 is fixed.
+// - Chromium always runs. WebKit is opt-in via `REVKIT_ENABLE_WEBKIT=1`:
+//   the flake's `pkgs.playwright-driver.browsers` webkit build fails to
+//   start on BOTH the NixOS dev host AND CI's Ubuntu runner (CI uses the
+//   same nix-provided browsers via PLAYWRIGHT_BROWSERS_PATH), so ADR-0018's
+//   Safari coverage is currently deferred to #19.
 import { defineConfig, devices } from "@playwright/test";
 
-const enableWebKit = process.env.REVKIT_ENABLE_WEBKIT === "1" || !!process.env.CI;
+const enableWebKit = process.env.REVKIT_ENABLE_WEBKIT === "1";
 
 export default defineConfig({
   testDir: "./tests",

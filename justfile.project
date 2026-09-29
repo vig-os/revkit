@@ -60,8 +60,8 @@ precommit:
 # Playwright smoke. Bun test runs per-package rather than at the workspace
 # root because it would otherwise walk `site/tests/*.spec.ts` — which are
 # Playwright specs and refuse to load in bun test. Playwright's own suite
-# builds the site once and runs Chromium always plus WebKit on CI (locally
-# opt-in via REVKIT_ENABLE_WEBKIT=1, see site/playwright.config.ts).
+# builds the site once and runs Chromium; WebKit is opt-in via
+# REVKIT_ENABLE_WEBKIT=1 (see site/playwright.config.ts) pending #19.
 [group('test')]
 test *args:
     @if [ ! -f package.json ]; then \
