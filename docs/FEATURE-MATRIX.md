@@ -7,7 +7,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | ID | Story | ADRs | Milestone | Tracking | Status |
 |---|---|---|---|---|---|
 | A1 | Rich question pages instead of chat prompts, answer to agent < 1 s | ADR-0007, ADR-0002 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
-| A2 | Inline comments on any block, persistent, structured to the agent | ADR-0006 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
+| A2 | Inline comments on any block, persistent, structured to the agent | ADR-0002, ADR-0006 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
 | A3 | Threads with the agent anchored on a block | ADR-0007, ADR-0011 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
 | A4 | Agent publishes a report; page refreshes < 1 s without a full build | ADR-0001 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
 | A5 | Live delivery: mid-turn / while away; live, handover, quiet modes | ADR-0007 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
@@ -22,7 +22,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | B6 | Agent picks up the review, fixes, replies, resolves | ADR-0003 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
 | C1 | Registered components only; hand-rolled UI blocked; escalation | ADR-0002, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C2 | Vocabulary defined once; undefined terms and redefinitions flagged | ADR-0003, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
-| C3 | Links and doc sets validated; no orphans | ADR-0001, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
+| C3 | Links and doc sets validated; no orphans | ADR-0001, ADR-0003, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C4 | Plots are spec + data side files, never inline | ADR-0004, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C5 | LaTeX math rendered at build, no client JS | ADR-0001 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C6 | Phone / tablet / desktop layouts, train-line navigation | ADR-0001 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |

@@ -4,9 +4,9 @@ One file per decision, `NNNN-slug.md`, each carrying its own `- Status:` line (t
 is **derived** from those files by `scripts/adr-index.sh` and checked by the guardrails `derived-docs` gate; the
 `adr-matrix` gate requires every Accepted ADR to be cited in [`FEATURE-MATRIX.md`](../FEATURE-MATRIX.md).
 
+<!-- guardrails:derived cmd="scripts/adr-index.sh" -->
 | ADR | Decision | Status |
 |---|---|---|
-<!-- guardrails:derived cmd="scripts/adr-index.sh" -->
 | [0001](0001-static-first-site-stack.md) | Static-first site stack: Astro, Starlight, Bun | **Proposed** |
 | [0002](0002-solid-islands-component-registry.md) | Solid islands and a single component registry | **Proposed** |
 | [0003](0003-content-model-mdx-typed-data.md) | Content model: MDX prose plus typed data files | **Proposed** |

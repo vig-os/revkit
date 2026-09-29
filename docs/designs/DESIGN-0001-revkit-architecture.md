@@ -6,7 +6,7 @@
 | Issue | [#3](https://github.com/vig-os/revkit/issues/3) |
 | Date | 2026-09-29 |
 | Decisions | [ADR-0001 – ADR-0011](../adr/README.md) · traceability: [FEATURE-MATRIX](../FEATURE-MATRIX.md) |
-| Decided so far | Starlight shell · Solid islands · self-minted invite links (Authentik later, [#4](https://github.com/vig-os/revkit/issues/4)) |
+| Agreed in discussion (ADRs pending acceptance) | Starlight shell · Solid islands · self-minted invite links (Authentik later, [#4](https://github.com/vig-os/revkit/issues/4)) |
 
 revkit is an HTML-first review surface for the agentic era. An agent authors structured documents (ADRs, designs,
 reports, questions) from an **opinionated, guarded component set**; a human reads them rendered, comments inline, and
@@ -181,7 +181,8 @@ and the question has previews. It is opt-in, never a silent redirect.
 
 Every rendered block carries `data-src="<file>#L<start>-L<end>"`, injected by a rehype plugin from the MDX AST
 positions. A comment stores a **dual anchor**: the source range plus a text-quote selector (W3C Web Annotation style:
-exact + prefix/suffix), so it re-anchors after edits and marks itself *outdated* when the quote disappears.
+exact + prefix/suffix), so it re-anchors after edits and marks itself *orphaned* when the quote can't be re-found
+(§5.4).
 
 ```mermaid
 sequenceDiagram
@@ -209,7 +210,7 @@ transports put it into the agent session, best first. Checked against the Claude
 
 | Transport | Mid-turn | While you're away (session open) | Setup |
 |---|---|---|---|
-| **Channel.** `revkit mcp` declares the `claude/channel` capability; events arrive as `<channel source="revkit">`, and the agent answers through the channel's `reply` tool, so the reply appears live in the thread | yes, between tool calls | yes | Research preview. `claude --channels plugin:revkit@<marketplace>` needs the plugin on an allowlist (the org's `allowedChannelPlugins`, i.e. a vig-os marketplace: vig-os/devkit#1765, #927); until then `--dangerously-load-development-channels server:revkit` |
+| **Channel.** `revkit mcp` declares the `claude/channel` capability; events arrive as `<channel source="revkit">`, and the agent answers through the channel's `reply` tool, so the reply appears live in the thread | yes, between tool calls | yes | Research preview. `claude --channels plugin:revkit@<marketplace>` needs the plugin on an allowlist (the org's `allowedChannelPlugins`, i.e. a vig-os marketplace: vig-os/devkit#1765, vig-os/devkit#927); until then `--dangerously-load-development-channels server:revkit` |
 | **Monitor WebSocket.** The revkit skill arms `Monitor({ws: {url: "ws://127.0.0.1:<port>/events?for=agent"}})`, and every frame becomes a notification | yes | while the monitor is armed; it expires after at most 30 min and the skill re-arms it | None. Built in, no flags |
 | **UserPromptSubmit hook.** Prepends "N new comments" as `additionalContext` | no, next prompt only | no | Fallback |
 
@@ -432,16 +433,23 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 
 ## 8. Milestones (to be split into issues after review)
 
-1. **M1 — skeleton + guards:** ([#6](https://github.com/vig-os/revkit/issues/6)) Astro/Starlight/Solid/Tailwind scaffold, the content model, `revkit check` (the four
-   guards) as flake hooks, KaTeX, Vega-Lite SSR plots, the train-line sidebar.
-2. **M2 — local loop:** ([#7](https://github.com/vig-os/revkit/issues/7)) `revkit serve` daemon + `/events` stream, anchors + re-anchoring (§5.4), comment rail,
-   threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a **channel** with a Monitor-WebSocket fallback,
-   delivery modes + handover, presence, the Claude Code skill.
-3. **M3 — PR review:** ([#8](https://github.com/vig-os/revkit/issues/8)) CI preview deploy + PR comment, GitHub App, two-way threads, submit review.
-4. **M4 — guests:** ([#9](https://github.com/vig-os/revkit/issues/9)) invite links; then Authentik (#4).
-5. **M5 — distribution:** ([#10](https://github.com/vig-os/revkit/issues/10)) flake outputs, template, devkit module proposal.
-6. **M6 — suggested edits:** ([#11](https://github.com/vig-os/revkit/issues/11)) patch-carrying comments, accept → source, GitHub `suggestion` blocks.
-7. **M7 — co-editing:** ([#12](https://github.com/vig-os/revkit/issues/12)) CodeMirror 6 source pane + Yjs, daemon-owned Y.Doc per file, agent writes ingested as ops.
+1. **M1 — skeleton + guards:** ([#6](https://github.com/vig-os/revkit/issues/6)) Astro/Starlight/Solid/Tailwind
+   scaffold, the content model, `revkit check` (the five guards) as flake hooks, KaTeX, Vega-Lite SSR plots, the
+   train-line sidebar.
+2. **M2 — local loop:** ([#7](https://github.com/vig-os/revkit/issues/7)) `revkit serve` daemon + `/events` stream,
+   anchors + re-anchoring (§5.4), comment rail, threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a
+   **channel** with a Monitor-WebSocket fallback, delivery modes + handover, presence, the Claude Code skill.
+3. **M3 — PR review:** ([#8](https://github.com/vig-os/revkit/issues/8)) CI preview deploy + PR comment, GitHub App,
+   two-way threads, submit review.
+4. **M4 — hosting, deploy + guests:** ([#9](https://github.com/vig-os/revkit/issues/9)) `revkit deploy` (§6.1, one
+   Worker per org), invite links; then Authentik (#4). The Worker and `deploy init` land **before** M3's preview
+   deploys, which need them.
+5. **M5 — distribution:** ([#10](https://github.com/vig-os/revkit/issues/10)) flake outputs, template, devkit module
+   proposal.
+6. **M6 — suggested edits:** ([#11](https://github.com/vig-os/revkit/issues/11)) patch-carrying comments, accept →
+   source, GitHub `suggestion` blocks.
+7. **M7 — co-editing:** ([#12](https://github.com/vig-os/revkit/issues/12)) CodeMirror 6 source pane + Yjs, daemon-owned
+   Y.Doc per file, agent writes ingested as ops.
 
 ## 9. Open questions
 
