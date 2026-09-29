@@ -6,12 +6,12 @@
 // path that walks outside the spec's own directory. Rendering that
 // silently falls back to an empty scenegraph is the exact regression the
 // reviewer bar-chart check catches.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
-import { renderPlotToSvg, stripScriptsFromSvg } from "./render-plot.ts";
+import { renderPlotToSvg, sanitizeSvg } from "./render-plot.ts";
 
 const PLOT_FIXTURE_DIR = fileURLToPath(new URL("../../tests/fixtures/plots/", import.meta.url));
 const EXAMPLE_DIR = join(PLOT_FIXTURE_DIR, "example");
@@ -90,21 +90,21 @@ describe("renderPlotToSvg — failure modes", () => {
     const spec = { ...(await loadExampleSpec()), data: { url: "../../../etc/passwd" } };
     await expect(
       renderPlotToSvg(spec, { specDir: EXAMPLE_DIR, accessibleName: "x" }),
-    ).rejects.toThrow(/plot loader refused to read outside/);
+    ).rejects.toThrow(/non-sibling data url/);
   });
 
   test("refuses an http:// data.url", async () => {
     const spec = { ...(await loadExampleSpec()), data: { url: "http://example.com/x.csv" } };
     await expect(
       renderPlotToSvg(spec, { specDir: EXAMPLE_DIR, accessibleName: "x" }),
-    ).rejects.toThrow(/scheme-qualified/);
+    ).rejects.toThrow(/non-sibling data url/);
   });
 
   test("refuses an absolute data.url", async () => {
     const spec = { ...(await loadExampleSpec()), data: { url: "/etc/passwd" } };
     await expect(
       renderPlotToSvg(spec, { specDir: EXAMPLE_DIR, accessibleName: "x" }),
-    ).rejects.toThrow(/absolute path/);
+    ).rejects.toThrow(/non-sibling data url/);
   });
 
   test("throws with Vega-Lite's own error when a spec is structurally invalid", async () => {
@@ -118,6 +118,35 @@ describe("renderPlotToSvg — failure modes", () => {
     await expect(
       renderPlotToSvg(spec, { specDir: EXAMPLE_DIR, accessibleName: "x" }),
     ).rejects.toThrow();
+  });
+
+  test("refuses a symlinked data file that resolves outside the spec dir", async () => {
+    // A symlink whose target sits above the spec directory would pass a
+    // naive `resolve()` prefix check (resolve doesn't follow links). The
+    // loader `lstat`s the candidate first and refuses if it is a link,
+    // so a plot cannot exfiltrate `/etc/hostname` or similar.
+    const specDir = await mkdtemp(join(tmpdir(), "revkit-plot-symlink-"));
+    const outside = await mkdtemp(join(tmpdir(), "revkit-plot-outside-"));
+    try {
+      const secret = join(outside, "secret.csv");
+      await writeFile(secret, "a,b\n99,99\n");
+      await symlink(secret, join(specDir, "data.csv"));
+      const spec = {
+        schemaVersion: 1,
+        data: { url: "data.csv", format: { type: "csv" } },
+        mark: "bar",
+        encoding: {
+          x: { field: "a", type: "nominal" },
+          y: { field: "b", type: "quantitative" },
+        },
+      };
+      await expect(
+        renderPlotToSvg(spec, { specDir, accessibleName: "x" }),
+      ).rejects.toThrow(/symlinked data file/);
+    } finally {
+      await rm(specDir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
   });
 
   test("reads a sibling file inside a subdirectory of the spec dir", async () => {
@@ -152,19 +181,67 @@ describe("renderPlotToSvg — failure modes", () => {
   });
 });
 
-describe("stripScriptsFromSvg", () => {
-  test("removes <script> elements", () => {
-    const dirty = "<svg><script>alert(1)</script><rect/></svg>";
-    expect(stripScriptsFromSvg(dirty)).toBe("<svg><rect/></svg>");
+describe("sanitizeSvg (DOM-based, denylist)", () => {
+  const SVG_OPEN = '<svg xmlns="http://www.w3.org/2000/svg">';
+
+  test("removes <script> elements anywhere in the tree", () => {
+    const dirty = `${SVG_OPEN}<g><script>alert(1)</script><rect/></g></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("<script");
+    expect(clean).toContain("<rect");
   });
 
-  test("removes inline event handlers (onclick, onload, …)", () => {
-    const dirty = '<svg><rect onclick="alert(1)" onload=\'x\'/></svg>';
-    expect(stripScriptsFromSvg(dirty)).toBe("<svg><rect/></svg>");
+  test("removes inline event handlers on any element", () => {
+    const dirty = `${SVG_OPEN}<rect onclick="a" onload="b" onmouseover="c"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toMatch(/\bon[a-z]+\s*=/i);
   });
 
-  test("removes javascript: URLs", () => {
-    const dirty = '<svg><a xlink:href="javascript:alert(1)">x</a></svg>';
-    expect(stripScriptsFromSvg(dirty)).not.toContain("javascript:");
+  test("strips javascript: URLs on href and xlink:href", () => {
+    const dirty = `${SVG_OPEN}<a xlink:href="javascript:alert(1)"><text>x</text></a></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("javascript:");
+  });
+
+  test("strips http(s) hrefs on <a>, leaving only same-page # fragments", () => {
+    const dirty = `${SVG_OPEN}<a href="https://evil.example"><text>x</text></a><a href="#ok"><text>y</text></a></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("https://evil.example");
+    expect(clean).toContain('href="#ok"');
+  });
+
+  test("removes <foreignObject>, <iframe>, <object>, <embed>", () => {
+    const dirty =
+      `${SVG_OPEN}<foreignObject><div>x</div></foreignObject>` +
+      `<iframe src="x"></iframe><object></object><embed></embed>` +
+      `<rect/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    for (const forbidden of ["<foreignObject", "<iframe", "<object", "<embed"]) {
+      expect(clean.toLowerCase()).not.toContain(forbidden.toLowerCase());
+    }
+    expect(clean).toContain("<rect");
+  });
+
+  test("survives the nested <scr<script>ipt> shape (CodeQL js/incomplete-multi-character-sanitization)", () => {
+    // A regex sanitiser would strip the inner `<script>` and leave the
+    // outer text `scr…ipt`, which combined with the leftover `<` before
+    // `scr` could still parse as a script tag in HTML. A DOM parser
+    // never re-tokenises its output, so the class of attack is defeated
+    // structurally.
+    const dirty = `${SVG_OPEN}<g>scr<script>alert(1)</script>ipt</g></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("<script");
+    expect(clean).not.toContain("</script");
+  });
+
+  test("survives an unquoted onload handler", () => {
+    const dirty = `${SVG_OPEN}<rect onload=alert(1) x="5"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toMatch(/\bonload\b/i);
+    expect(clean).toContain('x="5"');
+  });
+
+  test("throws when handed something that is not an SVG root", () => {
+    expect(() => sanitizeSvg('<div>hi</div>')).toThrow(/expected an <svg> root/i);
   });
 });

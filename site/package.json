@@ -16,7 +16,6 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
-    "@astrojs/markdown-remark": "7.3.1",
     "@astrojs/mdx": "8.0.2",
     "@astrojs/solid-js": "7.0.2",
     "@astrojs/starlight": "0.42.4",
@@ -25,6 +24,7 @@
     "@tailwindcss/vite": "4.3.3",
     "astro": "7.3.5",
     "katex": "0.18.9",
+    "linkedom": "0.18.13",
     "rehype-katex": "7.0.1",
     "remark-math": "6.0.0",
     "solid-js": "1.9.15",
@@ -38,7 +38,12 @@
     "@axe-core/playwright": "4.13.0",
     "@playwright/test": "1.59.1",
     "@types/bun": "1.4.2",
+    "@types/hast": "3.0.5",
     "@types/node": "26.6.3",
-    "typescript": "5.9.3"
+    "rehype-stringify": "^10.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
+    "typescript": "5.9.3",
+    "unified": "^11.0.5"
   }
 }

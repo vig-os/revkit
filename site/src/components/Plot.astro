@@ -2,23 +2,27 @@
 // Build-time plot renderer (ADR-0004, C4).
 //
 // Looks up a plot spec from the `plots` collection by `name`, resolves the
-// spec's directory, and streams the Vega-Lite -> Vega -> SVG rendering
+// spec's directory, validates every `field` reference against the columns
+// of the data file, then streams the Vega-Lite -> Vega -> SVG rendering
 // pipeline (site/src/lib/render-plot.ts). The output is inlined into the
 // page as `<svg role="img" aria-label="…">` — inline is the CSP-friendly
 // choice under ADR-0012: served SVG carries `Content-Security-Policy:
 // sandbox`, which would strip an inline title/desc's tooltip and force
 // the reader through an extra fetch. Inline SVG runs no script under the
-// page's own CSP (`default-src 'none'`) and the sanitiser
-// (`stripScriptsFromSvg`) removes anything that could try, so an inline
-// plot stays inert.
+// page's own CSP (`default-src 'none'`) and the DOM sanitiser
+// (`sanitizeSvg`) removes anything that could try, so an inline plot
+// stays inert.
 //
 // Errors — a missing plot, a missing sibling data file, a Vega compile
-// error — throw at build time so a broken plot fails the build loudly,
-// per ADR-0004 / C4.
+// error, an undefined `field` — throw at build time so a broken plot
+// fails the build loudly, per ADR-0004 / C4. Every thrown error is
+// wrapped with the plot name and spec path so the CI log names the file
+// to fix.
 import { getEntry } from "astro:content";
 import { dirname } from "node:path";
 import { resolveSpecAbsolutePath } from "../content/loaders/plots.ts";
 import { renderPlotToSvg } from "../lib/render-plot.ts";
+import { assertPlotFieldsExist } from "../lib/plot-fields.ts";
 
 interface Props {
   /** Name of the plot in the `plots` collection — matches the folder name
@@ -55,10 +59,23 @@ if (!entry.filePath) {
 const specAbs = resolveSpecAbsolutePath(entry.filePath, process.cwd());
 const specDir = dirname(specAbs);
 
-const svg = await renderPlotToSvg(entry.data, {
-  specDir,
-  accessibleName: label,
-});
+let svg: string;
+try {
+  // Column-level check first — an undefined `field` reference would
+  // otherwise render an empty plot silently. Runs against the CSV/JSON
+  // that the loader has already validated as a sibling.
+  await assertPlotFieldsExist(entry.data, specDir);
+  svg = await renderPlotToSvg(entry.data, {
+    specDir,
+    accessibleName: label,
+  });
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  throw new Error(
+    `<Plot name="${name}"> at ${entry.filePath}: ${message}`,
+    { cause: error instanceof Error ? error : undefined },
+  );
+}
 ---
 
 <figure class:list={["revkit-plot", className]} data-plot-name={name} set:html={svg}></figure>

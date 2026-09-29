@@ -106,6 +106,73 @@ test("no vega/katex client-side JS is loaded", async ({ page }) => {
   ).toEqual([]);
 });
 
+test("no vega/katex identifiers appear in the built _astro/*.js bundles", async () => {
+  // The over-the-wire check above catches "was this URL fetched?"; this
+  // one catches "did any bundled chunk sneak vega/katex code in?", which
+  // would happen if a component ever accidentally imported the runtime
+  // from a client-only script tag. Runs on the on-disk build so a
+  // regression trips even for scripts loaded after `networkidle`.
+  const { readdir, readFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const astroDir = join(process.cwd(), "dist", "_astro");
+  const files = await readdir(astroDir);
+  const jsFiles = files.filter((name) => name.endsWith(".js"));
+  expect(jsFiles.length, "expected the build to emit some _astro/*.js").toBeGreaterThan(0);
+
+  // Distinctive identifiers from each library. Substrings that only
+  // exist in the runtime code, not in incidental strings like `vega` in
+  // a comment or an SVG class name.
+  const forbiddenPatterns: readonly RegExp[] = [
+    /\bkatex\.render\b/,
+    /vega-lite/i,
+    /vegaLite/,
+    /\bVegaView\b/,
+    /VEGA_SCHEMA/i,
+    /vega\.parse/,
+  ];
+  const hits: { file: string; pattern: string; excerpt: string }[] = [];
+  for (const jsFile of jsFiles) {
+    const contents = await readFile(join(astroDir, jsFile), "utf8");
+    for (const pattern of forbiddenPatterns) {
+      const match = pattern.exec(contents);
+      if (match) {
+        hits.push({
+          file: jsFile,
+          pattern: pattern.toString(),
+          excerpt: contents.slice(Math.max(0, match.index - 20), match.index + 60),
+        });
+      }
+    }
+  }
+  expect(hits, `vega/katex identifiers found in built bundles: ${JSON.stringify(hits, null, 2)}`).toEqual([]);
+});
+
+test("math + plots page loads the same script set as a page without them", async ({ page }) => {
+  // Baseline: any Starlight docs page (an ADR) loads a fixed set of
+  // chunks. The math + plots page must load the SAME set — a new chunk
+  // there means the math or plot pipeline started shipping runtime code.
+  const collectScripts = async (route: string): Promise<Set<string>> => {
+    const scripts = new Set<string>();
+    page.on("request", (request) => {
+      if (request.resourceType() === "script") {
+        const url = new URL(request.url());
+        scripts.add(url.pathname);
+      }
+    });
+    await page.goto(route);
+    await page.waitForLoadState("networkidle");
+    return scripts;
+  };
+  const baseline = await collectScripts("/adr/0001-static-first-site-stack/");
+  page.removeAllListeners("request");
+  const target = await collectScripts(PAGE);
+  const extras = [...target].filter((path) => !baseline.has(path));
+  expect(
+    extras,
+    `math + plots page loaded scripts an ADR page did not: ${JSON.stringify(extras)}`,
+  ).toEqual([]);
+});
+
 test("axe finds no serious/critical violations on the math + plots page", async ({ page }) => {
   await page.goto(PAGE);
   await expectNoBlockingViolations(page);
