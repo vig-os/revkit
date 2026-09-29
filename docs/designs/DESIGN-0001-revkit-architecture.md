@@ -5,6 +5,7 @@
 | Status | Proposed — review inline on the PR |
 | Issue | [#3](https://github.com/vig-os/revkit/issues/3) |
 | Date | 2026-09-29 |
+| Decisions | [ADR-0001 – ADR-0011](../adr/README.md) · traceability: [FEATURE-MATRIX](../FEATURE-MATRIX.md) |
 | Decided so far | Starlight shell · Solid islands · self-minted invite links (Authentik later, [#4](https://github.com/vig-os/revkit/issues/4)) |
 
 revkit is an HTML-first review surface for the agentic era. An agent authors structured documents (ADRs, designs,
@@ -431,16 +432,16 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 
 ## 8. Milestones (to be split into issues after review)
 
-1. **M1 — skeleton + guards:** Astro/Starlight/Solid/Tailwind scaffold, the content model, `revkit check` (the four
+1. **M1 — skeleton + guards:** ([#6](https://github.com/vig-os/revkit/issues/6)) Astro/Starlight/Solid/Tailwind scaffold, the content model, `revkit check` (the four
    guards) as flake hooks, KaTeX, Vega-Lite SSR plots, the train-line sidebar.
-2. **M2 — local loop:** `revkit serve` daemon + `/events` stream, anchors + re-anchoring (§5.4), comment rail,
+2. **M2 — local loop:** ([#7](https://github.com/vig-os/revkit/issues/7)) `revkit serve` daemon + `/events` stream, anchors + re-anchoring (§5.4), comment rail,
    threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a **channel** with a Monitor-WebSocket fallback,
    delivery modes + handover, presence, the Claude Code skill.
-3. **M3 — PR review:** CI preview deploy + PR comment, GitHub App, two-way threads, submit review.
-4. **M4 — guests:** invite links; then Authentik (#4).
-5. **M5 — distribution:** flake outputs, template, devkit module proposal.
-6. **M6 — suggested edits:** patch-carrying comments, accept → source, GitHub `suggestion` blocks.
-7. **M7 — co-editing:** CodeMirror 6 source pane + Yjs, daemon-owned Y.Doc per file, agent writes ingested as ops.
+3. **M3 — PR review:** ([#8](https://github.com/vig-os/revkit/issues/8)) CI preview deploy + PR comment, GitHub App, two-way threads, submit review.
+4. **M4 — guests:** ([#9](https://github.com/vig-os/revkit/issues/9)) invite links; then Authentik (#4).
+5. **M5 — distribution:** ([#10](https://github.com/vig-os/revkit/issues/10)) flake outputs, template, devkit module proposal.
+6. **M6 — suggested edits:** ([#11](https://github.com/vig-os/revkit/issues/11)) patch-carrying comments, accept → source, GitHub `suggestion` blocks.
+7. **M7 — co-editing:** ([#12](https://github.com/vig-os/revkit/issues/12)) CodeMirror 6 source pane + Yjs, daemon-owned Y.Doc per file, agent writes ingested as ops.
 
 ## 9. Open questions
 

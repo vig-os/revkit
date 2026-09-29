@@ -121,6 +121,7 @@
         # finding; escape a single line with `guardrails-ok`.
         codeFiles = "\\.(ts|tsx|js|mjs|cjs|astro)$";
         docFiles = "\\.(md|mdx)$";
+        adrFiles = "^(docs/adr/|docs/FEATURE-MATRIX\\.md$|scripts/adr-index\\.sh$)";
         guardrailsHooks =
           gates: files:
           builtins.listToAttrs (
@@ -170,7 +171,27 @@
                 "no-hardcoded"
                 "duplication"
               ] codeFiles
-              // guardrailsHooks [ "derived-docs" ] docFiles;
+              // guardrailsHooks [ "derived-docs" ] docFiles
+              // {
+                # Every Accepted ADR must be cited in the feature matrix and
+                # listed (as Accepted) in the ADR index.
+                guardrails-adr-matrix = {
+                  enable = true;
+                  entry = "guardrails-adr-matrix docs/adr/README.md docs/FEATURE-MATRIX.md";
+                  language = "system";
+                  files = adrFiles;
+                  pass_filenames = false;
+                };
+                # The ADR index is derived from the ADR files; re-check it
+                # whenever any ADR changes, not only when README.md is staged.
+                adr-index = {
+                  enable = true;
+                  entry = "guardrails-derived-docs docs/adr/README.md";
+                  language = "system";
+                  files = adrFiles;
+                  pass_filenames = false;
+                };
+              };
 
             # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
             # shared base hook set instead of hand-managing the scaffolded
