@@ -6,7 +6,7 @@
 import type { Loader } from "astro/loaders";
 import { glob } from "astro/loaders";
 import { access } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isObject, walkObjects } from "../utils/vega-lite-walk.ts";
 
@@ -42,9 +42,7 @@ async function fileExists(absolutePath: string): Promise<boolean> {
  * fixtures without standing up a full Astro loader context. */
 export async function assertSiblingFiles(entry: PlotEntry, projectRoot: string): Promise<void> {
   if (!entry.filePath) return; // glob loader always populates it; guard for safety
-  const specAbsolute = isAbsolute(entry.filePath)
-    ? entry.filePath
-    : resolve(projectRoot, entry.filePath);
+  const specAbsolute = resolveSpecAbsolutePath(entry.filePath, projectRoot);
   const specDir = dirname(specAbsolute);
   for (const url of collectDataUrls(entry.data)) {
     const dataAbsolute = resolve(specDir, url);
@@ -61,8 +59,39 @@ export async function assertSiblingFiles(entry: PlotEntry, projectRoot: string):
  * that every `data.url` points at an existing sibling file — the sibling-
  * exists check the schema cannot perform on its own.
  */
+/** Derive a plot's collection id from its file path. Each plot lives at
+ * `plots/<name>/spec.vl.json`, and the folder name IS the plot id — so a
+ * page can look one up with `getEntry('plots', '<name>')` without knowing
+ * the spec filename. The default glob `generateId` would strip only one
+ * extension (leaving `bundle-sizes/spec.vl`), which does not match the
+ * one-plot-per-directory shape the schema and loader assume. */
+export function plotIdFromEntry(entry: {
+  entry: string;
+  base: URL;
+  data: Record<string, unknown>;
+}): string {
+  const posixEntry = entry.entry.split(/[\\/]/).join("/");
+  const dir = posix.dirname(posixEntry);
+  return dir === "." ? posix.basename(posixEntry).replace(/\.vl\.json$/, "") : dir;
+}
+
+/** Resolve a plots-collection entry's `filePath` (relative to the Astro
+ * project root, e.g. `../plots/bundle-sizes/spec.vl.json`) to an absolute
+ * filesystem path, using `projectRoot` as the base. Exported so both
+ * loader-side checks and build-time components share one resolver. */
+export function resolveSpecAbsolutePath(
+  filePath: string,
+  projectRoot: string,
+): string {
+  return isAbsolute(filePath) ? filePath : resolve(projectRoot, filePath);
+}
+
 export function plotsLoader(baseFromProjectRoot = "../plots"): Loader {
-  const wrapped = glob({ base: baseFromProjectRoot, pattern: "**/spec.vl.json" });
+  const wrapped = glob({
+    base: baseFromProjectRoot,
+    pattern: "**/spec.vl.json",
+    generateId: plotIdFromEntry,
+  });
   return {
     name: "revkit-plots-loader",
     async load(context) {

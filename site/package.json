@@ -6,7 +6,9 @@
   "description": "revkit review site (Astro + Starlight + Solid + Tailwind).",
   "license": "Apache-2.0",
   "scripts": {
+    "predev": "bun run scripts/copy-katex-assets.ts",
     "dev": "astro dev",
+    "prebuild": "bun run scripts/copy-katex-assets.ts",
     "build": "astro build",
     "preview": "astro preview",
     "astro": "astro",
@@ -14,6 +16,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@astrojs/markdown-remark": "7.3.1",
     "@astrojs/mdx": "8.0.2",
     "@astrojs/solid-js": "7.0.2",
     "@astrojs/starlight": "0.42.4",
@@ -21,8 +24,13 @@
     "@revkit/components": "workspace:*",
     "@tailwindcss/vite": "4.3.3",
     "astro": "7.3.5",
+    "katex": "0.18.9",
+    "rehype-katex": "7.0.1",
+    "remark-math": "6.0.0",
     "solid-js": "1.9.15",
     "tailwindcss": "4.3.3",
+    "vega": "6.4.0",
+    "vega-lite": "6.4.3",
     "yaml": "2.9.1"
   },
   "devDependencies": {

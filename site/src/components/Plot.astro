@@ -1,0 +1,64 @@
+---
+// Build-time plot renderer (ADR-0004, C4).
+//
+// Looks up a plot spec from the `plots` collection by `name`, resolves the
+// spec's directory, and streams the Vega-Lite -> Vega -> SVG rendering
+// pipeline (site/src/lib/render-plot.ts). The output is inlined into the
+// page as `<svg role="img" aria-label="…">` — inline is the CSP-friendly
+// choice under ADR-0012: served SVG carries `Content-Security-Policy:
+// sandbox`, which would strip an inline title/desc's tooltip and force
+// the reader through an extra fetch. Inline SVG runs no script under the
+// page's own CSP (`default-src 'none'`) and the sanitiser
+// (`stripScriptsFromSvg`) removes anything that could try, so an inline
+// plot stays inert.
+//
+// Errors — a missing plot, a missing sibling data file, a Vega compile
+// error — throw at build time so a broken plot fails the build loudly,
+// per ADR-0004 / C4.
+import { getEntry } from "astro:content";
+import { dirname } from "node:path";
+import { resolveSpecAbsolutePath } from "../content/loaders/plots.ts";
+import { renderPlotToSvg } from "../lib/render-plot.ts";
+
+interface Props {
+  /** Name of the plot in the `plots` collection — matches the folder name
+   * under `plots/`, e.g. `<Plot name="bundle-sizes" />`. */
+  name: string;
+  /** Optional accessible name override. When omitted, the spec's `title`
+   * is used (see `renderPlotToSvg`); when the spec has no title, callers
+   * SHOULD pass `label` so the plot has an accessible name. */
+  label?: string;
+  /** Optional CSS class forwarded to the wrapping `<figure>`. */
+  class?: string;
+}
+
+const { name, label, class: className } = Astro.props;
+
+const entry = await getEntry("plots", name);
+if (!entry) {
+  throw new Error(
+    `<Plot name="${name}"> — no such entry in the 'plots' collection. Add plots/${name}/spec.vl.json or fix the name.`,
+  );
+}
+if (!entry.filePath) {
+  throw new Error(
+    `<Plot name="${name}"> — the plots loader did not set filePath; cannot resolve sibling data files.`,
+  );
+}
+
+// `entry.filePath` is relative to the Astro project root (site/). Astro
+// runs both `astro build` and `astro dev` from that project root, so
+// `process.cwd()` gives us the base to resolve against. `import.meta.url`
+// is unreliable here — a built .astro chunk lives under `dist/.prerender`,
+// and walking `../..` from there does NOT reach the plot's source
+// directory.
+const specAbs = resolveSpecAbsolutePath(entry.filePath, process.cwd());
+const specDir = dirname(specAbs);
+
+const svg = await renderPlotToSvg(entry.data, {
+  specDir,
+  accessibleName: label,
+});
+---
+
+<figure class:list={["revkit-plot", className]} data-plot-name={name} set:html={svg}></figure>

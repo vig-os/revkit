@@ -1,0 +1,112 @@
+// E2e for the math + plots page (M1 item 3, C4 + C5). The site sources
+// KaTeX at build time and inlines each Vega-Lite plot as an SVG — this
+// suite exercises the built artefact so a regression in the remark /
+// rehype pipeline, in the plots loader, in the `<Plot>` component, or in
+// the CSP-friendly SVG shape trips.
+//
+// Every page assertion also runs an axe-core scan (ADR-0017) so the math
+// + plots surface stays WCAG 2.2 AA-clean.
+import AxeBuilder from "@axe-core/playwright";
+import { expect, test } from "@playwright/test";
+
+const PAGE = "/math-and-plots/";
+
+/** Blocking axe violations only — matches the landing-page smoke's bar
+ * and matches the ADR-0017 gate (advisory findings shouldn't fail CI). */
+async function expectNoBlockingViolations(page: import("@playwright/test").Page): Promise<void> {
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
+    .analyze();
+  const blocking = results.violations.filter(
+    (violation) => violation.impact === "serious" || violation.impact === "critical",
+  );
+  expect(
+    blocking,
+    `serious/critical axe violations: ${JSON.stringify(blocking, null, 2)}`,
+  ).toEqual([]);
+}
+
+test("KaTeX renders math at build with no raw $ delimiters left over", async ({ page }) => {
+  await page.goto(PAGE);
+  // A `.katex` span is what KaTeX emits for every equation — its absence
+  // would mean the remark-math -> rehype-katex chain never ran.
+  const katex = page.locator(".katex").first();
+  await expect(katex).toBeVisible();
+  // The display equation is wrapped in `.katex-display`; asserting on
+  // that class rejects a regression where inline-only worked but display
+  // math (double-dollars) fell back to raw text.
+  await expect(page.locator(".katex-display")).toHaveCount(1);
+  // The MDX source has `E = \sum_{n=1}^{N} …`; a working render surfaces
+  // the identifier `E` inside a KaTeX span and no leftover `$$` fence.
+  const bodyText = await page.locator("main").innerText();
+  expect(bodyText).not.toContain("$$");
+  expect(bodyText).not.toMatch(/\$[A-Za-z\\][^$]{0,40}\$/);
+});
+
+test("KaTeX stylesheet is self-hosted from /_katex, not a CDN", async ({ page, request }) => {
+  await page.goto(PAGE);
+  // A `<link rel=stylesheet href="/_katex/katex.min.css">` in the head is
+  // the proof the CSS is served from the origin (ADR-0012 CSP: no CDN).
+  const hrefs = await page.locator('link[rel="stylesheet"]').evaluateAll(
+    (elements: Element[]) =>
+      elements.map((element) => (element as HTMLLinkElement).href),
+  );
+  expect(hrefs.some((href) => href.endsWith("/_katex/katex.min.css"))).toBe(true);
+  // The stylesheet itself must resolve; a build-time regression that
+  // failed to copy KaTeX assets would ship a broken link.
+  const cssResponse = await request.get("/_katex/katex.min.css");
+  expect(cssResponse.ok(), "katex.min.css should be served").toBe(true);
+  // The CSS references `fonts/KaTeX_Main-Regular.woff2` relative to
+  // itself; asserting one representative font is fetchable proves the
+  // whole `fonts/` prefix is present.
+  const fontResponse = await request.get("/_katex/fonts/KaTeX_Main-Regular.woff2");
+  expect(fontResponse.ok(), "KaTeX woff2 fonts should be served").toBe(true);
+});
+
+test("the Plot renders as an accessible inline SVG with category labels", async ({ page }) => {
+  await page.goto(PAGE);
+  // The <Plot> component wraps its SVG in a <figure class="revkit-plot">.
+  const figure = page.locator("figure.revkit-plot").first();
+  await expect(figure).toBeVisible();
+
+  // The inline SVG must carry role="img" + aria-label so assistive tech
+  // announces the plot with the label the MDX author passed.
+  const svg = figure.locator("svg[role='img']").first();
+  await expect(svg).toBeVisible();
+  await expect(svg).toHaveAttribute("aria-label", /JavaScript library bundle sizes/i);
+
+  // Each of the four measured categories from DESIGN-0001 §2 renders as
+  // a text label in the SVG. A regression that shipped an empty
+  // scenegraph would drop them all.
+  for (const label of ["Solid", "uPlot", "Observable Plot", "vega-embed"]) {
+    await expect(svg.locator("text", { hasText: label }).first()).toBeVisible();
+  }
+
+  // The SVG must not carry a `<script>` element (ADR-0012: served SVG
+  // is sandboxed; inline SVG is defence-in-depth for the same rule).
+  await expect(svg.locator("script")).toHaveCount(0);
+});
+
+test("no vega/katex client-side JS is loaded", async ({ page }) => {
+  const requestedScripts: string[] = [];
+  page.on("request", (request) => {
+    if (request.resourceType() === "script") requestedScripts.push(request.url());
+  });
+  await page.goto(PAGE);
+  // Wait for network to settle so any deferred scripts have a chance to
+  // start their request.
+  await page.waitForLoadState("networkidle");
+
+  const disallowed = requestedScripts.filter((url) =>
+    /(vega|vega-embed|vega-lite|katex\.(?:min\.)?js)/i.test(url),
+  );
+  expect(
+    disallowed,
+    `expected no vega/katex JS to be requested; saw ${JSON.stringify(disallowed)}`,
+  ).toEqual([]);
+});
+
+test("axe finds no serious/critical violations on the math + plots page", async ({ page }) => {
+  await page.goto(PAGE);
+  await expectNoBlockingViolations(page);
+});

@@ -69,6 +69,12 @@ coverage/
 site/dist/
 site/.astro/
 
+# KaTeX assets: regenerated on each build by site/scripts/copy-katex-assets.ts
+# from the pinned katex package (ADR-0001 exact-pins). Checking them in would
+# mean two places to update on a KaTeX bump, so the script is the source of
+# truth (ADR-0012: assets are self-hosted from `/_katex/`, not a CDN).
+site/public/_katex/
+
 # Playwright output
 test-results/
 playwright-report/
