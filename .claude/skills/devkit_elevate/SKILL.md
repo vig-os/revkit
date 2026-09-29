@@ -20,8 +20,11 @@ the state. Read it first so a run never re-proposes a settled candidate.
 ```bash
 DEVKIT_VERSION=$(grep -E '^DEVKIT_VERSION=' .vig-os | cut -d= -f2)
 gh issue view 1 -R vig-os/revkit --comments          # the ledger: settled + open candidates
-git log --since="$(gh issue view 1 -R vig-os/revkit --json comments \
-  -q '.comments[-1].createdAt // empty')" --oneline   # what changed since the last run
+# The last run is the newest ledger comment carrying the run marker (step 6), so a human
+# reply on the ledger doesn't move the window. No prior run means the whole history.
+since=$(gh api --paginate repos/vig-os/revkit/issues/1/comments \
+  -q '.[] | select(.body | startswith("## devkit_elevate run")) | .created_at' | tail -n 1)
+git log --since="${since:-1970-01-01}" --oneline      # what changed since the last run
 ```
 
 Resolve the devkit checkout at the pinned tag, not a floating branch. The comparison must be against what revkit
@@ -54,18 +57,32 @@ own slug, so glob on the repo name:
 
 ```bash
 CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-T=$(ls -d "$CFG"/projects/*revkit* 2>/dev/null)
+# Every transcript of every revkit working dir, including subagent transcripts
+# (<session>/subagents/*.jsonl), which usually hold most of the tool calls.
+# -L: the projects dir is often a symlink (e.g. Home Manager), and find does not
+# descend a symlinked start point without it.
+mapfile -t FILES < <(find -L "$CFG/projects" -type f -name '*.jsonl' -path "$CFG/projects/*revkit*/*" 2>/dev/null)
+echo "${#FILES[@]} transcript files"
+# Guard: with no file arguments jq reads stdin and blocks forever.
+[ "${#FILES[@]}" -gt 0 ] || { echo "no transcripts found; skip this step"; FILES=(/dev/null); }
+# Redact token-shaped strings BEFORE anything reaches your context.
+redact() {
+  sed -E -e 's/(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}/<redacted-gh-token>/g' \
+    -e 's/sk-[A-Za-z0-9_-]{20,}/<redacted-key>/g' -e 's/AKIA[0-9A-Z]{16}/<redacted-aws-key>/g' \
+    -e 's/-----BEGIN [A-Z ]*PRIVATE KEY-----.*/<redacted-private-key>/g' \
+    -e 's/([Bb]earer|[Tt]oken[=:])[[:space:]]*[A-Za-z0-9._~+\/-]{16,}/\1 <redacted>/g'
+}
 # Commands that failed (tool errors) — the raw friction signal
 jq -r 'select(.type=="user") | .message.content[]?
-       | select(.type=="tool_result" and .is_error==true) | (.content|tostring)' $T/*.jsonl \
-  | cut -c1-240 | sort | uniq -c | sort -rn | head -40
+       | select(.type=="tool_result" and .is_error==true) | (.content|tostring)' "${FILES[@]}" \
+  | redact | cut -c1-240 | sort | uniq -c | sort -rn | head -40
 # Shell commands the agent ran, most repeated first — manual steps that want a recipe/module
 jq -r 'select(.type=="assistant") | .message.content[]?
-       | select(.type=="tool_use" and .name=="Bash") | .input.command' $T/*.jsonl \
-  | sed -E 's/[[:space:]]+/ /g' | cut -c1-160 | sort | uniq -c | sort -rn | head -40
+       | select(.type=="tool_use" and .name=="Bash") | .input.command' "${FILES[@]}" \
+  | redact | sed -E 's/[[:space:]]+/ /g' | cut -c1-160 | sort | uniq -c | sort -rn | head -40
 # Environment workarounds: explicit flags, env overrides, "workaround" talk
-jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' $T/*.jsonl \
-  | grep -n -i -E 'workaround|not enabled|403|refus|clobber|by hand|hand-(wire|edit)|missing' | head -40
+jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' "${FILES[@]}" \
+  | redact | grep -n -i -E 'workaround|not enabled|403|refus|clobber|by hand|hand-(wire|edit)|missing' | head -40
 ```
 
 Transcripts are raw session data. Quote only the short snippet that proves a finding. Never paste secrets, tokens,
@@ -102,8 +119,9 @@ Name the devkit home for every **elevate**, e.g. "`bun` module" or "`runtime` op
 1. Show the operator the findings table: candidate, evidence (file:line or transcript snippet), disposition,
    devkit home.
 2. On confirmation, append one dated comment to the ledger:
-   `gh issue comment 1 -R vig-os/revkit --body-file <report.md>`, and update the body checklist for new or settled
-   candidates.
+   `gh issue comment 1 -R vig-os/revkit --body-file <report.md>`. The report's first line must be exactly
+   `## devkit_elevate run <YYYY-MM-DD>`: step 1 finds the last run by it. Then update the body checklist for new or
+   settled candidates.
 3. For each confirmed **elevate**, extend an existing devkit issue if one matches (comment with the new evidence);
    otherwise file one with the `feature` label, linking back to the ledger. Never file a duplicate; step 4 is the
    gate.
