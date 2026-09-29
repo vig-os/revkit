@@ -52,6 +52,11 @@
           # Bun: fast TS runtime/test runner/package manager for the review
           # toolchain (Astro/Vite builds, guard scripts).
           pkgs.bun
+          # Cloudflare CLI for the hosted Worker (ADR-0008). Auth comes from
+          # CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, loaded per call by
+          # `just cf` from ~/.config/revkit/cf.env (ADR-0014), never exported
+          # into the shell.
+          pkgs.wrangler
         ];
 
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
