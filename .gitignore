@@ -30,16 +30,52 @@ justfile.local
 # process-compose / services-flake local dev services state (#795)
 data/
 
+# ── Node / TypeScript ─────────────────────────────────────────────────────────
+# Appended to the language-neutral base by init-workspace.sh when a package.json
+# marks the repo as Node/TypeScript.
+#
+# NOTE: no blanket `dist/` ignore — a JS GitHub Action commits its bundled
+# entrypoint (dist/index.js, referenced by action.yml `runs.main`), so ignoring
+# dist/ would silently drop the committed bundle (#1024).
+
+# Dependencies
+node_modules/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# tsc/ncc emit .d.ts + .d.ts.map declaration byproducts under dist/src/ (#1092);
+# the .d.ts.map files embed absolute file:// paths regenerated per checkout, so
+# ignore them — WITHOUT a blanket dist/ ignore, keeping the committed bundle
+# dist/index.js + dist/package.json tracked.
+dist/src/
+
+# Coverage reports
+coverage/
+.nyc_output/
+
 # Repo-specific root .gitignore entries — yours to edit; upgrades never
 # overwrite this file. This is the durable committed home for repo-ROOT ignores:
 # git honors a root ignore only from the root .gitignore, which devkit
 # regenerates on every upgrade, so entries added HERE are appended to that
 # regenerated .gitignore and survive. Put durable repo-root ignores below (not
 # in the managed .gitignore, where hand edits are lost).
-#
-# Examples (uncomment / add your own):
-#   /scratch/
-#   /secrets.local.yaml
+
+# Bun / Node
+node_modules/
+
+# Astro build artefacts
+site/dist/
+site/.astro/
+
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# TypeScript incremental build info
+*.tsbuildinfo
 
 # flake-hooks opt-in (#1092): the generated .pre-commit-config.yaml is a
 # /nix/store symlink — never commit it.

@@ -1,0 +1,22 @@
+{
+  "name": "@revkit/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "revkit CLI (M1: --version, --help).",
+  "license": "Apache-2.0",
+  "bin": {
+    "revkit": "./bin/revkit.js"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.9.3"
+  }
+}

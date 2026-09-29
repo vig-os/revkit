@@ -4,7 +4,19 @@
 # regenerates on every upgrade, so entries added HERE are appended to that
 # regenerated .gitignore and survive. Put durable repo-root ignores below (not
 # in the managed .gitignore, where hand edits are lost).
-#
-# Examples (uncomment / add your own):
-#   /scratch/
-#   /secrets.local.yaml
+
+# Bun / Node
+node_modules/
+
+# Astro build artefacts
+site/dist/
+site/.astro/
+
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# TypeScript incremental build info
+*.tsbuildinfo

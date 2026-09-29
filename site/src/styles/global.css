@@ -1,0 +1,9 @@
+/* Global site stylesheet.
+ *
+ * Loads Tailwind v4 and Starlight's Tailwind base tokens. Starlight's Tailwind
+ * plugin is a CSS-only entry point (its docs say to `@import` it after
+ * `tailwindcss`), so no PostCSS plugin is required. Custom design tokens go
+ * beneath this line as `@theme` layers when they are needed.
+ */
+@import "tailwindcss";
+@import "@astrojs/starlight-tailwind";

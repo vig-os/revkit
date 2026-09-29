@@ -59,6 +59,16 @@
           pkgs.wrangler
         ];
 
+        # Playwright browsers from nixpkgs (ADR-0016/0018) — Chromium, Firefox
+        # and WebKit rebuilt with Nix's own libraries, so the driver never
+        # tries to fetch a manylinux tarball on a NixOS host. The consumer
+        # shellHook exports PLAYWRIGHT_BROWSERS_PATH at this store path and
+        # PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true so `@playwright/test`
+        # runs from the store. `@playwright/test` in site/package.json is
+        # pinned to the SAME version as `pkgs.playwright-driver.version` so
+        # the driver protocol matches the browsers.
+        playwrightBrowsers = pkgs.playwright-driver.browsers;
+
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
         # flake-generated pre-commit hooks — the branch guard and the
         # commit-message validator — follow the workspace manifest, mirroring
@@ -148,6 +158,17 @@
           {
             inherit pkgs;
             extraPackages = extraPackages pkgs;
+
+            # Consumer shellHook (mkProjectShell appends this after the module
+            # fragments). Pins Playwright to the nix-built browsers and skips
+            # the driver's host-package validation, which trips on NixOS's
+            # non-FHS layout. Kept last so the "dev environment loaded" echo
+            # from the default shellHook is preserved by re-emitting it.
+            shellHook = ''
+              export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"
+              export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+              echo "devcontainer dev environment loaded (nix)"
+            '';
 
             # Capability modules (mirrored in .vig-os DEVKIT_MODULES):
             #   node       - nodejs/npm for the Astro/Vite/TS toolchain
