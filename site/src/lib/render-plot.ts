@@ -220,7 +220,13 @@ const ALLOWED_ATTRIBUTES: ReadonlySet<string> = new Set([
   "vector-effect",
   "stop-color",
   "stop-opacity",
-  "style",
+  // `style` is deliberately absent: CSS has a wider surface than an SVG
+  // presentation attribute (image-set(), CSS-escape sequences like
+  // `\72` for `r`, url(...) values our regex would only catch when it
+  // reads as the literal text `url`), and Vega's static SVG output
+  // uses presentation attributes throughout. If a future Vega bump
+  // starts emitting `style="…"`, convert the specific properties into
+  // presentation attributes rather than re-allowing CSS.
   // Text
   "font-family",
   "font-size",
@@ -265,11 +271,12 @@ function sanitizeUrlsInValue(value: string): string {
   });
 }
 
-/** Attributes whose values can carry a `url(...)` reference. Vega uses
- * these for gradient / clip fills, so the value has to be sanitised
- * rather than the attribute removed. */
+/** Presentation attributes whose values can legitimately carry a
+ * `url(#fragment)` reference (Vega uses these for gradient / clip
+ * fills), so the value is rewritten rather than the attribute stripped.
+ * `style` is intentionally NOT here — see the block comment on
+ * ALLOWED_ATTRIBUTES for why raw CSS never survives. */
 const URL_BEARING_ATTRIBUTES: ReadonlySet<string> = new Set([
-  "style",
   "fill",
   "stroke",
   "clip-path",

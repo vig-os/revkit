@@ -246,22 +246,60 @@ describe("sanitizeSvg (DOM-based, allowlist)", () => {
     expect(clean).toContain("<rect");
   });
 
-  test("strips url(https://…) inside style / fill attributes, keeps url(#fragment)", () => {
-    // Regression guard against the reviewer's finding: `style="fill:url
+  test("strips url(https://…) inside presentation attributes, keeps url(#fragment)", () => {
+    // Regression guard against the reviewer's finding: `fill="url
     // (https://evil)"` survived the old denylist because the element
     // was benign and neither `on*` nor `href` fired the strip rule. The
-    // new sanitiser rewrites url(...) values inside style + presentation
-    // attributes, keeping only same-document fragments.
+    // sanitiser rewrites url(...) values inside presentation attributes,
+    // keeping only same-document fragments.
     const dirty =
-      `${SVG_OPEN}<rect style="fill:url(https://evil.example);stroke:red" ` +
-      `fill="url('https://evil.example/img.png')"/>` +
-      `<circle style="fill:url(#gradient1)" fill="url(#patternA)"/></svg>`;
+      `${SVG_OPEN}<rect fill="url('https://evil.example/img.png')" stroke="url(https://evil2.example)"/>` +
+      `<circle fill="url(#patternA)" stroke="url(#gradient1)"/></svg>`;
     const clean = sanitizeSvg(dirty);
     expect(clean).not.toContain("evil.example");
-    expect(clean).toContain("url(#gradient1)");
+    expect(clean).not.toContain("evil2.example");
     expect(clean).toContain("url(#patternA)");
-    // The unrelated presentation stays untouched.
-    expect(clean).toContain("stroke:red");
+    expect(clean).toContain("url(#gradient1)");
+  });
+
+  test("drops the style attribute entirely (CSS is wider than presentation attrs)", () => {
+    // The `style` attribute is not on the allowlist because CSS can
+    // smuggle outbound references our url(…) regex would miss — see
+    // the two bypasses below. A regression that re-allowed `style`
+    // would trip this test even before those bypasses land.
+    const dirty = `${SVG_OPEN}<rect x="5" y="10" style="fill:red;stroke:blue"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("style=");
+    expect(clean).not.toContain("fill:red");
+    // Legitimate presentation still survives.
+    expect(clean).toContain('x="5"');
+  });
+
+  test("style=\"background-image:image-set('https://evil…' 1x)\" never survives", () => {
+    // CSS `image-set()` fetches its argument at read time — the same
+    // outbound problem as `url(https://…)`, but the argument is not
+    // wrapped in `url(…)`, so the url-rewrite regex wouldn't strip it
+    // even if `style` were kept. Dropping `style` outright is what
+    // makes this shape inert.
+    const dirty =
+      `${SVG_OPEN}<rect style="background-image:image-set('https://evil.example/a.png' 1x)"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("evil.example");
+    expect(clean).not.toContain("image-set");
+    expect(clean).not.toContain("style=");
+  });
+
+  test("style with CSS-escape sequences (fill:u\\72l(https://evil/y)) never survives", () => {
+    // CSS lets \72 stand in for `r`, so `u\72l(…)` is a valid `url()`
+    // call at parse time. A regex that only matches the literal text
+    // `url(…)` would miss it — but since `style` is dropped, the
+    // whole attribute never reaches the browser to be un-escaped.
+    const dirty = String.raw`${SVG_OPEN}<rect style="fill:u\72l(https://evil.example/y)"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("evil.example");
+    // The escaped `u\72l` fragment itself must also be gone.
+    expect(clean).not.toMatch(/u\\?72l/);
+    expect(clean).not.toContain("style=");
   });
 
   test("removes attributes not in the allowlist while keeping legitimate presentation", () => {
