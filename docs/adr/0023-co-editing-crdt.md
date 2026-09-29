@@ -2,6 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-09-29
+- Stories: A7
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 
 ## Context
@@ -15,4 +16,4 @@ Story A7 (co-editing the source beside the rendered view) needs concurrent editi
 
 ## Consequences
 
-Stories: A7. Will amend ADR-0006 when accepted.
+Will amend ADR-0006 when accepted.

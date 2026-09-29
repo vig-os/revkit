@@ -22,5 +22,4 @@ React-only libraries are out of scope. New components go through the escalation 
 ## Acceptance (2026-09-29)
 
 - Vendored upstream code (shadcn-solid styled layer) keeps its `LICENSE` under `packages/components/vendor/<pkg>/` and
-  is
-  listed in `NOTICE`; see ADR-0022. Kobalte is a normal dependency.
+  is listed in `NOTICE`; see ADR-0022. Kobalte is a normal dependency.

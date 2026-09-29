@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-29
+- Stories: C6, E1
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 
 ## Context
@@ -15,4 +16,4 @@ The review surface targets phone, tablet and desktop.
 
 ## Consequences
 
-Stories: C6, E1.
+See Decision.

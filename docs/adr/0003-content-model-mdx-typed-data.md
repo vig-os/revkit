@@ -7,7 +7,8 @@
 
 ## Context
 
-A pure JSON/nested-JSON doc model was considered. PR review (B2, B6) needs comments to land on reviewable source lines.
+A pure JSON/nested-JSON doc model was considered. PR review (B2, B6) needs comments to land on reviewable source
+lines.
 
 ## Decision
 

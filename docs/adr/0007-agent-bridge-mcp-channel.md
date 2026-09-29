@@ -24,7 +24,9 @@ call on a human.
 ## Acceptance (2026-09-29)
 
 - **Channel-first** (owner decision): M2 builds the `claude/channel` server as the primary path, run with
-  `--dangerously-load-development-channels server:revkit` until the plugin is published on an allowlisted
-  marketplace; the Monitor-WebSocket path is the supported fallback for sessions without channels, and the
-  UserPromptSubmit hook the last resort.
+  `--dangerously-load-development-channels server:revkit` until the plugin is published on an allowlisted marketplace;
+  the Monitor-WebSocket path is the supported fallback for sessions without channels, and the UserPromptSubmit hook
+  the last resort.
 - Default delivery mode is `handover`.
+- Ask/answer history stays local (`.revkit/asks/`, gitignored); `revkit ask --keep` promotes one into
+  `docs/decisions/` as a committed record.

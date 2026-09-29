@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-29
+- Stories: A1–A3, C6
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 
 ## Context
@@ -16,4 +17,4 @@ Reviewers must be able to read, navigate and comment with keyboard and assistive
 
 ## Consequences
 
-Stories: C6, A1–A3.
+See Decision.

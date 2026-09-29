@@ -24,6 +24,6 @@ train-line nav is a sidebar override. Rust tooling is deferred until revkit owns
 
 ## Acceptance (2026-09-29)
 
-- Versions are **exact** in `package.json`/`bun.lock`; Renovate opens bump PRs that CI and the guards must pass. A bump
-  needs no ADR change unless it changes behaviour this ADR relies on.
+- Versions are **exact** in `package.json`/`bun.lock`; Renovate opens bump PRs that CI and the guards must pass. A
+  bump needs no ADR change unless it changes behaviour this ADR relies on.
 - Starting set: Astro 7.3, Starlight 0.42, Bun from the flake (1.3).

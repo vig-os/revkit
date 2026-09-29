@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-29
+- Stories: D1
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 
 ## Context
@@ -18,4 +19,4 @@ revkit ships a flake, a CLI, guards and a content schema that other repos depend
 
 ## Consequences
 
-Stories: D1.
+See Decision.

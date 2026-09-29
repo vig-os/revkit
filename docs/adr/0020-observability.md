@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-29
+- Stories: D2
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 
 ## Context
@@ -16,4 +17,4 @@ The hosted Worker and local daemon need diagnosable failures without leaking rev
 
 ## Consequences
 
-Stories: D2. Relates to ADR-0015.
+Relates to ADR-0015.

@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-09-29
+- Stories: B7
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 
 ## Context
@@ -15,4 +16,4 @@ Owner decided to plan code-diff review rather than exclude it.
 
 ## Consequences
 
-Stories: B7.
+See Decision.

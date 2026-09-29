@@ -7,7 +7,8 @@
 
 ## Context
 
-Any repo, and devkit consumers in particular, should adopt revkit in one line (D1) without every TS repo carrying Astro.
+Any repo, and devkit consumers in particular, should adopt revkit in one line (D1) without every TS repo carrying
+Astro.
 
 ## Decision
 

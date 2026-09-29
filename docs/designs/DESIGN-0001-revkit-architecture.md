@@ -5,8 +5,7 @@
 | Status | Accepted 2026-09-29 (ADR-0001 – ADR-0024; ADR-0023 deferred) |
 | Issue | [#3](https://github.com/vig-os/revkit/issues/3) |
 | Date | 2026-09-29 |
-| Decisions | [ADR-0001 – ADR-0011](../adr/README.md) · traceability: [FEATURE-MATRIX](../FEATURE-MATRIX.md) |
-| Agreed in discussion (ADRs pending acceptance) | Starlight shell · Solid islands · self-minted invite links (Authentik later, [#4](https://github.com/vig-os/revkit/issues/4)) |
+| Decisions | [ADR-0001 – ADR-0024](../adr/README.md) · traceability: [FEATURE-MATRIX](../FEATURE-MATRIX.md) |
 
 revkit is an HTML-first review surface for the agentic era. An agent authors structured documents (ADRs, designs,
 reports, questions) from an **opinionated, guarded component set**; a human reads them rendered, comments inline, and
@@ -348,6 +347,7 @@ Details:
   request.
 - **GitHub users:** GitHub App OAuth (user-to-server). The session is valid if the user has read access to the repo,
   checked via the API and cached.
+- **Security** of the hosted origin, fork previews and secrets: ADR-0012, ADR-0014.
 - **Invite links (v1).** `revkit invite --repo X --pr 12 --name "Jane Doe" --email … --expires 14d`:
   - mints a random token, stored **hashed** in D1 and scoped to the repo, optionally one PR, and an expiry;
   - is revocable (`revkit invite --revoke`);
@@ -453,6 +453,8 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
    source, GitHub `suggestion` blocks.
 7. **M7 — co-editing:** ([#12](https://github.com/vig-os/revkit/issues/12)) CodeMirror 6 source pane + Yjs, daemon-owned
    Y.Doc per file, agent writes ingested as ops.
+8. **M8 — code diffs:** ([#15](https://github.com/vig-os/revkit/issues/15)) source diffs with the comment rail and PR
+   line mapping (ADR-0024).
 
 ## 9. Decisions on the former open questions (2026-09-29)
 
