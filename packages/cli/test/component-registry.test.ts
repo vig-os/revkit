@@ -380,4 +380,26 @@ describe("component-registry — raw HTML in .md (allowlist)", () => {
     const result = checkComponentRegistryFile(source, "docs/x.md");
     expect(result.diagnostics.length).toBeGreaterThan(0);
   });
+
+  test("pathological `<!--<!--…<!--` runs in O(n) and does not classify as comments-only", () => {
+    // Regression guard: an earlier regex-based check
+    // (`^\s*(?:<!--[\s\S]*?-->\s*)+$`) exponentially backtracked on
+    // this shape (CodeQL js/redos). The linear scanner returns fast
+    // and refuses the input because there is no closing `-->`.
+    const source = "# hi\n\n" + "<!--".repeat(200) + "\n";
+    const start = performance.now();
+    const result = checkComponentRegistryFile(source, "docs/x.md");
+    const elapsed = performance.now() - start;
+    // A backtracking regex on this input takes seconds; the linear
+    // scanner takes microseconds. Cap generously.
+    expect(elapsed).toBeLessThan(1000);
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+  });
+
+  test("nested `<!--<!-- --> -->` — outer content after inner `-->` is not comments-only", () => {
+    // Defense against a smuggled tag hiding after a comment close.
+    const source = "# hi\n\n<!-- outer <!-- inner --> <script>alert(1)</script> -->\n";
+    const result = checkComponentRegistryFile(source, "docs/x.md");
+    expect(result.diagnostics.length).toBeGreaterThan(0);
+  });
 });

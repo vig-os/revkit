@@ -213,24 +213,69 @@ function attributeValueDiagnostic(
   return null;
 }
 
-/** Line-cased HTML entities a `.md` raw-HTML node may contain. Only
- * comments are legal; `<`, `>`, `"` inside prose are fine, but a
- * complete tag is not. */
-const HTML_COMMENT_ONLY = /^\s*(?:<!--[\s\S]*?-->\s*)+$/;
+/** Linear-scan check that `value` contains only ASCII whitespace and
+ * complete HTML comments (`<!-- … -->`). Written by hand instead of a
+ * regex because the regex form (`^\s*(?:<!--[\s\S]*?-->\s*)+$`) can
+ * backtrack exponentially on `<!--<!--…` inputs (CodeQL js/redos) and
+ * a linear scan proves that impossible. Uses `indexOf` for the closing
+ * `-->` which is O(n) with no backtracking. */
+function isCommentsOnlyHtml(value: string): boolean {
+  let index = 0;
+  const length = value.length;
+  while (index < length) {
+    while (index < length && isAsciiWhitespace(value.charCodeAt(index))) index += 1;
+    if (index >= length) return true;
+    if (value.charCodeAt(index) !== 0x3C /* < */) return false;
+    if (value.slice(index, index + 4) !== "<!--") return false;
+    const closeIndex = value.indexOf("-->", index + 4);
+    if (closeIndex === -1) return false;
+    index = closeIndex + 3;
+  }
+  return true;
+}
+
+/** Find the first non-whitespace, non-comment character run in `value`
+ * and return up to `maxLength` characters starting there. Used to build
+ * an error-message excerpt without a regex `.replace()` that could hide
+ * `<!--` inside its output (CodeQL js/incomplete-multi-character-
+ * sanitization). Linear scan, no backtracking. */
+function firstNonCommentExcerpt(value: string, maxLength: number): string {
+  let index = 0;
+  const length = value.length;
+  while (index < length) {
+    if (isAsciiWhitespace(value.charCodeAt(index))) {
+      index += 1;
+      continue;
+    }
+    if (value.slice(index, index + 4) === "<!--") {
+      const closeIndex = value.indexOf("-->", index + 4);
+      if (closeIndex === -1) return "";
+      index = closeIndex + 3;
+      continue;
+    }
+    return value.slice(index, index + maxLength);
+  }
+  return "";
+}
+
+/** WHATWG ASCII whitespace set (tab, LF, FF, CR, space). Matches the
+ * set the `.replace(/\s+/, "")` call would have used, without a regex
+ * engine. */
+function isAsciiWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0A || code === 0x0C || code === 0x0D;
+}
 
 /** Diagnostics for one `html` mdast node. Because the allowlist is a
- * whitelist ("only HTML comments"), the check is a single regex; if it
- * fails, the whole raw-HTML value is flagged with one diagnostic. */
+ * whitelist ("only HTML comments"), a linear scan is enough; if the
+ * scan refuses the value, the whole raw-HTML node is flagged with one
+ * diagnostic naming the first offending run. */
 function rawHtmlDiagnostic(
   value: string,
   line: number,
   file: string,
 ): Diagnostic | null {
-  if (HTML_COMMENT_ONLY.test(value)) return null;
-  // Take the first non-comment character run as the excerpt so the
-  // reader sees WHICH tag started the trouble.
-  const withoutComments = value.replace(/<!--[\s\S]*?-->/g, "").trim();
-  const excerpt = withoutComments.slice(0, 60);
+  if (isCommentsOnlyHtml(value)) return null;
+  const excerpt = firstNonCommentExcerpt(value, 60);
   return {
     file,
     line,
