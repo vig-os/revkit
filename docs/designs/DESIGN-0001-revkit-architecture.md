@@ -283,6 +283,31 @@ loaded on read-only pages.
 - Slash commands: `/suggest`, `/ask`, `/handover`, `/resolve`. Plus reactions.
 - **With A6:** it upgrades to CodeMirror's markdown mode, which also gives code-aware suggestion diffs.
 
+#### Mentions and references
+
+`@` is for **actors**: whoever can act on a comment. Everything you only point *at* gets its own sigil.
+
+| `@` target | Autocomplete source | Effect |
+|---|---|---|
+| GitHub users with repo access | Collaborators (assignable-users API, cached), PR participants ranked first | Notified in revkit; mirrored to the PR as a real `@login`, so GitHub notifies too |
+| Invited guests | revkit's invite table, scoped to the repo/PR | Notified by email if the invite has one, else a badge on the next visit. Mirrored as plain **Name (guest)**, never as `@handle`, so a guest name can't ping a same-named GitHub user |
+| Teams (`@org/team`) | The org's teams | Mirrored as a GitHub team mention |
+| Roles: `@author`, `@reviewers`, `@owners` | Per thread: the PR author, requested reviewers, the **CODEOWNERS of the commented file** | Expanded to people at send time |
+| Agents: `@agent`, `@agent:<name>`; hosted: `@claude` | Agent sessions connected to the daemon (each channel/Monitor connection registers a name) | Delivered **now**, even in handover mode. `@claude` stays intact on the PR, so a Claude GitHub Action on the repo picks it up |
+
+Other sigils:
+- `#123` for issues and PRs, and `#t-<id>` for another revkit thread.
+- `[[term]]` for vocabulary entries, checked by the vocabulary guard.
+- `[[path#section]]` for docs and sections, checked by the link guard.
+
+Rules:
+- **Mentions are stored typed**, as `{kind: gh-user|guest|team|role|agent, id}`, and rendered per surface, so a rename
+  never breaks an old comment.
+- **Guests' autocomplete** lists only participants of the doc or PR, never the org directory.
+- **Mentioning someone without access** offers an invite, and only to users with write access. Accepting mints a
+  per-person link scoped to the PR.
+- **`@agent` with no agent connected** is queued, and the page says so rather than implying delivery.
+
 ### 5.6 PR review round-trip (B1–B6)
 
 ```mermaid
