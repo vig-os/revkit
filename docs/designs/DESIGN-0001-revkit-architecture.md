@@ -29,6 +29,10 @@ It has two modes, which share one content model and one anchor model:
 | A2 | As a user, I **comment inline** on any block of a doc the agent wrote; comments persist across edits and rebuilds and reach the agent as structured input |
 | A3 | As a user, I can **chat with the agent in a thread** anchored on a block ("why this number?") |
 | A4 | As an agent, I **publish** a report (prose, math, plots, tables) and the page refreshes in < 1 s, without a full build |
+| A5 | As a user, my comments reach the agent **live** (mid-turn, or while I'm away from the terminal), and I choose the cadence: live, on **handover** of a batch, or quiet |
+| A6 | As a user, I **suggest an edit** on the rendered text; the agent (or I) accepts it and it lands in the source |
+| A7 | *(later)* As a user, I **co-edit** the source next to the rendered view while the agent edits too, without conflicts |
+| A8 | As a user, comments **never break on rebuild**: they re-anchor after edits, I can comment while a rebuild runs, and a comment whose text vanished is kept as *orphaned*, never lost |
 
 **B — PR review**
 
@@ -197,7 +201,89 @@ Threads reach the agent in two ways:
 - **Push:** a `UserPromptSubmit` hook that prepends "N new review comments" when there are unread threads, so the
   agent never has to be told to check.
 
-### 5.3 PR review round-trip (B1–B6)
+### 5.3 Live delivery, handover and presence (A5)
+
+"Next turn" isn't good enough. The daemon exposes **one event stream** (`/events`, WebSocket + SSE), and three
+transports put it into the agent session, best first. Checked against the Claude Code docs on 2026-09-29:
+
+| Transport | Mid-turn | While you're away (session open) | Setup |
+|---|---|---|---|
+| **Channel.** `revkit mcp` declares the `claude/channel` capability; events arrive as `<channel source="revkit">`, and the agent answers through the channel's `reply` tool, so the reply appears live in the thread | yes, between tool calls | yes | Research preview. `claude --channels plugin:revkit@<marketplace>` needs the plugin on an allowlist (the org's `allowedChannelPlugins`, i.e. a vig-os marketplace: vig-os/devkit#1765, #927); until then `--dangerously-load-development-channels server:revkit` |
+| **Monitor WebSocket.** The revkit skill arms `Monitor({ws: {url: "ws://127.0.0.1:<port>/events?for=agent"}})`, and every frame becomes a notification | yes | while the monitor is armed; it expires after at most 30 min and the skill re-arms it | None. Built in, no flags |
+| **UserPromptSubmit hook.** Prepends "N new comments" as `additionalContext` | no, next prompt only | no | Fallback |
+
+The alternatives were checked and rejected:
+- `asyncRewake` hooks wake Claude **once**, when the hook process exits with code 2, so they are a one-shot wake, not a
+  stream.
+- MCP `list_changed` / resource notifications don't surface to the model.
+
+**Delivery modes.** This is a per-session setting in the page header, also `revkit mode <m>`:
+
+- **`handover` (default).** Comments accumulate as drafts, like a GitHub pending review. **Hand over** (Ctrl+Enter)
+  sends *one* event with all drafts plus the revision they were made on, so the agent is interrupted once with
+  coherent input: "here's my state of mind, go".
+- **`live`.** Each comment is pushed as it's posted. This is pairing mode ("fix this now").
+- **`quiet`.** Nothing is pushed; the agent pulls with `threads()`.
+- A per-comment override, `@agent now`, pushes one comment immediately in any mode.
+
+**Presence.** The agent's `publish`/edit calls emit presence events. The page shows "agent is editing
+`adr/0003` L40–60", marks those blocks, and holds a comment made on them until the edit lands, then re-anchors it
+(below).
+
+### 5.4 Comments that survive rebuilds (A8)
+
+- **The UI lives outside the content.** The comment rail is an island mounted beside the rendered region, and thread
+  state is owned by the daemon (`bun:sqlite` locally, D1 hosted). A rebuild or hot reload replaces content only; the
+  rail re-attaches by anchor, and composing never blocks.
+- **Every comment records the revision it was made against**: a content hash of the source file, with snapshots kept
+  per revision. A comment made on a stale render is carried forward like any other.
+- **Re-anchoring pipeline**, run on each source change:
+  1. Map the line range through the text diff from the comment's revision to the current file.
+  2. Verify the quote at the mapped position.
+  3. If that fails, fuzzy-search the quote in the file (diff-match-patch style, context-weighted).
+  4. If that fails too, mark it **orphaned**: kept, shown in a side panel with its original snippet, and still
+     answerable. Nothing is ever dropped.
+- This is the same model GitHub uses for "outdated" review comments, which is why hosted mode can map both ways.
+
+### 5.5 Suggested edits, co-editing and the editor (A6, A7)
+
+**Typical basis for live co-editing.** A **CRDT** — Yjs is the common choice, Automerge the alternative — synced
+over WebSocket, with **IndexedDB** as the browser's offline store (`y-indexeddb`). IndexedDB is storage, not a sync
+model.
+
+revkit v1 needs no CRDT:
+
+- Humans don't edit prose in v1.
+- Comments are an append-only, server-ordered event log, so there is nothing to merge.
+- IndexedDB is used only for unsent drafts and offline.
+
+The path from there:
+
+1. **Suggested edits** (A6, Google Docs' "suggesting" mode):
+   - select text, type a replacement, and it is stored as a comment carrying a patch;
+   - accept applies it to the source file;
+   - in PR mode it becomes a GitHub ` ```suggestion ` block, so it's one click to commit on GitHub too.
+   This covers most "just fix this word" needs with zero merge machinery.
+2. **Co-editing** (A7, later):
+   - a **CodeMirror 6** source pane next to the rendered view, scroll-synced via the `data-src` anchors and bound to
+     a Yjs doc (`y-codemirror.next`);
+   - the daemon owns one Y.Doc per file and writes it to disk;
+   - the agent's on-disk writes are ingested as diffs, turned into Y.Text operations, so human and agent edit
+     concurrently without clobbering each other.
+
+**CodeMirror**, yes, for the source pane and later the comment composer. It is always a **lazy** island, never
+loaded on read-only pages.
+
+**Rich comment field**, yes, but staged:
+
+- **v1:** a textarea with markdown shortcuts and live preview, in the GitHub-compatible subset so PR mirroring is
+  lossless. `@mentions` cover people and `@agent`.
+- Auto-attached context: the quoted selection; or a **region pin** on a plot/diagram (data coordinates); or a block
+  snapshot.
+- Slash commands: `/suggest`, `/ask`, `/handover`, `/resolve`. Plus reactions.
+- **With A6:** it upgrades to CodeMirror's markdown mode, which also gives code-aware suggestion diffs.
+
+### 5.6 PR review round-trip (B1–B6)
 
 ```mermaid
 sequenceDiagram
@@ -274,11 +360,14 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 
 1. **M1 — skeleton + guards:** Astro/Starlight/Solid/Tailwind scaffold, the content model, `revkit check` (the four
    guards) as flake hooks, KaTeX, Vega-Lite SSR plots, the train-line sidebar.
-2. **M2 — local loop:** `revkit serve` daemon, anchors, comment rail, threads, MCP (`ask`/`await_answer`/`threads`/
-   `reply`/`resolve`), the Claude Code skill, the UserPromptSubmit hook.
+2. **M2 — local loop:** `revkit serve` daemon + `/events` stream, anchors + re-anchoring (§5.4), comment rail,
+   threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a **channel** with a Monitor-WebSocket fallback,
+   delivery modes + handover, presence, the Claude Code skill.
 3. **M3 — PR review:** CI preview deploy + PR comment, GitHub App, two-way threads, submit review.
 4. **M4 — guests:** invite links; then Authentik (#4).
 5. **M5 — distribution:** flake outputs, template, devkit module proposal.
+6. **M6 — suggested edits:** patch-carrying comments, accept → source, GitHub `suggestion` blocks.
+7. **M7 — co-editing:** CodeMirror 6 source pane + Yjs, daemon-owned Y.Doc per file, agent writes ingested as ops.
 
 ## 9. Open questions
 
