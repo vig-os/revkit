@@ -5,7 +5,12 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
-import { assertSiblingFiles, collectDataUrls } from "./plots.ts";
+import {
+  assertSiblingFiles,
+  collectDataUrls,
+  plotIdFromEntry,
+  resolveSpecAbsolutePath,
+} from "./plots.ts";
 
 const PLOT_FIXTURE_DIR = fileURLToPath(new URL("../../../tests/fixtures/plots/", import.meta.url));
 const specAbsolute = `${PLOT_FIXTURE_DIR}example/spec.vl.json`;
@@ -72,5 +77,60 @@ describe("plots loader — collectDataUrls (shared with the schema walker)", () 
   test("ignores data blocks without a url (e.g. { name })", () => {
     const urls = collectDataUrls({ data: { name: "referenced-dataset" } });
     expect(urls).toEqual([]);
+  });
+});
+
+describe("plots loader — plotIdFromEntry", () => {
+  test("uses the containing directory as the plot id", () => {
+    const id = plotIdFromEntry({
+      entry: "bundle-sizes/spec.vl.json",
+      base: new URL("file:///tmp/"),
+      data: {},
+    });
+    expect(id).toBe("bundle-sizes");
+  });
+
+  test("handles nested plot folders", () => {
+    const id = plotIdFromEntry({
+      entry: "category/nested-name/spec.vl.json",
+      base: new URL("file:///tmp/"),
+      data: {},
+    });
+    expect(id).toBe("category/nested-name");
+  });
+
+  test("handles Windows-style backslash separators", () => {
+    const id = plotIdFromEntry({
+      entry: "bundle-sizes\\spec.vl.json",
+      base: new URL("file:///tmp/"),
+      data: {},
+    });
+    expect(id).toBe("bundle-sizes");
+  });
+
+  test("falls back to the file basename when the spec sits at the base directory", () => {
+    // Not a supported layout (revkit expects `<name>/spec.vl.json`), but
+    // the fallback keeps the id stable rather than emitting `.` — which
+    // would collide with any other same-shape entry.
+    const id = plotIdFromEntry({
+      entry: "spec.vl.json",
+      base: new URL("file:///tmp/"),
+      data: {},
+    });
+    expect(id).toBe("spec");
+  });
+});
+
+describe("plots loader — resolveSpecAbsolutePath", () => {
+  test("resolves a relative filePath against the project root", () => {
+    expect(resolveSpecAbsolutePath("../plots/x/spec.vl.json", "/home/u/repo/site")).toBe(
+      "/home/u/repo/plots/x/spec.vl.json",
+    );
+  });
+
+  test("returns an absolute filePath unchanged", () => {
+    expect(resolveSpecAbsolutePath("/abs/plots/x/spec.vl.json", "/home/u/repo/site")).toBe(
+      "/abs/plots/x/spec.vl.json",
+    );
   });
 });

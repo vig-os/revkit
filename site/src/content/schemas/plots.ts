@@ -11,6 +11,15 @@
 // filename — no scheme, no leading `/`, no `..`. Vega-Lite grammar keys
 // such as `format`, `name` and `sequence` pass through: the check is
 // data-source shape, not full Vega-Lite validation.
+//
+// Two Vega-Lite features are also refused because they would let a spec
+// emit a link or fetch an external resource from the rendered SVG: the
+// `href` encoding channel (renders `<a xlink:href="…">` around the mark)
+// and the `image` mark type (renders `<image xlink:href="…">`, fetching
+// the URL at read time). Rejected at any depth. Plots are static
+// figures in revkit — an author who needs an interactive link belongs in
+// the interactive-island escape hatch (ADR-0004), not in a build-time
+// SVG that ships without JS.
 import { z } from "astro/zod";
 import { isObject, walkObjects } from "../utils/vega-lite-walk.ts";
 import { schemaVersionField } from "./shared.ts";
@@ -34,7 +43,8 @@ interface InlineDataIssue {
 }
 
 /** Walk the whole spec and report every escape hatch that would let inline
- * data slip past the plot guard. Shared with the plots loader via
+ * data — or a link / image mark that would emit an outbound reference —
+ * slip past the plot guard. Shared with the plots loader via
  * `walkObjects` so a schema-side rule can never drift from a loader-side
  * check that consults the same tree. */
 function findInlineDataIssues(spec: unknown): InlineDataIssue[] {
@@ -63,6 +73,33 @@ function findInlineDataIssues(spec: unknown): InlineDataIssue[] {
           });
         }
       }
+    }
+    // The `href` encoding channel renders each mark inside an
+    // `<a xlink:href="…">` — a link out from a supposedly static figure.
+    // Rejected wherever an `encoding` block appears (top-level, inside a
+    // layer, concat, facet, spec, repeat, …). The channel accepts a
+    // field/expression/datum, so refusing the key outright is the
+    // simplest safe rule.
+    if (isObject(node.encoding) && "href" in node.encoding) {
+      issues.push({
+        path: [...path, "encoding", "href"],
+        message: `${FILE_ROLE}: the 'href' encoding channel is forbidden — plots are static figures and must not emit outbound links (ADR-0004, C4).`,
+      });
+    }
+    // An `image` mark renders `<image xlink:href="…">`, which fetches the
+    // URL at read time in the browser. Two shapes match: `mark: "image"`
+    // and `mark: { type: "image", url: "…" }` — reject both.
+    if (node.mark === "image") {
+      issues.push({
+        path: [...path, "mark"],
+        message: `${FILE_ROLE}: the 'image' mark is forbidden — it would fetch a remote resource from the rendered SVG (ADR-0004, C4).`,
+      });
+    }
+    if (isObject(node.mark) && node.mark.type === "image") {
+      issues.push({
+        path: [...path, "mark", "type"],
+        message: `${FILE_ROLE}: the 'image' mark is forbidden — it would fetch a remote resource from the rendered SVG (ADR-0004, C4).`,
+      });
     }
   });
   return issues;

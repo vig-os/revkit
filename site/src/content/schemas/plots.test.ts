@@ -149,6 +149,67 @@ describe("plotSpecSchema — rejections", () => {
   });
 });
 
+describe("plotSpecSchema — link and image mark rejections", () => {
+  test("rejects the top-level `href` encoding channel", () => {
+    const withHref = {
+      ...validSpec,
+      encoding: { ...validSpec.encoding, href: { field: "u", type: "nominal" } },
+    };
+    const result = plotSpecSchema.safeParse(withHref);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    const paths = result.error.issues.map((issue) => issue.path.join("/"));
+    expect(paths.some((path) => path === "encoding/href")).toBe(true);
+  });
+
+  test("rejects an `href` encoding channel nested inside a layer[]", () => {
+    const layered = {
+      ...validSpec,
+      layer: [
+        {
+          mark: "point",
+          encoding: { href: { field: "u", type: "nominal" } },
+        },
+      ],
+    };
+    const result = plotSpecSchema.safeParse(layered);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    const paths = result.error.issues.map((issue) => issue.path.join("/"));
+    expect(paths.some((path) => path.endsWith("encoding/href"))).toBe(true);
+  });
+
+  test("rejects `mark: \"image\"` as a string shorthand", () => {
+    const image = { ...validSpec, mark: "image" };
+    const result = plotSpecSchema.safeParse(image);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(JSON.stringify(result.error.issues)).toContain("'image' mark is forbidden");
+  });
+
+  test("rejects `mark: { type: \"image\", url: … }` as an object", () => {
+    const image = {
+      ...validSpec,
+      mark: { type: "image", url: "https://example.com/x.png" },
+    };
+    const result = plotSpecSchema.safeParse(image);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(JSON.stringify(result.error.issues)).toContain("'image' mark is forbidden");
+  });
+
+  test("rejects an image mark nested inside a concat block", () => {
+    const nested = {
+      ...validSpec,
+      hconcat: [{ mark: "image" }, { mark: "point" }],
+    };
+    const result = plotSpecSchema.safeParse(nested);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(JSON.stringify(result.error.issues)).toContain("'image' mark is forbidden");
+  });
+});
+
 describe("isSiblingFilename", () => {
   test("accepts bare filenames and subdirectory-relative paths", () => {
     expect(isSiblingFilename("data.csv")).toBe(true);

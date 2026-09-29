@@ -1,0 +1,36 @@
+---
+title: Math and plots
+description: KaTeX-rendered equations and a build-time Vega-Lite plot, dogfooded from the plots collection.
+---
+
+import Plot from "../../components/Plot.astro";
+
+revkit renders **math at build time** with KaTeX (ADR-0001, C5) and **plots at build time** as static SVG from a
+Vega-Lite spec plus a sibling data file (ADR-0004, C4). Neither ships client JavaScript.
+
+## Math
+
+Inline math uses single dollar signs: the golden ratio $\varphi = \tfrac{1 + \sqrt{5}}{2}$ appears in-line with the
+surrounding text. Display math uses double dollar signs and gets a centred block:
+
+$$
+E = \sum_{n=1}^{N} p_n \log_2 \frac{1}{p_n}
+$$
+
+The rendered output is HTML plus KaTeX CSS — no browser-side script parses or renders the equation, so the page's
+Content Security Policy (ADR-0012) keeps `default-src 'none'` unchanged. Fonts come from `/_katex/fonts/`, self-hosted
+per `font-src 'self'`.
+
+## Plots
+
+Below is `plots/bundle-sizes/spec.vl.json` — the measured JavaScript bundle sizes cited in
+[DESIGN-0001 §2](/designs/design-0001-revkit-architecture/#2-stack-and-which-stories-each-part-covers) that motivate
+picking Solid for islands (4 KB gz) and Vega-Lite for plots (0 KB shipped once rendered to SVG):
+
+<Plot name="bundle-sizes" label="JavaScript library bundle sizes, gzipped" />
+
+The plot is one `<Plot name="…" />` invocation. Its spec (JSON) and data (CSV) live in `plots/bundle-sizes/`; the
+build compiles the Vega-Lite spec to Vega, renders a `View` to SVG with `renderer: 'none'`, and inlines the result
+here. A file loader restricted to the plot's directory is the only door data can enter through — the schema check
+(no inline `values`, no `datasets`, `data.url` must be a bare sibling filename) plus the loader's
+`assertSiblingFiles` pass together make an agent-authored spec inert.
