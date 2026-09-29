@@ -1,0 +1,14 @@
+{
+  "name": "revkit",
+  "private": true,
+  "type": "module",
+  "description": "HTML-first review surface for the agentic era (Bun workspace root).",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "site",
+    "packages/*"
+  ],
+  "engines": {
+    "bun": ">=1.3.0"
+  }
+}

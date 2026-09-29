@@ -5,6 +5,16 @@
 # regenerated .gitignore and survive. Put durable repo-root ignores below (not
 # in the managed .gitignore, where hand edits are lost).
 #
-# Examples (uncomment / add your own):
-#   /scratch/
-#   /secrets.local.yaml
+# `node_modules/` and `*.tsbuildinfo` come from the managed node.gitignore
+# fragment (appended by init-workspace when DEVKIT_LANGUAGES lists `node`),
+# so they are deliberately NOT repeated here.
+
+# Astro build artefacts
+site/dist/
+site/.astro/
+
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/

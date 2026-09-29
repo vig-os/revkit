@@ -24,21 +24,28 @@ info:
 # CODE QUALITY
 # -------------------------------------------------------------------------------
 
-# The uv-backed recipes below are guarded on pyproject.toml so they stay safe in
-# a non-Python repo — but they REPORT the skip instead of no-oping in silence: a
-# repo that lost its pyproject.toml used to run nothing, print nothing and exit 0
-# (#1478). Whether the skip is legitimate is asserted once in CI, against the
-# languages this repo declares in .vig-os (DEVKIT_LANGUAGES).
+# revkit is a Bun workspace (ADR-0001); the recipes below wrap `bun` / `astro`
+# / `playwright` from the flake dev shell. They are guarded on package.json so
+# they REPORT the skip instead of no-oping in silence — matching devkit's own
+# language-neutral guard style — but do not assume Python tooling is present.
 
-# Run all linters
+# Run TypeScript / Astro type checks across the workspace.
 [group('quality')]
 lint:
-    @if [ -f pyproject.toml ]; then uv run ruff check .; else echo "just lint: no pyproject.toml — skipping"; fi
+    @if [ -f package.json ]; then \
+      cd site && bun run check && cd .. && \
+      cd packages/cli && bun run typecheck && cd ../.. && \
+      cd packages/components && bun run typecheck; \
+    else \
+      echo "just lint: no package.json — skipping"; \
+    fi
 
-# Format code
+# Format source (Biome is not wired in M1 — the guardrails hooks enforce the
+# rules that matter here; add Biome in the next PR if a veto reviewer wants
+# it, so this scaffold PR stays lean). Kept as a no-op with a clear message.
 [group('quality')]
 format:
-    @if [ -f pyproject.toml ]; then uv run ruff format .; else echo "just format: no pyproject.toml — skipping"; fi
+    @echo "just format: no formatter wired yet (see PR #6 body for the choice-for-veto)"
 
 # Run pre-commit hooks on all files
 [group('quality')]
@@ -49,73 +56,92 @@ precommit:
 # TESTING
 # -------------------------------------------------------------------------------
 
-# Run tests with pytest. Exit 5 ("no tests collected") is a no-op ONLY while the
-# repo has no tests/ directory — a fresh scaffold. Once a test directory exists,
-# zero collected is a signal, not a no-op, so it propagates (#1281 narrowed by
-# #1478).
+# Run unit tests (bun test) in each package that has them, then the site's
+# Playwright smoke. Bun test runs per-package rather than at the workspace
+# root because it would otherwise walk `site/tests/*.spec.ts` — which are
+# Playwright specs and refuse to load in bun test. Playwright's own suite
+# builds the site once and runs Chromium; WebKit is opt-in via
+# REVKIT_ENABLE_WEBKIT=1 (see site/playwright.config.ts) pending #19.
 [group('test')]
 test *args:
-    @if [ ! -f pyproject.toml ]; then echo "just test: no pyproject.toml — skipping"; elif uv run pytest {{ args }}; then :; else rc=$?; if [ "$rc" -eq 5 ] && [ ! -d tests ]; then echo "just test: no tests collected and no tests/ directory — skipping"; else exit "$rc"; fi; fi
+    @if [ ! -f package.json ]; then \
+      echo "just test: no package.json — skipping"; \
+    else \
+      cd packages/cli && bun test {{ args }} && cd ../.. && \
+      just e2e; \
+    fi
 
-# Run tests with coverage (same exit-5 rule as `test` above)
+# Run bun unit tests with coverage. Reports to the terminal by default;
+# `just test-cov --coverage-reporter=lcov` writes an lcov file. Only the CLI
+# ships unit tests today (the Callout component is exercised by the
+# Playwright smoke against the built site — see
+# packages/components/src/Callout.tsx); the recipe walks every package that
+# grows unit tests over time, so new ones join without a recipe edit.
 [group('test')]
 test-cov *args:
-    @if [ ! -f pyproject.toml ]; then echo "just test-cov: no pyproject.toml — skipping"; elif uv run pytest --cov --cov-report=term-missing {{ args }}; then :; else rc=$?; if [ "$rc" -eq 5 ] && [ ! -d tests ]; then echo "just test-cov: no tests collected and no tests/ directory — skipping"; else exit "$rc"; fi; fi
+    @if [ ! -f package.json ]; then \
+      echo "just test-cov: no package.json — skipping"; \
+    else \
+      cd packages/cli && bun test --coverage {{ args }}; \
+    fi
+
+# Run the Playwright browser suite by itself (skips the bun unit tests).
+[group('test')]
+e2e *args:
+    @if [ ! -f site/package.json ]; then \
+      echo "just e2e: no site/package.json — skipping"; \
+    else \
+      cd site && bun run test:e2e -- {{ args }}; \
+    fi
 
 # -------------------------------------------------------------------------------
 # DEPENDENCIES
 # -------------------------------------------------------------------------------
 
-# Sync dependencies (all groups; extras are opt-in, e.g. `just sync --all-extras`)
+# Sync workspace dependencies. `--frozen-lockfile` matches CI: if bun.lock
+# would change, this fails loudly so a missing pin is caught locally.
 [group('deps')]
-sync *args="--all-groups":
-    @if [ -f pyproject.toml ]; then uv sync {{ args }}; else echo "just sync: no pyproject.toml — skipping"; fi
+sync *args="--frozen-lockfile":
+    @if [ -f package.json ]; then \
+      bun install {{ args }}; \
+    else \
+      echo "just sync: no package.json — skipping"; \
+    fi
 
-# Update all dependencies
+# Manual dependency bump. Renovate owns routine bumps (ADR-0001): it opens
+# PRs that update the exact pins in package.json + bun.lock, so this recipe
+# is an escape hatch, not the normal path. Prints the reminder and runs
+# `bun update --latest` — with exact pins, plain `bun update` is a no-op.
 [group('deps')]
-update:
-    uv lock --upgrade
-    @just sync
+update *args="--latest":
+    @echo "Note: Renovate owns routine dependency bumps (ADR-0001); use this only for a manual escape."
+    bun update {{ args }}
+    @just sync --no-frozen-lockfile
 
 # -------------------------------------------------------------------------------
-# BUILD
+# BUILD / DEV
 # -------------------------------------------------------------------------------
 
-# Clean build artifacts
+# Astro dev server for the review site (hot-reload). See ADR-0001.
+[group('build')]
+dev *args:
+    cd site && bun run dev -- {{ args }}
+
+# Build the review site to static output (site/dist).
+[group('build')]
+build:
+    cd site && bun run build
+
+# Clean workspace build artefacts (Astro output, Playwright reports, TS
+# incremental info). Leaves node_modules/ and bun.lock alone.
 [group('build')]
 clean-artifacts:
-    rm -rf .pytest_cache .ruff_cache .coverage htmlcov dist build *.egg-info
-    find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    rm -rf site/dist site/.astro site/test-results site/playwright-report site/blob-report
+    find . -name '*.tsbuildinfo' -type f -delete 2>/dev/null || true
 
 # ===============================================================================
 # PROJECT-SPECIFIC RECIPES
 # ===============================================================================
-# Uncomment and customize for your project:
-# # Run the application
-# [group('app')]
-# run *args:
-#     uv run python -m {{project}} {{args}}
-#
-# # Boot the local dev services declared in flake.nix (mkProjectServices,
-# # #795): daemonless process-compose stack, state in ./data (gitignore it).
-# [group('services')]
-# services *args:
-#     nix run .#services -- {{args}}
-#
-# # Prepare release branch (manual workflow dispatch helper)
-# [group('release')]
-# prepare-release version:
-#     gh workflow run prepare-release.yml --ref dev -f "version={{ version }}"
-#
-# # Finalize and publish release (manual workflow dispatch helper)
-# [group('release')]
-# finalize-release version:
-#     gh workflow run release.yml --ref release/{{ version }} -f "version={{ version }}" -f "release-kind=final" -f "dry-run=false"
-#
-# # Publish candidate release (manual workflow dispatch helper)
-# [group('release')]
-# publish-candidate version:
-#     gh workflow run release.yml --ref release/{{ version }} -f "version={{ version }}" -f "release-kind=candidate" -f "dry-run=false"
 
 # -------------------------------------------------------------------------------
 # AGENT
