@@ -1,0 +1,65 @@
+# revkit vocabulary — the one place a term is defined (DESIGN-0001 §3, C2).
+#
+# `<Term id>` references in prose resolve here; a bold-defined phrase whose
+# text matches a listed `term` or one of its `aliases` trips the vocabulary
+# guard (revkit check, ADR-0005) as a redefinition.
+#
+# schemaVersion:
+#   1: id, term, definition (required); aliases (optional, defaults to []).
+#      A future change adds a MAJOR version (ADR-0003 Acceptance, ADR-0021).
+schemaVersion: 1
+entries:
+  - id: anchor
+    term: anchor
+    definition: >-
+      A dual reference (MDX source range plus a text-quote selector) that pins
+      a comment to a doc block so it survives edits and rebuilds (ADR-0006).
+    aliases:
+      - dual anchor
+
+  - id: orphaned
+    term: orphaned
+    definition: >-
+      A comment whose text-quote could not be re-found after edits; it is
+      kept, shown in a side panel with its original snippet, and still
+      answerable (DESIGN-0001 §5.4).
+    aliases:
+      - orphan
+      - outdated comment
+
+  - id: handover
+    term: handover
+    definition: >-
+      The delivery mode that batches a reviewer's drafts and sends them as
+      one event when the reviewer submits (DESIGN-0001 §5.3).
+    aliases: []
+
+  - id: share-type
+    term: share type
+    definition: >-
+      A rendered block a comment can attach to (paragraph, plot, question,
+      code sample); every block carries `data-src="<file>#L<start>-L<end>"`
+      for the comment rail (DESIGN-0001 §5.2).
+    aliases:
+      - shareable
+      - anchorable block
+
+  - id: doc-set
+    term: doc set
+    definition: >-
+      An ordered sequence of pages under `docs/sets/<name>/` rendered with
+      the train-line navigation; prev/next are derived, orphans fail the
+      links + sets guard (DESIGN-0001 §3, C3).
+    aliases:
+      - set
+      - train-line set
+
+  - id: registry
+    term: component registry
+    definition: >-
+      The `@revkit/components` package: the only component set MDX pages may
+      import from (ADR-0002). Additions go through `revkit escalate` and a
+      `component-request` issue, never a hand-rolled export (ADR-0005).
+    aliases:
+      - component set
+      - registered components

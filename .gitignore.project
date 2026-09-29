@@ -18,3 +18,8 @@ test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
+
+# Local revkit daemon state: runtime asks the agent writes and comment
+# threads the daemon owns (ADR-0007 acceptance, ADR-0013). Both are
+# always local; hosted mode uses D1 and Durable Objects instead.
+.revkit/

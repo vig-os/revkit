@@ -7,3 +7,19 @@
  */
 @import "tailwindcss";
 @import "@astrojs/starlight-tailwind";
+
+/* WCAG 2.2 SC 1.4.1 (Use of color, ADR-0017): Starlight's default markdown
+ * theme distinguishes body links from surrounding text with color only, which
+ * axe-core flags as a serious violation. Add a persistent underline that
+ * disappears on hover so links stay identifiable without relying on color
+ * perception. Scoped to markdown body content (Starlight leaves nav, sidebar
+ * and hero actions to their own component styles). */
+@layer starlight.content {
+	.sl-markdown-content a:not(:where(.not-content *)) {
+		text-decoration: underline;
+		text-underline-offset: 0.15em;
+	}
+	.sl-markdown-content a:hover:not(:where(.not-content *)) {
+		text-decoration: none;
+	}
+}
