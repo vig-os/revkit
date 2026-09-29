@@ -340,7 +340,7 @@ Details:
 
 ## 6. Hosting and auth
 
-- **One Cloudflare project per org.** Previews at `pr-<n>.<repo>.<org-domain>`, with the Worker in front of every
+- **One Cloudflare Worker per org** (§6.1). Previews at `pr-<n>--<repo>.<domain>`, with the Worker in front of every
   request.
 - **GitHub users:** GitHub App OAuth (user-to-server). The session is valid if the user has read access to the repo,
   checked via the API and cached.
