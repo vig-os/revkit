@@ -287,17 +287,35 @@ export function repoDocsLoader(baseFromProjectRoot = "../docs"): Loader {
       const { watcher } = context;
       if (!watcher) return;
 
-      // Astro's watcher only tells us a file changed — no "which entry did
-      // it belong to?" context. Match the changed path back to a source id
-      // and re-run the loader for just that one, and if a watched file is
-      // removed drop its entry so `astro dev` reflects the deletion.
-      const watchedPaths = new Set(sources.map((source) => source.filePath));
-      for (const path of watchedPaths) watcher.add(path);
+      // Watch the containing directories (chokidar recurses by default) so a
+      // brand-new ADR added during `astro dev` is picked up without a
+      // restart. sourceForPath maps a chokidar event back to the id the
+      // repo-docs loader would assign it — anything outside the docs/adr
+      // and docs/designs .md set is ignored so the callback stays cheap.
+      const adrDir = join(docsRoot, ADR_DIR);
+      const designsDir = join(docsRoot, DESIGNS_DIR);
+      const matrixFile = join(docsRoot, MATRIX_FILE);
+      watcher.add(adrDir);
+      watcher.add(designsDir);
+      watcher.add(matrixFile);
 
-      const rerun = async (path: string, kind: "change" | "delete"): Promise<void> => {
-        const absolute = resolve(path);
-        if (!watchedPaths.has(absolute)) return;
-        const source = sources.find((candidate) => candidate.filePath === absolute);
+      const sourceForPath = (rawPath: string): Source | null => {
+        const absolute = resolve(rawPath);
+        if (absolute === matrixFile) return { filePath: absolute, id: MATRIX_ID };
+        if (!absolute.endsWith(".md")) return null;
+        for (const [dir, prefix] of [
+          [adrDir, ADR_DIR],
+          [designsDir, DESIGNS_DIR],
+        ] as const) {
+          if (absolute === join(dir, basename(absolute)) && dirname(absolute) === dir) {
+            return { filePath: absolute, id: `${prefix}/${basename(absolute, ".md").toLowerCase()}` };
+          }
+        }
+        return null;
+      };
+
+      const rerun = async (rawPath: string, kind: "change" | "delete"): Promise<void> => {
+        const source = sourceForPath(rawPath);
         if (!source) return;
         if (kind === "delete") {
           context.store.delete(source.id);
@@ -314,6 +332,12 @@ export function repoDocsLoader(baseFromProjectRoot = "../docs"): Loader {
         }
       };
 
+      // chokidar emits `add` on the initial scan too; that just re-loads
+      // the entries we already loaded above, which is idempotent — the
+      // store's digest check dedupes real writes. `unlink` handles deletes.
+      watcher.on("add", (path) => {
+        void rerun(path, "change");
+      });
       watcher.on("change", (path) => {
         void rerun(path, "change");
       });

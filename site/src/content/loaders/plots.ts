@@ -8,38 +8,23 @@ import { glob } from "astro/loaders";
 import { access } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isObject, walkObjects } from "../utils/vega-lite-walk.ts";
 
 interface PlotEntry {
   filePath?: string;
   data: Record<string, unknown>;
 }
 
-/** Walk the loaded spec and collect every `data.url` value; needed because
- * a Vega-Lite spec can carry a data block at any depth. */
-function collectDataUrls(spec: unknown): string[] {
+/** Every `data.url` in the spec, at any depth. Shares the tree walk with
+ * the schema-side inline-data check so the loader can never validate a
+ * different set of nodes than the schema rejects. */
+export function collectDataUrls(spec: unknown): string[] {
   const urls: string[] = [];
-  const stack: unknown[] = [spec];
-  while (stack.length > 0) {
-    const node = stack.pop();
-    if (node === null || typeof node !== "object") continue;
-    if (Array.isArray(node)) {
-      for (const item of node) stack.push(item);
-      continue;
+  walkObjects(spec, (node) => {
+    if (isObject(node.data) && typeof node.data.url === "string") {
+      urls.push(node.data.url);
     }
-    const record = node as Record<string, unknown>;
-    for (const [key, value] of Object.entries(record)) {
-      if (
-        key === "data" &&
-        value !== null &&
-        typeof value === "object" &&
-        !Array.isArray(value)
-      ) {
-        const dataObject = value as Record<string, unknown>;
-        if (typeof dataObject.url === "string") urls.push(dataObject.url);
-      }
-      stack.push(value);
-    }
-  }
+  });
   return urls;
 }
 
@@ -52,7 +37,10 @@ async function fileExists(absolutePath: string): Promise<boolean> {
   }
 }
 
-async function assertSiblingFiles(entry: PlotEntry, projectRoot: string): Promise<void> {
+/** Validate that every `data.url` in a plot entry resolves to a file next
+ * to the spec on disk. Exported so unit tests can exercise it against
+ * fixtures without standing up a full Astro loader context. */
+export async function assertSiblingFiles(entry: PlotEntry, projectRoot: string): Promise<void> {
   if (!entry.filePath) return; // glob loader always populates it; guard for safety
   const specAbsolute = isAbsolute(entry.filePath)
     ? entry.filePath

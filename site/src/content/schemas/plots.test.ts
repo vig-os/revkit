@@ -91,6 +91,32 @@ describe("plotSpecSchema — rejections", () => {
     expect(result.success).toBe(false);
   });
 
+  test("rejects Vega-Lite's `datasets` escape hatch, even when data.url is a sibling", () => {
+    // A top-level `datasets` field maps names to inline data arrays, then
+    // a `data` block with `name` references one of them. A schema that
+    // only guards `data.values` would let this pass — the review flagged
+    // it as the last hole in the plot guard.
+    const spec = {
+      ...validSpec,
+      datasets: { table: [{ a: "x", b: 1 }] },
+      data: { name: "table" },
+    };
+    const result = plotSpecSchema.safeParse(spec);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    const message = JSON.stringify(result.error.issues);
+    expect(message).toContain("datasets");
+  });
+
+  test("rejects a `datasets` block nested inside a spec sub-tree, too", () => {
+    const spec = {
+      ...validSpec,
+      concat: [{ datasets: { t: [{ a: 1 }] }, data: { name: "t" } }],
+    };
+    const result = plotSpecSchema.safeParse(spec);
+    expect(result.success).toBe(false);
+  });
+
   test("rejects a remote https url on data.url", () => {
     const remote = { ...validSpec, data: { url: "https://example.com/data.csv" } };
     const result = plotSpecSchema.safeParse(remote);
