@@ -13,11 +13,17 @@
 // "a.b"`) is accepted if either the dotted path or its first segment
 // exists — Vega-Lite treats `a.b` as a property path when `a` is an
 // object column.
+//
+// The data file is read through {@link readConfinedSibling} so this
+// check applies the SAME containment rules as the runtime Vega loader.
+// A regression that let a symlinked file through the field-check would
+// otherwise leak the target's first line into the CI error message
+// (`"Columns in the file: [root:x:0:0…]"`); sharing the helper closes
+// that hole once, not twice.
 
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { isObject, walkObjects } from "../content/utils/vega-lite-walk.ts";
+import { readConfinedSibling } from "./plot-file-io.ts";
 
 /** Collect every string `field` reference that must resolve to a data
  * column. Skips the aggregate wildcard (`"*"`) and non-string values
@@ -92,25 +98,32 @@ function readJsonColumns(text: string): string[] {
 /** Read the columns of a plot's top-level data file. Handles CSV, TSV,
  * JSON (arrays / records) and YAML (arrays / records); other formats
  * return `null`, which tells the caller to skip the column check rather
- * than fail on an unknown shape. */
+ * than fail on an unknown shape.
+ *
+ * Uses {@link readConfinedSibling} so a symlink to `/etc/passwd`
+ * (`plots/x/link.csv -> /etc/passwd`) is refused BEFORE its contents
+ * reach us — the raised error carries no bytes from the target file. */
 export async function readDataColumns(
   specDir: string,
   url: string,
   format?: { type?: string },
 ): Promise<string[] | null> {
-  const absolute = resolve(specDir, url);
-  const text = await readFile(absolute, "utf8");
   const explicitType = format?.type?.toLowerCase();
   const extensionMatch = url.match(/\.([a-z0-9]+)$/i);
   const kind = explicitType ?? extensionMatch?.[1]?.toLowerCase() ?? "";
+  // Unknown format: schema still guards the sibling shape, and we don't
+  // even open the file — keeping the confined helper as the only door
+  // to a data file's contents.
+  if (kind !== "csv" && kind !== "tsv" && kind !== "json" && kind !== "yaml" && kind !== "yml") {
+    return null;
+  }
+  const { text } = await readConfinedSibling(specDir, url);
   if (kind === "csv") return parseDelimitedColumns(text, ",");
   if (kind === "tsv") return parseDelimitedColumns(text, "\t");
   if (kind === "json") return readJsonColumns(text);
-  if (kind === "yaml" || kind === "yml") {
-    const parsed: unknown = parseYaml(text);
-    return readJsonColumns(JSON.stringify(parsed));
-  }
-  return null; // Unknown format: schema still guards the sibling shape.
+  // yaml / yml
+  const parsed: unknown = parseYaml(text);
+  return readJsonColumns(JSON.stringify(parsed));
 }
 
 /** Check that every referenced field exists in the columns list. A

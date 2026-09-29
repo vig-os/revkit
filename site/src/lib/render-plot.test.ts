@@ -181,7 +181,7 @@ describe("renderPlotToSvg — failure modes", () => {
   });
 });
 
-describe("sanitizeSvg (DOM-based, denylist)", () => {
+describe("sanitizeSvg (DOM-based, allowlist)", () => {
   const SVG_OPEN = '<svg xmlns="http://www.w3.org/2000/svg">';
 
   test("removes <script> elements anywhere in the tree", () => {
@@ -198,16 +198,22 @@ describe("sanitizeSvg (DOM-based, denylist)", () => {
   });
 
   test("strips javascript: URLs on href and xlink:href", () => {
+    // <a> is not in the allowlist, so the whole element goes — its text
+    // children go with it. This test guards the property "javascript:
+    // never survives", not the exact tree shape.
     const dirty = `${SVG_OPEN}<a xlink:href="javascript:alert(1)"><text>x</text></a></svg>`;
     const clean = sanitizeSvg(dirty);
     expect(clean).not.toContain("javascript:");
   });
 
-  test("strips http(s) hrefs on <a>, leaving only same-page # fragments", () => {
-    const dirty = `${SVG_OPEN}<a href="https://evil.example"><text>x</text></a><a href="#ok"><text>y</text></a></svg>`;
+  test("removes <a> entirely (not in the element allowlist)", () => {
+    // <a> is a link, and revkit plots are static figures (ADR-0004); an
+    // element allowlist is stricter than the previous denylist — <a>
+    // drops even with an innocent same-page href.
+    const dirty = `${SVG_OPEN}<a href="#ok"><text>x</text></a></svg>`;
     const clean = sanitizeSvg(dirty);
-    expect(clean).not.toContain("https://evil.example");
-    expect(clean).toContain('href="#ok"');
+    expect(clean).not.toContain("<a");
+    expect(clean).not.toContain("href=");
   });
 
   test("removes <foreignObject>, <iframe>, <object>, <embed>", () => {
@@ -222,12 +228,55 @@ describe("sanitizeSvg (DOM-based, denylist)", () => {
     expect(clean).toContain("<rect");
   });
 
+  test("removes SMIL animation elements (<set>, <animate>, <animateTransform>, <animateMotion>)", () => {
+    // A previous denylist sanitiser missed these — `<set attributeName=
+    // "href" to="javascript:alert(1)"/>` would let SMIL flip an attribute
+    // at animation time. The allowlist drops every animation element
+    // outright.
+    const dirty =
+      `${SVG_OPEN}<rect><set attributeName="href" to="javascript:alert(1)"/>` +
+      `<animate attributeName="fill" values="red;blue"/>` +
+      `<animateTransform attributeName="transform" from="0" to="1"/>` +
+      `<animateMotion path="M0,0 L1,1"/></rect></svg>`;
+    const clean = sanitizeSvg(dirty);
+    for (const forbidden of ["<set", "<animate", "<animatetransform", "<animatemotion"]) {
+      expect(clean.toLowerCase()).not.toContain(forbidden);
+    }
+    // The parent <rect> and no forbidden children remain.
+    expect(clean).toContain("<rect");
+  });
+
+  test("strips url(https://…) inside style / fill attributes, keeps url(#fragment)", () => {
+    // Regression guard against the reviewer's finding: `style="fill:url
+    // (https://evil)"` survived the old denylist because the element
+    // was benign and neither `on*` nor `href` fired the strip rule. The
+    // new sanitiser rewrites url(...) values inside style + presentation
+    // attributes, keeping only same-document fragments.
+    const dirty =
+      `${SVG_OPEN}<rect style="fill:url(https://evil.example);stroke:red" ` +
+      `fill="url('https://evil.example/img.png')"/>` +
+      `<circle style="fill:url(#gradient1)" fill="url(#patternA)"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).not.toContain("evil.example");
+    expect(clean).toContain("url(#gradient1)");
+    expect(clean).toContain("url(#patternA)");
+    // The unrelated presentation stays untouched.
+    expect(clean).toContain("stroke:red");
+  });
+
+  test("removes attributes not in the allowlist while keeping legitimate presentation", () => {
+    // `data-*` / arbitrary custom attributes are stripped — an
+    // allowlist has no way to know they are safe, and Vega's SVG
+    // renderer does not emit them.
+    const dirty = `${SVG_OPEN}<rect x="5" y="10" width="20" height="30" fill="#abc" data-tracker="pixel" ping="https://evil"/></svg>`;
+    const clean = sanitizeSvg(dirty);
+    expect(clean).toContain('x="5"');
+    expect(clean).toContain('fill="#abc"');
+    expect(clean).not.toContain("data-tracker");
+    expect(clean).not.toContain("ping=");
+  });
+
   test("survives the nested <scr<script>ipt> shape (CodeQL js/incomplete-multi-character-sanitization)", () => {
-    // A regex sanitiser would strip the inner `<script>` and leave the
-    // outer text `scr…ipt`, which combined with the leftover `<` before
-    // `scr` could still parse as a script tag in HTML. A DOM parser
-    // never re-tokenises its output, so the class of attack is defeated
-    // structurally.
     const dirty = `${SVG_OPEN}<g>scr<script>alert(1)</script>ipt</g></svg>`;
     const clean = sanitizeSvg(dirty);
     expect(clean).not.toContain("<script");

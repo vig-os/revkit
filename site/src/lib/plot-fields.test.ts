@@ -3,7 +3,7 @@
 // a column of the data file must fail the build. Runs on real CSV/JSON
 // fixtures written to a temp dir so parser edge cases (quoted commas,
 // JSON records) are exercised.
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
@@ -143,6 +143,47 @@ describe("assertPlotFieldsExist", () => {
       await expect(assertPlotFieldsExist(spec, dir)).resolves.toBeUndefined();
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses a symlinked data file and NEVER quotes its contents in the error", async () => {
+    // Regression guard: an earlier version of readDataColumns opened the
+    // file directly with fs.readFile, so `link.csv -> /etc/passwd` would
+    // surface the target's first line inside the "Columns in the file:
+    // […]" error message. Routing through the confined-read helper
+    // means the error fires BEFORE any bytes leave the file.
+    const specDir = await mkdtemp(join(tmpdir(), "revkit-fields-symlink-"));
+    const outside = await mkdtemp(join(tmpdir(), "revkit-fields-outside-"));
+    try {
+      const secret = join(outside, "secret.csv");
+      const secretContent = "SECRET_HEADER,LEAKED_ROW\nSECRET_VALUE_ONE,SECRET_VALUE_TWO\n";
+      await writeFile(secret, secretContent);
+      await symlink(secret, join(specDir, "link.csv"));
+      const spec = {
+        data: { url: "link.csv", format: { type: "csv" } },
+        mark: "bar",
+        encoding: { x: { field: "SECRET_HEADER", type: "nominal" } },
+      };
+      let caught: Error | null = null;
+      try {
+        await assertPlotFieldsExist(spec, specDir);
+      } catch (error) {
+        caught = error as Error;
+      }
+      expect(caught, "expected the confined loader to refuse the symlink").not.toBeNull();
+      expect(caught?.message ?? "").toMatch(/symlinked data file/i);
+      // The critical assertion: no bytes from the target file appear in
+      // the error message. Guards against a regression that would open
+      // the file BEFORE the containment check.
+      for (const secretFragment of ["SECRET_HEADER", "LEAKED_ROW", "SECRET_VALUE_ONE", "SECRET_VALUE_TWO"]) {
+        expect(
+          caught?.message ?? "",
+          `error message must not contain '${secretFragment}' from the symlink target`,
+        ).not.toContain(secretFragment);
+      }
+    } finally {
+      await rm(specDir, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
     }
   });
 

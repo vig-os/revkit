@@ -30,10 +30,9 @@ import {
   Error as VegaError,
 } from "vega";
 import { compile as vegaLiteCompile } from "vega-lite";
-import { readFile, realpath, lstat } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
 import { DOMParser } from "linkedom";
 import { isSiblingFilename } from "../content/schemas/plots.ts";
+import { readConfinedSibling } from "./plot-file-io.ts";
 
 /** Options for {@link renderPlotToSvg}. */
 export interface RenderPlotOptions {
@@ -59,55 +58,18 @@ type VegaLoaderShape = ReturnType<typeof vegaLoader>;
 
 /** Build a Vega loader that resolves data URLs relative to `specDir` and
  * refuses anything that would escape it — no HTTP fetches, no absolute
- * paths, no `..` traversal, no symlinks that leak outside. Overrides
- * `sanitize`, `load`, `file` and `http` on the base loader so every path
- * Vega uses to fetch a dataset flows through the same containment check.
+ * paths, no `..` traversal, no symlinks that leak outside. Every read
+ * routes through {@link readConfinedSibling}, so this loader and the
+ * pre-render column check share exactly one containment implementation.
  *
  * `sanitize` returns the relative URL as `href` (not the absolute one):
  * Vega also calls `sanitize` for the `href` encoding channel and the
  * `image` mark's URL — the schema rejects both, but returning an
  * absolute build-host path here would leak `/home/runner/…` into a page
- * anyway if a future schema hole let one through. Reads still resolve
- * against `specDir` inside `load` / `file`, so the sandbox stays intact. */
+ * anyway if a future schema hole let one through. Reads still route
+ * through `load` / `file` where the containment check runs. */
 function buildRestrictedLoader(specDir: string): VegaLoaderShape {
   const baseVegaLoader = vegaLoader();
-
-  async function resolveInsideReal(uri: string): Promise<string> {
-    if (!isSiblingFilename(uri)) {
-      throw new Error(
-        `plot loader refused a non-sibling data url: ${JSON.stringify(uri)}`,
-      );
-    }
-    const specDirReal = await realpath(specDir);
-    const specDirRealTrimmed = specDirReal.endsWith(sep)
-      ? specDirReal.slice(0, -1)
-      : specDirReal;
-    const candidate = resolve(specDirRealTrimmed, uri);
-    // Refuse a symlinked data file outright — `realpath()` on the target
-    // would follow the link and pass the prefix check even when the real
-    // file lives outside the plot directory.
-    const stat = await lstat(candidate).catch(() => null);
-    if (stat === null) {
-      throw new Error(`plot loader: data file not found: ${uri}`);
-    }
-    if (stat.isSymbolicLink()) {
-      throw new Error(
-        `plot loader refused a symlinked data file: ${uri} (symlinks would let a data file escape the plot directory).`,
-      );
-    }
-    const targetReal = await realpath(candidate);
-    if (
-      targetReal !== specDirRealTrimmed &&
-      !targetReal.startsWith(`${specDirRealTrimmed}${sep}`)
-    ) {
-      const outside = relative(specDirRealTrimmed, targetReal);
-      throw new Error(
-        `plot loader refused to read outside the spec dir: ${uri} ` +
-          `(real target ${outside} sits above the spec directory).`,
-      );
-    }
-    return targetReal;
-  }
 
   const restricted: VegaLoaderShape = {
     ...baseVegaLoader,
@@ -124,12 +86,12 @@ function buildRestrictedLoader(specDir: string): VegaLoaderShape {
       return { href: uri };
     },
     async load(uri: string) {
-      const absolute = await resolveInsideReal(uri);
-      return readFile(absolute, "utf8");
+      const { text } = await readConfinedSibling(specDir, uri);
+      return text;
     },
     async file(filename: string) {
-      const absolute = await resolveInsideReal(filename);
-      return readFile(absolute, "utf8");
+      const { text } = await readConfinedSibling(specDir, filename);
+      return text;
     },
     async http() {
       throw new Error(`plot loader refused an HTTP fetch (data.url must be a sibling file)`);
@@ -138,81 +100,267 @@ function buildRestrictedLoader(specDir: string): VegaLoaderShape {
   return restricted;
 }
 
-/** Elements a Vega SVG never legitimately emits and that would be
- * dangerous to render even if the CSP blocked their side effects. */
-const DISALLOWED_ELEMENTS: ReadonlySet<string> = new Set([
-  "script",
-  "foreignobject",
-  "iframe",
-  "object",
-  "embed",
-  "link",
-  "meta",
-  "base",
-  "form",
-  "input",
-  "button",
+/** Allowlist of element tag names Vega's static SVG output legitimately
+ * emits. Everything else is removed at sanitise time — animation
+ * elements (`<set>`, `<animate>`, `<animateTransform>`, `<animateMotion>`),
+ * SMIL declarative logic, embed / script / foreign-object escape hatches
+ * and unknown-to-us elements all fail closed. Names are lowercased
+ * because linkedom's SVG-XML parser normalises tag names. */
+const ALLOWED_ELEMENTS: ReadonlySet<string> = new Set([
+  "svg",
+  "g",
+  "defs",
+  "clippath",
+  "path",
+  "rect",
+  "line",
+  "circle",
+  "ellipse",
+  "polygon",
+  "polyline",
+  "text",
+  "tspan",
+  "title",
+  "desc",
+  "lineargradient",
+  "radialgradient",
+  "stop",
+  "pattern",
+  "mask",
+  "marker",
+  "symbol",
+  "use",
+  "metadata",
+  "switch",
 ]);
 
-/** Attributes stripped from every element regardless of tag name.
- * `on*` handlers, plus the two `href` shapes an SVG can carry. */
-function isDangerousAttribute(name: string, value: string): boolean {
+/** Attributes that are always safe on an allowed element regardless of
+ * value. Keeps the list to what Vega's static output uses: geometry,
+ * presentation, text, and the ARIA / structural bits we care about for
+ * accessibility. Any attribute not in this set is stripped from the
+ * element (allowlist, not denylist) — a `<set attributeName="href" …>`
+ * dropped through the element allowlist would still lose the attribute
+ * anyway. */
+const ALLOWED_ATTRIBUTES: ReadonlySet<string> = new Set([
+  // Structural / accessibility
+  "id",
+  "class",
+  "role",
+  "aria-label",
+  "aria-labelledby",
+  "aria-describedby",
+  "aria-roledescription",
+  "aria-hidden",
+  "lang",
+  "xml:lang",
+  "xml:space",
+  "xmlns",
+  "xmlns:xlink",
+  "version",
+  // Layout
+  "width",
+  "height",
+  "x",
+  "y",
+  "x1",
+  "y1",
+  "x2",
+  "y2",
+  "cx",
+  "cy",
+  "r",
+  "rx",
+  "ry",
+  "dx",
+  "dy",
+  "d",
+  "points",
+  "viewbox",
+  "preserveaspectratio",
+  "transform",
+  "clip-path",
+  "clip-rule",
+  "fill-rule",
+  "mask",
+  "offset",
+  "patterncontentunits",
+  "patternunits",
+  "gradienttransform",
+  "gradientunits",
+  "spreadmethod",
+  "marker-end",
+  "marker-mid",
+  "marker-start",
+  "markerheight",
+  "markerwidth",
+  "markerunits",
+  "refx",
+  "refy",
+  "orient",
+  "viewport-fill",
+  // Presentation
+  "fill",
+  "fill-opacity",
+  "stroke",
+  "stroke-opacity",
+  "stroke-width",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "stroke-miterlimit",
+  "stroke-dasharray",
+  "stroke-dashoffset",
+  "opacity",
+  "display",
+  "visibility",
+  "color",
+  "cursor",
+  "pointer-events",
+  "shape-rendering",
+  "text-rendering",
+  "vector-effect",
+  "stop-color",
+  "stop-opacity",
+  "style",
+  // Text
+  "font-family",
+  "font-size",
+  "font-weight",
+  "font-style",
+  "font-variant",
+  "text-anchor",
+  "text-decoration",
+  "dominant-baseline",
+  "alignment-baseline",
+  "baseline-shift",
+  "letter-spacing",
+  "word-spacing",
+  "writing-mode",
+  "direction",
+  "unicode-bidi",
+  "text-indent",
+  "line-height",
+  // Symbol / use (only same-document fragment, checked separately)
+  "href",
+  "xlink:href",
+]);
+
+/** Regex extracting every `url(…)` value from a CSS declaration list.
+ * Matches both quoted and unquoted forms. */
+const URL_VALUE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi;
+
+/** True when a `url(...)` argument is a same-document fragment
+ * (`url(#gradient1)`) — the only outbound reference an inline SVG here
+ * ever needs, so allow it and refuse everything else. */
+function isSafeFragmentReference(raw: string): boolean {
+  return /^#[A-Za-z_][\w.-]*$/.test(raw.trim());
+}
+
+/** Rewrite a `style` or presentation-attribute value so any `url(…)` that
+ * is not a same-document fragment (`url(#foo)`) is dropped. Returns
+ * `null` when nothing survives worth keeping. */
+function sanitizeUrlsInValue(value: string): string {
+  return value.replace(URL_VALUE, (whole, dq, sq, uq) => {
+    const inner = (dq ?? sq ?? uq ?? "").trim();
+    return isSafeFragmentReference(inner) ? `url(#${inner.slice(1)})` : "";
+  });
+}
+
+/** Attributes whose values can carry a `url(...)` reference. Vega uses
+ * these for gradient / clip fills, so the value has to be sanitised
+ * rather than the attribute removed. */
+const URL_BEARING_ATTRIBUTES: ReadonlySet<string> = new Set([
+  "style",
+  "fill",
+  "stroke",
+  "clip-path",
+  "mask",
+  "filter",
+  "marker-start",
+  "marker-mid",
+  "marker-end",
+]);
+
+function isSameDocumentFragment(value: string): boolean {
+  return value.trim().startsWith("#");
+}
+
+/** Decide whether an attribute survives on an allowed element. Returns
+ * either the (possibly rewritten) value to keep, or `null` to remove
+ * the attribute entirely. */
+function keepAttribute(name: string, value: string): string | null {
   const lower = name.toLowerCase();
-  if (lower.startsWith("on")) return true;
-  if (/\s*javascript:/i.test(value)) return true;
-  // Only same-page fragment hrefs survive; any absolute / relative /
-  // scheme-carrying href is refused. Applies to both `href` and
-  // `xlink:href` — Vega does not emit either, so this is defence in
-  // depth ready for a future encoding channel escape.
+  // `xmlns:*` declarations pass — linkedom parses SVG in the XHTML
+  // namespace, and we still want the source's own namespace bindings.
+  if (lower.startsWith("xmlns:")) return value;
+  if (lower.startsWith("on")) return null;
+  // href / xlink:href only survive as same-document fragments; every
+  // other href would be an outbound reference from a supposedly static
+  // figure (ADR-0004).
   if (lower === "href" || lower === "xlink:href") {
-    const trimmed = value.trim();
-    if (!trimmed.startsWith("#")) return true;
+    return isSameDocumentFragment(value) ? value : null;
   }
-  return false;
+  if (!ALLOWED_ATTRIBUTES.has(lower)) return null;
+  // `javascript:` URLs in any surviving attribute value must go too.
+  if (/\bjavascript:/i.test(value)) return null;
+  if (URL_BEARING_ATTRIBUTES.has(lower)) {
+    return sanitizeUrlsInValue(value);
+  }
+  return value;
 }
 
 /** Minimal shape of a linkedom node — the class ships with types that
  * don't line up with the browser lib.dom `Element`, so we describe just
  * the surface the sanitiser walks (children, attributes, remove,
- * removeAttribute, localName). Kept here so the rest of the file uses
- * ordinary DOM ergonomics without pulling in linkedom's whole typing. */
+ * removeAttribute, setAttribute, localName). Kept here so the rest of
+ * the file uses ordinary DOM ergonomics without pulling in linkedom's
+ * whole typing. */
 interface SvgNode {
   readonly localName?: string;
   readonly children?: readonly SvgNode[];
   readonly attributes?: readonly { name: string; value: string }[];
   remove(): void;
   removeAttribute(name: string): void;
+  setAttribute(name: string, value: string): void;
   readonly outerHTML: string;
 }
 
-/** Recursively strip disallowed elements and attributes from an SVG DOM
- * tree in place. */
+/** Apply the element + attribute allowlist to one element in place. */
+function sanitizeOneElement(element: SvgNode): void {
+  const attributes = Array.from(element.attributes ?? []);
+  for (const attribute of attributes) {
+    const kept = keepAttribute(attribute.name, attribute.value);
+    if (kept === null) {
+      element.removeAttribute(attribute.name);
+    } else if (kept !== attribute.value) {
+      element.setAttribute(attribute.name, kept);
+    }
+  }
+}
+
+/** Recursively enforce the element allowlist on a tree in place. */
 function sanitizeSvgTree(root: SvgNode): void {
   // Copy children into an array first — mutating during iteration would
   // skip siblings after a removal.
   const children = Array.from(root.children ?? []);
   for (const child of children) {
     const tagName = child.localName?.toLowerCase() ?? "";
-    if (DISALLOWED_ELEMENTS.has(tagName)) {
+    if (!ALLOWED_ELEMENTS.has(tagName)) {
       child.remove();
       continue;
     }
-    // Drop dangerous attributes on this element.
-    const attributes = Array.from(child.attributes ?? []);
-    for (const attribute of attributes) {
-      if (isDangerousAttribute(attribute.name, attribute.value)) {
-        child.removeAttribute(attribute.name);
-      }
-    }
+    sanitizeOneElement(child);
     sanitizeSvgTree(child);
   }
 }
 
 /**
- * Sanitise an SVG fragment: parse it into a real DOM, strip disallowed
- * elements and dangerous attributes anywhere in the tree, and serialise
- * back to a string. Applied unconditionally; Vega's SVG renderer does
- * not emit any of the stripped shapes today and never should for us.
+ * Sanitise an SVG fragment: parse it into a real DOM, enforce an
+ * ALLOWLIST of elements and attributes, sanitise `url(...)` values in
+ * style / presentation attributes so only `url(#fragment)` survives,
+ * and serialise back to a string. Applied unconditionally; Vega's SVG
+ * renderer stays inside the allowlist today, so any element or
+ * attribute this drops is either dead code or a new escape hatch a
+ * reviewer should approve.
  */
 export function sanitizeSvg(svg: string): string {
   const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
@@ -222,13 +370,8 @@ export function sanitizeSvg(svg: string): string {
       `sanitizeSvg: expected an <svg> root element, got <${root?.localName ?? "unknown"}>`,
     );
   }
-  // Strip dangerous attrs on the SVG root itself before descending.
-  const rootAttrs = Array.from(root.attributes ?? []);
-  for (const attribute of rootAttrs) {
-    if (isDangerousAttribute(attribute.name, attribute.value)) {
-      root.removeAttribute(attribute.name);
-    }
-  }
+  // Enforce the allowlist on the root <svg> itself before descending.
+  sanitizeOneElement(root);
   sanitizeSvgTree(root);
   // `outerHTML` on a linkedom node serialises the whole subtree with the
   // element's own tag, preserving attributes and namespaces — same shape
