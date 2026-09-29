@@ -1,6 +1,6 @@
 # ADR-0010: Distribution: revkit as an opt-in flake
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: D1
@@ -18,3 +18,7 @@ patterns) is proposed as a devkit **default** once proven (#1).
 ## Consequences
 
 Version pinning follows devkit's lockstep policy.
+
+## Acceptance (2026-09-29)
+
+- Versioning and release per ADR-0021 (SemVer via the devkit release train).

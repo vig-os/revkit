@@ -8,9 +8,9 @@ an opinionated, guarded component set. Humans read them rendered, answer questio
 prompts, and comment inline. Those comments flow back to the agent live, or become real GitHub PR review comments on
 the exact source lines.
 
-> **Status: design phase.** Nothing is runnable yet. The architecture is under review in
-> [DESIGN-0001](docs/designs/DESIGN-0001-revkit-architecture.md) and ADR-0001 to ADR-0011; implementation starts
-> with milestone [M1](https://github.com/vig-os/revkit/milestone/1).
+> **Status: design accepted, implementation starting.** Nothing is runnable yet. The architecture is
+> [DESIGN-0001](docs/designs/DESIGN-0001-revkit-architecture.md) with [ADR-0001 to ADR-0024](docs/adr/README.md);
+> implementation starts with milestone [M1](https://github.com/vig-os/revkit/milestone/1).
 
 ## What it will do
 
@@ -23,7 +23,7 @@ the exact source lines.
   data side files, LaTeX at build time, enforced by pre-commit and build.
 - **Lean:** static HTML by default, Solid islands only where interaction needs them, plots and math rendered at build.
 
-Stack: Astro + Starlight, Solid, Bun, Vega-Lite, KaTeX; hosting on one Cloudflare Worker per org. Ships as a Nix
+Stack: Astro + Starlight, Solid, Bun, Vega-Lite, KaTeX; hosting on one Cloudflare Worker per org (`review.exoma.org`). Ships as a Nix
 flake that any repo, including vig-os devkit consumers, can opt into.
 
 ## Docs
@@ -33,7 +33,7 @@ flake that any repo, including vig-os devkit consumers, can opt into.
 | [DESIGN-0001](docs/designs/DESIGN-0001-revkit-architecture.md) | Architecture, user stories, agent interaction |
 | [ADRs](docs/adr/README.md) | One decision per record |
 | [Feature matrix](docs/FEATURE-MATRIX.md) | Story → ADR → milestone → issue |
-| [Milestones](https://github.com/vig-os/revkit/milestones) | M1–M7 roadmap |
+| [Milestones](https://github.com/vig-os/revkit/milestones) | M1–M8 roadmap |
 
 ## Development
 

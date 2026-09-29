@@ -10,7 +10,7 @@ review them rendered, with comments that flow back to the agent (locally) or to 
 | Architecture, user stories, agent interaction | `docs/designs/DESIGN-0001-revkit-architecture.md` |
 | Decisions (one per file, `- Status:` line is the truth) | `docs/adr/NNNN-*.md`, index `docs/adr/README.md` (derived) |
 | Story → ADR → milestone → issue traceability | `docs/FEATURE-MATRIX.md` |
-| Roadmap | GitHub milestones M1–M7, tracking issues #6–#12 |
+| Roadmap | GitHub milestones M1–M8, tracking issues #6–#12 and #15 |
 | Tooling to promote into vig-os/devkit | ledger issue #1, skill `/devkit_elevate` |
 
 Before building a feature, find its story ID in the matrix and cite the ADR it implements. A change that contradicts
@@ -37,6 +37,13 @@ an ADR needs a new ADR (superseding), not a silent deviation.
 - Conventional commits with `Refs: #<issue>` (chore may omit). No AI attribution trailers.
 - Gitflow: branch `<type>/<issue>-<summary>` from `dev` (types: feature, bugfix, docs, test, refactor, hotfix,
   release, chore), PR into `dev`. `main` only via the release train. Merge commits only.
+
+## Secrets (ADR-0014)
+
+- Never write a token, key or cookie into a tracked file, a commit, an issue or a log. Local Cloudflare credentials
+  live in `~/.config/revkit/cf.env` (mode 600): load with `set -a; . ~/.config/revkit/cf.env` inside the single
+  command that needs them, never `cat` or echo them.
+- Workflows: no `pull_request_target`; PR builds get no secrets; deploys go through the `production` environment.
 
 ## Conventions for revkit content (from ADR-0003/0004/0005)
 

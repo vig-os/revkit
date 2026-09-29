@@ -1,6 +1,6 @@
 # ADR-0002: Solid islands and a single component registry
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: C1, A1–A3, E1
@@ -18,3 +18,9 @@ vendored once into `@revkit/components`; content and consumers import it, never 
 ## Consequences
 
 React-only libraries are out of scope. New components go through the escalation path (ADR-0005).
+
+## Acceptance (2026-09-29)
+
+- Vendored upstream code (shadcn-solid styled layer) keeps its `LICENSE` under `packages/components/vendor/<pkg>/` and
+  is
+  listed in `NOTICE`; see ADR-0022. Kobalte is a normal dependency.

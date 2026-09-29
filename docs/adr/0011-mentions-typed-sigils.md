@@ -1,6 +1,6 @@
 # ADR-0011: Mentions and references: typed actors and sigils
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: A3, B2, B5
@@ -19,3 +19,7 @@ guest autocomplete is limited to participants; an agent mention with none connec
 ## Consequences
 
 Mentioning someone without access offers an invite (write access only).
+
+## Acceptance (2026-09-29)
+
+- CODEOWNERS is parsed at build time and cached with the site; `@owners` resolves against that snapshot.

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed — review inline on the PR |
+| Status | Accepted 2026-09-29 (ADR-0001 – ADR-0024; ADR-0023 deferred) |
 | Issue | [#3](https://github.com/vig-os/revkit/issues/3) |
 | Date | 2026-09-29 |
 | Decisions | [ADR-0001 – ADR-0011](../adr/README.md) · traceability: [FEATURE-MATRIX](../FEATURE-MATRIX.md) |
@@ -45,6 +45,7 @@ It has two modes, which share one content model and one anchor model:
 | B4 | As a reviewer, I see existing PR review threads **on the page** (two-way), resolved state included |
 | B5 | As a non-GitHub reviewer, I open a **personal invite link**; my comments are attributed to me and mirrored to the PR |
 | B6 | As an agent, I pick up the review (threads with anchors), fix the source, reply and resolve; the next preview re-anchors |
+| B7 | *(M8)* As a reviewer, I review **code diffs** of a PR in revkit with the same comment rail, mapped to PR lines |
 
 **C — authoring and consistency (guards)**
 
@@ -342,7 +343,8 @@ Details:
 
 ## 6. Hosting and auth
 
-- **One Cloudflare Worker per org** (§6.1). Previews at `pr-<n>--<repo>.<domain>`, with the Worker in front of every
+- **One Cloudflare Worker per org** (§6.1). Previews at `review.exoma.org/<repo>/pr-<n>/` (path-based, ADR-0008), with
+  the Worker in front of every
   request.
 - **GitHub users:** GitHub App OAuth (user-to-server). The session is valid if the user has read access to the repo,
   checked via the API and cached.
@@ -368,7 +370,8 @@ as the local daemon (§5.3). The Worker uses:
 - D1 for threads, invites and sessions;
 - a Durable Object per doc for live fan-out.
 
-Previews are served at `pr-<n>--<repo>.<domain>`, so there is one auth surface and a new PR is just an upload.
+Previews are served path-based at `review.exoma.org/<repo>/pr-<n>/`, so there is one auth surface and a new PR is just
+an upload (ADR-0008; isolation per ADR-0012).
 
 **Per org, once:** `revkit deploy init --org <org>`
 
@@ -451,8 +454,13 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 7. **M7 — co-editing:** ([#12](https://github.com/vig-os/revkit/issues/12)) CodeMirror 6 source pane + Yjs, daemon-owned
    Y.Doc per file, agent writes ingested as ops.
 
-## 9. Open questions
+## 9. Decisions on the former open questions (2026-09-29)
 
-- The org domain and Cloudflare account for previews.
-- Whether ask/answer history is committed (an audit trail of decisions) or stays local.
-- Whether revkit renders **code** diffs too, or stays docs-only and leaves code to GitHub.
+- **Domain / Cloudflare account:** the EXOMA Cloudflare account; `exoma.org` moves to Cloudflare, app at
+  `review.exoma.org`, previews path-based (ADR-0008).
+- **Ask/answer history:** local and gitignored; `revkit ask --keep` promotes one into `docs/decisions/` (ADR-0007).
+- **Code diffs:** docs only in v1; code diffs are planned as M8 (ADR-0024, #15).
+
+Cross-cutting decisions made at acceptance: security (ADR-0012), local daemon (0013), secrets (0014), retention and
+privacy (0015), testing (0016), accessibility (0017), browsers (0018), i18n (0019), observability (0020), versioning
+(0021), vendored licenses (0022). The table of stories, ADRs and milestones is [FEATURE-MATRIX](../FEATURE-MATRIX.md).
