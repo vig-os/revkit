@@ -59,30 +59,32 @@ precommit:
 # Run unit tests (bun test) in each package that has them, then the site's
 # Playwright smoke. Bun test runs per-package rather than at the workspace
 # root because it would otherwise walk `site/tests/*.spec.ts` — which are
-# Playwright specs and refuse to load in bun test. Playwright's own suite
-# builds the site once and runs Chromium; WebKit is opt-in via
-# REVKIT_ENABLE_WEBKIT=1 (see site/playwright.config.ts) pending #19.
+# Playwright specs and refuse to load in bun test. The site's own bun tests
+# live under `src/content/schemas/` (outside the Playwright testDir) so both
+# runners coexist without a collision. Playwright's own suite builds the
+# site once and runs Chromium; WebKit is opt-in via REVKIT_ENABLE_WEBKIT=1
+# (see site/playwright.config.ts) pending #19.
 [group('test')]
 test *args:
     @if [ ! -f package.json ]; then \
       echo "just test: no package.json — skipping"; \
     else \
       cd packages/cli && bun test {{ args }} && cd ../.. && \
+      cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
       just e2e; \
     fi
 
 # Run bun unit tests with coverage. Reports to the terminal by default;
-# `just test-cov --coverage-reporter=lcov` writes an lcov file. Only the CLI
-# ships unit tests today (the Callout component is exercised by the
-# Playwright smoke against the built site — see
-# packages/components/src/Callout.tsx); the recipe walks every package that
-# grows unit tests over time, so new ones join without a recipe edit.
+# `just test-cov --coverage-reporter=lcov` writes an lcov file. Walks every
+# package that grows unit tests over time (packages/cli, site's schema
+# tests today) so new ones join without a recipe edit.
 [group('test')]
 test-cov *args:
     @if [ ! -f package.json ]; then \
       echo "just test-cov: no package.json — skipping"; \
     else \
-      cd packages/cli && bun test --coverage {{ args }}; \
+      cd packages/cli && bun test --coverage {{ args }} && cd ../.. && \
+      cd site && bun test --coverage src/content/schemas/ {{ args }}; \
     fi
 
 # Run the Playwright browser suite by itself (skips the bun unit tests).
