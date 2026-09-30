@@ -6,12 +6,24 @@
 # over the `revkit` MCP channel, the agent replies through the `reply` tool
 # and resolves the thread, and the reply appears in the page in real time.
 #
-# Round-5 hardening (PR #42 review round 4):
+# Round-6 hardening (PR #42 review round 5):
 #
-#   Round-4 verified the CLI flags but the child claude inherited
-#   the OWNER's settings via CLAUDE_CONFIG_DIR — statusLine, hooks,
-#   env block, plugins, AND the owner's global CLAUDE.md. Round-5
-#   plugs that leak.
+#   Round-5 wired the owner-profile isolation (--setting-sources ""
+#   + --settings <state>/settings.json), but teardown died silently
+#   under `set -e` any time a `revkit.js serve` process existed on
+#   the box whose cwd was not our STATE_DIR — e.g. the owner's
+#   normal dogfood daemon, or a neighbouring worktree's test daemon.
+#   State dirs, profile transcript dirs, artifacts and daemon.log
+#   (with its plaintext launch code) all leaked past the crash.
+#   Round-6 makes cleanup best-effort and audits every trap-called
+#   helper for the same `&&`-last-statement pattern.
+#
+#   Round-6 also replaces the owner-specific statusline grep with
+#   the reviewer's own signal: `flk agent_session` must stay null
+#   for the whole run (proves no session-start hook fired), and
+#   tightens the CLAUDE.md check (fail closed on a missing
+#   transcript dir, match up to six short quote-free phrases
+#   rather than one long line).
 #
 #   The lockdown proof is the PRE-LAUNCH /proc check on the real
 #   claude process, NOT any model behaviour. The old post-run "did
@@ -146,6 +158,7 @@ STATE_DIR=""
 TMP_ARTIFACTS_DIR=""
 DAEMON_LOG=""
 PLAYWRIGHT_JOB_PID=""
+SELFTEST_DECOY_PID=""
 
 # Return 0 when `path` is currently held with an advisory flock (either
 # LOCK_EX or LOCK_SH). `flock -n` acquires the lock non-blocking; success
@@ -189,6 +202,9 @@ close_pane_if_any() {
       flk pane close "${by_name}" >/dev/null 2>&1 || true
     fi
   fi
+  # Round-6 audit: return 0 explicitly so callers under `set -e` do not
+  # bail when the last executed command was a false `[[ -n … ]]`.
+  return 0
 }
 
 # Kill a daemon we started. `serve.json` and `daemon.lock` are unlinked
@@ -238,17 +254,33 @@ daemons_rooted_at_state() {
   local pids p cwd
   # Widen the pattern to catch any `revkit.js serve` — with or without
   # STATE_DIR in the args — then filter by /proc/<pid>/cwd.
+  # Round-6 blocker: the loop body used to be `[[ … ]] && printf …`
+  # — the last iteration whose pid was NOT rooted at STATE_DIR
+  # returned 1, and under `set -e` that killed the trap partway
+  # through cleanup. Use an explicit `if`; end with `return 0` so
+  # a false final condition can never propagate a non-zero exit.
   pids="$(pgrep -f 'revkit\.js serve' 2>/dev/null || true)"
   for p in ${pids}; do
     cwd="$(readlink "/proc/${p}/cwd" 2>/dev/null || true)"
-    [[ "${cwd}" == "${STATE_DIR}"* ]] && printf '%s\n' "${p}"
+    if [[ "${cwd}" == "${STATE_DIR}"* ]]; then
+      printf '%s\n' "${p}"
+    fi
   done
+  return 0
 }
 
 # shellcheck disable=SC2329
 # ^ invoked indirectly through `trap` below; shellcheck can't see that.
 cleanup() {
   local rc=$?
+  # Round-6 blocker: `set -e` was tearing this function apart. Any
+  # helper whose last statement was a false `[[ … ]] && …` returned
+  # 1 and killed the trap partway through — leaving state dirs,
+  # profile transcripts, artifacts and (worst) daemon.log with its
+  # plaintext launch code on disk. Cleanup is a "do the best we can
+  # in any order" contract; a single failing helper must not stop
+  # the rest. Every step below is guarded independently.
+  set +e
   log "teardown starting (exit=${rc})"
   # Kill an in-flight Playwright pipeline FIRST — otherwise the trap
   # would block on `wait $PLAYWRIGHT_JOB_PID` in cases where SIGINT
@@ -272,6 +304,13 @@ cleanup() {
   fi
   close_pane_if_any
   kill_daemon_if_ours
+  # Kill any self-test decoy this run started. Belongs in cleanup so
+  # even a mid-run abort doesn't leave the decoy running.
+  if [[ -n "${SELFTEST_DECOY_PID}" ]]; then
+    kill -9 "${SELFTEST_DECOY_PID}" 2>/dev/null || true
+    log "SELFTEST-TEARDOWN: killed decoy pid ${SELFTEST_DECOY_PID}"
+    SELFTEST_DECOY_PID=""
+  fi
   # POST-TEARDOWN SELF-CHECK — a leak turns the exit code non-zero
   # regardless of the loop's own result.
   local sweep_bad=0
@@ -393,6 +432,44 @@ if [[ -z "${IN_NIX_SHELL:-}" && -z "${DEVCONTAINER_ACTIVE:-}" ]]; then
 fi
 
 log "worktree: ${REPO_ROOT}"
+
+# ── SELF-TEST: teardown must survive an unrelated `revkit.js serve` ─────
+# Round-6 blocker regression test. On PR #42 head 6b90ac9, a decoy
+# process whose argv matched `revkit.js serve` — even one belonging to
+# a completely unrelated codebase, or one someone started for a
+# neighbouring worktree — killed this script's cleanup partway
+# through. The last statement of `daemons_rooted_at_state` was a
+# `[[ … ]] && printf …`, which returned 1 on the final non-matching
+# pid, and under `set -e` that propagated up and terminated the trap.
+# Fix: `cleanup` does `set +e`; `daemons_rooted_at_state` uses an
+# explicit `if` and ends with `return 0`.
+#
+# The self-test starts a real decoy (a harmless `sleep` with argv[0]
+# rewritten to look like `bun /somewhere/revkit.js serve`), then
+# triggers an immediate `exit 0` so the trap runs. Cleanup must
+# reach `teardown complete` in the log; the self-test verifies that
+# from OUTSIDE (or a reviewer greps the log by hand).
+if [[ "${DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY:-0}" == "1" ]]; then
+  # Some minimal state so cleanup has something to look at.
+  STATE_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/revkit-dogfood-selftest-XXXXXX")"
+  # Start a decoy whose argv matches the pgrep pattern in
+  # daemons_rooted_at_state (`revkit\.js serve`) but whose cwd is NOT
+  # STATE_DIR (so the pattern-match hits, the cwd filter misses, and
+  # the loop body's `[[ … ]]` is false on that iteration — exactly the
+  # RED case). We rewrite argv[0] with `exec -a` and run `/usr/bin/sleep`
+  # so no file changes and nothing harmful ever runs.
+  bash -c 'exec -a "bun /nonexistent/packages/cli/bin/revkit.js serve --dir /nonexistent/dist" /usr/bin/sleep 60' >/dev/null 2>&1 &
+  SELFTEST_DECOY_PID=$!
+  disown "${SELFTEST_DECOY_PID}" 2>/dev/null || true
+  # Give the decoy a beat to be visible via pgrep.
+  sleep 0.5
+  log "SELFTEST-TEARDOWN: started decoy pid ${SELFTEST_DECOY_PID} (matches pgrep 'revkit.js serve'; cwd unrelated to STATE_DIR)"
+  log "SELFTEST-TEARDOWN: triggering exit — the EXIT trap must run all of cleanup and reach 'teardown complete'"
+  # exit 0 → trap → cleanup. If cleanup completes fully, the log ends
+  # with "teardown complete". If the round-6 bug is present, the log
+  # stops mid-cleanup and the assertion outside sees no such line.
+  exit 0
+fi
 
 # ── step 1: bun install (idempotent, cheap when up to date) ─────────────
 if [[ ! -d "${REPO_ROOT}/node_modules/.bun" ]]; then
@@ -1114,103 +1191,126 @@ fi
 # ADR-0007 wants: channel content is untrusted).
 
 # ── step 10: EMPIRICAL isolation checks ─────────────────────────────────
-# Round-5 blocker: verify that the owner's settings really did not
-# leak into the test session. Three independent proofs, all hard
-# failures. If any one of these fires, the isolation as-configured is
-# incomplete and the harness has NOT proven what it claims to.
-
-# 10a. Owner's statusLine did NOT render in the test pane's footer.
-#      A user-configured statusLine typically emits a branch marker
-#      (`⑂`), context progress bars (`▓░`), or `ctx `/`5h `/`7d ` uptime
-#      indicators. A bare `⏵⏵ don't ask on … · ← for agents` footer
-#      is what a session with NO statusLine setting produces.
-STATUSLINE_MARKERS=('⑂' '5h ▓' '7d ▓' 'ctx ▓' 'ctx ░')
-require_no_owner_statusline() {
-  local screen
-  screen="$(flk agent read "${PANE_ID}" --lines 400 2>/dev/null | jq -r '.result.read.text // ""')"
-  local m
-  for m in "${STATUSLINE_MARKERS[@]}"; do
-    if grep -qF "${m}" <<<"${screen}"; then
-      log "ISOLATION FAIL: pane footer contains statusline marker '${m}' — owner's statusLine leaked"
-      return 1
-    fi
-  done
-  log "isolation proof (statusline): pane has NO owner-statusline markers — good"
-  return 0
-}
-
-# 10b. No SessionStart / UserPromptSubmit / other hook fired in the
-#      test pane. `flk hook` output labels itself; a `settings.json`
-#      hook that ran anything would leave shell output (or `[hook: `,
-#      or `SessionStart`) somewhere in the pane read.
-HOOK_MARKERS=('[hook:' 'SessionStart' 'UserPromptSubmit' 'PreToolUse' 'PostToolUse' 'Stop hook')
-require_no_hooks_fired() {
-  local screen
-  screen="$(flk agent read "${PANE_ID}" --lines 400 2>/dev/null | jq -r '.result.read.text // ""')"
-  local m
-  for m in "${HOOK_MARKERS[@]}"; do
-    if grep -qF "${m}" <<<"${screen}"; then
-      log "ISOLATION FAIL: pane contains hook marker '${m}' — owner's hook leaked"
-      return 1
-    fi
-  done
-  log "isolation proof (hooks): pane has NO hook-fire markers — good"
-  return 0
-}
-
-# 10c. The test agent's transcript does NOT include the owner's
-#      global CLAUDE.md. Claude Code writes per-project transcripts
-#      as JSONL under `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl`.
-#      Grep those files for a distinctive phrase from the owner's
-#      global CLAUDE.md (`Global Claude preferences`). If it's there
-#      the `instructionFiles: "managed-only"` setting didn't take
-#      effect and the isolation is incomplete.
+# Round-5 established the checks; round-6 tightened them per the reviewer:
 #
-#      We derive the marker at RUN time from the owner's actual
-#      CLAUDE.md file (if present) so this check works on any
-#      machine, but require the file exist and be non-empty to
-#      derive a non-trivial substring — if the owner has no global
-#      CLAUDE.md, there's nothing to leak and we short-circuit.
+#   - Statusline marker grep DROPPED. It was owner-specific (targeted
+#     the reviewer's own statusLine template) and duplicated what
+#     the /proc cmdline check already guarantees. The pre-launch
+#     verification of `--setting-sources ""` + `--settings <ours>`
+#     already proves that no settings-driven statusLine can fire.
+#
+#   - Hook-marker pane grep REPLACED with `flk`-authoritative evidence:
+#     the test agent's `agent_session` field must stay null for the
+#     whole run. flk sets `agent_session` when a claude session-start
+#     hook reports its session id back through the flock socket; a
+#     null value across `flk agent list` for our test agent means no
+#     such hook fired. This is the exact signal the reviewer verified
+#     manually — codifying it turns their observation into a per-run
+#     assertion.
+#
+#   - CLAUDE.md fingerprint check now:
+#     - HARD FAILS when the transcript dir is missing (a run that
+#       posted a comment and got a reply MUST have a transcript;
+#       missing dir means we cannot verify no leak, and "cannot
+#       verify" fails closed);
+#     - matches SEVERAL short, quote-free phrases from the owner's
+#       CLAUDE.md instead of one long line (long lines often carry
+#       apostrophes and dashes that trip grep, or match by accident
+#       in unrelated prose).
+
+# 10a. `agent_session` for our test agent must stay null.
+require_agent_session_null() {
+  local agent_json session
+  agent_json="$(flk agent list 2>/dev/null | jq -c --arg n "${AGENT_NAME}" \
+    '.result.agents[] | select(.name == $n)' 2>/dev/null || true)"
+  if [[ -z "${agent_json}" ]]; then
+    # Fallback: pane-id lookup (in case name matching lost the row).
+    if [[ -n "${PANE_ID}" ]]; then
+      agent_json="$(flk agent list 2>/dev/null | jq -c --arg p "${PANE_ID}" \
+        '.result.agents[] | select(.pane_id == $p)' 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "${agent_json}" ]]; then
+    log "ISOLATION FAIL: could not read the test agent's flk state; agent_session unknown, treating as fail"
+    return 1
+  fi
+  session="$(printf '%s' "${agent_json}" | jq -r '.agent_session // "null"' 2>/dev/null || echo "null")"
+  if [[ "${session}" != "null" ]]; then
+    log "ISOLATION FAIL: flk agent_session is set for the test agent (value: ${session}) — a session-start hook fired, so owner hooks leaked"
+    return 1
+  fi
+  log "isolation proof (hooks): flk agent_session is null for the test agent — no owner hook fired"
+  return 0
+}
+
+# 10b. Owner's global CLAUDE.md must not be in the transcript.
+#      Matches SEVERAL short, quote-free phrases from CLAUDE.md;
+#      requires the transcript dir to exist (fail closed if missing).
 require_no_owner_claudemd_in_transcript() {
   local owner_claudemd="${CLAUDE_CONFIG_DIR_VAL}/CLAUDE.md"
   if [[ ! -s "${owner_claudemd}" ]]; then
     log "isolation proof (CLAUDE.md): owner has no global CLAUDE.md at ${owner_claudemd} — nothing to leak"
     return 0
   fi
-  # Take the first non-empty, non-heading line as our fingerprint.
-  # Trim to <= 120 chars to keep the grep argument short. If the
-  # first non-heading line is very short (<20 chars) prefer the
-  # first heading, since a short line is more likely to appear in
-  # unrelated prose.
-  local marker
-  marker="$(grep -m 1 -E '^[^#[:space:]].{20,}' "${owner_claudemd}" 2>/dev/null | head -c 120 || true)"
-  if [[ -z "${marker}" ]]; then
-    marker="$(head -n 1 "${owner_claudemd}" 2>/dev/null | head -c 120 || true)"
-  fi
-  if [[ -z "${marker}" ]]; then
-    log "isolation proof (CLAUDE.md): owner's CLAUDE.md is unreadable / empty; skipping transcript check"
+  # Extract UP TO 6 quote-free, ASCII-safe fingerprint phrases from
+  # the owner's CLAUDE.md. We look at the first 60 chars of each
+  # non-heading line that has at least 30 chars of grep-safe content
+  # in that prefix — quote-free (no `'`, `"`, backtick, `\`, `/`, `=`,
+  # `$`) so the fixed-string grep sees clean text and no shell
+  # escapes trip over anything. Six independent short phrases beat
+  # one long line: a single-line hit could be an accident of prose;
+  # matching two or more from CLAUDE.md is a strong signal.
+  local phrases=()
+  while IFS= read -r line; do
+    [[ -z "${line}" ]] && continue
+    [[ "${line}" =~ ^\# ]] && continue          # skip Markdown headings
+    # Trim leading list markers so the phrase starts on the content.
+    local content="${line#[-*] }"
+    content="${content#[[:space:]]*}"
+    # Take first 60 characters as the candidate.
+    local prefix="${content:0:60}"
+    # Reject any prefix that contains a shell-escape-hostile character.
+    if [[ "${prefix}" =~ [\'\"\`\\/=$\<\>] ]]; then continue; fi
+    # Length of the safe prefix.
+    (( ${#prefix} >= 30 )) || continue
+    phrases+=("${prefix}")
+    (( ${#phrases[@]} >= 6 )) && break
+  done < "${owner_claudemd}"
+  if (( ${#phrases[@]} == 0 )); then
+    log "isolation proof (CLAUDE.md): could not extract any quote-free short phrases from ${owner_claudemd}; skipping transcript check"
     return 0
   fi
   local run_slug="${STATE_DIR//\//-}"
   local project_dir="${CLAUDE_CONFIG_DIR_VAL}/projects/${run_slug}"
+  # Round-6 nit: FAIL closed if the transcript dir is missing. A run
+  # that got as far as the isolation-check step must have written a
+  # transcript; a missing dir means we cannot verify no leak.
   if [[ ! -d "${project_dir}" ]]; then
-    log "isolation proof (CLAUDE.md): profile dir ${project_dir} does not exist — nothing to grep, session may have been so short no transcript was written"
-    return 0
-  fi
-  local hits
-  hits="$(grep -lF "${marker}" "${project_dir}"/*.jsonl 2>/dev/null | head -3 || true)"
-  if [[ -n "${hits}" ]]; then
-    log "ISOLATION FAIL: owner's global CLAUDE.md marker present in transcript file(s):"
-    printf '%s\n' "${hits}" | log_block "transcript-hit" || true
+    log "ISOLATION FAIL: profile dir ${project_dir} does not exist post-run; cannot verify no owner-CLAUDE.md leak"
     return 1
   fi
-  log "isolation proof (CLAUDE.md): transcript files under ${project_dir} do NOT contain the owner's CLAUDE.md marker — good"
+  local matches
+  matches="$(find "${project_dir}" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | head -5 || true)"
+  if [[ -z "${matches}" ]]; then
+    log "ISOLATION FAIL: no *.jsonl transcript under ${project_dir}; cannot verify no owner-CLAUDE.md leak"
+    return 1
+  fi
+  local phrase
+  for phrase in "${phrases[@]}"; do
+    local hits
+    hits="$(grep -lF "${phrase}" "${project_dir}"/*.jsonl 2>/dev/null || true)"
+    if [[ -n "${hits}" ]]; then
+      log "ISOLATION FAIL: owner CLAUDE.md phrase '${phrase}' present in transcript file(s):"
+      printf '%s\n' "${hits}" | log_block "transcript-hit" || true
+      return 1
+    fi
+  done
+  log "isolation proof (CLAUDE.md): ${#phrases[@]} distinct phrases from ${owner_claudemd} — none found in ${project_dir}/*.jsonl — good"
   return 0
 }
 
 isolation_bad=0
-require_no_owner_statusline    || isolation_bad=1
-require_no_hooks_fired         || isolation_bad=1
+require_agent_session_null              || isolation_bad=1
 require_no_owner_claudemd_in_transcript || isolation_bad=1
 if [[ ${isolation_bad} -ne 0 ]]; then
   die "isolation proof failed — the test agent inherited some part of the owner's Claude profile despite --setting-sources '' + --settings <state>/settings.json"

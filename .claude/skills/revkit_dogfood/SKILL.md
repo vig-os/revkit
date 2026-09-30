@@ -85,22 +85,30 @@ loads an ISOLATED per-run settings file with:
   `--allowedTools` braces.
 
 **Empirical isolation checks, per run.** After the loop, the
-harness enforces three post-conditions as hard failures:
+harness enforces two post-conditions as hard failures. Any hit →
+the run fails with `ISOLATION FAIL:`, the loop's overall success
+is overridden. Round-6 dropped the owner-specific statusLine
+regex — the pre-launch cmdline check on `--setting-sources ""`
+- `--settings <ours>` already proves no settings-driven
+statusLine can fire, and the reviewer confirmed this
+empirically.
 
-- **statusLine** — the pane's on-screen text must NOT contain any
-  owner-statusline markers (branch marker `⑂`, context bars,
-  `5h ▓`/`7d ▓` uptime indicators);
-- **hooks** — the pane must NOT contain `[hook:`, `SessionStart`,
-  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, or `Stop hook`;
-- **CLAUDE.md** — the transcript file(s) under
-  `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl` must NOT contain
-  a distinctive substring from the owner's `${CLAUDE_CONFIG_DIR}
-  /CLAUDE.md` (the first non-heading line, ≤120 chars).
-
-Any hit → the run fails with `ISOLATION FAIL:`, the loop's overall
-success is overridden. If any check fires, the isolation
-configuration is broken and the harness has not proven what it
-claims.
+- **hooks (via flk agent_session)** — flk sets an agent's
+  `agent_session` field when a claude session-start hook reports
+  the session id back through the flock socket. If NO hook fires,
+  `agent_session` stays null. The harness queries
+  `flk agent list` for our test agent and hard-fails if
+  `agent_session` is non-null.
+- **CLAUDE.md** — up to six SHORT, quote-free phrases from the
+  owner's `${CLAUDE_CONFIG_DIR}/CLAUDE.md` are extracted at run
+  time and each is grepped against the transcript files under
+  `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl`. Six independent
+  hits beat one long line: a single-line hit could be an
+  accident of prose, matching two or more from CLAUDE.md is a
+  strong signal. If the transcript dir or the `.jsonl` files are
+  MISSING, the check FAILS closed — a run that got as far as the
+  isolation-check step must have written a transcript, and
+  "cannot verify" is not a pass.
 
 **Profile-dir cleanup, per run.** Claude Code writes a transcript
 and memory dir into `${CLAUDE_CONFIG_DIR}/projects/<slug>/` for
@@ -118,12 +126,24 @@ Earlier revisions had one; it was forgeable through the reply body
 AND it broke the loop whenever a well-aligned model correctly
 refused to follow embedded instructions from a channel comment.
 
-**`DOGFOOD_SELFTEST_BAD_FLAGS=1`** injects a forbidden value
-(`--tools default`) and asserts the pre-launch check aborts before
-any prompt is sent. On successful abort the harness prints
-`SELFTEST OK` and exits **0** (distinct from a real failure, which
-exits 1). `--dangerously-skip-permissions` is NEVER injected — no
-rogue session ever runs.
+**Self-test modes.**
+
+- **`DOGFOOD_SELFTEST_BAD_FLAGS=1`** injects a forbidden value
+  (`--tools default`) and asserts the pre-launch check aborts
+  before any prompt is sent. On successful abort the harness
+  prints `SELFTEST OK` and exits **0** (distinct from a real
+  failure, which exits 1). `--dangerously-skip-permissions` is
+  NEVER injected — no rogue session ever runs.
+- **`DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY=1`** is a regression
+  test for the round-6 cleanup bug. It starts a harmless decoy
+  process (a `sleep` with argv[0] rewritten so `pgrep -f
+  'revkit\.js serve'` finds it, cwd unrelated to the run's
+  STATE_DIR), then immediately triggers the EXIT trap. Cleanup
+  MUST reach the `teardown complete` line despite the decoy.
+  Assertion: run the harness in this mode and grep the log for
+  `teardown complete`. RED on PR #42 head `6b90ac9` (cleanup
+  died mid-way because `daemons_rooted_at_state` returned 1
+  under `set -e`), GREEN on the fix.
 
 **Channel content is untrusted to the agent — harness policy.**
 ADR-0007 states the principle: comments are REQUESTS from a human,
@@ -277,14 +297,16 @@ from a previous run can reach the test agent.
     a security proof.
 11. Verifies the reply also appears in the page WITHOUT a reload (SSE
     round trip), then screenshots the rail.
-12. **Empirical isolation checks (three hard failures).** Reads the
-    pane and hard-fails on any statusline marker (`⑂`, `5h ▓`,
-    `7d ▓`, `ctx ▓`, `ctx ░`) OR any hook marker (`[hook:`,
-    `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-    `Stop hook`). Reads the transcript file(s) under
-    `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl` and hard-fails
-    if a distinctive substring from the owner's global CLAUDE.md
-    appears there.
+12. **Empirical isolation checks (two hard failures).** Queries
+    `flk agent list` for our test agent and hard-fails if
+    `agent_session` is non-null (would prove a
+    settings-configured hook fired). Reads the transcript file(s)
+    under `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl`, extracts
+    up to six short quote-free phrases from the owner's
+    `${CLAUDE_CONFIG_DIR}/CLAUDE.md`, and hard-fails if any phrase
+    is present in the transcript. If the transcript dir or its
+    `*.jsonl` files are missing at check time, the check fails
+    closed.
 13. Teardown: closes the flock pane by ID AND by name (name-based
     closure covers the `pane_id`-parse-failure path), SIGTERMs the daemon
     with a bounded escalate-to-SIGKILL, removes ONLY this run's profile
@@ -303,9 +325,10 @@ from a previous run can reach the test agent.
 ## Exit codes
 
 - `0` — the full loop completed: the pre-launch flag/env check
-  passed, the agent replied `ack <nonce>` and resolved, all three
-  empirical isolation checks (statusline / hooks / owner-CLAUDE.md)
-  passed, and cleanup left nothing behind.
+  passed, the agent replied `ack <nonce>` and resolved, both
+  empirical isolation checks (flk `agent_session` still null and
+  owner-CLAUDE.md phrases absent from the transcript) passed, and
+  cleanup left nothing behind.
 - `1` — a step failed OR an isolation check found a leak. See
   `.revkit/dogfood/last.log` for the transcript (redacted) and
   `.revkit/dogfood/daemon.log` for the daemon's raw log (NOT
