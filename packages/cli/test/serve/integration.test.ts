@@ -99,6 +99,11 @@ async function startCtx(overrides: { launchCodeTtlMs?: number; sqlitePath?: stri
   const outside = join(root, "outside");
   mkdirSync(outside, { recursive: true });
   writeFileSync(join(outside, "secret.txt"), "SECRET");
+  // Seed a source file at the path every test anchor points at, so
+  // the daemon's server-side revision computation (PR #38 review)
+  // can `readFileSync` it and produce a real revision.
+  mkdirSync(join(root, "docs", "adr"), { recursive: true });
+  writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nquestion body\nwhy 30s?\nsecond line\n");
   const logs: string[] = [];
   const sink: LineSink = { write: (line) => logs.push(line) };
   const handle = await startDaemon({
@@ -384,6 +389,34 @@ describe("revkit serve — security", () => {
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toContain("text/event-stream");
       await response.body?.cancel();
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts a bearer-authenticated POST with NO Origin header (browser-less caller)", async () => {
+    // `revkit mcp` is a subprocess with no browser envelope. Its
+    // credential is the bearer token; missing Origin should not
+    // reject it — the Origin check exists to catch browsers, and a
+    // browser always attaches Origin. A malformed body still 400s,
+    // proving the request reached the API branch (i.e. passed the
+    // Origin/Sec-Fetch guards).
+    const ctx = await startCtx();
+    try {
+      const response = await fetch(ctx.handle.url + "/api/threads", {
+        method: "POST",
+        headers: {
+          // NOTE: no `origin` header.
+          host: `127.0.0.1:${ctx.handle.port}`,
+          authorization: `Bearer ${ctx.handle.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      // Reached the API branch: 400 (invalid body), not 403 (Origin
+      // rejected).
+      expect(response.status).toBe(400);
     } finally {
       await ctx.handle.stop();
       rmSync(ctx.root, { recursive: true, force: true });

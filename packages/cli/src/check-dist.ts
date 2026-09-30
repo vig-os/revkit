@@ -21,6 +21,7 @@ import { extname, join, relative } from "node:path";
 import { parse as parse5Parse } from "parse5";
 import type { Diagnostic } from "./diagnostics.ts";
 import ALLOWLIST_JSON from "./dist-check-allowlist.json" with { type: "json" };
+import { parseDataSrc } from "./data-src-format.ts";
 import {
   ALLOWED_SVG_ATTRIBUTES,
   ALLOWED_SVG_ELEMENTS,
@@ -560,6 +561,21 @@ export function scanDocument(document: ParseTreeNode, reportPath: string): Check
       if (lower === "style") {
         const styleFinding = styleAttrFinding(tagName, attrValue);
         if (styleFinding !== null) findings.push({ file: reportPath, message: styleFinding });
+      }
+      // `data-src` value format check — every stamped attribute
+      // must parse to `<repo-relative path>:<startLine>-<endLine>`
+      // with a valid path (no `..`, no absolute prefix, no `:`
+      // in the path, etc). A malformed value would either fail
+      // the rail's parser (a dead anchor) or point at a file
+      // outside the repo (a leaked absolute path in the built
+      // output). PR #38 review.
+      if (lower === "data-src") {
+        if (parseDataSrc(attrValue) === undefined) {
+          findings.push({
+            file: reportPath,
+            message: `<${tagName} data-src=${JSON.stringify(attrValue)}> — value does not parse as '<repo-relative path>:<startLine>-<endLine>'.`,
+          });
+        }
       }
     }
 

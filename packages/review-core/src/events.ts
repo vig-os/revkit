@@ -43,6 +43,7 @@ import { z } from "zod";
 import { anchorSchema } from "./anchor.ts";
 import { askAnswerSchema, askSchema } from "./asks.ts";
 import { authorSchema } from "./author.ts";
+import { idSchema } from "./id.ts";
 import { SHA256_HEX_REGEX } from "./revision.ts";
 import { externalRefSchema } from "./thread.ts";
 import { isoTimestamp } from "./timestamp.ts";
@@ -62,35 +63,35 @@ const envelope = {
  * apart. */
 const commentCreatedPayload = {
   kind: z.literal("comment.created"),
-  threadId: z.string().min(1),
-  commentId: z.string().min(1),
+  threadId: idSchema,
+  commentId: idSchema,
   anchor: anchorSchema,
   body: z.string().min(1),
 } as const;
 
 const commentRepliedPayload = {
   kind: z.literal("comment.replied"),
-  threadId: z.string().min(1),
-  commentId: z.string().min(1),
-  parentId: z.string().min(1),
+  threadId: idSchema,
+  commentId: idSchema,
+  parentId: idSchema,
   body: z.string().min(1),
 } as const;
 
 const threadResolvedPayload = {
   kind: z.literal("thread.resolved"),
-  threadId: z.string().min(1),
+  threadId: idSchema,
   resolution: z.string().min(1).optional(),
 } as const;
 
 const threadReopenedPayload = {
   kind: z.literal("thread.reopened"),
-  threadId: z.string().min(1),
+  threadId: idSchema,
   reason: z.string().min(1).optional(),
 } as const;
 
 const handoverPayload = {
   kind: z.literal("handover"),
-  commentIds: z.array(z.string().min(1)).min(1),
+  commentIds: z.array(idSchema).min(1),
   revision: z
     .string()
     .regex(SHA256_HEX_REGEX, "handover.revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
@@ -111,20 +112,20 @@ const presencePayload = {
 
 const askCreatedPayload = {
   kind: z.literal("ask.created"),
-  askId: z.string().min(1),
+  askId: idSchema,
   spec: askSchema,
   url: z.string().min(1).optional(),
 } as const;
 
 const askAnsweredPayload = {
   kind: z.literal("ask.answered"),
-  askId: z.string().min(1),
+  askId: idSchema,
   answer: askAnswerSchema,
 } as const;
 
 const commentLinkedPayload = {
   kind: z.literal("comment.linked"),
-  commentId: z.string().min(1),
+  commentId: idSchema,
   external: externalRefSchema,
 } as const;
 

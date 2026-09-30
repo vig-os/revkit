@@ -28,13 +28,19 @@ import { dirname, extname, relative as relativePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
 import {
+  isValidId,
+  revisionOf,
   threadStatusSchema,
+  type Anchor,
   type Author,
   type ReviewEvent,
   type ReviewEventInput,
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
+import { readFileSync as readFileSyncNode, realpathSync as realpathSyncNode, statSync as statSyncNode } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+import { resolveWithinRoot as resolveWithinRootStrict } from "./confined-path.ts";
 import { openStaticServer } from "./static-server.ts";
 import { contentTypeForExtension } from "./mime.ts";
 import {
@@ -48,6 +54,8 @@ import {
   setCookieHeader,
 } from "./auth.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
+import { buildRailBundle } from "../rail/bundle.ts";
+import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
 import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
@@ -432,6 +440,35 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return response;
     }
 
+    // Fresh launch-code mint (PR #38 round-2 blocker 3). The startup
+    // launch code has a 60 s TTL; an auto-started daemon (spawned
+    // by `revkit mcp`) prints it to a stdout the parent ignored, so
+    // no human ever sees it. This endpoint lets a caller with the
+    // agent bearer mint a NEW single-use code so it can hand the
+    // human a fresh URL. Bearer-authed only, exact Host check
+    // already applied above, no cookie path.
+    if (method === "POST" && url.pathname === "/-/launch-code") {
+      const bearer = bearerFromHeader(request.headers.get("authorization"));
+      if (bearer === undefined || !auth.isAgent(bearer)) {
+        logger.warn("launch-code.rejected.auth", { requestId });
+        return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
+      }
+      const minted = auth.mintLaunchCode();
+      const launchUrl = `${boundUrl}/-/auth?code=${minted.value}`;
+      const body = JSON.stringify({
+        launchCode: minted.value,
+        launchUrl,
+        ttlMs: options.launchCodeTtlMs ?? 60_000,
+      });
+      logger.info("launch-code.minted", { requestId });
+      const response = new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+      response.headers.set("x-content-type-options", "nosniff");
+      return response;
+    }
+
     // `/events` — SSE by default, WebSocket on upgrade. Origin check
     // runs inside the handler after we know which credential the
     // caller presented (a bearer-authenticated non-browser client may
@@ -445,6 +482,18 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // the handler.
     if (url.pathname === "/api/threads" || url.pathname.startsWith("/api/threads/")) {
       return handleApi(request, url, method, requestId);
+    }
+
+    // Rail bundle — served from memory (built with `Bun.build` on
+    // first request, cached forever). The rail is opt-in by the
+    // page: the daemon's HTMLRewriter appends
+    // `<script type="module" src="/-/rail.js"></script>` to every
+    // static HTML response's `<head>`. Rail assets are public (no
+    // user data), so no cookie or Origin check runs here — same
+    // stance as the static branch below.
+    if (url.pathname === RAIL_JS_PATH || url.pathname === RAIL_CSS_PATH) {
+      if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
+      return handleRailAsset(url, method, requestId);
     }
 
     // Static files. GET / HEAD only. Static output is public — no
@@ -535,14 +584,65 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
     }
     logger.info("auth.exchange.ok", { requestId });
+    // Deep-link target. The MCP `review_url` tool sets `?next=<path>`
+    // so the browser lands on a specific page (an ADR, a design)
+    // after the login redirect. Guard against open-redirect:
+    // accept `next` ONLY if it is a same-origin relative path
+    // (single leading `/`, no `//`, no `\`, no scheme, no control
+    // chars, resolves inside the served dir). Otherwise fall back
+    // to `/`.
+    const nextParam = url.searchParams.get("next");
+    const location = safeNextRedirect(nextParam) ?? "/";
     const response = new Response(null, {
       status: 302,
       headers: {
-        location: "/",
+        location,
         "set-cookie": setCookieHeader(cookieName(port), outcome.cookie),
       },
     });
     return withHygiene(response, undefined);
+  }
+
+  /** Validate a `next=` value for the auth redirect. Returns the
+   * accepted path (leading slash, no query, no fragment) or
+   * undefined if the value is unsafe. Rules:
+   *
+   *   - `next` must not be null.
+   *   - After percent-decoding (which the URL parser has done for
+   *     us since we read via `searchParams.get`), the value must
+   *     start with a SINGLE `/`, must not start with `//` (protocol-
+   *     relative), must not start with `/\` (Windows path or
+   *     escape), must not contain a scheme (`:` before `/`), must
+   *     not contain a backslash or a control character, and its
+   *     resolved absolute path (via `staticServer.resolve`) must
+   *     land under the served dir.
+   *
+   * Test coverage in `test/serve/launch-code.test.ts` (round-3). */
+  function safeNextRedirect(next: string | null): string | undefined {
+    if (next === null) return undefined;
+    if (!next.startsWith("/")) return undefined;
+    if (next.startsWith("//")) return undefined;
+    if (next.startsWith("/\\")) return undefined;
+    if (next.includes("\\")) return undefined;
+    for (let i = 0; i < next.length; i++) {
+      const cc = next.charCodeAt(i);
+      if (cc < 0x20 || cc === 0x7f) return undefined;
+    }
+    // Reject a scheme-shaped prefix that URL parsing may have left
+    // in an already-percent-decoded value. `javascript:` /
+    // `https:` don't start with `/`; a value like
+    // `/x?u=javascript:alert(1)` would still pass here because
+    // we resolve on the pathname only.
+    if (/^\/[a-z][a-z0-9+.-]*:/i.test(next)) return undefined;
+    // Take the pathname component only — drop query / fragment
+    // that a URL parser might have kept.
+    const pathOnly = next.split("?")[0]!.split("#")[0]!;
+    // Resolve inside the served dir.
+    const resolved = staticServer.resolve(pathOnly);
+    if (!resolved.ok) return undefined;
+    // Rebuild the redirect target from the (URL-safe) pathname,
+    // preserving any query the caller included.
+    return next;
   }
 
   // ── API branch ────────────────────────────────────────────────────
@@ -594,6 +694,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const parsed = createThreadRequestSchema.safeParse(bodyRead.value);
       if (!parsed.success) return badRequest(parsed.error.issues);
       if (!enforceCommentBodyLimit(parsed.data.body)) return payloadTooLarge();
+      // Anchor authority: the daemon (a) confirms the source file
+      // exists under the repo root (containment prevents an anchor
+      // to `/etc/passwd` or `../outside/file`) and (b) OVERRIDES
+      // the client-supplied `revision` with `revisionOf(source)`.
+      // Re-anchoring (M2 item 5) depends on the revision matching
+      // the actual file bytes at thread creation, so a client
+      // value (rail's textContent hash) would fail the pipeline
+      // silently. PR #38 review.
+      const anchorResolution = await resolveAnchorSource(parsed.data.anchor, options.repoRoot);
+      if (!anchorResolution.ok) {
+        return badRequest([{ code: "custom", path: ["anchor", "path"], message: anchorResolution.reason }]);
+      }
+      const anchorWithServerRevision: Anchor = {
+        ...parsed.data.anchor,
+        revision: anchorResolution.revision,
+      };
       const threadId = parsed.data.threadId ?? randomUUID();
       const commentId = parsed.data.commentId ?? randomUUID();
       const input: ReviewEventInput = {
@@ -601,7 +717,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         actor,
         threadId,
         commentId,
-        anchor: parsed.data.anchor,
+        anchor: anchorWithServerRevision,
         body: parsed.data.body,
       };
       return await appendAndReturn(input, requestId, { threadId, commentId });
@@ -618,6 +734,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         threadId = decodeURIComponent(match[1] ?? "");
       } catch {
         return badRequest([{ code: "custom", path: ["threadId"], message: "invalid percent-encoding" }]);
+      }
+      // Structural id check on the URL path (PR #38 review):
+      // review-core's `idSchema` refuses `<`, `>`, `"`, etc.
+      if (!isValidId(threadId)) {
+        return badRequest([{ code: "custom", path: ["threadId"], message: "identifier fails idSchema" }]);
       }
       const kind = match[2];
       const bodyRead = await readCappedJsonBody(request);
@@ -893,7 +1014,53 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response(null, { status: 200, headers: { "content-length": String(size) } }), contentType);
     }
     const body = Bun.file(result.absolutePath);
-    return withHygiene(new Response(body, { status: 200 }), contentType);
+    const rawResponse = withHygiene(new Response(body, { status: 200 }), contentType);
+    // Only HTML responses get the rail injected; a JS asset, CSS,
+    // JSON, or image is served untouched. `injectRail` materialises
+    // the body before feeding it to `HTMLRewriter` — a Bun 1.3.13
+    // `Bun.file()` body handed straight to `.transform()` hangs when
+    // `Bun.serve` tries to write it (the socket sits waiting on a
+    // never-flushed stream). Buffering is cheap for HTML: even a
+    // large Astro page is a few hundred KiB.
+    if (contentType.startsWith("text/html")) {
+      return await injectRail(rawResponse, {
+        onOversize: (bodyBytes: number) => {
+          logger.warn("static.rail.skipped-oversize", {
+            requestId,
+            path: decodedPath,
+            bytes: bodyBytes,
+          });
+        },
+      });
+    }
+    return rawResponse;
+  }
+
+  /** Serve the rail bundle (`/-/rail.js` and `/-/rail.css`). Built
+   * once with `Bun.build` on first request, then held in memory for
+   * the daemon's lifetime — the bundle is deterministic in the
+   * package's source tree. */
+  async function handleRailAsset(url: URL, method: string, requestId: string): Promise<Response> {
+    let bundle;
+    try {
+      bundle = await buildRailBundle();
+    } catch (error) {
+      logger.error("rail.build.failed", { requestId, errorKind: (error as Error).name });
+      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text/plain; charset=utf-8");
+    }
+    const isJs = url.pathname === RAIL_JS_PATH;
+    const body = isJs ? bundle.js : bundle.css;
+    const contentType = isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";
+    if (method === "HEAD") {
+      return withHygiene(
+        new Response(null, { status: 200, headers: { "content-length": String(body.byteLength) } }),
+        contentType,
+      );
+    }
+    // `body` is a `Uint8Array`; `new Response(body)` widens through
+    // `BodyInit` — a cast keeps TS's stricter DOM types happy without
+    // a runtime copy.
+    return withHygiene(new Response(body as BodyInit, { status: 200 }), contentType);
   }
 
   /** Attach the response-hygiene headers every response carries:
@@ -993,4 +1160,56 @@ function payloadTooLarge(): Response {
   });
   response.headers.set("x-content-type-options", "nosniff");
   return response;
+}
+
+/** Cap on a source file the daemon will read to compute a
+ * revision. 5 MiB is comfortable for even the largest reasonable
+ * document; a file over the cap gets the same generic
+ * "anchor.path is not a valid anchor target" refusal (below) so
+ * the daemon does not become an oracle for which oversized files
+ * exist in the repo. (PR #38 round-2 review.) */
+const ANCHOR_SOURCE_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Resolve an anchor's `path` under the repo root, confirm the file
+ * exists, and return `revisionOf(sourceContents)`.
+ *
+ * Uses the shared `resolveWithinRoot` confinement helper (realpath +
+ * lstat, refuses symlinks that escape the repo) so a hostile anchor
+ * cannot chase a symlink into `/etc`. Path shape is already checked
+ * by `anchorPathSchema`; this step adds the filesystem containment,
+ * a size cap, and revision computation.
+ *
+ * Every rejection returns the SAME `reason` string ("anchor.path is
+ * not a valid anchor target in the repository") so the response
+ * body cannot be used to distinguish "missing file", "over cap", or
+ * "symlink escape" — a caller either has the file or does not.
+ * (PR #38 round-2 review.) */
+export async function resolveAnchorSource(
+  anchor: Anchor,
+  repoRoot: string,
+): Promise<{ ok: true; revision: string } | { ok: false; reason: string }> {
+  const UNIFORM_REJECTION = "anchor.path is not a valid anchor target in the repository";
+  // Use the shared confinement helper: it realpaths the root and
+  // refuses `..`, symlinks that escape, and non-file entries.
+  const rootReal = realpathSyncNode(resolvePath(repoRoot));
+  const resolved = resolveWithinRootStrict(rootReal, "/" + anchor.path);
+  if (!resolved.ok) return { ok: false, reason: UNIFORM_REJECTION };
+  let stat;
+  try {
+    stat = statSyncNode(resolved.absolutePath);
+  } catch {
+    return { ok: false, reason: UNIFORM_REJECTION };
+  }
+  if (!stat.isFile()) return { ok: false, reason: UNIFORM_REJECTION };
+  if (stat.size > ANCHOR_SOURCE_MAX_BYTES) {
+    return { ok: false, reason: UNIFORM_REJECTION };
+  }
+  let contents: string;
+  try {
+    contents = readFileSyncNode(resolved.absolutePath, "utf8");
+  } catch {
+    return { ok: false, reason: UNIFORM_REJECTION };
+  }
+  const revision = await revisionOf(contents);
+  return { ok: true, revision };
 }

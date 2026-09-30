@@ -37,6 +37,7 @@ export interface LogFields {
   readonly version?: string;
   readonly pid?: number;
   readonly errorKind?: string;
+  readonly bytes?: number;
 }
 
 /** A tiny writer interface so tests can inject a buffer. Node's

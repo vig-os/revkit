@@ -129,19 +129,13 @@ function extractStatus(body: string): string | undefined {
   return undefined;
 }
 
-/** Strip the leading `# <title>` line (and any blank lines that follow) so
- * Starlight's own heading doesn't render twice — its layout renders the
- * title from frontmatter above the body. */
-function stripLeadingHeading(body: string): string {
-  const lines = body.split(/\r?\n/);
-  let index = 0;
-  while (index < lines.length && lines[index].trim() === "") index += 1;
-  if (index < lines.length && /^#\s+/.test(lines[index])) {
-    index += 1;
-    while (index < lines.length && lines[index].trim() === "") index += 1;
-  }
-  return lines.slice(index).join("\n");
-}
+// `stripLeadingHeading` was removed after PR #38 round 2. The
+// leading `# Title` is now dropped in hast by
+// `rehype-drop-repo-doc-title` so `rehype-data-src` sees correct
+// mdast positions — a source-side strip shifted every downstream
+// anchor by the number of dropped lines (off-by-2 on every ADR /
+// design / matrix page). The raw markdown body flows through
+// `renderMarkdown` unchanged.
 
 /** Map a repo-relative markdown path (POSIX-normalised, e.g.
  * `docs/adr/0002-solid-islands-component-registry.md`) to the site route
@@ -236,7 +230,7 @@ async function loadSource(
     filePath: source.filePath,
   });
 
-  const body = stripLeadingHeading(raw);
+  const body = raw;
   const rendered = await ctx.renderMarkdown(body, {
     fileURL: pathToFileURL(source.filePath),
   });

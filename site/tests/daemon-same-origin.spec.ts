@@ -33,6 +33,11 @@ test.describe("same-origin daemon UI", () => {
       "<!doctype html><html><body><div id='outcome'>pending</div></body></html>",
     );
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "revkit", private: true, type: "module" }));
+    // Seed the anchor's source file — the daemon computes
+    // `anchor.revision` server-side and refuses an anchor pointing
+    // at a non-existent file (PR #38 review).
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "docs", "x.md"), "# x\n\nhello\n");
 
     const cliBin = resolve(import.meta.dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
     const daemon = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", dist], {

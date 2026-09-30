@@ -11,6 +11,7 @@
 // `commit_id`; the M2 local rail leaves it undefined. Reserved on the v0
 // wire so M3 lands without a `schemaVersion` bump.
 import { z } from "zod";
+import { isValidRepoRelativePath } from "./path.ts";
 import { GIT_COMMIT_HEX_REGEX, SHA256_HEX_REGEX } from "./revision.ts";
 
 /** Text-quote selector (W3C Web Annotation §4.2.4). `prefix` and `suffix`
@@ -29,13 +30,28 @@ export const textQuoteSchema = z
 
 export type TextQuote = z.infer<typeof textQuoteSchema>;
 
+/** Structural validator for a repo-relative anchor path.
+ *
+ * Calls `isValidRepoRelativePath` from `./path.ts` — the SINGLE
+ * source of truth (PR #38 round-2 review) so the daemon, the rail,
+ * `check-dist`, and the GitHub adapter apply the exact same rule.
+ * The predicate encodes the full rule (length, charset, containment,
+ * empty segments); this schema just wraps it in a Zod message. */
+export const anchorPathSchema = z
+  .string()
+  .refine(isValidRepoRelativePath, {
+    message:
+      "anchor.path must be repo-relative POSIX, 1..512 chars, no '..'/'.'/'//' segments, " +
+      "no control chars, no `:`/`*`/`?`/`<`/`>`/`|`/`\"`, no leading `/`, no backslash.",
+  });
+
 /** An anchor: file path plus 1-indexed inclusive line range, the text-quote
  * selector for the range, and the revision it was captured on. Refined so
  * `endLine >= startLine`. Line numbers are 1-based (matching editors and
  * `data-src="<file>#L<n>-L<m>"`). */
 export const anchorSchema = z
   .object({
-    path: z.string().min(1),
+    path: anchorPathSchema,
     startLine: z.number().int().positive(),
     endLine: z.number().int().positive(),
     quote: textQuoteSchema,
