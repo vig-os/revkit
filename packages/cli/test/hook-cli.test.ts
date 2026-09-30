@@ -40,6 +40,11 @@ async function bootDaemon(root: string): Promise<DaemonHandle> {
     installSignalHandlers: false,
     logSink: { write: () => {} },
     deliveryIdleFlushMs: 0,
+    // Round-2: the hook shows DELIVERED threads only. Post the test
+    // comments under `live` so they land in the delivered set and
+    // the hook renders them; the "handover drafts stay hidden"
+    // behaviour has its own regression test below.
+    deliveryMode: "live",
   });
 }
 
@@ -178,5 +183,82 @@ describe("revkit hook user-prompt-submit", () => {
     const result = await runHookCommand(["session-start"], { cwd: root });
     expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("unknown subject");
+  });
+
+  test("BLOCKER 2: handover drafts do NOT leak into the hook (round-2)", async () => {
+    // Boot a fresh daemon in the DEFAULT (handover) mode. A draft
+    // comment posted here is batched — it should not appear in the
+    // hook's output. Only after a `POST /api/handover` (or an
+    // `@agent now` marker) does it become delivered.
+    if (daemon !== undefined) { await daemon.stop(); daemon = undefined; }
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "revkit-hook-blocker2-"));
+    const dist = join(root, "dist");
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, "index.html"), "<h1>ok</h1>");
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "docs", "a.md"), "hi\n");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "revkit", private: true }));
+    daemon = await startDaemon({
+      dir: dist,
+      repoRoot: root,
+      port: 0,
+      sqlitePath: ":memory:",
+      version: "0.0.0-test",
+      localUserId: "local-test",
+      installSignalHandlers: false,
+      logSink: { write: () => {} },
+      deliveryIdleFlushMs: 0,
+      // Default (handover) — this test's whole point.
+    });
+    const cookie = await mintCookie(daemon);
+    await postComment(daemon, cookie, "quiet feedback, no rush");
+    const linesBefore: string[] = [];
+    const before = await runHookCommand(["user-prompt-submit"], {
+      cwd: root,
+      out: (line) => linesBefore.push(line),
+    });
+    expect(before.exitCode).toBe(0);
+    // The comment is BATCHED — the hook shows nothing.
+    expect(linesBefore.join("")).toBe("");
+
+    // Now hand over. The delivered set now includes the comment.
+    await fetch(`${daemon.url}/api/handover`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${daemon.agentToken}` },
+    });
+    const linesAfter: string[] = [];
+    const after = await runHookCommand(["user-prompt-submit"], {
+      cwd: root,
+      out: (line) => linesAfter.push(line),
+    });
+    expect(after.exitCode).toBe(0);
+    expect(linesAfter.join("")).toContain("<revkit-pending");
+  });
+
+  test("BLOCKER 3: hook does not double-print (round-2)", async () => {
+    // The hook returns `stdout` for bin/revkit.js to write ONCE.
+    // If it also wrote to a default `process.stdout` internally,
+    // the shell caller would see the block twice. This test
+    // spawns the REAL bin and asserts on the output count.
+    if (daemon !== undefined) { await daemon.stop(); daemon = undefined; }
+    rmSync(root, { recursive: true, force: true });
+    root = mkdtempSync(join(tmpdir(), "revkit-hook-blocker3-"));
+    daemon = await bootDaemon(root);
+    const cookie = await mintCookie(daemon);
+    await postComment(daemon, cookie, "single ack please");
+    // Spawn the real bin — this is the only path prod actually runs.
+    const revkitBin = new URL("../bin/revkit.js", import.meta.url).pathname;
+    const proc = Bun.spawn(["bun", revkitBin, "hook", "user-prompt-submit"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    // Frame appears exactly once — open + close, no duplicate.
+    const opens = (out.match(/<revkit-pending count="1">/g) ?? []).length;
+    const closes = (out.match(/<\/revkit-pending>/g) ?? []).length;
+    expect(opens).toBe(1);
+    expect(closes).toBe(1);
   });
 });

@@ -7,8 +7,7 @@
   "license": "Apache-2.0",
   "exports": {
     ".": "./src/index.ts",
-    "./path": "./src/path.ts",
-    "./mentions": "./src/mentions.ts"
+    "./path": "./src/path.ts"
   },
   "scripts": {
     "test": "bun test",

@@ -25,11 +25,21 @@
 import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
-// Sub-path import: `@revkit/review-core/mentions` is a leaf module
-// with NO Zod dependency, so the rail bundle stays free of Zod's
-// `new Function` feature-probe (which the daemon's CSP forbids) —
-// see `packages/review-core/package.json` `exports` map.
-import { parseMentions, type Mention } from "@revkit/review-core/mentions";
+// Round-2 refactor: the rail no longer parses mention structure
+// itself. The daemon parses every comment body at append time with
+// the real Markdown AST and writes the typed mention list onto the
+// event; the rail reads `comment.mentions` and renders chips from
+// that data. This removes the parser from the browser bundle
+// entirely.
+//
+// We keep a Mention type here as a browser-side duck-type only.
+interface Mention {
+  readonly kind: "agent" | "agent-now" | "gh-user" | "team" | "role";
+  readonly id: string;
+  readonly label: string;
+  readonly name?: string;
+  readonly range: readonly [number, number];
+}
 
 /** The wire shape the daemon returns from `GET /api/threads` — kept as
  * a minimal duck type here so the rail bundle does not pull the whole
@@ -73,6 +83,7 @@ interface RailComment {
   readonly parentId?: string;
   readonly author: RailAuthor;
   readonly body: string;
+  readonly mentions?: readonly Mention[];
   readonly createdAt: string;
 }
 interface RailThread {
@@ -923,7 +934,7 @@ function Rail(): JSX.Element {
                         <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
                         <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
                       </p>
-                      <p class="revkit-rail__body">{renderBodyWithMentions(comment.body)}</p>
+                      <p class="revkit-rail__body">{renderBodyWithMentions(comment.body, comment.mentions ?? [])}</p>
                     </li>
                   )}
                 </For>
@@ -1064,7 +1075,7 @@ function Rail(): JSX.Element {
                             <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
                             <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
                           </p>
-                          <p class="revkit-rail__body">{renderBodyWithMentions(comment.body)}</p>
+                          <p class="revkit-rail__body">{renderBodyWithMentions(comment.body, comment.mentions ?? [])}</p>
                         </li>
                       )}
                     </For>
@@ -1179,22 +1190,24 @@ function orphanReasonFor(thread: RailThread): string {
   );
 }
 
-/** Render a comment body with `@mention` chips inline (M2 item 6,
- * ADR-0011). The parser produces typed non-overlapping ranges into
- * the original body; we walk them once and emit alternating text
- * spans + chip elements. The rail refuses to render mention text as
- * HTML — every chip goes through the JSX text path so a body like
+/** Render a comment body with `@mention` chips inline (M2 item 6
+ * round 2, ADR-0011). Round-2: the rail no longer parses mention
+ * structure. The daemon parsed the body with the real Markdown AST
+ * at append time and stored typed mentions on the event; here we
+ * consume them.
+ *
+ * The rail refuses to render mention text as HTML — every chip
+ * goes through the JSX text path so a body like
  * `<script>@agent</script>` never lands in the DOM as script. */
-function renderBodyWithMentions(body: string): JSX.Element {
-  const scan = parseMentions(body);
-  if (scan.mentions.length === 0) return body;
+function renderBodyWithMentions(body: string, mentions: readonly Mention[]): JSX.Element {
+  if (mentions.length === 0) return body;
   const nodes: JSX.Element[] = [];
   let cursor = 0;
   // Deduplicate ranges: an `@agent now` produces two entries whose
   // ranges overlap (the bare agent mention + the marker). Prefer the
   // WIDER range for chip rendering so `@agent now` appears as one
   // chip, not two overlapping ones.
-  const sorted = [...scan.mentions].sort((a, b) => a.range[0] - b.range[0] || (b.range[1] - b.range[0]) - (a.range[1] - a.range[0]));
+  const sorted = [...mentions].sort((a, b) => a.range[0] - b.range[0] || (b.range[1] - b.range[0]) - (a.range[1] - a.range[0]));
   const chosen: Mention[] = [];
   let lastEnd = -1;
   for (const mention of sorted) {

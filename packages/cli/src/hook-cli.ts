@@ -95,6 +95,7 @@ interface HookThread {
     readonly endLine?: number;
   };
   readonly comments: readonly {
+    readonly id: string;
     readonly author?: { readonly kind?: string };
     readonly body: string;
   }[];
@@ -115,9 +116,13 @@ export async function runHookCommand(args: readonly string[], env: RunHookEnv): 
 }
 
 /** The user-prompt-submit implementation. See file header for the
- * contract. */
+ * contract. Round-2 fix: this returns `stdout` and lets
+ * `bin/revkit.js` write it — no `env.out` write. A test can inject
+ * `out` to spy on the write path (used only by unit tests), and
+ * the returned `stdout` matches what bin will print. Double-print
+ * is prevented BY CONSTRUCTION: exactly one write, done by bin
+ * (or by the test spy alone if provided). */
 export async function runHookUserPromptSubmit(env: RunHookEnv): Promise<RunHookResult> {
-  const out = env.out ?? ((line) => process.stdout.write(line));
   const err = env.err ?? ((_) => { void _; });
   const deadlineMs = env.deadlineMs ?? DEFAULT_DEADLINE_MS;
   const fetch = env.fetch ?? globalThis.fetch;
@@ -133,7 +138,12 @@ export async function runHookUserPromptSubmit(env: RunHookEnv): Promise<RunHookR
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), deadlineMs);
   try {
-    const response = await fetch(`${state.url}/api/threads?status=open`, {
+    // Round-2: the hook renders only DELIVERED threads waiting on
+    // a human. To compute that we need both the thread list AND
+    // the raw event log — the delivered set is derived from
+    // handover events + arrival modes. `/api/threads` gives the
+    // human-friendly view; `/events?since=0` gives the raw log.
+    const threadsResp = await fetch(`${state.url}/api/threads?status=open`, {
       method: "GET",
       headers: {
         authorization: `Bearer ${state.agentToken}`,
@@ -141,25 +151,51 @@ export async function runHookUserPromptSubmit(env: RunHookEnv): Promise<RunHookR
       },
       signal: controller.signal,
     });
-    if (!response.ok) {
-      err(`revkit hook: daemon returned ${response.status}\n`);
+    if (!threadsResp.ok) {
+      err(`revkit hook: daemon returned ${threadsResp.status}\n`);
       return { exitCode: 0, stdout: "", stderr: "" };
     }
-    const parsed = (await response.json()) as { threads?: readonly HookThread[] };
+    const parsed = (await threadsResp.json()) as { threads?: readonly HookThread[] };
     const threads = Array.isArray(parsed.threads) ? parsed.threads : [];
-    // Only threads with a HUMAN as the last commenter are on the
-    // agent's plate — a thread whose tail is the agent's own reply
-    // is not waiting on it.
+    // Pull the derived "delivered" comment ids from the daemon's
+    // dedicated endpoint (round-2: adds a small `/api/delivered`
+    // read the hook uses so it does not have to re-derive from
+    // the event log).
+    const deliveredResp = await fetch(`${state.url}/api/delivered`, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${state.agentToken}`,
+        accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+    let deliveredIds = new Set<string>();
+    if (deliveredResp.ok) {
+      const body = (await deliveredResp.json()) as { deliveredCommentIds?: readonly string[] };
+      if (Array.isArray(body.deliveredCommentIds)) deliveredIds = new Set(body.deliveredCommentIds);
+    }
+    // A thread appears iff:
+    //   - status open
+    //   - the LAST comment is a human (agent is waiting on someone)
+    //   - AND the last comment's id is in the delivered set
+    // Handover drafts (arrival_mode=handover AND not covered by
+    // any handover event) are NOT delivered — they stay hidden
+    // from the hook, like a GitHub pending review.
     const pending = threads.filter((t) => {
       if (t.status !== "open") return false;
       const last = t.comments[t.comments.length - 1];
       if (last === undefined) return false;
-      return last.author?.kind !== "agent";
+      if (last.author?.kind === "agent") return false;
+      return deliveredIds.has(last.id);
     });
     if (pending.length === 0) return { exitCode: 0, stdout: "", stderr: "" };
     const lines = renderPreamble(pending);
-    for (const line of lines) out(line + "\n");
-    return { exitCode: 0, stdout: lines.join("\n") + (lines.length > 0 ? "\n" : ""), stderr: "" };
+    const stdout = lines.join("\n") + "\n";
+    // Test hook: `env.out` mirrors what bin will write. Only
+    // fires when explicitly injected by a test — production runs
+    // let bin/revkit.js write the returned stdout ONCE.
+    if (env.out !== undefined) env.out(stdout);
+    return { exitCode: 0, stdout, stderr: "" };
   } catch {
     // AbortError, TypeError (network), etc — silent.
     return { exitCode: 0, stdout: "", stderr: "" };

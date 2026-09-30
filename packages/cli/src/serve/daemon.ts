@@ -29,17 +29,22 @@ import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
 import {
   isValidId,
-  parseMentions,
   revisionOf,
   threadStatusSchema,
+  currentDeliveryMode,
+  deliveredCommentIds,
+  pendingCommentIds,
   type Anchor,
   type Author,
+  type HandoverTrigger,
   type ReviewEvent,
   type ReviewEventInput,
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
-import { openDeliveryState, parseMode, type DeliveryState } from "./delivery-modes.ts";
+import { openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
+import { extractMentions } from "./mentions.ts";
+import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
 import { openStaticServer } from "./static-server.ts";
 import { resolveAnchorSource } from "./anchor-source.ts";
 import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
@@ -125,11 +130,11 @@ export interface StartDaemonOptions {
    * (`handover` mode, M2 item 6). 0 disables the idle timer; the
    * production default (90 s) lives in `delivery-modes.ts`. */
   readonly deliveryIdleFlushMs?: number;
-  /** Initial delivery mode. Overrides `.revkit/delivery.json` on
-   * boot when set; production callers omit and the persisted mode
-   * (default `handover`) is used. Tests that exercise the AGENT
-   * fan-out path pass `"live"` here so a `comment.created` event
-   * flows to the AGENT stream without waiting for a handover. */
+  /** Initial delivery mode. If set AND the log carries no
+   * `delivery.mode_changed` event yet, the daemon writes one at
+   * startup so the log records the reviewer's boot-time choice.
+   * Production callers omit; tests pass `"live"` to exercise the
+   * fan-out path without going through handover. */
   readonly deliveryMode?: "handover" | "live" | "quiet";
   /** How long a presence beacon stays live before the daemon expires
    * it. Presence events (`state: "editing"`) are broadcast to the
@@ -177,18 +182,18 @@ interface WebSocketData {
   detach?: () => void;
 }
 
-/** A `Subscriber` backed by a WebSocket. `filter` is the optional
- * per-event predicate the delivery-mode state supplies for AGENT
- * subscribers; passed by name so a rail subscriber constructed
- * without it defaults to "accept everything". */
+/** A `Subscriber` backed by a WebSocket. Its `audience` (agent or
+ * rail) is what the `EventBus.publish` mask compares against; a
+ * publish call with `audiences: ["rail"]` skips this subscriber
+ * when its audience is `"agent"` (M2 item 6 round 2). */
 class WebSocketSubscriber implements Subscriber {
   #closed = false;
-  readonly matches?: (event: ReviewEvent) => boolean;
+  readonly audience: "agent" | "rail";
   constructor(
     private readonly ws: ServerWebSocket<WebSocketData>,
-    filter?: (event: ReviewEvent) => boolean,
+    audience: "agent" | "rail",
   ) {
-    if (filter !== undefined) this.matches = filter;
+    this.audience = audience;
   }
   deliver(event: ReviewEvent): void {
     if (this.#closed) return;
@@ -293,34 +298,34 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     ...(options.reanchor ?? {}),
   });
 
-  // Delivery-mode state (ADR-0007, M2 item 6). Persisted per-repo
-  // under `.revkit/delivery.json` at mode 600. On boot we rehydrate
-  // the handover batch from the store's log; when the batch's
-  // survival between restarts matters (the reviewer left comments
-  // in `handover` mode, the daemon restarted, the batch should
-  // still be pending), the log is where the truth lives.
-  const delivery: DeliveryState = openDeliveryState({
-    repoRoot: options.repoRoot,
+  // Delivery-mode adapter (ADR-0007, M2 item 6 round 2). The mode
+  // and the pending batch are derived from the durable log —
+  // `delivery.mode_changed` records every mode transition,
+  // `handover` events record every delivery to the agent. This
+  // module owns the idle-flush timer only.
+  const delivery: DeliveryAdapter = openDeliveryAdapter({
     ...(options.deliveryIdleFlushMs !== undefined ? { idleFlushMs: options.deliveryIdleFlushMs } : {}),
     ...(options.nowMs !== undefined ? { nowMs: options.nowMs } : {}),
-    ...(options.deliveryMode !== undefined ? { initialMode: options.deliveryMode } : {}),
   });
-  try {
-    const bootstrapEvents = await store.since(0);
-    delivery.rehydrate(bootstrapEvents);
-  } catch (error) {
-    logger.warn("delivery.rehydrate.failed", {
-      errorKind: (error as Error).name,
-    });
-  }
 
-  // Presence TTL state (M2 item 6). An `editing` beacon is followed
-  // by an automatic `idle` event after `presenceTtlMs`; at most one
-  // live timer per (actorKind, actorId), a subsequent `editing`
-  // refresh renews it. Sits at daemon scope so `stop()` can drain it.
-  const presenceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  const presenceTtlMs = options.presenceTtlMs ?? 30_000;
-  const presenceKey = (author: Author): string => `${author.kind}:${author.id}`;
+  // Presence hub (M2 item 6 round 2): EPHEMERAL broadcast. Never
+  // touches the store. Fresh subscribers get the current state on
+  // connect; a restart wipes all beacons (which is correct — the
+  // agent is not still editing after a restart).
+  const presence: PresenceHub = openPresenceHub({
+    ...(options.presenceTtlMs !== undefined ? { ttlMs: options.presenceTtlMs } : {}),
+    onBroadcast: (frame) => {
+      // Route directly to the bus, bypassing the store. Bus
+      // subscribers are typed on `ReviewEvent`, but our
+      // `PresenceFrame` has the same "kind" discriminator shape
+      // (minus seq) so consumers that switch on `event.kind` can
+      // recognise it. The cast is safe: subscribers that only
+      // read `.kind` see "presence"; subscribers that dereference
+      // `.seq` on presence would be a bug regardless of typing
+      // (round-2: no seq on presence). Rail + channel handle it.
+      void bus.publish(frame as unknown as ReviewEvent);
+    },
+  });
 
   // Inline-script hash allowlist (ADR-0012 rule "the daemon applies
   // the allowlist of the revkit version it runs, never hashes found
@@ -410,20 +415,24 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // resume slice either — the pending set is still owed a
           // single `handover` promotion when the reviewer hands over.
           const audience = data.audience;
+          const allEvents = await store.since(0);
           const primeFilter = (event: ReviewEvent): boolean =>
-            audience === "rail"
-              ? true
-              : delivery.shouldFanOutToAgent(event, { agentNow: humanEventCarriesAgentNow(event) });
+            audience === "rail" ? true : delivery.shouldFanOutToAgent(event, allEvents);
           for (const event of primer) {
             if (!primeFilter(event)) continue;
             ws.send(JSON.stringify(event));
           }
-          const wsFilter =
-            audience === "agent"
-              ? (event: ReviewEvent): boolean =>
-                  delivery.shouldFanOutToAgent(event, { agentNow: humanEventCarriesAgentNow(event) })
-              : undefined;
-          const subscriber = new WebSocketSubscriber(ws, wsFilter);
+          // Round-2: prime the rail with the current presence state
+          // so a fresh tab sees existing "agent is editing …" chips
+          // without waiting for the next beacon. Agents don't need
+          // to see peer beacons on connect (they only care about
+          // NEW state).
+          if (audience === "rail") {
+            for (const frame of presence.currentStates()) {
+              ws.send(JSON.stringify(frame));
+            }
+          }
+          const subscriber = new WebSocketSubscriber(ws, audience);
           const detach = bus.subscribe(subscriber);
           data.subscriber = subscriber;
           data.detach = detach;
@@ -553,13 +562,36 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
   }
 
-  // Idle-flush wiring (M2 item 6). The delivery state runs the
-  // timer; we hand it a closure that appends the `handover` event
-  // through the store + fans it out on the bus. `flushHandoverBatch`
-  // is a hoisted function declaration further down, so it is
-  // callable here as well as from `appendAndReturn`.
-  delivery.scheduleIdleFlush(() => {
-    void flushHandoverBatch("idle");
+  // Boot-time hydration (round-2). If the caller supplied an
+  // `initialMode` AND the log has no `delivery.mode_changed` yet,
+  // write one so the log records that boot-time choice. Also
+  // re-arm the idle timer if the derived batch is non-empty (a
+  // reviewer left comments in `handover` mode; the daemon
+  // restarted; the drafts must still auto-flush on the SAME
+  // schedule).
+  const bootstrapEvents0 = await store.since(0);
+  const bootMode = currentDeliveryMode(bootstrapEvents0);
+  if (options.deliveryMode !== undefined && options.deliveryMode !== bootMode) {
+    // No prior mode change AND caller wants a different start.
+    const hasChange = bootstrapEvents0.some((e) => e.kind === "delivery.mode_changed");
+    if (!hasChange) {
+      try {
+        await store.append({
+          kind: "delivery.mode_changed",
+          actor: localActor,
+          from: null,
+          to: options.deliveryMode,
+        });
+      } catch (error) {
+        logger.warn("delivery.boot-mode.failed", {
+          errorKind: (error as Error).name,
+        });
+      }
+    }
+  }
+  const bootstrapEvents1 = await store.since(0);
+  delivery.reconcileIdleTimer(bootstrapEvents1, () => {
+    void flushPendingHandover("idle");
   });
 
   let stopped = false;
@@ -590,8 +622,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // Best-effort — a failure to close a watcher never blocks shutdown.
       }
       delivery.stop();
-      for (const timer of presenceTimers.values()) clearTimeout(timer);
-      presenceTimers.clear();
+      presence.stop();
       try {
         server.stop(true);
       } catch {
@@ -734,13 +765,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return handleApi(request, url, method, requestId);
     }
 
-    // Delivery mode + handover + presence (M2 item 6, ADR-0007). All
-    // three share the /api/ auth + Origin discipline the thread
-    // endpoints use.
+    // Delivery mode + handover + presence + delivered-set (M2 item 6,
+    // ADR-0007). All share the /api/ auth + Origin discipline the
+    // thread endpoints use.
     if (
       url.pathname === "/api/delivery-mode" ||
       url.pathname === "/api/handover" ||
-      url.pathname === "/api/presence"
+      url.pathname === "/api/presence" ||
+      url.pathname === "/api/delivered" ||
+      url.pathname === "/api/pending"
     ) {
       return handleDeliveryApi(request, url, method, requestId);
     }
@@ -1003,6 +1036,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
       const threadId = parsed.data.threadId ?? randomUUID();
       const commentId = parsed.data.commentId ?? randomUUID();
+      // Round-2 nit: parse mentions on the daemon at append time
+      // and store them on the event so the rail renders chips
+      // WITHOUT bundling a parser. `extractMentions` uses the real
+      // Markdown AST — a `\@agent`, an inline `<code>`, an HTML
+      // comment, an indented code block, or mismatched backticks
+      // all fail to fire.
+      const mentions = actor.kind === "agent" ? undefined : extractMentions(parsed.data.body).mentions;
       const input: ReviewEventInput = {
         kind: "comment.created",
         actor,
@@ -1010,6 +1050,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         commentId,
         anchor: anchorWithServerRevision,
         body: parsed.data.body,
+        ...(mentions !== undefined && mentions.length > 0
+          ? { mentions: mentions.map((m) => ({ ...m, range: [m.range[0], m.range[1]] as [number, number] })) }
+          : {}),
       };
       return await appendAndReturn(input, requestId, { threadId, commentId });
     }
@@ -1040,6 +1083,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         if (!parsed.success) return badRequest(parsed.error.issues);
         if (!enforceCommentBodyLimit(parsed.data.body)) return payloadTooLarge();
         const commentId = parsed.data.commentId ?? randomUUID();
+        const mentions = actor.kind === "agent" ? undefined : extractMentions(parsed.data.body).mentions;
         const input: ReviewEventInput = {
           kind: "comment.replied",
           actor,
@@ -1047,6 +1091,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           commentId,
           parentId: parsed.data.parentId,
           body: parsed.data.body,
+          ...(mentions !== undefined && mentions.length > 0
+            ? { mentions: mentions.map((m) => ({ ...m, range: [m.range[0], m.range[1]] as [number, number] })) }
+            : {}),
         };
         return await appendAndReturn(input, requestId, { threadId, commentId });
       }
@@ -1097,34 +1144,49 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
       throw error;
     }
-    // Rehydrate the persisted event and fan it out. `since(seq - 1)`
-    // returns exactly the row just written.
+    // Rehydrate the persisted event. `since(seq - 1)` returns
+    // exactly the row just written.
     const events = await store.since(seq - 1);
     const event = events.find((e) => e.seq === seq);
     if (event !== undefined) {
-      // Delivery-mode bookkeeping (M2 item 6). If this is a human
-      // comment / reply, ask the mention parser whether the body
-      // carries `@agent now`; if so, the batch bypass applies and
-      // the delivery state does NOT add the comment to the pending
-      // set. Otherwise it's a normal batched event under handover
-      // (silently invisible to the AGENT stream until the next
-      // `handover` promotion).
-      const agentNow =
-        (event.kind === "comment.created" || event.kind === "comment.replied") &&
-        event.actor.kind !== "agent" &&
-        parseMentions((event as { body?: string }).body ?? "").hasAgentNow;
-      delivery.onHumanEvent(event, { agentNow });
-      // Fire-and-forget: subscribers should not block the API
-      // response, and the bus already isolates delivery failures per
-      // subscriber.
-      void bus.publish(event);
-      // If the body carried `@agent now` under handover mode, drain
-      // the pending set and promote a `handover` event immediately
-      // — everything the reviewer had queued goes to the agent along
-      // with the "now" comment, in one coherent frame.
-      if (agentNow && delivery.status().mode === "handover") {
-        void flushHandoverBatch("agent-now");
+      // Round-2 ATOMICITY: the delivery event (if any) is appended
+      // FIRST, so the fan-out decision at publish time reads a log
+      // that already reflects the delivery. Otherwise a
+      // `comment.created` under agent-now would publish to the
+      // rail-only audience because the covering `handover` event
+      // is not yet on the log.
+      //
+      // The delivery event covers BY IDS: a comment appended
+      // concurrently whose id is not in the pending snapshot here
+      // stays pending.
+      if (event.kind === "comment.created" || event.kind === "comment.replied") {
+        if (event.actor.kind !== "agent") {
+          const body = (event as { body?: string }).body ?? "";
+          const scan = extractMentions(body);
+          const modeSnapshot = currentDeliveryMode(await store.since(0));
+          if (modeSnapshot === "live") {
+            await appendDeliveryEvent([event.commentId], "live", requestId);
+          } else if (scan.hasAgentNow) {
+            // @agent now flushes the pending batch alongside.
+            const pending = pendingCommentIds(await store.since(0));
+            const ids = new Set<string>(pending);
+            ids.add(event.commentId);
+            await appendDeliveryEvent([...ids], "agent-now", requestId);
+          }
+          // handover mode without @agent now: comment stays
+          // pending. quiet: never delivered (pull-only).
+        }
       }
+      // NOW publish the original event with a fan-out decision
+      // computed against the updated log.
+      const allEvents = await store.since(0);
+      const audiences = auditFanOutAudiences(event, allEvents);
+      void bus.publish(event, { audiences });
+      // Re-arm the idle timer based on the updated log (includes
+      // any delivery event we just appended).
+      delivery.reconcileIdleTimer(allEvents, () => {
+        void flushPendingHandover("idle");
+      });
     }
     // Reconcile the re-anchor watchers so a NEW thread on a NEW
     // path gets a watcher installed immediately (fire-and-forget:
@@ -1139,6 +1201,82 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return jsonResponse({ seq, event }, 201);
   }
 
+  /** Decide which audiences receive THIS event. Called after append
+   * with the full log so pending / delivered ids are current. Rail
+   * always sees everything; agent visibility follows the derived
+   * rules in `@revkit/review-core`. */
+  function auditFanOutAudiences(
+    event: ReviewEvent,
+    allEvents: readonly ReviewEvent[],
+  ): readonly ("agent" | "rail")[] {
+    const rail: ("agent" | "rail")[] = ["rail"];
+    if (delivery.shouldFanOutToAgent(event, allEvents)) rail.push("agent");
+    return rail;
+  }
+
+  /** Append a `handover` delivery event covering `ids` under the
+   * given `trigger`. The revision is the SHA-256 of a synthetic
+   * "delivered:<ISO ts>" string — the log's own reference for the
+   * frame, not an anchor revision. Returns the emitted event or
+   * undefined on any store failure (logged). */
+  async function appendDeliveryEvent(
+    ids: readonly string[],
+    trigger: HandoverTrigger,
+    requestId: string,
+  ): Promise<ReviewEvent | undefined> {
+    if (ids.length === 0) return undefined;
+    const revision = await revisionOf(`delivered:${new Date().toISOString()}\n`);
+    const note = {
+      live: "Comment pushed under live delivery.",
+      "agent-now": "Batch flushed alongside an @agent-now marker.",
+      handover: "Reviewer handed the batch to the agent.",
+      "mode-change-flush": "Batch flushed on handover→live mode change.",
+    }[trigger];
+    const input: ReviewEventInput = {
+      kind: "handover",
+      actor: localActor,
+      commentIds: [...ids],
+      revision,
+      trigger,
+      note,
+    };
+    try {
+      const seq = await store.append(input);
+      const events = await store.since(seq - 1);
+      const event = events.find((e) => e.seq === seq);
+      if (event !== undefined) {
+        const allEvents = await store.since(0);
+        const audiences = auditFanOutAudiences(event, allEvents);
+        void bus.publish(event, { audiences });
+      }
+      logger.info("delivery.appended", { seq, count: ids.length, from: trigger });
+      return event;
+    } catch (error) {
+      logger.warn("delivery.append.failed", {
+        requestId,
+        errorKind: (error as Error).name,
+      });
+      return undefined;
+    }
+  }
+
+  /** Flush the current pending batch (derived from the log) as one
+   * `handover` event with the given trigger. Cover BY IDS: the
+   * pending snapshot captures ids at THIS moment; a comment
+   * appended concurrently that is not in the snapshot stays
+   * pending. Returns the emitted event or undefined when nothing
+   * was pending. */
+  async function flushPendingHandover(trigger: "handover" | "mode-change-flush" | "idle"): Promise<ReviewEvent | undefined> {
+    const allEvents = await store.since(0);
+    const pending = pendingCommentIds(allEvents);
+    if (pending.size === 0) return undefined;
+    // Map "idle" reason onto the schema's `handover` trigger — idle
+    // is the reviewer implicitly handing over (they walked away).
+    const effectiveTrigger: HandoverTrigger = trigger === "idle" ? "handover" : trigger;
+    const requestId = "flush-" + trigger;
+    return await appendDeliveryEvent([...pending], effectiveTrigger, requestId);
+  }
+
   /** Resolve the caller to an `Author`, or undefined if neither the
    * session cookie nor the agent bearer token authenticates. */
   function identifyActor(request: Request): Author | undefined {
@@ -1147,65 +1285,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const cookieValue = readCookie(request.headers.get("cookie"), cookieName(port));
     if (auth.hasSession(cookieValue)) return localActor;
     return undefined;
-  }
-
-  /** Does THIS event carry `@agent now` in its body? Used by the
-   * event-bus filter so a `@agent now`-marked comment fans out to
-   * the AGENT stream even under `handover` / `quiet`. Non-human
-   * events (agent replies, thread lifecycle, presence, handover,
-   * re-anchor) never carry the marker. */
-  function humanEventCarriesAgentNow(event: ReviewEvent): boolean {
-    if (event.kind !== "comment.created" && event.kind !== "comment.replied") return false;
-    if (event.actor.kind === "agent") return false;
-    const body = (event as { body?: unknown }).body;
-    if (typeof body !== "string") return false;
-    return parseMentions(body).hasAgentNow;
-  }
-
-  /** Drain the delivery batch and append a synthetic `handover`
-   * event so the AGENT stream sees ONE coherent frame with every
-   * pending comment id. `revision` is the SHA-256 of the daemon's
-   * current time — the log's own reference for the frame, not an
-   * anchor revision; the review-core schema only requires a 64-hex
-   * lower value. Called by the mode-change handler, the explicit
-   * `POST /api/handover`, the idle timer, and the `@agent now`
-   * override on append. Returns the fan-out event or undefined
-   * when nothing was pending. */
-  async function flushHandoverBatch(reason: "explicit" | "idle" | "agent-now" | "mode-change"): Promise<ReviewEvent | undefined> {
-    const drain = delivery.drainBatch();
-    if (drain === undefined) return undefined;
-    const revision = await revisionOf(`handover:${new Date().toISOString()}\n`);
-    const noteMap = {
-      explicit: "Reviewer handed the batch to the agent.",
-      idle: "Handover flushed after the idle window elapsed.",
-      "agent-now": "Handover flushed because a comment carried @agent now.",
-      "mode-change": "Handover flushed because the delivery mode changed.",
-    } as const;
-    const input: ReviewEventInput = {
-      kind: "handover",
-      actor: localActor,
-      commentIds: [...drain.commentIds],
-      revision,
-      note: noteMap[reason],
-    };
-    try {
-      const seq = await store.append(input);
-      const events = await store.since(seq - 1);
-      const event = events.find((e) => e.seq === seq);
-      if (event !== undefined) void bus.publish(event);
-      logger.info("delivery.handover.flushed", {
-        seq,
-        reason,
-        count: drain.commentIds.length,
-      });
-      return event;
-    } catch (error) {
-      logger.warn("delivery.handover.append-failed", {
-        reason,
-        errorKind: (error as Error).name,
-      });
-      return undefined;
-    }
   }
 
   async function handleDeliveryApi(
@@ -1226,10 +1305,41 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
 
     if (url.pathname === "/api/delivery-mode" && method === "GET") {
-      return jsonResponse(delivery.status());
+      const events = await store.since(0);
+      return jsonResponse(delivery.snapshot(events));
+    }
+
+    if (url.pathname === "/api/delivered" && method === "GET") {
+      // Round-2: expose the derived "delivered to agent" set so the
+      // hook + catch-up summary can filter to threads whose last
+      // comment has actually reached the agent (never leak handover
+      // drafts or quiet-mode comments).
+      const events = await store.since(0);
+      const ids = deliveredCommentIds(events);
+      return jsonResponse({ deliveredCommentIds: [...ids] });
+    }
+
+    if (url.pathname === "/api/pending" && method === "GET") {
+      // Round-2: pending is a pure function of the log. Exposed so
+      // the rail's mode-badge and the channel client's catch-up
+      // summary both derive from the same source.
+      const events = await store.since(0);
+      const ids = pendingCommentIds(events);
+      return jsonResponse({ pendingCommentIds: [...ids] });
     }
 
     if (url.pathname === "/api/delivery-mode" && method === "POST") {
+      // Round-2 authority rule (ADR-0007 amendment):
+      //   - The MCP `mode` tool does NOT expose a `set` verb, so
+      //     a prompt-injected agent has no surface to flip modes.
+      //   - The HTTP endpoint accepts both the reviewer's cookie
+      //     AND the agent bearer — the bearer is filesystem-gated
+      //     on `.revkit/serve.json` (mode 600), which is the
+      //     reviewer's CLI credential too. A prompt-injected
+      //     agent without filesystem read cannot obtain it.
+      //   - This is documented in ADR-0007 so the trade-off is
+      //     explicit: the security envelope is "local filesystem
+      //     access" (not "identity of the bearer").
       const bodyRead = await readCappedJsonBody(request);
       if (!bodyRead.ok) {
         return bodyRead.kind === "too-large"
@@ -1242,30 +1352,56 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       if (mode === undefined) {
         return badRequest([{ code: "custom", path: ["mode"], message: "unknown mode" }]);
       }
-      // A change from any mode → `live` flushes the pending batch so
-      // the reviewer's mid-flight batched drafts do not disappear
-      // silently — they land as a `handover` event first, then live
-      // mode takes over.
-      const before = delivery.status().mode;
-      if (before === "handover" && mode !== "handover" && delivery.status().batched > 0) {
-        await flushHandoverBatch("mode-change");
+      const before = currentDeliveryMode(await store.since(0));
+      if (mode === before) {
+        // No-op — do not emit a duplicate mode_changed event.
+        return jsonResponse(delivery.snapshot(await store.since(0)));
       }
-      const status = delivery.setMode(mode, actor.kind === "agent" ? "agent" : "local");
-      logger.info("delivery.mode.changed", { requestId, from: before, to: status.mode });
-      return jsonResponse(status);
+      // A handover→live transition flushes the pending batch first
+      // (documented, ADR-0007). handover→quiet does NOT flush: the
+      // drafts stay pending and follow the "quiet: never delivered"
+      // rule once the reviewer flips back OR uses @agent-now.
+      if (before === "handover" && mode === "live") {
+        await flushPendingHandover("mode-change-flush");
+      }
+      try {
+        await store.append({
+          kind: "delivery.mode_changed",
+          actor,
+          from: before,
+          to: mode,
+        });
+      } catch (error) {
+        if (error instanceof ThreadStoreAppendError) {
+          return badRequest([{ code: "custom", path: [], message: error.rejection.kind }]);
+        }
+        throw error;
+      }
+      // Fan out the mode-change (rail-only per audit rules).
+      const eventsAfter = await store.since(0);
+      const modeEvent = eventsAfter[eventsAfter.length - 1];
+      if (modeEvent !== undefined) {
+        const audiences = auditFanOutAudiences(modeEvent, eventsAfter);
+        void bus.publish(modeEvent, { audiences });
+      }
+      delivery.reconcileIdleTimer(eventsAfter, () => {
+        void flushPendingHandover("idle");
+      });
+      logger.info("delivery.mode.changed", { requestId, from: before, to: mode });
+      return jsonResponse(delivery.snapshot(eventsAfter));
     }
 
     if (url.pathname === "/api/handover" && method === "POST") {
-      // Explicit hand-over: empty body accepted, drain regardless of
-      // current mode (the reviewer may have flipped to `live`; the
-      // batch is still theirs). Returns the promoted event or 204
-      // when nothing was pending, so the rail can distinguish the
-      // two states.
-      const event = await flushHandoverBatch("explicit");
+      // Explicit hand-over: flush the derived pending set. Round-2
+      // atomicity: covered BY IDS. A comment appended concurrently
+      // whose id is not in the pending snapshot below stays pending
+      // until the next flush covers it.
+      const event = await flushPendingHandover("handover");
       if (event === undefined) {
         return jsonResponse({ ok: true, flushed: 0 });
       }
-      return jsonResponse({ ok: true, flushed: 1, event }, 201);
+      const count = (event as { commentIds?: readonly string[] }).commentIds?.length ?? 0;
+      return jsonResponse({ ok: true, flushed: count, event }, 201);
     }
 
     if (url.pathname === "/api/presence" && method === "POST") {
@@ -1278,65 +1414,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const parsed = presenceRequestSchema.safeParse(bodyRead.value);
       if (!parsed.success) return badRequest(parsed.error.issues);
       // Only agent-authored presence beacons matter for the "agent
-      // is editing …" chip. A local caller's presence is refused so
-      // the daemon does not become a signal-passer for the browser
-      // to spoof.
+      // is editing …" chip. A local caller's presence is refused
+      // so the daemon does not become a signal-passer for the
+      // browser to spoof.
       if (actor.kind !== "agent") {
         return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
       }
-      const key = presenceKey(actor);
-      const existingTimer = presenceTimers.get(key);
-      if (existingTimer !== undefined) {
-        clearTimeout(existingTimer);
-        presenceTimers.delete(key);
-      }
-      const input: ReviewEventInput = {
-        kind: "presence",
-        actor,
-        state: parsed.data.state,
-        ...(parsed.data.path !== undefined ? { path: parsed.data.path } : {}),
-        ...(parsed.data.startLine !== undefined ? { startLine: parsed.data.startLine } : {}),
-        ...(parsed.data.endLine !== undefined ? { endLine: parsed.data.endLine } : {}),
-      };
-      try {
-        const seq = await store.append(input);
-        const events = await store.since(seq - 1);
-        const event = events.find((e) => e.seq === seq);
-        if (event !== undefined) void bus.publish(event);
-        // Schedule the auto-idle beacon.
-        if (parsed.data.state === "editing" && presenceTtlMs > 0) {
-          const idleTimer = setTimeout(() => {
-            presenceTimers.delete(key);
-            void (async () => {
-              try {
-                const idleInput: ReviewEventInput = {
-                  kind: "presence",
-                  actor,
-                  state: "idle",
-                  ...(parsed.data.path !== undefined ? { path: parsed.data.path } : {}),
-                };
-                const s = await store.append(idleInput);
-                const es = await store.since(s - 1);
-                const e = es.find((x) => x.seq === s);
-                if (e !== undefined) void bus.publish(e);
-              } catch {
-                // A store append failure at TTL expiry is not fatal — the rail
-                // clears its own presence badge on a UI timeout as well.
-              }
-            })();
-          }, presenceTtlMs);
-          if (typeof (idleTimer as unknown as { unref?: () => void }).unref === "function") {
-            (idleTimer as unknown as { unref: () => void }).unref();
-          }
-          presenceTimers.set(key, idleTimer);
-        }
-        return jsonResponse({ seq, event }, 201);
-      } catch (error) {
-        if (error instanceof ThreadStoreAppendError) {
-          return badRequest([{ code: "custom", path: [], message: error.rejection.kind }]);
-        }
-        throw error;
-      }
+      // Round-2: EPHEMERAL. No store.append; the hub keeps state
+      // in memory and broadcasts to /events subscribers directly.
+      const frame =
+        parsed.data.state === "editing"
+          ? presence.editing(actor, {
+              ...(parsed.data.path !== undefined ? { path: parsed.data.path } : {}),
+              ...(parsed.data.startLine !== undefined ? { startLine: parsed.data.startLine } : {}),
+              ...(parsed.data.endLine !== undefined ? { endLine: parsed.data.endLine } : {}),
+            })
+          : presence.idle(actor, parsed.data.path !== undefined ? { path: parsed.data.path } : undefined);
+      return jsonResponse({ ok: true, frame });
     }
 
     return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
@@ -1433,15 +1527,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // Already closed.
         }
       },
-      ...(audience === "agent"
-        ? {
-            matches(event: ReviewEvent): boolean {
-              return delivery.shouldFanOutToAgent(event, {
-                agentNow: humanEventCarriesAgentNow(event),
-              });
-            },
-          }
-        : {}),
+      audience,
     };
     const detach = bus.subscribe(subscriber);
 
@@ -1466,12 +1552,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // changed while the daemon was down is re-anchored here.
           await reanchor.refreshAll();
           const primer = await store.since(since);
+          const allEventsForPrime = audience === "agent" ? await store.since(0) : [];
           for (const event of primer) {
-            if (audience === "agent" &&
-                !delivery.shouldFanOutToAgent(event, { agentNow: humanEventCarriesAgentNow(event) })) {
+            if (
+              audience === "agent" &&
+              !delivery.shouldFanOutToAgent(event, allEventsForPrime)
+            ) {
               continue;
             }
             controller.enqueue(encoder.encode(sseFrame(event)));
+          }
+          // Prime the rail with current presence beacons (agent
+          // stream deliberately skips these — an agent only cares
+          // about NEW peer activity, not the pre-existing state).
+          if (audience === "rail") {
+            for (const frame of presence.currentStates()) {
+              controller.enqueue(encoder.encode(sseFrame(frame as unknown as ReviewEvent)));
+            }
           }
         } catch (error) {
           logger.error("events.sse.prime-failed", { requestId, errorKind: (error as Error).name });

@@ -54,6 +54,110 @@ call on a human.
   `/-/health`, rebuilds the `DaemonClient` with the new port + token, and resubscribes from `min(lastSeenSeq, head)`
   so a fresh sqlite (head=0) does not stall on a stale resume point. Backoff is bounded (500 ms → 30 s).
 
+## Amendment (2026-09-30, round 2) — Derived delivery, agent authority, ephemeral presence
+
+Round-2 review of the PR-53 landing pointed out one root design flaw: the round-1
+delivery state was split between an in-memory batch cache and an ad-hoc rehydration
+that ignored the mode. Live comments and `@agent now` sends re-batched after a
+restart and were delivered twice; `quiet → handover` gave different results in
+memory and after a restart. Round 2 fixes this **by construction**:
+
+- **Delivery state is fully DERIVED from the durable log.**
+  - Every mode change is a `delivery.mode_changed` event carrying `from` / `to` /
+    `actor`. There is NO `.revkit/delivery.json` — the round-1 file was removed.
+  - Every delivery to the agent is a `handover` event with a typed `trigger`:
+    `"live"` (bookkeeping for a live push — agent already saw the `comment.created`),
+    `"agent-now"` (the marker comment + the prior batch, delivered together),
+    `"handover"` (explicit reviewer hand-over), or `"mode-change-flush"` (only
+    fires on `handover → live`, see below).
+  - "Pending" is a pure function of the log: a human `comment.created` /
+    `comment.replied` is pending iff its ARRIVAL MODE (the mode at its own `seq`)
+    was `handover` AND no `handover` event lists its `commentId`. Live arrivals
+    are delivered, never pending. Quiet arrivals are neither pending nor
+    delivered (pull-only). The functions `pendingCommentIds`,
+    `deliveredCommentIds` and `currentDeliveryMode` in `@revkit/review-core`
+    are the single source of truth.
+  - The in-memory adapter is a THIN wrapper that caches the derived answer for
+    cheap `/api/delivery-mode` reads AND owns the idle-flush timer. It never
+    writes state that the log does not carry.
+  - **Restart property**: the pending set on the same log is identical
+    before and after a restart, and no `commentId` is delivered twice or
+    never. `packages/review-core/test/delivery.test.ts:PROPERTY` covers this
+    over a random-ish sequence mixing modes, comments, handovers, agent-now
+    flushes and prefixes.
+
+- **`quiet` transitions (documented decision).** DESIGN §5.3 says `quiet` means
+  "nothing is pushed; the agent pulls with `threads()`". The design is silent on
+  what happens to comments made under quiet when the mode later changes. Round 2
+  chooses: **quiet-mode comments are never pending, never auto-delivered — they
+  reach the agent only through a `threads` pull OR through a subsequent explicit
+  `@agent now` marker on a fresh comment.** Rationale: a quiet comment is a note
+  the reviewer *deliberately* chose not to interrupt on; auto-delivering it on a
+  later mode flip would surprise them. Reviewers who want a quiet-mode comment
+  routed to the agent explicitly hand it over.
+
+- **`handover → live` flushes; `handover → quiet` does NOT.** Round 1 flushed on
+  every handover→X change, silently sending drafts under a mode the reviewer
+  might not intend. Round 2: the daemon appends a `handover(trigger =
+  "mode-change-flush")` event only on the `handover → live` transition. On
+  `handover → quiet` the pending batch stays pending; a subsequent hand-over
+  or flip back to handover keeps working.
+
+- **Idle-timer restart.** On daemon boot, the adapter reads the current log
+  and, if the derived pending set is non-empty AND the current mode is
+  `handover`, re-arms the idle timer on the same schedule. A reviewer who
+  left drafts pending before a crash still sees the auto-flush honoured.
+
+- **Flush atomicity — cover BY IDS.** A concurrent comment appended between
+  the moment the daemon decides to flush and the moment the `handover` event
+  lands stays pending unless its `commentId` is on the delivery event. The
+  daemon takes a `pendingCommentIds` snapshot, then appends a `handover`
+  covering exactly that snapshot. Anything appended after stays pending
+  until the NEXT flush covers it. Tested in
+  `packages/cli/test/serve/delivery-http.test.ts`.
+
+- **`@agent now` mention parser is Markdown-AST-aware.** Round 1 scanned
+  characters and misfired on `\@agent`, 4-space indented code, inline
+  `<code>`, HTML comments, and mismatched backticks. Round 2 parses the
+  body on the DAEMON at append time with `remark-parse` and extracts
+  mentions from prose text nodes only. `<code>...</code>` regions and
+  `<!-- ... -->` comments are masked pre-parse (offsets preserved) so the
+  AST never sees a mention inside them. The typed `Mention[]` list rides
+  on the `comment.created` / `comment.replied` event; the rail renders
+  chips from that data. This removes the parser from the browser bundle
+  entirely.
+
+- **Presence is EPHEMERAL, not durable.** The round-1 daemon appended
+  `presence` events to sqlite; a restart resurrected stale "agent is
+  editing…" beacons that reflected nothing. Round 2 keeps presence in
+  memory only (`packages/cli/src/serve/presence-hub.ts`) and broadcasts
+  each state change to `/events` subscribers directly. Fresh subscribers
+  get the current state on connect. Presence carries no `seq` on the
+  wire; `event-subscriber.ts` accepts frames without seq (they never
+  advance the resume point).
+
+- **Hook + catch-up summary use the derived DELIVERED set.** Round 1 leaked
+  handover drafts (and quiet-mode comments) into the UserPromptSubmit hook
+  and the MCP catch-up summary. Round 2 both callers pull the derived
+  `deliveredCommentIds` from `GET /api/delivered` and filter to threads
+  whose last comment is in that set — handover drafts stay hidden (like a
+  GitHub pending review), quiet-mode comments stay hidden.
+
+- **Hook single-write.** The round-1 hook wrote to `env.out` internally AND
+  returned `stdout` for `bin/revkit.js` to write again, so the shell saw
+  the pending block twice. Round 2: the hook returns `stdout` and bin
+  writes it once. A test fixture spawning the REAL bin
+  (`test/hook-cli.test.ts:BLOCKER 3`) is the regression net.
+
+- **Agent authority over the mode.** The MCP `mode` tool is **read-only**
+  from the agent surface: the tool's inputSchema declares no `set`
+  property, so a prompt-injected agent has NO way to flip modes through
+  the channel. The HTTP endpoint `POST /api/delivery-mode` still accepts
+  the reviewer's cookie AND the agent bearer, because the bearer is
+  filesystem-gated on `.revkit/serve.json` (mode 600) — a prompt-injected
+  agent without local filesystem read cannot obtain it. The security
+  envelope is "local filesystem access", not "identity of the bearer".
+
 ## Amendment (2026-09-30) — M2 item 6: delivery modes, presence, `@agent`, hook
 
 M2 item 6 wires the delivery-mode surface, presence, the Monitor-WebSocket fallback and the UserPromptSubmit hook.

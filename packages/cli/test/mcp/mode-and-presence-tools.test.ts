@@ -102,23 +102,15 @@ describe("`mode` MCP tool", () => {
     expect(parsed.mode).toBe("handover");
   });
 
-  test("set flips the mode and reports the new one", async () => {
-    const result = await ctx.client.callTool({ name: "mode", arguments: { set: "live" } });
-    const parsed = JSON.parse(textOf(result as { content: readonly { readonly type: string; readonly text?: string }[] })) as { mode: string };
-    expect(parsed.mode).toBe("live");
-    // Verify via HTTP too.
-    const cookie = await mintCookie(ctx.daemon);
-    const response = await fetch(`${ctx.daemon.url}/api/delivery-mode`, {
-      headers: { cookie, host: `127.0.0.1:${ctx.daemon.port}`, origin: ctx.daemon.url },
-    });
-    const status = (await response.json()) as { mode: string };
-    expect(status.mode).toBe("live");
-  });
-
-  test("rejects an unknown mode with the validator's message", async () => {
+  test("MCP `mode` tool refuses a `set` argument (round-2: read-only)", async () => {
+    // Round-2: the mode tool is read-only from the agent surface.
+    // A prompt-injected agent can never flip modes through the MCP.
+    // The daemon's HTTP endpoint (used by `revkit mode <m>` on the
+    // CLI) still accepts changes — see the HTTP tests for that
+    // path. Here we assert the agent-facing contract.
     const result = (await ctx.client.callTool({
       name: "mode",
-      arguments: { set: "loud" },
+      arguments: { set: "live" },
     })) as { isError?: boolean; content: readonly { text?: string }[] };
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text ?? "").toMatch(/invalid tool args/);
@@ -134,14 +126,16 @@ describe("`presence` MCP tool", () => {
     await tearDown(ctx);
   });
 
-  test("emits a presence event with the given state and location", async () => {
+  test("emits a presence FRAME (ephemeral, not durable) with location", async () => {
     const result = await ctx.client.callTool({
       name: "presence",
       arguments: { state: "editing", path: "docs/a.md", startLine: 1, endLine: 3 },
     });
-    const parsed = JSON.parse(textOf(result as { content: readonly { readonly type: string; readonly text?: string }[] })) as { event: { kind: string; state: string } };
-    expect(parsed.event.kind).toBe("presence");
-    expect(parsed.event.state).toBe("editing");
+    const parsed = JSON.parse(textOf(result as { content: readonly { readonly type: string; readonly text?: string }[] })) as { ok: boolean; frame: { kind: string; state: string; path?: string } };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.frame.kind).toBe("presence");
+    expect(parsed.frame.state).toBe("editing");
+    expect(parsed.frame.path).toBe("docs/a.md");
   });
 
   test("refuses an invalid line range", async () => {
@@ -157,8 +151,9 @@ describe("`presence` MCP tool", () => {
       name: "presence",
       arguments: { state: "idle" },
     });
-    const parsed = JSON.parse(textOf(result as { content: readonly { readonly type: string; readonly text?: string }[] })) as { event: { kind: string; state: string } };
-    expect(parsed.event.state).toBe("idle");
+    const parsed = JSON.parse(textOf(result as { content: readonly { readonly type: string; readonly text?: string }[] })) as { ok: boolean; frame: { kind: string; state: string } };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.frame.state).toBe("idle");
   });
 });
 

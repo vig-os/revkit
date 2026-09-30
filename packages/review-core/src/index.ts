@@ -90,13 +90,6 @@ export { ID_REGEX, idSchema, isValidId } from "./id.ts";
 export { isValidRepoRelativePath } from "./path.ts";
 export { authorKinds, authorSchema, type Author, type AuthorKind } from "./author.ts";
 export {
-  addressesAgent,
-  hasAgentNow,
-  parseMentions,
-  type Mention,
-  type MentionScan,
-} from "./mentions.ts";
-export {
   askAnswerSchema,
   askKinds,
   askSchema,
@@ -106,10 +99,21 @@ export {
 } from "./asks.ts";
 export { exportArchive, parseArchive, threadArchiveSchema, type ThreadArchive } from "./export.ts";
 export {
+  DEFAULT_DELIVERY_MODE,
+  currentDeliveryMode,
+  deliveredCommentIds,
+  isPending,
+  pendingCommentIds,
+} from "./delivery.ts";
+export {
+  deliveryModeSchema,
+  handoverTriggerSchema,
   presenceStateSchema,
   reanchorMethodSchema,
   reviewEventKinds,
   reviewEventSchema,
+  type DeliveryMode,
+  type HandoverTrigger,
   type PresenceState,
   type ReanchorEventMethod,
   type ReviewEvent,

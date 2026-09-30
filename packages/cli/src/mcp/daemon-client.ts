@@ -160,6 +160,27 @@ export class DaemonClient {
     return parsed;
   }
 
+  /** `GET /api/delivered` — the derived set of comment ids that
+   * have already reached the agent stream. Used by the catch-up
+   * summary + the UserPromptSubmit hook to hide handover drafts /
+   * quiet-mode comments (round-2 review). */
+  async getDeliveredCommentIds(): Promise<readonly string[]> {
+    const response = await this.#fetch(`${this.#url}/api/delivered`, {
+      method: "GET",
+      headers: this.#authHeaders(),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon GET /api/delivered → ${response.status}`,
+        response.status,
+        text,
+      );
+    }
+    const parsed = (await response.json()) as { deliveredCommentIds?: readonly string[] };
+    return Array.isArray(parsed.deliveredCommentIds) ? parsed.deliveredCommentIds : [];
+  }
+
   /** `GET /api/delivery-mode` — read the daemon's current delivery
    * mode plus batched-count and last-updated timestamp. */
   async getMode(): Promise<{

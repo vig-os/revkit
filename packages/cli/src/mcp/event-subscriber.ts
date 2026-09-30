@@ -26,7 +26,11 @@ import { stripTrailingSlashes } from "./daemon-client.ts";
  * before appending — but does insist on `seq` being an integer so
  * `Last-Event-ID` on reconnect is well-formed. */
 export interface WireEvent {
-  readonly seq: number;
+  /** Absent for ephemeral frames (M2 item 6 round 2 — presence).
+   * A subscriber that resumes on `Last-Event-ID` uses `seq` for
+   * durable events; ephemeral frames pass through without
+   * advancing the resume point. */
+  readonly seq?: number;
   readonly kind: string;
   readonly ts: string;
   readonly threadId?: string;
@@ -168,7 +172,7 @@ async function consume(
       buffer = buffer.slice(boundary + 2);
       const parsed = parseFrame(frame);
       if (parsed !== undefined) {
-        onSeq(parsed.seq);
+        if (typeof parsed.seq === "number") onSeq(parsed.seq);
         await onEvent(parsed);
       }
       boundary = buffer.indexOf("\n\n");
@@ -201,8 +205,10 @@ function parseFrame(frame: string): WireEvent | undefined {
   }
   if (parsed === null || typeof parsed !== "object") return undefined;
   const event = parsed as Partial<WireEvent>;
-  if (typeof event.seq !== "number" || !Number.isInteger(event.seq)) return undefined;
   if (typeof event.kind !== "string") return undefined;
   if (typeof event.ts !== "string") return undefined;
+  // Round 2: `seq` is optional (ephemeral presence frames have
+  // none). When present it must still be a positive integer.
+  if (event.seq !== undefined && !Number.isInteger(event.seq)) return undefined;
   return event as WireEvent;
 }

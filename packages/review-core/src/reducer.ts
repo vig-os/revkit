@@ -15,10 +15,13 @@
 //      such an event on the append side, so a correctly-produced log
 //      never carries one — the skip is a safety net for a partial
 //      slice, not a silent cover-up.
-//   3. `handover`, `presence`, `ask.created` and `ask.answered` do not
-//      touch thread state; they are surfaced through the event stream
-//      elsewhere (delivery modes, ask routes). `reduce` leaves them out
-//      of the Thread view rather than shoehorning them into a comment.
+//   3. `handover`, `delivery.mode_changed`, `ask.created` and
+//      `ask.answered` do not touch thread state; they are surfaced
+//      through the event stream elsewhere (delivery modes, ask
+//      routes). `reduce` leaves them out of the Thread view rather
+//      than shoehorning them into a comment. `presence` used to be
+//      here too but is ephemeral now (M2 item 6 round 2) — never
+//      on the durable log.
 
 import type { ReviewEvent } from "./events.ts";
 import type { Comment, Thread } from "./thread.ts";
@@ -47,6 +50,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         author: event.actor,
         body: event.body,
         createdAt: event.ts,
+        ...(event.mentions !== undefined ? { mentions: event.mentions } : {}),
       };
       // An unanchored anchor represents "imported without a
       // trustworthy anchor" — the thread starts orphaned so the
@@ -83,6 +87,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         author: event.actor,
         body: event.body,
         createdAt: event.ts,
+        ...(event.mentions !== undefined ? { mentions: event.mentions } : {}),
       };
       threads.set(event.threadId, {
         ...thread,
@@ -207,7 +212,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       return;
     }
     case "handover":
-    case "presence":
+    case "delivery.mode_changed":
     case "ask.created":
     case "ask.answered":
       // Handled outside the Thread view — see the file header.

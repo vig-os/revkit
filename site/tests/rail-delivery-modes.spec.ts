@@ -246,9 +246,22 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
     await page.goto(ctx.launchUrl, { waitUntil: "domcontentloaded" });
     await page.goto(`${ctx.url}/${fixture.path}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="revkit-rail"]');
-    // The mode fieldset + presence-empty + any chip rendered from the
-    // previous test should not add a violation. Run axe against the
-    // whole page.
+    // Round-2 fix: wait for the delivery-mode UI to be READY before
+    // running axe. The rail loads asynchronously (mode is fetched
+    // from /api/delivery-mode after the page's SSE subscription
+    // settles). Waiting for a stable selector, not a fixed timeout,
+    // stops the intermittent race the reviewer observed in the full
+    // suite where axe fired before the fieldset rendered.
+    await page.waitForSelector('[data-testid="revkit-rail-mode"] fieldset');
+    // Also wait until at least one mode radio is `data-selected="true"`
+    // — that only happens once `fetchDeliveryMode` has resolved.
+    await page.waitForFunction(
+      () =>
+        document.querySelectorAll(
+          '[data-testid^="revkit-rail-mode-"][data-selected="true"]',
+        ).length > 0,
+      { timeout: 10_000 },
+    );
     const results = await new AxeBuilder({ page }).analyze();
     // ADR-0017 gate: zero violations at any severity.
     expect(results.violations).toEqual([]);

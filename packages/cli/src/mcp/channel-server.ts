@@ -216,20 +216,15 @@ const RESOLVE_TOOL = {
 const MODE_TOOL = {
   name: "mode",
   description:
-    "Read or change revkit's delivery mode (ADR-0007 §5.3). Modes: `handover` (default; " +
-    "the reviewer's comments are batched and delivered on hand-over), `live` (each comment " +
-    "pushes as it lands), `quiet` (nothing is pushed; the agent pulls via `threads`). Without " +
-    "arguments, returns the current mode + batched count. With `set`, changes it (the reviewer " +
-    "typically owns the mode — an agent-side change is honoured but should be rare).",
+    "Read revkit's current delivery mode (ADR-0007 §5.3). Modes: `handover` (default; the " +
+    "reviewer's comments are batched and delivered on hand-over), `live` (each comment pushes " +
+    "as it lands), `quiet` (nothing is pushed; the agent pulls via `threads`). Round 2: the " +
+    "mode is the REVIEWER's choice and the agent cannot change it — a `set` call is refused " +
+    "at the daemon (ADR-0007 amendment: agent authority over the mode is denied so a " +
+    "prompt-injected agent cannot silence inbound review).",
   inputSchema: {
     type: "object",
-    properties: {
-      set: {
-        type: "string",
-        enum: ["handover", "live", "quiet"],
-        description: "Optional new mode.",
-      },
-    },
+    properties: {},
     additionalProperties: false,
   },
 } as const;
@@ -276,6 +271,12 @@ interface WireComment {
   readonly author?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   readonly body: string;
 }
+
+/** Optional set of "delivered to agent" comment ids the caller may
+ * supply — the daemon derives this from the log; when absent the
+ * catch-up falls back to the pre-round-2 heuristic ("human last
+ * commenter") but with a clear note that it may over-count. */
+export type DeliveredSet = ReadonlySet<string>;
 /** A minimal duck type for the wire thread the daemon exposes.
  * Issue #46 item 5: an anchor may be `line` (start/end present)
  * OR `unanchored` (start/end absent, `kind: "unanchored"` set).
@@ -324,6 +325,7 @@ function renderAnchorRange(anchor: {
  * `<channel>` tag even in the worst case. */
 export function formatCatchupSummary(
   threads: readonly WireThread[],
+  delivered?: DeliveredSet,
 ): ChannelPayload | undefined {
   const waiting = threads.filter((thread) => {
     // Issue #46 item 5: `resolved` and `orphaned` threads never
@@ -332,7 +334,14 @@ export function formatCatchupSummary(
     if (thread.status !== "open") return false;
     const last = thread.comments[thread.comments.length - 1];
     if (last === undefined) return false;
-    return last.author?.kind !== "agent";
+    if (last.author?.kind === "agent") return false;
+    // Round-2: filter to DELIVERED threads only. A handover-batched
+    // draft is the reviewer's WIP (like a GitHub pending review)
+    // and MUST NOT leak into the catch-up summary until it is
+    // handed over. Absent `delivered` = pre-round-2 caller; fall
+    // back to the old shape but the caller should upgrade.
+    if (delivered !== undefined && !delivered.has(last.id)) return false;
+    return true;
   });
   if (waiting.length === 0) return undefined;
   const sample = waiting.slice(0, 10);
@@ -597,11 +606,7 @@ const reviewUrlArgsSchema = z
   })
   .strict();
 
-const modeArgsSchema = z
-  .object({
-    set: z.enum(["handover", "live", "quiet"]).optional(),
-  })
-  .strict();
+const modeArgsSchema = z.object({}).strict();
 
 const presenceArgsSchema = z
   .object({
@@ -701,7 +706,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       if (toolName === "mode") {
         const parsed = modeArgsSchema.safeParse(args);
         if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
-        if (parsed.data.set !== undefined) return await client.setMode(parsed.data.set);
+        void parsed;
         return await client.getMode();
       }
       if (toolName === "presence") {
@@ -802,7 +807,18 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       ? { threads: options.initialListing.threads, head: options.initialListing.head }
       : await currentClient.listThreads();
     lastSeenSeq = listing.head ?? 0;
-    const summary = formatCatchupSummary(listing.threads as readonly WireThread[]);
+    // Round-2: the catch-up summary must ONLY list threads that
+    // are delivered to the agent. A handover-batched draft is
+    // hidden until the reviewer hands over — pull the derived
+    // set from the daemon. A failure here (older daemon) falls
+    // back to the pre-round-2 shape.
+    let delivered: DeliveredSet | undefined;
+    try {
+      delivered = new Set(await currentClient.getDeliveredCommentIds());
+    } catch {
+      delivered = undefined;
+    }
+    const summary = formatCatchupSummary(listing.threads as readonly WireThread[], delivered);
     if (summary !== undefined) {
       await emitNotification(summary);
     }
@@ -820,7 +836,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       agentToken: currentToken,
       since: lastSeenSeq,
       onEvent: async (event: WireEvent) => {
-        if (event.seq > lastSeenSeq) lastSeenSeq = event.seq;
+        // Round-2: ephemeral frames (presence) carry no `seq` and
+        // must not advance the resume point.
+        if (typeof event.seq === "number" && event.seq > lastSeenSeq) lastSeenSeq = event.seq;
         const payload = formatChannelPayload(event);
         if (payload === undefined) return;
         await emitNotification(payload);

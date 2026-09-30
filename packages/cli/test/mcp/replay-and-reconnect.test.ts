@@ -83,6 +83,8 @@ async function bootDaemon(): Promise<Ctx> {
     localUserId: "local-test",
     installSignalHandlers: false,
     logSink: { write: () => {} },
+
+    deliveryMode: "live",
   });
   const cookie = await mintCookie(daemon);
   return { daemon, root, cookie };
@@ -212,6 +214,8 @@ describe("blocker 2b — tool call reconnect is bounded", () => {
       localUserId: "local-test",
       installSignalHandlers: false,
       logSink: { write: () => {} },
+
+      deliveryMode: "live",
     });
   });
   afterEach(async () => {
@@ -290,6 +294,8 @@ describe("blocker 3 — reconnect on daemon restart", () => {
       localUserId: "local-test",
       installSignalHandlers: false,
       logSink: { write: () => {} },
+
+      deliveryMode: "live",
     });
     // Store sqlitePath for the discover to boot the second daemon
     // on the SAME file (so seqs continue).
@@ -341,6 +347,8 @@ describe("blocker 3 — reconnect on daemon restart", () => {
         localUserId: "local-test",
         installSignalHandlers: false,
         logSink: { write: () => {} },
+
+        deliveryMode: "live",
       });
       return {
         url: daemonB.url,
