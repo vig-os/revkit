@@ -378,8 +378,11 @@ export class GitHubAdapter {
   // --- Write paths (pending review) --- //
 
   /** Create a pending review pinned to `commitId`. `comments` seeds
-   * initial comments in one round-trip (GitHub supports this on the
-   * create call). */
+   * initial line comments in one round-trip (GitHub's create-review
+   * endpoint accepts `{path, body, line, side, start_line?,
+   * start_side?}` items — not `subject_type: file`). File-level
+   * comments must go through `addPendingComment` after the pending
+   * review exists. */
   async createPendingReview(input: {
     readonly pr: PrRef;
     readonly commitId: string;
@@ -387,11 +390,10 @@ export class GitHubAdapter {
     readonly comments?: ReadonlyArray<{
       readonly path: string;
       readonly body: string;
-      readonly line?: number;
+      readonly line: number;
       readonly side?: "RIGHT" | "LEFT";
       readonly startLine?: number;
       readonly startSide?: "RIGHT" | "LEFT";
-      readonly subjectType?: "line" | "file";
     }>;
   }): Promise<PendingReview> {
     const url = `${this.baseUrl}/repos/${enc(input.pr.owner)}/${enc(input.pr.repo)}/pulls/${input.pr.pullNumber}/reviews`;
@@ -788,22 +790,19 @@ function ghAuthorToReviewCoreAuthor(comment: GhReviewComment): Author {
 function shapeCommentPayload(c: {
   readonly path: string;
   readonly body: string;
-  readonly line?: number;
+  readonly line: number;
   readonly side?: "RIGHT" | "LEFT";
   readonly startLine?: number;
   readonly startSide?: "RIGHT" | "LEFT";
-  readonly subjectType?: "line" | "file";
 }): Record<string, unknown> {
-  const payload: Record<string, unknown> = { path: c.path, body: c.body };
-  if (c.subjectType === "file") {
-    payload.subject_type = "file";
-    return payload;
-  }
-  if (c.line === undefined) {
-    throw new Error("shapeCommentPayload: line is required for a line-subject comment");
-  }
-  payload.line = c.line;
-  payload.side = c.side ?? "RIGHT";
+  // Line-only shape — file-level comments go through the separate
+  // `addPendingComment` call (see `createPendingReview`'s doc-comment).
+  const payload: Record<string, unknown> = {
+    path: c.path,
+    body: c.body,
+    line: c.line,
+    side: c.side ?? "RIGHT",
+  };
   if (c.startLine !== undefined) {
     payload.start_line = c.startLine;
     payload.start_side = c.startSide ?? payload.side;

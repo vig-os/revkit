@@ -98,7 +98,12 @@ describe("createPendingReview — contract", () => {
     expect(req.headers["content-type"] ?? req.headers["Content-Type"]).toBe("application/json");
   });
 
-  test("seeds comments via the create call with the correct shape", async () => {
+  test("seeds line comments via the create call with the correct shape", async () => {
+    // Note: GitHub's `POST /pulls/:n/reviews` seeded-comments field
+    // only accepts LINE comments (`path`, `body`, `line`, `side`,
+    // `start_line?`, `start_side?`). File-level comments must go
+    // through `addPendingComment` after the pending review exists —
+    // the adapter's typing refuses to seed them.
     const { fetch, requests } = makeRecorder(() => ok({ id: 1002, node_id: "PRR_y", commit_id: COMMIT, state: "PENDING" }));
     const adapter = new GitHubAdapter({ token: staticToken, fetch });
     await adapter.createPendingReview({
@@ -108,7 +113,6 @@ describe("createPendingReview — contract", () => {
       comments: [
         { path: "docs/a.mdx", line: 3, body: "single-line" },
         { path: "docs/b.mdx", line: 12, startLine: 8, body: "multi-line" },
-        { path: "docs/c.mdx", body: "file-scope", subjectType: "file" },
       ],
     });
     const req = requests[0]!;
@@ -118,7 +122,6 @@ describe("createPendingReview — contract", () => {
       comments: [
         { path: "docs/a.mdx", body: "single-line", line: 3, side: "RIGHT" },
         { path: "docs/b.mdx", body: "multi-line", line: 12, side: "RIGHT", start_line: 8, start_side: "RIGHT" },
-        { path: "docs/c.mdx", body: "file-scope", subject_type: "file" },
       ],
     });
   });
