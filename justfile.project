@@ -35,7 +35,8 @@ lint:
     @if [ -f package.json ]; then \
       cd site && bun run check && cd .. && \
       cd packages/cli && bun run typecheck && cd ../.. && \
-      cd packages/components && bun run typecheck; \
+      cd packages/components && bun run typecheck && cd ../.. && \
+      cd packages/review-core && bun run typecheck; \
     else \
       echo "just lint: no package.json — skipping"; \
     fi
@@ -74,6 +75,7 @@ test *args:
       echo "just test: no package.json — skipping"; \
     else \
       cd packages/cli && bun test {{ args }} && cd ../.. && \
+      cd packages/review-core && bun test {{ args }} && bun run typecheck && cd ../.. && \
       cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
       just check && \
       just e2e; \
@@ -102,6 +104,7 @@ test-cov *args:
       echo "just test-cov: no package.json — skipping"; \
     else \
       cd packages/cli && bun test --coverage {{ args }} && cd ../.. && \
+      cd packages/review-core && bun test --coverage {{ args }} && cd ../.. && \
       cd site && bun test --coverage src/content/schemas/ {{ args }}; \
     fi
 

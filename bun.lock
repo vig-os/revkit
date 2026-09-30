@@ -39,6 +39,17 @@
         "solid-js": "1.9.15",
       },
     },
+    "packages/review-core": {
+      "name": "@revkit/review-core",
+      "version": "0.0.0",
+      "dependencies": {
+        "zod": "4.6.5",
+      },
+      "devDependencies": {
+        "@types/bun": "1.4.2",
+        "typescript": "5.9.3",
+      },
+    },
     "site": {
       "name": "@revkit/site",
       "version": "0.0.0",
@@ -48,6 +59,7 @@
         "@astrojs/starlight": "0.42.4",
         "@astrojs/starlight-tailwind": "5.0.0",
         "@revkit/components": "workspace:*",
+        "@revkit/review-core": "workspace:*",
         "@tailwindcss/vite": "4.3.3",
         "astro": "7.3.5",
         "katex": "0.18.9",
@@ -365,6 +377,8 @@
     "@revkit/cli": ["@revkit/cli@workspace:packages/cli"],
 
     "@revkit/components": ["@revkit/components@workspace:packages/components"],
+
+    "@revkit/review-core": ["@revkit/review-core@workspace:packages/review-core"],
 
     "@revkit/site": ["@revkit/site@workspace:site"],
 

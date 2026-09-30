@@ -5,7 +5,7 @@
 // Vega-Lite grammar keys such as `format` are allowed to pass through.
 import { describe, expect, test } from "bun:test";
 import { isSiblingFilename, plotSpecSchema } from "./plots.ts";
-import { CURRENT_SCHEMA_VERSION } from "./shared.ts";
+import { CURRENT_SCHEMA_VERSION } from "@revkit/review-core";
 
 const validSpec = {
   schemaVersion: CURRENT_SCHEMA_VERSION,

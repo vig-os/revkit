@@ -21,6 +21,7 @@
     "@astrojs/starlight": "0.42.4",
     "@astrojs/starlight-tailwind": "5.0.0",
     "@revkit/components": "workspace:*",
+    "@revkit/review-core": "workspace:*",
     "@tailwindcss/vite": "4.3.3",
     "astro": "7.3.5",
     "katex": "0.18.9",

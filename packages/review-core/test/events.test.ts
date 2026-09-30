@@ -1,0 +1,194 @@
+// Tests for the ReviewEvent Zod schema — the boundary check every event
+// hits before it enters the log. Exercises three things: (a) each `kind`
+// accepts its documented payload, (b) a stray extra field is rejected
+// on every strict variant, (c) core payload invariants fail loudly
+// (positive seq, ISO ts with offset, non-empty ids, SHA-256-shaped
+// revision, presence line-range coherence, and ask-specific rules).
+import { describe, expect, test } from "bun:test";
+import { reviewEventKinds, reviewEventSchema, type ReviewEvent } from "../src/index.ts";
+
+const t = "2026-09-30T12:00:00Z";
+const actor = { kind: "gh-user", id: "gerchowl" } as const;
+const anchor = {
+  path: "docs/adr/0006-comments-anchoring-event-log.md",
+  startLine: 40,
+  endLine: 44,
+  quote: { exact: "text-quote selector", prefix: "carries a ", suffix: " and the revision" },
+  revision: "c".repeat(64),
+} as const;
+
+/** One valid event per kind, used both to prove the happy path and as
+ * a base for negative tests below. */
+const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
+  "comment.created": {
+    seq: 1,
+    ts: t,
+    actor,
+    kind: "comment.created",
+    threadId: "th-1",
+    commentId: "c-1",
+    anchor,
+    body: "why 30 s?",
+  },
+  "comment.replied": {
+    seq: 2,
+    ts: t,
+    actor,
+    kind: "comment.replied",
+    threadId: "th-1",
+    commentId: "c-2",
+    parentId: "c-1",
+    body: "raised to 60 s",
+  },
+  "thread.resolved": {
+    seq: 3,
+    ts: t,
+    actor,
+    kind: "thread.resolved",
+    threadId: "th-1",
+  },
+  "thread.reopened": {
+    seq: 4,
+    ts: t,
+    actor,
+    kind: "thread.reopened",
+    threadId: "th-1",
+  },
+  handover: {
+    seq: 5,
+    ts: t,
+    actor,
+    kind: "handover",
+    commentIds: ["c-1"],
+    revision: "d".repeat(64),
+  },
+  presence: {
+    seq: 6,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "presence",
+    state: "editing",
+    path: "docs/adr/0006-comments-anchoring-event-log.md",
+    startLine: 40,
+    endLine: 60,
+  },
+  "ask.created": {
+    seq: 7,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "ask.created",
+    askId: "ask-1",
+    spec: {
+      schemaVersion: 1,
+      kind: "choice",
+      title: "Which storage?",
+      options: [
+        { id: "d1", label: "D1" },
+        { id: "kv", label: "KV" },
+      ],
+      allowOther: false,
+      multi: false,
+    },
+  },
+  "ask.answered": {
+    seq: 8,
+    ts: t,
+    actor,
+    kind: "ask.answered",
+    askId: "ask-1",
+    answer: { kind: "choice", value: "d1" },
+  },
+  "comment.linked": {
+    seq: 9,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "comment.linked",
+    commentId: "c-1",
+    external: { github: { commentId: 42, reviewId: 7, nodeId: "PRC_x" } },
+  },
+};
+
+describe("reviewEventSchema — happy paths", () => {
+  test("every declared kind has a valid example that parses", () => {
+    // Sanity: the fixture covers exactly the kinds the schema declares.
+    // If a kind is added to `reviewEventKinds` without a fixture, this
+    // fails at the length check instead of silently under-testing.
+    expect(Object.keys(validPerKind).sort()).toEqual([...reviewEventKinds].sort());
+    for (const kind of reviewEventKinds) {
+      const result = reviewEventSchema.safeParse(validPerKind[kind]);
+      if (!result.success) {
+        throw new Error(`kind '${kind}' should parse but did not: ${JSON.stringify(result.error.issues)}`);
+      }
+    }
+  });
+});
+
+describe("reviewEventSchema — rejections", () => {
+  test("a stray extra field is rejected (strict on every variant)", () => {
+    const stray = { ...validPerKind["comment.created"], bogus: 1 };
+    expect(reviewEventSchema.safeParse(stray).success).toBe(false);
+  });
+
+  test("seq must be a positive integer", () => {
+    for (const seq of [0, -1, 1.5]) {
+      const bad = { ...validPerKind["comment.created"], seq };
+      expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+
+  test("ts must be an ISO datetime WITH offset (Z or ±hh:mm)", () => {
+    const bareLocal = { ...validPerKind["comment.created"], ts: "2026-09-30T12:00:00" };
+    expect(reviewEventSchema.safeParse(bareLocal).success).toBe(false);
+    const notADate = { ...validPerKind["comment.created"], ts: "tomorrow" };
+    expect(reviewEventSchema.safeParse(notADate).success).toBe(false);
+  });
+
+  test("actor.kind must be one of the documented set", () => {
+    const bad = { ...validPerKind["comment.created"], actor: { kind: "wizard", id: "merlin" } };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("anchor.revision must be 64 hex chars (SHA-256 shape)", () => {
+    const bad = {
+      ...validPerKind["comment.created"],
+      anchor: { ...anchor, revision: "not-a-hash" },
+    };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("comment.replied requires threadId, commentId, parentId, body — all non-empty", () => {
+    const missingParent = {
+      ...validPerKind["comment.replied"],
+    } as Record<string, unknown>;
+    delete missingParent.parentId;
+    expect(reviewEventSchema.safeParse(missingParent).success).toBe(false);
+    const emptyBody = { ...validPerKind["comment.replied"], body: "" };
+    expect(reviewEventSchema.safeParse(emptyBody).success).toBe(false);
+  });
+
+  test("presence with only startLine (no endLine) is rejected — half-specified range", () => {
+    const bad = { ...validPerKind.presence } as Record<string, unknown>;
+    delete bad.endLine;
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("presence with endLine < startLine is rejected", () => {
+    const bad = { ...validPerKind.presence, startLine: 50, endLine: 40 };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("ask.answered rejects an answer whose kind mismatches the shape", () => {
+    // A `choice` answer that carries a `text` field only is rejected —
+    // the discriminated union on answer.kind refuses cross-kind fields.
+    const bad = {
+      ...validPerKind["ask.answered"],
+      answer: { kind: "choice", text: "hi" },
+    };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("comment.linked with an empty external object is rejected — needs at least one backend", () => {
+    const bad = { ...validPerKind["comment.linked"], external: {} };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+});

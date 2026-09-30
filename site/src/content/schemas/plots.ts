@@ -22,7 +22,7 @@
 // SVG that ships without JS.
 import { z } from "astro/zod";
 import { isObject, walkObjects } from "../utils/vega-lite-walk.ts";
-import { schemaVersionField } from "./shared.ts";
+import { schemaVersionField } from "@revkit/review-core";
 
 const FILE_ROLE = "plots/<name>/spec.vl.json";
 

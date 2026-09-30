@@ -1,13 +1,19 @@
-// Tests for the shared schemaVersion field — the acceptance-criterion for
-// ADR-0003 (every data file carries schemaVersion; missing or unknown
-// values fail loudly with a message that names the file's role).
+// Tests for the shared schemaVersion field — the ADR-0003 acceptance
+// criterion (every data file and every exported archive carries a
+// schemaVersion; missing or unknown values fail loudly with a message
+// that names the file's role). Moved from `site/src/content/schemas/`
+// when the helper moved into `@revkit/review-core`.
 import { describe, expect, test } from "bun:test";
-import { z } from "astro/zod";
-import { CURRENT_SCHEMA_VERSION, acceptedSchemaVersions, schemaVersionField } from "./shared.ts";
+import { z } from "zod";
+import {
+  CURRENT_SCHEMA_VERSION,
+  acceptedSchemaVersions,
+  schemaVersionField,
+} from "../src/index.ts";
 
 // Local re-declaration mirrors the shape a data-file schema builds around
-// the field, so a regression in schemaVersionField's error wiring trips a
-// test rather than surfacing on a build months later.
+// the field, so a regression in `schemaVersionField`'s error wiring trips
+// a test rather than surfacing on a build months later.
 const wrapped = z.object({
   schemaVersion: schemaVersionField("test/example.yaml"),
   payload: z.string(),
@@ -26,7 +32,7 @@ describe("schemaVersionField", () => {
     expect(result.success).toBe(true);
   });
 
-  test("rejects a file that is missing schemaVersion, with a hint at the required value", () => {
+  test("rejects a file that is missing schemaVersion, with the fileRole in the message", () => {
     const result = wrapped.safeParse({ payload: "ok" });
     expect(result.success).toBe(false);
     if (result.success) return;

@@ -1,22 +1,29 @@
 // Tests for the ask (question spec) schema (DESIGN-0001 §5.1, ADR-0003,
-// ADR-0007). The schema is a discriminated union on `kind`; the guarantees
-// exercised here are: (a) each kind's happy path validates, (b) an unknown
-// kind fails and names the allowed set, (c) schemaVersion is enforced,
-// (d) kind-specific invariants hold (choice needs >= 2 options with unique
-// ids, scale needs min < max), and (e) strict shape — a stray body field
-// (including the removed `id`) fails, since the daemon assigns ids from
-// filenames (ADR-0007 acceptance).
+// ADR-0007). Moved from `site/src/content/schemas/asks.test.ts` when the
+// schema itself moved into `@revkit/review-core` (ADR-0025). The
+// guarantees exercised here are: (a) each kind's happy path validates,
+// (b) an unknown kind fails and names the allowed set, (c) schemaVersion
+// is enforced, (d) kind-specific invariants hold (choice needs >= 2
+// options with unique ids, scale needs min < max), and (e) strict shape
+// — a stray body field (including the removed `id`) fails, since the
+// daemon assigns ids from filenames (ADR-0007 acceptance).
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
-import { askKinds, askSchema } from "./asks.ts";
-import { CURRENT_SCHEMA_VERSION } from "./shared.ts";
+import { CURRENT_SCHEMA_VERSION, askKinds, askSchema } from "../src/index.ts";
 
 const baseOf = (kind: string): Record<string, unknown> => ({
   schemaVersion: CURRENT_SCHEMA_VERSION,
   kind,
   title: `Example ${kind}`,
 });
+
+/** The committed fixture stays in the site tree because Playwright and
+ * other site-side tooling reads it too; this test resolves it from the
+ * repo root so a move of either half is a loud break, not a silent one. */
+const FIXTURE_PATH = fileURLToPath(
+  new URL("../../../site/tests/fixtures/asks/example-choice.json", import.meta.url),
+);
 
 describe("askSchema — happy paths", () => {
   test("choice accepts >= 2 options and defaults multi/allowOther to false", () => {
@@ -53,10 +60,7 @@ describe("askSchema — happy paths", () => {
   });
 
   test("the committed fixture (site/tests/fixtures/asks/example-choice.json) validates", async () => {
-    const fixturePath = fileURLToPath(
-      new URL("../../../tests/fixtures/asks/example-choice.json", import.meta.url),
-    );
-    const parsed = JSON.parse(await readFile(fixturePath, "utf8")) as unknown;
+    const parsed = JSON.parse(await readFile(FIXTURE_PATH, "utf8")) as unknown;
     const result = askSchema.safeParse(parsed);
     expect(result.success).toBe(true);
   });

@@ -16,7 +16,7 @@ import { file, glob } from "astro/loaders";
 import { parse as parseYaml } from "yaml";
 import { plotsLoader } from "./content/loaders/plots.ts";
 import { repoDocsLoader } from "./content/loaders/repo-docs.ts";
-import { askSchema } from "./content/schemas/asks.ts";
+import { askSchema } from "@revkit/review-core";
 import { plotSpecSchema } from "./content/schemas/plots.ts";
 import { vocabEntrySchema, vocabFileSchema } from "./content/schemas/vocab.ts";
 

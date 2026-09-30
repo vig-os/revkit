@@ -1,0 +1,354 @@
+// The transition validator — one place that owns the rules a well-formed
+// event log obeys. Called by `InMemoryThreadStore.append` (assigning a
+// fresh `seq`/`ts`) and by `InMemoryThreadStore.import` (replaying an
+// archive's own seq/ts) and by `parseArchive` (refusing a corrupt
+// archive at the byte boundary). One rule set, three call sites,
+// zero drift.
+//
+// Rules (each with its own AppendRejection kind so a caller can branch
+// on `rejection.kind` without parsing the message):
+//   comment.created  — new threadId (no `duplicate-thread`); the
+//                      commentId must be globally unique across the
+//                      log (no `duplicate-comment-id`).
+//   comment.replied  — the threadId must exist (`unknown-thread`), the
+//                      parentId must be a commentId in the same thread
+//                      (`unknown-parent`), and the commentId globally
+//                      unique.
+//   thread.resolved  — the threadId must exist and its status must be
+//                      `open` (a second resolve or a resolve on an
+//                      orphan-only thread is rejected: `not-open`).
+//   thread.reopened  — the threadId must exist and its status must be
+//                      `resolved` (`not-resolved`).
+//   handover         — every commentId in `commentIds` must exist in
+//                      the log (`unknown-comment`).
+//   presence         — no thread state; always accepted.
+//   ask.created      — the askId must be new (`duplicate-ask`).
+//   ask.answered     — the askId must be a prior `ask.created` and not
+//                      already answered (`unknown-ask`,
+//                      `duplicate-answer`).
+//   comment.linked   — the commentId must exist; a commentId may be
+//                      linked once (a second link is `duplicate-link`).
+//
+// State (`LogState`) is mutated on success — cheap and equivalent to a
+// functional model for the small maps we keep. Store implementations
+// hold one long-lived `LogState`; `parseArchive` builds a fresh one and
+// throws it away.
+
+import type { AskKind } from "./asks.ts";
+import type { ReviewEvent } from "./events.ts";
+import type { ThreadStatus } from "./thread.ts";
+
+/** The bookkeeping the validator needs — everything an event might
+ * reference at the wire boundary. Kept minimal so the store can hold one
+ * without carrying a full Thread map. All fields are mutable maps of
+ * plain values; `cloneLogState` deep-copies them so an atomic-commit
+ * pass (see `InMemoryThreadStore.import`) can dry-run against a shadow
+ * and either commit the whole sequence or leave the real state
+ * untouched. */
+export interface LogState {
+  /** Per-thread status. Presence in the map means the thread exists. */
+  readonly threads: Map<string, { status: ThreadStatus; readonly commentIds: Set<string> }>;
+  /** commentId → threadId. Global (across threads) so a duplicate
+   * commentId in any thread is a rejection. */
+  readonly commentIndex: Map<string, string>;
+  /** askId → { kind, answered? }. `kind` is stored so `ask.answered`
+   * can be refused when the answer's discriminant does not match the
+   * ask's kind (a `scale` answer on a `text` ask, and so on). */
+  readonly asks: Map<string, { kind: AskKind; answered: boolean }>;
+  /** commentId → set of already-linked backends, so a second link to
+   * the same backend on the same comment can be rejected without
+   * silently overwriting the first. */
+  readonly commentLinks: Map<string, Set<string>>;
+  /** External id → local commentId. Key is `<backend>:<id>` (today
+   * `github:<commentId>`). Guards against two different local
+   * comments claiming the same external id. */
+  readonly externalIndex: Map<string, string>;
+}
+
+export function emptyLogState(): LogState {
+  return {
+    threads: new Map(),
+    commentIndex: new Map(),
+    asks: new Map(),
+    commentLinks: new Map(),
+    externalIndex: new Map(),
+  };
+}
+
+/** Deep-copy a `LogState`. The maps' values are plain records or Sets,
+ * so a top-level clone of each entry is enough — nothing in this shape
+ * holds a reference to a caller's mutable object. Used by
+ * `InMemoryThreadStore.import` to dry-run an archive without mutating
+ * the real state (the atomic-commit contract). */
+export function cloneLogState(state: LogState): LogState {
+  const threads = new Map<string, { status: ThreadStatus; commentIds: Set<string> }>();
+  for (const [id, entry] of state.threads) {
+    threads.set(id, { status: entry.status, commentIds: new Set(entry.commentIds) });
+  }
+  const asks = new Map<string, { kind: AskKind; answered: boolean }>();
+  for (const [id, entry] of state.asks) {
+    asks.set(id, { kind: entry.kind, answered: entry.answered });
+  }
+  const commentLinks = new Map<string, Set<string>>();
+  for (const [id, backends] of state.commentLinks) {
+    commentLinks.set(id, new Set(backends));
+  }
+  return {
+    threads,
+    commentIndex: new Map(state.commentIndex),
+    asks,
+    commentLinks,
+    externalIndex: new Map(state.externalIndex),
+  };
+}
+
+/** Every reason `validateNext` may reject an event. `kind` is stable
+ * across implementations; the message names the specifics. */
+export type AppendRejection =
+  | { kind: "invalid-shape"; message: string }
+  | { kind: "duplicate-thread"; threadId: string; message: string }
+  | { kind: "unknown-thread"; threadId: string; message: string }
+  | { kind: "unknown-parent"; threadId: string; parentId: string; message: string }
+  | { kind: "duplicate-comment-id"; commentId: string; message: string }
+  | { kind: "not-open"; threadId: string; message: string }
+  | { kind: "not-resolved"; threadId: string; message: string }
+  | { kind: "unknown-comment"; commentId: string; message: string }
+  | { kind: "duplicate-ask"; askId: string; message: string }
+  | { kind: "unknown-ask"; askId: string; message: string }
+  | { kind: "duplicate-answer"; askId: string; message: string }
+  | { kind: "answer-kind-mismatch"; askId: string; askKind: AskKind; answerKind: AskKind; message: string }
+  | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
+  | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string };
+
+export type ValidationResult = { ok: true } | { ok: false; rejection: AppendRejection };
+
+/** Validate `event` against `state`. On success, mutates `state` to
+ * include the event's effect and returns `{ ok: true }`. On failure,
+ * leaves `state` untouched and returns the rejection.
+ *
+ * Callers guarantee `event` has already passed `reviewEventSchema` — this
+ * function checks only the transition rules the Zod schema cannot see
+ * (cross-event / cross-thread invariants).
+ */
+export function validateNext(state: LogState, event: ReviewEvent): ValidationResult {
+  switch (event.kind) {
+    case "comment.created": {
+      if (state.threads.has(event.threadId)) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "duplicate-thread",
+            threadId: event.threadId,
+            message: `thread '${event.threadId}' already exists — thread creation is implicit and one-shot.`,
+          },
+        };
+      }
+      if (state.commentIndex.has(event.commentId)) {
+        return duplicateComment(event.commentId);
+      }
+      state.threads.set(event.threadId, {
+        status: "open",
+        commentIds: new Set([event.commentId]),
+      });
+      state.commentIndex.set(event.commentId, event.threadId);
+      return { ok: true };
+    }
+    case "comment.replied": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (!thread.commentIds.has(event.parentId)) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-parent",
+            threadId: event.threadId,
+            parentId: event.parentId,
+            message: `comment.replied: parent '${event.parentId}' is not a comment in thread '${event.threadId}'.`,
+          },
+        };
+      }
+      if (state.commentIndex.has(event.commentId)) {
+        return duplicateComment(event.commentId);
+      }
+      thread.commentIds.add(event.commentId);
+      state.commentIndex.set(event.commentId, event.threadId);
+      return { ok: true };
+    }
+    case "thread.resolved": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (thread.status !== "open") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-open",
+            threadId: event.threadId,
+            message: `thread.resolved: thread '${event.threadId}' is not open (current status: ${thread.status}).`,
+          },
+        };
+      }
+      thread.status = "resolved";
+      return { ok: true };
+    }
+    case "thread.reopened": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (thread.status !== "resolved") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-resolved",
+            threadId: event.threadId,
+            message: `thread.reopened: thread '${event.threadId}' is not resolved (current status: ${thread.status}).`,
+          },
+        };
+      }
+      thread.status = "open";
+      return { ok: true };
+    }
+    case "handover": {
+      for (const commentId of event.commentIds) {
+        if (!state.commentIndex.has(commentId)) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "unknown-comment",
+              commentId,
+              message: `handover: comment '${commentId}' is not in the log.`,
+            },
+          };
+        }
+      }
+      return { ok: true };
+    }
+    case "presence":
+      return { ok: true };
+    case "ask.created": {
+      if (state.asks.has(event.askId)) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "duplicate-ask",
+            askId: event.askId,
+            message: `ask.created: ask '${event.askId}' already exists.`,
+          },
+        };
+      }
+      state.asks.set(event.askId, { kind: event.spec.kind, answered: false });
+      return { ok: true };
+    }
+    case "ask.answered": {
+      const ask = state.asks.get(event.askId);
+      if (ask === undefined) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-ask",
+            askId: event.askId,
+            message: `ask.answered: ask '${event.askId}' does not exist (no prior ask.created).`,
+          },
+        };
+      }
+      if (ask.answered) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "duplicate-answer",
+            askId: event.askId,
+            message: `ask.answered: ask '${event.askId}' already has an answer.`,
+          },
+        };
+      }
+      if (event.answer.kind !== ask.kind) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "answer-kind-mismatch",
+            askId: event.askId,
+            askKind: ask.kind,
+            answerKind: event.answer.kind,
+            message: `ask.answered: ask '${event.askId}' is a '${ask.kind}' question, so the answer.kind must be '${ask.kind}' — got '${event.answer.kind}'.`,
+          },
+        };
+      }
+      ask.answered = true;
+      return { ok: true };
+    }
+    case "comment.linked": {
+      if (!state.commentIndex.has(event.commentId)) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-comment",
+            commentId: event.commentId,
+            message: `comment.linked: comment '${event.commentId}' is not in the log.`,
+          },
+        };
+      }
+      const linked = state.commentLinks.get(event.commentId) ?? new Set<string>();
+      // Build the (backend, externalId) list first — no state mutation
+      // until every backend on the event passes both the same-comment
+      // duplicate check and the cross-comment external-id uniqueness
+      // check, so a rejection leaves state untouched.
+      const github = event.external.github;
+      const pairs: Array<{ backend: string; externalId: string }> = [];
+      if (github !== undefined) pairs.push({ backend: "github", externalId: String(github.commentId) });
+      for (const { backend, externalId } of pairs) {
+        if (linked.has(backend)) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "duplicate-link",
+              commentId: event.commentId,
+              backend,
+              message: `comment.linked: comment '${event.commentId}' is already linked to backend '${backend}'.`,
+            },
+          };
+        }
+        const externalKey = `${backend}:${externalId}`;
+        const existingCommentId = state.externalIndex.get(externalKey);
+        if (existingCommentId !== undefined && existingCommentId !== event.commentId) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "duplicate-external-id",
+              commentId: event.commentId,
+              backend,
+              externalId,
+              existingCommentId,
+              message: `comment.linked: external ${backend} id '${externalId}' is already linked to comment '${existingCommentId}' — external ids are unique across local comments.`,
+            },
+          };
+        }
+      }
+      for (const { backend, externalId } of pairs) {
+        linked.add(backend);
+        state.externalIndex.set(`${backend}:${externalId}`, event.commentId);
+      }
+      state.commentLinks.set(event.commentId, linked);
+      return { ok: true };
+    }
+  }
+}
+
+function unknownThread(threadId: string, eventKind: string): ValidationResult {
+  return {
+    ok: false,
+    rejection: {
+      kind: "unknown-thread",
+      threadId,
+      message: `${eventKind}: thread '${threadId}' does not exist — a '${eventKind}' event needs a prior 'comment.created'.`,
+    },
+  };
+}
+
+function duplicateComment(commentId: string): ValidationResult {
+  return {
+    ok: false,
+    rejection: {
+      kind: "duplicate-comment-id",
+      commentId,
+      message: `commentId '${commentId}' already exists in the log (commentIds are globally unique).`,
+    },
+  };
+}
