@@ -49,3 +49,31 @@ previews path-based rather than per-subdomain (ADR-0008).
 
 Blocks M3. Isolation weaker than per-subdomain origins is accepted in exchange for zero certificate cost; revisit if
 third-party (non-org) repos are ever onboarded.
+
+## Amendment (2026-09-30)
+
+Clarifications from the M2 build-out of the CSP on `revkit serve` (issue #22; see also the ADR-0013 amendment on the
+same date for the local daemon's per-directive specifics).
+
+- **Inline-script hash allowlist as a release artefact.** The M2 daemon reads its `sha256-…` allowlist from
+  `packages/cli/src/dist-check-allowlist.json` — the committed, reviewed set the running revkit version ships. It
+  NEVER reads a hashes file the served dir carries: whoever controls the build controls the `<script>` tags too, so
+  a build-owned artefact widening `script-src` would be trivially forgeable. This is the ADR line "the Worker applies
+  the allowlist of the revkit version it runs, never hashes found in an artifact" applied to the daemon. `revkit
+  check-dist` already enforces that every inline script in a built site is a subset of the same allowlist; the
+  daemon reads the same file.
+- **`script-src` path scoping.** The M2 daemon lists the exact loopback URLs for its script sources
+  (`http://127.0.0.1:<port>/-/rail.js` and `.../_astro/`). The hosted Worker will use `/_revkit/<version>/` on the
+  revkit-owned origin as this ADR already prescribes; the daemon exception is documented in ADR-0013.
+- **`'unsafe-eval'` scope; `'wasm-unsafe-eval'` only.** ADR-0012's `script-src` never contains `'unsafe-eval'`, and
+  the M2 daemon does not either: the rail is JSX-compiled at build time with `babel-preset-solid`, so the bundle has
+  no runtime template compilation. Starlight search (pagefind) needs `'wasm-unsafe-eval'` — the narrow keyword that
+  allows `WebAssembly.instantiate` on a byte sequence but not `eval()` / `new Function()` on JavaScript. The mutation
+  guards in `test/serve/headers.test.ts` and `test/rail/injector.test.ts` refuse a regression. See ADR-0013 amendment.
+- **`connect-src` and WebSocket.** CSP L3 (Chromium ≥ 96, Firefox ≥ 99) treats `'self'` as covering `ws://` on the
+  same origin; the hosted Worker keeps `'self'` alone. The local daemon adds an explicit `ws://127.0.0.1:<port>` for
+  older WebKit builds.
+- **Response hygiene beyond `nosniff`.** Every response also carries `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, and a `Permissions-Policy`
+  denying camera / microphone / geolocation / payment / USB / WebAuthn / display-capture / … . API JSON, launch-code
+  responses, and the `/-/auth` 302 carry `Cache-Control: no-store`. The M3/M4 Worker will ship the same set.

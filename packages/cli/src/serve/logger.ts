@@ -38,6 +38,8 @@ export interface LogFields {
   readonly pid?: number;
   readonly errorKind?: string;
   readonly bytes?: number;
+  readonly count?: number;
+  readonly artefact?: string;
 }
 
 /** A tiny writer interface so tests can inject a buffer. Node's
@@ -142,6 +144,9 @@ const ALLOWED_KEYS = [
   "version",
   "pid",
   "errorKind",
+  "bytes",
+  "count",
+  "artefact",
 ] as const satisfies readonly (keyof LogFields)[];
 
 /** Exported so `test/serve/logger.test.ts` can iterate the allowlist —
