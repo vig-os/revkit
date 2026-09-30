@@ -10,10 +10,10 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { acquireAndPublish, findRunningDaemon, readServeState } from "../../src/serve/serve-state.ts";
+import { acquireAndPublish, daemonLockPath, findRunningDaemon, readServeState } from "../../src/serve/serve-state.ts";
 
 const cliBin = resolve(import.meta.dirname, "..", "..", "bin", "revkit.js");
 
@@ -199,6 +199,50 @@ describe("round-3 blocker-1 scenarios", () => {
     publishA.release();
     const survivor = readServeState(root);
     expect(survivor?.instanceId, "B's serve.json must survive A's shutdown").toBe("B");
+  });
+});
+
+describe("round-4 nits (mode observation and CLI-path integration)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = tmpRepo();
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // Nit 1: `.revkit/` mode via the REAL CLI entry point. `readOrMintLocalUserId`
+  // used to `mkdirSync(..., { recursive: true })` without a mode
+  // (round-4 review found this leaves the dir at 0755 under a
+  // typical umask). Route through `ensureRevkitDir` and observe the
+  // mode from a spawned `revkit serve`.
+  // Mutation partner: drop `ensureRevkitDir` from
+  // `readOrMintLocalUserId` and this test flips 0700 → 0755.
+  test("spawn revkit serve → .revkit/ is 0700 on disk", async () => {
+    const info = await spawnDaemon(root);
+    try {
+      const mode = statSync(join(root, ".revkit")).mode & 0o777;
+      expect(mode, ".revkit/ should be 0700 after the real CLI ran").toBe(0o700);
+    } finally {
+      info.proc.kill("SIGTERM");
+      await waitExit(info.proc);
+    }
+  });
+
+  // Nit 5: the lock file is opened at mode 0600.
+  // Mutation partner: change the openSync mode to 0o644 and this
+  // test flips.
+  test("spawn revkit serve → daemon.lock is 0600 on disk", async () => {
+    const info = await spawnDaemon(root);
+    try {
+      const path = daemonLockPath(root);
+      expect(existsSync(path)).toBe(true);
+      const mode = statSync(path).mode & 0o777;
+      expect(mode, "daemon.lock should be 0600").toBe(0o600);
+    } finally {
+      info.proc.kill("SIGTERM");
+      await waitExit(info.proc);
+    }
   });
 });
 

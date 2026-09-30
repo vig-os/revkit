@@ -179,18 +179,24 @@ describe("revkit serve — security", () => {
     }
   });
 
-  test("refuses a request with a matching Origin but Sec-Fetch-Site: same-site", async () => {
-    // Round-3 survivor: the "Origin present" branch previously only
-    // returned early on `sfs === "same-origin"`, but did not refuse
-    // a mismatched-but-present sfs. A page on the same site but a
-    // different port sends Origin=<port>+Sec-Fetch-Site=same-site.
-    // Mutation: drop the `sfs !== "same-origin"` check → this test
-    // flips 403 → 200.
+  test("cookie + matching Origin + Sec-Fetch-Site: same-site is refused (Origin-present branch)", async () => {
+    // Round-3 survivor, corrected in round 4: this exercises the
+    // **cookie** path of `checkOrigin` — a browser page on the
+    // same site but a different port sends Origin=<daemon-origin>
+    // (matches, because ports are not part of same-site) and
+    // `Sec-Fetch-Site: same-site`. The "Origin present" branch
+    // must refuse a `sfs != same-origin`. Sending a bearer would
+    // instead exercise the bearer branch of the same check, so we
+    // authenticate via the session cookie.
+    // Mutation: drop the `sfs !== "same-origin"` check in the
+    // Origin-present cookie branch → this test flips 403 → 200
+    // (verified in the round-4 falsification report).
     const ctx = await startCtx();
     try {
+      const cookie = await ctx.cookieFor(ctx.handle.launchCode);
       const response = await fetch(ctx.handle.url + "/api/threads", {
         headers: loopbackHeaders(ctx.handle.port, {
-          authorization: `Bearer ${ctx.handle.agentToken}`,
+          cookie,
           "sec-fetch-site": "same-site",
         }),
       });

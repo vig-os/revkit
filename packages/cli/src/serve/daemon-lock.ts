@@ -8,19 +8,18 @@
 // pid check. If the second process gets the lock, the first is truly
 // gone.
 //
-// **Why `flock(2)` via FFI, not `bun:sqlite` in EXCLUSIVE mode.**
-// The reviewer suggested a dedicated SQLite database with
-// `PRAGMA locking_mode=EXCLUSIVE` + `BEGIN EXCLUSIVE`. Probed on Bun
-// 1.3.13 on this host: a second connection's WRITE succeeds while
-// the first's EXCLUSIVE transaction is open (an identical Python
-// holder correctly returns "database is locked" — SQLITE_BUSY — so
-// the mechanism does work, but Bun's connection does not hold the
-// OS-level lock across statements the way the docs describe). The
-// underlying property the reviewer wants is a kernel-held fcntl-
-// family lock that survives SIGSTOP; `flock(2)` is that same
-// mechanism, called directly, so the same guarantee holds without
-// depending on the SQLite driver's autocommit / lock-retention
-// behaviour.
+// **Why `flock(2)`, not `bun:sqlite` in EXCLUSIVE mode.** SQLite in
+// EXCLUSIVE mode (`PRAGMA locking_mode=EXCLUSIVE` + `BEGIN EXCLUSIVE`)
+// does deliver the same fcntl-family cross-process refusal on this
+// host — the round-4 reviewer confirmed a second writer is refused.
+// This module picks `flock(2)` because it is one syscall directly
+// against a kernel lock, with no dependency on the SQLite driver's
+// autocommit rules, journal mode, or WAL-vs-rollback lock semantics.
+// One syscall in, one syscall out, kernel-released on exit: the
+// mutual-exclusion contract is a property of the kernel primitive
+// alone. A future review that wants to swap this for the SQLite
+// path can do so — the surface (`acquireDaemonLock`,
+// `DaemonLock.release`) does not depend on the mechanism.
 //
 // Advisory vs. mandatory: `flock(2)` on Linux is advisory. That is
 // enough for the daemon's need — only `revkit serve` calls
@@ -28,18 +27,35 @@
 // instances (which the round-3 blocker asks for). An external tool
 // that ignores flock cannot become "another daemon".
 
-import { dlopen, FFIType } from "bun:ffi";
 import { closeSync, constants, openSync } from "node:fs";
 
-/** LOCK_EX and LOCK_NB from `sys/file.h`. Same constants on Linux
- * and macOS (BSD-derived flock lives on both). */
+/** LOCK_EX / LOCK_NB / LOCK_UN from `sys/file.h`. Same constants on
+ * Linux and macOS (BSD-derived flock lives on both). */
 const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
 
-/** Resolve libc for this platform. Bun's `dlopen` accepts a literal
- * path or a name it will search. */
-function loadLibc(): { flock: (fd: number, op: number) => number } {
+/** `FD_CLOEXEC` for `fcntl(F_SETFD, …)`. */
+const FD_CLOEXEC = 1;
+const F_SETFD = 2;
+
+/** Lazily-resolved libc bindings. Loaded on the first
+ * `acquireDaemonLock` call so that `revkit check` and every other
+ * command path never touches `bun:ffi` (round-4 review nit). A test
+ * or a runtime that lives without FFI (a browser build of the CLI —
+ * hypothetical) sees the module import cost only if it also asks
+ * for a daemon lock. */
+interface LibcBindings {
+  flock(fd: number, op: number): number;
+  fcntl(fd: number, cmd: number, arg: number): number;
+}
+let cachedLibc: LibcBindings | undefined;
+
+function loadLibc(): LibcBindings {
+  if (cachedLibc !== undefined) return cachedLibc;
+  // Kept behind an inline `require`-style dynamic import so the
+  // `bun:ffi` runtime cost is paid only on first lock acquisition.
+  const { dlopen, FFIType } = require("bun:ffi") as typeof import("bun:ffi");
   const candidates =
     process.platform === "darwin"
       ? ["libSystem.B.dylib", "libSystem.dylib"]
@@ -49,18 +65,19 @@ function loadLibc(): { flock: (fd: number, op: number) => number } {
     try {
       const lib = dlopen(name, {
         flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+        fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
       });
-      return {
+      cachedLibc = {
         flock: (fd, op) => Number(lib.symbols.flock(fd, op)),
+        fcntl: (fd, cmd, arg) => Number(lib.symbols.fcntl(fd, cmd, arg)),
       };
+      return cachedLibc;
     } catch (error) {
       lastError = error;
     }
   }
   throw new Error(`daemon-lock: could not load libc (tried ${candidates.join(", ")}): ${String(lastError)}`);
 }
-
-const libc = loadLibc();
 
 /** A held daemon lock. `release()` is idempotent. */
 export interface DaemonLock {
@@ -77,14 +94,32 @@ export interface DaemonLock {
  * daemon can hand the lock off deliberately during a graceful
  * shutdown, but leaking the fd through process exit is safe. */
 export function acquireDaemonLock(lockPath: string): DaemonLock | null {
+  const libc = loadLibc();
   // O_RDWR because `flock` needs a writable fd on some filesystems
   // (specifically NFS with `local_lock=all`, which is a corner case
   // but easy to accommodate — the caller does not care what mode).
+  //
+  // `O_CLOEXEC` so the lock fd is not inherited by any subprocess
+  // the daemon spawns (a child that inherits the fd would keep the
+  // lock alive past the daemon's exit, refusing every future start).
+  // Node's `fs.constants.O_CLOEXEC` is present on Linux and macOS
+  // — when it is missing we fall through to `fcntl(F_SETFD,
+  // FD_CLOEXEC)` after the open.
+  const O_CLOEXEC = (constants as { O_CLOEXEC?: number }).O_CLOEXEC ?? 0;
   let fd: number;
   try {
-    fd = openSync(lockPath, constants.O_RDWR | constants.O_CREAT, 0o600);
+    fd = openSync(lockPath, constants.O_RDWR | constants.O_CREAT | O_CLOEXEC, 0o600);
   } catch (error) {
     throw new Error(`daemon-lock: could not open '${lockPath}': ${(error as Error).message}`);
+  }
+  if (O_CLOEXEC === 0) {
+    try {
+      libc.fcntl(fd, F_SETFD, FD_CLOEXEC);
+    } catch {
+      // Not fatal on the daemon-in-foreground case; a spawned
+      // child would inherit the lock. Log-worthy on platforms
+      // that lack both mechanisms.
+    }
   }
   const rc = libc.flock(fd, LOCK_EX | LOCK_NB);
   if (rc !== 0) {

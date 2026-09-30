@@ -7,10 +7,11 @@
 // test that wants to run `startDaemon` directly) does not pick up the
 // argv parser and the "block forever" behaviour they don't want.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve as resolvePath } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { randomBytes } from "node:crypto";
 import { startDaemon, type StartDaemonOptions } from "./daemon.ts";
+import { ensureRevkitDir } from "./serve-state.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
 
 /** One CLI invocation of `revkit serve`. `blockForever` is a Promise
@@ -87,7 +88,11 @@ export function readOrMintLocalUserId(repoRoot: string): string {
     if (raw.length > 0) return raw;
   }
   const id = "local-" + randomBytes(9).toString("base64url");
-  mkdirSync(dirname(path), { recursive: true });
+  // Route through the one `.revkit/` directory owner in
+  // `serve-state.ts` so the mode (0700) is consistent across every
+  // entry point (round-4 review nit: an early `mkdir` here without
+  // a mode left the dir at 0755).
+  ensureRevkitDir(repoRoot);
   writeFileSync(path, id + "\n", { mode: 0o600 });
   return id;
 }

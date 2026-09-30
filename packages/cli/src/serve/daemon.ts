@@ -49,7 +49,7 @@ import {
 } from "./auth.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
-import { acquireAndPublish, type ServeState } from "./serve-state.ts";
+import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
 import {
   createThreadRequestSchema,
@@ -144,14 +144,18 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
   const requestedPort = options.port ?? 0;
 
-  // `.revkit/` mode is owned by `acquireAndPublish` / `writeServeState`
-  // (see serve-state.ts) — it does the mkdir+chmod so both the sqlite
-  // and the state file land in a 0700 dir. Historically the daemon
-  // did it too; the duplicate was flagged in round 3 as "two owners
-  // for the same setting" — one owner (serve-state) does it now.
+  // `.revkit/` mode is owned by `ensureRevkitDir` in serve-state.ts
+  // (one owner, one place — round-4 review nit). Call it here so the
+  // sqlite file's parent exists before `SqliteThreadStore.open`,
+  // even if the caller passed a custom sqlite path outside `.revkit/`.
   const sqlitePath = options.sqlitePath ?? `${options.repoRoot}/.revkit/threads.sqlite`;
   if (sqlitePath !== ":memory:") {
-    mkdirSync(dirname(sqlitePath), { recursive: true, mode: 0o700 });
+    ensureRevkitDir(options.repoRoot);
+    // If the caller supplied a non-standard sqlitePath outside
+    // `.revkit/`, still guarantee its parent exists (mode default).
+    if (dirname(sqlitePath) !== `${options.repoRoot}/.revkit`) {
+      mkdirSync(dirname(sqlitePath), { recursive: true });
+    }
   }
   const store = SqliteThreadStore.open({
     filename: sqlitePath,

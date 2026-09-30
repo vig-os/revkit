@@ -75,6 +75,28 @@ export const SERVE_STATE_DIR = ".revkit";
 export const SERVE_STATE_FILE = "serve.json";
 export const DAEMON_LOCK_FILE = "daemon.lock";
 
+/** Ensure `.revkit/` exists under `repoRoot` at mode 0700 — the one
+ * owner for that directory's create + mode, so a caller that
+ * accidentally does its own `mkdirSync` without a mode does not
+ * end up with a 0755 tree that leaks the sqlite / cookie files.
+ * Idempotent; safe to call from multiple entry points (`revkit
+ * serve`, `readOrMintLocalUserId`, tests). */
+export function ensureRevkitDir(repoRoot: string): string {
+  const dir = join(repoRoot, SERVE_STATE_DIR);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // `mkdir` with a mode does not downgrade an existing dir's mode.
+  // Force 0700 on the created / existing dir — the tests spawn the
+  // real CLI in a fresh temp repo, so this call is the one that
+  // matters for the mode-observation test.
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    // A caller-supplied dir may be a symlink chain we cannot
+    // chmod; not fatal.
+  }
+  return dir;
+}
+
 /** Absolute path to `.revkit/serve.json` under `repoRoot`. */
 export function serveStatePath(repoRoot: string): string {
   return join(repoRoot, SERVE_STATE_DIR, SERVE_STATE_FILE);
@@ -169,7 +191,7 @@ export interface WriteRefused {
  * next start to notice / ignore. */
 export function writeServeState(repoRoot: string, state: ServeState): void {
   const path = serveStatePath(repoRoot);
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  ensureRevkitDir(repoRoot);
   const tmpSuffix = randomBytes(6).toString("hex");
   const tmpPath = `${path}.${tmpSuffix}.tmp`;
   const fd = openSync(tmpPath, "wx", 0o600);
@@ -212,8 +234,8 @@ export interface RefusedDaemon {
 }
 
 export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
+  ensureRevkitDir(repoRoot);
   const lockPath = daemonLockPath(repoRoot);
-  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
   const lock = acquireDaemonLock(lockPath);
   if (lock === null) {
     return {
@@ -271,7 +293,17 @@ export function removeServeState(repoRoot: string): void {
 /** Consumer helper: find a running daemon by checking the lock. If
  * the lock is free, the state file — even if it exists — is stale.
  * Kept small so `revkit mcp` and other clients can import one
- * function to answer "is the daemon up, and if so where". */
+ * function to answer "is the daemon up, and if so where".
+ *
+ * **Race note (acceptable).** `findRunningDaemon` and a starting
+ * daemon can race: the caller's `acquireDaemonLock` probe succeeds
+ * (lock is free), the caller releases; a `revkit serve` then
+ * acquires the lock and writes `serve.json`; the caller returns
+ * `undefined`. The consumer's next call sees the running daemon.
+ * The alternative — a lock the caller holds while reading state —
+ * would block a new daemon from starting whenever `revkit mcp`
+ * probes, which is the wrong trade. `revkit mcp` retries on
+ * `undefined`, so the race window is a single extra probe. */
 export function findRunningDaemon(repoRoot: string): ServeState | undefined {
   const lockPath = daemonLockPath(repoRoot);
   if (!existsSync(lockPath)) return undefined;
