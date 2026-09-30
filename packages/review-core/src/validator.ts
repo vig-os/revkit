@@ -34,23 +34,35 @@
 // hold one long-lived `LogState`; `parseArchive` builds a fresh one and
 // throws it away.
 
+import type { AskKind } from "./asks.ts";
 import type { ReviewEvent } from "./events.ts";
 import type { ThreadStatus } from "./thread.ts";
 
 /** The bookkeeping the validator needs — everything an event might
  * reference at the wire boundary. Kept minimal so the store can hold one
- * without carrying a full Thread map. */
+ * without carrying a full Thread map. All fields are mutable maps of
+ * plain values; `cloneLogState` deep-copies them so an atomic-commit
+ * pass (see `InMemoryThreadStore.import`) can dry-run against a shadow
+ * and either commit the whole sequence or leave the real state
+ * untouched. */
 export interface LogState {
   /** Per-thread status. Presence in the map means the thread exists. */
   readonly threads: Map<string, { status: ThreadStatus; readonly commentIds: Set<string> }>;
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
   readonly commentIndex: Map<string, string>;
-  /** askId → answered? — created and answered tracked together. */
-  readonly asks: Map<string, { answered: boolean }>;
-  /** commentId → set of already-linked backends, so a second link to the
-   * same backend can be rejected without silently overwriting the first. */
+  /** askId → { kind, answered? }. `kind` is stored so `ask.answered`
+   * can be refused when the answer's discriminant does not match the
+   * ask's kind (a `scale` answer on a `text` ask, and so on). */
+  readonly asks: Map<string, { kind: AskKind; answered: boolean }>;
+  /** commentId → set of already-linked backends, so a second link to
+   * the same backend on the same comment can be rejected without
+   * silently overwriting the first. */
   readonly commentLinks: Map<string, Set<string>>;
+  /** External id → local commentId. Key is `<backend>:<id>` (today
+   * `github:<commentId>`). Guards against two different local
+   * comments claiming the same external id. */
+  readonly externalIndex: Map<string, string>;
 }
 
 export function emptyLogState(): LogState {
@@ -59,6 +71,34 @@ export function emptyLogState(): LogState {
     commentIndex: new Map(),
     asks: new Map(),
     commentLinks: new Map(),
+    externalIndex: new Map(),
+  };
+}
+
+/** Deep-copy a `LogState`. The maps' values are plain records or Sets,
+ * so a top-level clone of each entry is enough — nothing in this shape
+ * holds a reference to a caller's mutable object. Used by
+ * `InMemoryThreadStore.import` to dry-run an archive without mutating
+ * the real state (the atomic-commit contract). */
+export function cloneLogState(state: LogState): LogState {
+  const threads = new Map<string, { status: ThreadStatus; commentIds: Set<string> }>();
+  for (const [id, entry] of state.threads) {
+    threads.set(id, { status: entry.status, commentIds: new Set(entry.commentIds) });
+  }
+  const asks = new Map<string, { kind: AskKind; answered: boolean }>();
+  for (const [id, entry] of state.asks) {
+    asks.set(id, { kind: entry.kind, answered: entry.answered });
+  }
+  const commentLinks = new Map<string, Set<string>>();
+  for (const [id, backends] of state.commentLinks) {
+    commentLinks.set(id, new Set(backends));
+  }
+  return {
+    threads,
+    commentIndex: new Map(state.commentIndex),
+    asks,
+    commentLinks,
+    externalIndex: new Map(state.externalIndex),
   };
 }
 
@@ -76,7 +116,9 @@ export type AppendRejection =
   | { kind: "duplicate-ask"; askId: string; message: string }
   | { kind: "unknown-ask"; askId: string; message: string }
   | { kind: "duplicate-answer"; askId: string; message: string }
-  | { kind: "duplicate-link"; commentId: string; backend: string; message: string };
+  | { kind: "answer-kind-mismatch"; askId: string; askKind: AskKind; answerKind: AskKind; message: string }
+  | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
+  | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string };
 
 export type ValidationResult = { ok: true } | { ok: false; rejection: AppendRejection };
 
@@ -192,7 +234,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      state.asks.set(event.askId, { answered: false });
+      state.asks.set(event.askId, { kind: event.spec.kind, answered: false });
       return { ok: true };
     }
     case "ask.answered": {
@@ -217,6 +259,18 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
+      if (event.answer.kind !== ask.kind) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "answer-kind-mismatch",
+            askId: event.askId,
+            askKind: ask.kind,
+            answerKind: event.answer.kind,
+            message: `ask.answered: ask '${event.askId}' is a '${ask.kind}' question, so the answer.kind must be '${ask.kind}' — got '${event.answer.kind}'.`,
+          },
+        };
+      }
       ask.answered = true;
       return { ok: true };
     }
@@ -232,8 +286,14 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
         };
       }
       const linked = state.commentLinks.get(event.commentId) ?? new Set<string>();
-      for (const backend of Object.keys(event.external)) {
-        if (event.external[backend as keyof typeof event.external] === undefined) continue;
+      // Build the (backend, externalId) list first — no state mutation
+      // until every backend on the event passes both the same-comment
+      // duplicate check and the cross-comment external-id uniqueness
+      // check, so a rejection leaves state untouched.
+      const github = event.external.github;
+      const pairs: Array<{ backend: string; externalId: string }> = [];
+      if (github !== undefined) pairs.push({ backend: "github", externalId: String(github.commentId) });
+      for (const { backend, externalId } of pairs) {
         if (linked.has(backend)) {
           return {
             ok: false,
@@ -245,7 +305,25 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
             },
           };
         }
+        const externalKey = `${backend}:${externalId}`;
+        const existingCommentId = state.externalIndex.get(externalKey);
+        if (existingCommentId !== undefined && existingCommentId !== event.commentId) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "duplicate-external-id",
+              commentId: event.commentId,
+              backend,
+              externalId,
+              existingCommentId,
+              message: `comment.linked: external ${backend} id '${externalId}' is already linked to comment '${existingCommentId}' — external ids are unique across local comments.`,
+            },
+          };
+        }
+      }
+      for (const { backend, externalId } of pairs) {
         linked.add(backend);
+        state.externalIndex.set(`${backend}:${externalId}`, event.commentId);
       }
       state.commentLinks.set(event.commentId, linked);
       return { ok: true };

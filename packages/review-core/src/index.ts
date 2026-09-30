@@ -29,7 +29,7 @@ export {
   type ReviewEventKind,
 } from "./events.ts";
 export { reduce } from "./reducer.ts";
-export { GIT_SHA_HEX_REGEX, SHA256_HEX_REGEX, revisionOf } from "./revision.ts";
+export { GIT_COMMIT_HEX_REGEX, GIT_SHA_HEX_REGEX, SHA256_HEX_REGEX, revisionOf } from "./revision.ts";
 export {
   CURRENT_SCHEMA_VERSION,
   acceptedSchemaVersions,
@@ -58,6 +58,7 @@ export {
 } from "./thread.ts";
 export { isoTimestamp } from "./timestamp.ts";
 export {
+  cloneLogState,
   emptyLogState,
   validateNext,
   type LogState,

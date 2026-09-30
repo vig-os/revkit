@@ -27,7 +27,7 @@ import { parseArchive, type ThreadArchive } from "./export.ts";
 import { reviewEventSchema, type ReviewEvent, type ReviewEventInput } from "./events.ts";
 import { reduce } from "./reducer.ts";
 import type { Thread, ThreadFilter, ThreadStatus } from "./thread.ts";
-import { emptyLogState, validateNext, type AppendRejection, type LogState } from "./validator.ts";
+import { cloneLogState, emptyLogState, validateNext, type AppendRejection, type LogState } from "./validator.ts";
 
 /** A monotonic clock, injected so tests can control `ts`. Defaults to the
  * process wall clock (`new Date().toISOString()`). */
@@ -136,14 +136,23 @@ export class InMemoryThreadStore implements ThreadStore {
         `import: archive's first seq ${firstSeq} is not strictly greater than the store's head ${this.#head}.`,
       );
     }
-    // Replay through `validateNext` against THIS store's state (which
-    // may already carry events; the parse-time run started from empty).
-    // This catches an archive that is self-consistent but conflicts with
-    // what is already in the store — e.g. a duplicated commentId across
-    // the boundary.
+    // Atomic commit — the documented behaviour. Dry-run the whole
+    // sequence against a DEEP COPY of the store's state; if any event
+    // is refused, throw before touching the real state so a retry with
+    // a corrected archive still sees the same starting point. A
+    // one-by-one commit would half-import the archive up to the
+    // rejected event, and a bun:sqlite / D1 backing that copied that
+    // shape would inherit the bug.
+    const shadow = cloneLogState(this.#logState);
     for (const event of validated.events) {
-      const result = validateNext(this.#logState, event);
+      const result = validateNext(shadow, event);
       if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
+    }
+    // Every event passed on the shadow — the real state is structurally
+    // identical to the shadow's starting point, so replaying the same
+    // events on it is guaranteed to succeed. Commit as one step.
+    for (const event of validated.events) {
+      validateNext(this.#logState, event);
       this.#events.push(event);
       this.#head = event.seq;
     }

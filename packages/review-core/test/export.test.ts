@@ -258,19 +258,16 @@ describe("import — propagates validateNext rejections", () => {
     const source = await seed(); // seqs 1..3, thread 'th-1'
     const archive = await exportArchive(source);
     const target = new InMemoryThreadStore({ clock: fixedClock() });
-    // Seed target with the same thread (append path), then try to import
-    // an archive whose seqs are past the head but re-uses 'th-1'.
-    // Note: import()'s "seq strictly > head" check refuses the archive
-    // first, so we rebuild an archive with a bumped-seq copy to bypass
-    // the monotone gate and hit the validator.
+    // Seed the target via `append` first so 'th-1' already exists,
+    // then hand it an archive whose seqs are past the head but reuse
+    // 'th-1'. The monotone-head gate would otherwise refuse the
+    // archive before the validator; bumping the seqs bypasses that
+    // gate specifically so the test hits the validator path.
     const bumped = parseArchive({
       schemaVersion: 1,
       events: archive.events.map((e, i) => ({ ...e, seq: 100 + i })),
     });
-    // Seed the target so 'th-1' already exists there.
     for (const event of archive.events) {
-      // Strip the store-assigned fields so `append` re-stamps them for
-      // this target; the payload stays the same log-shape.
       const { seq: _seq, ts: _ts, ...input } = event;
       void _seq;
       void _ts;
@@ -285,5 +282,114 @@ describe("import — propagates validateNext rejections", () => {
         expect(error.rejection.kind).toBe("duplicate-thread");
       }
     }
+  });
+});
+
+describe("import — atomic commit (all-or-nothing)", () => {
+  test("a rejection at the second-or-later event leaves the store unchanged, and a corrected archive still imports", async () => {
+    // The reviewer's probe: an archive whose FIRST event lands a fresh
+    // thread `tA` (seq 10, commentId `cA`), and whose SECOND event
+    // (seq 11) reuses a commentId that ALREADY EXISTS in the target
+    // store from an earlier `append`. `parseArchive` sees a clean log
+    // from empty; the conflict shows up only when `import` plays the
+    // archive against the target's real state. If `import` committed
+    // one-by-one, the seq-10 event would land, `head` would advance to
+    // 10, and a retry of the (necessarily seq-10-first) corrected
+    // archive would be refused by the monotone-head gate — bug.
+    const t0 = "2026-09-30T13:00:00Z";
+    const t1 = "2026-09-30T13:00:01Z";
+
+    const store = new InMemoryThreadStore({ clock: fixedClock() });
+    // Seed the target so `cSeed` is already a commentId in the log
+    // (head becomes 1).
+    await store.append({
+      actor: human,
+      kind: "comment.created",
+      threadId: "th-seed",
+      commentId: "cSeed",
+      anchor,
+      body: "seed",
+    });
+
+    const badArchive = parseArchive({
+      schemaVersion: 1,
+      events: [
+        {
+          seq: 10,
+          ts: t0,
+          actor: human,
+          kind: "comment.created",
+          threadId: "tA",
+          commentId: "cA",
+          anchor,
+          body: "first",
+        },
+        {
+          seq: 11,
+          ts: t1,
+          actor: human,
+          kind: "comment.created",
+          threadId: "tB",
+          commentId: "cSeed",
+          anchor,
+          body: "second (bad — reuses cSeed from the target)",
+        },
+      ],
+    });
+
+    // Snapshot the target's state before the failing import.
+    const beforeEvents = await store.since(0);
+    const beforeThreads = (await store.threads()).map((t) => t.id);
+
+    let rejection: string | null = null;
+    try {
+      await store.import(badArchive);
+      throw new Error("import should have been refused");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ThreadStoreAppendError);
+      if (error instanceof ThreadStoreAppendError) {
+        rejection = error.rejection.kind;
+      }
+    }
+    expect(rejection).toBe("duplicate-comment-id");
+
+    // The store MUST be unchanged: no new events, no new threads —
+    // this is the atomic-commit contract.
+    expect(await store.since(0)).toEqual(beforeEvents);
+    expect((await store.threads()).map((t) => t.id)).toEqual(beforeThreads);
+    expect(await store.thread("tA")).toBeUndefined();
+
+    // A retry with a corrected archive (distinct commentIds) now
+    // imports cleanly — proving the failed attempt didn't advance
+    // `head` past the archive's first seq.
+    const goodArchive = parseArchive({
+      schemaVersion: 1,
+      events: [
+        {
+          seq: 10,
+          ts: t0,
+          actor: human,
+          kind: "comment.created",
+          threadId: "tA",
+          commentId: "cA",
+          anchor,
+          body: "first",
+        },
+        {
+          seq: 11,
+          ts: t1,
+          actor: human,
+          kind: "comment.created",
+          threadId: "tB",
+          commentId: "cB",
+          anchor,
+          body: "second",
+        },
+      ],
+    });
+    await store.import(goodArchive);
+    const seqs = (await store.since(0)).map((e) => e.seq);
+    // Ordered: seed's seq 1, then the archive's 10 and 11.
+    expect(seqs).toEqual([1, 10, 11]);
   });
 });

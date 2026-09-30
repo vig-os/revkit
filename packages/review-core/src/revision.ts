@@ -14,10 +14,18 @@
 export const SHA256_HEX_REGEX = /^[0-9a-f]{64}$/;
 
 /** Regex for a full-length git commit SHA (40 lowercase hex characters).
- * Used by `Anchor.commit`, which is the optional PR-head SHA the M3 local
- * PR-review surface (ADR-0025) records against a comment so the GitHub
- * adapter can pin a pending review to the right `commit_id`. */
+ * Used by tooling that only ever sees SHA-1 refs; `GIT_COMMIT_HEX_REGEX`
+ * is preferred for a commit id field because git's SHA-256 transition
+ * emits 64-hex commit ids and revkit must accept both. */
 export const GIT_SHA_HEX_REGEX = /^[0-9a-f]{40}$/;
+
+/** Regex for a git commit id in either SHA-1 (40 hex) or SHA-256 (64 hex)
+ * form. Git's object-format = sha256 mode produces 64-hex ids for repos
+ * that opted in; a revkit anchor made in such a repo must round-trip
+ * without a schemaVersion bump, so `Anchor.commit` accepts either
+ * length. Used by the M3 local PR-review surface (ADR-0025) to pin a
+ * pending review to a head. */
+export const GIT_COMMIT_HEX_REGEX = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * Content hash of a source string, LF-normalised. Returns 64 lowercase

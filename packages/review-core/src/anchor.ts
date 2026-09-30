@@ -11,7 +11,7 @@
 // `commit_id`; the M2 local rail leaves it undefined. Reserved on the v0
 // wire so M3 lands without a `schemaVersion` bump.
 import { z } from "zod";
-import { GIT_SHA_HEX_REGEX, SHA256_HEX_REGEX } from "./revision.ts";
+import { GIT_COMMIT_HEX_REGEX, SHA256_HEX_REGEX } from "./revision.ts";
 
 /** Text-quote selector (W3C Web Annotation §4.2.4). `prefix` and `suffix`
  * disambiguate a repeated `exact` inside the same file — the re-anchoring
@@ -44,7 +44,10 @@ export const anchorSchema = z
       .regex(SHA256_HEX_REGEX, "revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
     commit: z
       .string()
-      .regex(GIT_SHA_HEX_REGEX, "commit must be a full-length lowercase 40-char git SHA (ADR-0025 M3 head-pinning).")
+      .regex(
+        GIT_COMMIT_HEX_REGEX,
+        "commit must be a lowercase git commit id — 40 hex (SHA-1) or 64 hex (SHA-256 repos) — (ADR-0025 M3 head-pinning).",
+      )
       .optional(),
   })
   .strict()

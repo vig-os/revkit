@@ -274,6 +274,62 @@ describe("append — log-shape rules (validateNext)", () => {
       "duplicate-link",
     );
   });
+
+  test("refuses linking two different local comments to the same external github id (duplicate-external-id)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await store.append(reply);
+    await store.append({
+      actor: agent,
+      kind: "comment.linked",
+      commentId: "c-1",
+      external: { github: { commentId: 42 } },
+    });
+    await expectRejection(
+      () =>
+        store.append({
+          actor: agent,
+          kind: "comment.linked",
+          commentId: "c-2",
+          external: { github: { commentId: 42 } },
+        }),
+      "duplicate-external-id",
+    );
+  });
+
+  test("refuses ask.answered whose answer.kind mismatches the ask's kind (answer-kind-mismatch)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    // Create a `text` ask, then try to answer with a `scale` answer.
+    await store.append({
+      actor: agent,
+      kind: "ask.created",
+      askId: "ask-txt",
+      spec: {
+        schemaVersion: 1,
+        kind: "text",
+        title: "one-liner",
+        multiline: false,
+      },
+    });
+    await expectRejection(
+      () =>
+        store.append({
+          actor: human,
+          kind: "ask.answered",
+          askId: "ask-txt",
+          answer: { kind: "scale", value: 5 },
+        }),
+      "answer-kind-mismatch",
+    );
+    // Sanity: the correctly-kinded answer still works.
+    const seq = await store.append({
+      actor: human,
+      kind: "ask.answered",
+      askId: "ask-txt",
+      answer: { kind: "text", text: "hi" },
+    });
+    expect(seq).toBeGreaterThan(0);
+  });
 });
 
 describe("since — replay ordering", () => {
