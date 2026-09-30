@@ -45,18 +45,20 @@ function walk(dir: string): string[] {
 
 /** Decode the handful of HTML entities the built output emits, then
  * collapse whitespace. Enough for the substring assertion; not a
- * general-purpose HTML parser. */
+ * general-purpose HTML parser. Single pass so `&amp;lt;` stays as
+ * `&lt;` rather than double-unescaping to `<`. */
+const ENTITY_MAP: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&#39;": "'",
+  "&#x27;": "'",
+  "&nbsp;": " ",
+};
 function normaliseText(html: string): string {
-  return html
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&nbsp;/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const decoded = html.replace(/&(?:amp|lt|gt|quot|nbsp|#39|#x27);/g, (m) => ENTITY_MAP[m] ?? m);
+  return decoded.replace(/\s+/g, " ").trim();
 }
 
 /** Strip HTML tags to get visible text. Good enough for the
