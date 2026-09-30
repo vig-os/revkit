@@ -58,9 +58,16 @@ const ALLOWED_IMPORT_SPECIFIERS: readonly string[] = [
 /** Return `true` when `specifier` names one of the allowed roots
  * exactly or one of their subpaths (`@revkit/components/Plot`).
  * Relative imports (`./`, `../`) always return `false` — content
- * imports the registered set by bare specifier only. */
+ * imports the registered set by bare specifier only. `..` anywhere
+ * in the specifier (e.g. `@revkit/components/../evil`) also refuses,
+ * so a subpath cannot walk out of the allowed root. */
 export function isAllowedImportSpecifier(specifier: string): boolean {
   if (specifier.startsWith(".") || specifier.startsWith("/")) return false;
+  // Path traversal: reject any `..` segment inside the specifier. A
+  // resolver may treat `@revkit/components/../secrets/env` as reaching
+  // outside the root; refuse it at the syntax level, not by trusting
+  // the resolver to be strict.
+  if (specifier.split("/").some((segment) => segment === "..")) return false;
   // Test-only paths are never importable, no matter which root they
   // sit under — a fixture or unit test is not a registered component.
   if (/(?:^|\/)([^/]+\.)?test(?:\.[jt]sx?)?(?:$|\/)/i.test(specifier)) return false;
@@ -119,15 +126,23 @@ function headComponentName(name: string | null): string | null {
   return firstChar >= "A" && firstChar <= "Z" ? head : null;
 }
 
-/** Regex for a JSX comment-only expression body: whitespace + one or
- * more JS block/line comments and nothing else. `{/* … *\/}` is the
- * only expression form allowed in content — anything with executable
- * substance is smuggling code into a docs page. */
-function isCommentOnlyExpression(rawValue: string): boolean {
-  const stripped = rawValue
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/[^\n]*/g, "");
-  return /^\s*$/.test(stripped);
+// Comment-only expression check driven by the estree, NOT by a
+// regex — a regex disagrees with the JS parser on inputs where a
+// line comment on one line hides real JSX in the middle and another
+// line comment on the last line hides a block-comment closer at the
+// end. A naive block-comment stripper reads the whole thing as one
+// long comment; the real parser reads it as "line comment, then JSX,
+// then line comment" (bypass #1 in PR #23 round 2 review).
+//
+// Rule: comments-only means the ESTree Program has an empty `body`
+// (whitespace and comments live on `Program.comments` from
+// `estree-util-visit`-style parsers, not in `body`). Anything with
+// executable substance produces at least one body node.
+function isCommentOnlyExpression(estree: unknown): boolean {
+  if (estree === null || typeof estree !== "object") return false;
+  const program = estree as { type?: string; body?: readonly unknown[] };
+  if (program.type !== "Program") return false;
+  return Array.isArray(program.body) && program.body.length === 0;
 }
 
 /** Extract the attribute name from an MdxJsxAttribute; returns "" for
@@ -176,7 +191,12 @@ function attributeValueDiagnostic(
   }
 
   // 3) Value shape: string OK, or an mdxJsxAttributeValueExpression
-  //    whose estree is a statically-evaluable literal.
+  //    whose estree is a statically-evaluable primitive Literal
+  //    (string / number / boolean / null) — arrays and objects are
+  //    refused on ALL attributes (no per-component schema exists yet,
+  //    so we default-deny; without this, a `href={["javascript:…"]}`
+  //    array-typed URL still reaches the DOM through JSX's
+  //    array-to-string coercion — bypass #2 in the round-2 review).
   const value = attribute.value;
   let resolved: unknown;
   if (typeof value === "string") {
@@ -191,16 +211,38 @@ function attributeValueDiagnostic(
         file,
         line: elementLine,
         rule: "component-registry",
-        message: `attribute '${name}' on <${displayName}> has a non-static expression value — refused (only literal strings / numbers / booleans / null and arrays/objects of those; ADR-0002, C1).`,
+        message: `attribute '${name}' on <${displayName}> has a non-static expression value — refused (only literal strings / numbers / booleans / null; ADR-0002, C1).`,
+      };
+    }
+    // Refuse Array / Object expression values on ALL attributes — no
+    // per-component schema, no coercion surface. A URL attribute
+    // gets a stricter branch below (string / number only).
+    const exprType = (expr as { type?: string }).type;
+    if (exprType === "ArrayExpression" || exprType === "ObjectExpression") {
+      return {
+        file,
+        line: elementLine,
+        rule: "component-registry",
+        message: `attribute '${name}' on <${displayName}> uses an array/object expression — refused (attributes must be primitive literals; ADR-0002, C1).`,
       };
     }
     resolved = evalStaticExpression(expr);
   }
 
-  // 4) URL-bearing attribute: check the resolved string, if it IS a
-  //    string, against the refused scheme set.
-  if (URL_BEARING_ATTRIBUTES.has(name.toLowerCase()) && typeof resolved === "string") {
-    if (isRefusedUrl(resolved)) {
+  // 4) URL-bearing attribute: after the array/object refusal above the
+  //    resolved value can only be a string, number, boolean or null.
+  //    Refuse boolean/null there too (a URL is not a boolean) and
+  //    scheme-check the string form.
+  if (URL_BEARING_ATTRIBUTES.has(name.toLowerCase())) {
+    if (typeof resolved !== "string" && typeof resolved !== "number") {
+      return {
+        file,
+        line: elementLine,
+        rule: "component-registry",
+        message: `attribute '${name}' on <${displayName}> must be a string or number URL (got ${JSON.stringify(resolved)}).`,
+      };
+    }
+    if (typeof resolved === "string" && isRefusedUrl(resolved)) {
       return {
         file,
         line: elementLine,
@@ -307,6 +349,32 @@ function forEachChild(
   }
 }
 
+/** Turn a parse-time exception into a `file:line: rule: message`
+ * diagnostic. remark-mdx / micromark set `.line` / `.column` /
+ * `.place` on their VFileMessage-flavoured errors; a plain `Error`
+ * falls back to line 0 (the whole file). */
+function parseErrorDiagnostic(error: unknown, file: string): Diagnostic {
+  let line = 0;
+  let reason = "";
+  if (error !== null && typeof error === "object") {
+    const err = error as {
+      line?: number;
+      column?: number;
+      place?: { line?: number };
+      reason?: string;
+      message?: string;
+    };
+    line = err.line ?? err.place?.line ?? 0;
+    reason = typeof err.reason === "string" ? err.reason : (err.message ?? "");
+  }
+  return {
+    file,
+    line,
+    rule: "component-registry",
+    message: `parse error: ${reason.split("\n")[0] ?? "(no message)"}`,
+  };
+}
+
 /** Result of checking one file. */
 export interface ComponentRegistryFileResult {
   readonly diagnostics: Diagnostic[];
@@ -316,12 +384,24 @@ export interface ComponentRegistryFileResult {
   }[];
 }
 
-/** Check one MDX / MD file against the component-registry rule. */
+/** Check one MDX / MD file against the component-registry rule. A
+ * parse error surfaces as a `file:line: component-registry: parse …`
+ * diagnostic — never a raw micromark / acorn stack — so the CLI's
+ * output stays legible in a pre-commit log (nit 1 in the round-2
+ * review). */
 export function checkComponentRegistryFile(
   source: string,
   file: string,
 ): ComponentRegistryFileResult {
-  const root = parseSourceFor(file, source);
+  let root;
+  try {
+    root = parseSourceFor(file, source);
+  } catch (error) {
+    return {
+      diagnostics: [parseErrorDiagnostic(error, file)],
+      usedAllowAnnotations: [],
+    };
+  }
   const diagnostics: Diagnostic[] = [];
   const usedAllowAnnotations: {
     annotation: AllowAnnotation;
@@ -368,6 +448,7 @@ export function checkComponentRegistryFile(
   forEachChild(root, (child, prev, _parent) => {
     if (child.type !== "mdxFlowExpression" && child.type !== "mdxTextExpression") return;
     const rawValue = (child as unknown as { value: string }).value;
+    const estree = (child as unknown as { data?: { estree?: unknown } }).data?.estree;
     const line = lineOf(child);
     const annotation = parseAllowAnnotation(rawValue);
     if (annotation !== null) {
@@ -377,7 +458,10 @@ export function checkComponentRegistryFile(
       annotationBySibling.set(child, annotation);
       return;
     }
-    if (isCommentOnlyExpression(rawValue)) return;
+    // An empty estree body means the expression contains only comments
+    // and whitespace. When estree is missing (a hand-built fixture), the
+    // check refuses too — no estree means "not statically verified".
+    if (isCommentOnlyExpression(estree)) return;
     // Non-comment expression: refuse. Pin the message to the shape so
     // the reader knows what was blocked.
     const looksDynamic = looksLikeDynamicImport(rawValue);
@@ -458,6 +542,27 @@ export function checkComponentRegistryFile(
     const value = (node as unknown as { value: string }).value;
     const finding = rawHtmlDiagnostic(value, lineOf(node), file);
     if (finding !== null) diagnostics.push(finding);
+  });
+
+  // Phase 5: markdown `link` / `image` / `definition` URL scheme check.
+  // `[x](javascript:alert(1))` renders a live javascript: href in the
+  // built HTML; `[r]: javascript:...` becomes an autolink definition
+  // that any `[r]` reference then uses (bypass #3 in the round-2
+  // review). Apply the same isRefusedUrl the JSX attribute path uses
+  // so a scheme trick that survives that path is also refused here.
+  walkMdast(root as unknown as Nodes, (node) => {
+    const kind = node.type;
+    if (kind !== "link" && kind !== "image" && kind !== "definition") return;
+    const url = (node as unknown as { url?: unknown }).url;
+    if (typeof url !== "string") return;
+    if (!isRefusedUrl(url)) return;
+    const shape = kind === "link" ? "[…](url)" : kind === "image" ? "![…](url)" : "[ref]: url";
+    diagnostics.push({
+      file,
+      line: lineOf(node),
+      rule: "component-registry",
+      message: `markdown ${kind} (${shape}) uses a refused URL scheme (one of: ${[...REFUSED_URL_SCHEMES].join(", ")}); refused after HTML-entity decoding and whitespace/control-char strip (ADR-0002, C1).`,
+    });
   });
 
   return { diagnostics, usedAllowAnnotations };

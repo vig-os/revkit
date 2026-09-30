@@ -14,9 +14,11 @@ import type { AllowAnnotation } from "./allow-annotation.ts";
 import { verifyAllowAnnotationOnline } from "./allow-annotation.ts";
 import type { Diagnostic } from "./diagnostics.ts";
 import { formatDiagnostic } from "./diagnostics.ts";
+import type { DiscoveredSymlink } from "./file-discovery.ts";
 import { repoRelative } from "./file-discovery.ts";
 import type { GhRunner } from "./gh-runner.ts";
 import { checkComponentRegistryFile } from "./rules/component-registry.ts";
+import { checkFrontmatter } from "./rules/frontmatter.ts";
 import { checkLinksFile } from "./rules/links.ts";
 import { checkNoHandRolledUiFile } from "./rules/no-hand-rolled-ui.ts";
 import { checkPlotSpecFile } from "./rules/plot-structure.ts";
@@ -99,10 +101,13 @@ function toCheckOutput(diagnostics: readonly Diagnostic[]): CheckOutput {
 }
 
 /** Run every rule that applies to `files`. `repoRoot` anchors the
- * vocabulary and plot rules' filesystem access. */
+ * vocabulary and plot rules' filesystem access. `symlinks` is the list
+ * of symlinks discovery observed under a content/UI tree — each becomes
+ * one diagnostic with rule `no-hand-rolled-ui`. */
 export async function runCheck(
   repoRoot: string,
   files: readonly CheckFile[],
+  symlinks: readonly DiscoveredSymlink[],
   options: CheckOptions,
 ): Promise<CheckOutput> {
   const findings: Diagnostic[] = [];
@@ -110,6 +115,18 @@ export async function runCheck(
     contentFilesFrom([file.relative]).length === 1
   );
   const plotFiles = files.filter((file) => plotSpecFilesFrom([file.relative]).length === 1);
+
+  // 0) Symlinks under content/UI trees — Astro follows them at build,
+  //    so refusing at discovery keeps a `docs/evil.md -> /etc/passwd`
+  //    kind of link from ever reaching a rendered page (bypass #5).
+  for (const symlink of symlinks) {
+    findings.push({
+      file: symlink.posixPath,
+      line: 0,
+      rule: "no-hand-rolled-ui",
+      message: "symlink refused (Astro follows symlinks during build; use a copy or a `.md` reference instead).",
+    });
+  }
 
   // Vocabulary is loaded once so a rule run over 200 files parses the
   // YAML exactly once. Errors surface as one diagnostic against the YAML
@@ -134,8 +151,10 @@ export async function runCheck(
     readonly line: number;
     readonly annotation: AllowAnnotation;
   }[] = [];
+  const sourceCache = new Map<string, string>();
   for (const file of contentFiles) {
     const source = await readFile(file.absolute);
+    sourceCache.set(file.absolute, source);
     const result = checkComponentRegistryFile(source, file.relative);
     findings.push(...result.diagnostics);
     for (const used of result.usedAllowAnnotations) {
@@ -145,6 +164,16 @@ export async function runCheck(
         annotation: used.annotation,
       });
     }
+  }
+
+  // 1b) frontmatter — YAML at the top of `.md`/`.mdx` must satisfy a
+  //     strict key allowlist. Starlight's `docsSchema` accepts `head`,
+  //     `banner.content` and `hero.actions[].link` — all of which the
+  //     Starlight renderer emits as raw HTML / hrefs in the built
+  //     page (bypass #4).
+  for (const file of contentFiles) {
+    const source = sourceCache.get(file.absolute) ?? await readFile(file.absolute);
+    findings.push(...checkFrontmatter(source, file.relative));
   }
 
   // 2) no-hand-rolled-UI — path-only, runs on every UI-shaped input.

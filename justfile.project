@@ -76,6 +76,7 @@ test *args:
       cd packages/cli && bun test {{ args }} && cd ../.. && \
       cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
       just check && \
+      just build && \
       just e2e; \
     fi
 
@@ -147,10 +148,19 @@ update *args="--latest":
 dev *args:
     cd site && bun run dev -- {{ args }}
 
-# Build the review site to static output (site/dist).
+# Build the review site to static output (site/dist), then run the
+# output-gate sanitiser (`revkit check-dist`) over the built HTML —
+# ADR-0012 defence in depth. Source guards can miss a parser
+# differential (bypass classes surfaced in PR #23 round-2 review);
+# check-dist parses every built page with a real DOM parser (linkedom)
+# and refuses `on*` attrs, `javascript:`/`data:`/`vbscript:` URLs,
+# `<iframe>`/`<object>`/`<base>`/`<meta refresh>`, external stylesheets,
+# and any inline `<script>` whose SHA-256 is not in
+# `packages/cli/src/dist-check-allowlist.json`.
 [group('build')]
 build:
     cd site && bun run build
+    bun packages/cli/bin/revkit.js check-dist site/dist
 
 # Clean workspace build artefacts (Astro output, Playwright reports, TS
 # incremental info). Leaves node_modules/ and bun.lock alone.

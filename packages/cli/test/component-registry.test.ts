@@ -33,10 +33,10 @@ describe("component-registry — allowed shapes", () => {
     expect(result.diagnostics).toEqual([]);
   });
 
-  test("statically-evaluable object/array attribute values pass", () => {
+  test("statically-evaluable primitive expression value passes", () => {
     const source = `import { Callout } from "@revkit/components";
 
-<Callout kind="info" title="ok" data={{a: 1, b: [true, null, "x"]}} />
+<Callout kind="info" title={"ok"} />
 `;
     const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
     expect(result.diagnostics).toEqual([]);
@@ -401,5 +401,94 @@ describe("component-registry — raw HTML in .md (allowlist)", () => {
     const source = "# hi\n\n<!-- outer <!-- inner --> <script>alert(1)</script> -->\n";
     const result = checkComponentRegistryFile(source, "docs/x.md");
     expect(result.diagnostics.length).toBeGreaterThan(0);
+  });
+});
+
+describe("component-registry — round-2 bypasses", () => {
+  test("bypass #1: `{// a /*` … `<img onerror=…>` … `// */}` (regex-vs-parser differential) is refused", () => {
+    // The regex-based comment stripper reads this input as one long
+    // block comment; the JS parser instead sees line-comment then
+    // real JSX then line-comment. The estree-based check catches it
+    // because the Program body is not empty (the JSX is a real
+    // expression node).
+    const source = String.raw`# hi
+
+{// a /*
+<img src="x" onerror="alert(7)" />
+// */
+}
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics.some((d) => d.rule === "component-registry")).toBe(true);
+    expect(result.diagnostics.some((d) => d.message.includes("expression in content"))).toBe(true);
+  });
+
+  test("bypass #2: `href={[\"javascript:...\"]}` (array-typed URL) is refused", () => {
+    const source = `import { Callout } from "@revkit/components";
+
+<Callout kind="info" title="t" href={["javascript:alert(8)"]} />
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    // Refused as "array/object expression" — not passed through to the
+    // URL scheme check because the value is not a string at all.
+    expect(result.diagnostics.some((d) => d.message.includes("array/object expression"))).toBe(true);
+  });
+
+  test("bypass #3a: markdown link `[x](javascript:alert(9))` is refused", () => {
+    const source = `# hi
+
+See [click me](javascript:alert(9)).
+`;
+    const result = checkComponentRegistryFile(source, "docs/x.md");
+    const finding = result.diagnostics.find((d) => d.message.includes("markdown link"));
+    expect(finding).toBeDefined();
+    expect(finding?.rule).toBe("component-registry");
+    expect(finding?.message).toContain("refused URL scheme");
+  });
+
+  test("bypass #3b: markdown link definition `[r]: javascript:...` is refused", () => {
+    const source = `# hi
+
+See [ref].
+
+[ref]: javascript:alert(10)
+`;
+    const result = checkComponentRegistryFile(source, "docs/x.md");
+    const finding = result.diagnostics.find((d) => d.message.includes("markdown definition"));
+    expect(finding).toBeDefined();
+  });
+
+  test("bypass #3c: markdown image `![alt](javascript:...)` is refused", () => {
+    const source = `# hi
+
+![evil](javascript:alert(11))
+`;
+    const result = checkComponentRegistryFile(source, "docs/x.md");
+    const finding = result.diagnostics.find((d) => d.message.includes("markdown image"));
+    expect(finding).toBeDefined();
+  });
+
+  test("nit 2: import from `@revkit/components/../evil` is refused (`..` in specifier)", () => {
+    const source = `import { X } from "@revkit/components/../evil";
+
+<X />
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics.some((d) => d.message.includes("../evil"))).toBe(true);
+  });
+
+  test("nit 1: unparsable MDX produces a `file:line` diagnostic, not a stack trace", () => {
+    // MDX-invalid content: unclosed JSX + stray `<!` — the parser
+    // throws; the rule must catch and produce a diagnostic.
+    const source = `# hi
+
+<Broken attr={unclosed
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics.length).toBeGreaterThanOrEqual(1);
+    const parseFinding = result.diagnostics.find((d) => d.message.startsWith("parse error"));
+    expect(parseFinding).toBeDefined();
+    expect(parseFinding?.rule).toBe("component-registry");
+    expect(typeof parseFinding?.line).toBe("number");
   });
 });

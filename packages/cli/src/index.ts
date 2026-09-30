@@ -8,6 +8,11 @@
 import type { CheckOutput } from "./check.ts";
 import { runCheck, toCheckFiles } from "./check.ts";
 import {
+  checkDistDirectory,
+  collectInlineScriptHashes,
+} from "./check-dist.ts";
+import { formatDiagnostic } from "./diagnostics.ts";
+import {
   expandPathArgs,
   repoRelative,
   stagedFiles,
@@ -17,6 +22,7 @@ import type { GhRunner } from "./gh-runner.ts";
 import { spawnGh } from "./gh-runner.ts";
 import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
+import { resolve as resolvePath } from "node:path";
 
 /** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
 export const VERSION = "0.0.0";
@@ -28,13 +34,21 @@ Usage:
   revkit [--version | -v]
   revkit [--help | -h]
   revkit check [--staged | <paths...>] [--online]
+  revkit check-dist <dist-dir> [--print-hashes]
   revkit escalate "<need>"
 
 Guards (ADR-0005):
   component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure.
 
+check-dist is the ADR-0012 output-gate sanitiser: parses every built
+HTML with a real DOM parser and refuses on* attrs, javascript: /
+data: / vbscript: URLs, off-list <script> hashes, <iframe>/<object>/
+<embed>/<base>/<meta http-equiv=refresh> and external stylesheets.
+
 --staged limits check to git-staged files (pre-commit path).
---online verifies revkit-allow annotations via 'gh api' (issue open + labeled 'component-request').
+--online verifies revkit-allow annotations via 'gh api'.
+--print-hashes prints every distinct inline-script hash in the dir so
+  a maintainer can update dist-check-allowlist.json after an upgrade.
 
 Subcommands (serve, build, mcp, invite, deploy) land in their milestones
 (see the roadmap in docs/designs/DESIGN-0001-revkit-architecture.md).
@@ -103,6 +117,10 @@ export async function dispatch(
     return await runCheckCommand(rest, env);
   }
 
+  if (first === "check-dist") {
+    return runCheckDistCommand(rest, env);
+  }
+
   if (first === "escalate") {
     return await runEscalateCommand(rest, env);
   }
@@ -157,14 +175,14 @@ async function runCheckCommand(
     };
   }
 
-  let absolutePaths: string[];
+  let discovery;
   try {
     if (staged) {
-      absolutePaths = await stagedFiles(repoRoot);
+      discovery = await stagedFiles(repoRoot);
     } else if (positional.length > 0) {
-      absolutePaths = expandPathArgs(positional, env.cwd);
+      discovery = expandPathArgs(positional, env.cwd);
     } else {
-      absolutePaths = walkForCheckables(repoRoot);
+      discovery = walkForCheckables(repoRoot);
     }
   } catch (error) {
     return {
@@ -174,10 +192,10 @@ async function runCheckCommand(
     };
   }
 
-  const files = toCheckFiles(absolutePaths, repoRoot);
+  const files = toCheckFiles(discovery.files, repoRoot);
   void repoRelative; // exported for tests; referenced here for tree-shaking safety.
 
-  const output: CheckOutput = await runCheck(repoRoot, files, {
+  const output: CheckOutput = await runCheck(repoRoot, files, discovery.symlinks, {
     online,
     repoSlug: env.repoSlug,
     gh: env.gh,
@@ -218,5 +236,49 @@ async function runEscalateCommand(
     stdout: `${lines.join("\n")}\n`,
     stderr: "",
     exitCode: ExitCode.ok,
+  };
+}
+
+/** Handle `revkit check-dist <dir>`. Kept sync — the DOM parser and
+ * fs walks are all sync — so the caller's process exits promptly on a
+ * finding. */
+function runCheckDistCommand(
+  args: readonly string[],
+  env: DispatchEnv,
+): CliResult {
+  let printHashes = false;
+  const positional: string[] = [];
+  for (const arg of args) {
+    if (arg === "--print-hashes") printHashes = true;
+    else if (arg.startsWith("--")) {
+      return {
+        stdout: "",
+        stderr: `revkit check-dist: unknown flag '${arg}'\n${HELP}`,
+        exitCode: ExitCode.usage,
+      };
+    } else positional.push(arg);
+  }
+  if (positional.length !== 1 || positional[0] === undefined) {
+    return {
+      stdout: "",
+      stderr: `revkit check-dist: expected exactly one <dist-dir> argument\n${HELP}`,
+      exitCode: ExitCode.usage,
+    };
+  }
+  const distDir = resolvePath(env.cwd, positional[0]);
+  if (printHashes) {
+    const seen = collectInlineScriptHashes(distDir);
+    const lines: string[] = [];
+    for (const [hash, info] of seen) {
+      lines.push(`${hash}  count=${info.count}  ${JSON.stringify(info.sample.slice(0, 60))}`);
+    }
+    return { stdout: `${lines.sort().join("\n")}\n`, stderr: "", exitCode: ExitCode.ok };
+  }
+  const diagnostics = checkDistDirectory(distDir);
+  const lines = diagnostics.map(formatDiagnostic);
+  return {
+    stdout: lines.length > 0 ? `${lines.join("\n")}\n` : "",
+    stderr: "",
+    exitCode: diagnostics.length > 0 ? ExitCode.findings : ExitCode.ok,
   };
 }

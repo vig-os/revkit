@@ -16,6 +16,10 @@ export const ruleIds = [
   "vocabulary",
   "links",
   "plot-structure",
+  // Output-gate rule (ADR-0012 defence in depth): runs on built HTML
+  // after `astro build`, not on sources. Kept in the same diagnostic
+  // shape so CI logs / editors handle it uniformly.
+  "check-dist",
 ] as const;
 
 export type RuleId = (typeof ruleIds)[number];

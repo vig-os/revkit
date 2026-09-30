@@ -1,0 +1,16 @@
+{
+  "$description": "SHA-256 hashes of inline <script> blocks the current site build emits. `revkit check-dist` fails when a built page carries an inline script whose hash is NOT in this list. Regenerate after a Starlight or Astro upgrade by running `bun packages/cli/bin/revkit.js check-dist --print-hashes site/dist` and commit the diff — a hash change is a signal the vendored script content moved, and the reviewer should look at the diff before accepting it.",
+  "$comment": "Each entry names the vendor / feature the script comes from so a maintainer can tell at a glance which pipeline emitted it.",
+  "sha256": {
+    "1cbb968b5e6d5421bb29ba088f699949436448c3a5bd060192062fce0a172aa9": "revkit inline: adds tabIndex to pre[data-language] for keyboard access (site/astro.config.mjs head[]).",
+    "556a395a9e1aa928fa9d280ca5e029f5c2a279aa087f015402e9c056e808e600": "starlight: StarlightThemeProvider bootstrapping (theme picker on-load).",
+    "7ffcc0504ef8b9c737258a78af8410be42687e841d90e2211d82be8de67a7a4a": "starlight: search modal open-button + keyboard-shortcut wiring.",
+    "1a4641467bd2ba1b71fdcbf3bee915917d892595be0dd3e556bec15fc4de7eaa": "starlight: StarlightThemeProvider.updatePickers() flush per page.",
+    "9d53bdf1619d240e72ba9d7f30076e906a94952e8fb2e7fb249145e62916a9b4": "starlight: pre-render theme resolver (dark/light/auto stored in localStorage).",
+    "84fe3cb14cb04c05f2836daabe974e0bf718200f0c7cf74a11b3c2fe6bc69383": "starlight: theme-picker <select> custom element.",
+    "b9c3df75873d14f22f6e69e7f440afdde2ca60bb7cfe178c3c543e84d4e7ea36": "starlight: mobile menu toggle custom element (viewport media-query driven).",
+    "c17db23800de57e34c9e07e50f9b988b7be5e744870b8b1f335126ca5563957e": "starlight: desktop sidebar init (matchMedia + scroll restore).",
+    "ede095e23b6caf8b789276f773814244f7aeec619978e5061375ef5a2c745ce4": "starlight: sidebar scroll-position bootstrap.",
+    "560ae070a06f20cdd7a622c9e9f12fd55cba60707094a2e462d15d7c1328b93a": "starlight: sl-sidebar-state-persist custom-element wiring."
+  }
+}
