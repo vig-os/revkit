@@ -29,6 +29,7 @@
 // keeps the command's fast paths (parse/resolve/refuse/materialize/
 // import) covered by tests without needing a full astro build in CI.
 
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import {
@@ -407,13 +408,12 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
 
   const localUserId =
     env.localUserId ??
-    // The daemon expects a local user id; if the caller didn't
-    // supply one, mint one under the target dir so it doesn't touch
-    // the reviewer's own .revkit/local-user.
-    (function mint() {
-      const rand = Math.random().toString(36).slice(2, 12);
-      return `review-${rand}`;
-    })();
+    // The daemon expects a local user id. If the caller didn't
+    // supply one, mint a per-review id from a CSPRNG so it doesn't
+    // touch the reviewer's own .revkit/local-user, and so the
+    // opaque tag has no predictability the daemon's auth might
+    // ever depend on later.
+    `review-${randomBytes(9).toString("base64url")}`;
 
   const serveHandle = await env.startServe({
     materializedRoot,
