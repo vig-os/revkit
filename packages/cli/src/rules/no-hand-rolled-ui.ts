@@ -78,18 +78,48 @@ function startsWithCI(haystack: string, needle: string): boolean {
   return haystack.slice(0, needle.length).toLowerCase() === needle.toLowerCase();
 }
 
+/** UI-test extensions (lowercase, leading dot). */
+const UI_TEST_EXTENSIONS: ReadonlySet<string> = new Set([".js", ".jsx", ".ts", ".tsx"]);
+
+/** Return the basename (last `/`-segment) of a POSIX-relative path,
+ * lowercased. Linear-time split — no regex, so a CodeQL ReDoS scanner
+ * can not flag the check on `..test.` repetitions. */
+function basenameLower(posixRepoRelative: string): string {
+  const idx = posixRepoRelative.lastIndexOf("/");
+  const name = idx === -1 ? posixRepoRelative : posixRepoRelative.slice(idx + 1);
+  return name.toLowerCase();
+}
+
 /** Is `posixRepoRelative` a UI test file? Only `.test.[jt]sx?` counts
  * — a plain-text `.test.md` still trips branch C so tests can not
- * hide inside a content directory. */
+ * hide inside a content directory. Linear-scan implementation
+ * (replaces the earlier regex `/(^|\/)([^/]+\.)?test\.[jt]sx?$/i`
+ * that CodeQL flagged as potentially-superlinear on
+ * `..test...test.` repetition). */
 function isTestFile(posixRepoRelative: string): boolean {
-  return /(^|\/)([^/]+\.)?test\.[jt]sx?$/i.test(posixRepoRelative);
+  const name = basenameLower(posixRepoRelative);
+  const dot = name.lastIndexOf(".");
+  if (dot === -1) return false;
+  const ext = name.slice(dot);
+  if (!UI_TEST_EXTENSIONS.has(ext)) return false;
+  const stem = name.slice(0, dot);
+  // Match `stem` ending in `.test` (with something before it) OR
+  // exactly `test` — the historic pattern allowed both `foo.test.ts`
+  // and `test.ts`.
+  return stem === "test" || stem.endsWith(".test");
 }
 
 /** Is `posixRepoRelative` ANY test file (`.test.*`)? Broader than the
  * UI exemption above — used by branch C to catch `docs/foo.test.md`
- * and friends. */
+ * and friends. Linear-scan (no regex). */
 function isAnyTestFile(posixRepoRelative: string): boolean {
-  return /(^|\/)[^/]+\.test\.[^/]+$/i.test(posixRepoRelative);
+  const name = basenameLower(posixRepoRelative);
+  const lastDot = name.lastIndexOf(".");
+  if (lastDot <= 0) return false;
+  const stem = name.slice(0, lastDot);
+  const priorDot = stem.lastIndexOf(".");
+  if (priorDot <= 0) return false;
+  return stem.slice(priorDot + 1) === "test";
 }
 
 /** Is this file's path under one of the allowed UI prefixes? */

@@ -130,4 +130,16 @@ describe("no-hand-rolled-ui — test files inside content dirs (round-3 nit)", (
   test("packages/cli/test/foo.test.ts is NOT flagged (outside content dir)", () => {
     expect(checkNoHandRolledUiFile("packages/cli/test/foo.test.ts")).toEqual([]);
   });
+
+  test("pathological `..test...test.` repetition runs in O(n) (ReDoS regression)", () => {
+    // CodeQL flagged the earlier regex `/(^|\/)([^/]+\.)?test\.[jt]sx?$/i`
+    // as potentially superlinear on this shape. The linear-scan
+    // replacement returns immediately.
+    const path = "docs/" + "..test.".repeat(500) + "md";
+    const start = performance.now();
+    const _ = checkNoHandRolledUiFile(path);
+    void _;
+    const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(200);
+  });
 });
