@@ -1,0 +1,168 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNTowODo0MVrOp2SKpw=="
+          },
+          "nodes": [
+            {
+              "id": "PRRT_kwDOUyqeeM6nYqWy",
+              "path": "packages/cli/src/mcp/daemon-bootstrap.ts",
+              "isResolved": true,
+              "isOutdated": true,
+              "line": null,
+              "startLine": null,
+              "originalLine": 186,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNDoyNzoyMFrO9s_WjA=="
+                },
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOUyqeeM72z9aM",
+                    "databaseId": 4140816012,
+                    "body": "## CodeQL / Polynomial regular expression used on uncontrolled data\n\nThis [regular expression](1) that depends on [library input](2) may run slow on strings with many repetitions of '/'.\n\n[Show more details](https://github.com/vig-os/revkit/security/code-scanning/9)",
+                    "createdAt": "2026-09-30T04:27:20Z",
+                    "url": "https://github.com/vig-os/revkit/pull/38#discussion_r4140816012",
+                    "author": {
+                      "login": "github-advanced-security",
+                      "__typename": "Bot"
+                    },
+                    "originalCommit": {
+                      "oid": "1020c2f2cd04af619e0ecdd30670eb516e88ecff"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOUyqeeM6nYqXF",
+              "path": "packages/cli/src/mcp/daemon-client.ts",
+              "isResolved": true,
+              "isOutdated": true,
+              "line": null,
+              "startLine": null,
+              "originalLine": 52,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNDoyNzoyMFrO9s_Wow=="
+                },
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOUyqeeM72z9aj",
+                    "databaseId": 4140816035,
+                    "body": "## CodeQL / Polynomial regular expression used on uncontrolled data\n\nThis [regular expression](1) that depends on [library input](2) may run slow on strings with many repetitions of '/'.\n\n[Show more details](https://github.com/vig-os/revkit/security/code-scanning/8)",
+                    "createdAt": "2026-09-30T04:27:20Z",
+                    "url": "https://github.com/vig-os/revkit/pull/38#discussion_r4140816035",
+                    "author": {
+                      "login": "github-advanced-security",
+                      "__typename": "Bot"
+                    },
+                    "originalCommit": {
+                      "oid": "1020c2f2cd04af619e0ecdd30670eb516e88ecff"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOUyqeeM6nYqXL",
+              "path": "packages/cli/src/mcp/event-subscriber.ts",
+              "isResolved": true,
+              "isOutdated": true,
+              "line": null,
+              "startLine": null,
+              "originalLine": 75,
+              "originalStartLine": null,
+              "diffSide": "RIGHT",
+              "startDiffSide": null,
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNDoyNzoyMFrO9s_Wqg=="
+                },
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOUyqeeM72z9aq",
+                    "databaseId": 4140816042,
+                    "body": "## CodeQL / Polynomial regular expression used on uncontrolled data\n\nThis [regular expression](1) that depends on [library input](2) may run slow on strings with many repetitions of '/'.\nThis [regular expression](1) that depends on [library input](3) may run slow on strings with many repetitions of '/'.\n\n[Show more details](https://github.com/vig-os/revkit/security/code-scanning/10)",
+                    "createdAt": "2026-09-30T04:27:20Z",
+                    "url": "https://github.com/vig-os/revkit/pull/38#discussion_r4140816042",
+                    "author": {
+                      "login": "github-advanced-security",
+                      "__typename": "Bot"
+                    },
+                    "originalCommit": {
+                      "oid": "1020c2f2cd04af619e0ecdd30670eb516e88ecff"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "id": "PRRT_kwDOUyqeeM6nZIqn",
+              "path": "site/tests/data-src-anchors.spec.ts",
+              "isResolved": true,
+              "isOutdated": true,
+              "line": null,
+              "startLine": null,
+              "originalLine": 51,
+              "originalStartLine": 50,
+              "diffSide": "RIGHT",
+              "startDiffSide": "RIGHT",
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNTowODo0MVrO9tLI9Q=="
+                },
+                "nodes": [
+                  {
+                    "id": "PRRC_kwDOUyqeeM720sj1",
+                    "databaseId": 4141009141,
+                    "body": "## CodeQL / Double escaping or unescaping\n\nThis replacement may produce '&' characters that are double-unescaped [here](1).\n\n[Show more details](https://github.com/vig-os/revkit/security/code-scanning/11)",
+                    "createdAt": "2026-09-30T05:08:41Z",
+                    "url": "https://github.com/vig-os/revkit/pull/38#discussion_r4141009141",
+                    "author": {
+                      "login": "github-advanced-security",
+                      "__typename": "Bot"
+                    },
+                    "originalCommit": {
+                      "oid": "5023b9050ef267a076a5a23b242e29a65d7c4d3c"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

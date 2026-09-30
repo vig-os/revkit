@@ -48,10 +48,18 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         body: event.body,
         createdAt: event.ts,
       };
+      // PR-43 round-5 nit: an unanchored anchor represents "imported
+      // without a trustworthy anchor" — the reducer treats it as
+      // orphaned-from-birth so the reanchor engine / rail skip it
+      // (no snapshot to load, no quote to render). Any subsequent
+      // `thread.orphaned` or `thread.resolved` is a no-op because
+      // the status is already terminal.
+      const initialStatus =
+        "kind" in event.anchor && event.anchor.kind === "unanchored" ? "orphaned" : "open";
       threads.set(event.threadId, {
         id: event.threadId,
         anchor: event.anchor,
-        status: "open",
+        status: initialStatus,
         createdSeq: event.seq,
         createdAt: event.ts,
         updatedAt: event.ts,

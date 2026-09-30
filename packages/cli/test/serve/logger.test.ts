@@ -69,6 +69,32 @@ describe("logger", () => {
     }
   });
 
+  test("no `gh` bearer token key can be smuggled onto a log line", () => {
+    // M3 part 1 (ADR-0025): the daemon holds a bearer token from
+    // `gh auth token`. Even a caller who casts to `any` and passes
+    // `{ ghToken: "..." }` / `{ bearer: "..." }` / `{ token: "..." }`
+    // must NOT see the value on stderr.
+    const { sink, lines } = bufferedSink();
+    const log = makeLogger({ sink });
+    const secret = "ghp_" + "a".repeat(40);
+    (log.info as (event: string, fields: unknown) => void)("github.pending.create", {
+      status: 201,
+      ghToken: secret,
+      bearer: secret,
+      token: secret,
+      Authorization: `Bearer ${secret}`,
+    });
+    const record = JSON.parse(lines[0] ?? "{}");
+    expect(record.status).toBe(201);
+    for (const key of ["ghToken", "bearer", "token", "Authorization"]) {
+      expect(record[key]).toBeUndefined();
+      expect(LOG_FIELD_KEYS).not.toContain(key);
+    }
+    // Raw line check — belt-and-braces, the token value must not
+    // appear anywhere on stderr.
+    expect(lines[0]).not.toContain(secret);
+  });
+
   test("emits warn and error at their levels", () => {
     const { sink, lines } = bufferedSink();
     const log = makeLogger({ sink });
