@@ -50,6 +50,46 @@ just claude-plugin    # optional: vig-os devkit Claude Code plugin
 Branching is gitflow (`<type>/<issue>-<summary>` from `dev`), with conventional commits carrying `Refs: #<issue>`.
 Agents: start with [CLAUDE.md](CLAUDE.md).
 
+### Try the agent loop locally
+
+To see the M2 review loop end to end (comment on the rendered page → channel notification → agent reply → live update
+in the rail), open two terminals in the worktree:
+
+```bash
+# Terminal 1: build the site and start the loopback daemon.
+just build
+bun packages/cli/bin/revkit.js serve --dir site/dist
+# → prints `revkit serve: listening on http://127.0.0.1:<port>` and a
+#   single-use launch URL. Open the launch URL in a browser to sign in.
+```
+
+```bash
+# Terminal 2: start Claude Code with the revkit MCP server opted in.
+# The `--dangerously-load-development-channels server:revkit` flag lets a
+# development MCP channel be loaded (ADR-0007). The MCP server is registered
+# in .mcp.json; if a daemon isn't running yet it auto-starts one.
+claude --dangerously-load-development-channels server:revkit
+# The agent can then mint a fresh launch URL from its own tools:
+#   > use the `review_url` tool to open the review UI
+```
+
+Post a comment on any block from the rendered page (select text, click the floating "Comment", type, submit). The
+agent receives a `notifications/claude/channel` frame in that session; ask it to reply with the `reply` tool. The
+reply lands on the page without a reload.
+
+Automated end-to-end proof: `just dogfood` runs the same loop headless in a disposable, locked-down flock pane. No
+built-in tools; only `mcp__revkit__{threads,reply,resolve}` allowed. `env -i` at pane launch strips `SSH_AUTH_SOCK`
+/ `FLOCK_SOCKET_PATH` / `GH_TOKEN` / etc. The pane's cwd is an isolated temp state dir under `$XDG_RUNTIME_DIR`
+OUTSIDE the git worktree. `--setting-sources ""` + `--settings <state-dir>/settings.json` isolates the pane from
+the owner's user / project / local settings (no hooks, no statusLine, no env block, no plugins,
+`instructionFiles: "managed-only"` drops the owner's global CLAUDE.md). The lockdown is verified PRE-LAUNCH against
+the real claude process — after `/proc/<pid>/exe` resolves to `.claude-wrapped`, the harness hard-fails on any
+missing required flag, any forbidden flag, or any env var not on the explicit allowlist — AND POST-RUN via three
+empirical isolation checks (owner statusline / hook / CLAUDE.md markers must be absent from the pane and the
+transcript). The dogfood comment is a natural reviewer's note (channel content is untrusted; a well-aligned model
+may decline). Requires `flk` and a logged-in Claude; not part of `just test` or CI. See
+[`.claude/skills/revkit_dogfood/SKILL.md`](.claude/skills/revkit_dogfood/SKILL.md) for the runbook.
+
 ## License
 
 [Apache-2.0](LICENSE)

@@ -112,6 +112,14 @@ export interface ChannelServerOptions {
   readonly reconnectToolDeadlineMs?: number;
   /** Test hook: sleep function (ms). */
   readonly sleep?: (ms: number) => Promise<void>;
+  /** Test hook: pre-seed the prime step's threads listing. When
+   * set, `primeAndSubscribe` uses this value instead of calling
+   * `currentClient.listThreads()`. Only used by tests that need to
+   * exercise the tool-call path without a real daemon-side listing
+   * (e.g. the 401-triggers-reconnect scenario, where the initial
+   * client's bearer is stale and would 403 at `/api/threads`
+   * before the tool is ever invoked). */
+  readonly initialListing?: { readonly threads: readonly unknown[]; readonly head: number };
 }
 
 /** One running channel server. `stop()` is idempotent and closes
@@ -559,15 +567,23 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       // as the tool's own error — reconnecting would not help and
       // would mask the real message from the caller (PR #38
       // round-3 review: reconnect only on transport / 5xx).
-      if (error instanceof DaemonHttpError && error.status >= 400 && error.status < 500) {
+      //
+      // EXCEPTION: a 401 means our BEARER is stale. A daemon that
+      // died and restarted on the SAME loopback port mints a fresh
+      // agentToken, so the client we still hold rejects us with 401
+      // even though the request itself was well-formed. This IS a
+      // "reconnect and re-discover" signal — the round-4 review
+      // spotted this hole. Fall through to the reconnect path.
+      if (error instanceof DaemonHttpError && error.status >= 400 && error.status < 500 && error.status !== 401) {
         return {
           isError: true,
           content: [{ type: "text", text: `revkit mcp: tool '${toolName}' rejected by daemon (${error.status}): ${error.body || error.message}` }],
         };
       }
-      // Transport failures (fetch rejected) and 5xx: the daemon
-      // is unavailable or errored server-side; reconnect ONCE
-      // within the bounded deadline. The background subscriber
+      // Transport failures (fetch rejected), 401 (fresh daemon at
+      // the same URL → stale bearer), and 5xx: the daemon is
+      // unavailable, restarted, or errored server-side; reconnect
+      // ONCE within the bounded deadline. The background subscriber
       // keeps trying with capped backoff.
       if (options.discover !== undefined && !stopped) {
         try {
@@ -622,8 +638,11 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   const primeAndSubscribe = async (): Promise<void> => {
     // 1. Fetch the current state — gives us `head` and the open
-    //    threads for the catchup decision.
-    const listing = await currentClient.listThreads();
+    //    threads for the catchup decision. Tests may pre-seed via
+    //    `initialListing` (round-4 401-reconnect scenario).
+    const listing = options.initialListing !== undefined
+      ? { threads: options.initialListing.threads, head: options.initialListing.head }
+      : await currentClient.listThreads();
     lastSeenSeq = listing.head ?? 0;
     const summary = formatCatchupSummary(listing.threads as readonly WireThread[]);
     if (summary !== undefined) {
