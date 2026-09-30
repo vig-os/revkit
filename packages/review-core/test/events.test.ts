@@ -161,6 +161,26 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     reviewNodeId: "PR_review_2",
     reason: "head-moved",
   },
+  "comment.sync_requested": {
+    seq: 15,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "comment.sync_requested",
+    commentId: "c-1",
+    path: "docs/index.md",
+    subjectType: "LINE",
+    side: "RIGHT",
+    line: 2,
+    bodyHash: "e".repeat(64),
+  },
+  "comment.sync_failed": {
+    seq: 16,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "comment.sync_failed",
+    commentId: "c-1",
+    reason: "adapter-rate-limited",
+  },
 };
 
 describe("reviewEventSchema — happy paths", () => {

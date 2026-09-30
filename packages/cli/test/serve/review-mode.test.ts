@@ -526,17 +526,18 @@ describe("daemon review mode — head-move reanchor + repost", () => {
     const body = (await response.json()) as {
       ok: boolean;
       abandonedReviewNodeId: string;
-      openedReviewNodeId: string;
-      reanchored: number;
+      newIntents: number;
       orphaned: number;
       repositions: Array<{ outcome: string }>;
+      reconcile: { reviewNodeId: string | null; newlySynced: readonly string[] };
     };
     expect(body.ok).toBe(true);
     expect(body.abandonedReviewNodeId).toBe(oldReviewNodeId);
-    expect(body.openedReviewNodeId).not.toBe(oldReviewNodeId);
-    expect(body.reanchored).toBe(1);
+    expect(body.reconcile.reviewNodeId).not.toBe(oldReviewNodeId);
+    expect(body.newIntents).toBe(1);
     expect(body.orphaned).toBe(0);
     expect(body.repositions[0]!.outcome).toBe("moved");
+    expect(body.reconcile.newlySynced.length).toBe(1);
 
     // Adapter side-effects:
     //   - old review was deleted (deletePendingReview),
@@ -554,7 +555,7 @@ describe("daemon review mode — head-move reanchor + repost", () => {
       state: { openPending: { reviewNodeId: string; comments: unknown[] } | null; terminal: unknown[] };
     };
     expect(stateBody.stale).toBe(false);
-    expect(stateBody.state.openPending?.reviewNodeId).toBe(body.openedReviewNodeId);
+    expect(stateBody.state.openPending?.reviewNodeId).toBe(body.reconcile.reviewNodeId ?? undefined);
     expect(stateBody.state.openPending?.comments.length).toBe(1);
     // The old review shows up in terminal as abandoned.
     expect(stateBody.state.terminal.length).toBe(1);
@@ -623,12 +624,12 @@ describe("daemon review mode — head-move reanchor + repost", () => {
     expect(response.status).toBe(201);
     const body = (await response.json()) as {
       ok: boolean;
-      reanchored: number;
+      newIntents: number;
       orphaned: number;
       repositions: Array<{ outcome: string; reason?: string }>;
     };
     expect(body.ok).toBe(true);
-    expect(body.reanchored).toBe(0);
+    expect(body.newIntents).toBe(0);
     expect(body.orphaned).toBe(1);
     expect(body.repositions[0]!.outcome).toBe("orphaned");
     expect(body.repositions[0]!.reason).toBe("new-source-unavailable");

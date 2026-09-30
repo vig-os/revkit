@@ -920,13 +920,16 @@ export class GitHubAdapter {
     await this.graphql(SUBMIT_REVIEW_MUTATION, variables);
   }
 
-  /** M3 part 2b — reply to an existing review THREAD (published,
-   * not draft; there is no draft-reply GraphQL surface). Returns
-   * the new comment's identifiers so the caller can `comment.
-   * linked` it. Mutation — no auto-retry. */
+  /** M3 part 2b round-2 (ADR-0025 (b)): reply to an existing review
+   * thread, optionally pinned to a pending review so the reply is a
+   * DRAFT that submits alongside the rest of the review. When
+   * `pendingReviewId` is undefined the reply is published
+   * immediately (used only outside a review). Mutation — no
+   * auto-retry. */
   async addReviewThreadReply(input: {
     readonly threadNodeId: string;
     readonly body: string;
+    readonly pendingReviewId?: string;
   }): Promise<{ nodeId: string; databaseId: number; body: string; url: string }> {
     const result = await this.graphql<{
       data: {
@@ -937,6 +940,7 @@ export class GitHubAdapter {
     }>(ADD_REVIEW_THREAD_REPLY_MUTATION, {
       pullRequestReviewThreadId: input.threadNodeId,
       body: input.body,
+      ...(input.pendingReviewId !== undefined ? { pullRequestReviewId: input.pendingReviewId } : {}),
     });
     const comment = result.data.addPullRequestReviewThreadReply?.comment;
     if (comment === undefined || comment === null) {
@@ -2336,16 +2340,23 @@ const SUBMIT_REVIEW_MUTATION = /* GraphQL */ `
   }
 `;
 
-/** M3 part 2b — reply to an existing review thread. Uses the
- * `addPullRequestReviewThreadReply` mutation which appends a
- * comment inline (published, not draft) to a persisted thread.
- * The mutation returns the new comment's node + database id so
- * the caller can `comment.linked` it. */
+/** M3 part 2b round-2 (BLOCK-fix, ADR-0025 (b)):
+ * `addPullRequestReviewThreadReply` accepts a
+ * `pullRequestReviewId` argument so a reply on an existing thread
+ * during a review becomes a DRAFT on that pending review rather
+ * than a published comment. Without it, replies leak out
+ * unpended — a reviewer's mid-review reply appears immediately
+ * on GitHub, which contradicts the ADR-0025 write model. */
 const ADD_REVIEW_THREAD_REPLY_MUTATION = /* GraphQL */ `
-  mutation AddReviewThreadReply($pullRequestReviewThreadId: ID!, $body: String!) {
+  mutation AddReviewThreadReply(
+    $pullRequestReviewThreadId: ID!,
+    $body: String!,
+    $pullRequestReviewId: ID
+  ) {
     addPullRequestReviewThreadReply(input: {
       pullRequestReviewThreadId: $pullRequestReviewThreadId,
-      body: $body
+      body: $body,
+      pullRequestReviewId: $pullRequestReviewId
     }) {
       comment { id databaseId body url }
     }

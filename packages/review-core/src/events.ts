@@ -368,6 +368,56 @@ const reviewAbandonedPayload = {
   reason: z.string().min(1).max(256).optional(),
 } as const;
 
+/** M3 part 2b round-2 (BLOCK-fix): a local comment's sync to the
+ * reviewer's PENDING GitHub review was REQUESTED. This is an
+ * intent, not a completion — the reconciler is what turns intent
+ * into confirmation (via `comment.linked`) or into a visible
+ * failure (`comment.sync_failed`). Emitted:
+ *   - by the daemon's POST /api/threads handler right after the
+ *     local `comment.created`, BEFORE any GitHub call;
+ *   - by the re-anchor pipeline for each carried-forward comment
+ *     at the new head.
+ * Body / anchor coordinates are stored so the reconciler can
+ * fingerprint a candidate draft on GitHub (by nodeId when known,
+ * else by path+line+side+body). `bodyHash` is `revisionOf(body)`
+ * — reconstructable, so the reconciler never trusts the body
+ * bytes themselves. */
+const commentSyncRequestedPayload = {
+  kind: z.literal("comment.sync_requested"),
+  commentId: idSchema,
+  /** The path the pending comment was posted against — matches the
+   * anchor's path except when the anchor mapped to a file-level
+   * fallback (renamed file, etc.). */
+  path: z.string().min(1),
+  /** `LINE` (line-scoped, has line + side) or `FILE` (file-level,
+   * no line). */
+  subjectType: z.enum(["LINE", "FILE"]),
+  side: z.enum(["RIGHT", "LEFT"]).optional(),
+  line: z.number().int().positive().optional(),
+  startLine: z.number().int().positive().optional(),
+  /** SHA-256 hex of the body the daemon INTENDS to post. The
+   * reconciler compares GitHub's draft body hash against this to
+   * detect an already-posted match. */
+  bodyHash: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "comment.sync_requested.bodyHash must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
+    ),
+} as const;
+
+/** M3 part 2b round-2 (BLOCK-fix): the reconciler tried to sync a
+ * comment and GitHub refused / the network broke / etc. Carries a
+ * short machine-readable `reason` so the rail's "not on GitHub —
+ * retry" state can be actioned. A subsequent `comment.sync_requested`
+ * or `comment.linked` clears the failed state — the log's LAST
+ * event on a comment decides its sync state. */
+const commentSyncFailedPayload = {
+  kind: z.literal("comment.sync_failed"),
+  commentId: idSchema,
+  reason: z.string().min(1).max(512),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
@@ -424,6 +474,8 @@ const eventVariants = [
   z.object({ ...envelope, ...reviewOpenedPayload }).strict(),
   z.object({ ...envelope, ...reviewSubmittedPayload }).strict(),
   z.object({ ...envelope, ...reviewAbandonedPayload }).strict(),
+  z.object({ ...envelope, ...commentSyncRequestedPayload }).strict(),
+  z.object({ ...envelope, ...commentSyncFailedPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -458,6 +510,8 @@ export const reviewEventKinds = [
   "review.opened",
   "review.submitted",
   "review.abandoned",
+  "comment.sync_requested",
+  "comment.sync_failed",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

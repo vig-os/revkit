@@ -139,7 +139,17 @@ export interface FakeFetchOptions {
 }
 
 /** Mutable pending-review state the fake maintains across calls.
- * Tests read it after a POST to assert on what the daemon sent. */
+ * Round-2 (BLOCK-fix): mirrors GitHub's real semantics —
+ *   - a single pending review per viewer per PR (a second
+ *     AddReview against an already-pending viewer errors);
+ *   - a SUBMITTED review is IMMUTABLE (AddThread / Submit / reply
+ *     pinned to it error);
+ *   - node ids must EXIST (a reply / submit / delete on an
+ *     unknown reviewNodeId errors);
+ *   - drafts posted with `pullRequestReviewId` are DRAFTS on that
+ *     pending review; discarding it removes them.
+ * Tests read this slot after a POST to assert on what the daemon
+ * sent. */
 export interface FakePendingState {
   /** The current pending review's node id (if any). */
   reviewNodeId: string | null;
@@ -161,12 +171,16 @@ export interface FakePendingState {
     side?: "RIGHT" | "LEFT";
     subjectType: "LINE" | "FILE";
   }>;
+  /** Reviews that have been submitted — for the "submitted review
+   * is immutable" invariant. */
+  submittedReviewIds: Set<string>;
   /** Every submit call. */
   submits: Array<{ reviewNodeId: string; event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES"; body?: string }>;
   /** Every delete-review call. */
   deletes: Array<{ reviewNodeId: string }>;
-  /** Every reply-to-thread call. */
-  replies: Array<{ threadNodeId: string; body: string; commentNodeId: string; databaseId: number }>;
+  /** Every reply-to-thread call. `pendingReviewId` is set when
+   * the caller pinned the reply to a pending review (ADR-0025 (b)). */
+  replies: Array<{ threadNodeId: string; body: string; commentNodeId: string; databaseId: number; pendingReviewId?: string }>;
   /** Every resolve/unresolve call. */
   resolutions: Array<{ threadNodeId: string; op: "resolve" | "unresolve" }>;
 }
@@ -179,6 +193,7 @@ export function makePendingState(): FakePendingState {
     commitOid: null,
     nextCommentId: 100_000,
     drafts: [],
+    submittedReviewIds: new Set<string>(),
     submits: [],
     deletes: [],
     replies: [],
@@ -293,9 +308,49 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
             },
           });
         }
+        case "ReviewComments": {
+          // Serve back the drafts on the review named by `id`.
+          if (pending === undefined || pending.reviewNodeId !== vars.id) {
+            return jsonResponse({ data: { node: null } });
+          }
+          return jsonResponse({
+            data: {
+              node: {
+                comments: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: pending.drafts.map((d) => ({
+                    id: d.commentNodeId,
+                    databaseId: d.databaseId,
+                    path: d.path,
+                    body: d.body,
+                    line: d.line ?? null,
+                    startLine: d.startLine ?? null,
+                    originalLine: d.line ?? null,
+                    originalStartLine: d.startLine ?? null,
+                    subjectType: d.subjectType,
+                    url: `https://github.com/example/repo/pull/1#discussion_r${d.databaseId}`,
+                  })),
+                },
+              },
+            },
+          });
+        }
         case "AddReview": {
           if (refuseAllWrites || pending === undefined) {
             throw new Error(`fake github: refusing AddReview (no pending state)`);
+          }
+          // Semantic: at most ONE pending review per viewer per PR.
+          // A second AddReview while one exists errors — mirrors
+          // GitHub's real behaviour.
+          if (pending.reviewNodeId !== null) {
+            return jsonResponse({
+              errors: [
+                {
+                  type: "UNPROCESSABLE",
+                  message: `A pending review already exists for this pull request (${pending.reviewNodeId}).`,
+                },
+              ],
+            });
           }
           const oid = vars.commitOID as string;
           const id = `PR_review_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
@@ -308,6 +363,19 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
         case "AddThread": {
           if (refuseAllWrites || pending === undefined) {
             throw new Error(`fake github: refusing AddThread`);
+          }
+          const reviewId = vars.pullRequestReviewId as string | undefined;
+          // Refuse an AddThread on a review that is not currently
+          // the pending review (submitted / dismissed / unknown).
+          if (reviewId !== pending.reviewNodeId) {
+            return jsonResponse({
+              errors: [
+                {
+                  type: "NOT_FOUND",
+                  message: `Pull request review '${String(reviewId)}' is not in the PENDING state.`,
+                },
+              ],
+            });
           }
           const dbId = pending.nextCommentId++;
           const commentNodeId = `PRRC_${dbId}`;
@@ -354,33 +422,65 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
           if (refuseAllWrites || pending === undefined) {
             throw new Error(`fake github: refusing SubmitReview`);
           }
+          const submitReviewId = vars.pullRequestReviewId as string;
+          // Refuse a submit on an unknown / already-terminal review.
+          // Probe P4: a re-submit of a submitted review must fail.
+          if (submitReviewId !== pending.reviewNodeId) {
+            return jsonResponse({
+              errors: [
+                {
+                  type: "NOT_FOUND",
+                  message: `Pull request review '${submitReviewId}' is not PENDING (already submitted or unknown).`,
+                },
+              ],
+            });
+          }
           pending.submits.push({
-            reviewNodeId: vars.pullRequestReviewId as string,
+            reviewNodeId: submitReviewId,
             event: vars.event as "COMMENT" | "APPROVE" | "REQUEST_CHANGES",
             ...(typeof vars.body === "string" ? { body: vars.body as string } : {}),
           });
+          pending.submittedReviewIds.add(submitReviewId);
           pending.reviewNodeId = null;
           pending.commitOid = null;
           pending.drafts.length = 0;
           return jsonResponse({
-            data: { submitPullRequestReview: { pullRequestReview: { id: vars.pullRequestReviewId, state: "COMMENTED" } } },
+            data: { submitPullRequestReview: { pullRequestReview: { id: submitReviewId, state: "COMMENTED" } } },
           });
         }
         case "DeleteReview": {
           if (refuseAllWrites || pending === undefined) {
             throw new Error(`fake github: refusing DeleteReview`);
           }
-          pending.deletes.push({ reviewNodeId: vars.pullRequestReviewId as string });
+          const deleteReviewId = vars.pullRequestReviewId as string;
+          if (deleteReviewId !== pending.reviewNodeId) {
+            return jsonResponse({
+              errors: [
+                { type: "NOT_FOUND", message: `Pull request review '${deleteReviewId}' is not PENDING.` },
+              ],
+            });
+          }
+          pending.deletes.push({ reviewNodeId: deleteReviewId });
           pending.reviewNodeId = null;
           pending.commitOid = null;
           pending.drafts.length = 0;
           return jsonResponse({
-            data: { deletePullRequestReview: { pullRequestReview: { id: vars.pullRequestReviewId, state: "DISMISSED" } } },
+            data: { deletePullRequestReview: { pullRequestReview: { id: deleteReviewId, state: "DISMISSED" } } },
           });
         }
         case "AddReviewThreadReply": {
           if (refuseAllWrites || pending === undefined) {
             throw new Error(`fake github: refusing AddReviewThreadReply`);
+          }
+          const replyReviewId = vars.pullRequestReviewId as string | undefined;
+          // If pinned to a pending review, that review must exist
+          // AND be the current pending review.
+          if (replyReviewId !== undefined && replyReviewId !== pending.reviewNodeId) {
+            return jsonResponse({
+              errors: [
+                { type: "NOT_FOUND", message: `Pull request review '${replyReviewId}' is not PENDING.` },
+              ],
+            });
           }
           const dbId = pending.nextCommentId++;
           const commentNodeId = `PRRC_${dbId}`;
@@ -389,6 +489,7 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
             body: vars.body as string,
             commentNodeId,
             databaseId: dbId,
+            ...(replyReviewId !== undefined ? { pendingReviewId: replyReviewId } : {}),
           });
           return jsonResponse({
             data: {

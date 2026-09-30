@@ -658,6 +658,25 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       state.reviews.set(event.reviewNodeId, { status: "pending", headSha: event.headSha });
       return { ok: true };
     }
+    case "comment.sync_requested":
+    case "comment.sync_failed": {
+      // The comment must exist. Cross-review lifecycle is enforced
+      // by the reducer / derived view — a sync_requested on an
+      // already-terminal review is dead intent, not a validator
+      // failure. We refuse UNKNOWN comment ids so a caller can't
+      // record intent for a comment that never landed.
+      if (!state.commentIndex.has(event.commentId)) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-comment",
+            commentId: event.commentId,
+            message: `${event.kind}: comment '${event.commentId}' is not in the log.`,
+          },
+        };
+      }
+      return { ok: true };
+    }
     case "review.submitted":
     case "review.abandoned": {
       const attempted = event.kind === "review.submitted" ? "submitted" : "abandoned";

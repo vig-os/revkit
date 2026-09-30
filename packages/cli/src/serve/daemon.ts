@@ -49,13 +49,17 @@ import {
   ThreadStoreAppendError,
 } from "@revkit/review-core";
 import {
-  linkCommentAsPendingReviewComment,
-  makeReviewModeHandle,
+  buildSyncRequest,
   defaultSubmitBody,
+  makeReviewModeHandle,
+  mapAnchorForPending,
   reanchorPendingReviewAtNewHead,
+  reconcile,
+  unsyncedCount,
   type ReviewModeHandle,
   type ReviewModeOptions,
 } from "./review-mode.ts";
+import { populateStoreFromPr } from "../review/import-threads.ts";
 import { IngestGapError, openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
 import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
@@ -407,12 +411,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const systemActor: Author = { kind: "system", id: "revkit-daemon" };
 
   // M3 part 2b — review-mode handle (undefined outside review mode).
-  // The handle carries the adapter + mutable PR summary; every
-  // pending-review write path reads through it. `refuseAgent`
-  // returns true for an agent-bearer caller so the review write
-  // paths can 403 uniformly.
   const reviewMode: ReviewModeHandle | undefined =
     options.reviewMode !== undefined ? makeReviewModeHandle(options.reviewMode) : undefined;
+  // M3 part 2b round-2 (BLOCK-fix): single-flight guard on submit
+  // so a double-click / channel retry cannot race two submits at
+  // the daemon layer. The lock is process-local — GitHub's own
+  // pending-review uniqueness is the ultimate guard.
+  let submitInFlight = false;
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -653,6 +658,27 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   delivery.reconcileIdleTimer(() => {
     void flushPendingHandover("idle");
   });
+
+  // M3 part 2b round-2 (BLOCK-fix): boot-time reconcile so a crash
+  // between an adapter mutation and the log append is healed on
+  // the next start. Never blocks the daemon's bind — a network
+  // hiccup here should not prevent serving.
+  if (reviewMode !== undefined) {
+    void (async () => {
+      try {
+        await reconcile({
+          review: reviewMode,
+          store,
+          actor: localActor,
+          appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, "boot-reconcile"),
+        });
+      } catch (error) {
+        logger.warn("review.boot.reconcile-failed", {
+          errorKind: (error as Error).name,
+        });
+      }
+    })();
+  }
 
   let stopped = false;
   const handle: DaemonHandle = {
@@ -1637,13 +1663,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
   // ── review-mode helpers (M3 part 2b) ────────────────────────────
 
-  /** Push a local human-authored comment into the reviewer's
-   * PENDING GitHub review via the adapter. Only called from
-   * `POST /api/threads` after the local append succeeded and only
-   * when the actor is a local human (agent-authored comments
-   * NEVER touch the adapter — the human's `gh` identity must not
-   * carry an agent's writes). Failures are logged (structured;
-   * no token / body content); the local thread stays valid. */
+  /** M3 part 2b round-2 (BLOCK-fix): record a human-authored
+   * comment's intent to sync onto the pending GitHub review, then
+   * invoke the reconciler. Agents never mirror — the reviewer's
+   * `gh` identity is not authorized to carry an agent's writes.
+   * The reconciler is what actually calls the adapter; on failure
+   * it appends `comment.sync_failed`, so the rail can surface a
+   * retry line and the comment NEVER silently vanishes. */
   async function mirrorPendingReviewComment(input: {
     readonly reviewMode: ReviewModeHandle;
     readonly localCommentId: string;
@@ -1652,9 +1678,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     readonly actor: Author;
     readonly requestId: string;
   }): Promise<void> {
-    // Agents never mirror. This is the security boundary: the
-    // adapter posts under the reviewer's identity; an agent
-    // must not be able to post as the reviewer.
     if (input.actor.kind !== "local") {
       logger.warn("review.mirror.refused.actor", {
         requestId: input.requestId,
@@ -1662,41 +1685,103 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       });
       return;
     }
-    try {
-      const outcome = await linkCommentAsPendingReviewComment({
-        review: input.reviewMode,
-        store,
-        localCommentId: input.localCommentId,
-        anchor: input.anchor,
-        body: input.body,
-        actor: input.actor,
-        appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, input.requestId),
-      });
-      if (outcome.kind === "stale") {
-        logger.warn("review.mirror.stale", {
-          requestId: input.requestId,
-          reviewNodeId: outcome.reviewNodeId,
-          expectedHeadSha: outcome.expectedHeadSha,
-          actualHeadSha: outcome.actualHeadSha,
-        });
-      } else if (outcome.kind === "orphaned") {
-        logger.warn("review.mirror.orphaned", {
-          requestId: input.requestId,
-          reason: outcome.reason,
-        });
-      } else {
-        logger.info("review.mirror.linked", {
-          requestId: input.requestId,
-          reviewNodeId: outcome.reviewNodeId,
-          fileFallback: outcome.reason === "file-fallback",
-        });
+    // (a) Map the anchor to a pending-comment coordinate (line or
+    // file-level fallback) and hash the outgoing body. Orphaned
+    // anchors emit `thread.orphaned` immediately — never silently
+    // dropped.
+    const mapping = mapAnchorForPending(input.anchor, input.reviewMode.options.files, input.body);
+    if (mapping.kind === "orphan") {
+      try {
+        await appendReviewLifecycleEvent(
+          {
+            kind: "thread.orphaned",
+            actor: input.actor,
+            threadId: (await store.thread(await threadIdOfCommentInStore(input.localCommentId))) === undefined
+              ? ""
+              : ((await threadIdOfCommentInStore(input.localCommentId)) as string),
+            revision: await revisionOf(`orphan-at-mirror:${input.anchor.path}\n`),
+            reason: mapping.reason,
+          },
+          input.requestId,
+        );
+      } catch {
+        /* already orphaned — fine */
       }
+      logger.warn("review.mirror.orphaned", {
+        requestId: input.requestId,
+        reason: mapping.reason,
+      });
+      return;
+    }
+    // (b) Record the intent BEFORE any adapter call. On a
+    // reject shape or duplicate the intent is a no-op; on
+    // failure of the adapter, the reconciler emits
+    // comment.sync_failed and the rail shows the retry line.
+    try {
+      const req = await buildSyncRequest({
+        actor: input.actor,
+        commentId: input.localCommentId,
+        mapping,
+      });
+      await appendReviewLifecycleEvent(req, input.requestId);
     } catch (error) {
-      logger.error("review.mirror.error", {
+      logger.warn("review.mirror.intent-append-failed", {
         requestId: input.requestId,
         errorKind: (error as Error).name,
       });
+      // No adapter call ran; the local thread stays valid.
+      return;
     }
+    // (c) Invoke the reconciler. It reads GitHub, matches by
+    // fingerprint, and posts what's missing. Failures land on the
+    // log as comment.sync_failed.
+    try {
+      const outcome = await reconcile({
+        review: input.reviewMode,
+        store,
+        actor: input.actor,
+        appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, input.requestId),
+      });
+      logger.info("review.mirror.reconciled", {
+        requestId: input.requestId,
+        count: outcome.newlySynced.length,
+      });
+    } catch (error) {
+      // Reconciler read failure: mark this specific intent as
+      // failed so the rail shows the retry line. The reconciler
+      // itself does per-item failures, but a hard read-side error
+      // (viewerLogin / pending-review lookup) bubbles up here.
+      logger.warn("review.mirror.reconcile-failed", {
+        requestId: input.requestId,
+        errorKind: (error as Error).name,
+      });
+      try {
+        await appendReviewLifecycleEvent(
+          {
+            kind: "comment.sync_failed",
+            actor: input.actor,
+            commentId: input.localCommentId,
+            reason: `reconcile-read-failed:${(error as Error).name}`,
+          },
+          input.requestId,
+        );
+      } catch {
+        /* fine */
+      }
+    }
+  }
+
+  /** Look up a comment's threadId by scanning the store's log.
+   * Used only from the orphan-emit fallback path; hot paths use
+   * `store.thread()` directly with a known id. */
+  async function threadIdOfCommentInStore(commentId: string): Promise<string> {
+    const events = await store.since(0);
+    for (const evt of events) {
+      if ((evt.kind === "comment.created" || evt.kind === "comment.replied") && evt.commentId === commentId) {
+        return evt.threadId;
+      }
+    }
+    return "";
   }
 
   /** M3 part 2b B4 two-way: mirror a local reply to a GitHub-
@@ -1751,11 +1836,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const external = thread.external;
     if (external === undefined || external.provider !== "github") return;
     // `external.threadId` is the GitHub review-thread node id
-    // (see `mapThreadsToEvents`).
+    // (see `mapThreadsToEvents`). If a pending review is open for
+    // the viewer, PIN the reply to it (ADR-0025 (b)): a mid-review
+    // reply is a DRAFT that submits with the review, not a
+    // published comment that leaks out unpended.
+    const state = await input.reviewMode.readState(store);
+    const pendingReviewId = state.openPending?.reviewNodeId;
     try {
       const posted = await input.reviewMode.options.adapter.addReviewThreadReply({
         threadNodeId: external.threadId,
         body: input.body,
+        ...(pendingReviewId !== undefined ? { pendingReviewId } : {}),
       });
       await appendReviewLifecycleEvent(
         {
@@ -1893,6 +1984,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const headSha = reviewMode.currentHeadSha();
       const summary = reviewMode.options.summary;
       const stale = isPendingReviewStale(state.openPending, headSha);
+      // Serialise `state`: `commentSync` is a Map that would land
+      // as `{}` on JSON. Convert to an entry array so the rail
+      // consumer can walk it.
+      const commentSyncEntries: Array<{ readonly commentId: string; readonly state: unknown }> = [];
+      for (const [commentId, syncState] of state.commentSync) {
+        commentSyncEntries.push({ commentId, state: syncState });
+      }
       return jsonResponse({
         pr: {
           owner: reviewMode.options.pr.owner,
@@ -1907,7 +2005,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           state: summary.state,
         },
         viewerLogin: reviewMode.options.viewerLogin,
-        state,
+        state: {
+          openPending: state.openPending,
+          terminal: state.terminal,
+          unsyncedCommentIds: [...state.unsyncedCommentIds],
+          commentSync: commentSyncEntries,
+        },
         stale,
       });
     }
@@ -1934,65 +2037,145 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const parsed = submitReviewRequestSchema.safeParse(bodyRead.value);
       if (!parsed.success) return badRequest(parsed.error.issues);
 
-      const state = await reviewMode.readState(store);
-      if (state.openPending === null) {
-        return badRequest([{ code: "custom", path: [], message: "no-open-pending-review" }]);
-      }
-      const headSha = reviewMode.currentHeadSha();
-      if (isPendingReviewStale(state.openPending, headSha)) {
+      // Single-flight guard: block a concurrent submit on the
+      // same daemon. Handles a double-click on the rail's submit
+      // button and a channel-driven retry landing at the same
+      // moment. The lock is released before returning; a crash
+      // between the reconcile and the store append is healed on
+      // the next reconcile (which sees the review as SUBMITTED on
+      // GitHub).
+      if (submitInFlight) {
         return withHygiene(
-          new Response(
-            JSON.stringify({
-              error: "stale-pending-review",
-              reviewNodeId: state.openPending.reviewNodeId,
-              expectedHeadSha: headSha,
-              openedHeadSha: state.openPending.headSha,
-            }),
-            { status: 409 },
-          ),
+          new Response(JSON.stringify({ error: "submit-in-flight" }), { status: 409 }),
           "json",
           "application/json; charset=utf-8",
         );
       }
-
-      const submitEvent: ReviewSubmitEvent = parsed.data.event;
-      const submitBody = parsed.data.body ?? defaultSubmitBody(submitEvent, headSha);
+      submitInFlight = true;
       try {
-        await reviewMode.options.adapter.submitReview({
-          reviewId: state.openPending.reviewNodeId,
-          event: submitEvent,
-          body: submitBody,
-        });
-      } catch (error) {
-        logger.warn("review.submit.adapter-failed", {
-          requestId,
-          errorKind: (error as Error).name,
-        });
-        return internalServerError({ error: "submit-failed" });
-      }
-      // Log the terminal transition. On any local append failure
-      // (concurrent submit, race with abandon) surface the error
-      // — GitHub has already accepted the submit, so the log MUST
-      // record it to stay coherent.
-      try {
-        await appendReviewLifecycleEvent(
-          {
-            kind: "review.submitted",
+        // Reconcile FIRST — heals a crash-between-mutation-and-log
+        // race and posts any pending intents the reviewer had
+        // queued. On any per-item failure the reconciler emits
+        // `comment.sync_failed`; we then refuse submit until the
+        // rail retries.
+        try {
+          await reconcile({
+            review: reviewMode,
+            store,
             actor,
-            reviewNodeId: state.openPending.reviewNodeId,
+            appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+          });
+        } catch (error) {
+          logger.warn("review.submit.reconcile-failed", {
+            requestId,
+            errorKind: (error as Error).name,
+          });
+          return internalServerError({ error: "submit-reconcile-failed" });
+        }
+
+        const state = await reviewMode.readState(store);
+        if (state.openPending === null) {
+          return badRequest([{ code: "custom", path: [], message: "no-open-pending-review" }]);
+        }
+        const headSha = reviewMode.currentHeadSha();
+        if (isPendingReviewStale(state.openPending, headSha)) {
+          return withHygiene(
+            new Response(
+              JSON.stringify({
+                error: "stale-pending-review",
+                reviewNodeId: state.openPending.reviewNodeId,
+                expectedHeadSha: headSha,
+                openedHeadSha: state.openPending.headSha,
+              }),
+              { status: 409 },
+            ),
+            "json",
+            "application/json; charset=utf-8",
+          );
+        }
+        // Refuse submit if any comment still owes a sync — the
+        // GitHub review would ship without them.
+        const unsynced = unsyncedCount(state);
+        if (unsynced > 0) {
+          return withHygiene(
+            new Response(
+              JSON.stringify({
+                error: "unsynced-comments",
+                unsyncedCount: unsynced,
+                unsyncedCommentIds: [...state.unsyncedCommentIds],
+              }),
+              { status: 409 },
+            ),
+            "json",
+            "application/json; charset=utf-8",
+          );
+        }
+
+        const submitEvent: ReviewSubmitEvent = parsed.data.event;
+        const submitBody = parsed.data.body ?? defaultSubmitBody(submitEvent, headSha);
+        try {
+          await reviewMode.options.adapter.submitReview({
+            reviewId: state.openPending.reviewNodeId,
             event: submitEvent,
             body: submitBody,
-          },
-          requestId,
-        );
+          });
+        } catch (error) {
+          logger.warn("review.submit.adapter-failed", {
+            requestId,
+            errorKind: (error as Error).name,
+          });
+          return internalServerError({ error: "submit-failed" });
+        }
+        // Log the terminal transition. On any local append failure
+        // (concurrent submit, race with abandon) the next reconcile
+        // will observe GitHub's submitted state and heal.
+        try {
+          await appendReviewLifecycleEvent(
+            {
+              kind: "review.submitted",
+              actor,
+              reviewNodeId: state.openPending.reviewNodeId,
+              event: submitEvent,
+              body: submitBody,
+            },
+            requestId,
+          );
+        } catch (error) {
+          logger.error("review.submit.append-failed", {
+            requestId,
+            errorKind: (error as Error).name,
+          });
+          return internalServerError({ error: "submit-log-write-failed" });
+        }
+        return jsonResponse({ ok: true, reviewNodeId: state.openPending.reviewNodeId, event: submitEvent }, 201);
+      } finally {
+        submitInFlight = false;
+      }
+    }
+    // POST /api/review/reconcile — session cookie or agent bearer.
+    // Idempotent read-first sync between the log and GitHub. Used
+    // by the rail's "retry" button and by daemon startup.
+    if (url.pathname === "/api/review/reconcile" && method === "POST") {
+      // NOTE: reconcile is a READ-then-mutate that never approves
+      // or submits. Both actor kinds may invoke it — the mutations
+      // it can make are only "post the pending drafts the human
+      // already intended to post". An agent invoking reconcile
+      // does not cross the "no submit / no approve" line.
+      try {
+        const outcome = await reconcile({
+          review: reviewMode,
+          store,
+          actor,
+          appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+        });
+        return jsonResponse({ ok: true, ...outcome, newlyFailed: [...outcome.newlyFailed] }, 201);
       } catch (error) {
-        logger.error("review.submit.append-failed", {
+        logger.warn("review.reconcile.failed", {
           requestId,
           errorKind: (error as Error).name,
         });
-        return internalServerError({ error: "submit-log-write-failed" });
+        return internalServerError({ error: "reconcile-failed" });
       }
-      return jsonResponse({ ok: true, reviewNodeId: state.openPending.reviewNodeId, event: submitEvent }, 201);
     }
 
     // POST /api/review/discard — session cookie ONLY. Deletes the
@@ -2090,10 +2273,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
 
     // POST /api/review/refresh — session cookie ONLY. Re-reads the
-    // PR summary via the adapter; if the head moved, the abandon is
-    // driven by the client (the rail shows the banner and offers
-    // discard + re-post). The refresh itself is READ-only against
-    // GitHub. Agent bearer refused for the same reason as submit.
+    // PR summary via the adapter, pulls remote review threads
+    // through `importThreads` (B4 sync), then runs the reconciler
+    // to heal any stray writes. Agent bearer refused.
     if (url.pathname === "/api/review/refresh" && method === "POST") {
       if (hasValidBearer && actor.kind === "agent") {
         logger.warn("review.refresh.rejected.agent-bearer", { requestId });
@@ -2112,6 +2294,51 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         const prevHeadSha = reviewMode.currentHeadSha();
         reviewMode.refreshSummary(nextSummary, nextFiles);
         const moved = prevHeadSha.toLowerCase() !== nextSummary.headSha.toLowerCase();
+
+        // B4 pull (ADR-0025): re-import remote review threads
+        // idempotently. `populateStoreFromPr` uses deterministic
+        // thread / comment ids, so a re-import silently skips
+        // already-present events — no echo back to GitHub.
+        let importedNew = 0;
+        let importedSkipped = 0;
+        try {
+          const remoteThreads = await reviewMode.options.adapter.listReviewThreads(reviewMode.options.pr);
+          const populate = await populateStoreFromPr({
+            pr: reviewMode.options.pr,
+            threads: remoteThreads,
+            headSha: nextSummary.headSha,
+            baseRef: nextSummary.baseRef,
+            adapter: reviewMode.options.adapter,
+            materializedRoot: options.repoRoot,
+            store,
+            oldPathOf: (currentPath) =>
+              nextFiles.find((f) => f.filename === currentPath)?.previousFilename,
+          });
+          importedNew = populate.appended;
+          importedSkipped = populate.skipped;
+        } catch (error) {
+          logger.warn("review.refresh.import-failed", {
+            requestId,
+            errorKind: (error as Error).name,
+          });
+        }
+
+        // Reconcile any local intents against the fresh view.
+        let reconcileOutcome;
+        try {
+          reconcileOutcome = await reconcile({
+            review: reviewMode,
+            store,
+            actor,
+            appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+          });
+        } catch (error) {
+          logger.warn("review.refresh.reconcile-failed", {
+            requestId,
+            errorKind: (error as Error).name,
+          });
+        }
+
         const state = await reviewMode.readState(store);
         const stale = isPendingReviewStale(state.openPending, nextSummary.headSha);
         return jsonResponse({
@@ -2121,6 +2348,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           currentHeadSha: nextSummary.headSha,
           stale,
           openPendingReviewNodeId: state.openPending?.reviewNodeId ?? null,
+          importedNew,
+          importedSkipped,
+          ...(reconcileOutcome !== undefined ? { reconcile: { newlySynced: reconcileOutcome.newlySynced, newlyFailed: [...reconcileOutcome.newlyFailed] } } : {}),
         });
       } catch (error) {
         logger.warn("review.refresh.adapter-failed", {

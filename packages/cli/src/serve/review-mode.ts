@@ -1,51 +1,35 @@
 // Review-mode integration for the daemon (M3 part 2b, ADR-0025).
 //
-// When `startDaemon` is invoked with a `reviewMode` option, the daemon
-// carries a live GitHub adapter, a PR ref and the reviewer's `gh`
-// token (in memory only, ADR-0013). Every human-authored comment
-// posted to `/api/threads` (POST) is mapped onto a `(path, line/
-// start_line, side)` — or a file-level position when the block sits
-// outside the PR's diff hunks — and added to the reviewer's PENDING
-// GitHub review via `GitHubAdapter.addPendingReviewThread`.
+// Round-2 (BLOCK-fix): the mirror-to-GitHub path is an INTENT LOG
+// plus a RECONCILER. The request handler NEVER makes fire-and-forget
+// mutations. It appends `comment.sync_requested` (intent), then
+// invokes `reconcile()`, which:
 //
-// Pending-review LIFECYCLE is derived from the log (`reduceReviewState`),
-// not held in memory. The daemon writes:
+//   1. READS the truth: viewer's pending review + its comments, and
+//      the full `listReviewThreads` set for B4 sync.
+//   2. Compares against the log's intents.
+//   3. Adds only what is missing, matching by GraphQL node id when
+//      known, else by a body-hash + position fingerprint recorded on
+//      the `comment.sync_requested` event.
+//   4. Emits `comment.linked` on success, `comment.sync_failed` on
+//      GitHub error. NEVER auto-retries a mutation — retries happen
+//      by re-invoking `reconcile`, which always re-reads first.
 //
-//   1. `review.opened(reviewNodeId, headSha)`  — the first time we
-//      touch GitHub in this daemon lifetime; carries the pending
-//      review's GraphQL id and the head SHA the review is pinned to.
-//   2. `comment.linked` events with `external.github.pending: true`
-//      and `reviewNodeId` for every pending comment we post.
-//   3. `review.submitted(reviewNodeId, event, body?)`  — on submit.
-//   4. `review.abandoned(reviewNodeId, reason)`  — on head-move
-//      before re-opening a fresh review at the new head.
+// Runs after every human-driven write, on `/api/review/refresh`, and
+// at daemon startup — so a crash between "GitHub accepted the write"
+// and "the log recorded it" heals on the next tick. The log stays
+// the source of truth; GitHub becomes idempotently consistent.
 //
-// The event kinds are enforced by the validator (`duplicate-review`,
-// `review-not-pending`), so a restart's boot-time hydration derives
-// the same pending set the daemon had before shutdown.
-//
-// Security (ADR-0009, ADR-0013):
-//
-//   - Every write to GitHub goes through the adapter, and the
-//     adapter is called ONLY from human-authenticated request paths
-//     (session cookie). The daemon refuses `POST /api/review/submit`
-//     and `POST /api/review/refresh` when the caller presents the
-//     agent bearer token — an agent MUST NOT be able to submit or
-//     approve a review on the human's behalf.
-//   - Idempotency: mutations are never auto-retried (adapter policy).
-//     Every `addPendingReviewThread` result is captured on
-//     `comment.linked`, so a retry after a network flake WOULD show
-//     up as `duplicate-external-id` on the second attempt.
-//   - Tokens never touch the browser or the log. The adapter holds
-//     the reviewer's `gh` token in memory; the daemon reads it via
-//     the injected `TokenSource`.
+// Security (ADR-0009, ADR-0013): every adapter call is invoked from
+// a human-authenticated path (session cookie). The agent bearer is
+// refused with 403 at the daemon's route layer for every review
+// write. Tokens never touch the browser or the log.
 
 import {
   type Anchor,
-  type AnyAnchor,
   type Author,
+  type CommentSyncState,
   type GitHubAdapter,
-  type GhReviewThread,
   type PendingReviewComment as AdapterPendingReviewComment,
   type PrRef,
   type PrFile,
@@ -54,7 +38,7 @@ import {
   type ReviewEventInput,
   type ReviewState,
   type ReviewSubmitEvent,
-  type DerivedPendingReviewComment,
+  type SyncFingerprint,
   type ThreadStore,
   ThreadStoreAppendError,
   anchorToPrComment,
@@ -66,323 +50,530 @@ import {
   revisionOf,
 } from "@revkit/review-core";
 
-/** Options the daemon accepts in review-mode. Provided by
- * `packages/cli/src/review/cli.ts` after the safe PR-head build
- * finishes. Every write on this shape carries the reviewer's
- * IDENTITY (their `gh` token), so nothing on this shape crosses
- * the wire to the browser or to the agent. */
+/** Options the daemon accepts in review-mode. */
 export interface ReviewModeOptions {
-  /** GitHub adapter, ready-to-call. Constructed by the CLI with the
-   * reviewer's TokenSource (`createGhTokenSource(gh)`). */
   readonly adapter: GitHubAdapter;
-  /** PR coordinate the daemon reviews. */
   readonly pr: PrRef;
-  /** Cached PR summary from the last `getPullRequest` call. The
-   * head-move refresh routine mutates this in-place after a
-   * re-fetch. */
   summary: PullRequestSummary;
-  /** The reviewer's GitHub login — used by `findOrCreatePendingReview`
-   * to look up an existing pending review by author, and by the rail
-   * / channel to attribute the pending draft. */
   readonly viewerLogin: string;
-  /** PR file list — anchor-map input. Refreshed on head move. */
   files: readonly PrFile[];
-  /** Whether the reviewer passed `--trust <sha>` (unlocks fork PRs
-   * or PRs whose tooling files differ from base). Recorded for
-   * refresh; the head-move flow refuses a re-fetch that doesn't
-   * still match the trust. */
   readonly trustSha?: string;
 }
 
-/** Public handle a caller uses to interact with review-mode state.
- * `pendingCommentsFromLog` re-reads the log every call (cheap) so
- * the derived state cannot drift; the memory-only fields are the
- * adapter and the (mutable) PR summary. */
+/** Handle the daemon uses to interact with review-mode state. */
 export interface ReviewModeHandle {
   readonly options: ReviewModeOptions;
-  /** True when the caller-provided actor kind must not perform
-   * review writes (submit / approve / request-changes / any
-   * mutation on the pending review). The agent bearer is refused;
-   * a session-cookie caller is allowed. */
-  refuseAgent(actor: Author): boolean;
-  /** Read the current pending-review state from the log. */
+  /** Read the current review state from the log. */
   readState(store: ThreadStore): Promise<ReviewState>;
-  /** Return the current PR head SHA (from the cached summary). */
+  /** Current PR head SHA (from the cached summary). */
   currentHeadSha(): string;
-  /** Update the cached summary / files (used by the head-move
-   * refresh path). */
+  /** Update the cached summary / files (after a refresh call). */
   refreshSummary(summary: PullRequestSummary, files: readonly PrFile[]): void;
 }
 
-/** Build a `ReviewModeHandle` from options. Pure — the handle
- * closes over the mutable `options` slot. */
+/** Build a `ReviewModeHandle` from options. */
 export function makeReviewModeHandle(options: ReviewModeOptions): ReviewModeHandle {
-  let files = options.files;
-  let summary = options.summary;
   return {
     options,
-    refuseAgent(actor: Author): boolean {
-      return actor.kind === "agent";
-    },
     async readState(store: ThreadStore): Promise<ReviewState> {
       const events = await store.since(0);
       return reduceReviewState(events);
     },
     currentHeadSha(): string {
-      return summary.headSha;
+      return options.summary.headSha;
     },
     refreshSummary(next: PullRequestSummary, nextFiles: readonly PrFile[]): void {
-      summary = next;
-      files = nextFiles;
-      // Mutate the options record too so any handler reading
-      // options.summary sees the update.
       (options as { summary: PullRequestSummary }).summary = next;
       (options as { files: readonly PrFile[] }).files = nextFiles;
     },
   };
 }
 
-/** Result of `linkCommentAsPendingReviewComment`. */
-export type LinkPendingOutcome =
-  | { readonly kind: "linked"; readonly reviewNodeId: string; readonly pendingComment: AdapterPendingReviewComment; readonly reason?: "file-fallback" }
-  | { readonly kind: "orphaned"; readonly reason: string }
-  | { readonly kind: "stale"; readonly reviewNodeId: string; readonly expectedHeadSha: string; readonly actualHeadSha: string | null };
+/** Result of mapping a local anchor onto a pending-review coordinate.
+ * `orphan` means the anchor cannot be represented as a pending draft
+ * on GitHub (deleted path, etc.); the caller decides what to do. */
+export type PendingMap =
+  | {
+      readonly kind: "line";
+      readonly path: string;
+      readonly line: number;
+      readonly startLine?: number;
+      readonly side: "RIGHT" | "LEFT";
+      readonly submittedBody: string;
+    }
+  | {
+      readonly kind: "file";
+      readonly path: string;
+      readonly submittedBody: string;
+    }
+  | { readonly kind: "orphan"; readonly reason: string };
 
-/**
- * Post a local `comment.created` event as a pending-review comment.
- *
- * Steps:
- *   1. Ensure a pending review exists at the CURRENT headSha. If a
- *      previous `review.opened` in the log names a different headSha,
- *      short-circuit `{ kind: "stale" }` so the caller can prompt the
- *      reviewer through the re-anchor / abandon flow.
- *   2. Map the anchor to a GitHub position (line / file-level).
- *   3. Call `adapter.addPendingReviewThread` (never auto-retries;
- *      idempotent-in-shape: a duplicate call would fail on the second
- *      `comment.linked` at `duplicate-external-id`).
- *   4. Append the `review.opened` event (once) and the
- *      `comment.linked` event.
- *
- * All GitHub writes are gated by the caller (`daemon.ts` only invokes
- * this on a cookie-authenticated `POST /api/threads`).
- */
-export async function linkCommentAsPendingReviewComment(input: {
-  readonly review: ReviewModeHandle;
-  readonly store: ThreadStore;
-  readonly localCommentId: string;
-  readonly anchor: Anchor;
-  readonly body: string;
-  readonly actor: Author;
-  /** Callback the daemon provides so the returned append events get
-   * fanned out on `/events` and folded into the delivery cache. The
-   * daemon uses its own append path to keep audiences consistent;
-   * this module never talks to the bus directly. */
-  readonly appendAndPublish: (input: ReviewEventInput) => Promise<ReviewEvent | undefined>;
-}): Promise<LinkPendingOutcome> {
-  const { review, store, actor, body, anchor, localCommentId, appendAndPublish } = input;
-
-  const state = await review.readState(store);
-  const headSha = review.currentHeadSha();
-
-  // Head-move guard: if we already have a pending review open on a
-  // different headSha, that review is stale; the daemon must run
-  // the re-anchor flow before accepting more drafts. Refuse with a
-  // typed result so the caller can plumb the banner (never guess).
-  if (state.openPending !== null && isPendingReviewStale(state.openPending, headSha)) {
+/** Map an anchor onto a pending-review request. Same anchor-map used
+ * by both the request handler AND the reanchor pipeline. Returns
+ * `orphan` when the block cannot be posted (deleted file, patch
+ * unavailable). Callable pure — no I/O. */
+export function mapAnchorForPending(
+  anchor: Anchor,
+  files: readonly PrFile[],
+  body: string,
+): PendingMap {
+  const mapResult = anchorToPrComment(anchor, files);
+  if (mapResult.kind === "reject") {
+    return { kind: "orphan", reason: `anchor rejected: ${mapResult.reason}` };
+  }
+  if (mapResult.kind === "file") {
     return {
-      kind: "stale",
-      reviewNodeId: state.openPending.reviewNodeId,
-      expectedHeadSha: headSha,
-      actualHeadSha: state.openPending.headSha,
+      kind: "file",
+      path: mapResult.target.path,
+      submittedBody: fileFallbackPreamble(anchor, mapResult.reason) + body,
     };
   }
-
-  // Find or create the pending review, pinned to the current head.
-  let reviewNodeId: string;
-  if (state.openPending !== null) {
-    reviewNodeId = state.openPending.reviewNodeId;
-  } else {
-    const found = await review.options.adapter.findOrCreatePendingReview({
-      pullRequestNodeId: review.options.summary.nodeId,
-      commitOid: headSha,
-      viewerLogin: review.options.viewerLogin,
-    });
-    if (found.kind === "stale") {
-      // A pending review already exists on a foreign head — that is,
-      // the reviewer had a draft open in the GitHub UI at an older
-      // commit. Do not touch it silently; refuse and let the
-      // reviewer decide (abandon → re-open, or open the GitHub UI).
-      return {
-        kind: "stale",
-        reviewNodeId: found.review.id,
-        expectedHeadSha: headSha,
-        actualHeadSha: found.actualCommitOid,
-      };
-    }
-    reviewNodeId = found.review.id;
-    // First touch — record the open so the log carries it before
-    // any comment.linked lands.
-    await appendAndPublish({
-      kind: "review.opened",
-      actor,
-      reviewNodeId,
-      headSha,
-    });
-  }
-
-  // Map the anchor to a PR position. The anchor-map file-level
-  // fallback (ADR-0025 §5.6) fires when the block is outside every
-  // hunk / lives on a renamed file / etc.
-  const mapResult = anchorToPrComment(anchor, review.options.files);
-  if (mapResult.kind === "reject") {
-    return { kind: "orphaned", reason: `anchor rejected: ${mapResult.reason}` };
-  }
-
-  let submittedBody = body;
-  let subject: "LINE" | "FILE" = "LINE";
-  let line: number | undefined;
-  let startLine: number | undefined;
-  let side: "RIGHT" | "LEFT" = "RIGHT";
-  if (mapResult.kind === "line") {
-    line = mapResult.target.line;
-    if (mapResult.target.startLine !== undefined && mapResult.target.startLine !== mapResult.target.line) {
-      startLine = mapResult.target.startLine;
-    }
-    side = mapResult.target.side;
-  } else {
-    // File-level fallback. Prepend a machine-readable preamble so a
-    // human reader on GitHub sees where the anchor was pointing.
-    subject = "FILE";
-    submittedBody = fileFallbackPreamble(anchor, mapResult.reason) + submittedBody;
-  }
-
-  const posted = await review.options.adapter.addPendingReviewThread({
-    reviewId: reviewNodeId,
-    path: mapResult.target.path,
-    body: submittedBody,
-    subjectType: subject,
-    ...(line !== undefined ? { line } : {}),
-    ...(startLine !== undefined ? { startLine } : {}),
-    side,
-  });
-
-  // Emit comment.linked. If the append fails with a duplicate
-  // (retry after a network flake, another window submitted the
-  // same comment), swallow — the log already has the mapping.
-  try {
-    await appendAndPublish({
-      kind: "comment.linked",
-      actor,
-      commentId: localCommentId,
-      external: {
-        github: {
-          commentId: posted.databaseId,
-          ...(posted.nodeId !== undefined ? { nodeId: posted.nodeId } : {}),
-          pending: true,
-          reviewNodeId,
-        },
-      },
-    });
-  } catch (err) {
-    if (
-      err instanceof ThreadStoreAppendError &&
-      (err.rejection.kind === "duplicate-link" ||
-        err.rejection.kind === "duplicate-external-id")
-    ) {
-      // Idempotent path — the daemon retried a POST after the mutation
-      // already landed; the log holds the mapping.
-    } else {
-      throw err;
-    }
-  }
-
+  const line = mapResult.target.line;
+  const startLine =
+    mapResult.target.startLine !== undefined && mapResult.target.startLine !== mapResult.target.line
+      ? mapResult.target.startLine
+      : undefined;
   return {
-    kind: "linked",
-    reviewNodeId,
-    pendingComment: posted,
-    ...(mapResult.kind === "file" ? { reason: "file-fallback" as const } : {}),
+    kind: "line",
+    path: mapResult.target.path,
+    line,
+    side: mapResult.target.side,
+    submittedBody: body,
+    ...(startLine !== undefined ? { startLine } : {}),
   };
 }
 
-/** True when the anchor's `path` still exists in the current file
- * list (used by the head-move re-anchor). */
-export function anchorPathInFiles(anchor: AnyAnchor, files: readonly PrFile[]): boolean {
-  for (const file of files) {
-    if (file.filename === anchor.path) return true;
-    if (file.previousFilename === anchor.path) return true;
+/** Compose the `comment.sync_requested` event input for a mapped
+ * pending draft. Pure — the caller appends it. */
+export async function buildSyncRequest(input: {
+  readonly actor: Author;
+  readonly commentId: string;
+  readonly mapping: PendingMap;
+}): Promise<ReviewEventInput> {
+  if (input.mapping.kind === "orphan") {
+    throw new Error("buildSyncRequest: cannot build for an orphan mapping — the caller must handle orphans separately.");
   }
-  return false;
-}
-
-/** Read the ordered list of pending comments the log carries for
- * the current open pending review, if any. Returns an empty list
- * when there's no open pending review. */
-export function pendingComments(state: ReviewState): readonly DerivedPendingReviewComment[] {
-  return state.openPending?.comments ?? [];
+  const bodyHash = await revisionOf(input.mapping.submittedBody);
+  if (input.mapping.kind === "line") {
+    return {
+      kind: "comment.sync_requested",
+      actor: input.actor,
+      commentId: input.commentId,
+      path: input.mapping.path,
+      subjectType: "LINE",
+      side: input.mapping.side,
+      line: input.mapping.line,
+      ...(input.mapping.startLine !== undefined ? { startLine: input.mapping.startLine } : {}),
+      bodyHash,
+    };
+  }
+  return {
+    kind: "comment.sync_requested",
+    actor: input.actor,
+    commentId: input.commentId,
+    path: input.mapping.path,
+    subjectType: "FILE",
+    bodyHash,
+  };
 }
 
 /** Compose the top-level body for a submit event when the caller
- * left `body` undefined. GitHub allows an empty body on
- * `submitPullRequestReview`, but we always send a small trailer so
- * a viewer on GitHub sees WHERE the review was authored — same
- * spirit as ADR-0025's file-level preamble. `viewerLogin` is
- * spliced in only if provided; missing = the fallback body without
- * an author reference. */
+ * left `body` undefined. */
 export function defaultSubmitBody(event: ReviewSubmitEvent, headSha: string): string {
   const label =
     event === "COMMENT" ? "Comment" : event === "APPROVE" ? "Approval" : "Requested changes";
   return `${label} submitted from revkit local review at ${headSha.slice(0, 12)}.`;
 }
 
-/** M3 part 2b head-move re-anchoring. Callable by the daemon's
- * `/api/review/reanchor` handler, and only after the daemon has
- * confirmed via `/api/review/refresh` that the head moved. The
- * daemon (not this helper) is the one that owns the human-only
- * auth gate; here we trust the caller and run the pipeline.
+/** Full reconciler outcome. */
+export interface ReconcileOutcome {
+  /** Local commentIds we just marked synced. */
+  readonly newlySynced: readonly string[];
+  /** Local commentIds we just marked failed. */
+  readonly newlyFailed: ReadonlyArray<{ readonly commentId: string; readonly reason: string }>;
+  /** The pending review's node id after reconcile (null when none
+   * exists on either side). */
+  readonly reviewNodeId: string | null;
+  /** True when reconcile discovered a submitted review on GitHub
+   * that the log had not yet recorded. */
+  readonly healedSubmit: boolean;
+  /** True when reconcile discovered the review had been deleted
+   * from under us (abandon). */
+  readonly healedAbandon: boolean;
+}
+
+/** Reconciler input. `store` needs the snapshot API for the
+ * head-move reanchor path but the reconciler itself only reads
+ * events. `appendAndPublish` fans through the daemon's audit
+ * path. */
+export interface ReconcileInput {
+  readonly review: ReviewModeHandle;
+  readonly store: ThreadStore;
+  readonly actor: Author;
+  readonly appendAndPublish: (input: ReviewEventInput) => Promise<ReviewEvent | undefined>;
+}
+
+/** Compare two `SyncFingerprint`s. `nodeId` matching is the primary
+ * key on `comment.linked` events, but at re-hydration time we may
+ * see a GitHub draft we posted BEFORE a crash and never linked; then
+ * the fingerprint is what tells us it's ours. Fingerprint match is
+ * strict on path + subjectType + side + line + startLine + bodyHash. */
+export async function fingerprintMatches(
+  fingerprint: SyncFingerprint,
+  draft: AdapterPendingReviewComment,
+): Promise<boolean> {
+  if (draft.path !== fingerprint.path) return false;
+  if ((draft.subjectType ?? "LINE") !== fingerprint.subjectType) return false;
+  if (fingerprint.subjectType === "LINE") {
+    if (draft.line !== fingerprint.line) return false;
+    if ((draft.startLine ?? undefined) !== (fingerprint.startLine ?? undefined)) return false;
+    // The pending-comment shape from GraphQL doesn't expose `side`,
+    // only the parent thread does; we trust the (path,line) pair.
+  }
+  const draftHash = await revisionOf(draft.body);
+  return draftHash === fingerprint.bodyHash;
+}
+
+/** Reconcile the log against GitHub's actual state. See file header
+ * for the invariants. Never throws for a per-comment failure — it
+ * emits `comment.sync_failed` and continues. Throws only for a
+ * fatal read-side error (network to `viewer` or the pending-review
+ * query). */
+export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome> {
+  const { review, store, actor, appendAndPublish } = input;
+
+  let state = await review.readState(store);
+  const currentHeadSha = review.currentHeadSha();
+
+  // 1. Read the truth: is there a pending review on GitHub?
+  //    `findOrCreatePendingReview` returns reused|created|stale. We
+  //    NEVER auto-create here — the reconciler only opens a review
+  //    when there's at least one intent to sync. That keeps GitHub
+  //    from carrying an empty pending review after a discard.
+  const hasIntent =
+    state.unsyncedCommentIds.length > 0 ||
+    (state.openPending !== null && state.openPending.comments.length > 0);
+
+  let reviewNodeId: string | null = state.openPending?.reviewNodeId ?? null;
+  let healedSubmit = false;
+  let healedAbandon = false;
+
+  // If the log records an open pending review, check it exists on
+  // GitHub. If not, it was submitted or deleted elsewhere — heal.
+  if (state.openPending !== null) {
+    // A single GraphQL query returns the viewer's current pending
+    // review + commit oid. Compare with what the log has.
+    let live;
+    try {
+      live = await review.options.adapter.findOrCreatePendingReview({
+        pullRequestNodeId: review.options.summary.nodeId,
+        commitOid: state.openPending.headSha,
+        viewerLogin: review.options.viewerLogin,
+      });
+    } catch (err) {
+      // Network hiccup — bail; the caller will retry.
+      throw err;
+    }
+    if (live.kind === "reused") {
+      // Good — the log's open pending review still exists.
+      reviewNodeId = live.review.id;
+    } else if (live.kind === "created") {
+      // The log thought a pending review existed but GitHub had
+      // none — mark the old one abandoned locally and adopt the
+      // new one. Then walk the intents (which point at the OLD
+      // reviewNodeId) — they still need to sync on the NEW review.
+      if (state.openPending.reviewNodeId !== live.review.id) {
+        try {
+          await appendAndPublish({
+            kind: "review.abandoned",
+            actor,
+            reviewNodeId: state.openPending.reviewNodeId,
+            reason: "reconciler-healed-missing",
+          });
+          healedAbandon = true;
+        } catch (err) {
+          // Already terminal / racing — fine.
+          void err;
+        }
+        await appendAndPublish({
+          kind: "review.opened",
+          actor,
+          reviewNodeId: live.review.id,
+          headSha: state.openPending.headSha,
+        });
+        reviewNodeId = live.review.id;
+        state = await review.readState(store);
+      }
+    } else {
+      // stale: the pending review is pinned to a different commit
+      // than we asked for. That means the head moved and we asked
+      // via `state.openPending.headSha`. Not our reconciler's job
+      // to fix — the reanchor flow does that. Return the stale
+      // shape via state.stale flag.
+      reviewNodeId = live.review.id;
+    }
+  }
+
+  if (!hasIntent) {
+    return { newlySynced: [], newlyFailed: [], reviewNodeId, healedSubmit, healedAbandon };
+  }
+
+  // 2. If we still don't have a reviewNodeId (no local open pending)
+  //    and we DO have intents, open a pending review on GitHub and
+  //    record `review.opened`. Idempotent by construction —
+  //    findOrCreatePendingReview reuses an existing viewer pending
+  //    review if one already exists.
+  if (reviewNodeId === null) {
+    let live;
+    try {
+      live = await review.options.adapter.findOrCreatePendingReview({
+        pullRequestNodeId: review.options.summary.nodeId,
+        commitOid: currentHeadSha,
+        viewerLogin: review.options.viewerLogin,
+      });
+    } catch (err) {
+      throw err;
+    }
+    if (live.kind === "stale") {
+      // A pending review exists but at a different commit — the
+      // caller must resolve via the reanchor flow. Do not touch.
+      return {
+        newlySynced: [],
+        newlyFailed: [],
+        reviewNodeId: live.review.id,
+        healedSubmit,
+        healedAbandon,
+      };
+    }
+    reviewNodeId = live.review.id;
+    await appendAndPublish({
+      kind: "review.opened",
+      actor,
+      reviewNodeId,
+      headSha: live.review.commitSha ?? currentHeadSha,
+    });
+    state = await review.readState(store);
+  }
+
+  // 3. Read the pending review's actual drafts on GitHub.
+  let liveDrafts: AdapterPendingReviewComment[] = [];
+  try {
+    liveDrafts = await review.options.adapter.listPendingReviewComments(reviewNodeId);
+  } catch (err) {
+    // If listing failed, mark every un-synced intent as failed
+    // (with a machine-readable reason) so the rail can show retry.
+    const newlyFailed: Array<{ commentId: string; reason: string }> = [];
+    for (const commentId of state.unsyncedCommentIds) {
+      const st = state.commentSync.get(commentId);
+      if (st === undefined) continue;
+      newlyFailed.push({ commentId, reason: `list-drafts-failed:${(err as Error).name}` });
+      await appendAndPublish({
+        kind: "comment.sync_failed",
+        actor,
+        commentId,
+        reason: `list-drafts-failed:${(err as Error).name}`,
+      });
+    }
+    return { newlySynced: [], newlyFailed, reviewNodeId, healedSubmit, healedAbandon };
+  }
+
+  // 4. For each unsynced intent, look for a matching draft already
+  //    on GitHub (fingerprint). If present → emit comment.linked.
+  //    Otherwise → post via addPendingReviewThread → on success
+  //    emit comment.linked; on failure emit comment.sync_failed.
+  const newlySynced: string[] = [];
+  const newlyFailed: Array<{ commentId: string; reason: string }> = [];
+  const usedDraftIds = new Set<string>();
+  for (const commentId of state.unsyncedCommentIds) {
+    const syncState = state.commentSync.get(commentId);
+    if (syncState === undefined) continue;
+    // syncState is pending-sync or failed; both carry a
+    // fingerprint from the LATEST sync_requested via
+    // reduceReviewState. A failed state may hold an older
+    // fingerprint; scan for the latest one.
+    const fingerprint = syncStateFingerprint(syncState);
+    if (fingerprint === undefined) continue;
+    let matched: AdapterPendingReviewComment | undefined;
+    for (const draft of liveDrafts) {
+      if (usedDraftIds.has(draft.nodeId)) continue;
+      if (await fingerprintMatches(fingerprint, draft)) {
+        matched = draft;
+        break;
+      }
+    }
+    if (matched !== undefined) {
+      usedDraftIds.add(matched.nodeId);
+      try {
+        await appendAndPublish({
+          kind: "comment.linked",
+          actor,
+          commentId,
+          external: {
+            github: {
+              commentId: matched.databaseId,
+              nodeId: matched.nodeId,
+              pending: true,
+              reviewNodeId,
+            },
+          },
+        });
+        newlySynced.push(commentId);
+      } catch (err) {
+        if (
+          err instanceof ThreadStoreAppendError &&
+          (err.rejection.kind === "duplicate-link" || err.rejection.kind === "duplicate-external-id")
+        ) {
+          newlySynced.push(commentId);
+        } else {
+          throw err;
+        }
+      }
+      continue;
+    }
+    // Not on GitHub — post it. Rebuild the request from the
+    // fingerprint (path, line, side, subjectType, bodyHash) plus
+    // the ORIGINAL body which we fetch back from the local thread.
+    let submittedBody: string | undefined;
+    const thread = await store.thread((await threadIdOfComment(store, commentId)) ?? "");
+    if (thread !== undefined) {
+      const c = thread.comments.find((x) => x.id === commentId);
+      submittedBody = c?.body;
+    }
+    if (submittedBody === undefined) {
+      newlyFailed.push({ commentId, reason: "body-not-in-log" });
+      await appendAndPublish({
+        kind: "comment.sync_failed",
+        actor,
+        commentId,
+        reason: "body-not-in-log",
+      });
+      continue;
+    }
+    // Recompute the outgoing body: if the fingerprint said FILE and
+    // the local thread carries a plain body without the preamble
+    // (rare — only when the anchor mapping fell back), we may need
+    // to prepend it here. Simpler and correct: recompute from
+    // anchor + files. If mapping now says orphan, mark failed.
+    if (thread === undefined || !isLineAnchor(thread.anchor)) {
+      // An unanchored thread should never reach this path — its
+      // anchor is `unanchored` and we never queued a sync request
+      // for it. Defensive fail.
+      newlyFailed.push({ commentId, reason: "unanchored-thread" });
+      await appendAndPublish({
+        kind: "comment.sync_failed",
+        actor,
+        commentId,
+        reason: "unanchored-thread",
+      });
+      continue;
+    }
+    const mapping = mapAnchorForPending(thread.anchor, review.options.files, submittedBody);
+    if (mapping.kind === "orphan") {
+      newlyFailed.push({ commentId, reason: mapping.reason });
+      await appendAndPublish({
+        kind: "comment.sync_failed",
+        actor,
+        commentId,
+        reason: mapping.reason,
+      });
+      continue;
+    }
+    try {
+      const posted = await review.options.adapter.addPendingReviewThread({
+        reviewId: reviewNodeId,
+        path: mapping.path,
+        body: mapping.submittedBody,
+        subjectType: mapping.kind === "file" ? "FILE" : "LINE",
+        ...(mapping.kind === "line" ? { line: mapping.line, side: mapping.side } : {}),
+        ...(mapping.kind === "line" && mapping.startLine !== undefined ? { startLine: mapping.startLine } : {}),
+      });
+      await appendAndPublish({
+        kind: "comment.linked",
+        actor,
+        commentId,
+        external: {
+          github: {
+            commentId: posted.databaseId,
+            nodeId: posted.nodeId,
+            pending: true,
+            reviewNodeId,
+          },
+        },
+      });
+      newlySynced.push(commentId);
+    } catch (err) {
+      if (
+        err instanceof ThreadStoreAppendError &&
+        (err.rejection.kind === "duplicate-link" || err.rejection.kind === "duplicate-external-id")
+      ) {
+        newlySynced.push(commentId);
+      } else {
+        const reason = `adapter:${(err as Error).name}`;
+        newlyFailed.push({ commentId, reason });
+        await appendAndPublish({
+          kind: "comment.sync_failed",
+          actor,
+          commentId,
+          reason,
+        });
+      }
+    }
+  }
+
+  return { newlySynced, newlyFailed, reviewNodeId, healedSubmit, healedAbandon };
+}
+
+/** Extract the fingerprint from a sync state entry. Returns
+ * undefined when the state is `synced` or `not-attempted` (no
+ * intent still-pending). For `failed`, the previous
+ * `sync_requested`'s fingerprint is the one to retry against — but
+ * we cannot recover it from the CommentSyncState alone (it's only
+ * kept for `pending-sync`). The daemon rebuilds a fresh
+ * `sync_requested` before invoking reconcile on retry, so
+ * `failed`'s fingerprint isn't needed here. */
+function syncStateFingerprint(state: CommentSyncState): SyncFingerprint | undefined {
+  if (state.kind === "pending-sync") return state.fingerprint;
+  return undefined;
+}
+
+/** Look up the local threadId for a comment via the store. Reads
+ * the log's `comment.created` and `comment.replied` events; slow
+ * but only used on the reconciler's rare fallback path. */
+async function threadIdOfComment(store: ThreadStore, commentId: string): Promise<string | undefined> {
+  const events = await store.since(0);
+  for (const evt of events) {
+    if ((evt.kind === "comment.created" || evt.kind === "comment.replied") && evt.commentId === commentId) {
+      return evt.threadId;
+    }
+  }
+  return undefined;
+}
+
+/** Head-move re-anchor + repost. Correct ordering (BLOCK-fix):
  *
- * Flow, in order:
- *   1. Read every pending comment from the log (via the store).
- *   2. For each: read the local thread → its LINE anchor. Read
- *      the OLD source from the snapshot table (indexed by the
- *      anchor's revision). Fetch the NEW source for that path
- *      from the adapter at the new headSha (`fetchBlobText`).
- *      Run the ADR-0006 re-anchor pipeline against the pair.
- *      A `moved`/`fuzzy` result gives a NEW anchor; an
- *      `orphaned` result means the block is gone — the caller
- *      keeps the local thread orphaned.
- *   3. Delete the OLD pending review on GitHub (`deletePendingReview`).
- *   4. Emit `review.abandoned` for the old reviewNodeId.
- *   5. Open a NEW pending review on the new headSha. Emit
- *      `review.opened`.
- *   6. For each non-orphaned pending comment: `addPendingReviewThread`
- *      at the NEW anchor's mapped position (line, or file-level
- *      when the new position falls outside a hunk). Emit
- *      `comment.linked` for the new pending comment. Also emit
- *      `thread.reanchored` so the local rail shows the new
- *      position.
- *   7. For each orphaned pending comment: emit `thread.orphaned`
- *      (unless the thread was already orphaned; the
- *      `already-orphaned` rejection is swallowed).
- *
- * The caller (daemon) is responsible for: (a) refreshing the PR
- * summary + files list before this call; (b) supplying the
- * `appendAndPublish` seam so events fan out uniformly. On any
- * error other than an idempotent duplicate, this function throws
- * — the caller returns 5xx to the reviewer, who then reads
- * `/api/review/state` again.
- */
+ *   (a) Compute ALL mappings first. Append `thread.orphaned` for
+ *       unmappable comments so orphans are never silently dropped.
+ *   (b) Delete the OLD pending review on GitHub. On adapter failure,
+ *       STOP — do NOT append `review.abandoned`, so a retry can
+ *       resume. (Old failure path swallowed the error.)
+ *   (c) Append `review.abandoned`.
+ *   (d) Append fresh `comment.sync_requested` events for the
+ *       carried-forward comments; run `reconcile()` to let the
+ *       normal reconciler post them. Per-item failures land as
+ *       `comment.sync_failed` and stay retryable. */
 export interface HeadMoveReanchorResult {
   readonly abandonedReviewNodeId: string;
-  readonly openedReviewNodeId: string;
-  readonly reanchored: number;
+  readonly newIntents: number;
   readonly orphaned: number;
   readonly repositions: ReadonlyArray<{
     readonly localCommentId: string;
     readonly path: string;
     readonly outcome: "moved" | "fuzzy" | "file-fallback" | "orphaned";
-    readonly score?: number;
     readonly reason?: string;
   }>;
+  /** The reconcile pass that ran after re-anchoring, so callers
+   * can surface newly-synced vs newly-failed counts. */
+  readonly reconcile: ReconcileOutcome;
 }
 
 export async function reanchorPendingReviewAtNewHead(input: {
@@ -402,29 +593,39 @@ export async function reanchorPendingReviewAtNewHead(input: {
   if (oldHeadSha.toLowerCase() === newHeadSha.toLowerCase()) {
     throw new Error("reanchorPendingReviewAtNewHead: head has not moved");
   }
-  // Fetch new-source PER-PATH once — the pipeline is per-file.
-  const newSourceByPath = new Map<string, string | undefined>();
-  const perComment: Array<{
-    localCommentId: string;
-    threadId: string;
-    path: string;
-    // Set on non-orphan outcomes.
-    newAnchor?: Anchor;
-    outcome: "moved" | "fuzzy" | "orphaned" | "file-fallback";
-    score?: number;
-    reason?: string;
-  }> = [];
 
-  for (const c of state.openPending.comments) {
-    const thread = await store.thread(c.threadId);
-    if (thread === undefined || !isLineAnchor(thread.anchor)) {
-      // Non-line-anchored threads (unanchored imports) are already
-      // orphan-on-birth. Skip. This shouldn't happen for a
-      // locally-authored pending draft.
+  // (a) Compute all mappings first.
+  interface Reposition {
+    readonly commentId: string;
+    readonly threadId: string;
+    readonly path: string;
+    readonly newAnchor?: Anchor;
+    readonly outcome: "moved" | "fuzzy" | "orphaned";
+    readonly reason?: string;
+  }
+  const perComment: Reposition[] = [];
+  const newSourceByPath = new Map<string, string | undefined>();
+
+  // Enumerate LOCAL comments whose sync intent points at the OLD
+  // pending review. The openPending comments field holds the
+  // SYNCED set; for unsynced intents that never reached
+  // comment.linked, we also walk the commentSync map.
+  const commentIds = new Set<string>();
+  for (const c of state.openPending.comments) commentIds.add(c.commentId);
+  for (const [cid, st] of state.commentSync) {
+    if (st.kind === "pending-sync" || st.kind === "failed") commentIds.add(cid);
+  }
+
+  for (const commentId of commentIds) {
+    const threadId = await threadIdOfComment(store, commentId);
+    if (threadId === undefined) continue;
+    const thread = await store.thread(threadId);
+    if (thread === undefined) continue;
+    if (!isLineAnchor(thread.anchor)) {
       perComment.push({
-        localCommentId: c.commentId,
-        threadId: c.threadId,
-        path: c.path,
+        commentId,
+        threadId,
+        path: thread.anchor.path,
         outcome: "orphaned",
         reason: "unanchored-source-thread",
       });
@@ -434,34 +635,33 @@ export async function reanchorPendingReviewAtNewHead(input: {
     const oldSource = store.getSnapshot(oldAnchor.revision);
     if (oldSource === undefined) {
       perComment.push({
-        localCommentId: c.commentId,
-        threadId: c.threadId,
-        path: c.path,
+        commentId,
+        threadId,
+        path: oldAnchor.path,
         outcome: "orphaned",
         reason: "missing-old-snapshot",
       });
       continue;
     }
-    // Fetch the new-side file content once per path.
-    let newSource = newSourceByPath.get(c.path);
-    if (newSource === undefined && !newSourceByPath.has(c.path)) {
+    let newSource = newSourceByPath.get(oldAnchor.path);
+    if (newSource === undefined && !newSourceByPath.has(oldAnchor.path)) {
       try {
         const result = await review.options.adapter.fetchBlobText({
           owner: review.options.pr.owner,
           repo: review.options.pr.repo,
-          expression: `${newHeadSha}:${c.path}`,
+          expression: `${newHeadSha}:${oldAnchor.path}`,
         });
         newSource = result.kind === "text" ? result.text : undefined;
       } catch {
         newSource = undefined;
       }
-      newSourceByPath.set(c.path, newSource);
+      newSourceByPath.set(oldAnchor.path, newSource);
     }
     if (newSource === undefined) {
       perComment.push({
-        localCommentId: c.commentId,
-        threadId: c.threadId,
-        path: c.path,
+        commentId,
+        threadId,
+        path: oldAnchor.path,
         outcome: "orphaned",
         reason: "new-source-unavailable",
       });
@@ -469,118 +669,96 @@ export async function reanchorPendingReviewAtNewHead(input: {
     }
     const result = await reanchor(oldAnchor, oldSource, newSource);
     if (result.kind === "anchored" || result.kind === "moved" || result.kind === "fuzzy") {
-      // Preserve the new source under the anchor's new revision
-      // so a subsequent local rebuild can re-anchor from it.
-      if (result.kind !== "anchored") {
-        store.putSnapshot(result.anchor.revision, newSource);
-      }
-      // For `anchored` (identity — unchanged file), reuse oldAnchor
-      // but with the new head commit stamp. Not strictly needed on
-      // an identity re-anchor, so we skip re-emitting an event and
-      // just keep the anchor.
       const newAnchor: Anchor = result.kind === "anchored" ? oldAnchor : result.anchor;
+      if (result.kind !== "anchored") {
+        store.putSnapshot(newAnchor.revision, newSource);
+      }
       perComment.push({
-        localCommentId: c.commentId,
-        threadId: c.threadId,
-        path: c.path,
+        commentId,
+        threadId,
+        path: oldAnchor.path,
         newAnchor,
-        outcome: result.kind === "anchored" ? "moved" : result.kind,
-        ...(result.kind === "fuzzy" ? { score: result.score } : {}),
+        outcome: result.kind === "fuzzy" ? "fuzzy" : "moved",
       });
     } else {
       perComment.push({
-        localCommentId: c.commentId,
-        threadId: c.threadId,
-        path: c.path,
+        commentId,
+        threadId,
+        path: oldAnchor.path,
         outcome: "orphaned",
         reason: result.reason,
       });
     }
   }
 
-  // Delete the old pending review on GitHub. All its drafts go
-  // with it — that's the semantics of `deletePendingReview`.
+  // Emit `thread.orphaned` for unmappable comments FIRST — orphans
+  // must be visible before the abandon lands. Refused
+  // `already-orphaned` is fine.
+  for (const p of perComment) {
+    if (p.outcome !== "orphaned") continue;
+    try {
+      const rev = await revisionOf(
+        newSourceByPath.get(p.path) ?? `head-move-unavailable:${newHeadSha}:${p.path}\n`,
+      );
+      await appendAndPublish({
+        kind: "thread.orphaned",
+        actor,
+        threadId: p.threadId,
+        revision: rev,
+        ...(p.reason !== undefined ? { reason: p.reason } : {}),
+      });
+    } catch {
+      /* already-orphaned — fine */
+    }
+  }
+
+  // (b) Delete the old pending review on GitHub. On failure STOP —
+  // do not append review.abandoned; the reviewer can retry.
+  await review.options.adapter.deletePendingReview({ reviewId: oldReviewNodeId });
+
+  // (c) Append review.abandoned.
   try {
-    await review.options.adapter.deletePendingReview({ reviewId: oldReviewNodeId });
+    await appendAndPublish({
+      kind: "review.abandoned",
+      actor,
+      reviewNodeId: oldReviewNodeId,
+      reason: "head-moved",
+    });
   } catch (err) {
-    // If GitHub says the review is already gone (submitted /
-    // deleted from another window), fall through — the abandon
-    // event still records our local decision.
-    void err;
+    if (
+      err instanceof ThreadStoreAppendError &&
+      err.rejection.kind === "review-not-pending"
+    ) {
+      /* already terminal — fine */
+    } else {
+      throw err;
+    }
   }
-  await appendAndPublish({
-    kind: "review.abandoned",
-    actor,
-    reviewNodeId: oldReviewNodeId,
-    reason: "head-moved",
-  });
 
-  // Open a fresh pending review at the new head.
-  const opened = await review.options.adapter.findOrCreatePendingReview({
-    pullRequestNodeId: review.options.summary.nodeId,
-    commitOid: newHeadSha,
-    viewerLogin: review.options.viewerLogin,
-  });
-  if (opened.kind === "stale") {
-    // Race — another window already opened a pending review at a
-    // DIFFERENT head. Refuse loudly.
-    throw new Error(
-      `reanchorPendingReviewAtNewHead: findOrCreatePendingReview returned stale (expected ${newHeadSha}, got ${opened.actualCommitOid ?? "null"})`,
-    );
-  }
-  const newReviewNodeId = opened.review.id;
-  await appendAndPublish({
-    kind: "review.opened",
-    actor,
-    reviewNodeId: newReviewNodeId,
-    headSha: newHeadSha,
-  });
-
-  let reanchored = 0;
+  // (d) Emit fresh sync_requested for each carried-forward
+  // comment. The reconciler then opens a new pending review and
+  // posts them.
+  let newIntents = 0;
   let orphaned = 0;
   const repositions: Array<{
     localCommentId: string;
     path: string;
     outcome: "moved" | "fuzzy" | "file-fallback" | "orphaned";
-    score?: number;
     reason?: string;
   }> = [];
-
   for (const p of perComment) {
-    if (p.newAnchor === undefined) {
+    if (p.outcome === "orphaned") {
       orphaned++;
-      // Emit thread.orphaned (best-effort — validator refuses on
-      // `already-orphaned` which we swallow). The revision is the
-      // hash of the new source we tried, or an "unavailable" hash
-      // when the fetch failed. `revisionOf` is deterministic; the
-      // sentinel string is HONEST — it names why we couldn't reach
-      // the file.
-      try {
-        const newSrc = newSourceByPath.get(p.path);
-        const rev = await revisionOf(
-          newSrc !== undefined ? newSrc : `head-move-unavailable:${newHeadSha}:${p.path}\n`,
-        );
-        await appendAndPublish({
-          kind: "thread.orphaned",
-          actor,
-          threadId: p.threadId,
-          revision: rev,
-          ...(p.reason !== undefined ? { reason: p.reason } : {}),
-        });
-      } catch {
-        /* already-orphaned — fine */
-      }
       repositions.push({
-        localCommentId: p.localCommentId,
+        localCommentId: p.commentId,
         path: p.path,
         outcome: "orphaned",
         ...(p.reason !== undefined ? { reason: p.reason } : {}),
       });
       continue;
     }
-    // Emit a reanchor event so the rail moves the thread's marker
-    // to the new position on the current head. A fuzzy match
-    // carries a score field; a moved (quote-exact) result omits it.
+    if (p.newAnchor === undefined) continue;
+    // Emit thread.reanchored so the rail moves the marker.
     try {
       const method: "quote-exact" | "fuzzy" = p.outcome === "fuzzy" ? "fuzzy" : "quote-exact";
       await appendAndPublish({
@@ -589,101 +767,52 @@ export async function reanchorPendingReviewAtNewHead(input: {
         threadId: p.threadId,
         anchor: p.newAnchor,
         method,
-        ...(method === "fuzzy" && p.score !== undefined ? { score: p.score } : {}),
-      });
+        // Fuzzy score isn't threaded through the reanchor result
+        // — omit and the wire schema's `superRefine` accepts.
+      } as ReviewEventInput);
     } catch {
-      /* fine — the anchor is still recoverable */
+      /* fine */
     }
-    // Map the NEW anchor onto the refreshed PR files list. If the
-    // block is outside every hunk on the new PR, fall back to a
-    // file-level comment.
-    const mapResult = anchorToPrComment(p.newAnchor, review.options.files);
-    if (mapResult.kind === "reject") {
-      orphaned++;
-      repositions.push({
-        localCommentId: p.localCommentId,
-        path: p.path,
-        outcome: "orphaned",
-        reason: `anchor rejected: ${mapResult.reason}`,
-      });
-      continue;
-    }
-    // Load the original comment body from the store (opening
-    // comment of the thread).
     const thread = await store.thread(p.threadId);
     if (thread === undefined) continue;
     const body = thread.comments[0]?.body ?? "";
-    let submittedBody = body;
-    let subject: "LINE" | "FILE" = "LINE";
-    let line: number | undefined;
-    let startLine: number | undefined;
-    let side: "RIGHT" | "LEFT" = "RIGHT";
-    let outcomeTag: "moved" | "fuzzy" | "file-fallback" = p.outcome === "fuzzy" ? "fuzzy" : "moved";
-    if (mapResult.kind === "line") {
-      line = mapResult.target.line;
-      if (mapResult.target.startLine !== undefined && mapResult.target.startLine !== mapResult.target.line) {
-        startLine = mapResult.target.startLine;
-      }
-      side = mapResult.target.side;
-    } else {
-      subject = "FILE";
-      submittedBody = fileFallbackPreamble(p.newAnchor, mapResult.reason) + submittedBody;
-      outcomeTag = "file-fallback";
-    }
-    try {
-      const posted = await review.options.adapter.addPendingReviewThread({
-        reviewId: newReviewNodeId,
-        path: mapResult.target.path,
-        body: submittedBody,
-        subjectType: subject,
-        ...(line !== undefined ? { line } : {}),
-        ...(startLine !== undefined ? { startLine } : {}),
-        side,
-      });
-      await appendAndPublish({
-        kind: "comment.linked",
-        actor,
-        commentId: p.localCommentId,
-        external: {
-          github: {
-            commentId: posted.databaseId,
-            ...(posted.nodeId !== undefined ? { nodeId: posted.nodeId } : {}),
-            pending: true,
-            reviewNodeId: newReviewNodeId,
-          },
-        },
-      });
-      reanchored++;
+    const mapping = mapAnchorForPending(p.newAnchor, review.options.files, body);
+    if (mapping.kind === "orphan") {
+      orphaned++;
       repositions.push({
-        localCommentId: p.localCommentId,
+        localCommentId: p.commentId,
         path: p.path,
-        outcome: outcomeTag,
-        ...(p.score !== undefined ? { score: p.score } : {}),
+        outcome: "orphaned",
+        reason: mapping.reason,
       });
-    } catch (err) {
-      if (
-        err instanceof ThreadStoreAppendError &&
-        (err.rejection.kind === "duplicate-link" || err.rejection.kind === "duplicate-external-id")
-      ) {
-        // Already re-linked — treat as success (idempotent
-        // retry).
-        reanchored++;
-        repositions.push({
-          localCommentId: p.localCommentId,
-          path: p.path,
-          outcome: outcomeTag,
-        });
-      } else {
-        throw err;
-      }
+      continue;
     }
+    const req = await buildSyncRequest({ actor, commentId: p.commentId, mapping });
+    await appendAndPublish(req);
+    newIntents++;
+    repositions.push({
+      localCommentId: p.commentId,
+      path: p.path,
+      outcome: mapping.kind === "file" ? "file-fallback" : p.outcome === "fuzzy" ? "fuzzy" : "moved",
+    });
   }
+
+  // Run the reconciler now to actually post the new intents. The
+  // reconciler opens a fresh pending review on GitHub as needed.
+  const reconcileOutcome = await reconcile({ review, store, actor, appendAndPublish });
 
   return {
     abandonedReviewNodeId: oldReviewNodeId,
-    openedReviewNodeId: newReviewNodeId,
-    reanchored,
+    newIntents,
     orphaned,
     repositions,
+    reconcile: reconcileOutcome,
   };
+}
+
+/** Compute how many local comments still owe a GitHub write. Used by
+ * the submit gate: submit is only allowed when this is zero AND the
+ * pending review is not stale. */
+export function unsyncedCount(state: ReviewState): number {
+  return state.unsyncedCommentIds.length;
 }

@@ -209,6 +209,14 @@ interface RailReviewState {
         }
       | null;
     readonly terminal: ReadonlyArray<{ readonly reviewNodeId: string; readonly outcome: unknown }>;
+    readonly unsyncedCommentIds?: readonly string[];
+    readonly commentSync?: ReadonlyArray<{
+      readonly commentId: string;
+      readonly state: {
+        readonly kind: "not-attempted" | "pending-sync" | "synced" | "failed";
+        readonly reason?: string;
+      };
+    }>;
   };
   readonly stale: boolean;
 }
@@ -617,6 +625,11 @@ function Rail(): JSX.Element {
   const [submitEvent, setSubmitEvent] = createSignal<"COMMENT" | "APPROVE" | "REQUEST_CHANGES">("COMMENT");
   const [submitBody, setSubmitBody] = createSignal<string>("");
   const [reviewBusy, setReviewBusy] = createSignal<boolean>(false);
+  // Two-step discard (nit): first click arms, second click fires,
+  // and a 5s idle window disarms — you cannot lose N drafts with
+  // a single stray click.
+  const [discardArmed, setDiscardArmed] = createSignal<boolean>(false);
+  let discardArmTimer: ReturnType<typeof setTimeout> | undefined;
   // Presence — latest beacon per agent id. Cleared on `idle`.
   const [presence, setPresence] = createSignal<readonly PresenceBadge[]>([]);
   // Round-3: "flushed by …" indicator. Every handover or mode
@@ -1089,6 +1102,67 @@ function Rail(): JSX.Element {
               <code>{reviewState()!.state.openPending!.headSha.slice(0, 12)}</code>
             </Show>
           </p>
+          {/* Round-2 (ADR-0025): per-comment sync state — a local
+              comment whose GitHub AddThread failed shows a "not on
+              GitHub — retry" line here. Submit is gated on
+              everything being SYNCED; retry runs the reconciler,
+              which itself reads GitHub first before writing. */}
+          <Show when={(reviewState()!.state.unsyncedCommentIds ?? []).length > 0}>
+            <div
+              class="revkit-rail__review-unsynced"
+              data-testid="revkit-rail-review-unsynced"
+              role="alert"
+            >
+              <p class="revkit-rail__review-unsynced-summary">
+                {(reviewState()!.state.unsyncedCommentIds ?? []).length} comment
+                {(reviewState()!.state.unsyncedCommentIds ?? []).length === 1 ? "" : "s"} not on GitHub yet.
+              </p>
+              <ul class="revkit-rail__review-unsynced-list">
+                <For each={(reviewState()!.state.commentSync ?? []).filter((c) => c.state.kind === "failed" || c.state.kind === "pending-sync" || c.state.kind === "not-attempted")}>
+                  {(entry) => (
+                    <li
+                      class="revkit-rail__review-unsynced-item"
+                      data-testid="revkit-rail-review-unsynced-item"
+                      data-comment-id={entry.commentId}
+                      data-sync-kind={entry.state.kind}
+                    >
+                      <code>{entry.commentId.slice(0, 12)}</code>{" "}
+                      <span class="revkit-rail__review-unsynced-kind">{entry.state.kind}</span>
+                      <Show when={entry.state.reason !== undefined}>
+                        <span class="revkit-rail__review-unsynced-reason"> — {entry.state.reason}</span>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ul>
+              <button
+                type="button"
+                class="revkit-rail__review-unsynced-retry"
+                data-testid="revkit-rail-review-unsynced-retry"
+                disabled={reviewBusy()}
+                onClick={() => {
+                  void (async () => {
+                    setReviewBusy(true);
+                    setError(undefined);
+                    try {
+                      const url = new URL(location.href);
+                      await fetch(new URL("/api/review/reconcile", url.origin), {
+                        method: "POST",
+                        headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
+                        credentials: "same-origin",
+                        body: "{}",
+                      });
+                      await refetchReview();
+                    } catch (cause) {
+                      setError((cause as Error).message);
+                    } finally {
+                      setReviewBusy(false);
+                    }
+                  })();
+                }}
+              >Retry sync</button>
+            </div>
+          </Show>
           <Show when={reviewState()!.state.openPending !== null && !reviewState()!.stale}>
             <form
               class="revkit-rail__review-submit"
@@ -1144,14 +1218,24 @@ function Rail(): JSX.Element {
                   type="submit"
                   class="revkit-rail__review-submit-button"
                   data-testid="revkit-rail-review-submit-button"
-                  disabled={reviewBusy()}
+                  disabled={reviewBusy() || (reviewState()!.state.unsyncedCommentIds ?? []).length > 0}
+                  title={(reviewState()!.state.unsyncedCommentIds ?? []).length > 0 ? "Retry sync before submitting — the review would ship without unsynced comments." : ""}
                 >{reviewBusy() ? "Submitting…" : `Submit review (${submitEvent()})`}</button>
                 <button
                   type="button"
-                  class="revkit-rail__review-discard"
+                  class={discardArmed() ? "revkit-rail__review-discard revkit-rail__review-discard--armed" : "revkit-rail__review-discard"}
                   data-testid="revkit-rail-review-discard"
+                  data-discard-armed={discardArmed() ? "true" : "false"}
                   disabled={reviewBusy()}
                   onClick={() => {
+                    if (!discardArmed()) {
+                      setDiscardArmed(true);
+                      if (discardArmTimer !== undefined) clearTimeout(discardArmTimer);
+                      discardArmTimer = setTimeout(() => setDiscardArmed(false), 5000);
+                      return;
+                    }
+                    if (discardArmTimer !== undefined) clearTimeout(discardArmTimer);
+                    setDiscardArmed(false);
                     void (async () => {
                       setReviewBusy(true);
                       setError(undefined);
@@ -1165,7 +1249,7 @@ function Rail(): JSX.Element {
                       }
                     })();
                   }}
-                >Discard</button>
+                >{discardArmed() ? "Click again to discard" : "Discard"}</button>
                 <button
                   type="button"
                   class="revkit-rail__review-refresh"

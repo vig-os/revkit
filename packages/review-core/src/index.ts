@@ -139,9 +139,11 @@ export {
 export {
   isPendingReviewStale,
   reduceReviewState,
+  type CommentSyncState,
   type OpenPendingReview,
   type PendingReviewComment as DerivedPendingReviewComment,
   type ReviewState,
+  type SyncFingerprint,
   type TerminalReview,
 } from "./review-state.ts";
 export {
