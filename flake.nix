@@ -57,6 +57,16 @@
           # `just cf` from ~/.config/revkit/cf.env (ADR-0014), never exported
           # into the shell.
           pkgs.wrangler
+          # Deterministic font set for the Playwright visual-regression
+          # baselines (ADR-0016). Bundling from the flake — reached through
+          # REVKIT_TEST_FONTS_DIR in the shell hook below — means the same
+          # /nix/store bytes render the pages on the NixOS dev host and the
+          # Ubuntu CI runner, so screenshots do not depend on either host's
+          # fontconfig. The font is loaded ONLY by the visual-regression
+          # spec's Playwright fixture (site/tests/fixtures/visual.ts); it is
+          # NOT injected into the site build, which stays on Starlight's
+          # system-font stack.
+          pkgs.dejavu_fonts
         ];
 
         # Playwright browsers from nixpkgs (ADR-0016/0018) — Chromium, Firefox
@@ -167,6 +177,11 @@
             shellHook = ''
               export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"
               export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+              # Deterministic-font fixture path for the Playwright visual
+              # regression suite (ADR-0016). The site build does not touch
+              # these fonts; only tests/fixtures/visual.ts reads them and
+              # injects them into the page under test.
+              export REVKIT_TEST_FONTS_DIR="${pkgs.dejavu_fonts}/share/fonts/truetype"
               echo "devcontainer dev environment loaded (nix)"
             '';
 

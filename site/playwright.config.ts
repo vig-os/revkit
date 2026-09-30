@@ -4,10 +4,16 @@
 //   `PLAYWRIGHT_BROWSERS_PATH` env var set by the dev shell (ADR-0018).
 //   `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true` is also exported there
 //   so the driver does not try to check host packages on NixOS.
-// - `webServer` builds the site once and serves the static output through
-//   `tests/server.ts` — a tiny Bun static server — because Astro 7's
-//   `astro preview` daemonises and Playwright's `webServer` cannot manage a
-//   command that returns before its server is ready.
+// - `webServer` serves the pre-built static output through `tests/server.ts`
+//   — a tiny Bun static server — because Astro 7's `astro preview` daemonises
+//   and Playwright's `webServer` cannot manage a command that returns before
+//   its server is ready. `just e2e` / `just e2e-update` run `just build`
+//   BEFORE Playwright starts, so every run screenshots and axe-scans a
+//   freshly built dist. A stale `dist/` from a previous run cannot mask a
+//   regression the way a "build only if missing" guard would (PR #31
+//   review: an intentional low-contrast paragraph added between builds
+//   went undetected). If dist is missing when webServer starts,
+//   `tests/server.ts` exits with a clear message pointing at `just e2e`.
 // - Chromium always runs. WebKit is opt-in via `REVKIT_ENABLE_WEBKIT=1`:
 //   the flake's `pkgs.playwright-driver.browsers` webkit build fails to
 //   start on BOTH the NixOS dev host AND CI's Ubuntu runner (CI uses the
@@ -43,7 +49,7 @@ export default defineConfig({
       : []),
   ],
   webServer: {
-    command: "bun run build && bun tests/server.ts",
+    command: "bun tests/server.ts",
     url: "http://127.0.0.1:4321",
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,
