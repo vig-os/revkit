@@ -10,13 +10,20 @@ import { join } from "node:path";
 import { parseServeArgs, readOrMintLocalUserId } from "../../src/serve/cli.ts";
 
 describe("parseServeArgs", () => {
-  test("accepts an empty argv", () => {
+  test("accepts an empty argv (auto-build enabled by default)", () => {
     const outcome = parseServeArgs([]);
     expect(outcome.ok).toBe(true);
     if (outcome.ok) {
       expect(outcome.dir).toBeUndefined();
       expect(outcome.port).toBeUndefined();
+      expect(outcome.noAutoBuild).toBe(false);
     }
+  });
+
+  test("parses --no-auto-build (M5 part 2, issue #57)", () => {
+    const outcome = parseServeArgs(["--no-auto-build"]);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.noAutoBuild).toBe(true);
   });
 
   test("parses --dir <path> and --port <n>", () => {

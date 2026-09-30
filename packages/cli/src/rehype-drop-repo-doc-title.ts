@@ -22,6 +22,7 @@
 import { resolve } from "node:path";
 import type { Root, RootContent } from "hast";
 import { filePathOf, repoRelativePosix, type VFileLike } from "./rehype-vfile.ts";
+import { applyPathMap } from "./rehype-data-src.ts";
 
 /** Options accepted by the plugin. `repoRoot` is required so paths
  * can be compared to the repo's `docs/` directory. */
@@ -31,6 +32,14 @@ export interface DropRepoDocTitleOptions {
   /** Optional predicate over a repo-relative POSIX path. Defaults to
    * "any `.md` file under `docs/`" — the repo-doc loader's set. */
   readonly matches?: (repoRelPath: string) => boolean;
+  /** Same shape as `rehype-data-src` — optional prefix rewrites
+   * applied to the absolute file path BEFORE the repo-relative
+   * calculation. `revkit build` maps the staging copy back to the
+   * source `docs/` path so the leading-H1 rule fires for consumer
+   * docs too (which are copied to `<consumer>/.revkit/build/src/
+   * content/docs/`, an anchor path the `matches` predicate does
+   * NOT accept without a remap). Order matters — first match wins. */
+  readonly pathMap?: readonly { readonly from: string; readonly to: string }[];
 }
 
 // `VFileLike`, `filePathOf`, and `repoRelativePosix` come from
@@ -84,11 +93,18 @@ export function dropLeadingH1(tree: Root): boolean {
 export function rehypeDropRepoDocTitle(options: DropRepoDocTitleOptions) {
   const repoRoot = resolve(options.repoRoot);
   const matches = options.matches ?? defaultMatches;
+  const pathMap = options.pathMap;
   return (tree: Root, file?: VFileLike): void => {
     if (file === undefined) return;
     const filePath = filePathOf(file);
     if (filePath === undefined) return;
-    const rel = repoRelativePosix(repoRoot, filePath);
+    // Same staging→source remap as rehype-data-src, so the leading
+    // H1 is dropped for a consumer's `docs/index.mdx` (copied to
+    // `<consumer>/.revkit/build/src/content/docs/index.mdx`) —
+    // Starlight renders the frontmatter title above the body and
+    // a leading `# Title` in prose would visually duplicate it.
+    const mapped = applyPathMap(filePath, pathMap);
+    const rel = repoRelativePosix(repoRoot, mapped);
     if (rel === undefined) return;
     if (!matches(rel)) return;
     dropLeadingH1(tree);

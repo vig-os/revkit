@@ -112,7 +112,10 @@ jobs:
 
       - name: Run template smoke
         # Scaffolds the template into a temp dir, uses --override-input
-        # to point at THIS checkout, runs revkit check, nix build, and
-        # the wrapper's --help/--version. scripts/template-smoke.sh
-        # traps EXIT so no daemon leaks on failure.
+        # to point at THIS checkout, runs revkit check, nix build,
+        # revkit build (M5 part 2, issue #57) and revkit serve.
+        # Asserts GET / returns 200 with the rendered doc text AND
+        # the daemon's `<script src="/-/rail.js">` tag.
+        # scripts/template-smoke.sh traps EXIT so no daemon leaks
+        # on failure (kills its own child pid only).
         run: bash scripts/template-smoke.sh "${GITHUB_WORKSPACE}"

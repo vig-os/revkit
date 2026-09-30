@@ -84,6 +84,18 @@ test *args:
       just e2e; \
     fi
 
+# Regenerate the pipeline-digest fixture that
+# `packages/cli/test/build/own-build-unchanged.test.ts` compares
+# against (issue #57). Run this after a LEGITIMATE change to the
+# rendering pipeline — a new rehype plugin, a Starlight upgrade, a
+# tweak to `astro.config.mjs`. The recipe sets
+# `REVKIT_UPDATE_OWN_DIGEST=1` so the test WRITES the digest
+# instead of asserting. Commit the resulting
+# `packages/cli/test/build/fixtures/pipeline-digest.json`.
+[group('quality')]
+update-own-digest:
+    REVKIT_UPDATE_OWN_DIGEST=1 REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test test/build/own-build-unchanged.test.ts'
+
 # Run the revkit authoring guards over the workspace (ADR-0005). Offline
 # by default; passes `--online` when GITHUB_TOKEN is available so `revkit
 # escalate` annotations get verified against GitHub in CI when the
