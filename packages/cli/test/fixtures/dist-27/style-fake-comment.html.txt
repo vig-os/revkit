@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused style url() with fake comment payload (reviewer bypass A) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<div style="background:url(https://evil.example/A.png/*);--x:'*/'"></div>
+</body>
+</html>

@@ -33,6 +33,7 @@ import { compile as vegaLiteCompile } from "vega-lite";
 import { DOMParser } from "linkedom";
 import { isSiblingFilename } from "../content/schemas/plots.ts";
 import { readConfinedSibling } from "./plot-file-io.ts";
+import { scanCssForUrlRefs, svgHrefRefusalReason } from "./css-url-scan.ts";
 
 /** Options for {@link renderPlotToSvg}. */
 export interface RenderPlotOptions {
@@ -250,33 +251,22 @@ export const ALLOWED_SVG_ATTRIBUTES: ReadonlySet<string> = new Set([
   "xlink:href",
 ]);
 
-/** Regex extracting every `url(…)` value from a CSS declaration list.
- * Matches both quoted and unquoted forms. */
-const URL_VALUE = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi;
-
-/** True when a `url(...)` argument is a same-document fragment
- * (`url(#gradient1)`) — the only outbound reference an inline SVG here
- * ever needs, so allow it and refuse everything else. */
-function isSafeFragmentReference(raw: string): boolean {
-  return /^#[A-Za-z_][\w.-]*$/.test(raw.trim());
-}
-
-/** Rewrite a `style` or presentation-attribute value so any `url(…)` that
- * is not a same-document fragment (`url(#foo)`) is dropped. Returns
- * `null` when nothing survives worth keeping. */
-function sanitizeUrlsInValue(value: string): string {
-  return value.replace(URL_VALUE, (whole, dq, sq, uq) => {
-    const inner = (dq ?? sq ?? uq ?? "").trim();
-    return isSafeFragmentReference(inner) ? `url(#${inner.slice(1)})` : "";
-  });
-}
+// URL scanning delegated to `scanCssForUrlRefs` (css-url-scan.ts) —
+// see that file's header for the CSS Syntax Level 3 tokenizer that
+// closes the round-1 regex bypasses (unterminated url(https://…, the
+// `/* */` pre-strip that turned `url(x/*);--x:'*/'` into a benign
+// value, and `u\rl(` / `\75 rl(` escape-name shapes).
 
 /** Presentation attributes whose values can legitimately carry a
  * `url(#fragment)` reference (Vega uses these for gradient / clip
  * fills), so the value is rewritten rather than the attribute stripped.
  * `style` is intentionally NOT here — see the block comment on
- * ALLOWED_ATTRIBUTES for why raw CSS never survives. */
-const URL_BEARING_ATTRIBUTES: ReadonlySet<string> = new Set([
+ * ALLOWED_ATTRIBUTES for why raw CSS never survives.
+ *
+ * Exported so `revkit check-dist` can URL-scan the same set of
+ * presentation attributes at the output gate (issue #27) — one source
+ * of truth for which SVG attribute values can carry `url(…)`. */
+export const URL_BEARING_SVG_ATTRIBUTES: ReadonlySet<string> = new Set([
   "fill",
   "stroke",
   "clip-path",
@@ -285,33 +275,51 @@ const URL_BEARING_ATTRIBUTES: ReadonlySet<string> = new Set([
   "marker-start",
   "marker-mid",
   "marker-end",
+  // `cursor: url(…)` is a legitimate CSS presentation value; without it
+  // an attacker could point cursor at a tracker (`cursor="url(https://
+  // evil.example/pixel.png)"`) and check-dist would miss it. Added here
+  // so both the source sanitiser and check-dist rewrite / refuse it.
+  "cursor",
 ]);
 
-function isSameDocumentFragment(value: string): boolean {
-  return value.trim().startsWith("#");
-}
+const URL_BEARING_ATTRIBUTES = URL_BEARING_SVG_ATTRIBUTES;
 
 /** Decide whether an attribute survives on an allowed element. Returns
  * either the (possibly rewritten) value to keep, or `null` to remove
- * the attribute entirely. */
+ * the attribute entirely. Issue #27 round 2: URL scanning now goes
+ * through the shared CSS Level 3 tokenizer
+ * (`scanCssForUrlRefs`) — a URL-shaped construct that is not a
+ * bare `url(#ident)` fragment drops the entire attribute (defence-
+ * in-depth: Vega never mixes a good and a bad url() in the same
+ * value, so dropping the whole attribute is safe and matches the
+ * check-dist refusal semantics). Same href predicate
+ * (`svgHrefRefusalReason`) as check-dist. */
 function keepAttribute(name: string, value: string): string | null {
   const lower = name.toLowerCase();
   // `xmlns:*` declarations pass — linkedom parses SVG in the XHTML
   // namespace, and we still want the source's own namespace bindings.
   if (lower.startsWith("xmlns:")) return value;
   if (lower.startsWith("on")) return null;
-  // href / xlink:href only survive as same-document fragments; every
-  // other href would be an outbound reference from a supposedly static
-  // figure (ADR-0004).
+  // href / xlink:href only survive as same-document `#ident`
+  // fragments — checked against the RAW value (a browser resolves
+  // `%23a` as a relative path, so percent-encoded characters are
+  // refused). Shared predicate with check-dist so a change here
+  // can't drift.
   if (lower === "href" || lower === "xlink:href") {
-    return isSameDocumentFragment(value) ? value : null;
+    return svgHrefRefusalReason(value) === null ? value : null;
   }
   if (!ALLOWED_SVG_ATTRIBUTES.has(lower)) return null;
-  // `javascript:` URLs in any surviving attribute value must go too.
-  if (/\bjavascript:/i.test(value)) return null;
   if (URL_BEARING_ATTRIBUTES.has(lower)) {
-    return sanitizeUrlsInValue(value);
+    // Any URL-shaped token that is not `url(#ident)` drops the whole
+    // attribute. `javascript:` shows up as an Ident+Colon and is
+    // caught by the same tokenizer walk.
+    if (scanCssForUrlRefs(value, { allowFragmentUrl: true }).length > 0) return null;
+    return value;
   }
+  // Non-URL-bearing attribute: `javascript:` in any surviving
+  // attribute value must still go (the token walk only runs on
+  // URL-bearing attrs above).
+  if (/\bjavascript:/i.test(value)) return null;
   return value;
 }
 
