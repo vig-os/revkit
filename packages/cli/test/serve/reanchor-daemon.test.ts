@@ -33,7 +33,15 @@
 //     `prepareReanchor` passes race and one wins with a stale seq.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { revisionOf } from "@revkit/review-core";
@@ -83,6 +91,7 @@ async function bootDaemon(): Promise<DaemonCtx> {
       fileDebounceMs: 50,
       buildDebounceMs: 50,
       pollIntervalMs: 100,
+      dirRebindIntervalMs: 100,
     },
   });
   // Launch flow — set the session cookie so the API accepts POSTs.
@@ -501,36 +510,200 @@ describe("re-anchor daemon integration (M2 item 5b, story A8)", () => {
   });
 
   // ── PR #45 round-2 nit: unchanged files skip the hash + pipeline ─
-  test("refreshAll skips the read + hash for files whose mtime+size haven't changed (mutation guard)", async () => {
-    // The reviewer's concern: `refreshAll` runs on every unfiltered
-    // GET /api/threads and on every /events connect. Without a
-    // cache, each call re-reads and re-hashes every threaded file.
-    // The fix caches (mtime, size, revision) per path; a second
-    // refresh with no file changes hits the cache and skips the
-    // pipeline entirely.
-    //
-    // We drive this via a fresh Ctx (no shared inflight state)
-    // and count `resolveSourceUnderRoot` calls via the handle's
-    // `fileReadCount()` diagnostic.
+  test("refreshAll always reads + hashes, but skips the PIPELINE for unchanged content (PR #45 round-3)", async () => {
+    // Round-3 correctness fix: the previous (mtime, size) cache had
+    // two races — a write between read and post-read stat (probe A),
+    // and a same-size + preserved-mtime edit (probe F). The fix is
+    // to always read + hash, and use the CONTENT revision as the
+    // cache key. So `fileReadCount` grows on every refresh (cheap),
+    // while `pipelineRunCount` grows only when the revision changed.
     await createThread(ctx, "target phrase");
 
-    // First call — reads the file once.
+    // First call — pipeline runs once (fresh thread + first read).
     await listThreads(ctx);
+    const pipelineAfterFirst = await countPipelineRuns(ctx);
+    expect(pipelineAfterFirst).toBeGreaterThan(0);
     const readsAfterFirst = await countReads(ctx);
     expect(readsAfterFirst).toBeGreaterThan(0);
 
-    // Second call, no edit — cache should skip the read.
+    // Second call, no edit — the PIPELINE must NOT run again (the
+    // revision matches the last-processed one). Reads DO grow —
+    // that's the cost of correctness under a same-size + mtime-
+    // preserved edit (probes A + F).
     await listThreads(ctx);
+    const pipelineAfterSecond = await countPipelineRuns(ctx);
     const readsAfterSecond = await countReads(ctx);
-    // The cache must have short-circuited: no additional reads.
-    expect(readsAfterSecond).toBe(readsAfterFirst);
+    expect(pipelineAfterSecond).toBe(pipelineAfterFirst);
+    expect(readsAfterSecond).toBeGreaterThan(readsAfterFirst);
 
-    // Third call, WITH an edit — the cache must miss and re-read.
+    // Third call, WITH an edit — the pipeline must run again.
     const edited = SEED_SOURCE.replace("target phrase", "target token");
     writeFileSync(join(ctx.root, SOURCE_REL_PATH), edited);
     await listThreads(ctx);
-    const readsAfterEdit = await countReads(ctx);
-    expect(readsAfterEdit).toBeGreaterThan(readsAfterSecond);
+    const pipelineAfterEdit = await countPipelineRuns(ctx);
+    expect(pipelineAfterEdit).toBeGreaterThan(pipelineAfterSecond);
+  });
+
+  // ── PR #45 round-3 blocker (probe A): stat-race carrying stale ────
+  test("PROBE A: a write landing between read and stat cannot poison the cache (correctness on interleaved writes)", async () => {
+    // Setup a thread + do a first refresh so lastProcessedRevision
+    // is set. Then rapidly interleave writes with refreshes. Under
+    // the OLD (mtime, size) cache this would pair the new
+    // (mtime, size) with the OLD revision and leave every later
+    // refresh short-circuiting. Under the content-revision cache
+    // the pipeline runs whenever the content differs, no matter
+    // what stat says.
+    await createThread(ctx, "target phrase");
+    const sourcePath = join(ctx.root, SOURCE_REL_PATH);
+
+    // v2: shift the anchor down (insert paragraphs).
+    const v2 =
+      "# Design note\n\nFirst paragraph, unchanged across edits.\n\n" +
+      "Inserted A.\n\nInserted B.\n\n" +
+      "The target phrase lives on this line and reviewers pick it.\n\n" +
+      "Third paragraph, also unchanged.\n\nFourth paragraph.\n";
+    // v3: shift down further.
+    const v3 =
+      "# Design note\n\nFirst paragraph, unchanged across edits.\n\n" +
+      "Inserted A.\n\nInserted B.\n\nInserted C.\n\nInserted D.\n\n" +
+      "Inserted E.\n\nInserted F.\n\nInserted G.\n\nInserted H.\n\n" +
+      "The target phrase lives on this line and reviewers pick it.\n\n" +
+      "Third paragraph, also unchanged.\n\nFourth paragraph.\n";
+
+    // The reviewer's probe: v2 → refresh → v3 → refresh ×N. Under
+    // the buggy cache the thread ends at v2's line, not v3's.
+    writeFileSync(sourcePath, v2);
+    const p1 = listThreads(ctx, { path: SOURCE_REL_PATH });
+    writeFileSync(sourcePath, v3);
+    const p2 = listThreads(ctx, { path: SOURCE_REL_PATH });
+    await Promise.all([p1, p2]);
+    // A few more refreshes — under the buggy cache these stay
+    // stuck; under the correct cache they converge on v3.
+    for (let i = 0; i < 3; i++) await listThreads(ctx, { path: SOURCE_REL_PATH });
+    const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+    const v3Revision = await revisionOf(v3);
+    expect(after.threads[0]?.anchor.revision).toBe(v3Revision);
+  });
+
+  // ── PR #45 round-3 blocker (probe F): same-size + mtime restored ──
+  test("PROBE F: an edit with the same size AND restored mtime (touch -r) still re-anchors", async () => {
+    // `cp -p`, `touch -r`, `rsync -t`, `tar x`, an editor that
+    // preserves mtime for undo — the file's content changed but
+    // stat says nothing did. The content-revision cache catches
+    // this because the pipeline compares HASHES, not stat tuples.
+    await createThread(ctx, "target phrase");
+    const sourcePath = join(ctx.root, SOURCE_REL_PATH);
+    // First refresh so lastProcessedRevision is set.
+    await listThreads(ctx, { path: SOURCE_REL_PATH });
+    const st = statSync(sourcePath);
+    // Same-size edit: pad the difference with an equally-long
+    // trailing filler so the total size is unchanged.
+    const original = SEED_SOURCE;
+    const shorter =
+      "# Design note\n\nThe target phrase lives on this line and reviewers pick it.\n\nOutro.\n";
+    const padSize = Buffer.byteLength(original, "utf8") - Buffer.byteLength(shorter, "utf8");
+    const sameSize = shorter + "Z".repeat(Math.max(0, padSize));
+    expect(Buffer.byteLength(sameSize, "utf8")).toBe(
+      Buffer.byteLength(original, "utf8"),
+    );
+    writeFileSync(sourcePath, sameSize);
+    // Restore the mtime (and atime) so stat looks unchanged.
+    // `utimesSync` accepts fractional seconds but the filesystem
+    // stores nanoseconds — after the round-trip the mtime is
+    // truncated at the FS precision, which may be ns or ms
+    // depending on kernel + fs (probes on the reviewer's ext4
+    // repro observed the ms case). Comparing at ms granularity
+    // covers both.
+    utimesSync(sourcePath, st.atime, st.mtime);
+    const restored = statSync(sourcePath);
+    expect(Math.floor(restored.mtimeMs)).toBe(Math.floor(st.mtimeMs));
+    expect(restored.size).toBe(st.size);
+
+    // Under the OLD (mtime, size) cache, subsequent refreshes
+    // would skip. Under the content-revision cache, the pipeline
+    // catches the diff.
+    for (let i = 0; i < 3; i++) await listThreads(ctx, { path: SOURCE_REL_PATH });
+    const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+    const newRevision = await revisionOf(sameSize);
+    expect(after.threads[0]?.anchor.revision).toBe(newRevision);
+    // The anchor moved: the phrase is now on line 3.
+    expect(after.threads[0]?.anchor.startLine).toBe(3);
+  });
+
+  // ── PR #45 round-3 nit (probe G): dir removed + recreated ─────────
+  test("PROBE G: a parent directory removed + recreated does NOT leave a dead watcher (probe fires re-anchor on next write)", async () => {
+    await createThread(ctx, "target phrase");
+    // Wait a beat so the watcher is armed.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(ctx.daemon.reanchorDiagnostics.watchedDirs()).toBeGreaterThan(0);
+    // Remove the parent directory entirely — this kills a naive
+    // `fs.watch(dir)` silently.
+    const dir = join(ctx.root, "docs");
+    rmSync(dir, { recursive: true, force: true });
+    // Recreate the dir and write a fresh source at the same path.
+    mkdirSync(dir, { recursive: true });
+    const edited = SEED_SOURCE.replace("target phrase", "target token");
+    writeFileSync(join(ctx.root, SOURCE_REL_PATH), edited);
+    // Give the rebind probe time to reinstall the watcher and the
+    // lazy trigger to run.
+    await waitFor(async () => {
+      const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+      const revNew = await revisionOf(edited);
+      return after.threads[0]?.anchor.revision === revNew;
+    }, { timeoutMs: 8_000, intervalMs: 100 });
+    // A second write — proves the reinstalled watcher is live.
+    const editedAgain = edited.replace("target token", "target codeword");
+    writeFileSync(join(ctx.root, SOURCE_REL_PATH), editedAgain);
+    const revAgain = await revisionOf(editedAgain);
+    await waitFor(async () => {
+      const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+      return after.threads[0]?.anchor.revision === revAgain;
+    }, { timeoutMs: 8_000, intervalMs: 100 });
+  });
+
+  // ── PR #45 round-3 nit: one fs.watch per DIRECTORY, not per file ──
+  test("N threaded files in the SAME directory share ONE directory watcher", async () => {
+    // Under the old code, five threads in `docs/` used five
+    // watchers, all bound to the same parent inode. The fix
+    // collapses them: one watcher per unique directory.
+    // Add three more threads to the SAME directory as the first one.
+    // Each thread's anchor points at a distinct file in `docs/`.
+    for (let i = 0; i < 3; i++) {
+      const relPath = `docs/extra-fixture-${i}.md`;
+      writeFileSync(
+        join(ctx.root, relPath),
+        SEED_SOURCE.replace("target phrase", `target phrase ${i}`),
+      );
+      const source = SEED_SOURCE.replace("target phrase", `target phrase ${i}`);
+      const idx = source.indexOf(`target phrase ${i}`);
+      const before = source.slice(0, idx);
+      const startLine = (before.match(/\n/g)?.length ?? 0) + 1;
+      const anchor = {
+        path: relPath,
+        startLine,
+        endLine: startLine,
+        quote: {
+          exact: `target phrase ${i}`,
+          prefix: source.slice(Math.max(0, idx - 32), idx),
+          suffix: source.slice(idx + `target phrase ${i}`.length, idx + `target phrase ${i}`.length + 32),
+        },
+        revision: "0".repeat(64),
+      };
+      const response = await apiFetch(ctx, "/api/threads", {
+        method: "POST",
+        body: JSON.stringify({ anchor, body: "extra thread" }),
+      });
+      expect(response.status).toBe(201);
+    }
+    // Give the daemon a moment to reconcile watchers.
+    await waitFor(async () => ctx.daemon.reanchorDiagnostics.watchedPaths() >= 3, {
+      timeoutMs: 2_000,
+      intervalMs: 50,
+    });
+    // Now: 3 threaded paths + 0 pre-existing threads = 3 watched paths.
+    // The paths all live in `docs/`, so the DIR count is 1.
+    expect(ctx.daemon.reanchorDiagnostics.watchedPaths()).toBeGreaterThanOrEqual(3);
+    expect(ctx.daemon.reanchorDiagnostics.watchedDirs()).toBe(1);
   });
 
   // ── PR #45 round-2 nit: rebind build watcher after rm+mkdir ──────
@@ -581,22 +754,14 @@ async function waitFor(
 }
 
 async function countReads(ctx: DaemonCtx): Promise<number> {
-  // The reanchor daemon exposes `fileReadCount` on the handle. We
-  // reach it via a debug endpoint that we install below in the
-  // production daemon's `handleRequest` — see
-  // `packages/cli/src/serve/daemon.ts` (`GET /-/reanchor-diag`,
-  // bearer-only). If the endpoint is disabled in a release, tests
-  // that need this counter must run against a daemon started with
-  // an internal harness.
-  const response = await fetch(`${ctx.daemon.url}/-/reanchor-diag`, {
-    headers: {
-      host: `127.0.0.1:${ctx.daemon.port}`,
-      authorization: `Bearer ${ctx.daemon.agentToken}`,
-    },
-  });
-  if (response.status !== 200) return 0;
-  const body = (await response.json()) as { fileReadCount?: number };
-  return body.fileReadCount ?? 0;
+  // Round-3 review nit: the reanchor diagnostic counters are on
+  // the handle, not an HTTP endpoint — production daemons must not
+  // leak internal-state probes.
+  return ctx.daemon.reanchorDiagnostics.fileReadCount();
+}
+
+async function countPipelineRuns(ctx: DaemonCtx): Promise<number> {
+  return ctx.daemon.reanchorDiagnostics.pipelineRunCount();
 }
 
 /** Pull the raw event log via the daemon's `/events` SSE stream, using

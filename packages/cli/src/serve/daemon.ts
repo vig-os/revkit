@@ -129,6 +129,18 @@ export interface DaemonHandle {
   readonly agentToken: string;
   readonly launchCode: string;
   readonly launchUrl: string;
+  /** Diagnostic counters from the re-anchoring service. Exposed on
+   * the handle (not over HTTP) so in-process tests can drive
+   * mutation checks against the file-read / pipeline-run rates
+   * without adding an operator-facing endpoint that would leak
+   * internal state. See `packages/cli/src/serve/reanchor-daemon.ts`.
+   * (PR #45 round-3 review.) */
+  readonly reanchorDiagnostics: {
+    fileReadCount(): number;
+    pipelineRunCount(): number;
+    watchedPaths(): number;
+    watchedDirs(): number;
+  };
   stop(): Promise<void>;
 }
 
@@ -438,6 +450,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     agentToken,
     launchCode,
     launchUrl,
+    reanchorDiagnostics: {
+      fileReadCount: () => reanchor.fileReadCount(),
+      pipelineRunCount: () => reanchor.pipelineRunCount(),
+      watchedPaths: () => reanchor.watchedPaths(),
+      watchedDirs: () => reanchor.watchedDirs(),
+    },
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
@@ -548,24 +566,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // the daemon only (no tokens, no data).
     if (method === "GET" && url.pathname === "/-/health") {
       const body = JSON.stringify({ instanceId, pid: process.pid });
-      return withHygiene(new Response(body, { status: 200 }), "json", "application/json; charset=utf-8");
-    }
-
-    // Bearer-only diagnostic for the re-anchoring daemon. The
-    // reanchor engine's `fileReadCount` is the counter the
-    // "unchanged files skip the hash" test needs; there is no other
-    // public surface that reflects it. Locked to the agent bearer
-    // so a cookie-authenticated browser tab cannot probe internal
-    // state (defence in depth even for a diagnostic).
-    if (method === "GET" && url.pathname === "/-/reanchor-diag") {
-      const bearer = bearerFromHeader(request.headers.get("authorization"));
-      if (bearer === undefined || !auth.isAgent(bearer)) {
-        return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
-      }
-      const body = JSON.stringify({
-        fileReadCount: reanchor.fileReadCount(),
-        watchedPaths: reanchor.watchedPaths(),
-      });
       return withHygiene(new Response(body, { status: 200 }), "json", "application/json; charset=utf-8");
     }
 

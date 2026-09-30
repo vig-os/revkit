@@ -192,24 +192,30 @@ describe("SqliteThreadStore", () => {
     rmSync(filename, { force: true });
   });
 
-  test("snapshot GC honours the grace period: a fresh snapshot survives even if unretained (PR #45 round-2 race)", () => {
+  test("snapshot GC honours the grace period using the store's INJECTED CLOCK (PR #45 round-3 nit)", () => {
     // The reviewer's probe: a concurrent POST /api/threads inserts
     // a snapshot AFTER retain was computed but BEFORE gcSnapshots
     // ran. Without the grace period the fresh row is deleted. With
     // the default 30 s grace, any snapshot younger than 30 s is
-    // retained regardless of the retain set.
+    // retained regardless of the retain set. **The grace uses the
+    // store's injected clock**, not `Date.now()`, so a test can
+    // drive the window deterministically.
+    let nowMs = 1_000_000; // pinned to 1970-01-01 + 1000s.
+    const clock = () => new Date(nowMs).toISOString();
     const filename = tmpDb();
-    const store = SqliteThreadStore.open({ filename });
+    const store = SqliteThreadStore.open({ filename, clock });
     const revFresh = "f".repeat(64);
     store.putSnapshot(revFresh, "fresh source");
-    // Default grace period (30 s). retain is empty, so on the
-    // narrow reading the fresh row would be deleted. It is NOT —
-    // the grace period saves it.
+    // Default grace period (30 s). retain is empty; the injected
+    // clock has not advanced, so the snapshot is < 30 s old and
+    // must survive.
     expect(store.gcSnapshots(new Set())).toBe(0);
     expect(store.getSnapshot(revFresh)).toBe("fresh source");
-    // Passing `graceMs: 0` explicitly bypasses the grace and the
-    // row goes.
-    expect(store.gcSnapshots(new Set(), 0)).toBe(1);
+    // Advance the clock past the grace window; the same call now
+    // deletes the row. Under a `Date.now`-based grace this test
+    // could not drive the window at all.
+    nowMs += 60_000;
+    expect(store.gcSnapshots(new Set())).toBe(1);
     expect(store.getSnapshot(revFresh)).toBeUndefined();
     store.close();
     rmSync(filename, { force: true });
@@ -220,8 +226,10 @@ describe("SqliteThreadStore", () => {
     // slip a fresh row in between the SELECT and the DELETEs. This
     // test drives a concurrent-write shape and asserts the fresh
     // row survives — proving the transaction is IMMEDIATE.
+    let nowMs = 2_000_000;
+    const clock = () => new Date(nowMs).toISOString();
     const filename = tmpDb();
-    const store = SqliteThreadStore.open({ filename });
+    const store = SqliteThreadStore.open({ filename, clock });
     const revOld = "1".repeat(64);
     const revNew = "2".repeat(64);
     store.putSnapshot(revOld, "old");

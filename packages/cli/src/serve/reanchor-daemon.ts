@@ -129,6 +129,12 @@ export interface ReanchorDaemonOptions {
   readonly fileDebounceMs?: number;
   readonly buildDebounceMs?: number;
   readonly pollIntervalMs?: number;
+  /** How often the periodic rebind probe reinstalls a directory
+   * watcher whose parent came back after being removed. Default
+   * `DEFAULT_BUILD_REBIND_INTERVAL_MS` (2 s); tests inject a shorter
+   * value so a probe-G reproduction settles inside a few hundred
+   * ms. */
+  readonly dirRebindIntervalMs?: number;
   /** Injected clock (ms) for tests. */
   readonly nowMs?: () => number;
 }
@@ -161,13 +167,28 @@ export interface ReanchorDaemonHandle {
    * resolved. Called by the daemon after every `store.append`. */
   reconcileWatchers(): Promise<void>;
   /** Number of paths currently under a watcher (real fs.watch or
-   * polling fallback). Diagnostic. */
+   * polling fallback). A single directory watcher covers all its
+   * threaded files; this counter reflects paths, not watchers. */
   watchedPaths(): number;
-  /** Number of times the re-anchor pipeline actually READ a file
-   * (called `resolveSourceUnderRoot`). A skip through the
-   * mtime+size cache does not increment this counter — the counter
-   * is what the "no re-hash on unchanged file" test asserts on. */
+  /** Number of directory watchers currently held. Since M2 item 5b
+   * round 3, watchers are per-DIRECTORY with a fan-out to the set
+   * of threaded files inside; a doc dir with N threaded files
+   * carries ONE watcher, not N. */
+  watchedDirs(): number;
+  /** Number of times the daemon read + hashed a file
+   * (`resolveSourceUnderRoot`). Under the correctness-first
+   * cache, every refresh reads and hashes; a "skip" is when the
+   * hashed revision matches the last-processed one. Diagnostic for
+   * tests only — see `pipelineRunCount()` for the "did the pipeline
+   * actually run?" counter. */
   fileReadCount(): number;
+  /** Number of times the pipeline (`prepareReanchor` +
+   * per-thread `reanchorWith`) actually executed on a fresh
+   * revision. A burst of refreshes over an unchanged file leaves
+   * this at its previous value — that is what the "unchanged file
+   * skips the pipeline" test asserts on. Diagnostic; not exposed
+   * over HTTP. */
+  pipelineRunCount(): number;
   stop(): Promise<void>;
 }
 
@@ -186,6 +207,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     fileDebounceMs = DEFAULT_FILE_DEBOUNCE_MS,
     buildDebounceMs = DEFAULT_BUILD_DEBOUNCE_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+    dirRebindIntervalMs = DEFAULT_BUILD_REBIND_INTERVAL_MS,
   } = options;
 
   const actor: Author = { kind: "agent", id: REANCHOR_ACTOR_ID };
@@ -202,26 +224,86 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     dirty: boolean;
   }
   const inflight = new Map<string, InflightState>();
-  /** Per-path read cache (mtime + size + revision) so an unchanged
-   * file is skipped without re-hashing the whole source. `resolveSourceUnderRoot`
-   * still opens the file and runs `revisionOf` when the mtime/size
-   * says the file changed, so a rename-save (which changes both) still
-   * hits the pipeline. */
-  const readCache = new Map<string, { mtimeMs: number; size: number; revision: string; source: string }>();
-  const fileWatchers = new Map<string, { close: () => void }>();
+  /** Per-path record of the last revision the PIPELINE ran against.
+   *
+   * **Correctness first.** The previous shape (mtime + size cache)
+   * had two bugs (PR #45 round-3 blocker):
+   *
+   *   - a write between the read and a post-read `statSync` paired
+   *     the new (mtime, size) with the OLD revision, so every later
+   *     refresh short-circuited on stale content (probe A);
+   *   - a same-size edit whose mtime was restored by `touch -r`,
+   *     `cp -p`, `rsync -t` or `tar x` was invisible to the cache
+   *     forever (probe F).
+   *
+   * The fix: always read and hash the file (cheap under the 5 MiB
+   * cap), and use the CONTENT revision as the cache key. If
+   * `revisionOf(content) === lastProcessedRevision`, the pipeline
+   * is skipped (the identity short-circuit in `reanchorWith` would
+   * emit nothing anyway); otherwise the pipeline runs and the new
+   * revision is stored. The stat race is gone by construction. */
+  const lastProcessedRevision = new Map<string, string>();
+  /** Per-directory watcher, fanned out to the set of threaded
+   * basenames inside. Round-3 nit: the previous code installed one
+   * watcher per file, all bound to the SAME parent inode; five
+   * threads under `docs/` used five watchers. Now we install ONE
+   * watcher per directory and dispatch the `filename` argument to
+   * the matching threaded paths.
+   *
+   * `paths` is the set of REPO-RELATIVE paths whose parent is this
+   * directory; the map's basename → path lookup is `basename` →
+   * the entry in `paths` whose basename matches (linear over the
+   * set — tiny). We keep both a basename-set for the O(1) match on
+   * the `filename` argument and the `paths` set for reconcile
+   * bookkeeping. */
+  interface DirectoryWatcher {
+    watcher?: FSWatcher;
+    /** basename → repo-relative path. Used by the fs.watch callback
+     * to look up which refresh to schedule. Kept as a Map so a
+     * future filename that differs by case (mac HFS) stays
+     * discriminating. */
+    basenames: Map<string, string>;
+    /** Polling interval id when we fell back off `fs.watch`. */
+    poll?: ReturnType<typeof setInterval>;
+    /** Per-file mtime+size snapshot the polling fallback compares
+     * against. Only populated when `poll` is set. */
+    pollStat?: Map<string, { mtimeMs: number; size: number } | undefined>;
+    /** Set when the parent dir itself was removed and the watcher
+     * needs a rebind (probe G). */
+    needsRebind: boolean;
+  }
+  const dirWatchers = new Map<string, DirectoryWatcher>();
+  /** Per-path debounce timer for the fan-out. */
   const fileTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let buildTimer: ReturnType<typeof setTimeout> | undefined;
   let buildWatcher: FSWatcher | undefined;
   let stopped = false;
   let fileReadCount = 0;
+  /** Number of times the pipeline (`prepareReanchor` + per-thread
+   * `reanchorWith`) actually ran on a distinct revision. The
+   * content-revision cache short-circuits a refresh whose content
+   * matches the last-processed revision, so a burst of GETs on an
+   * idle file leaves this counter unchanged. */
+  let pipelineRunCount = 0;
+
+  /** Number of threaded paths currently under a watcher (real or
+   * poll). Kept in a local helper so both `watchedPaths` and the
+   * dir-rebind probe use one source of truth. */
+  function countWatchedPaths(): number {
+    let total = 0;
+    for (const dw of dirWatchers.values()) total += dw.basenames.size;
+    return total;
+  }
 
   const handle: ReanchorDaemonHandle = {
     refresh,
     refreshAll,
     gc: gcOnce,
     reconcileWatchers,
-    watchedPaths: () => fileWatchers.size,
+    watchedPaths: countWatchedPaths,
+    watchedDirs: () => dirWatchers.size,
     fileReadCount: () => fileReadCount,
+    pipelineRunCount: () => pipelineRunCount,
     stop,
   };
 
@@ -287,30 +369,9 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // is the SAME resolver the POST /api/threads path uses, so a
     // path that snuck onto a thread despite the anchor check (or a
     // symlink that appeared between then and now) is refused here
-    // too.
-    //
-    // Fast path: the (mtime, size) tuple already matches the cached
-    // (mtime, size, revision). Skip the read + hash + pipeline
-    // entirely — nothing has changed since the last refresh. This
-    // is what keeps `/api/threads` cheap under the lazy trigger.
-    // A rename-save (write tmp + rename over) changes mtime AND
-    // size, so it still hits the pipeline (blocker 1 fix relies on
-    // this).
-    const rooted = repoRoot + "/" + path;
-    const cached = readCache.get(path);
-    if (cached !== undefined) {
-      try {
-        const stat = statSync(rooted);
-        if (stat.mtimeMs === cached.mtimeMs && stat.size === cached.size) {
-          // No change on disk; the pipeline would emit `anchored` for
-          // every thread (identity short-circuit). Skip.
-          return;
-        }
-      } catch {
-        // Fall through to `resolveSourceUnderRoot`, which will report
-        // the removal + orphan every thread.
-      }
-    }
+    // too. Always read + hash: the SHA-256 of a source under the
+    // 5 MiB cap is < 1 ms, and it removes an entire class of
+    // stat-race bugs (PR #45 round-3 blocker).
     fileReadCount += 1;
     const resolved = await resolveSourceUnderRoot(path, repoRoot);
     if (!resolved.ok) {
@@ -320,7 +381,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       // reveal WHICH failure mode fired (matches
       // `UNIFORM_ANCHOR_REJECTION`'s privacy stance) — an operator
       // reads the daemon's own log for the specific cause.
-      readCache.delete(path);
+      lastProcessedRevision.delete(path);
       logger.warn("reanchor.source.rejected", { path, reason: resolved.reason });
       await orphanAll(
         path,
@@ -329,20 +390,14 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       return;
     }
     const { revision: newRevision, source: newSource } = resolved;
-    // Refresh the read cache. `statSync` here is called AFTER the
-    // read; a write between the two settles at the next refresh (a
-    // rename-save's second event fires the watcher again).
-    try {
-      const stat = statSync(rooted);
-      readCache.set(path, {
-        mtimeMs: stat.mtimeMs,
-        size: stat.size,
-        revision: newRevision,
-        source: newSource,
-      });
-    } catch {
-      readCache.delete(path);
-    }
+
+    // Content-addressed short-circuit: if the file has the same
+    // revision as the last successful pipeline run, the pipeline
+    // would emit `anchored` for every thread (identity short-circuit
+    // in `reanchorWith`). Skip the work. The read + hash still ran,
+    // so a same-size + preserved-mtime edit (probe F) is caught by
+    // the revision comparison — there is NO stat shortcut left.
+    if (lastProcessedRevision.get(path) === newRevision) return;
 
     // Fetch open + orphaned threads on this path. `resolved` threads
     // are not tracked — the human/agent's final word stands.
@@ -428,6 +483,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         await emitEvent(event);
       }
     }
+
+    // Record the revision the pipeline finished on. A future
+    // refresh reading the same content skips at the top; a refresh
+    // reading a different revision runs the pipeline (correctly, on
+    // the fresh content) and updates this entry.
+    lastProcessedRevision.set(path, newRevision);
+    pipelineRunCount += 1;
 
     // Opportunistic GC. Cheap when nothing changed, bounded by
     // snapshot count.
@@ -534,119 +596,181 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * mount, some containers), fall back to `stat`-poll at
    * `pollIntervalMs`. Idempotent — a second call for the same path
    * is a no-op. */
+  /** Schedule a debounced `refresh(path)`. Coalesces bursts of
+   * events on the same file. */
+  function fireForPath(path: string): void {
+    const existing = fileTimers.get(path);
+    if (existing !== undefined) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      fileTimers.delete(path);
+      void refresh(path).catch((error) =>
+        logger.warn("reanchor.watch.refresh.failed", {
+          path,
+          errorKind: (error as Error).name,
+        }),
+      );
+    }, fileDebounceMs);
+    fileTimers.set(path, timer);
+  }
+
+  /** Make sure the directory that `path` lives in has a watcher (or
+   * polling fallback), and register `path`'s basename with it.
+   * Idempotent: a second call for the same path is a no-op. */
   function ensureWatcher(path: string): void {
-    if (stopped || fileWatchers.has(path)) return;
+    if (stopped) return;
     const rooted = repoRoot + "/" + path;
-    const fire = (): void => {
-      const existing = fileTimers.get(path);
-      if (existing !== undefined) clearTimeout(existing);
-      const timer = setTimeout(() => {
-        fileTimers.delete(path);
-        void refresh(path).catch((error) =>
-          logger.warn("reanchor.watch.refresh.failed", {
-            path,
-            errorKind: (error as Error).name,
-          }),
-        );
-      }, fileDebounceMs);
-      fileTimers.set(path, timer);
-    };
-    if (forcePoll) {
-      installPollingWatcher(path, rooted, fire);
-      return;
-    }
-    // **Blocker 1 fix**: watch the PARENT directory and filter by
-    // basename. `fs.watch(file)` binds to the inode, so vim,
-    // Sublime, VS Code, `git checkout` and every atomic-save (write
-    // tmp + `renameSync` over the target) silently break the
-    // watcher — no more events, no error, and the polling fallback
-    // never arms. Watching the parent and matching the basename
-    // catches BOTH `change` events (in-place writes) and `rename`
-    // events (atomic replace, delete, recreate). The `filename`
-    // argument may be null on some kernels; when it is, we treat
-    // any event as a match and let the refresh's own mtime cache
-    // short-circuit the no-op case.
     const dir = dirname(rooted);
     const basename = basenameOf(rooted);
-    // A parent directory that does not exist yet (rare — the file
-    // was just written) fails `fs.watch`. Fall back to polling in
-    // that case; the caller can re-`ensureWatcher` once the dir
-    // exists.
+    let dw = dirWatchers.get(dir);
+    if (dw === undefined) {
+      dw = { basenames: new Map(), needsRebind: false };
+      dirWatchers.set(dir, dw);
+      installDirectoryWatcher(dir, dw);
+    }
+    dw.basenames.set(basename, path);
+    if (dw.pollStat !== undefined && !dw.pollStat.has(path)) {
+      // Prime the polling snapshot so the first tick after adding a
+      // new file to an existing polled dir does not fire spuriously.
+      dw.pollStat.set(path, safeStat(rooted));
+    }
+  }
+
+  /** Try `fs.watch(dir)`, fall back to polling on error. `needsRebind`
+   * is set when the directory disappears (probe G); the rebind loop
+   * below (`rebindMissingDirWatchers`) reinstalls the watcher when
+   * the dir returns. */
+  function installDirectoryWatcher(dir: string, dw: DirectoryWatcher): void {
+    if (forcePoll) {
+      installDirectoryPolling(dir, dw);
+      return;
+    }
+    if (!existsSync(dir)) {
+      dw.needsRebind = true;
+      installDirectoryPolling(dir, dw);
+      return;
+    }
     try {
-      const watcher = watch(dir, { persistent: false }, (_eventType, filename) => {
-        if (filename !== null && filename !== basename) return;
-        fire();
+      const watcher = watch(dir, { persistent: false }, (eventType, filename) => {
+        // Any event on the DIRECTORY itself (its own inode) — no
+        // `filename` on most kernels — dispatch to every threaded
+        // path. `filename === ''` happens on some macOS versions
+        // and is treated as a directory-level signal too.
+        if (filename === null || filename === "" || !dw.basenames.has(filename)) {
+          // Directory-level event or an untracked filename. If the
+          // dir was just removed, mark for rebind and fan out to
+          // every tracked path so `refresh` orphans them.
+          if (!existsSync(dir)) {
+            dw.needsRebind = true;
+            for (const p of dw.basenames.values()) fireForPath(p);
+            // Close the dead watcher; the rebind loop will reinstall.
+            try {
+              dw.watcher?.close();
+            } catch {
+              // Already closed.
+            }
+            dw.watcher = undefined;
+            return;
+          }
+          // Directory rename event with no filename → conservatively
+          // fan out to every tracked path.
+          if (eventType === "rename") {
+            for (const p of dw.basenames.values()) fireForPath(p);
+          }
+          return;
+        }
+        const targetPath = dw.basenames.get(filename)!;
+        fireForPath(targetPath);
       });
       watcher.on("error", () => {
-        // fs.watch failed after start; swap to polling silently. The
-        // debounce timer keeps whatever the last `fire()` scheduled.
         try {
           watcher.close();
         } catch {
           // Already closed.
         }
-        fileWatchers.delete(path);
-        installPollingWatcher(path, rooted, fire);
+        dw.watcher = undefined;
+        dw.needsRebind = true;
+        installDirectoryPolling(dir, dw);
       });
-      fileWatchers.set(path, {
-        close: () => {
-          try {
-            watcher.close();
-          } catch {
-            // Already closed.
-          }
-        },
-      });
+      dw.watcher = watcher;
+      dw.needsRebind = false;
+      // If a polling fallback was previously installed, tear it down
+      // — the fs.watch is now live.
+      if (dw.poll !== undefined) {
+        clearInterval(dw.poll);
+        dw.poll = undefined;
+        dw.pollStat = undefined;
+      }
     } catch {
-      installPollingWatcher(path, rooted, fire);
+      installDirectoryPolling(dir, dw);
     }
   }
 
-  function installPollingWatcher(path: string, rooted: string, fire: () => void): void {
-    // `path` is the map key we install under so tearDown finds us.
-    let lastMtime = -1;
-    let lastSize = -1;
+  /** Polling fallback for a directory. Compares (mtime, size) of
+   * each tracked file at `pollIntervalMs` and fires a refresh when
+   * either changes. A file that vanishes fires once so `refresh`
+   * (which does its own read + orphan) sees the deletion. */
+  function installDirectoryPolling(dir: string, dw: DirectoryWatcher): void {
+    if (dw.poll !== undefined) return;
+    dw.pollStat = new Map();
+    for (const [basename, path] of dw.basenames) {
+      void basename;
+      dw.pollStat.set(path, safeStat(repoRoot + "/" + path));
+    }
     const interval = setInterval(() => {
-      try {
-        const stat = statSync(rooted);
-        if (lastMtime === -1) {
-          lastMtime = stat.mtimeMs;
-          lastSize = stat.size;
-          return;
+      if (stopped) return;
+      for (const [basename, path] of dw.basenames) {
+        void basename;
+        const rooted = repoRoot + "/" + path;
+        const now = safeStat(rooted);
+        const prev = dw.pollStat!.get(path);
+        if (prev === undefined && now === undefined) continue;
+        if (prev === undefined || now === undefined) {
+          dw.pollStat!.set(path, now);
+          fireForPath(path);
+          continue;
         }
-        if (stat.mtimeMs !== lastMtime || stat.size !== lastSize) {
-          lastMtime = stat.mtimeMs;
-          lastSize = stat.size;
-          fire();
-        }
-      } catch {
-        // File gone — fire once so orphanAll runs on the next refresh.
-        if (lastMtime !== -1) {
-          lastMtime = -1;
-          lastSize = -1;
-          fire();
+        if (prev.mtimeMs !== now.mtimeMs || prev.size !== now.size) {
+          dw.pollStat!.set(path, now);
+          fireForPath(path);
         }
       }
     }, pollIntervalMs);
-    // `unref` so the interval does not keep the process alive on its
-    // own — the daemon's server keeps it up while active, and
-    // `stop()` clears the interval.
     (interval as unknown as { unref?: () => void }).unref?.();
-    fileWatchers.set(path, {
-      close: () => clearInterval(interval),
-    });
+    dw.poll = interval;
   }
 
-  function tearDownWatcher(path: string): void {
-    const watcher = fileWatchers.get(path);
-    if (watcher !== undefined) {
-      watcher.close();
-      fileWatchers.delete(path);
+  function safeStat(rooted: string): { mtimeMs: number; size: number } | undefined {
+    try {
+      const st = statSync(rooted);
+      return { mtimeMs: st.mtimeMs, size: st.size };
+    } catch {
+      return undefined;
     }
+  }
+
+  /** Remove `path` from its directory's watcher. If the directory
+   * has no more tracked paths, tear the whole watcher down. */
+  function tearDownWatcher(path: string): void {
+    const rooted = repoRoot + "/" + path;
+    const dir = dirname(rooted);
+    const basename = basenameOf(rooted);
+    const dw = dirWatchers.get(dir);
+    if (dw === undefined) return;
+    dw.basenames.delete(basename);
+    if (dw.pollStat !== undefined) dw.pollStat.delete(path);
     const timer = fileTimers.get(path);
     if (timer !== undefined) {
       clearTimeout(timer);
       fileTimers.delete(path);
+    }
+    if (dw.basenames.size === 0) {
+      try {
+        dw.watcher?.close();
+      } catch {
+        // Already closed.
+      }
+      if (dw.poll !== undefined) clearInterval(dw.poll);
+      dirWatchers.delete(dir);
     }
   }
 
@@ -667,8 +791,36 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       wanted.add(thread.anchor.path);
     }
     for (const path of wanted) ensureWatcher(path);
-    for (const path of [...fileWatchers.keys()]) {
+    // Tear down any tracked path no longer wanted. Iterate a
+    // snapshot of the map contents because `tearDownWatcher` may
+    // remove the directory entry when its basename set empties.
+    const trackedPaths: string[] = [];
+    for (const dw of dirWatchers.values()) {
+      for (const path of dw.basenames.values()) trackedPaths.push(path);
+    }
+    for (const path of trackedPaths) {
       if (!wanted.has(path)) tearDownWatcher(path);
+    }
+    // Rebind directory watchers whose parent came back. Cheap:
+    // touches only entries flagged `needsRebind`.
+    rebindMissingDirWatchers();
+  }
+
+  /** Reinstall any directory watcher whose parent directory has
+   * returned. Called from `reconcileWatchers` (a POST /api/threads
+   * has landed) and from the periodic build-watcher rebind probe
+   * (which already ticks every `DEFAULT_BUILD_REBIND_INTERVAL_MS`).
+   * The polling fallback for a missing dir keeps firing refreshes
+   * that orphan the thread; once the dir returns we swap back to
+   * the cheap `fs.watch` path. */
+  function rebindMissingDirWatchers(): void {
+    for (const [dir, dw] of dirWatchers) {
+      if (!dw.needsRebind) continue;
+      if (!existsSync(dir)) continue;
+      // Directory came back. If a polling fallback is running, keep
+      // it up until the fs.watch is confirmed installed — installer
+      // clears it on success.
+      installDirectoryWatcher(dir, dw);
     }
   }
 
@@ -679,6 +831,19 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * fresh watcher instead of dropping build signals forever. See PR
    * #45 round-2 nit. */
   let buildRebindTimer: ReturnType<typeof setInterval> | undefined;
+  /** Periodic probe that reinstalls a directory watcher whose parent
+   * came back after being removed (probe G: `rmdir docs && mkdir
+   * docs` while a thread is anchored under it). Same cadence as the
+   * build-watcher rebind, so a common shape for both. */
+  let dirRebindTimer: ReturnType<typeof setInterval> | undefined;
+  function armDirRebind(): void {
+    if (dirRebindTimer !== undefined || stopped) return;
+    dirRebindTimer = setInterval(() => {
+      if (stopped) return;
+      rebindMissingDirWatchers();
+    }, dirRebindIntervalMs);
+    (dirRebindTimer as unknown as { unref?: () => void }).unref?.();
+  }
   function installBuildWatcher(): void {
     if (distDir === undefined || stopped) return;
     if (!existsSync(distDir)) {
@@ -753,8 +918,19 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       clearInterval(buildRebindTimer);
       buildRebindTimer = undefined;
     }
-    for (const watcher of fileWatchers.values()) watcher.close();
-    fileWatchers.clear();
+    if (dirRebindTimer !== undefined) {
+      clearInterval(dirRebindTimer);
+      dirRebindTimer = undefined;
+    }
+    for (const dw of dirWatchers.values()) {
+      try {
+        dw.watcher?.close();
+      } catch {
+        // Already closed.
+      }
+      if (dw.poll !== undefined) clearInterval(dw.poll);
+    }
+    dirWatchers.clear();
     try {
       buildWatcher?.close();
     } catch {
@@ -768,6 +944,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
   // a fresh daemon has no threads yet; a restart's reconcile happens
   // in the background and never blocks the first request.
   installBuildWatcher();
+  armDirRebind();
   void reconcileWatchers().catch((error) =>
     logger.warn("reanchor.reconcile.failed", { errorKind: (error as Error).name }),
   );

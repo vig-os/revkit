@@ -362,7 +362,12 @@ export class SqliteThreadStore implements ThreadStore {
    * entirely before or entirely after the sweep — never mid-scan.
    * `retain` is treated as read-only. */
   gcSnapshots(retain: ReadonlySet<string>, graceMs: number = DEFAULT_SNAPSHOT_GC_GRACE_MS): number {
-    const cutoffMs = Date.now() - graceMs;
+    // Compare against the STORE's own clock, not `Date.now()`, so a
+    // test that pins the clock can drive the grace window
+    // deterministically (PR #45 round-3 nit). The clock returns an
+    // ISO-8601 string; `Date.parse` inverts it.
+    const nowMs = Date.parse(this.#clock());
+    const cutoffMs = nowMs - graceMs;
     // Turn the retain set into a stable, quoted SQL list. sqlite's
     // parameterised `IN (?, ?, …)` needs one placeholder per value,
     // which is awkward at scale; the retain set is small (one
