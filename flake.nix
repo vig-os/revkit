@@ -29,13 +29,36 @@
       nixpkgs,
       flake-utils,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    let
+      # ────────────────────────────────────────────────────────────────────
+      # revkit's own consumer-facing helpers (D1 / ADR-0010 / M5).
+      # System-independent, so they live outside `eachDefaultSystem`.
+      #
+      #   revkit.lib.hooks — reusable pre-commit hook definitions a
+      #     consumer flake merges into its devkit `hooks` block.
+      #   revkit.templates.default — `nix flake init -t github:vig-os/revkit`
+      #     scaffolds a minimal docs repo consuming this flake.
+      # ────────────────────────────────────────────────────────────────────
+      revkitLib = {
+        hooks = import ./nix/hooks.nix { inherit (nixpkgs) lib; };
+      };
+    in
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ vigos.overlays.default ];
           config.allowUnfree = true;
+        };
+
+        # revkit CLI package (ADR-0010, D1). Reproducible Bun build with
+        # a fixed-output node_modules derivation; see nix/revkit-package.nix
+        # for the split rationale. `nodeModulesHash` is captured after the
+        # first successful FOD build and bumped when `bun.lock` changes.
+        revkitPkg = pkgs.callPackage ./nix/revkit-package.nix {
+          src = ./.;
+          nodeModulesHash = "sha256-wQ6uaPMSryTssbHgS8mFxgaE+zVQdTCl0s01lWMzBHU=";
         };
 
         # ────────────────────────────────────────────────────────────────────
@@ -340,6 +363,43 @@
         # Future (upstream, opt-in): vigos may expose modular language shells —
         # e.g. `vigos.devShells.${system}.{cpp,geant4,dataAnalysis}` — that you
         # select without changing this scaffold. Out of scope today.
+
+        # revkit packages (D1 / ADR-0010 / M5). `nix build .#revkit` produces
+        # a reproducible `bin/revkit` that runs `--help`, `check` and `serve`
+        # outside the repo. `packages.default` points at the same drv so
+        # `nix build` and `nix run` work without an attribute name.
+        packages.revkit = revkitPkg;
+        packages.default = revkitPkg;
+
+        # `nix run .#revkit -- <args>` runs the CLI without a repo checkout
+        # (nix downloads the flake, builds `packages.revkit`, invokes the
+        # wrapper). Idiomatic per the flake schema.
+        apps.revkit = {
+          type = "app";
+          program = "${revkitPkg}/bin/revkit";
+        };
       }
-    );
+    ))
+    //
+      # System-independent outputs (lib.hooks, templates.default).
+      {
+        lib = revkitLib;
+
+        templates.default = {
+          path = ./templates/default;
+          description = "Minimal revkit docs repo — a docs/ example, vocab, revkit-check hook, and a flake consuming revkit.packages.";
+          welcomeText = ''
+            # Welcome to revkit
+
+            A minimal revkit docs repo has been scaffolded here.
+
+            Next steps:
+              direnv allow            # or: nix develop
+              revkit check            # run the ADR-0005 authoring guards
+              revkit serve            # boot the local review daemon (M2)
+
+            Docs: https://github.com/vig-os/revkit
+          '';
+        };
+      };
 }

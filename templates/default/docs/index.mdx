@@ -1,0 +1,42 @@
+---
+title: Welcome
+description: A minimal revkit docs repo scaffolded by `nix flake init -t github:vig-os/revkit`.
+---
+
+import { Aside } from "@astrojs/starlight/components";
+import { Callout } from "@revkit/components";
+
+<Aside type="tip">
+  Edit this file, then run `revkit check` and `revkit serve`. Comments a
+  reviewer leaves on a block reach your agent live.
+</Aside>
+
+## What this is
+
+This is a docs repository that consumes the revkit flake:
+
+- **Content** lives here as MDX. Only registered components are allowed
+  (ADR-0002); the CLI's authoring guards refuse hand-rolled HTML/CSS/JS.
+- **Vocabulary** is defined once in `vocab/terms.yaml`; `<Term id>`
+  references resolve there once the site build is wired in.
+- **`revkit check`** enforces the five authoring guards from ADR-0005:
+  component registry, no hand-rolled UI, vocabulary, links, plot
+  structure — plus the vendored-code contract from ADR-0022.
+- **`revkit serve`** boots the local review daemon on `127.0.0.1`; a
+  reviewer opens it in a browser and comments on any block. Comments
+  flow back to the authoring agent through the M2 MCP channel.
+
+## Three commands
+
+```bash
+direnv allow       # or: nix develop
+revkit check       # run the authoring guards
+revkit serve       # start the local review daemon
+```
+
+<Callout kind="note">
+  See the [revkit repo][revkit] for the full architecture (DESIGN-0001,
+  ADR-0001 to ADR-0025).
+</Callout>
+
+[revkit]: https://github.com/vig-os/revkit

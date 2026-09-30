@@ -1,0 +1,17 @@
+# Vocabulary for this docs repo — one place a term is defined
+# (DESIGN-0001 §3, revkit ADR-0005 C2). `<Term id="…">` references in
+# prose resolve here; a bold-defined phrase whose text matches a listed
+# `term` or one of its `aliases` trips the vocabulary guard.
+#
+# The `schemaVersion` field is required by `revkit check`; see the vocab
+# schema in @revkit/site for the current shape (ADR-0021).
+schemaVersion: 1
+entries:
+  - id: reviewer
+    term: reviewer
+    definition: >-
+      A human reading a rendered revkit doc who can comment on any
+      block; comments flow back to the agent, or (in PR review mode)
+      become GitHub PR review comments on the source line.
+    aliases:
+      - human reviewer
