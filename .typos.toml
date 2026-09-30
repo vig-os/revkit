@@ -18,6 +18,10 @@ BITAP = "BITAP"
 # lowercase plural suffix and reports the truncated stem. Not typos.
 INSER = "INSER"
 DELET = "DELET"
+# `teh` in the round-5 B5 fixture is a deliberate typo — the fixture
+# tests that fixing `teh` → `the` next to a quote lets the pipeline
+# re-anchor. Not a typo of `the`.
+teh = "teh"
 # CVE policy term (#637): a finding "unexcepted" = not in the exception register
 unexcepted = "unexcepted"
 # version-check.sh duration placeholder (#759): 'Nd' = N days (cf. Nw/Nh/Nm)

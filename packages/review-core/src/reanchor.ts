@@ -31,11 +31,8 @@
 //                      `alignMatchedText` walks the OLD quote's end
 //                      onto the new source and records the ACTUAL
 //                      matched text (Blocker 2 fix). Accept when the
-//                      best candidate's quote similarity ≥
-//                      `DEFAULT_MIN_QUOTE_SCORE` AND it beats EVERY
-//                      OTHER candidate in the window by
-//                      `DEFAULT_MIN_MARGIN` — regardless of whether
-//                      the others clear the gate. Never global.
+//                      quote similarity ≥ `DEFAULT_MIN_QUOTE_SCORE`.
+//                      Never global.
 //   (4c) deleted     — try `tryMove(...)`: search the new source for
 //                      an EXACT `prefix + exact + suffix` match with
 //                      substantial context (≥
@@ -507,28 +504,25 @@ function similarity(a: string, b: string): number {
   return denom === 0 ? 1 : 1 - distance / denom;
 }
 
-// ---------- Boundary + surroundings check (unchanged path) ----------
-
-/** How many bytes of immediate context must match verbatim on each
- * side of a span for the unchanged path to accept it. Catches the
- * K3 case (round-3 review): the anchor's exact quote is still there
- * (the `### Step` header) but the paragraph below was rewritten in
- * place; without this check the pipeline anchors to the kept header
- * while the comment's answer sits in the rewritten body. */
-const UNCHANGED_CONTEXT_CHECK_BYTES = 8;
+// ---------- Boundary-class check (unchanged path) ----------
 
 /**
- * Whether the immediate surroundings of the OLD span match the
- * immediate surroundings of the NEW span:
- *   - character class of the very next byte on each side (line
- *     boundary vs mid-line);
- *   - AND the next `UNCHANGED_CONTEXT_CHECK_BYTES` bytes on each
- *     side match byte-for-byte.
+ * Whether the immediate boundary of the OLD span matches the
+ * immediate boundary of the NEW span in CHARACTER CLASS: whether
+ * each side is at a line boundary (LF or file edge) or in the
+ * middle of a line.
  *
- * The class check alone catches the substring accident where the
- * quote appears embedded in a rewritten sentence. The byte-match
- * catches K3: the header is kept but the body immediately below
- * was rewritten in place.
+ * This catches the substring accident (E3) where the exact quote
+ * appears embedded in a rewritten sentence — the old quote was on
+ * a line by itself while the new location sits mid-sentence. That
+ * is a semantic move to a different context.
+ *
+ * A byte-for-byte context check was tried in round-4 and rejected:
+ * an edit within 8 chars of an unchanged quote (a comment's own
+ * answer — `must`→`should`, `teh`→`the`, `**validate**`, and so on)
+ * used to trip it and orphan the comment. The class check alone
+ * lets those edits re-anchor while still catching E3. See
+ * `test/reanchor.test.ts` fixtures B1–B15.
  */
 function boundariesMatch(
   oldSource: string,
@@ -542,22 +536,13 @@ function boundariesMatch(
   const newPre = newStart > 0 ? newSource.charCodeAt(newStart - 1) : -1;
   const oldPost = oldEnd < oldSource.length ? oldSource.charCodeAt(oldEnd) : -1;
   const newPost = newEnd < newSource.length ? newSource.charCodeAt(newEnd) : -1;
-  if (!sameBoundaryClass(oldPre, newPre)) return false;
-  if (!sameBoundaryClass(oldPost, newPost)) return false;
-  const n = UNCHANGED_CONTEXT_CHECK_BYTES;
-  const oldPreBytes = oldSource.slice(Math.max(0, oldStart - n), oldStart);
-  const newPreBytes = newSource.slice(Math.max(0, newStart - n), newStart);
-  if (oldPreBytes !== newPreBytes) return false;
-  const oldPostBytes = oldSource.slice(oldEnd, Math.min(oldSource.length, oldEnd + n));
-  const newPostBytes = newSource.slice(newEnd, Math.min(newSource.length, newEnd + n));
-  return oldPostBytes === newPostBytes;
+  return sameBoundaryClass(oldPre, newPre) && sameBoundaryClass(oldPost, newPost);
 }
 
 function sameBoundaryClass(a: number, b: number): boolean {
   const aBoundary = a === -1 || a === 10 /* \n */;
   const bBoundary = b === -1 || b === 10;
-  if (aBoundary !== bBoundary) return false;
-  return true;
+  return aBoundary === bBoundary;
 }
 
 // ---------- Old-span locator ----------
@@ -627,7 +612,12 @@ export async function prepareReanchor(
   dmp.Diff_Timeout = options.diffTimeoutSeconds ?? DEFAULT_DIFF_TIMEOUT_SECONDS;
   const diffs = dmp.diff_main(oldLF, newLF) as Diff[];
   dmp.diff_cleanupSemantic(diffs);
-  return {
+  // Freeze the context so a caller (item 5b, or a test) cannot
+  // mutate the shared diff or the shared line indices while another
+  // in-flight `reanchorWith` call is walking them. `Object.freeze`
+  // is shallow, but the arrays and strings inside are treated as
+  // read-only by the pipeline and never appended to.
+  return Object.freeze({
     oldLF,
     newLF,
     oldRevision,
@@ -635,7 +625,7 @@ export async function prepareReanchor(
     diffs,
     oldLineIndex: buildLineStartIndex(oldLF),
     newLineIndex: buildLineStartIndex(newLF),
-  };
+  });
 }
 
 /**

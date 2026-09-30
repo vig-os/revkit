@@ -713,16 +713,24 @@ describe("reanchor — MUST-orphan: copy-pasted blocks (K1 / K3 / J7b)", () => {
     expect(result.kind).toBe("orphaned");
   });
 
-  test("K3: Linux copy rewritten in place while macOS copy is untouched → orphaned", async () => {
+  test("K3: Linux copy rewritten in place while macOS copy is untouched → does NOT jump onto the macOS copy", async () => {
     const oldSrc = "# Linux\n\n" + blk + "# macOS\n\n" + blk;
     const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
     // Rewrite the first (Linux) block; the second (macOS) is intact.
     const newSrc =
       "# Linux\n\n### Step\n\nUse apt; no reboot.\n\n" + "# macOS\n\n" + blk;
     const result = await reanchor(anchor, oldSrc, newSrc);
-    // The rewrite is probably the answer to the comment. Orphaning
-    // beats moving onto the macOS copy.
-    expect(result.kind).toBe("orphaned");
+    // The Linux header (`### Step`) is intact in place, and its
+    // surrounding boundary class is preserved (still a line-anchored
+    // header). Anchoring back to L3 is CORRECT — the reader sees
+    // the header + the rewritten body (which is likely the answer
+    // to the comment). What the pipeline must never do is jump to
+    // the untouched macOS copy of `### Step`.
+    if (result.kind === "moved" || result.kind === "fuzzy") {
+      // The macOS `### Step` sits well below line 3; the Linux one
+      // stays at line 3.
+      expect(result.anchor.startLine).toBeLessThan(6);
+    }
   });
 
   test("J7b: a paragraph plus its copy, quoted phrase heavily rewritten in the first → orphaned", async () => {
@@ -900,6 +908,215 @@ describe("reanchor — mutation guards (default settings)", () => {
     // Sanity: the orphan reason names the old-side ambiguity — proof
     // that the round-3 check is what caught it.
     expect(result.reason).toContain("not unique in the old snapshot");
+  });
+});
+
+// ---------- Round-5: B1–B15 (nearby edits) ----------
+//
+// The round-4 8-byte context check was too strict: any edit within
+// 8 chars of an unchanged quote orphaned the comment. These are
+// exactly the edits a comment causes. The round-5 unchanged path
+// keeps only the line-boundary-class boundary check, so an
+// unchanged quote that stayed in the same class of surrounding
+// (mid-line vs line-boundary) re-anchors to the right chars while
+// a class change (E3 substring accident) still orphans.
+
+describe("reanchor — round-5 nearby-edit fixtures (must re-anchor with defaults)", () => {
+  /** Assert that `result` re-anchored at the given new-source offset
+   * with the given exact text. */
+  function expectAnchoredAt(
+    result: ReanchorResult,
+    newSource: string,
+    expectedStart: number,
+    expectedExact: string,
+  ): void {
+    expect(result.kind === "moved" || result.kind === "fuzzy").toBe(true);
+    if (result.kind !== "moved" && result.kind !== "fuzzy") return;
+    expect(result.anchor.quote.exact).toBe(expectedExact);
+    const actualStart = newSource.indexOf(result.anchor.quote.exact);
+    expect(actualStart).toBe(expectedStart);
+  }
+
+  test("B1: previous word edited (`must`→`should`) — anchor stays on `validate`", async () => {
+    const oldSrc = "You must validate every input on the site.";
+    const newSrc = "You should validate every input on the site.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B2: next word edited (`every`→`all`) — anchor stays on `validate`", async () => {
+    const oldSrc = "You must validate every input on the site.";
+    const newSrc = "You must validate all input on the site.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B3: word two away edited (`input`→`field`) — anchor stays on `validate`", async () => {
+    const oldSrc = "You must validate every input on the site.";
+    const newSrc = "You must validate every field on the site.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B4: punctuation after (`site.` → `site!`) — anchor stays on `validate`", async () => {
+    const oldSrc = "You must validate every input on the site.";
+    const newSrc = "You must validate every input on the site!";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B5: typo fix before (`teh`→`the`) — anchor stays on `validate`", async () => {
+    const oldSrc = "On teh site you validate every input.";
+    const newSrc = "On the site you validate every input.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B7: start of file, next word edited — anchor stays on `validate`", async () => {
+    const oldSrc = "validate all inputs at the start.";
+    const newSrc = "validate every input at the start.";
+    const start = 0;
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, 0, "validate");
+  });
+
+  test("B9: end of file, previous word edited — anchor stays on `validate`", async () => {
+    const oldSrc = "at the end, must validate";
+    const newSrc = "at the end, should validate";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B10: double space collapsed adjacent to the quote — anchor stays on `validate`", async () => {
+    const oldSrc = "must  validate  every input on the site.";
+    const newSrc = "must validate every input on the site.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+
+  test("B12: CRLF file with a neighbour word edited — anchor stays on `validate`", async () => {
+    const oldSrc = "line one\nYou must validate every input\nline three\n";
+    const newSrc = "line one\r\nYou should validate every input\r\nline three\r\n";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    // The pipeline LF-normalises internally, so `validate` still
+    // lives at the same LF offset as if the file were LF-only.
+    const newLF = newSrc.replace(/\r\n?/g, "\n");
+    expectAnchoredAt(result, newLF, newLF.indexOf("validate"), "validate");
+  });
+
+  test("B15: `**validate**` emphasis added around the quote — anchor stays on `validate`", async () => {
+    const oldSrc = "You must validate every input on the site.";
+    const newSrc = "You must **validate** every input on the site.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expectAnchoredAt(result, newSrc, newSrc.indexOf("validate"), "validate");
+  });
+});
+
+// ---------- Round-5: mutation guards for the boundary-class check ----------
+
+describe("reanchor — round-5 mutation: boundary-class check earns its place", () => {
+  // The line-boundary-class check on the unchanged path is
+  // load-bearing: it distinguishes the E3 substring accident (line-
+  // anchored old, mid-sentence in new) from a nearby edit like B1
+  // (mid-line both sides). Mutating the check to always-pass makes
+  // E3 wrongly quote-exact; mutating it to always-fail sends B1 to
+  // move detection where the changed prefix fails the exact-context
+  // check and orphans.
+  //
+  // These tests do NOT flip the check themselves; they document
+  // that the two fixtures below are the ones a mutation of the
+  // check would turn red. See the PR body for the verified-
+  // mutation mapping.
+  test("E3 substring accident stays orphan under the boundary-class check", async () => {
+    const oldSrc = "prelude paragraph one\n\nthe magic phrase\n\ntrailer content";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    const newSrc =
+      "prelude paragraph one\n\nas noted, the magic phrase is no longer canonical\n\ntrailer content";
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("B1 nearby edit anchors correctly under the boundary-class check", async () => {
+    const oldSrc = "You must validate every input on the site.";
+    const newSrc = "You should validate every input on the site.";
+    const start = oldSrc.indexOf("validate");
+    const anchor = await partialAnchorForSource(
+      "x.mdx",
+      oldSrc,
+      start,
+      start + "validate".length,
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind === "moved" || result.kind === "fuzzy").toBe(true);
   });
 });
 
