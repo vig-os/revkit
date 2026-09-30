@@ -20,12 +20,16 @@
 //   diff_match_patch;`. Both Bun and esbuild surface the class through
 //   the named-import shape below without any interop shim.
 //
-// The `@ts-ignore` on the sole `import` line is the entire scope of
-// the type suppression — the rest of the workspace consumes
+// The `@ts-expect-error` on the sole `import` line is the entire
+// scope of the type suppression — the rest of the workspace consumes
 // `DiffMatchPatch` through the narrow, well-typed interface exported
-// here, so no `any` escapes.
-// @ts-ignore -- 'diff-match-patch' ships CJS-only types (see file
-// comment above); the runtime shape is verified in
+// here, so no `any` escapes. Using `@ts-expect-error` (not
+// `@ts-ignore`) means if a future change gives `diff-match-patch`
+// ESM-shaped types that DO compose with `verbatimModuleSyntax`, this
+// suppression becomes a compile error itself and the reviewer of
+// that change is forced to delete it — no stale ignores linger.
+// @ts-expect-error -- 'diff-match-patch' ships CJS-only types (see
+// file comment above); the runtime shape is verified in
 // `test/browser-build.test.ts` and `test/reanchor.test.ts`.
 import { diff_match_patch as diffMatchPatchRuntime } from "diff-match-patch";
 
@@ -67,6 +71,11 @@ export interface DiffMatchPatch {
   /** Levenshtein distance between the two texts represented by
    * `diffs` (= number of edited characters). */
   diff_levenshtein(diffs: Diff[]): number;
+  /** Re-align long DELETE/INSERT pairs onto semantic boundaries
+   * (word/line) so the diff is more useful for downstream
+   * heuristics. Called after `diff_main` in the re-anchoring
+   * pipeline (ADR-0006 acceptance amendment 2026-09-30). */
+  diff_cleanupSemantic(diffs: Diff[]): void;
   /** Given a location in `text1`, find the equivalent location in
    * `text2` under `diffs`. Used to walk an old-string offset onto
    * the new string it maps to. */

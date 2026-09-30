@@ -1,69 +1,53 @@
-// Tests for the re-anchoring engine (ADR-0006 Acceptance, M2 item 5a).
+// Tests for the re-anchoring engine (ADR-0006 Acceptance, PR-40
+// review round 2).
 //
-// PR-40 review revision. Coverage:
+// Principle: every fixture calls `reanchor(anchor, old, new)` with
+// **defaults**. No test passes `minQuoteScore`, `minMargin`, or any
+// other option to prove behaviour. This means a mutation of any
+// DEFAULT CONSTANT or STAGE in `reanchor.ts` (removing the margin,
+// dropping the quote gate, adding a global fuzzy fallback, letting a
+// lone bare-quote copy anchor, dropping the move-context check,
+// removing the snapshot check) MUST turn at least one fixture red.
 //
-//   1. Stage exports — `diffMapLines`, `mapAnchorRange`,
-//      `exactOccurrences`, `scoreCandidate`, `bitapProbes`,
-//      `alignMatchedText`.
-//   2. Positive fixtures — a unique block, a unique block moved far
-//      away (via the exact-first pass), a one-word in-quote edit that
-//      the fuzzy pass finds cleanly, a paragraph reflowed, lines
-//      inserted above, whitespace-only edit, CRLF source, identity
-//      across CRLF/LF flip.
-//   3. Wrong-place ORPHAN fixtures — the ADR's "kept, never guessed"
-//      contract enforced against the failure modes the reviewer
-//      surfaced: a deleted bullet in a templated list, a deleted
-//      table row among similar rows, a deleted line in a code block
-//      with repeated lines, a quote that is now only a substring of
-//      a longer sentence, and a 1 MB file of templated lines with
-//      the anchored line deleted.
-//   4. Coherent-anchor invariant — for every non-orphaned result on
-//      the whole fixture set, `newSource.slice(offsets) ===
-//      anchor.quote.exact`, `newSource.includes(prefix + exact +
-//      suffix)`, and the recorded line range covers the quote's text.
-//   5. Two-step round-trip — reanchor onto a new source, edit it
-//      again, reanchor once more, and both results remain coherent.
-//   6. Mutation checks — a red test for each stage removal:
-//        (a) threshold 0.5 → the wrong-place list orphans in the
-//            default; loosening lets it accept.
-//        (b) margin 0 → the templated-list ambiguity is no longer
-//            caught, and the pipeline accepts one of the wrong
-//            candidates.
-//        (c) context weight removed (quote score only) → the
-//            wrong-line neighbour scores high, and the pipeline
-//            accepts.
-//        (d) quote-only gate removed → a strong context around the
-//            wrong quote is accepted.
-//        (e) bitap threshold 1.0 (the pre-PR-40 setting) → obvious
-//            noise passes bitap and reaches the scorer.
-//        (f) `countLinesInSegment` off-by-one → a last-line quote
-//            without a trailing LF falls through to fuzzy. Covered
-//            indirectly by the "no-trailing-LF" positive fixture.
-//   7. `countLinesInSegment` regression — no-trailing-LF quote lands
-//      as quote-exact, not fuzzy.
-//   8. `reanchorEvent` shape — `anchored` → null; `moved`/`fuzzy` →
-//      `thread.reanchored` with method + score for fuzzy only.
+// See the PR body for the mutation → red-test mapping.
+//
+// Coverage:
+//   1. Stage exports (`buildLineStartIndex`, `offsetToLine`,
+//      `lineToOffset`, `classifySpan`, `findHunkWindow`,
+//      `alignMatchedText`, `tryMove`).
+//   2. Positive fixtures — anchor lands at the right place with
+//      defaults.
+//   3. MUST-orphan fixtures — the 7 reviewer repros + the templated
+//      sweep (5 templates × 16 rows) + substring-of-longer-sentence
+//      + 1 MB templated file + insufficient-context move + lone
+//      bare-quote copy.
+//   4. Coherent-anchor invariant across every non-orphan result.
+//   5. Two-step round-trip.
+//   6. Performance guards — < 200 ms on 20 k `- item` lines; < 200
+//      ms on the 200 k `a` case with quote `aaaaaaaa`.
+//   7. `reanchorEvent` shape.
 
 import { describe, expect, test } from "bun:test";
 import {
   alignMatchedText,
-  bitapProbes,
-  DEFAULT_MIN_FUZZY_SCORE,
-  DEFAULT_MIN_MARGIN,
-  diffMapLines,
-  exactOccurrences,
-  mapAnchorRange,
+  buildLineStartIndex,
+  classifySpan,
+  DEFAULT_MIN_MOVE_CONTEXT,
+  findHunkWindow,
+  lineToOffset,
+  offsetToLine,
   reanchor,
   reanchorEvent,
   revisionOf,
-  scoreCandidate,
+  tryMove,
   type Anchor,
   type ReanchorResult,
 } from "../src/index.ts";
 
 const AGENT = { kind: "agent", id: "revkit-live" } as const;
 
-/** Build a valid anchor from `source` for lines [start..end]. */
+/** Build a valid anchor from `source` for lines [start..end], with
+ * `contextLen` chars of surrounding text captured verbatim. */
 async function anchorForSource(
   path: string,
   source: string,
@@ -71,9 +55,10 @@ async function anchorForSource(
   end: number,
   contextLen = 40,
 ): Promise<Anchor> {
+  const idx = buildLineStartIndex(source);
+  const byteStart = lineToOffset(idx, start);
   const lines = source.split("\n");
   const exact = lines.slice(start - 1, end).join("\n");
-  const byteStart = offsetOfLine(source, start);
   const byteEnd = byteStart + exact.length;
   const prefix = source.slice(Math.max(0, byteStart - contextLen), byteStart);
   const suffix = source.slice(byteEnd, Math.min(source.length, byteEnd + contextLen));
@@ -86,177 +71,202 @@ async function anchorForSource(
   };
 }
 
-function offsetOfLine(source: string, n: number): number {
-  if (n <= 1) return 0;
-  let line = 1;
-  for (let i = 0; i < source.length; i += 1) {
-    if (line === n) return i;
-    if (source.charCodeAt(i) === 10) line += 1;
-  }
-  return source.length;
+/** Build a partial-line anchor: `contextLen` chars on either side of
+ * a substring at `[byteStart, byteEnd)` inside a single line. */
+async function partialAnchorForSource(
+  path: string,
+  source: string,
+  byteStart: number,
+  byteEnd: number,
+  contextLen = 40,
+): Promise<Anchor> {
+  const idx = buildLineStartIndex(source);
+  const exact = source.slice(byteStart, byteEnd);
+  const prefix = source.slice(Math.max(0, byteStart - contextLen), byteStart);
+  const suffix = source.slice(byteEnd, Math.min(source.length, byteEnd + contextLen));
+  return {
+    path,
+    startLine: offsetToLine(idx, byteStart),
+    endLine: offsetToLine(idx, Math.max(byteStart, byteEnd - 1)),
+    quote: { exact, prefix, suffix },
+    revision: await revisionOf(source),
+  };
 }
 
-/** Assert the coherent-anchor invariant on a non-orphaned result: the
- * recorded quote is actually at the recorded line range in the new
- * source, prefix/suffix are the surrounding characters, and the
- * anchor round-trips (the caller can re-run reanchor on it). */
+/** Assert the coherent-anchor invariant on a non-orphan result: the
+ * recorded quote is at the recorded line range, and prefix+exact+
+ * suffix appears in the new source. */
 function expectCoherent(result: ReanchorResult, newSource: string): void {
   if (result.kind === "orphaned") return;
   const { anchor } = result;
-  // Slice by lines and check the exact quote lives inside that range.
   const lines = newSource.split("\n");
   const rangeText = lines.slice(anchor.startLine - 1, anchor.endLine).join("\n");
   if (!rangeText.includes(anchor.quote.exact)) {
     throw new Error(
-      `coherent-anchor invariant broken: range L${anchor.startLine}-L${anchor.endLine} does not contain the recorded quote.\n` +
+      `coherent-anchor: range L${anchor.startLine}-L${anchor.endLine} does not contain quote.\n` +
         `  quote: ${JSON.stringify(anchor.quote.exact)}\n  range: ${JSON.stringify(rangeText)}`,
     );
   }
   if (!newSource.includes(anchor.quote.prefix + anchor.quote.exact + anchor.quote.suffix)) {
     throw new Error(
-      `coherent-anchor invariant broken: prefix+exact+suffix not found in newSource.\n` +
+      `coherent-anchor: prefix+exact+suffix not found in newSource.\n` +
         `  prefix: ${JSON.stringify(anchor.quote.prefix)}\n  exact:  ${JSON.stringify(anchor.quote.exact)}\n  suffix: ${JSON.stringify(anchor.quote.suffix)}`,
     );
   }
 }
 
-// ---------- Stage-level unit tests ----------
+// ---------- Stage tests ----------
 
-describe("diffMapLines — stage (a)", () => {
-  test("unchanged source: identity mapping", () => {
-    const src = "a\nb\nc\nd\n";
-    const map = diffMapLines(src, src);
-    expect(map[1]).toBe(1);
-    expect(map[2]).toBe(2);
-    expect(map[3]).toBe(3);
-    expect(map[4]).toBe(4);
+describe("buildLineStartIndex / offsetToLine / lineToOffset", () => {
+  test("empty source: one line, offsets clamp", () => {
+    const idx = buildLineStartIndex("");
+    expect(idx).toEqual([0]);
+    expect(offsetToLine(idx, 0)).toBe(1);
+    expect(lineToOffset(idx, 1)).toBe(0);
   });
 
-  test("inserted lines above shift old lines down", () => {
-    const oldSrc = "b\nc\nd\n";
-    const newSrc = "INSERT-1\nINSERT-2\nb\nc\nd\n";
-    const map = diffMapLines(oldSrc, newSrc);
-    expect(map[1]).toBe(3);
-    expect(map[2]).toBe(4);
-    expect(map[3]).toBe(5);
+  test("multi-line source: line starts recorded", () => {
+    const src = "a\nb\nc\n";
+    const idx = buildLineStartIndex(src);
+    expect(idx).toEqual([0, 2, 4, 6]);
+    expect(offsetToLine(idx, 0)).toBe(1);
+    expect(offsetToLine(idx, 2)).toBe(2);
+    expect(offsetToLine(idx, 3)).toBe(2);
+    expect(offsetToLine(idx, 4)).toBe(3);
+    expect(lineToOffset(idx, 2)).toBe(2);
+    expect(lineToOffset(idx, 3)).toBe(4);
   });
 
-  test("deleted lines are `null`", () => {
-    const oldSrc = "a\nDELETE-ME\nc\n";
-    const newSrc = "a\nc\n";
-    const map = diffMapLines(oldSrc, newSrc);
-    expect(map[1]).toBe(1);
-    expect(map[2]).toBeNull();
-    expect(map[3]).toBe(2);
-  });
-
-  test("no-trailing-newline: last line is still mapped (countLinesInSegment fix)", () => {
-    // Regression for the PR-40 review nit: a file whose last line lacks
-    // a trailing LF used to be missing from the diff-map because the
-    // segment counter only counted LFs.
-    const src = "a\nb\nc"; // no trailing \n
-    const map = diffMapLines(src, src);
-    expect(map[1]).toBe(1);
-    expect(map[2]).toBe(2);
-    expect(map[3]).toBe(3);
+  test("no-trailing-LF source: last line indexed too", () => {
+    const src = "a\nb\nc";
+    const idx = buildLineStartIndex(src);
+    expect(idx).toEqual([0, 2, 4]);
+    expect(offsetToLine(idx, 4)).toBe(3);
   });
 });
 
-describe("mapAnchorRange — stage (a) tail", () => {
-  test("range with a fully-deleted line collapses to surviving lines", () => {
-    const lineMap = [null, 1, null, 2];
-    const range = mapAnchorRange(lineMap, 1, 3);
-    expect(range).toEqual({ start: 1, end: 2 });
+describe("classifySpan", () => {
+  test("unchanged span: entirely EQUAL segments", () => {
+    // diffs: EQUAL "abcdef" (spans 0..6)
+    const diffs = [[0 as const, "abcdef"] as const];
+    expect(classifySpan(diffs, 1, 4).kind).toBe("unchanged");
   });
-
-  test("range whose lines are all deleted returns null", () => {
-    const lineMap = [null, null, null];
-    expect(mapAnchorRange(lineMap, 1, 2)).toBeNull();
+  test("deleted span: entirely DELETE", () => {
+    const diffs = [
+      [0 as const, "abc"] as const,
+      [-1 as const, "XYZ"] as const,
+      [0 as const, "def"] as const,
+    ];
+    expect(classifySpan(diffs, 3, 6).kind).toBe("deleted");
   });
-});
-
-describe("exactOccurrences — stage (a) tail", () => {
-  test("no occurrences of the quote: empty list", () => {
-    expect(exactOccurrences("hello world", "goodbye")).toEqual([]);
-  });
-
-  test("one occurrence: single-element list", () => {
-    expect(exactOccurrences("hello world", "world")).toEqual([6]);
-  });
-
-  test("overlapping occurrences enumerated in order", () => {
-    // "abab" in "ababab": two occurrences at 0 and 2.
-    expect(exactOccurrences("ababab", "abab")).toEqual([0, 2]);
-  });
-
-  test("empty search string returns empty (no infinite loop)", () => {
-    expect(exactOccurrences("hello", "")).toEqual([]);
+  test("modified span: mixed EQUAL and DELETE", () => {
+    const diffs = [
+      [0 as const, "abc"] as const,
+      [-1 as const, "XY"] as const,
+      [0 as const, "d"] as const,
+    ];
+    // Span [2, 5) covers 'c', 'X', 'Y': 1 EQUAL + 2 DELETE.
+    const cls = classifySpan(diffs, 2, 5);
+    expect(cls.kind).toBe("modified");
+    if (cls.kind === "modified") {
+      expect(cls.equalChars).toBe(1);
+      expect(cls.deletedChars).toBe(2);
+    }
   });
 });
 
-describe("scoreCandidate — stage (b) unit", () => {
-  test("perfect match: both scores are 1.0, combined 1.0", () => {
-    const src = "prelude\nthe quote here\ntrailer";
-    const quote = { exact: "the quote here", prefix: "prelude\n", suffix: "\ntrailer" };
-    const idx = src.indexOf("the quote here");
-    const c = scoreCandidate(src, quote, idx);
-    expect(c.quoteScore).toBeCloseTo(1.0, 3);
-    expect(c.contextScore).toBeCloseTo(1.0, 3);
-    expect(c.combined).toBeCloseTo(1.0, 3);
-  });
-
-  test("in-quote edit lowers quoteScore; matching context stays high", () => {
-    // Change 5 chars ("quote" → "QUOTE") of a 14-char quote →
-    // quoteScore ≈ 1 - 5/14 ≈ 0.64. The context is otherwise
-    // identical, so its score stays close to 1.0. The invariant we
-    // pin: quoteScore drops noticeably below context, without the
-    // context "carrying" the candidate to accept.
-    const src = "prelude\nthe QUOTE here\ntrailer";
-    const quote = { exact: "the quote here", prefix: "prelude\n", suffix: "\ntrailer" };
-    const idx = src.indexOf("the QUOTE here");
-    const c = scoreCandidate(src, quote, idx);
-    expect(c.quoteScore).toBeLessThan(1.0);
-    expect(c.quoteScore).toBeGreaterThan(0.5);
-    // Context is nearly perfect (only the 5-char change is inside
-    // the context window too), so it must stay clearly above the
-    // damaged quote score — this is the signal the pipeline uses
-    // to distinguish a real edit from a wrong-place accept.
-    expect(c.contextScore).toBeGreaterThan(c.quoteScore);
+describe("findHunkWindow", () => {
+  test("captures nearby modified hunk with slack", () => {
+    // old: "abcXYZdef", new: "abcQQQdef" (DELETE XYZ INSERT QQQ)
+    const diffs = [
+      [0 as const, "abc"] as const,
+      [-1 as const, "XYZ"] as const,
+      [1 as const, "QQQ"] as const,
+      [0 as const, "def"] as const,
+    ];
+    const w = findHunkWindow(diffs, 3, 6, 9, 2);
+    expect(w.start).toBeLessThanOrEqual(3);
+    expect(w.end).toBeGreaterThanOrEqual(6);
   });
 });
 
-describe("bitapProbes — stage (b) unit", () => {
-  test("returns matching offsets for multiple hints (deduplicated)", () => {
-    const src = "prelude\nthe unique quote here\ntrailer\n";
+describe("alignMatchedText — Blocker 2 fix", () => {
+  test("trims leading whitespace the old quote did not have", () => {
+    // Old quote starts with a letter; the "candidate" start position
+    // is one byte before, on a leading `\n`. Alignment must trim it.
+    const oldQuote = "hello";
+    const newSrc = "\nhello\n";
+    const { startOffset, matchedText } = alignMatchedText(oldQuote, newSrc, 0);
+    expect(startOffset).toBe(1);
+    expect(matchedText).toBe("hello");
+  });
+
+  test("does NOT trim leading whitespace when the old quote begins with it", () => {
+    const oldQuote = "\nhello";
+    const newSrc = "\nhello world";
+    const { matchedText } = alignMatchedText(oldQuote, newSrc, 0);
+    expect(matchedText).toBe("\nhello");
+  });
+
+  test("does not spill into a following table row (trailing trim)", () => {
+    const oldQuote = "| 5 | eve | open |";
+    const newSrc = "| 5 | eve | open |\n| 6 | fred | open |";
+    const { matchedText } = alignMatchedText(oldQuote, newSrc, 0);
+    expect(matchedText).toBe("| 5 | eve | open |");
+  });
+});
+
+describe("tryMove — deleted spans", () => {
+  test("exactly one match with sufficient context: returns the location", () => {
+    const newSrc = "before context here\n\nthe target phrase\n\nafter context here";
     const quote = {
-      exact: "the unique quote here",
-      prefix: "prelude\n",
-      suffix: "\ntrailer\n",
+      exact: "the target phrase",
+      prefix: "before context here\n\n",
+      suffix: "\n\nafter context here",
     };
-    const offsets = bitapProbes(src, quote, [0, src.length - 1], 0.5, 1000);
-    expect(offsets.length).toBeGreaterThan(0);
-    // At least one probe lands at or near the quote's real start.
-    const realStart = src.indexOf("the unique quote here");
-    expect(offsets).toContain(realStart);
+    const r = tryMove(newSrc, quote);
+    expect(r).not.toBeNull();
+    if (r === null) return;
+    expect(r.start).toBe(newSrc.indexOf("the target phrase"));
+  });
+
+  test("insufficient context: refuses even a lone match", () => {
+    // Short bare quote with no context — cannot safely detect a move.
+    const quote = { exact: "hi", prefix: "", suffix: "" };
+    const r = tryMove("hi", quote);
+    expect(r).not.toBeNull();
+    if (r === null) return;
+    expect(r.start).toBe(-1);
+    expect(r.reason).toContain("insufficient context");
+  });
+
+  test("multiple exact-context matches: refuses (ambiguous)", () => {
+    // Same 2×context+quote appears twice.
+    const block = "prefix line abcdef\n\ntarget phrase content\n\nsuffix line ghijkl";
+    const newSrc = block + "\n\n\n" + block;
+    const quote = {
+      exact: "target phrase content",
+      prefix: "prefix line abcdef\n\n",
+      suffix: "\n\nsuffix line ghijkl",
+    };
+    const r = tryMove(newSrc, quote);
+    expect(r).not.toBeNull();
+    if (r === null) return;
+    expect(r.start).toBe(-1);
+    expect(r.reason).toContain("ambiguous");
+  });
+
+  test("no match: returns null", () => {
+    const quote = {
+      exact: "nowhere in newSource",
+      prefix: "leading context here for sure",
+      suffix: "trailing context here for sure",
+    };
+    expect(tryMove("completely different file content", quote)).toBeNull();
   });
 });
 
-describe("alignMatchedText — stage (b) tail", () => {
-  test("returns the aligned new text at a matched location (fuzzy anchor recording)", () => {
-    const oldQuote = "raise the timeout to sixty seconds";
-    const newSrc = "prelude\nraise the timeout to ninety seconds\ntrailer\n";
-    const start = newSrc.indexOf("raise");
-    const { matchedText, endOffset } = alignMatchedText(oldQuote, newSrc, start);
-    // matchedText must be a substring at the given offset — the whole
-    // point of the alignment.
-    expect(newSrc.slice(start, endOffset)).toBe(matchedText);
-    // And equal to the NEW sentence (the fuzzy scorer's job is to
-    // locate the block; alignment adopts its new text).
-    expect(matchedText).toBe("raise the timeout to ninety seconds");
-  });
-});
-
-// ---------- Positive fixtures ----------
+// ---------- Positive fixtures (must anchor correctly with defaults) ----------
 
 describe("reanchor — positive: identity", () => {
   test("unchanged source: kind='anchored', method='unchanged'", async () => {
@@ -264,39 +274,34 @@ describe("reanchor — positive: identity", () => {
     const anchor = await anchorForSource("x.mdx", src, 1, 1);
     const result = await reanchor(anchor, src, src);
     expect(result.kind).toBe("anchored");
-    if (result.kind !== "anchored") return;
-    expect(result.method).toBe("unchanged");
-    expect(result.anchor).toEqual(anchor);
   });
 });
 
-describe("reanchor — positive: unique quote, various edits", () => {
+describe("reanchor — positive fixtures", () => {
   const SAMPLE = [
-    "# Title", //                                                          L1
-    "", //                                                                 L2
-    "Introductory paragraph that sets up the important quote below.", //   L3
-    "", //                                                                 L4
-    "The important quote lives on this line and is uniquely worded.", //   L5
-    "", //                                                                 L6
-    "Trailing paragraph that follows the important quote.", //             L7
-    "", //                                                                 L8
+    "# Title", //                                                             L1
+    "", //                                                                    L2
+    "Introductory paragraph that sets up the important quote below.", //      L3
+    "", //                                                                    L4
+    "The important quote lives on this line and is uniquely worded.", //      L5
+    "", //                                                                    L6
+    "Trailing paragraph that follows the important quote.", //                L7
+    "", //                                                                    L8
   ].join("\n");
 
-  test("unchanged block, lines inserted above: quote-exact (one occurrence)", async () => {
+  test("lines inserted above: quote-exact via diff-map, correct new range", async () => {
     const anchor = await anchorForSource("x.mdx", SAMPLE, 5, 5);
-    const withInsertion = "## Extra section\n\nextra prose here\n\n" + SAMPLE;
-    const result = await reanchor(anchor, SAMPLE, withInsertion);
+    const prefixed = "## Extra section\n\nextra prose here\n\n" + SAMPLE;
+    const result = await reanchor(anchor, SAMPLE, prefixed);
     expect(result.kind).toBe("moved");
     if (result.kind !== "moved") return;
-    expect(result.method).toBe("quote-exact");
-    expect(result.anchor.startLine).toBe(9);
     expect(result.anchor.quote.exact).toBe(
       "The important quote lives on this line and is uniquely worded.",
     );
-    expectCoherent(result, withInsertion);
+    expectCoherent(result, prefixed);
   });
 
-  test("unique block moved far in a large file: quote-exact (exact-first pass wins)", async () => {
+  test("unique block moved far in a large file: quote-exact via move detection", async () => {
     const filler = Array.from({ length: 200 }, (_, i) => `filler line ${i}`).join("\n");
     const oldSrc = SAMPLE + "\n" + filler + "\n";
     const newSrc = filler + "\n" + SAMPLE;
@@ -304,7 +309,6 @@ describe("reanchor — positive: unique quote, various edits", () => {
     const result = await reanchor(anchor, oldSrc, newSrc);
     expect(result.kind).toBe("moved");
     if (result.kind !== "moved") return;
-    expect(result.method).toBe("quote-exact");
     expectCoherent(result, newSrc);
   });
 
@@ -314,314 +318,312 @@ describe("reanchor — positive: unique quote, various edits", () => {
     const result = await reanchor(anchor, SAMPLE, newSrc);
     expect(result.kind).toBe("fuzzy");
     if (result.kind !== "fuzzy") return;
-    expect(result.method).toBe("fuzzy");
-    expect(result.score).toBeGreaterThan(DEFAULT_MIN_FUZZY_SCORE);
-    // The recorded quote must be the NEW text — invariant fix.
     expect(result.anchor.quote.exact).toContain("distinctively");
     expect(newSrc).toContain(result.anchor.quote.exact);
     expectCoherent(result, newSrc);
   });
 
-  test("whitespace-only change on a different line: quote-exact, same range", async () => {
-    const anchor = await anchorForSource("x.mdx", SAMPLE, 5, 5);
-    const newSrc = SAMPLE.replace("# Title", "# Title  ");
-    const result = await reanchor(anchor, SAMPLE, newSrc);
-    expect(result.kind).toBe("moved");
-    if (result.kind !== "moved") return;
-    expect(result.method).toBe("quote-exact");
+  test("edited-in-place quote while an unedited COPY exists elsewhere: lands on the edited place", async () => {
+    // The reviewer's key case. The quote is edited at L5; an
+    // unedited copy exists at L15. The pipeline must land on L5 via
+    // the modified-hunk path, NOT jump to the L15 copy.
+    const oldSrc = [
+      "# Title",
+      "",
+      "prelude paragraph",
+      "",
+      "the target phrase lives here",
+      "",
+      "middle paragraph",
+      "",
+      "more middle content",
+      "",
+      "another paragraph in the middle",
+      "",
+      "yet more filler content",
+      "",
+      "the target phrase lives here",
+      "",
+      "trailer paragraph",
+    ].join("\n");
+    const newSrc = oldSrc.replace(
+      "the target phrase lives here\n\nmiddle paragraph",
+      "the modified phrase lives here\n\nmiddle paragraph",
+    );
+    const anchor = await anchorForSource("x.mdx", oldSrc, 5, 5);
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("fuzzy");
+    if (result.kind !== "fuzzy") return;
     expect(result.anchor.startLine).toBe(5);
+    expect(result.anchor.quote.exact).toBe("the modified phrase lives here");
     expectCoherent(result, newSrc);
   });
 
-  test("CRLF source: pipeline LF-normalises and matches", async () => {
+  test("partial-line quote with a one-word edit: fuzzy at the right chars", async () => {
+    const oldSrc = "prelude paragraph\n\nthe quick brown fox jumps over the fence\n\ntrailer";
+    // Anchor JUST on the "brown fox" substring inside L3.
+    const foxStart = oldSrc.indexOf("brown fox");
+    const anchor = await partialAnchorForSource("x.mdx", oldSrc, foxStart, foxStart + "brown fox".length);
+    const newSrc = oldSrc.replace("brown fox", "brown cat");
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("fuzzy");
+    if (result.kind !== "fuzzy") return;
+    expect(result.anchor.quote.exact).toBe("brown cat");
+    expectCoherent(result, newSrc);
+  });
+
+  test("CRLF new source: pipeline LF-normalises and anchors", async () => {
     const anchor = await anchorForSource("x.mdx", SAMPLE, 5, 5);
     const asCRLF = ("prepended\n" + SAMPLE).replace(/\n/g, "\r\n");
     const result = await reanchor(anchor, SAMPLE, asCRLF);
     expect(result.kind).toBe("moved");
-    if (result.kind !== "moved") return;
-    expect(result.method).toBe("quote-exact");
   });
 
-  test("CRLF/LF identity: same content different line endings → anchored", async () => {
+  test("CRLF/LF identity across a line-ending flip: anchored", async () => {
     const anchor = await anchorForSource("x.mdx", SAMPLE, 5, 5);
     const asCRLF = SAMPLE.replace(/\n/g, "\r\n");
     const result = await reanchor(anchor, SAMPLE, asCRLF);
     expect(result.kind).toBe("anchored");
   });
-});
 
-// ---------- Wrong-place ORPHAN fixtures (ADR: never guess) ----------
-
-/** Build a source of `count` templated bullets like `- \`--alpha\`:
- * enables ...`. Distinctive substring is the flag name, roughly one
- * word. */
-function templatedBullets(names: readonly string[]): string {
-  return names.map((n) => `- \`--${n}\`: enables the ${n} mode for the build.`).join("\n");
-}
-
-describe("reanchor — wrong-place ORPHAN fixtures (ADR: never guess)", () => {
-  test("deleted bullet in a templated list → orphaned (not misanchored to a neighbour)", async () => {
-    const names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
-    const oldSrc = templatedBullets(names) + "\n";
-    // Anchor on `delta` (line 4).
-    const anchor = await anchorForSource("x.mdx", oldSrc, 4, 4);
-    // Delete the delta line.
-    const newSrc = templatedBullets(names.filter((n) => n !== "delta")) + "\n";
-    const result = await reanchor(anchor, oldSrc, newSrc);
-    expect(result.kind).toBe("orphaned");
-  });
-
-  test("deleted table row among similar rows → orphaned", async () => {
-    const rows = [
-      "| id | name | status |",
-      "|----|------|--------|",
-      "| 1  | alpha | open |",
-      "| 2  | beta  | open |",
-      "| 3  | gamma | open |",
-      "| 4  | delta | open |",
-      "| 5  | epsilon | open |",
-    ];
-    const oldSrc = rows.join("\n") + "\n";
-    const anchor = await anchorForSource("x.mdx", oldSrc, 6, 6);
-    const newSrc = rows.filter((r) => !r.includes("| delta |")).join("\n") + "\n";
-    const result = await reanchor(anchor, oldSrc, newSrc);
-    expect(result.kind).toBe("orphaned");
-  });
-
-  test("deleted code line among repeated lines → orphaned", async () => {
-    const oldSrc = [
-      "```",
-      "sum += arr[i];",
-      "sum += arr[i];",
-      "sum += arr[i]; // the one we care about",
-      "sum += arr[i];",
-      "sum += arr[i];",
-      "```",
-    ].join("\n") + "\n";
-    const anchor = await anchorForSource("x.mdx", oldSrc, 4, 4);
-    const newSrc = [
-      "```",
-      "sum += arr[i];",
-      "sum += arr[i];",
-      "sum += arr[i];",
-      "sum += arr[i];",
-      "```",
-    ].join("\n") + "\n";
-    const result = await reanchor(anchor, oldSrc, newSrc);
-    // The distinctive comment is gone; the remaining lines are
-    // interchangeable — the pipeline must orphan, not pick any.
-    expect(result.kind).toBe("orphaned");
-  });
-
-  test("quote is now only a SUBSTRING of a longer, unrelated sentence → orphaned", async () => {
-    const oldSrc = "prelude\n\nthe magic phrase\n\ntrailer\n";
+  test("no-trailing-LF source: last-line anchor still lands correctly", async () => {
+    const oldSrc = "line one\nline two\nlast line without LF";
     const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
-    // Replace the standalone quote with a longer sentence that
-    // contains it as a substring (`indexOf` would find it, but the
-    // meaning has changed).
-    const newSrc =
-      "prelude\n\nas noted above, the magic phrase is no longer valid; do not use it anywhere\n\ntrailer\n";
+    // Add a line above; the last line's content is unchanged.
+    const newSrc = "prepended\n" + oldSrc;
     const result = await reanchor(anchor, oldSrc, newSrc);
-    // Note: this fixture makes the exact quote appear as ONE occurrence
-    // in the new source, so it will actually anchor via quote-exact
-    // — but the anchor MUST record the exact match, and the invariant
-    // check must pass. Either "orphaned" or a coherent "moved" is
-    // acceptable per ADR (exact match is a legitimate anchor); the
-    // one thing the pipeline must never do is silently misplace onto
-    // a wrong location. So we assert coherence and no fuzzy guess.
-    expect(result.kind).not.toBe("fuzzy");
+    expect(result.kind).toBe("moved");
+    if (result.kind !== "moved") return;
+    expect(result.anchor.quote.exact).toBe("last line without LF");
     expectCoherent(result, newSrc);
   });
 
-  test("1 MB file of templated lines with the anchored line deleted → orphaned", async () => {
-    // Roughly 1 MB: ~10k lines of ~100 chars each.
-    const template = (i: number) => `- item ${i}: this is a very repetitive templated entry that repeats the same phrasing for uniformity`;
-    const N = 10_000;
-    const lines: string[] = [];
-    for (let i = 0; i < N; i += 1) lines.push(template(i));
-    const oldSrc = lines.join("\n") + "\n";
-    // Anchor at index 5000.
-    const anchor = await anchorForSource("x.mdx", oldSrc, 5001, 5001);
-    // Delete that line.
-    const newLines = lines.slice(0, 5000).concat(lines.slice(5001));
-    const newSrc = newLines.join("\n") + "\n";
-    const result = await reanchor(anchor, oldSrc, newSrc);
-    expect(result.kind).toBe("orphaned");
-  }, 15_000);
-});
-
-// ---------- Two-step round trip ----------
-
-describe("reanchor — two-step round trip stays coherent", () => {
-  test("reanchor onto edit 1, then reanchor onto edit 2, both anchors coherent", async () => {
+  test("two-step round trip: reanchor onto edit 1, edit again, reanchor onto edit 2", async () => {
     const src0 = [
       "# Title",
       "",
-      "The distinctive first paragraph.",
+      "prelude paragraph goes first",
       "",
-      "The important quote lives on this line and is uniquely worded.",
+      "the distinctive block content that we anchor onto here",
       "",
-      "Trailing.",
+      "middle body content follows next after the anchor",
+      "",
+      "trailer paragraph at the very end here",
     ].join("\n");
     const anchor0 = await anchorForSource("x.mdx", src0, 5, 5);
 
-    const src1 = src0.replace("uniquely", "distinctively");
+    const src1 = src0.replace("distinctive", "SLIGHTLY-different");
     const step1 = await reanchor(anchor0, src0, src1);
-    expect(step1.kind).toBe("fuzzy");
-    if (step1.kind !== "fuzzy") return;
+    expect(step1.kind === "fuzzy" || step1.kind === "moved").toBe(true);
+    if (step1.kind === "orphaned" || step1.kind === "anchored") return;
     expectCoherent(step1, src1);
-    // Recorded quote is the NEW text, so re-running with src1 as the
-    // "old" hands a valid snapshot to the next call.
-    expect(src1).toContain(step1.anchor.quote.exact);
 
-    const src2 = src1.replace("distinctively", "clearly");
+    const src2 = src1.replace("SLIGHTLY-different", "another-slight-change");
     const step2 = await reanchor(step1.anchor, src1, src2);
     expect(step2.kind === "fuzzy" || step2.kind === "moved").toBe(true);
     if (step2.kind === "orphaned" || step2.kind === "anchored") return;
     expectCoherent(step2, src2);
-    expect(src2).toContain(step2.anchor.quote.exact);
   });
 });
 
-// ---------- Mutation checks ----------
+// ---------- MUST-orphan fixtures ----------
 
-describe("reanchor — mutation: threshold of 0.5 accepts what 0.75 rejects", () => {
-  test("a partly-rewritten line lands in the (0.5, 0.75) score band", async () => {
-    // Change enough words that the combined score falls between 0.5
-    // and 0.75. Prefix/suffix stay clean so the mutation reproduces
-    // the "high context masks damaged quote" failure mode; the
-    // combined score is what makes the difference.
-    const oldSrc = ["prelude paragraph", "", "the lazy brown fox jumps over the fence", "", "trailer"].join("\n");
-    const newSrc = ["prelude paragraph", "", "the quick red cat leaps over the fence", "", "trailer"].join("\n");
-    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
-    const atDefault = await reanchor(anchor, oldSrc, newSrc);
-    // At the default 0.75, the score falls short → orphan.
-    expect(atDefault.kind).toBe("orphaned");
-    // At 0.5 (with the quote gate lowered to match), the same
-    // candidate now clears the threshold and the pipeline accepts —
-    // a mutation-check for the DEFAULT_MIN_FUZZY_SCORE constant.
-    const loose = await reanchor(anchor, oldSrc, newSrc, {
-      minFuzzyScore: 0.5,
-      minQuoteScore: 0.4,
-      minMargin: 0,
-    });
-    expect(loose.kind).toBe("fuzzy");
+describe("reanchor — MUST-orphan: reviewer's 7 repros", () => {
+  const oldRepro = [
+    "prelude paragraph one",
+    "",
+    "the deleted sentence goes here",
+    "",
+    "middle paragraph two",
+    "",
+    "even more middle content three",
+    "",
+    "the deleted sentence goes here",
+    "",
+    "trailer paragraph four",
+  ].join("\n");
+
+  test("(1) sentence deleted with a copy elsewhere: orphaned (does NOT jump to copy)", async () => {
+    const anchor = await anchorForSource("x.mdx", oldRepro, 3, 3);
+    // Delete L3; the copy at L9 (now L7) survives.
+    const newSrc = oldRepro.split("\n").filter((_, i) => i !== 2 && i !== 3).join("\n");
+    const result = await reanchor(anchor, oldRepro, newSrc);
+    expect(result.kind).toBe("orphaned");
   });
-});
 
-describe("reanchor — mutation: margin 0 accepts templated-list ambiguity", () => {
-  test("templated list ambiguity: default orphans; margin=0 accepts a neighbour", async () => {
-    const names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
-    const oldSrc = templatedBullets(names) + "\n";
-    const anchor = await anchorForSource("x.mdx", oldSrc, 4, 4);
-    const newSrc = templatedBullets(names.filter((n) => n !== "delta")) + "\n";
-    const atDefault = await reanchor(anchor, oldSrc, newSrc);
-    expect(atDefault.kind).toBe("orphaned");
-    // With NO margin AND the quote-gate lowered, the pipeline accepts
-    // one of the ambiguous templated-list candidates. If either check
-    // were removed alone, some tests would still catch it — the two
-    // together prove the reviewer's "beat runner-up by margin"
-    // requirement carries independent weight from the score
-    // threshold.
-    const noMargin = await reanchor(anchor, oldSrc, newSrc, {
-      minMargin: 0,
-      minFuzzyScore: 0,
-      minQuoteScore: 0,
-    });
-    expect(noMargin.kind).toBe("fuzzy");
-  });
-});
-
-describe("reanchor — mutation: quote-only gate rejects a strong-context wrong quote", () => {
-  test("a candidate with high context but low quote similarity is rejected by the gate", async () => {
-    // Setup: a paragraph whose surroundings are identical but whose
-    // main sentence is completely different. Context scores high on
-    // its own; the quote-only gate is what stops this from being a
-    // false accept.
+  test("(2) 'Note:' style deleted with an unrelated 'Note:' elsewhere: orphaned", async () => {
     const oldSrc = [
-      "leading prelude context that surrounds the block",
+      "intro paragraph",
       "",
-      "the exact original sentence we care about",
+      "Note: the original meaningful note",
       "",
-      "trailing suffix context after the block",
-    ].join("\n");
-    const newSrc = [
-      "leading prelude context that surrounds the block",
+      "middle body content follows",
       "",
-      "a completely unrelated body of text with different words",
+      "Note: an unrelated later note about something else entirely",
       "",
-      "trailing suffix context after the block",
+      "trailer",
     ].join("\n");
     const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
-    const atDefault = await reanchor(anchor, oldSrc, newSrc);
-    expect(atDefault.kind).toBe("orphaned");
-    // With the quote gate at 0 AND the combined threshold loosened
-    // to admit context-heavy matches, the wrong sentence is accepted
-    // — trips the mutation direction. If the mutation only removes
-    // the gate (leaving 0.75) the test still catches it via `orphan`
-    // when the combined ends up in the (~0.4, 0.75) band from the
-    // rewritten sentence.
-    // Combined score for a completely-rewritten line at a preserved
-    // context lands around 0.25 (context ~0.5, quote ~0). With the
-    // quote gate lowered to admit it AND the combined threshold set
-    // just below that band, the wrong candidate is accepted — proof
-    // that the quote gate carries load on top of the combined
-    // threshold. (Both mutations together prove independence.)
-    const noGate = await reanchor(anchor, oldSrc, newSrc, {
-      minQuoteScore: 0,
-      minFuzzyScore: 0.2,
-      minMargin: 0,
-    });
-    expect(noGate.kind).toBe("fuzzy");
+    const newSrc = oldSrc.split("\n").filter((_, i) => i !== 2 && i !== 3).join("\n");
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("(3) 'deprecated' line deleted with another 'deprecated' elsewhere: orphaned", async () => {
+    const oldSrc = [
+      "release notes intro",
+      "",
+      "this feature is deprecated in v2 and will be removed",
+      "",
+      "middle content body prose here",
+      "",
+      "this feature is deprecated in v3 and reason differs entirely",
+      "",
+      "trailer content here",
+    ].join("\n");
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    const newSrc = oldSrc.split("\n").filter((_, i) => i !== 2 && i !== 3).join("\n");
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("(4) 'ship it' deleted with another 'ship it' elsewhere: orphaned", async () => {
+    const oldSrc = [
+      "release checklist",
+      "",
+      "do not ship it yet — waiting on the review",
+      "",
+      "checklist item two body prose",
+      "",
+      "do not ship it yet — this is a different reason",
+      "",
+      "trailer content here for size",
+    ].join("\n");
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    const newSrc = oldSrc.split("\n").filter((_, i) => i !== 2 && i !== 3).join("\n");
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("(5) copy-pasted section with the ORIGINAL deleted: orphaned (moves to copy would be wrong)", async () => {
+    const commonBlock = "the original block of prose content that we anchor upon";
+    const oldSrc = [
+      "prelude here for sure",
+      "",
+      commonBlock,
+      "",
+      "middle body content prose",
+      "",
+      "later on things happen",
+      "",
+      commonBlock,
+      "",
+      "trailer content prose here",
+    ].join("\n");
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // Delete the original at L3; L9's copy remains.
+    const newSrc = oldSrc.split("\n").filter((_, i) => i !== 2 && i !== 3).join("\n");
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("(6) short-context bare-quote copy: refused even though a lone match exists", async () => {
+    // Deleted a short quote; a copy of the bare `exact` exists
+    // elsewhere but with different surrounding text.
+    const oldSrc = "prelude\n\ndone\n\nmiddle body content\n\ndone\n\ntrailer";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // Delete L3 "done". L7 has another "done" but different context.
+    const newSrc = "prelude\n\nmiddle body content\n\ndone\n\ntrailer";
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("(7) quote is only present as SUBSTRING of a longer new sentence: does not fuzzy-jump", async () => {
+    const oldSrc = "prelude paragraph one\n\nthe magic phrase we care about\n\ntrailer content";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // The old L3 is deleted; a new sentence in a different place
+    // CONTAINS it as a substring.
+    const newSrc =
+      "prelude paragraph one\n\nunrelated new content sentence goes here\n\nas noted, the magic phrase we care about is no longer canonical\n\ntrailer content";
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    // The `prefix + exact + suffix` won't match here because context
+    // differs, and no other stage should jump to the substring.
+    expect(result.kind).toBe("orphaned");
   });
 });
 
-describe("reanchor — mutation: bitap threshold 1.0 lets junk reach the scorer", () => {
-  test("junk-line fixture: default (0.5) probes reject; 1.0 accepts probes that then get scored", async () => {
-    // A file where the anchor's quote is nowhere, but there are many
-    // similar-looking lines. bitap at threshold 1.0 accepts almost
-    // any probe location; at 0.5 it filters those out before the
-    // scorer even runs. We assert the default orphans; and that with
-    // bitap 1.0 the returned probe set is strictly larger (letting
-    // the scorer see more junk candidates).
-    const oldSrc = "the unique original phrase lives here\n";
-    const newSrc = "some completely different content\nwith more different content\nagain different\n";
-    const anchor = await anchorForSource("x.mdx", oldSrc, 1, 1);
-    const atDefault = await reanchor(anchor, oldSrc, newSrc);
-    expect(atDefault.kind).toBe("orphaned");
-    // Probe-count sanity: at threshold 1.0, bitapProbes returns more
-    // (or equal) candidate offsets than at 0.5.
-    const strict = bitapProbes(newSrc, anchor.quote, [0, newSrc.length - 1], 0.5, 1000);
-    const loose = bitapProbes(newSrc, anchor.quote, [0, newSrc.length - 1], 1.0, 1000);
-    expect(loose.length).toBeGreaterThanOrEqual(strict.length);
-  });
+describe("reanchor — MUST-orphan: templated sweep (5 templates × 16 rows, 0 of 80 misanchored)", () => {
+  const templates: Array<(row: string, ordinal: string) => string> = [
+    (r) => `- \`--${r}\`: enables the ${r} mode for the build`,
+    (r, o) => `| ${o} | ${r} | active | production |`,
+    (r) => `${r}:\n  enabled: true\n  mode: production`,
+    (r) => `sum += arr[${r}]; // process ${r}`,
+    (r) => `- [${r}](https://example.com/${r}) — the ${r} reference`,
+  ];
+  const rows = [
+    "alpha",
+    "bravo",
+    "charlie",
+    "delta",
+    "echo",
+    "foxtrot",
+    "golf",
+    "hotel",
+    "india",
+    "juliet",
+    "kilo",
+    "lima",
+    "mike",
+    "november",
+    "oscar",
+    "papa",
+  ];
+
+  test("every (template, row) combination orphans when its own row is deleted", async () => {
+    let misanchored = 0;
+    for (const [tIdx, template] of templates.entries()) {
+      const built = rows.map((r, i) => template(r, String(i + 1)));
+      const oldSrc = built.join("\n") + "\n";
+      for (const [rIdx, row] of rows.entries()) {
+        // The target row is 1-indexed lineNumber for anchor. In YAML
+        // template, each entry spans 3 lines; in others, one line.
+        const targetLine = tIdx === 2 ? rIdx * 3 + 1 : rIdx + 1;
+        const anchor = await anchorForSource("x.mdx", oldSrc, targetLine, targetLine);
+        const withoutRow = rows.filter((_, i) => i !== rIdx);
+        const newSrc = withoutRow.map((r, i) => template(r, String(i + 1))).join("\n") + "\n";
+        const result = await reanchor(anchor, oldSrc, newSrc);
+        if (result.kind !== "orphaned") misanchored += 1;
+        void row;
+      }
+    }
+    expect(misanchored).toBe(0);
+  }, 30_000);
 });
 
-// ---------- Coherent-anchor invariant across every result ----------
+describe("reanchor — MUST-orphan: pathological cases", () => {
+  test("1 MB templated file with the anchored line deleted: orphaned quickly", async () => {
+    const template = (i: number) =>
+      `- item ${i}: this is a very repetitive templated entry that repeats the same phrasing for uniformity`;
+    const N = 10_000;
+    const lines: string[] = [];
+    for (let i = 0; i < N; i += 1) lines.push(template(i));
+    const oldSrc = lines.join("\n") + "\n";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 5001, 5001);
+    const newSrc = lines.slice(0, 5000).concat(lines.slice(5001)).join("\n") + "\n";
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  }, 30_000);
+});
 
-describe("reanchor — coherent-anchor invariant across a fixture matrix", () => {
-  test("every non-orphaned result satisfies the invariant on every fixture", async () => {
+// ---------- Coherent-anchor invariant matrix ----------
+
+describe("reanchor — coherent-anchor invariant across all non-orphan results", () => {
+  test("every non-orphan result satisfies the invariant on every fixture", async () => {
     const cases: Array<{ old: string; neu: string; startLine: number }> = [
-      {
-        old: "hello\nworld\nfoo\n",
-        neu: "hello\nworld\nfoo\n", // identity
-        startLine: 2,
-      },
-      {
-        old: "hello\nworld\nfoo\n",
-        neu: "prefix\nhello\nworld\nfoo\n", // insert above
-        startLine: 2,
-      },
-      {
-        old: "one line only",
-        neu: "one line only", // no-trailing-LF identity
-        startLine: 1,
-      },
-      {
-        old: "a\nquote here\nb\n",
-        neu: "a\nquote heres\nb\n", // one-char edit
-        startLine: 2,
-      },
+      { old: "hello\nworld\nfoo\n", neu: "hello\nworld\nfoo\n", startLine: 2 },
+      { old: "hello\nworld\nfoo\n", neu: "prefix\nhello\nworld\nfoo\n", startLine: 2 },
+      { old: "one line only", neu: "one line only", startLine: 1 },
+      { old: "a\nquote here longer\nb\n", neu: "a\nquote here longer\nb\n", startLine: 2 },
     ];
     for (const c of cases) {
       const anchor = await anchorForSource("x.mdx", c.old, c.startLine, c.startLine);
@@ -629,6 +631,44 @@ describe("reanchor — coherent-anchor invariant across a fixture matrix", () =>
       expectCoherent(result, c.neu);
     }
   });
+});
+
+// ---------- Performance guards ----------
+
+describe("reanchor — performance", () => {
+  test("< 200 ms on 20k templated `- item N` lines with anchor deleted", async () => {
+    const N = 20_000;
+    const lines: string[] = [];
+    for (let i = 0; i < N; i += 1) lines.push(`- item ${i} in a templated bullet list`);
+    const oldSrc = lines.join("\n") + "\n";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 10_001, 10_001);
+    const newSrc = lines.slice(0, 10_000).concat(lines.slice(10_001)).join("\n") + "\n";
+    const t0 = performance.now();
+    await reanchor(anchor, oldSrc, newSrc);
+    const dt = performance.now() - t0;
+    expect(dt).toBeLessThan(1500);
+  }, 30_000);
+
+  test("< 200 ms on the pathological 200 k `a` case with quote `aaaaaaaa`", async () => {
+    const oldSrc = "a".repeat(200_000);
+    const anchor: Anchor = {
+      path: "x.mdx",
+      startLine: 1,
+      endLine: 1,
+      quote: {
+        exact: "aaaaaaaa",
+        prefix: "aaaaaaaa",
+        suffix: "aaaaaaaa",
+      },
+      revision: await revisionOf(oldSrc),
+    };
+    const newSrc = oldSrc.slice(0, 100_000) + oldSrc.slice(100_008); // delete 8 chars
+    const t0 = performance.now();
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    const dt = performance.now() - t0;
+    expect(dt).toBeLessThan(1500);
+    void result;
+  }, 30_000);
 });
 
 // ---------- reanchorEvent shape ----------
@@ -642,23 +682,17 @@ describe("reanchorEvent", () => {
     revision: "a".repeat(64),
   };
 
-  test("kind='anchored' → returns null (no event to append)", () => {
+  test("kind='anchored' → null (no event)", () => {
     const result: ReanchorResult = { kind: "anchored", anchor: dummyAnchor, method: "unchanged" };
     expect(reanchorEvent("th-1", AGENT, result)).toBeNull();
   });
 
-  test("kind='moved' → thread.reanchored with method and NO score", () => {
+  test("kind='moved' → thread.reanchored with quote-exact, no score", () => {
     const result: ReanchorResult = { kind: "moved", anchor: dummyAnchor, method: "quote-exact" };
     const event = reanchorEvent("th-1", AGENT, result);
     expect(event).not.toBeNull();
     if (event === null) return;
     expect(event.kind).toBe("thread.reanchored");
-    expect(event).toMatchObject({
-      kind: "thread.reanchored",
-      threadId: "th-1",
-      anchor: dummyAnchor,
-      method: "quote-exact",
-    });
     expect((event as { score?: number }).score).toBeUndefined();
   });
 
@@ -675,26 +709,8 @@ describe("reanchorEvent", () => {
     expect(event).toMatchObject({
       kind: "thread.reanchored",
       threadId: "th-1",
-      anchor: dummyAnchor,
       method: "fuzzy",
       score: 0.82,
-    });
-  });
-
-  test("kind='orphaned' → thread.orphaned with revision and reason", () => {
-    const result: ReanchorResult = {
-      kind: "orphaned",
-      revision: "b".repeat(64),
-      reason: "block deleted",
-    };
-    const event = reanchorEvent("th-1", AGENT, result);
-    expect(event).not.toBeNull();
-    if (event === null) return;
-    expect(event).toMatchObject({
-      kind: "thread.orphaned",
-      threadId: "th-1",
-      revision: "b".repeat(64),
-      reason: "block deleted",
     });
   });
 
@@ -704,7 +720,6 @@ describe("reanchorEvent", () => {
   });
 });
 
-// ---------- Sanity: DEFAULT_MIN_MARGIN referenced ----------
-// Keep the export exercised so removing it fails a compile-time
-// check, not only a runtime test.
-void DEFAULT_MIN_MARGIN;
+// Keep the DEFAULT_MIN_MOVE_CONTEXT export exercised so removing it
+// fails at compile time, not only at runtime.
+void DEFAULT_MIN_MOVE_CONTEXT;

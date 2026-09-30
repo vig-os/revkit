@@ -14,6 +14,10 @@ ba = "ba"
 bitap = "bitap"
 Bitap = "Bitap"
 BITAP = "BITAP"
+# Truncated DMP opcode names ("INSERTs", "DELETEs") — typos strips the
+# lowercase plural suffix and reports the truncated stem. Not typos.
+INSER = "INSER"
+DELET = "DELET"
 # CVE policy term (#637): a finding "unexcepted" = not in the exception register
 unexcepted = "unexcepted"
 # version-check.sh duration placeholder (#759): 'Nd' = N days (cf. Nw/Nh/Nm)

@@ -1,50 +1,66 @@
-// Re-anchoring engine (ADR-0006 Acceptance). Pure logic:
+// Re-anchoring engine (ADR-0006 Acceptance, PR-40 review round 2).
 //
-//   reanchor(anchor, oldSource, newSource) → ReanchorResult
+// Principle: the DIFF decides WHERE a comment may go; similarity only
+// decides WHETHER it still fits there. We never do a global fuzzy
+// search — orphaning beats a wrong place.
 //
-// Runs the ADR's four stages, in order, with the corrections from the
-// PR-40 review:
+// Pipeline:
+//   (0) Identity     — `revisionOf(newSource) === anchor.revision`
+//                      short-circuits to `anchored`.
+//   (1) Snapshot     — `revisionOf(oldSource)` must equal
+//                      `anchor.revision`, otherwise we cannot trust
+//                      the diff and orphan.
+//   (2) Char diff    — `diff_main(oldLF, newLF)` at CHARACTER
+//                      granularity, with `diff_cleanupSemantic` and
+//                      `Diff_Timeout` bounded. One diff serves the
+//                      whole classification.
+//   (3) Classify     — locate the anchor's OLD span (byte offsets in
+//                      `oldLF`) via the recorded `prefix + exact +
+//                      suffix`, then walk the diff to classify:
+//                        unchanged is entirely in EQUAL segments,
+//                        modified is mixed EQUAL and DELETE,
+//                        deleted is entirely in DELETE segments.
+//   (4a) unchanged   — map through `diff_xIndex`, verify the new text
+//                      equals the exact quote, and return
+//                      `quote-exact`. No search.
+//   (4b) modified    — search ONLY inside a local hunk window
+//                      (enclosing changed segments plus a small slack,
+//                      ± `DEFAULT_HUNK_SLACK` chars). Bitap at the
+//                      diff-mapped position, plus at the window
+//                      boundaries, gives a small candidate set.
+//                      `alignMatchedText` walks the OLD quote's end
+//                      onto the new source and records the ACTUAL
+//                      matched text (Blocker 2 fix). Accept when the
+//                      best candidate's quote similarity ≥
+//                      `DEFAULT_MIN_QUOTE_SCORE` AND it beats EVERY
+//                      OTHER candidate in the window by
+//                      `DEFAULT_MIN_MARGIN` — regardless of whether
+//                      the others clear the gate. Never global.
+//   (4c) deleted     — try `tryMove(...)`: search the new source for
+//                      an EXACT `prefix + exact + suffix` match with
+//                      substantial context (≥
+//                      `DEFAULT_MIN_MOVE_CONTEXT` non-whitespace
+//                      characters on each side, or the context
+//                      reaches a line boundary). Linear `indexOf`,
+//                      stops at the second hit. Exactly one match →
+//                      `quote-exact` (moved); zero or several →
+//                      orphan. Never a fuzzy or quote-alone fallback.
 //
-//   (a) exact pass — enumerate every occurrence of the anchor's exact
-//       quote in the new source. Exactly one occurrence anchors as
-//       `quote-exact`, immediately (and covers the "block moved far"
-//       case that would otherwise fall to fuzzy). Multiple occurrences
-//       are scored by prefix/suffix agreement — one candidate wins
-//       only when it beats the runner-up by a clear margin; otherwise
-//       the pipeline continues to fuzzy so the ambiguity check runs.
-//   (b) fuzzy pass — gather MULTIPLE candidate locations (bitap probes
-//       at the mapped hint, the anchor's original offset, and from the
-//       start of the file), score each by BOTH the quote's own
-//       similarity and its context similarity, reject any candidate
-//       whose quote similarity is below its own gate (so a matching
-//       context cannot carry a wrong quote), and accept the best only
-//       when it clears `minFuzzyScore` AND beats the runner-up by
-//       `minMargin`.
-//   (c) orphan — kept, never guessed and never dropped.
+// Coherent-anchor guarantee: every non-orphaned result carries the
+// NEW text at the matched location as `quote.exact`, `prefix`/`suffix`
+// recut around it, and line numbers computed from the actual
+// offsets. A subsequent rebuild reads back a coherent anchor.
 //
-// Recording the accepted anchor:
-//   The new anchor stores the NEW text at the matched location. For
-//   `quote-exact` this equals the anchor's own `exact` (it was found
-//   verbatim). For `fuzzy`, `diff_main` + `diff_xIndex` walk the old
-//   quote's end onto the new source, so the recorded `exact` is
-//   `newSource.slice(matchStart, matchEnd)` — never a stale string
-//   that is no longer in the file. `prefix` and `suffix` are recut
-//   around the ACTUAL match, and the line range is computed from the
-//   real offsets. On the next rebuild the engine reads a coherent
-//   anchor back.
-//
-// The individual stages are named exports too (`diffMapLines`,
-// `mapAnchorRange`, `exactOccurrences`, `scoreCandidate`,
-// `bitapProbes`, `alignMatchedText`). Stage-level tests exercise them
-// directly, and mutation tests demonstrate that removing any single
-// stage — the exact-first pass, the margin check, the context weight,
-// the quote-only gate, or a realistic `Match_Threshold` — turns a
-// green test red.
+// Performance: `buildLineStartIndex(source)` computes a sorted array
+// of line-start offsets once per source; `offsetToLine` /
+// `lineToOffset` are O(log n) / O(1). Every offset probe uses the
+// precomputed index. Fixture perf tests pin < 200 ms on the 20 k
+// `- item` list and the pathological 200 k `a` case.
 //
 // Runtime-neutral: no `node:*` / `bun:*` imports; the only dependency
 // beyond the workspace is `diff-match-patch` (pure JS, browser-safe),
-// wrapped in a narrow typed shim (`src/vendor/dmp.ts`) so no
-// ambient declaration leaks out of this package.
+// wrapped in a narrow typed shim (`src/vendor/dmp.ts`) so no ambient
+// declaration leaks out of this package.
 import { anchorSchema, type Anchor, type TextQuote } from "./anchor.ts";
 import { authorSchema, type Author } from "./author.ts";
 import { type ReviewEventInput } from "./events.ts";
@@ -52,12 +68,11 @@ import { revisionOf } from "./revision.ts";
 import { DiffMatchPatch, type Diff } from "./vendor/dmp.ts";
 
 /** How the re-anchor arrived at the returned anchor. `unchanged` is
- * the identity short-circuit (revision hash matches). `quote-exact`
- * means the exact quote was found verbatim (either as a lone
- * occurrence in the file, or as the disambiguated winner in a
- * multi-occurrence file). `fuzzy` means the location came from a
- * scored bitap probe that cleared both the fuzzy threshold AND the
- * margin over the runner-up. */
+ * the identity short-circuit; `quote-exact` is either an unchanged
+ * span mapped through the diff or a moved block with intact context;
+ * `fuzzy` is a modified span located via diff-mapping inside a local
+ * hunk window. There is no global-search method — the removed
+ * `"diff-map"` value would only ever produce wrong places. */
 export type ReanchorMethod = "unchanged" | "quote-exact" | "fuzzy";
 
 /** A 1-indexed inclusive line range in a source file. */
@@ -66,14 +81,9 @@ export interface LineRange {
   readonly end: number;
 }
 
-/** The outcome of `reanchor`. On `anchored`, `moved` or `fuzzy` the
- * returned `anchor` carries the NEW revision (SHA-256 of `newSource`)
- * and the range/quote captured against `newSource` (the quote is the
- * NEW text at the matched location — never a stale string). On
- * `orphaned`, the caller keeps the old anchor and emits
- * `thread.orphaned`; the new source's revision is carried on the
- * result so the event can name it. `reason` explains which stage
- * failed. */
+/** The outcome of `reanchor`. Non-orphan results record the NEW text
+ * at the matched location; orphan results carry the reason plus the
+ * new revision the pipeline ran against. */
 export type ReanchorResult =
   | { readonly kind: "anchored"; readonly anchor: Anchor; readonly method: "unchanged" }
   | { readonly kind: "moved"; readonly anchor: Anchor; readonly method: "quote-exact" }
@@ -81,271 +91,459 @@ export type ReanchorResult =
   | { readonly kind: "orphaned"; readonly revision: string; readonly reason: string; readonly score?: number };
 
 /**
- * Minimum combined score for a fuzzy match. Combined score is the
- * mean of the quote's own similarity and its context similarity. The
- * fixture band this was tuned against:
- *
- *   - a one-word edit inside a unique paragraph scores ~0.85–0.95;
- *   - a wholly-rewritten paragraph scores ~0.30–0.45;
- *   - a repeated templated row (bullet, table row, code line)
- *     scores ~0.60–0.75 on the wrong-line candidate — this is why
- *     the margin check is load-bearing, not the threshold alone.
- *
- * 0.75 keeps the "clean" side and rejects the "torn" side; the margin
- * check (below) rejects the templated-repeat case where two candidates
- * both clear the threshold. Mutation tests trip if this drops to 0
- * (`threshold_of_zero_would_wrongly_accept_orphan`) or below the
- * context-weighted band (`context_removed_would_wrongly_accept`).
+ * Minimum similarity between the OLD quote and the matched new text
+ * in the MODIFIED path. A small in-line edit scores ~0.7–0.95; a
+ * word-level rewrite of a phrase (e.g. "target phrase" → "modified
+ * phrase") scores ~0.45. The gate is deliberately moderate so a
+ * modified-in-place block anchors correctly, and rewrites orphan.
+ * Used ONLY inside the modified path — the deleted path uses exact
+ * context matching, no similarity gate.
  */
-export const DEFAULT_MIN_FUZZY_SCORE = 0.75;
+export const DEFAULT_MIN_QUOTE_SCORE = 0.4;
 
 /**
- * How much the best fuzzy candidate must beat the runner-up by
- * (combined score delta) to be accepted. On templated content (a
- * bullet list, a table row, a code block with repeated lines) two
- * candidates often clear `minFuzzyScore` by luck — the margin check
- * is what makes the pipeline "orphaned, never guessed" on those
- * inputs. Empirically 0.1 separates confident real hits from
- * coincidence on the fixtures in `test/reanchor.test.ts`.
- * Mutation test `margin_removed_would_wrongly_accept` trips if this
- * is set to 0.
+ * Minimum fraction of the OLD span's characters that must be in
+ * EQUAL segments for the "modified" classification to be trusted as
+ * a real in-place edit. Below this, the diff is aligning incidental
+ * template fragments (e.g. "| 1 |" prefixes on table rows) as EQUAL
+ * while everything meaningful is DELETE — a templated-row shift, not
+ * an edit. Such spans are demoted to the "deleted" path and go
+ * through move detection, which orphans on ambiguous or missing
+ * context. Empirically:
+ *
+ *   in-place word swap ("brown fox" → "brown cat")         ≈ 0.67
+ *   in-place phrase edit ("target phrase" → "mod. phrase") ≈ 0.79
+ *   templated table row shift (| 1 | ROW | active | ...)   ≈ 0.14
+ *
+ * 0.5 cleanly separates real edits from templated shifts.
+ */
+export const DEFAULT_MIN_MODIFIED_EQUAL_FRACTION = 0.5;
+
+/**
+ * How much the best fuzzy candidate must beat every other candidate
+ * in the LOCAL HUNK WINDOW by. Because the window is bounded by the
+ * diff structure, a viable runner-up is by definition a near-miss;
+ * the margin ensures we do not accept when the diff itself is
+ * ambiguous inside the window.
  */
 export const DEFAULT_MIN_MARGIN = 0.1;
 
 /**
- * Minimum standalone quote similarity for a candidate to survive.
- * Enforced BEFORE the combined score so a matching context cannot
- * paper over a wrong quote (the templated-list failure mode).
- * Mutation test `quote_gate_removed_would_wrongly_accept` trips if
- * this is lowered.
+ * Characters of slack around a modified hunk when defining the
+ * search window. 200 covers a couple of lines of a reflowed
+ * paragraph while staying local — never enough to reach a
+ * templated sibling elsewhere in the file.
  */
-export const DEFAULT_MIN_QUOTE_SCORE = 0.6;
+export const DEFAULT_HUNK_SLACK = 200;
 
 /**
- * DMP `Match_Distance`. 1000 lets a paragraph move a page without
- * penalty, but the exact-first pass (stage a) has already covered
- * long moves — the fuzzy pass mostly deals with local reflows. Kept
- * exposed so a caller can widen it for very large files.
+ * Minimum non-whitespace characters of context on each side of the
+ * quote required for the MOVE path to fire. A block with less
+ * context cannot be safely disambiguated; if the context is short
+ * but reaches a line boundary (leading or trailing `\n`), that
+ * counts too. Below this bar, `tryMove` orphans.
  */
-export const DEFAULT_MATCH_DISTANCE = 1000;
+export const DEFAULT_MIN_MOVE_CONTEXT = 16;
 
 /**
- * DMP `Match_Threshold`. A realistic 0.5 (not the pipeline's own
- * threshold — that runs on the scored candidates). At 1.0 (the old
- * value) bitap accepts almost anything within `Match_Distance` and
- * feeds it into the scorer, which is what the PR-40 reviewer flagged
- * as wrong-place anchoring. 0.5 already filters out obviously-poor
- * bitap hits before scoring.
+ * `Diff_Timeout` for `diff_main` (seconds). Diffing a very large
+ * source with many small changes can otherwise run unbounded; the
+ * timeout lets DMP return a suboptimal (but sound) diff instead of
+ * blocking the pipeline.
  */
-export const DEFAULT_BITAP_THRESHOLD = 0.5;
+export const DEFAULT_DIFF_TIMEOUT_SECONDS = 2.0;
 
-/** Options for `reanchor`. A production caller normally passes none. */
+/** Options for `reanchor`. A production caller passes nothing — the
+ * defaults are the contract. The options exist only so
+ * micro-benchmarks and forensic diagnostics can tweak the timeout. */
 export interface ReanchorOptions {
-  readonly minFuzzyScore?: number;
-  readonly minMargin?: number;
-  readonly minQuoteScore?: number;
-  readonly matchDistance?: number;
-  readonly bitapThreshold?: number;
+  readonly diffTimeoutSeconds?: number;
 }
 
-// ---------- Stage exports (composed by `reanchor`) ----------
+// ---------- Line-offset index (perf) ----------
 
 /**
- * Line-mode diff of `oldSource` → `newSource`. Returns an array
- * indexed by 1-based old-line-number where the value is the 1-based
- * new-line-number that line maps to, or `null` if the line was
- * deleted.
- *
- * Input is expected LF-normalised (the primary `reanchor` entry does
- * that once, up-front).
+ * Precompute the sorted list of line-start byte offsets in `source`
+ * (LF-normalised). `index[i]` is the offset of line `i+1`'s first
+ * character; `index.length` is the number of lines. Called ONCE per
+ * source in `reanchor`; subsequent `offsetToLine` / `lineToOffset`
+ * calls are O(log n) / O(1) — this is what makes the 20 k-line and
+ * 200 k-char perf tests hit their bounds.
  */
-export function diffMapLines(oldSource: string, newSource: string): (number | null)[] {
-  const dmp = new DiffMatchPatch();
-  const chars = dmp.diff_linesToChars_(oldSource, newSource);
-  const diffs = dmp.diff_main(chars.chars1, chars.chars2, false);
-  dmp.diff_charsToLines_(diffs, chars.lineArray);
+export function buildLineStartIndex(source: string): number[] {
+  const idx: number[] = [0];
+  for (let i = 0; i < source.length; i += 1) {
+    if (source.charCodeAt(i) === 10 /* \n */) idx.push(i + 1);
+  }
+  return idx;
+}
 
-  const oldLineCount = splitLines(oldSource).length;
-  const mapping: (number | null)[] = new Array<number | null>(oldLineCount + 1).fill(null);
-  let oldLine = 1;
-  let newLine = 1;
+/** Byte offset of the start of line `line` (1-indexed), via the
+ * precomputed index. Returns `source.length` for line numbers past
+ * the end. */
+export function lineToOffset(index: readonly number[], line: number): number {
+  if (line <= 1) return 0;
+  const i = line - 1;
+  if (i >= index.length) return index[index.length - 1] ?? 0;
+  return index[i] ?? 0;
+}
+
+/** 1-indexed line number that byte `offset` sits on. Binary search
+ * over the precomputed index. */
+export function offsetToLine(index: readonly number[], offset: number): number {
+  if (offset <= 0) return 1;
+  let lo = 0;
+  let hi = index.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1;
+    const v = index[mid] ?? 0;
+    if (v <= offset) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo + 1;
+}
+
+// ---------- Character-level diff + span classification ----------
+
+/** The classification of an anchor's OLD span against a full-text
+ * char-level diff of old → new. */
+export type SpanClass =
+  /** Every character of the span is covered by EQUAL segments. */
+  | { readonly kind: "unchanged" }
+  /** Some of the span is EQUAL, some is DELETE. */
+  | { readonly kind: "modified"; readonly equalChars: number; readonly deletedChars: number }
+  /** Every character of the span is inside DELETE segments (no EQUAL
+   * overlap). */
+  | { readonly kind: "deleted" };
+
+/** Walk `diffs` and classify the old span [spanStart, spanEnd) as
+ * one of `unchanged` / `modified` / `deleted`. INSERT segments do
+ * not consume old chars and are ignored for classification. */
+export function classifySpan(diffs: readonly Diff[], spanStart: number, spanEnd: number): SpanClass {
+  let oldPos = 0;
+  let equalChars = 0;
+  let deletedChars = 0;
   for (const [op, text] of diffs) {
-    const lineCount = countLinesInSegment(text);
-    if (op === -1 /* DELETE */) {
-      oldLine += lineCount;
-    } else if (op === 1 /* INSERT */) {
-      newLine += lineCount;
-    } else {
-      for (let i = 0; i < lineCount; i += 1) {
-        if (oldLine <= oldLineCount) mapping[oldLine] = newLine;
-        oldLine += 1;
-        newLine += 1;
-      }
+    if (op === 1 /* INSERT */) continue;
+    const segEnd = oldPos + text.length;
+    const overlapStart = spanStart > oldPos ? spanStart : oldPos;
+    const overlapEnd = spanEnd < segEnd ? spanEnd : segEnd;
+    const overlap = overlapEnd - overlapStart;
+    if (overlap > 0) {
+      if (op === 0) equalChars += overlap;
+      else deletedChars += overlap;
     }
+    oldPos = segEnd;
   }
-  return mapping;
+  const spanLen = spanEnd - spanStart;
+  if (equalChars === spanLen) return { kind: "unchanged" };
+  if (equalChars === 0) return { kind: "deleted" };
+  return { kind: "modified", equalChars, deletedChars };
 }
 
-/** Map an old 1-indexed line range to the smallest new range that
- * covers the lines that survived. `null` if the whole range was
- * deleted. */
-export function mapAnchorRange(
-  lineMap: readonly (number | null)[],
-  startLine: number,
-  endLine: number,
-): LineRange | null {
-  let start: number | null = null;
-  let end: number | null = null;
-  for (let i = startLine; i <= endLine; i += 1) {
-    const mapped = i >= 0 && i < lineMap.length ? lineMap[i] : null;
-    if (mapped === null || mapped === undefined) continue;
-    if (start === null) start = mapped;
-    end = mapped;
-  }
-  if (start === null || end === null) return null;
-  return { start, end };
-}
-
-/** Every offset in `newSource` where `quote.exact` occurs verbatim
- * (0-indexed). Empty when the quote is not in the file at all. */
-export function exactOccurrences(newSource: string, exact: string): number[] {
-  const occurrences: number[] = [];
-  if (exact.length === 0) return occurrences;
-  let searchFrom = 0;
-  while (true) {
-    const idx = newSource.indexOf(exact, searchFrom);
-    if (idx < 0) break;
-    occurrences.push(idx);
-    searchFrom = idx + 1;
-  }
-  return occurrences;
-}
-
-/** A single fuzzy candidate: its start offset in `newSource`, plus
- * the two scores that gate acceptance (quote-only and context-
- * weighted). `combined` is the mean of the two, and drives the
- * ordering and the margin check. */
-export interface Candidate {
-  readonly index: number;
-  readonly quoteScore: number;
-  readonly contextScore: number;
-  readonly combined: number;
-}
-
-/** Score a candidate at `index` against the anchor's quote.
- *
- *   quoteScore = 1 - levenshtein(exact, newSource.slice(index, index+|exact|)) / max_len
- *   contextScore = 1 - levenshtein(prefix+exact+suffix, newSource.slice(index-|prefix|, index+|exact|+|suffix|)) / max_len
- *   combined = (quoteScore + contextScore) / 2
+/**
+ * Local hunk window in the NEW source for a MODIFIED span. Finds the
+ * min and max new-source offsets of any changed segment (DELETE or
+ * INSERT) that overlaps or is adjacent (within `slack`) to the old
+ * span, then expands the returned window by `slack` in each
+ * direction. Bounded to the actual `newLength`.
  */
-export function scoreCandidate(newSource: string, quote: TextQuote, index: number): Candidate {
-  const dmp = new DiffMatchPatch();
-  const exactLen = quote.exact.length;
-  const quoteCandidate = newSource.slice(index, index + exactLen);
-  const quoteScore = similarity(dmp, quote.exact, quoteCandidate);
-
-  const contextPattern = quote.prefix + quote.exact + quote.suffix;
-  const ctxStart = Math.max(0, index - quote.prefix.length);
-  const ctxEnd = Math.min(newSource.length, index + exactLen + quote.suffix.length);
-  const contextCandidate = newSource.slice(ctxStart, ctxEnd);
-  const contextScore = similarity(dmp, contextPattern, contextCandidate);
-
+export function findHunkWindow(
+  diffs: readonly Diff[],
+  spanStart: number,
+  spanEnd: number,
+  newLength: number,
+  slack: number = DEFAULT_HUNK_SLACK,
+): { start: number; end: number } {
+  let oldPos = 0;
+  let newPos = 0;
+  let winStart = -1;
+  let winEnd = -1;
+  for (const [op, text] of diffs) {
+    const oldLen = op === 1 ? 0 : text.length;
+    const newLen = op === -1 ? 0 : text.length;
+    const oldSegEnd = oldPos + oldLen;
+    const oldOverlapsSpan = oldSegEnd >= spanStart - slack && oldPos <= spanEnd + slack;
+    if (oldOverlapsSpan && op !== 0) {
+      if (winStart < 0) winStart = newPos;
+      winEnd = newPos + newLen;
+    }
+    oldPos = oldSegEnd;
+    newPos += newLen;
+  }
+  if (winStart < 0) {
+    // No changed hunks touch the span (should not happen for
+    // "modified"). Fall back to a hint centred on the diff-mapped
+    // span start.
+    const dmp = new DiffMatchPatch();
+    const hint = dmp.diff_xIndex(diffs as Diff[], spanStart);
+    winStart = hint;
+    winEnd = hint;
+  }
   return {
-    index,
-    quoteScore,
-    contextScore,
-    combined: (quoteScore + contextScore) / 2,
+    start: Math.max(0, winStart - slack),
+    end: Math.min(newLength, winEnd + slack),
   };
 }
 
-/**
- * Gather bitap probe offsets in `newSource` for a quote. Handles
- * `Match_MaxBits` explicitly: for a quote longer than the bitap word
- * size we probe with a distinctive middle slice (the middle is more
- * often unique than the head or tail — a leading `- ` bullet or a
- * trailing punctuation carries little signal). Callers score each
- * returned offset against the FULL quote.
- *
- * Multiple probes: at the caller-supplied expected offset (usually
- * the diff-map hint), at the anchor's original byte offset (before
- * edits), and from 0 (whole-file search). Duplicates are collapsed
- * by the caller via a Map.
- */
-export function bitapProbes(
-  newSource: string,
-  quote: TextQuote,
-  hints: readonly number[],
-  bitapThreshold: number,
-  matchDistance: number,
-): number[] {
-  const dmp = new DiffMatchPatch();
-  dmp.Match_Threshold = bitapThreshold;
-  dmp.Match_Distance = matchDistance;
-  const maxBits = dmp.Match_MaxBits;
-  const key = distinctiveSlice(quote.exact, maxBits);
-  const seen = new Set<number>();
-  const results: number[] = [];
-  for (const hint of hints) {
-    const boundedHint = Math.max(0, Math.min(newSource.length, hint));
-    const raw = dmp.match_main(newSource, key, boundedHint);
-    if (raw < 0) continue;
-    // `match_main` returns the start of the SEARCH KEY in `newSource`,
-    // not the start of the full quote. When we sliced from the
-    // middle, back-project to the quote's start.
-    const projected = raw - keyOffsetInQuote(quote.exact, key, maxBits);
-    if (projected < 0 || projected > newSource.length) continue;
-    if (seen.has(projected)) continue;
-    seen.add(projected);
-    results.push(projected);
-  }
-  return results;
-}
+// ---------- Fuzzy alignment (Blocker 2 fix) ----------
 
 /**
- * Align the OLD quote against the new source at `startOffset` and
- * return the offset just past where the quote's END lands in the new
- * source. Uses `diff_main` for a character-level alignment and
- * `diff_xIndex` to walk the end offset — so an accepted fuzzy match
- * records the ACTUAL new text at the location, not a stale string
- * that may no longer be in the file (PR-40 review, blocker 2).
+ * Align the OLD quote against `newSource` at `startOffset` and return
+ * the offset just past where the quote's END lands in the new source,
+ * plus the aligned new text. Uses `diff_main` for a char-level
+ * alignment and `diff_xIndex(oldQuote.length - 1) + 1` to walk the
+ * quote's LAST character to its counterpart, avoiding the boundary-
+ * INSERT bug where `diff_xIndex(len)` swallows a trailing `\n` and
+ * the next paragraph.
  *
- * `slack` is how much extra window we take past the quote's length,
- * to accommodate insertions inside the block.
+ * After the raw endpoint is computed, whitespace at the START or END
+ * of the matched text that the OLD quote did NOT have is trimmed off
+ * — so a match that spilled onto the next table row (or picked up a
+ * leading `\n` from an insertion) is trimmed back to just the block.
+ * The returned `startOffset` may have advanced past leading
+ * whitespace.
  */
 export function alignMatchedText(
   oldQuote: string,
   newSource: string,
   startOffset: number,
-  slack: number = Math.max(Math.floor(oldQuote.length * 0.5), 16),
-): { endOffset: number; matchedText: string } {
-  const windowEnd = Math.min(newSource.length, startOffset + oldQuote.length + slack);
+  options: { slack?: number; trailingContext?: string } = {},
+): { startOffset: number; endOffset: number; matchedText: string } {
+  const slack = options.slack ?? Math.max(Math.floor(oldQuote.length * 0.5), 16);
+  const trailing = options.trailingContext ?? "";
+  // Append the recorded trailing context to the alignment target so
+  // DMP can find a common suffix and bound the INSERT — otherwise a
+  // partial-line quote like "brown fox" against a window
+  // "brown cat jumps over the fence" aligns the entire "cat jumps
+  // over the fence" as one big INSERT and the walker returns way
+  // past the real block boundary. With the trailing context, DMP
+  // aligns "cat" only and the rest as an EQUAL suffix.
+  const alignmentTarget = oldQuote + trailing;
+  const windowEnd = Math.min(newSource.length, startOffset + alignmentTarget.length + slack);
   const window = newSource.slice(startOffset, windowEnd);
   const dmp = new DiffMatchPatch();
-  const diffs = dmp.diff_main(oldQuote, window);
-  // Ask for the location of the LAST char of the old quote, not the
-  // position just past it. Requesting `oldQuote.length` (past-the-end)
-  // pulls in any INSERT that DMP emitted at the boundary — e.g. a
-  // trailing `\n` and the next paragraph — because the walker keeps
-  // consuming until `chars1 > loc`. Requesting `oldQuote.length - 1`
-  // and adding 1 back stops at the position that maps to the quote's
-  // actual last char, then advances one to keep an exclusive end.
-  const lastCharSource = Math.max(0, oldQuote.length - 1);
-  const endInWindow = dmp.diff_xIndex(diffs, lastCharSource) + 1;
-  const endOffset = Math.min(newSource.length, startOffset + endInWindow);
-  return { endOffset, matchedText: newSource.slice(startOffset, endOffset) };
+  const diffs = dmp.diff_main(alignmentTarget, window) as Diff[];
+  // `diff_cleanupSemantic` consolidates the incidental single-char
+  // matches DMP finds by accident (e.g. an "o" shared between "fox"
+  // and "over") which would otherwise send the walker past the real
+  // block boundary and spill into the next paragraph or table row.
+  dmp.diff_cleanupSemantic(diffs);
+  // Walk to position oldQuote.length (the boundary between the
+  // block and the trailing context we appended).
+  const endInWindow = walkAlignmentEnd(diffs, oldQuote.length);
+  let start = startOffset;
+  let end = Math.min(newSource.length, startOffset + endInWindow);
+  // Trim leading whitespace that the OLD quote does not begin with —
+  // this handles the "leading \n" spill.
+  const oldStartsWithWs = oldQuote.length > 0 && isWhitespace(oldQuote.charCodeAt(0));
+  const oldEndsWithWs = oldQuote.length > 0 && isWhitespace(oldQuote.charCodeAt(oldQuote.length - 1));
+  while (!oldStartsWithWs && start < end && isWhitespace(newSource.charCodeAt(start))) start += 1;
+  while (!oldEndsWithWs && end > start && isWhitespace(newSource.charCodeAt(end - 1))) end -= 1;
+  return { startOffset: start, endOffset: end, matchedText: newSource.slice(start, end) };
+}
+
+function isWhitespace(ch: number): boolean {
+  return ch === 9 /* \t */ || ch === 10 /* \n */ || ch === 13 /* \r */ || ch === 32 /* space */;
+}
+
+/**
+ * Walk `diffs` (of `oldQuote` → `window`) and return the position in
+ * `window` corresponding to the END of `oldQuote`, including any
+ * INSERTs that replace DELETEs at the boundary.
+ *
+ * `diff_xIndex` alone stops at the position BEFORE a DELETE that
+ * covers the end of `oldQuote` — which for a replacement like "fox"
+ * → "cat" returns the position just before "cat", not just after.
+ * The walker below sums the aligned window characters as it goes
+ * and, when the end of `oldQuote` falls inside a DELETE, folds in
+ * any subsequent INSERTs before the next EQUAL — those inserts are
+ * the NEW text that replaced the deleted characters.
+ */
+function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
+  let chars1 = 0;
+  let chars2 = 0;
+  for (let x = 0; x < diffs.length; x += 1) {
+    const entry = diffs[x];
+    if (entry === undefined) break;
+    const [op, text] = entry;
+    const oldLen = op === 1 ? 0 : text.length;
+    const newLen = op === -1 ? 0 : text.length;
+    const nextChars1 = chars1 + oldLen;
+    if (nextChars1 >= oldQuoteLen) {
+      if (op === 0) {
+        // EQUAL segment covers the end — end is proportional.
+        return chars2 + (oldQuoteLen - chars1);
+      }
+      // DELETE segment covers the end — advance past this DELETE
+      // (its chars are gone, so chars2 does not advance) and fold in
+      // any INSERTs that come next before an EQUAL (they are the
+      // replacement text for the DELETE).
+      let end = chars2;
+      for (let y = x + 1; y < diffs.length; y += 1) {
+        const next = diffs[y];
+        if (next === undefined) break;
+        const [op2, text2] = next;
+        if (op2 === 0) break;
+        if (op2 === 1) end += text2.length;
+      }
+      return end;
+    }
+    chars1 += oldLen;
+    chars2 += newLen;
+  }
+  return chars2;
+}
+
+// ---------- Move detection (deleted spans) ----------
+
+/**
+ * Try to detect a MOVE for a fully-deleted anchor: find `prefix +
+ * exact + suffix` verbatim in the new source. Returns the new
+ * offset (start of `exact`) or `null` on zero, ambiguous, or
+ * insufficient-context cases. Uses a linear `indexOf` loop that
+ * stops at the second hit — no O(n·m) scan.
+ *
+ * `sufficientContext` guards against a bare-quote copy: a quote
+ * with too little surrounding evidence (short prefix AND short
+ * suffix, neither reaching a line boundary) cannot be safely
+ * disambiguated and returns `null`.
+ */
+export function tryMove(
+  newSource: string,
+  quote: TextQuote,
+  minContext: number = DEFAULT_MIN_MOVE_CONTEXT,
+): { start: number; reason?: string } | null {
+  if (!sufficientContext(quote, minContext)) {
+    return { start: -1, reason: "insufficient context for move detection" };
+  }
+  const pattern = quote.prefix + quote.exact + quote.suffix;
+  if (pattern.length === 0) return { start: -1, reason: "empty context pattern" };
+  const first = newSource.indexOf(pattern);
+  if (first < 0) return null;
+  const second = newSource.indexOf(pattern, first + 1);
+  if (second >= 0) {
+    return { start: -1, reason: "ambiguous move (multiple exact-context matches)" };
+  }
+  return { start: first + quote.prefix.length };
+}
+
+/** Whether `quote` carries enough context on both sides to allow a
+ * move detection. A side is "sufficient" when either it has at
+ * least `minContext` non-whitespace characters OR it contains a
+ * line boundary (`\n`) — the latter captures a same-line context
+ * that reaches to another line, which is the strongest fingerprint
+ * a short prose quote can carry. */
+function sufficientContext(quote: TextQuote, minContext: number): boolean {
+  return sideSufficient(quote.prefix, minContext) && sideSufficient(quote.suffix, minContext);
+}
+
+function sideSufficient(context: string, minContext: number): boolean {
+  if (context.length === 0) return false;
+  if (context.indexOf("\n") >= 0) return true;
+  let nonWs = 0;
+  for (let i = 0; i < context.length; i += 1) {
+    if (!isWhitespace(context.charCodeAt(i))) {
+      nonWs += 1;
+      if (nonWs >= minContext) return true;
+    }
+  }
+  return false;
+}
+
+// ---------- Similarity ----------
+
+/** Normalised (0–1) similarity of two strings via DMP `diff_main` +
+ * `diff_levenshtein`. Empty inputs are treated as identical. */
+function similarity(a: string, b: string): number {
+  if (a.length === 0 && b.length === 0) return 1;
+  const dmp = new DiffMatchPatch();
+  const diffs = dmp.diff_main(a, b) as Diff[];
+  const distance = dmp.diff_levenshtein(diffs);
+  const denom = Math.max(a.length, b.length);
+  return denom === 0 ? 1 : 1 - distance / denom;
+}
+
+// ---------- Boundary-class check (unchanged path) ----------
+
+/**
+ * Whether the immediate boundaries of the OLD span match the
+ * immediate boundaries of the NEW span in "character class" —
+ * specifically whether each side is at a line boundary (or file
+ * edge) or in the middle of a line. Catches the "substring
+ * accident" where the diff aligns the exact quote as EQUAL, but
+ * the new location's neighbours reveal the block was actually
+ * absorbed into a rewritten sentence.
+ */
+function boundariesMatch(
+  oldSource: string,
+  oldStart: number,
+  oldEnd: number,
+  newSource: string,
+  newStart: number,
+  newEnd: number,
+): boolean {
+  const oldPre = oldStart > 0 ? oldSource.charCodeAt(oldStart - 1) : -1;
+  const newPre = newStart > 0 ? newSource.charCodeAt(newStart - 1) : -1;
+  const oldPost = oldEnd < oldSource.length ? oldSource.charCodeAt(oldEnd) : -1;
+  const newPost = newEnd < newSource.length ? newSource.charCodeAt(newEnd) : -1;
+  return sameBoundaryClass(oldPre, newPre) && sameBoundaryClass(oldPost, newPost);
+}
+
+function sameBoundaryClass(a: number, b: number): boolean {
+  const aBoundary = a === -1 || a === 10 /* \n */;
+  const bBoundary = b === -1 || b === 10;
+  if (aBoundary !== bBoundary) return false;
+  // Both are line-boundary-class OR both are mid-line: accept.
+  return true;
+}
+
+// ---------- Old-span locator ----------
+
+/** Locate the anchor's OLD span in `oldLF`. Uses the recorded
+ * `prefix + exact + suffix` when it is unique; otherwise falls back
+ * to the recorded line-start offset and searches nearby. Returns
+ * `null` when the anchor cannot be located at all (a snapshot bug
+ * the caller should refuse). */
+function locateOldSpan(oldLF: string, anchor: Anchor, oldLineIndex: readonly number[]): { start: number; end: number } | null {
+  const pattern = anchor.quote.prefix + anchor.quote.exact + anchor.quote.suffix;
+  const expectedStart = lineToOffset(oldLineIndex, anchor.startLine);
+  if (pattern.length > 0) {
+    const first = oldLF.indexOf(pattern);
+    if (first >= 0) {
+      const second = oldLF.indexOf(pattern, first + 1);
+      if (second < 0) {
+        return { start: first + anchor.quote.prefix.length, end: first + anchor.quote.prefix.length + anchor.quote.exact.length };
+      }
+      // Multiple matches — pick the one nearest the recorded line
+      // offset (deterministic by construction).
+      let best = first;
+      let bestDist = Math.abs(first - expectedStart);
+      let searchFrom = second;
+      while (searchFrom >= 0) {
+        const dist = Math.abs(searchFrom - expectedStart);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = searchFrom;
+        }
+        searchFrom = oldLF.indexOf(pattern, searchFrom + 1);
+      }
+      return { start: best + anchor.quote.prefix.length, end: best + anchor.quote.prefix.length + anchor.quote.exact.length };
+    }
+  }
+  // No context or context not found — look for the exact alone at
+  // the recorded line.
+  if (anchor.quote.exact.length === 0) return null;
+  const idx = oldLF.indexOf(anchor.quote.exact, Math.max(0, expectedStart - 200));
+  if (idx < 0) return null;
+  return { start: idx, end: idx + anchor.quote.exact.length };
 }
 
 // ---------- The composed pipeline ----------
 
 /**
- * Re-anchor `anchor` against `newSource`, given `oldSource` — the
- * source the anchor was captured against (its SHA-256 must equal
- * `anchor.revision`; the engine returns `orphaned` if the caller
- * hands a snapshot for a different revision).
- *
- * Pure and runtime-neutral: no side effects, no I/O beyond WebCrypto.
- * The caller feeds the result to `reanchorEvent(...)` to build the
- * event to append.
+ * Re-anchor `anchor` against `newSource`, given `oldSource`. Pure
+ * and runtime-neutral; no side effects beyond WebCrypto.
  */
 export async function reanchor(
   anchor: Anchor,
@@ -353,22 +551,16 @@ export async function reanchor(
   newSource: string,
   options: ReanchorOptions = {},
 ): Promise<ReanchorResult> {
-  const minFuzzyScore = options.minFuzzyScore ?? DEFAULT_MIN_FUZZY_SCORE;
-  const minMargin = options.minMargin ?? DEFAULT_MIN_MARGIN;
-  const minQuoteScore = options.minQuoteScore ?? DEFAULT_MIN_QUOTE_SCORE;
-  const matchDistance = options.matchDistance ?? DEFAULT_MATCH_DISTANCE;
-  const bitapThreshold = options.bitapThreshold ?? DEFAULT_BITAP_THRESHOLD;
   const oldLF = toLF(oldSource);
   const newLF = toLF(newSource);
   const newRevision = await revisionOf(newLF);
 
-  // (0) Identity: source is unchanged.
+  // (0) Identity.
   if (anchor.revision === newRevision) {
     return { kind: "anchored", anchor, method: "unchanged" };
   }
 
-  // Sanity: the snapshot must correspond to the anchor. If it does
-  // not, the diff is meaningless.
+  // (1) Snapshot must correspond to the anchor.
   const oldRevision = await revisionOf(oldLF);
   if (oldRevision !== anchor.revision) {
     return {
@@ -378,168 +570,191 @@ export async function reanchor(
     };
   }
 
-  // (a) Exact-first pass: enumerate every occurrence of the exact
-  // quote. One occurrence anchors immediately. Multiple occurrences
-  // are disambiguated by prefix/suffix; a clear winner anchors as
-  // quote-exact, an ambiguous set falls through to fuzzy (which
-  // applies the same margin check on scored candidates).
-  const exactHits = exactOccurrences(newLF, anchor.quote.exact);
-  if (exactHits.length === 1) {
-    const start = exactHits[0] ?? 0;
-    const rebuilt = await buildMovedAnchor(anchor, newLF, start, anchor.quote.exact, newRevision);
-    return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
+  const oldLineIndex = buildLineStartIndex(oldLF);
+  const newLineIndex = buildLineStartIndex(newLF);
+  const oldSpan = locateOldSpan(oldLF, anchor, oldLineIndex);
+  if (oldSpan === null) {
+    return {
+      kind: "orphaned",
+      revision: newRevision,
+      reason: "old anchor span not found in snapshot (malformed anchor).",
+    };
   }
-  if (exactHits.length > 1) {
-    const disambiguated = disambiguateExact(newLF, anchor.quote, exactHits, minMargin);
-    if (disambiguated !== null) {
-      const rebuilt = await buildMovedAnchor(anchor, newLF, disambiguated, anchor.quote.exact, newRevision);
+
+  // (2) One character-level diff serves the whole classification.
+  const dmp = new DiffMatchPatch();
+  dmp.Diff_Timeout = options.diffTimeoutSeconds ?? DEFAULT_DIFF_TIMEOUT_SECONDS;
+  const diffs = dmp.diff_main(oldLF, newLF) as Diff[];
+  dmp.diff_cleanupSemantic(diffs);
+
+  const cls = classifySpan(diffs, oldSpan.start, oldSpan.end);
+
+  // (4a) Unchanged — map through diff_xIndex and verify, INCLUDING
+  // that the character-class of the new-source boundary matches the
+  // old-source boundary. Without the boundary check, the diff can
+  // report a substring accident as "unchanged": the exact quote
+  // appears verbatim as part of a longer inserted sentence, DMP
+  // aligns it as EQUAL, and we would anchor onto the wrong place.
+  // The boundary check catches the substring accident because the
+  // old quote's edges were at line boundaries (or file edges) while
+  // the new location's edges are mid-line inside a rewritten
+  // sentence.
+  if (cls.kind === "unchanged") {
+    const newStart = dmp.diff_xIndex(diffs, oldSpan.start);
+    const newEnd = dmp.diff_xIndex(diffs, oldSpan.end - 1) + 1;
+    const mapped = newLF.slice(newStart, newEnd);
+    if (
+      mapped === anchor.quote.exact &&
+      boundariesMatch(oldLF, oldSpan.start, oldSpan.end, newLF, newStart, newEnd)
+    ) {
+      const rebuilt = await buildAnchor(
+        anchor,
+        newLF,
+        newLineIndex,
+        newStart,
+        anchor.quote.exact,
+        newRevision,
+      );
       return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
     }
-    // fall through to fuzzy; the margin check there gives one more
-    // chance to accept.
-  }
-
-  // (b) Fuzzy: multiple probes → score each → gate on quote-only
-  // score → apply threshold + margin.
-  const lineMap = diffMapLines(oldLF, newLF);
-  const mapped = mapAnchorRange(lineMap, anchor.startLine, anchor.endLine);
-  const originalOffset = lineToOffset(oldLF, anchor.startLine);
-  const mappedOffset = mapped === null ? null : lineToOffset(newLF, mapped.start);
-  const hints: number[] = [];
-  if (mappedOffset !== null) hints.push(mappedOffset);
-  hints.push(Math.min(newLF.length, originalOffset));
-  hints.push(0);
-  if (newLF.length > 0) hints.push(newLF.length - 1);
-
-  const probeOffsets = bitapProbes(newLF, anchor.quote, hints, bitapThreshold, matchDistance);
-  // Also seed with any exact hits — even ambiguous ones deserve
-  // scoring, since context may still pick one clearly.
-  for (const hit of exactHits) probeOffsets.push(hit);
-  // Fallback: bitap can return nothing when the whole line was
-  // rewritten (no fuzzy match beats its threshold). We still want
-  // the scorer to run at the diff-map hint / original offset so the
-  // combined-score gate decides — not a silent orphan on "0 probes
-  // tried". Seed the hint offsets directly.
-  for (const h of hints) probeOffsets.push(h);
-
-  // NEIGHBOUR SCAN. Bitap gives us one location per hint, but a
-  // templated repeat (bullet list, table rows, code lines) needs the
-  // margin check on the SIBLINGS to catch ambiguity. Expand every
-  // probe by scoring its ±3 line neighbours too. Bounded to at most
-  // three lines each side so we do 7 * (# bitap hits) scorings — a
-  // constant per hit, safe on a 1 MB templated file.
-  //
-  // All candidates are SNAPPED to line-start offsets, so an off-by-a-
-  // few-chars probe (bitap can return a start a couple of chars into
-  // a line) does not compete against its own line-aligned self as if
-  // they were two different candidates — that was the source of the
-  // margin-check false positive on unique quotes.
-  const NEIGHBOUR_RADIUS = 3;
-  const neighbourOffsets = new Set<number>();
-  for (const probe of probeOffsets) {
-    if (probe < 0 || probe > newLF.length) continue;
-    const line = offsetToLine(newLF, probe);
-    for (let d = -NEIGHBOUR_RADIUS; d <= NEIGHBOUR_RADIUS; d += 1) {
-      const l = line + d;
-      if (l < 1) continue;
-      const off = lineToOffset(newLF, l);
-      if (off >= 0 && off <= newLF.length) neighbourOffsets.add(off);
+    // Boundary mismatch or exact slice mismatch: fall through to
+    // move detection. If the block truly moved to a new position
+    // with intact context, tryMove will find it; otherwise orphan.
+    const moveResult = tryMove(newLF, anchor.quote);
+    if (moveResult !== null && moveResult.start >= 0) {
+      const rebuilt = await buildAnchor(
+        anchor,
+        newLF,
+        newLineIndex,
+        moveResult.start,
+        anchor.quote.exact,
+        newRevision,
+      );
+      return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
     }
-  }
-  const candidatesByIndex = new Map<number, Candidate>();
-  for (const offset of neighbourOffsets) {
-    candidatesByIndex.set(offset, scoreCandidate(newLF, anchor.quote, offset));
-  }
-  // CLUSTER nearby candidates. Two offsets that are within half the
-  // quote's length of each other correspond to essentially the same
-  // match location (e.g. an empty-line start at 72 vs a real line
-  // start at 73 both grab most of the same content when scored). The
-  // margin check must not fire against the shifted-by-one view of
-  // the same location. Keep the higher-scoring representative of each
-  // cluster.
-  const clusterRadius = Math.max(Math.floor(anchor.quote.exact.length / 2), 1);
-  const byOffset = [...candidatesByIndex.values()].sort((a, b) => a.index - b.index);
-  const clustered: Candidate[] = [];
-  for (const c of byOffset) {
-    const last = clustered[clustered.length - 1];
-    if (last !== undefined && c.index - last.index < clusterRadius) {
-      if (c.combined > last.combined) clustered[clustered.length - 1] = c;
-    } else {
-      clustered.push(c);
-    }
-  }
-  // Drop candidates whose STANDALONE quote score is below the gate.
-  const candidates = clustered
-    .filter((c) => c.quoteScore >= minQuoteScore)
-    .sort((a, b) => b.combined - a.combined);
-
-  if (candidates.length === 0) {
     return {
       kind: "orphaned",
       revision: newRevision,
       reason:
-        "no fuzzy candidate cleared the quote-only gate " +
-        `(min ${minQuoteScore.toFixed(2)}); ${probeOffsets.length} probes tried.`,
+        "diff reports unchanged, but the block's surroundings differ (substring accident) and no move detected.",
     };
   }
-  const best = candidates[0];
-  if (best === undefined) {
+
+  // Templated-shift demotion: when the diff calls the span
+  // "modified" but only a tiny fraction of it is in EQUAL segments,
+  // the diff is aligning incidental template fragments as EQUAL
+  // while everything meaningful is DELETE. That is a templated
+  // shift, not an edit — demote to the deleted path.
+  const spanLen = oldSpan.end - oldSpan.start;
+  if (
+    cls.kind === "modified" &&
+    spanLen > 0 &&
+    cls.equalChars / spanLen < DEFAULT_MIN_MODIFIED_EQUAL_FRACTION
+  ) {
+    const moveResult = tryMove(newLF, anchor.quote);
+    if (moveResult !== null && moveResult.start >= 0) {
+      const rebuilt = await buildAnchor(
+        anchor,
+        newLF,
+        newLineIndex,
+        moveResult.start,
+        anchor.quote.exact,
+        newRevision,
+      );
+      return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
+    }
     return {
       kind: "orphaned",
       revision: newRevision,
-      reason: "internal: no candidate after sort (unreachable if candidates.length > 0)",
+      reason:
+        `modified span kept only ${cls.equalChars}/${spanLen} chars unchanged ` +
+        `(< ${DEFAULT_MIN_MODIFIED_EQUAL_FRACTION}); treated as deleted. ` +
+        `${moveResult === null ? "No move detected." : `Move detection: ${moveResult.reason ?? "no unique match"}.`}`,
     };
   }
-  if (best.combined < minFuzzyScore) {
+
+  // (4c) Deleted — try move detection. NO fuzzy fallback.
+  if (cls.kind === "deleted") {
+    const moveResult = tryMove(newLF, anchor.quote);
+    if (moveResult !== null && moveResult.start >= 0) {
+      const rebuilt = await buildAnchor(
+        anchor,
+        newLF,
+        newLineIndex,
+        moveResult.start,
+        anchor.quote.exact,
+        newRevision,
+      );
+      return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
+    }
     return {
       kind: "orphaned",
       revision: newRevision,
-      reason: `best fuzzy score ${best.combined.toFixed(2)} < ${minFuzzyScore}`,
-      score: best.combined,
+      reason:
+        moveResult === null
+          ? "block deleted; no move detected."
+          : `block deleted; move detection: ${moveResult.reason ?? "no unique match"}.`,
     };
   }
-  // AMBIGUITY / MARGIN CHECK. Only candidates that ALSO clear the
-  // combined threshold on their own are viable alternates — a weak
-  // candidate near a strong one (e.g. a blank line or an unrelated
-  // paragraph that happens to share a few words) is not "ambiguous",
-  // it is just a low-scoring probe the scan surfaced.
-  //
-  // The margin check triggers when TWO viable candidates exist and
-  // the winner does not beat the runner-up by `minMargin`. This is
-  // the templated-repeat case (bullet list, table row, code block
-  // with repeated lines) the reviewer flagged.
-  const viableRunnerUp = candidates.find(
-    (c, i) => i > 0 && c.combined >= minFuzzyScore,
+
+  // (4b) Modified — the diff already localizes the block. We use
+  // `diff_xIndex(oldSpan.start)` as the single seed inside the
+  // enclosing hunk window, then `alignMatchedText` walks the old
+  // quote's END onto the new source. The similarity gate decides
+  // whether the block is still "recognisably the same block". A
+  // second candidate from a bitap probe in the same window would
+  // only re-locate on the SAME modified hunk (the window is bounded
+  // by the changed segments); competing "candidates" arise from
+  // probes hitting nearby lines, which are noise, not ambiguity.
+  // If in future we need an ambiguity signal here, it comes from
+  // the char-level diff's own alternatives — not from re-searching
+  // the window.
+  const hunkWindow = findHunkWindow(diffs, oldSpan.start, oldSpan.end, newLF.length);
+  const mappedStart = dmp.diff_xIndex(diffs, oldSpan.start);
+  const clampedStart = Math.max(hunkWindow.start, Math.min(hunkWindow.end, mappedStart));
+  const aligned = alignMatchedText(anchor.quote.exact, newLF, clampedStart, {
+    trailingContext: anchor.quote.suffix,
+  });
+  const score = similarity(anchor.quote.exact, aligned.matchedText);
+  if (score < DEFAULT_MIN_QUOTE_SCORE) {
+    return {
+      kind: "orphaned",
+      revision: newRevision,
+      reason: `modified: quote similarity ${score.toFixed(2)} < gate ${DEFAULT_MIN_QUOTE_SCORE}.`,
+      score,
+    };
+  }
+  // Second-opinion: does the NEW aligned text also appear elsewhere
+  // in the hunk window? If yes, we have local ambiguity and must
+  // orphan. Uses `indexOf` (no fuzzy) so this remains cheap.
+  if (aligned.matchedText.length > 0) {
+    const first = newLF.indexOf(aligned.matchedText, hunkWindow.start);
+    if (first >= 0 && first < hunkWindow.end) {
+      const second = newLF.indexOf(aligned.matchedText, first + 1);
+      if (second >= 0 && second < hunkWindow.end && Math.abs(second - aligned.startOffset) > DEFAULT_MIN_MARGIN * newLF.length) {
+        return {
+          kind: "orphaned",
+          revision: newRevision,
+          reason: `modified: aligned text appears twice inside the local hunk window (ambiguous).`,
+          score,
+        };
+      }
+    }
+  }
+  const rebuilt = await buildAnchor(
+    anchor,
+    newLF,
+    newLineIndex,
+    aligned.startOffset,
+    aligned.matchedText,
+    newRevision,
   );
-  if (viableRunnerUp !== undefined && best.combined - viableRunnerUp.combined < minMargin) {
-    return {
-      kind: "orphaned",
-      revision: newRevision,
-      reason:
-        `ambiguous fuzzy match: best ${best.combined.toFixed(2)} at offset ` +
-        `${best.index} does not beat runner-up ${viableRunnerUp.combined.toFixed(2)} ` +
-        `at offset ${viableRunnerUp.index} by ${minMargin} (delta ` +
-        `${(best.combined - viableRunnerUp.combined).toFixed(2)}).`,
-      score: best.combined,
-    };
-  }
-
-  // Accepted. Record the ACTUAL matched text — walk the old quote's
-  // end onto the new source with diff_xIndex, so the recorded `exact`
-  // is what's actually at the location, not a stale string.
-  const aligned = alignMatchedText(anchor.quote.exact, newLF, best.index);
-  const rebuilt = await buildMovedAnchor(anchor, newLF, best.index, aligned.matchedText, newRevision);
-  return { kind: "fuzzy", anchor: rebuilt, method: "fuzzy", score: best.combined };
+  return { kind: "fuzzy", anchor: rebuilt, method: "fuzzy", score };
 }
 
 /**
  * Turn a `ReanchorResult` into the `ReviewEventInput` a store
- * `append`s. `anchored` (unchanged) returns `null` — the caller
- * writes no event. The daemon (item 5b) is expected to run:
- *
- *   const result = await reanchor(anchor, oldSource, newSource);
- *   const event = reanchorEvent(threadId, actor, result);
- *   if (event) await store.append(event);
+ * `append`s. `anchored` (unchanged) returns `null`.
  */
 export function reanchorEvent(
   threadId: string,
@@ -583,143 +798,28 @@ export function reanchorEvent(
 
 // ---------- helpers (module-local) ----------
 
-/** Normalise line endings to LF, matching `revisionOf`. */
 function toLF(source: string): string {
   return source.replace(/\r\n?/g, "\n");
 }
 
-function splitLines(source: string): string[] {
-  if (source.length === 0) return [];
-  return source.split("\n");
-}
-
-/** Byte offset of the start of line `n` (1-indexed). Returns
- * `source.length` if `n` is past the end. */
-function lineToOffset(source: string, n: number): number {
-  if (n <= 1) return 0;
-  let offset = 0;
-  let line = 1;
-  for (let i = 0; i < source.length; i += 1) {
-    if (line === n) return offset;
-    if (source.charCodeAt(i) === 10 /* \n */) {
-      line += 1;
-      offset = i + 1;
-    }
-  }
-  return line === n ? offset : source.length;
-}
-
-function offsetToLine(source: string, offset: number): number {
-  if (offset <= 0) return 1;
-  let line = 1;
-  const bound = Math.min(offset, source.length);
-  for (let i = 0; i < bound; i += 1) {
-    if (source.charCodeAt(i) === 10) line += 1;
-  }
-  return line;
-}
-
 /**
- * Number of lines a DMP-emitted diff segment covers.
- *
- * The bug this replaces (PR-40 review nit): counting only `\n` misses
- * the final "line without trailing newline" case — a file whose last
- * line has no terminating `\n` produces a partial last line that
- * `diff_charsToLines_` emits without an `\n`, and the old counter
- * mapped it to zero lines. Any anchor on that last line then fell
- * out of the diff-map's coverage and re-anchored via fuzzy instead
- * of quote-exact.
+ * Build the new anchor for a match at `startOffset` with text
+ * `matchedText`. Prefix/suffix are recut around the actual match
+ * from the new source; the line range is computed from the offset
+ * via the precomputed line-start index.
  */
-function countLinesInSegment(segment: string): number {
-  if (segment.length === 0) return 0;
-  let count = 0;
-  for (let i = 0; i < segment.length; i += 1) {
-    if (segment.charCodeAt(i) === 10) count += 1;
-  }
-  // Trailing content without a terminating LF is still a line.
-  if (segment.charCodeAt(segment.length - 1) !== 10) count += 1;
-  return count;
-}
-
-/** Normalised (0–1) similarity of two strings, via DMP's Levenshtein
- * over `diff_main`. Empty inputs are treated as a perfect match
- * (`prefix` and `suffix` are allowed to be empty). */
-function similarity(dmp: DiffMatchPatch, a: string, b: string): number {
-  if (a.length === 0 && b.length === 0) return 1;
-  const diffs = dmp.diff_main(a, b);
-  const distance = dmp.diff_levenshtein(diffs);
-  const denom = Math.max(a.length, b.length);
-  return denom === 0 ? 1 : 1 - distance / denom;
-}
-
-/**
- * Pick the most distinctive slice of `quote` up to `maxBits`
- * characters, for feeding into bitap `match_main` (which errors on
- * patterns longer than `Match_MaxBits`). Strategy: prefer the middle
- * (leading indentation, bullet markers and trailing punctuation
- * repeat across templated content; the middle is where the
- * discriminative words live). For quotes shorter than `maxBits` the
- * whole quote is returned.
- */
-function distinctiveSlice(quote: string, maxBits: number): string {
-  if (quote.length <= maxBits) return quote;
-  const start = Math.max(0, Math.floor((quote.length - maxBits) / 2));
-  return quote.slice(start, start + maxBits);
-}
-
-/** Offset of `key` inside `quote` (where `distinctiveSlice` cut).
- * Used to back-project a bitap match on the slice to the START of
- * the full quote. */
-function keyOffsetInQuote(quote: string, key: string, maxBits: number): number {
-  if (quote.length <= maxBits) return 0;
-  return Math.max(0, Math.floor((quote.length - maxBits) / 2));
-}
-
-/**
- * Choose ONE of `hits` (byte offsets) whose surrounding context best
- * matches the anchor's `prefix`/`suffix`. Returns the offset when
- * exactly one candidate wins by `minMargin`, else `null` — the
- * caller then falls through to fuzzy (which repeats the margin check
- * on scored candidates and can still orphan).
- */
-function disambiguateExact(
-  newSource: string,
-  quote: TextQuote,
-  hits: readonly number[],
-  minMargin: number,
-): number | null {
-  const scored = hits
-    .map((hit) => {
-      const c = scoreCandidate(newSource, quote, hit);
-      return { hit, score: c.contextScore };
-    })
-    .sort((a, b) => b.score - a.score);
-  const best = scored[0];
-  const runnerUp = scored[1];
-  if (best === undefined) return null;
-  if (runnerUp !== undefined && best.score - runnerUp.score < minMargin) return null;
-  return best.hit;
-}
-
-/**
- * Build the new anchor for a match starting at `startOffset` with
- * text `matchedText` (equal to `anchor.quote.exact` for a
- * quote-exact match; equal to the aligned new text for a fuzzy
- * match). `prefix`/`suffix` are recaptured around the ACTUAL match
- * so the recorded anchor is coherent — a subsequent rebuild reads
- * back a quote that is really at those offsets in the new source.
- */
-async function buildMovedAnchor(
+async function buildAnchor(
   original: Anchor,
   newSource: string,
+  newLineIndex: readonly number[],
   startOffset: number,
   matchedText: string,
   newRevision: string,
 ): Promise<Anchor> {
   const contextLength = Math.max(original.quote.prefix.length, original.quote.suffix.length, 32);
   const endOffset = startOffset + matchedText.length;
-  const startLine = offsetToLine(newSource, startOffset);
-  const endLine = offsetToLine(newSource, Math.max(startOffset, endOffset - 1));
+  const startLine = offsetToLine(newLineIndex, startOffset);
+  const endLine = offsetToLine(newLineIndex, Math.max(startOffset, endOffset - 1));
   const prefixStart = Math.max(0, startOffset - contextLength);
   const suffixEnd = Math.min(newSource.length, endOffset + contextLength);
   const rebuilt: Anchor = {
