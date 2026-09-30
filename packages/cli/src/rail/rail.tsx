@@ -425,6 +425,12 @@ function subscribeEvents(
           const currentRoute = normaliseCurrentRoute(window.location.pathname);
           const eventRoute = normaliseCurrentRoute(event.route);
           if (currentRoute === eventRoute) {
+            // Round-2 nit: before triggering the page reload, snapshot
+            // every open reply-draft textarea into sessionStorage so
+            // the reload doesn't discard mid-typed replies. The rail
+            // restores each draft on the next mount (see `restoreDrafts`
+            // below).
+            saveReplyDraftsToSessionStorage();
             // Race guard: a very rapid follow-up publish should not
             // trigger overlapping reloads. `location.reload` is
             // idempotent in browsers (the second call is a no-op
@@ -496,6 +502,52 @@ function subscribeEvents(
 /** Try to find the block on the page whose `data-src` matches
  * `anchor.path:start-end`. Used to scroll a thread's anchor into view
  * when the reviewer opens it in the rail. */
+/** Round-2 nit: `doc.published` used to trigger a bare
+ * `location.reload()`, which discards every open reply draft.
+ * The three helpers here snapshot each reply textarea's value
+ * to sessionStorage (keyed by thread id) before reload,
+ * restore it on the next mount, and clear it once the reply
+ * successfully posts. sessionStorage is per-tab and per-origin;
+ * every access is try/caught — a private window or a blocked-
+ * storage origin degrades gracefully. */
+const DRAFT_KEY_PREFIX = "revkit.rail.draft:";
+function saveReplyDraftsToSessionStorage(): void {
+  try {
+    const forms = document.querySelectorAll<HTMLFormElement>(
+      "form.revkit-rail__reply-form[data-thread-id]",
+    );
+    for (const form of Array.from(forms)) {
+      const threadId = form.getAttribute("data-thread-id");
+      const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+      if (threadId === null || textarea === null) continue;
+      const value = textarea.value;
+      if (value.length === 0) {
+        try { sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${threadId}`); } catch { /* ignore */ }
+        continue;
+      }
+      try {
+        sessionStorage.setItem(`${DRAFT_KEY_PREFIX}${threadId}`, value);
+      } catch { /* private mode / quota — best-effort */ }
+    }
+  } catch { /* no DOM (SSR) */ }
+}
+function restoreReplyDraftFromSessionStorage(
+  threadId: string,
+  textarea: HTMLTextAreaElement,
+): boolean {
+  try {
+    const saved = sessionStorage.getItem(`${DRAFT_KEY_PREFIX}${threadId}`);
+    if (saved !== null && saved.length > 0) {
+      textarea.value = saved;
+      return true;
+    }
+  } catch { /* ignore */ }
+  return false;
+}
+function clearReplyDraftFor(threadId: string): void {
+  try { sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${threadId}`); } catch { /* ignore */ }
+}
+
 function findBlockForAnchor(anchor: RailAnchor): HTMLElement | undefined {
   // Issue #46 item 5: an unanchored anchor has no line range —
   // nothing on the page to scroll to. Skip the DOM lookup rather
@@ -602,6 +654,17 @@ function Rail(): JSX.Element {
   // open. Declared here so keyboard handlers set up below can read
   // it in Escape's dispatch table.
   const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
+
+  /** Wrapper that both restores a draft from sessionStorage AND
+   * sets the local `replyDraftFor` signal so the form stays open
+   * after the reload. The top-level `saveReplyDraftsToSessionStorage`
+   * / `restoreReplyDraftFromSessionStorage` do the persistence; this
+   * closure adds the signal update. */
+  function restoreReplyDraftForThread(threadId: string, textarea: HTMLTextAreaElement): void {
+    if (restoreReplyDraftFromSessionStorage(threadId, textarea)) {
+      setReplyDraftFor(threadId);
+    }
+  }
 
   // Wire the SSE stream on mount, tear it down on unmount. The three
   // subscribers are separated so a `presence` event does not force a
@@ -1075,12 +1138,14 @@ function Rail(): JSX.Element {
                   >
                     <form
                       class="revkit-rail__reply-form"
+                      data-thread-id={thread.id}
                       onSubmit={(event: SubmitEvent): void => {
                         event.preventDefault();
                         const form = event.currentTarget as HTMLFormElement;
                         const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
                         if (textarea === null || textarea.value.trim().length === 0) return;
                         void submitReply(thread, textarea.value.trim());
+                        clearReplyDraftFor(thread.id);
                       }}
                     >
                       <label class="revkit-rail__label">
@@ -1090,6 +1155,11 @@ function Rail(): JSX.Element {
                           rows="2"
                           data-testid="revkit-rail-reply-input"
                           aria-label="reply body"
+                          ref={(el: HTMLTextAreaElement) => {
+                            // Round-2: restore any draft saved before
+                            // a `doc.published` reload discarded the DOM.
+                            restoreReplyDraftForThread(thread.id, el);
+                          }}
                         ></textarea>
                       </label>
                       <div class="revkit-rail__actions">
@@ -1215,12 +1285,14 @@ function Rail(): JSX.Element {
                     >
                       <form
                         class="revkit-rail__reply-form"
+                        data-thread-id={thread.id}
                         onSubmit={(event: SubmitEvent): void => {
                           event.preventDefault();
                           const form = event.currentTarget as HTMLFormElement;
                           const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
                           if (textarea === null || textarea.value.trim().length === 0) return;
                           void submitReply(thread, textarea.value.trim());
+                          clearReplyDraftFor(thread.id);
                         }}
                       >
                         <label class="revkit-rail__label">
@@ -1230,6 +1302,9 @@ function Rail(): JSX.Element {
                             rows="2"
                             data-testid="revkit-rail-orphan-reply-input"
                             aria-label="reply body"
+                            ref={(el: HTMLTextAreaElement) => {
+                              restoreReplyDraftForThread(thread.id, el);
+                            }}
                           ></textarea>
                         </label>
                         <div class="revkit-rail__actions">

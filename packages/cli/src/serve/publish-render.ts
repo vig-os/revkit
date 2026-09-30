@@ -53,11 +53,16 @@ export interface RenderDocOptions {
 /** Result of `renderDocFragment`. `html` is the serialised article
  * body — the string that goes into the site's `<article>` element.
  * `dataSrcCount` is the number of block-level anchors stamped, so
- * the caller can log the coverage. */
-export interface RenderDocResult {
-  readonly html: string;
-  readonly dataSrcCount: number;
-}
+ * the caller can log the coverage. A refusal indicates the source
+ * uses a feature the fast path cannot render byte-for-byte with
+ * the full build (see `fastPathRefusalFor`). */
+export type RenderDocResult =
+  | {
+      readonly refused?: undefined;
+      readonly html: string;
+      readonly dataSrcCount: number;
+    }
+  | FastPathRefusal;
 
 /** File extensions the fast-path knows how to render. `.mdx` is
  * excluded (see file header). */
@@ -71,6 +76,61 @@ export const RENDERABLE_EXTENSIONS: readonly string[] = Object.freeze([".md"]);
 export function isRenderablePath(path: string): boolean {
   const ext = extname(path).toLowerCase();
   return RENDERABLE_EXTENSIONS.includes(ext);
+}
+
+/** Markdown source features the fast path CANNOT match against
+ * the full build's Starlight-driven output. The daemon refuses
+ * to fast-render these — dist keeps serving the old HTML until
+ * the background full build lands the update. Kept as a single
+ * source-content predicate so both the render side (short-
+ * circuits before invoking the shared processor) and the
+ * equivalence test (asserts the refusal contract) look at the
+ * same rules.
+ *
+ * Refused features:
+ *   1. **Fenced code blocks** (```…``` or ~~~…~~~). The full
+ *      build wraps every code block in Starlight's expressive-
+ *      code frame (`<div class="expressive-code">…</div>` with
+ *      themed shiki output and copy-button chrome). The fast
+ *      path renders a plain `<pre>` and therefore diverges on
+ *      HTML byte parity. Adding expressive-code to the shared
+ *      chain is tracked as follow-up work — it wants Starlight's
+ *      full theme + i18n preprocessor to match byte-for-byte.
+ *   2. **Starlight directives / asides** (`:::note`, `:::tip`,
+ *      `:::caution`, `:::danger`). Starlight compiles these
+ *      through `remark-directive` + a custom transformer;
+ *      dropping either from the shared chain lets the fast path
+ *      emit `<span class="…">` where the full build emits an
+ *      `<aside>` with a translated title. Refused to keep the
+ *      "same HTML or refuse" contract crisp.
+ *
+ * On a refusal, `renderDocFragment` returns `{ refused: true,
+ * reason }` and the daemon skips the fast-path override — the
+ * on-disk dist serves the previous full build's HTML. */
+export interface FastPathRefusal {
+  readonly refused: true;
+  readonly reason: "code-fence" | "starlight-directive";
+}
+
+/** Detect whether the fast path can render `source` byte-parity
+ * with a full build. Returns `undefined` when the source is
+ * renderable; a `FastPathRefusal` otherwise. Reads only the
+ * source — no filesystem I/O. */
+export function fastPathRefusalFor(source: string): FastPathRefusal | undefined {
+  // Fenced code blocks — three or more backticks or tildes at
+  // the start of a line, treated as an opening fence per the
+  // CommonMark spec. Indentation up to three spaces is still a
+  // fence; four or more is a code block by indentation (which
+  // Astro's default shiki handles the same as expressive-code
+  // would — so no divergence — and does NOT trigger a refusal).
+  const fenceLine = /^ {0,3}(?:```+|~~~+)/m;
+  if (fenceLine.test(source)) return { refused: true, reason: "code-fence" };
+  // Starlight asides: `:::note`, `:::tip`, `:::caution`,
+  // `:::danger` at the start of a line. `:::` (three colons)
+  // is remark-directive's block-container prefix.
+  const asideLine = /^ {0,3}::: ?(?:note|tip|caution|danger)\b/m;
+  if (asideLine.test(source)) return { refused: true, reason: "starlight-directive" };
+  return undefined;
 }
 
 /** Cached processor keyed by repo root. `createMarkdownProcessor`
@@ -94,6 +154,8 @@ export async function renderDocFragment(options: RenderDocOptions): Promise<Rend
       `renderDocFragment: path '${options.path}' is not a renderable extension (${RENDERABLE_EXTENSIONS.join(", ")}).`,
     );
   }
+  const refusal = fastPathRefusalFor(options.source);
+  if (refusal !== undefined) return refusal;
   let processorPromise = processorCache.get(options.repoRoot);
   if (processorPromise === undefined) {
     // `syntaxHighlight: false` matches what Starlight's

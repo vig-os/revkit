@@ -44,7 +44,9 @@ undocumented sneaks past.
 | `resolve` | Close a thread. Optional resolution note. | `thread_id` |
 | `review_url` | Mint a fresh single-use launch URL the human can open. 60 s TTL. | *(none — optional `path` to deep-link)* |
 | `ask` | Raise a rich question page (choice, rank, scale, text, region, review). Returns `{ ask, url }` immediately; the URL is ready-to-open. | `spec` |
-| `await_answer` | Long-poll for the human's answer to a previously-raised ask. Returns as soon as a terminal `ask.*` event lands, or after `timeout_ms`. `pending` is normal — call again. | `id` |
+| `await_answer` | Long-poll for the human's answer to a previously-raised ask. Returns as soon as a terminal `ask.*` event lands, or after `timeout_ms` (default 8000 ms, capped at 9000 ms). `pending` is normal — call again. | `id` |
+| `mode` | Read the current delivery mode (`handover` / `live` / `quiet`). Read-only from the agent side. | *(none)* |
+| `presence` | Mark the agent as `editing` or `idle` on a source region (30 s idle window). | `state: "editing" \| "idle"` |
 
 ## The loop
 
@@ -280,32 +282,73 @@ The daemon reads this stamp at request time and, when the current
 on-disk source has moved on from what dist was built against, renders
 the fresh source into the shell without waiting for a full build.
 
-You do not need to compute the revision yourself — `publish` returns
-it in the response body under `docs[].revision`. Store it if a later
-`ask` or `reply` should reference the exact revision you published;
-the daemon accepts `revision` as an optional field on `reply` for
-threads pinned to a source line.
+`publish` returns the revision it just wrote in the response's
+`published[].revision` — one entry per file, shape
+`{ path, route, revision }`. Keep the value alongside your record of
+the publish; when a comment comes back through the channel with a
+matching `revision` you know the human is looking at THAT exact
+version. `reply` itself takes only `thread_id`, `parent_id` and
+`body` — its schema is strict, so DON'T include a `revision` on
+the reply itself.
 
 ## What DOESN'T fast-render
 
-- **MDX (`site/src/content/docs/*.mdx`)** — the fast-path renderer
-  refuses `.mdx` because those files import components the shared
-  markdown pipeline cannot resolve on its own. A publish to an MDX
-  path still lands the write and fans out `doc.published`; the human
-  sees the new content once the background full build catches up
-  (typically 3–10 s). The skill's `publish` tool does not accept MDX
-  paths in v1.
-- **Plot spec / data files** — a publish to `plots/<name>/…` writes
-  the file (the collection loader picks it up on the next full
-  build), but there is no fast-path render because a plot is a
-  component. The doc that references the plot re-renders on its own
-  publish; between the two, the doc shows the old plot SVG until the
-  full build catches up.
+- **MDX (`site/src/content/docs/*.mdx`)**. `publish` refuses MDX
+  paths at the confinement gate (`400 confinement`) — the write
+  never lands, no build runs. To update MDX in v1, edit the file
+  outside `publish` and run `astro build` yourself.
+- **Fenced code blocks and Starlight asides (`:::note`, …)**. The
+  file is written and `doc.published` fans out, but the daemon
+  keeps serving the previous full build's HTML for that route
+  until you rerun `astro build` — the fast path refuses to render
+  a mismatch against Starlight's expressive-code frame. `publish`
+  is still safe to call; it just isn't sub-second visible.
+- **Plot spec / data files**. Writes to `plots/<name>/…` land on
+  disk and `doc.published` fans out with the batch's paths, but
+  the plot's own SVG is rendered at `astro build` time (Vega-Lite
+  → SVG); the referencing doc's page shows the old plot until
+  the next full build.
+
+None of the above triggers an automatic build. When the human wants
+to see stale content refresh, they rerun `bun run build` in
+`site/`; the daemon serves the new dist as soon as it lands.
 
 The skill's channel notifications carry a `path` and a `revision`;
 if `revision` differs from the source's current revision on disk,
 the human is looking at a stale render — call `publish` again with
 the current source to refresh.
+
+## `mode` and `presence`
+
+- **`mode`** (no args) reads the current delivery mode
+  (`handover` / `live` / `quiet`, per ADR-0007 §5.3). It is
+  read-only — the human sets the mode from the rail or with the
+  CLI (`revkit mode <m>`); the tool exists so the agent can
+  discover what delivery contract it is under.
+- **`presence`** (`{ state, path?, startLine?, endLine? }`) marks
+  the agent as `editing` or `idle` on a source region. The daemon
+  merges this into the presence hub the rail reads; the human
+  sees an "agent is here" chip on the file for 30 s of idle
+  before the entry evaporates. Call `presence({ state: "idle" })`
+  after finishing a stretch so a shared file doesn't show a stale
+  editor.
+
+## Batched comments in `handover` mode
+
+`handover` (default) collects comments until a hand-over event
+fires: the batch arrives as ONE channel notification of kind
+`handover` with `waiting_ids: [thread_id, …]`. Pull the bodies
+with `threads` — either the full open list or filtered to a
+path:
+
+```jsonc
+// tool: threads
+{ "status": "open" }
+```
+
+The notification is a summary, not the content. The default is
+quiet on purpose: it prevents each keystroke a human types from
+waking the agent mid-turn.
 
 ## Failure modes and their signals
 

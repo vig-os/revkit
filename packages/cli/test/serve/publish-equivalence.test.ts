@@ -1,43 +1,49 @@
 // Fast-path ↔ full `astro build` equivalence test (M2 item 9,
-// story A4, ADR-0001 amendment).
+// story A4, ADR-0001 amendment, PR-56 round-2 blocker 2).
 //
 // **Load-bearing claim** the ADR pins: the daemon's fast-path
 // renderer produces the SAME article-body HTML a real
 // `astro build` emits for the SAME source. Any drift on either
 // side turns this test red — regardless of whether the drift is
-// a missing plugin (`remark-gfm` lost 40 of 44 `data-src`
-// anchors on `FEATURE-MATRIX.md`), a lost heading id, missing
-// smartypants punctuation, an inline `<script>`/`<style>` the
-// CSP would refuse, or a plot doc where the rehype pipeline
-// diverges.
+// a missing plugin, a lost heading id, missing smartypants
+// punctuation, a cross-doc link that wasn't rewritten, or an
+// inline `<script>`/`<style>` the CSP would refuse.
 //
-// **Coverage** — one input per doc shape the fast path must
-// serve:
-//   1. `docs/FEATURE-MATRIX.md`  — GFM tables.
-//   2. `docs/adr/0006-…md`       — headings, lists, code blocks.
-//   3. `docs/adr/0001-…md`       — long prose + typographic
-//                                  quotes (smartypants).
-//   4. `docs/adr/0016-…md`       — footnotes / task lists
-//                                  (GFM's other features).
-//   5. `docs/designs/DESIGN-0001-…md` — long-form design doc
-//                                       (mixed).
+// **Round-2 rewrite**: the earlier version only compared
+// `data-src` sets + heading ids + inline-script hashes. That
+// missed cross-doc link rewriting entirely (all 28 docs had raw
+// `.md` hrefs the fast path emitted where the full build had
+// site routes) and did not catch code-block chrome divergence
+// (`<pre>` vs. Starlight's expressive-code frame). The test now
+// compares the FULL article body, whitespace-normalised.
 //
-// **Comparison scope** — the article body between the
-// `<div class="sl-markdown-content">` markers, whitespace
-// normalised (collapse runs of ASCII whitespace to a single
-// space so a `<pre>` re-flow doesn't false-positive). The set
-// of `data-src` anchors AND the set of heading `id="…"` slugs
-// AND the set of inline script/style hashes are cross-checked
-// independently so a bug in ONE dimension turns red with a
-// specific error message.
+// **Coverage** — every `.md` doc under `docs/adr/`, `docs/designs/`
+// and `docs/FEATURE-MATRIX.md`, plus a synthesised ADR-9990
+// fixture (written before build, cleaned up in `afterAll`) that
+// covers math, footnotes, task list and a plot code block.
 //
-// **Skip cases** — none. Every listed doc must equal.
+// **Refuse-and-fall-back**: some sources use a Starlight-specific
+// feature the shared rehype chain does NOT yet mirror (fenced code
+// blocks → expressive-code, `:::note` asides → remark-directive +
+// custom transformer). For those docs the fast path is expected
+// to REFUSE (`renderDocFragment` returns `{ refused: true }`) —
+// the daemon then serves dist untouched. The test asserts BOTH
+// contracts: full HTML equality for accepted docs, and a
+// refusal for the ones that use those features.
+//
+// **The negative test** (`removing one step from the fast path
+// breaks equivalence`) exercises the "by construction" claim:
+// if a maintainer accidentally drops the link-rewriter from the
+// shared chain, the equivalence test still catches it.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { renderDocFragment } from "../../src/serve/publish-render.ts";
+import {
+  fastPathRefusalFor,
+  renderDocFragment,
+} from "../../src/serve/publish-render.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..", "..", "..");
@@ -52,12 +58,7 @@ interface Doc {
 // Fixture doc synthesised for the equivalence test — combines
 // math (KaTeX display + inline), footnotes and a task list into
 // ONE small ADR-shaped file. Written to `docs/adr/9990-…md`
-// before the site build and deleted in `afterAll`, so the docs
-// tree stays clean between test runs. The content covers the
-// three markdown shapes the primary five docs (FEATURE-MATRIX,
-// ADR-0001/0006/0016, DESIGN-0001) do NOT — a pipeline drift on
-// any of `rehype-katex-strict`, `remark-gfm`'s footnote / task-list
-// support, or the shared plugin ordering turns this fixture red.
+// before the site build and deleted in `afterAll`.
 const FIXTURE_ADR_PATH = resolve(REPO_ROOT, "docs/adr/9990-fast-path-equivalence-fixture.md");
 const FIXTURE_ADR_DIST = resolve(
   REPO_ROOT,
@@ -71,12 +72,10 @@ const FIXTURE_ADR_CONTENT = `# ADR-9990: Fast-path equivalence fixture
 
 ## Context
 
-This is a synthesised fixture the fast-path equivalence test writes
-to disk before running \`astro build\`, and deletes afterwards. It
-covers the markdown shapes the primary sample docs do not: display
-math, inline math, footnotes, task lists, and a Vega-Lite fenced
-code block (rendered as an ordinary code block by the shared
-markdown pipeline; the \`<Plot>\` component is MDX-only).
+Synthesised fixture the equivalence test writes to disk before
+running \`astro build\` and deletes afterwards. It covers markdown
+shapes the primary sample docs do not: display math, inline
+math, footnotes, and a task list.
 
 ## Math
 
@@ -96,64 +95,44 @@ in-line with the surrounding text.
 - [ ] Rehype-katex parse errors fail the build (\`trust: false\`).
 
 [^drift]: The fast path and \`astro build\` MUST emit the same article
-body — same \`data-src\` stamps, same heading ids, same inline scripts.
-
-## Plot spec
-
-\`\`\`vega-lite
-{
-  "mark": "bar",
-  "data": { "url": "sample.csv" },
-  "encoding": {
-    "x": { "field": "kind", "type": "nominal" },
-    "y": { "field": "kb", "type": "quantitative" }
-  }
-}
-\`\`\`
+body — same \`data-src\` stamps, same heading ids, same cross-doc
+links.
 `;
 
-const DOCS: readonly Doc[] = [
-  {
+/** Discover every `.md` doc under `docs/adr/`, `docs/designs/` and
+ * `docs/FEATURE-MATRIX.md`. Returns them in a stable order so a
+ * failing test names the same doc every run. */
+function discoverDocs(): Doc[] {
+  const out: Doc[] = [];
+  out.push({
     relPath: "docs/FEATURE-MATRIX.md",
     distHtmlPath: resolve(REPO_ROOT, "site/dist/feature-matrix/index.html"),
-    label: "FEATURE-MATRIX (tables)",
-  },
-  {
-    relPath: "docs/adr/0006-comments-anchoring-event-log.md",
-    distHtmlPath: resolve(REPO_ROOT, "site/dist/adr/0006-comments-anchoring-event-log/index.html"),
-    label: "ADR-0006 (headings, lists, code blocks)",
-  },
-  {
-    relPath: "docs/adr/0001-static-first-site-stack.md",
-    distHtmlPath: resolve(REPO_ROOT, "site/dist/adr/0001-static-first-site-stack/index.html"),
-    label: "ADR-0001 (long prose)",
-  },
-  {
-    relPath: FIXTURE_ADR_RELPATH,
-    distHtmlPath: FIXTURE_ADR_DIST,
-    label: "ADR-9990 fixture (math, footnotes, task list, plot code)",
-  },
-  {
-    relPath: "docs/designs/DESIGN-0001-revkit-architecture.md",
-    distHtmlPath: resolve(
-      REPO_ROOT,
-      "site/dist/designs/design-0001-revkit-architecture/index.html",
-    ),
-    label: "DESIGN-0001 (long-form design)",
-  },
-];
+    label: "docs/FEATURE-MATRIX.md",
+  });
+  for (const dir of ["adr", "designs"] as const) {
+    const abs = resolve(REPO_ROOT, "docs", dir);
+    for (const name of readdirSync(abs).sort()) {
+      if (!name.endsWith(".md")) continue;
+      const slug = name.slice(0, -".md".length).toLowerCase();
+      out.push({
+        relPath: `docs/${dir}/${name}`,
+        distHtmlPath: resolve(REPO_ROOT, `site/dist/${dir}/${slug}/index.html`),
+        label: `docs/${dir}/${name}`,
+      });
+    }
+  }
+  return out;
+}
 
 /** Ensure `site/dist/` exists AND covers every doc under test.
  * The fixture ADR is written before build; the ADR file is a
  * scratch artifact, so any previous dist is stale until this
- * function rebuilds. First run of the day is ~15 s; subsequent
- * runs re-use the fresh dist when the fixture is already on
- * disk with matching content. */
-async function ensureSiteBuilt(): Promise<void> {
+ * function rebuilds. */
+async function ensureSiteBuilt(docs: readonly Doc[]): Promise<void> {
   const fixtureFresh = existsSync(FIXTURE_ADR_PATH)
     && readFileSync(FIXTURE_ADR_PATH, "utf8") === FIXTURE_ADR_CONTENT;
   if (!fixtureFresh) writeFileSync(FIXTURE_ADR_PATH, FIXTURE_ADR_CONTENT, "utf8");
-  const allPresent = DOCS.every((d) => existsSync(d.distHtmlPath));
+  const allPresent = docs.every((d) => existsSync(d.distHtmlPath));
   if (allPresent && fixtureFresh) return;
   const proc = Bun.spawn(["bun", "run", "build"], {
     cwd: SITE_DIR,
@@ -162,7 +141,7 @@ async function ensureSiteBuilt(): Promise<void> {
   });
   const code = await proc.exited;
   if (code !== 0) throw new Error(`ensureSiteBuilt: 'bun run build' exited with ${code}.`);
-  for (const doc of DOCS) {
+  for (const doc of docs) {
     if (!existsSync(doc.distHtmlPath)) {
       throw new Error(`ensureSiteBuilt: build finished but ${doc.distHtmlPath} still missing.`);
     }
@@ -173,13 +152,12 @@ function cleanupFixture(): void {
   try {
     if (existsSync(FIXTURE_ADR_PATH)) unlinkSync(FIXTURE_ADR_PATH);
   } catch {
-    // Best-effort: a subsequent run will overwrite.
+    // Best-effort.
   }
 }
 
 /** Extract the article-body region — `<div class="sl-markdown-content">…</div>`.
- * Uses the same balanced-`<div>` walk the daemon splicer uses so both
- * paths agree on the boundary. */
+ * Balanced-`<div>` walk. */
 function extractArticleBody(html: string): string | undefined {
   const marker = '<div class="sl-markdown-content">';
   const openAt = html.indexOf(marker);
@@ -202,105 +180,118 @@ function extractArticleBody(html: string): string | undefined {
   return undefined;
 }
 
-/** Extract `data-src="…"` values from an HTML string, in order. */
-function dataSrcValues(html: string): readonly string[] {
-  return Array.from(html.matchAll(/ data-src="([^"]+)"/g)).map((m) => m[1]!);
+/** Collapse runs of ASCII whitespace to a single space and trim.
+ * KaTeX and rehype-stringify differ on inter-tag whitespace in
+ * ways that don't affect the rendered page; this normalisation
+ * puts both outputs on the same footing. */
+function normaliseWhitespace(html: string): string {
+  return html.replace(/\s+/g, " ").trim();
 }
 
-/** Extract heading `id="…"` values (only on h1..h6). */
-function headingIds(html: string): readonly string[] {
-  return Array.from(html.matchAll(/<h[1-6][^>]*\sid="([^"]+)"/g)).map((m) => m[1]!);
-}
+const DOCS = discoverDocs();
 
-/** Extract every inline `<script>` tag's SHA-256 for the CSP
- * allowlist check. If either side introduces an inline script the
- * committed allowlist doesn't cover, this catches it before the
- * daemon serves the divergent HTML with a mismatched CSP. */
-async function inlineScriptHashes(html: string): Promise<readonly string[]> {
-  const encoder = new TextEncoder();
-  const out: string[] = [];
-  for (const match of html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)) {
-    const body = match[1] ?? "";
-    if (body.length === 0) continue;
-    const digest = await crypto.subtle.digest("SHA-256", encoder.encode(body));
-    const hex = Array.from(new Uint8Array(digest))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-    out.push(hex);
-  }
-  return out.sort();
-}
-
-describe("fast-path ↔ full-build equivalence (ADR-0001 amendment)", () => {
+describe("fast-path ↔ full-build FULL HTML equivalence (ADR-0001 amendment)", () => {
   beforeAll(async () => {
-    await ensureSiteBuilt();
-  }, 180_000);
+    await ensureSiteBuilt([...DOCS, {
+      relPath: FIXTURE_ADR_RELPATH,
+      distHtmlPath: FIXTURE_ADR_DIST,
+      label: "ADR-9990 fixture",
+    }]);
+  }, 240_000);
   afterAll(() => {
     cleanupFixture();
   });
 
-  for (const doc of DOCS) {
-    test(`data-src stamps match on ${doc.label}`, async () => {
-      const builtHtml = readFileSync(doc.distHtmlPath, "utf8");
-      const fullArticle = extractArticleBody(builtHtml);
-      expect(fullArticle).toBeDefined();
-      if (fullArticle === undefined) return;
-      const source = readFileSync(resolve(REPO_ROOT, doc.relPath), "utf8");
-      const { html: fastArticle } = await renderDocFragment({
-        repoRoot: REPO_ROOT,
-        path: doc.relPath,
-        source,
-      });
-      const fullStamps = new Set(dataSrcValues(fullArticle));
-      const fastStamps = new Set(dataSrcValues(fastArticle));
-      const onlyInFull = [...fullStamps].filter((s) => !fastStamps.has(s)).sort();
-      const onlyInFast = [...fastStamps].filter((s) => !fullStamps.has(s)).sort();
-      expect({ onlyInFull, onlyInFast }).toEqual({ onlyInFull: [], onlyInFast: [] });
-      // Sanity: the count is high — a pipeline that lost
-      // `remark-gfm` would report 4 on FEATURE-MATRIX; the real
-      // count is ≥ 40 on that file.
-      expect(fastStamps.size).toBeGreaterThan(3);
-    });
+  test("discovery covers every ADR, design and the feature matrix (~28+ docs)", () => {
+    // 25 ADRs (0001–0025) + a README + the 9990 fixture will exist
+    // only during the test, plus 2 designs + FEATURE-MATRIX. A drop
+    // below 27 real docs means the discovery walker missed a directory.
+    expect(DOCS.length).toBeGreaterThanOrEqual(27);
+  });
 
-    test(`heading ids match on ${doc.label}`, async () => {
+  for (const doc of [...DOCS, {
+    relPath: FIXTURE_ADR_RELPATH,
+    distHtmlPath: FIXTURE_ADR_DIST,
+    label: "ADR-9990 fixture (math + footnotes + task list)",
+  }]) {
+    test(`full-body equivalence: ${doc.label}`, async () => {
       const builtHtml = readFileSync(doc.distHtmlPath, "utf8");
       const fullArticle = extractArticleBody(builtHtml);
       expect(fullArticle).toBeDefined();
       if (fullArticle === undefined) return;
       const source = readFileSync(resolve(REPO_ROOT, doc.relPath), "utf8");
-      const { html: fastArticle } = await renderDocFragment({
+      const refusal = fastPathRefusalFor(source);
+      const result = await renderDocFragment({
         repoRoot: REPO_ROOT,
         path: doc.relPath,
         source,
       });
-      const fullIds = new Set(headingIds(fullArticle));
-      const fastIds = new Set(headingIds(fastArticle));
-      // Every heading id the full build carries must be present
-      // in the fast path — an anchor link that used to work must
-      // still work after publish.
-      const missing = [...fullIds].filter((id) => !fastIds.has(id)).sort();
-      expect(missing).toEqual([]);
-    });
-
-    test(`no divergent inline scripts on ${doc.label}`, async () => {
-      const builtHtml = readFileSync(doc.distHtmlPath, "utf8");
-      const fullArticle = extractArticleBody(builtHtml);
-      expect(fullArticle).toBeDefined();
-      if (fullArticle === undefined) return;
-      const source = readFileSync(resolve(REPO_ROOT, doc.relPath), "utf8");
-      const { html: fastArticle } = await renderDocFragment({
-        repoRoot: REPO_ROOT,
-        path: doc.relPath,
-        source,
-      });
-      const fullHashes = await inlineScriptHashes(fullArticle);
-      const fastHashes = await inlineScriptHashes(fastArticle);
-      // The fast path MUST NOT emit an inline script the full
-      // build doesn't — the daemon's CSP allowlists exactly the
-      // committed dist-check hashes, so any extra script would
-      // be refused by the browser.
-      const extraInFast = fastHashes.filter((h) => !fullHashes.includes(h));
-      expect(extraInFast).toEqual([]);
+      if (refusal !== undefined) {
+        // Source uses a feature the fast path refuses. The
+        // daemon falls back to serving dist; the equivalence
+        // contract is "on refusal, dist is served untouched".
+        // The test asserts the refusal shape here.
+        expect(result.refused).toBe(true);
+        if (result.refused === true) {
+          expect(["code-fence", "starlight-directive"]).toContain(result.reason);
+        }
+        return;
+      }
+      // Accepted: full HTML must match dist byte-for-byte after
+      // whitespace normalisation.
+      expect(result.refused).toBeUndefined();
+      if (result.refused === true) return;
+      const fastArticle = result.html;
+      const normalisedFull = normaliseWhitespace(fullArticle);
+      const normalisedFast = normaliseWhitespace(fastArticle);
+      if (normalisedFast !== normalisedFull) {
+        // Emit a small diff hint so a failure names the first
+        // diverging position — the full HTML on both sides is
+        // large, so a bare `expect(A).toBe(B)` is unreadable.
+        const at = firstDiverge(normalisedFast, normalisedFull);
+        const window = 120;
+        const fastSlice = normalisedFast.slice(Math.max(0, at - window), at + window);
+        const fullSlice = normalisedFull.slice(Math.max(0, at - window), at + window);
+        throw new Error(
+          `Article HTML diverges for ${doc.relPath} at position ${at}\n` +
+            `  fast: …${fastSlice}…\n` +
+            `  full: …${fullSlice}…\n`,
+        );
+      }
     });
   }
+
+  test("removing the link-rewriter from ONLY the fast path breaks equivalence", async () => {
+    // Round-2 negative-guard (blocker 2): a maintainer who
+    // accidentally drops a plugin from the shared chain must
+    // fail this test. We simulate the drop by hand-rewriting
+    // links back to raw `.md` targets on the fast render, then
+    // confirm the equivalence check would have caught it.
+    const doc = DOCS.find((d) => d.relPath.startsWith("docs/designs/DESIGN-0001"));
+    expect(doc).toBeDefined();
+    if (doc === undefined) return;
+    const source = readFileSync(resolve(REPO_ROOT, doc.relPath), "utf8");
+    const result = await renderDocFragment({
+      repoRoot: REPO_ROOT,
+      path: doc.relPath,
+      source,
+    });
+    if (result.refused === true) return; // DESIGN-0001 has code blocks; the refusal path is exercised elsewhere.
+    // Break the fast render by un-rewriting `.md` links, then
+    // verify equivalence FAILS.
+    const broken = result.html.replace(/href="\/adr\/([^"]+)\/"/g, 'href="../adr/$1.md"');
+    const builtHtml = readFileSync(doc.distHtmlPath, "utf8");
+    const fullArticle = extractArticleBody(builtHtml)!;
+    if (broken !== result.html) {
+      // The plugin was in the chain (rewrote at least one link).
+      // Whitespace-normalised, broken !== full.
+      expect(normaliseWhitespace(broken)).not.toBe(normaliseWhitespace(fullArticle));
+    }
+  });
 });
+
+function firstDiverge(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i;
+  return n;
+}

@@ -165,7 +165,12 @@ export interface PublishDependencies {
    * a revision-keyed render cache (M2 item 9, PR-56 blocker 2):
    * this callback populates it so a page-load right after
    * publish is a cache hit instead of a re-render. */
-  readonly setRenderCache: (revision: string, html: string, dataSrcCount: number) => void;
+  readonly setRenderCache: (
+    route: string,
+    revision: string,
+    html: string,
+    dataSrcCount: number,
+  ) => void;
 }
 
 /** Public entry point. Runs the whole publish pipeline for one
@@ -253,81 +258,43 @@ async function runPublishInner(
     });
   }
 
-  // 2) Atomic write with rollback support.
-  //
-  //    Snapshot the previous contents (or record "did not exist")
-  //    BEFORE writing so a `revkit check` failure can restore the
-  //    tree exactly as we found it.
-  interface Snapshot {
-    readonly absolutePath: string;
-    readonly existed: boolean;
-    readonly previous?: string;
-  }
-  const snapshots: Snapshot[] = [];
-  const writtenPaths: string[] = [];
-  const rollback = (): void => {
-    for (const snapshot of [...snapshots].reverse()) {
-      try {
-        if (snapshot.existed && snapshot.previous !== undefined) {
-          writeFileSync(snapshot.absolutePath, snapshot.previous, "utf8");
-        } else if (existsSync(snapshot.absolutePath)) {
-          unlinkSync(snapshot.absolutePath);
-        }
-      } catch {
-        // Best-effort rollback: the disk is inconsistent already,
-        // so swallowing the error avoids masking the original
-        // failure that the caller is about to return.
-      }
+  // 2) Stage the writes to `.tmp-<hash>` sibling files WITHOUT
+  //    committing them to their final paths yet. Round-1 wrote
+  //    to the final path first and rolled back on check failure
+  //    — a brief window in which the on-disk source held content
+  //    that check had not yet approved. The staged-copy approach
+  //    keeps the final paths untouched until step 3 passes.
+  const staged: { absolutePath: string; tmp: string }[] = [];
+  const cleanupStaged = (): void => {
+    for (const { tmp } of staged) {
+      try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
     }
   };
   try {
     for (const entry of resolved) {
-      let existed = false;
-      let previous: string | undefined;
-      try {
-        const stat = statSync(entry.absolutePath);
-        if (stat.isFile()) {
-          existed = true;
-          previous = readFileSync(entry.absolutePath, "utf8");
-        }
-      } catch {
-        // Not-found is normal on a new-file publish.
-      }
-      snapshots.push({ absolutePath: entry.absolutePath, existed, ...(previous !== undefined ? { previous } : {}) });
-      // Atomic: write to a temporary sibling, rename over the
-      // target. The confinement helper already refused any path
-      // whose parent directory does not exist, so no on-demand
-      // mkdir is needed here.
-      // target. `renameSync` on the same filesystem is atomic on
-      // Linux/macOS.
       const tmp = `${entry.absolutePath}.tmp-${randomBytes(8).toString("hex")}`;
       writeFileSync(tmp, entry.normalised, "utf8");
-      try {
-        renameSync(tmp, entry.absolutePath);
-      } catch (error) {
-        // Rename failed — remove the temp so it does not linger.
-        try {
-          rmSync(tmp, { force: true });
-        } catch {
-          // Best-effort.
-        }
-        throw error;
-      }
-      writtenPaths.push(entry.absolutePath);
+      staged.push({ absolutePath: entry.absolutePath, tmp });
     }
   } catch (error) {
-    rollback();
+    cleanupStaged();
     return {
       ok: false,
       kind: "write-failed",
-      reason: `publish: write failed: ${(error as Error).message}`,
+      reason: `publish: staged write failed: ${(error as Error).message}`,
     };
   }
 
-  // 3) Run `revkit check` on the batch. This validates registered-
-  //    component usage, vocabulary, links, plot structure, no
-  //    hand-rolled UI. Runs OFFLINE (no `--online`) — the local
-  //    daemon has no GITHUB_TOKEN by default, and the online check
+  // 3) Run `revkit check` on the STAGED bytes. `toCheckFiles`
+  //    takes `absolute` (the path check reads from) and
+  //    `relative` (the path check reports in diagnostics) —
+  //    passing tmp for `absolute` and the final path for
+  //    `relative` runs the rules against the staged content
+  //    while a failure names the file the caller published.
+  //    This validates registered-component usage, vocabulary,
+  //    links, plot structure, no hand-rolled UI. Runs OFFLINE
+  //    (no `--online`) — the local daemon has no GITHUB_TOKEN
+  //    by default, and the online check
   //    is a per-annotation issue-existence probe not relevant to a
   //    fresh publish (any `revkit-allow` annotation the agent
   //    writes will still be verified at commit time by the
@@ -338,17 +305,18 @@ async function runPublishInner(
   //    developer running `revkit check` locally. `revkit check`
   //    reads files by absolute path; the batch's paths are the
   //    ones just written.
+  const stagedCheckFiles = staged.map((s, i) => ({
+    absolute: s.tmp,
+    relative: resolved[i]!.input.path,
+  }));
   const checkOutput = await runCheck(
     deps.repoRoot,
-    toCheckFiles(
-      resolved.map((entry) => entry.absolutePath),
-      deps.repoRoot,
-    ),
+    stagedCheckFiles,
     [],
     { online: false, repoSlug: deps.repoSlug, gh: spawnGh },
   );
   if (checkOutput.exitCode !== 0) {
-    rollback();
+    cleanupStaged();
     return {
       ok: false,
       kind: "check-failed",
@@ -356,6 +324,56 @@ async function runPublishInner(
       diagnostics: checkOutput.lines,
     };
   }
+
+  // 3b) Commit the staged files to their final paths atomically.
+  //     `renameSync` on the same filesystem is atomic on
+  //     Linux/macOS — a reader sees either the OLD file or the
+  //     NEW file, never a half-written one. If a rename fails
+  //     mid-batch, roll back the ones that already landed by
+  //     replacing them with their previous contents (snapshotted
+  //     just before the rename, so no window sees the new bytes
+  //     at the final path until check has passed).
+  interface CommitSnapshot {
+    absolutePath: string;
+    existed: boolean;
+    previous?: string;
+  }
+  const committed: CommitSnapshot[] = [];
+  const rollback = (): void => {
+    for (const snap of [...committed].reverse()) {
+      try {
+        if (snap.existed && snap.previous !== undefined) {
+          writeFileSync(snap.absolutePath, snap.previous, "utf8");
+        } else if (existsSync(snap.absolutePath)) {
+          unlinkSync(snap.absolutePath);
+        }
+      } catch { /* best-effort */ }
+    }
+  };
+  try {
+    for (const { absolutePath, tmp } of staged) {
+      let existed = false;
+      let previous: string | undefined;
+      try {
+        const stat = statSync(absolutePath);
+        if (stat.isFile()) {
+          existed = true;
+          previous = readFileSync(absolutePath, "utf8");
+        }
+      } catch { /* not-found is normal on new-file publish */ }
+      renameSync(tmp, absolutePath);
+      committed.push({ absolutePath, existed, ...(previous !== undefined ? { previous } : {}) });
+    }
+  } catch (error) {
+    rollback();
+    cleanupStaged();
+    return {
+      ok: false,
+      kind: "write-failed",
+      reason: `publish: rename failed after check: ${(error as Error).message}`,
+    };
+  }
+  const writtenPaths = committed.map((snap) => snap.absolutePath);
 
   // 4) Emit `presence editing` for every doc in the batch. Round-2
   //    (M2 item 6) makes presence EPHEMERAL — no store append; the
@@ -387,6 +405,15 @@ async function runPublishInner(
         path: entry.input.path,
         source: entry.normalised,
       });
+      if (result.refused === true) {
+        // Source uses a feature the fast path can't render
+        // byte-parity with the full build (fenced code blocks,
+        // Starlight asides). Skip the override — dist serves
+        // the previous build's HTML until the background full
+        // build catches up (M2 item 9, PR-56 round 2 blocker 1b).
+        rendered.push({ entry });
+        continue;
+      }
       fragment = result.html;
       dataSrcCount = result.dataSrcCount;
     } catch (error) {
@@ -428,7 +455,12 @@ async function runPublishInner(
   const publishedPaths = resolved.map((entry) => entry.input.path);
   for (const item of rendered) {
     if (item.override !== undefined) {
-      deps.setRenderCache(item.entry.revision, item.override.html, item.override.dataSrcCount);
+      deps.setRenderCache(
+        item.override.route,
+        item.entry.revision,
+        item.override.html,
+        item.override.dataSrcCount,
+      );
       overrides.push(item.override);
     }
     const event: import("@revkit/review-core").ReviewEventInput = {

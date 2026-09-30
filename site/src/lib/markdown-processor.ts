@@ -19,6 +19,7 @@ import { rehypeKatexStrict } from "./rehype-katex-strict.ts";
 import { rehypeDataSrc } from "../../../packages/cli/src/rehype-data-src.ts";
 import { rehypeDropRepoDocTitle } from "../../../packages/cli/src/rehype-drop-repo-doc-title.ts";
 import { rehypeStampRevision } from "../../../packages/cli/src/rehype-stamp-revision.ts";
+import { rehypeRewriteMdLinks } from "../../../packages/cli/src/rehype-rewrite-md-links.ts";
 
 // Astro's markdown pipeline accepts a plugin entry as either a
 // bare plugin factory OR a `[plugin, options]` tuple. A local
@@ -64,6 +65,15 @@ export function buildSharedMarkdownConfig(repoRoot: string): {
       // keep their ORIGINAL source-line positions (a source-side
       // strip would shift every downstream anchor).
       [rehypeDropRepoDocTitle, { repoRoot }],
+      // Rewrite cross-doc `.md` links to their site route (or a
+      // GitHub blob URL for docs outside the publishable roots).
+      // Historically the `repo-docs` loader did this as a post-
+      // process on the FULL BUILD's HTML only — the fast path
+      // then emitted raw `../designs/DESIGN-0001….md` and every
+      // cross-doc link 404'd after a publish. Landing the rewrite
+      // in the shared rehype chain means both paths agree by
+      // construction (PR-56 round 2 blocker 1a).
+      [rehypeRewriteMdLinks, { repoRoot }],
       // Stamp every block with `data-src="repo/relative:start-end"`
       // — the rail anchors on these.
       [rehypeDataSrc, { repoRoot }],

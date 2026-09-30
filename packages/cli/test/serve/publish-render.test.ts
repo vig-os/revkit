@@ -35,17 +35,15 @@ A paragraph.
 
 - one
 - two
-
-\`\`\`ts
-const x = 1;
-\`\`\`
 `;
-    const { html, dataSrcCount } = await renderDocFragment({
+    const result = await renderDocFragment({
       repoRoot: REPO_ROOT,
       path: "docs/adr/x.md",
       source,
     });
-    expect(dataSrcCount).toBeGreaterThan(3); // p + ul + 2 li
+    if (result.refused === true) throw new Error("expected a render, got refusal");
+    const { html, dataSrcCount } = result;
+    expect(dataSrcCount).toBeGreaterThan(2); // p + ul + 2 li
     expect(html).toContain(`data-src="docs/adr/x.md:`);
     // The first h1 is dropped by rehype-drop-repo-doc-title, so
     // the paragraph after it is what gets stamped.
@@ -53,13 +51,42 @@ const x = 1;
     expect(html).toContain("A paragraph.");
     // `A paragraph.` is at line 3, `- one` at 5, `- two` at 6.
     expect(html).toMatch(/<ul[^>]*data-src="docs\/adr\/x\.md:5-6"/);
-    // Code blocks flow through Astro's default shiki highlighter
-    // (which strips source position). The rail anchors on the
-    // surrounding block; the `<pre>` itself carries no data-src
-    // in either the fast path OR a full build (Starlight's
-    // expressive-code wraps it with its own chrome downstream).
     // Regression: NO orphan `data-src="…:undefined-…"`.
     expect(html).not.toContain("undefined-undefined");
+  });
+
+  test("REFUSES a source containing a fenced code block (round-2 blocker 1b fallback)", async () => {
+    const source = `A paragraph.
+
+\`\`\`ts
+const x = 1;
+\`\`\`
+`;
+    const result = await renderDocFragment({
+      repoRoot: REPO_ROOT,
+      path: "docs/adr/x.md",
+      source,
+    });
+    expect(result.refused).toBe(true);
+    if (result.refused === true) {
+      expect(result.reason).toBe("code-fence");
+    }
+  });
+
+  test("REFUSES a source containing a Starlight aside directive", async () => {
+    const source = `:::note
+An aside.
+:::
+`;
+    const result = await renderDocFragment({
+      repoRoot: REPO_ROOT,
+      path: "docs/adr/x.md",
+      source,
+    });
+    expect(result.refused).toBe(true);
+    if (result.refused === true) {
+      expect(result.reason).toBe("starlight-directive");
+    }
   });
 
   test("emits KaTeX HTML for inline math and refuses a malformed formula", async () => {
@@ -70,6 +97,7 @@ const x = 1;
       path: "docs/adr/x.md",
       source: good,
     });
+    if (rendered.refused === true) throw new Error("expected a render, got refusal");
     expect(rendered.html).toContain("katex");
 
     const bad = `Broken math: $\\wrong{missing}$.

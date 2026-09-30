@@ -88,6 +88,8 @@ import { renderDocFragment } from "./publish-render.ts";
 import { extractDocRevision } from "../rehype-stamp-revision.ts";
 import { revisionOf as revisionOfBytes } from "@revkit/review-core";
 import { statSync } from "node:fs";
+import { runCheck, toCheckFiles } from "../check.ts";
+import { spawnGh } from "../gh-runner.ts";
 import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
 // The inline-script hash allowlist is the SAME committed set that
 // `revkit check-dist` enforces: `dist-check-allowlist.json`'s
@@ -387,14 +389,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // and never surfaces.
   const systemActor: Author = { kind: "system", id: "revkit-daemon" };
 
-  // Fast-path render cache (M2 item 9, story A4, PR-56 blocker 2).
+  // Fast-path render cache (M2 item 9, story A4, PR-56 blocker 2,
+  // round-2 blocker 3).
   //
-  // Content-addressed by source revision (SHA-256 of the LF-normalised
-  // source). `handleStatic` computes `revisionOf(currentSource)`
-  // for a page route, checks whether the on-disk `site/dist/`
-  // HTML was built against the same revision (via the stamp
-  // `rehypeStampRevision` injects), and — when they diverge —
-  // looks up this cache to serve a spliced fresh render.
+  // Content-addressed by **(route, source revision)**. The route
+  // in the key defends against a byte-identical source living at
+  // two different routes: without it, doc A's render would serve
+  // doc B if they shared bytes (the round-2 review's live probe
+  // showed exactly that — B's page was served with A's data-src
+  // attributes). The revision in the key is the SHA-256 of the
+  // LF-normalised source so a re-render of the SAME (route,
+  // source) is a Map hit.
   //
   // The cache never expires by TTL. A restart wipes it — that's
   // fine, because serving is DERIVED from files: on the first
@@ -407,22 +412,48 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     readonly dataSrcCount: number;
   }
   const renderCache = new Map<string, RenderCacheEntry>();
-  const cacheGet = (revision: string): RenderCacheEntry | undefined => {
-    const entry = renderCache.get(revision);
+  // Cache of `revkit check` verdicts, keyed on source revision.
+  // The fast path refuses to serve a source that `revkit check`
+  // rejects (a hand-rolled `<div onclick>` in a committed source
+  // would otherwise reach the reviewer's browser — round-2 NEW
+  // finding). Cached because check-per-request would double the
+  // fast-path latency; the revision key is content-addressed, so
+  // an edit that fixes the source is picked up automatically.
+  const CHECK_CACHE_MAX = 256;
+  const checkCache = new Map<string, { pass: boolean; diagnostics: readonly string[] }>();
+  const checkCacheGet = (revision: string): { pass: boolean; diagnostics: readonly string[] } | undefined => {
+    const entry = checkCache.get(revision);
     if (entry === undefined) return undefined;
-    // LRU touch: move to the tail by delete + re-set.
-    renderCache.delete(revision);
-    renderCache.set(revision, entry);
+    checkCache.delete(revision);
+    checkCache.set(revision, entry);
     return entry;
   };
-  const cacheSet = (revision: string, entry: RenderCacheEntry): void => {
+  const checkCacheSet = (revision: string, pass: boolean, diagnostics: readonly string[]): void => {
+    if (checkCache.size >= CHECK_CACHE_MAX) {
+      const oldest = checkCache.keys().next();
+      if (!oldest.done && typeof oldest.value === "string") checkCache.delete(oldest.value);
+    }
+    checkCache.set(revision, { pass, diagnostics });
+  };
+  const cacheKey = (route: string, revision: string): string => `${route}␟${revision}`;
+  const cacheGet = (route: string, revision: string): RenderCacheEntry | undefined => {
+    const key = cacheKey(route, revision);
+    const entry = renderCache.get(key);
+    if (entry === undefined) return undefined;
+    // LRU touch: move to the tail by delete + re-set.
+    renderCache.delete(key);
+    renderCache.set(key, entry);
+    return entry;
+  };
+  const cacheSet = (route: string, entry: RenderCacheEntry): void => {
+    const key = cacheKey(route, entry.revision);
     if (renderCache.size >= RENDER_CACHE_MAX) {
       const oldest = renderCache.keys().next();
       if (!oldest.done && typeof oldest.value === "string") {
         renderCache.delete(oldest.value);
       }
     }
-    renderCache.set(revision, entry);
+    renderCache.set(key, entry);
   };
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
@@ -1838,6 +1869,30 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return rawResponse;
   }
 
+  /** HTML for the "source changed — failing check" banner. Kept
+   * as a plain string so the CSP inline-style hash is stable
+   * (the daemon's check-dist allowlist can pre-approve it if the
+   * banner ever needs one). Body text is untrusted (a diagnostic
+   * line may contain a source-controlled path) so both `<pre>`
+   * and prose are HTML-escaped before insertion. */
+  function buildStaleCheckBanner(sourcePath: string, diagnostics: readonly string[]): string {
+    const escape = (s: string): string =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    const lines = diagnostics.slice(0, 5).map((line) => `<li>${escape(line)}</li>`).join("");
+    const more = diagnostics.length > 5 ? `<p>…and ${diagnostics.length - 5} more diagnostic(s).</p>` : "";
+    return (
+      `<aside class="revkit-stale-check-banner" role="status" aria-live="polite" ` +
+      `data-revkit-banner="stale-check" ` +
+      `style="border:2px solid #b45309;background:#fff7ed;color:#7c2d12;padding:0.75rem 1rem;` +
+      `margin:0 0 1rem 0;border-radius:0.5rem;font-family:ui-sans-serif,system-ui;">` +
+      `<strong>Source changed — failing <code>revkit check</code>.</strong>` +
+      ` The site is showing the previous full build's rendering of ` +
+      `<code>${escape(sourcePath)}</code>. Fix the source and republish.` +
+      `<ul>${lines}</ul>${more}</aside>`
+    );
+  }
+
   /** Derive-from-files serving (M2 item 9, PR-56 blocker 2).
    *
    * For a page route whose source file is one of the publishable
@@ -1886,8 +1941,69 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     //    no splice, no rail-injection buffer copy).
     const distRev = extractDocRevision(shellHtml);
     if (distRev === sourceRev) return undefined;
-    // 5. Cache lookup by SOURCE revision.
-    let entry = cacheGet(sourceRev);
+    // 4b. Gate the fast-render on `revkit check` (round-2 NEW).
+    //     A source that would be refused by check (hand-rolled
+    //     UI, off-list inline script, etc.) must NOT reach the
+    //     browser via the fast path; the daemon falls back to
+    //     dist and stamps a visible banner into the article body
+    //     so the reviewer sees that dist is stale AND why.
+    let checkVerdict = checkCacheGet(sourceRev);
+    if (checkVerdict === undefined) {
+      try {
+        const absSource = `${options.repoRoot}/${sourcePath}`;
+        const output = await runCheck(
+          options.repoRoot,
+          toCheckFiles([absSource], options.repoRoot),
+          [],
+          { online: false, repoSlug: options.repoSlug ?? "vig-os/revkit", gh: spawnGh },
+        );
+        checkVerdict = {
+          pass: output.exitCode === 0,
+          diagnostics: output.lines,
+        };
+      } catch (error) {
+        // `runCheck` throws only on hard I/O errors; treat as
+        // failure and log so a reviewer can diagnose.
+        logger.warn("static.fresh-render.check-threw", {
+          requestId,
+          path: sourcePath,
+          errorKind: (error as Error).name,
+        });
+        checkVerdict = { pass: false, diagnostics: [(error as Error).message] };
+      }
+      checkCacheSet(sourceRev, checkVerdict.pass, checkVerdict.diagnostics);
+    }
+    if (!checkVerdict.pass) {
+      // Serve dist with a banner spliced into the article body.
+      const banner = buildStaleCheckBanner(sourcePath, checkVerdict.diagnostics);
+      const marker = '<div class="sl-markdown-content">';
+      const withBanner = shellHtml.replace(
+        marker,
+        `${marker}${banner}`,
+      );
+      if (method === "HEAD") {
+        return withHygiene(
+          new Response(null, {
+            status: 200,
+            headers: { "content-length": String(Buffer.byteLength(withBanner, "utf8")) },
+          }),
+          "html",
+          "text/html; charset=utf-8",
+        );
+      }
+      const rawResponse = withHygiene(
+        new Response(withBanner, { status: 200 }),
+        "html",
+        "text/html; charset=utf-8",
+      );
+      return await injectRail(rawResponse, {
+        onOversize: (bodyBytes: number) => {
+          logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
+        },
+      });
+    }
+    // 5. Cache lookup by (route, source revision).
+    let entry = cacheGet(route, sourceRev);
     if (entry === undefined) {
       let fragment: string;
       let dataSrcCount: number;
@@ -1897,6 +2013,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           path: sourcePath,
           source,
         });
+        if (result.refused === true) {
+          // Fast path can't match dist for this source (code
+          // fences, Starlight asides). Serve dist untouched.
+          return undefined;
+        }
         fragment = result.html;
         dataSrcCount = result.dataSrcCount;
       } catch (error) {
@@ -1910,7 +2031,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const spliced = spliceArticleBody(shellHtml, fragment);
       if (spliced === undefined) return undefined;
       entry = { html: spliced, revision: sourceRev, dataSrcCount };
-      cacheSet(sourceRev, entry);
+      cacheSet(route, entry);
     }
     // 6. Serve.
     if (method === "HEAD") {
@@ -2316,8 +2437,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         },
         ingestDelivery: safeIngest,
         distDir: options.dir,
-        setRenderCache: (revision, html, dataSrcCount) => {
-          cacheSet(revision, { html, revision, dataSrcCount });
+        setRenderCache: (route, revision, html, dataSrcCount) => {
+          cacheSet(route, { html, revision, dataSrcCount });
         },
       },
     );
