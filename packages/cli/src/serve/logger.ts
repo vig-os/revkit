@@ -40,6 +40,12 @@ export interface LogFields {
   readonly bytes?: number;
   readonly count?: number;
   readonly artefact?: string;
+  /** M2 item 9 (publish): number of files in a `POST /api/publish`
+   * batch. */
+  readonly files?: number;
+  /** M2 item 9 (publish): number of route overrides installed by
+   * one publish (== the count of docs that had a rendered shell). */
+  readonly overrides?: number;
 }
 
 /** A tiny writer interface so tests can inject a buffer. Node's

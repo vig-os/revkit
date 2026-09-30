@@ -139,6 +139,15 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     revision: "e".repeat(64),
     reason: "block deleted on rebuild",
   },
+  "doc.published": {
+    seq: 14,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "doc.published",
+    path: "docs/adr/0006-comments-anchoring-event-log.md",
+    revision: "f".repeat(64),
+    route: "/adr/0006-comments-anchoring-event-log/",
+  },
 };
 
 describe("reviewEventSchema — happy paths", () => {

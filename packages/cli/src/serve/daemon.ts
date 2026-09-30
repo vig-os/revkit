@@ -74,10 +74,12 @@ import {
   cancelAskRequestSchema,
   createAskRequestSchema,
   createThreadRequestSchema,
+  publishRequestSchema,
   reopenRequestSchema,
   replyRequestSchema,
   resolveRequestSchema,
 } from "./api-schemas.ts";
+import { runPublish, type PublishOverride } from "./publish.ts";
 import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
 // The inline-script hash allowlist is the SAME committed set that
 // `revkit check-dist` enforces: `dist-check-allowlist.json`'s
@@ -280,6 +282,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // channel-server's actor-filter then hides as "loopback echo"
   // and never surfaces.
   const systemActor: Author = { kind: "system", id: "revkit-daemon" };
+
+  // Publish overrides (M2 item 9, story A4). Keyed on the SITE
+  // ROUTE the fast-path renderer produced HTML for. `handleStatic`
+  // checks this map before falling back to disk, so a freshly
+  // published document appears in under a second on every open
+  // page. Cleared on daemon stop. See `publish.ts` for the write
+  // side.
+  const publishOverrides = new Map<string, PublishOverride>();
+  const setPublishOverride = (route: string, override: PublishOverride): void => {
+    publishOverrides.set(normalisePublishRoute(route), override);
+  };
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -636,6 +649,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Ask JSON API (M2 item 7, story A1). Same Origin gate as threads.
     if (url.pathname === "/api/asks" || url.pathname.startsWith("/api/asks/")) {
       return handleAsksApi(request, url, method, requestId);
+    }
+
+    // Publish JSON API (M2 item 9, story A4). Agent-bearer only, one
+    // POST endpoint. The Origin discipline runs inside the handler
+    // for the same reasons as the other API branches.
+    if (url.pathname === "/api/publish") {
+      return handlePublishApi(request, method, requestId);
     }
 
     // `/ask/<id>` — the HTML page the human opens. Session cookie
@@ -1224,6 +1244,39 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       logger.warn("static.rejected.invalid-encoding", { requestId, path: url.pathname });
       return withHygiene(new Response("Bad Request", { status: 400 }), "text", "text/plain; charset=utf-8");
     }
+    // M2 item 9: check the publish-override map first. Overrides
+    // are keyed on the normalised route (leading + trailing slash),
+    // which matches the path the human's browser requests when
+    // clicking a link into a doc — Astro emits
+    // `<route>/index.html`, and the daemon rewrites `/route` →
+    // `/route/` via the static-server's directory-index handling
+    // for uncovered routes. Doing the lookup HERE, before
+    // `staticServer.resolve`, means an override wins even when the
+    // disk copy is stale (or missing on a fresh checkout).
+    const overrideRoute = normalisePublishRoute(decodedPath);
+    const override = publishOverrides.get(overrideRoute);
+    if (override !== undefined && (request.method === "GET" || request.method === "HEAD")) {
+      const overrideHtml = override.html;
+      if (request.method === "HEAD") {
+        return withHygiene(
+          new Response(null, {
+            status: 200,
+            headers: { "content-length": String(Buffer.byteLength(overrideHtml, "utf8")) },
+          }),
+          "html",
+          "text/html; charset=utf-8",
+        );
+      }
+      const rawResponse = withHygiene(new Response(overrideHtml, { status: 200 }), "html", "text/html; charset=utf-8");
+      // Rail injection runs on the override too — the rail's SSE
+      // listener is what turns a `doc.published` event into the
+      // page-refresh the reviewer sees.
+      return await injectRail(rawResponse, {
+        onOversize: (bodyBytes: number) => {
+          logger.warn("static.rail.skipped-oversize", { requestId, path: decodedPath, bytes: bodyBytes });
+        },
+      });
+    }
     const result = staticServer.resolve(decodedPath);
     if (!result.ok) {
       // Refused paths log the kind (traversal / symlink / outside /
@@ -1622,6 +1675,85 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
   }
 
+  // ── /api/publish branch (M2 item 9, story A4) ──────────────────
+
+  /** Handle `POST /api/publish`. Agent-bearer only; the Origin
+   * discipline is the same as `/api/threads` and `/api/asks`.
+   * The `runPublish` orchestrator does the confinement,
+   * `revkit check`, atomic write, fast-path render, event fanout
+   * and re-anchoring. */
+  async function handlePublishApi(request: Request, method: string, requestId: string): Promise<Response> {
+    if (method !== "POST") return methodNotAllowed();
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+    if (!hasValidBearer) {
+      logger.warn("api.publish.rejected.role", { requestId });
+      return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+    }
+    const bodyRead = await readCappedJsonBody(request);
+    if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+    const parsed = publishRequestSchema.safeParse(bodyRead.value);
+    if (!parsed.success) return badRequest(parsed.error.issues);
+    const outcome = await runPublish(
+      {
+        docs: parsed.data.docs ?? [],
+        ...(parsed.data.data !== undefined ? { data: parsed.data.data } : {}),
+      },
+      {
+        repoRoot: options.repoRoot,
+        store,
+        bus,
+        agentActor,
+        systemActor,
+        repoSlug: "vig-os/revkit",
+        refreshAnchors: async (path: string) => {
+          await reanchor.refresh(path);
+        },
+        reconcileWatchers: () => {
+          void reanchor.reconcileWatchers();
+        },
+        distDir: options.dir,
+        setOverride: setPublishOverride,
+      },
+    );
+    if (!outcome.ok) {
+      const status =
+        outcome.kind === "check-failed"
+          ? 422
+          : outcome.kind === "too-large"
+            ? 413
+            : outcome.kind === "confinement"
+              ? 400
+              : outcome.kind === "shell-missing"
+                ? 200
+                : 500;
+      logger.warn("api.publish.rejected", { requestId, errorKind: outcome.kind });
+      return jsonResponse(
+        {
+          error: outcome.kind,
+          reason: outcome.reason,
+          ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
+        },
+        status,
+      );
+    }
+    logger.info("api.publish.ok", {
+      requestId,
+      files: outcome.published.length,
+      overrides: outcome.overrides.length,
+    });
+    return jsonResponse(
+      {
+        published: outcome.published,
+        seqs: outcome.seqs,
+        overrides: outcome.overrides.map((o) => ({ route: o.route, dataSrcCount: o.dataSrcCount })),
+      },
+      201,
+    );
+  }
+
   /** Load one ask by id, first sweeping it for expiry so a caller
    * that hits `/api/asks/:id` after the deadline sees the terminal
    * `expired` state rather than a stale `pending`. Returns
@@ -1733,6 +1865,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
  * (a `--dir` pointing at some other directory on disk); the caller has
  * asked us to serve that path, so hiding it in a log would be
  * worse than an absolute leak. */
+/** Normalise a URL pathname into the shape publish overrides are
+ * keyed on: leading slash, trailing slash. `/adr/foo` and
+ * `/adr/foo/` and `/adr/foo/index.html` all normalise to
+ * `/adr/foo/`. Exported for tests. */
+export function normalisePublishRoute(pathname: string): string {
+  let p = pathname;
+  if (p.endsWith("/index.html")) p = p.slice(0, -"index.html".length);
+  if (!p.startsWith("/")) p = "/" + p;
+  if (!p.endsWith("/")) p = p + "/";
+  // Collapse double slashes so `/adr//foo/` never sneaks past the
+  // canonical spelling.
+  return p.replace(/\/+/g, "/");
+}
+
 function repoRelativeDisplay(repoRoot: string, absolute: string): string {
   const rel = relativePath(repoRoot, absolute);
   if (rel === "" || rel.startsWith("..")) return absolute;

@@ -99,6 +99,12 @@ interface RailReviewEvent {
   readonly seq: number;
   readonly kind: string;
   readonly threadId?: string;
+  /** M2 item 9, story A4: `doc.published` events carry the site
+   * `route` the fast-path renderer produced HTML for. When the
+   * route matches THIS page, the rail refreshes the page live so
+   * the reviewer sees the new content in under a second. */
+  readonly route?: string;
+  readonly path?: string;
 }
 
 /** Build the SHA-256 hex digest of the LF-normalised body — the
@@ -275,6 +281,19 @@ function nearestAnchorAncestor(node: Node | null): HTMLElement | undefined {
  * a comment / thread event. Reconnects on close with an exponential
  * backoff up to 30 s — a paused laptop can wake into a stale stream
  * and this brings it back quickly without hammering the daemon. */
+/** Normalise a URL pathname to the form the daemon's publish
+ * overrides use: leading `/`, trailing `/`, no `/index.html`. A
+ * page loaded at `/adr/foo` and a `doc.published.route` of
+ * `/adr/foo/` compare equal. Kept small so the rail bundle stays
+ * lean (M2 item 9, story A4). */
+function normaliseCurrentRoute(pathname: string): string {
+  let p = pathname;
+  if (p.endsWith("/index.html")) p = p.slice(0, -"index.html".length);
+  if (!p.startsWith("/")) p = "/" + p;
+  if (!p.endsWith("/")) p = p + "/";
+  return p.replace(/\/+/g, "/");
+}
+
 function subscribeEvents(onBump: () => void): () => void {
   let closed = false;
   let source: EventSource | undefined;
@@ -303,6 +322,25 @@ function subscribeEvents(onBump: () => void): () => void {
           event.kind === "thread.orphaned"
         ) {
           onBump();
+        }
+        // M2 item 9 (story A4): the agent published a new revision
+        // of a document. When the `route` on the event matches THIS
+        // page, refresh the page live so the reviewer sees the new
+        // content — the daemon's override is already serving the
+        // updated HTML on the same URL, so a simple reload is the
+        // whole live-update strategy. The rail re-mounts on the
+        // new page and pulls fresh state.
+        if (event.kind === "doc.published" && typeof event.route === "string") {
+          const currentRoute = normaliseCurrentRoute(window.location.pathname);
+          const eventRoute = normaliseCurrentRoute(event.route);
+          if (currentRoute === eventRoute) {
+            // Race guard: a very rapid follow-up publish should not
+            // trigger overlapping reloads. `location.reload` is
+            // idempotent in browsers (the second call is a no-op
+            // during the pending nav), but calling it once per
+            // event still keeps the console log tidy.
+            window.location.reload();
+          }
         }
       } catch {
         // A non-JSON frame is the SSE keepalive comment or a corrupt

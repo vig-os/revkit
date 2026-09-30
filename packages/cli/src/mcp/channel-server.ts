@@ -273,6 +273,59 @@ const AWAIT_ANSWER_TOOL = {
   },
 } as const;
 
+const PUBLISH_TOOL = {
+  name: "publish",
+  description:
+    "Publish (write and render) a document plus any data side files. The daemon confines writes to " +
+    "the review content roots (docs/adr/, docs/designs/, docs/FEATURE-MATRIX.md, plots/, vocab/), " +
+    "runs `revkit check` on the batch (registered components only, one vocabulary, valid links + " +
+    "sets, structured plots), atomically writes each file, re-anchors comments on the changed " +
+    "paths, and re-renders the affected pages so the live page swaps in under a second — WITHOUT " +
+    "a full site build (ADR-0001 amendment, story A4). Presence events (`agent is editing X`) " +
+    "wrap the write. `docs[].content` and `data[].content` are the FULL file bodies; there is no " +
+    "diff/patch shape (v1) — a partial update reads the file first (`fs`), edits in memory, then " +
+    "sends the whole new content. Refuses raw HTML in the source: the check gate is the guard, " +
+    "not the render. Path shape: repo-relative POSIX, no `..`, no leading `/`, no symlinks.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      docs: {
+        type: "array",
+        description:
+          "Primary source files to publish (`.md` under docs/adr/, docs/designs/, docs/FEATURE-MATRIX.md). " +
+          "Each entry: `{ path, content }`. Cap: 16 files.",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string", minLength: 1, maxLength: 4096 },
+            content: { type: "string" },
+          },
+          required: ["path", "content"],
+          additionalProperties: false,
+        },
+        maxItems: 16,
+      },
+      data: {
+        type: "array",
+        description:
+          "Data side files (plot data under plots/<name>/, vocab/terms.yaml). Each entry: " +
+          "`{ path, content }`. Cap: 16 files.",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string", minLength: 1, maxLength: 4096 },
+            content: { type: "string" },
+          },
+          required: ["path", "content"],
+          additionalProperties: false,
+        },
+        maxItems: 16,
+      },
+    },
+    additionalProperties: false,
+  },
+} as const;
+
 const REVIEW_URL_TOOL = {
   name: "review_url",
   description:
@@ -565,6 +618,20 @@ const awaitAnswerArgsSchema = z
   })
   .strict();
 
+const publishFileArgSchema = z
+  .object({
+    path: z.string().min(1).max(4096),
+    content: z.string(),
+  })
+  .strict();
+
+const publishArgsSchema = z
+  .object({
+    docs: z.array(publishFileArgSchema).max(16).optional(),
+    data: z.array(publishFileArgSchema).max(16).optional(),
+  })
+  .strict();
+
 /** Start the MCP server and wire it to the daemon. Returns a handle
  * whose `stop()` shuts down the transport and the SSE loop. */
 export async function startChannelServer(options: ChannelServerOptions): Promise<ChannelServerHandle> {
@@ -603,7 +670,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   // ── tools/list ────────────────────────────────────────────────────
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [THREADS_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, ASK_TOOL, AWAIT_ANSWER_TOOL],
+    tools: [THREADS_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, ASK_TOOL, AWAIT_ANSWER_TOOL, PUBLISH_TOOL],
   }));
 
   // ── ask-answer waiters ────────────────────────────────────────────
@@ -698,6 +765,14 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
           }
         }
         return { ask: (created as { ask?: unknown }).ask, url: openUrl };
+      }
+      if (toolName === "publish") {
+        const parsed = publishArgsSchema.safeParse(args);
+        if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
+        return await client.publish({
+          docs: parsed.data.docs ?? [],
+          ...(parsed.data.data !== undefined ? { data: parsed.data.data } : {}),
+        });
       }
       if (toolName === "await_answer") {
         const parsed = awaitAnswerArgsSchema.safeParse(args);
@@ -1015,9 +1090,18 @@ function toolError(issues: unknown): {
 export {
   askArgsSchema,
   awaitAnswerArgsSchema,
+  publishArgsSchema,
   replyArgsSchema,
   resolveArgsSchema,
   reviewUrlArgsSchema,
   threadsArgsSchema,
 };
-export { ASK_TOOL, AWAIT_ANSWER_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, THREADS_TOOL };
+export {
+  ASK_TOOL,
+  AWAIT_ANSWER_TOOL,
+  PUBLISH_TOOL,
+  REPLY_TOOL,
+  RESOLVE_TOOL,
+  REVIEW_URL_TOOL,
+  THREADS_TOOL,
+};

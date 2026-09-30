@@ -230,6 +230,41 @@ export class DaemonClient {
     return await response.json();
   }
 
+  /** `POST /api/publish` — write one or more source files to the
+   * repo, run `revkit check` on them, re-render the affected pages
+   * for < 1 s live-update, and append `doc.published` events (M2
+   * item 9, story A4). The daemon is the write authority — the
+   * client sends the FULL file bodies. */
+  async publish(request: {
+    docs: readonly { path: string; content: string }[];
+    data?: readonly { path: string; content: string }[];
+  }): Promise<{
+    published: readonly { path: string; route?: string; revision: string }[];
+    seqs: readonly number[];
+    overrides: readonly { route: string; dataSrcCount: number }[];
+  }> {
+    const body: Record<string, unknown> = { docs: request.docs };
+    if (request.data !== undefined) body.data = request.data;
+    const response = await this.#fetch(`${this.#url}/api/publish`, {
+      method: "POST",
+      headers: this.#authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /api/publish → ${response.status} ${text}`,
+        response.status,
+        text,
+      );
+    }
+    return (await response.json()) as {
+      published: readonly { path: string; route?: string; revision: string }[];
+      seqs: readonly number[];
+      overrides: readonly { route: string; dataSrcCount: number }[];
+    };
+  }
+
   /** `POST /api/threads/:id/resolve`. */
   async resolve(threadId: string, resolution?: string): Promise<AppendResponse> {
     const body = resolution !== undefined ? { resolution } : {};

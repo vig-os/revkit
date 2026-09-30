@@ -62,6 +62,17 @@
 //                      (ADR-0006). A subsequent `thread.reanchored`
 //                      un-orphans the thread when a later rebuild finds
 //                      it again.
+//   doc.published    — the `revkit publish` MCP tool (M2 item 9, story
+//                      A4) accepted a new revision of one source file.
+//                      Carries the repo-relative `path`, the new
+//                      `revision` and the site route the daemon serves
+//                      (`route` — may be undefined for a data side
+//                      file the site does not surface as its own
+//                      page). The rail listens for this event and
+//                      reloads the affected page live. The event
+//                      touches no thread state; the follow-up
+//                      re-anchor pass emits its own
+//                      `thread.reanchored`/`thread.orphaned` events.
 import { z } from "zod";
 import { anchorSchema, anyAnchorSchema } from "./anchor.ts";
 import { askAnswerSchema, askSchema } from "./asks.ts";
@@ -248,6 +259,31 @@ const threadOrphanedPayload = {
     .optional(),
 } as const;
 
+/** Payload for `doc.published` (M2 item 9, story A4). The agent's
+ * `publish` MCP tool wrote a new revision of `path`; the daemon
+ * accepted it, re-anchored comments, and re-rendered the affected
+ * page. `revision` is the SHA-256 of the new LF-normalised source
+ * (matches `revisionOf(source)` so a re-derivation reproduces
+ * exactly the same hash). `route` is the site route the daemon
+ * serves for this document, or `undefined` when the path is a data
+ * side file (a plot data file, `vocab/terms.yaml`) that participates
+ * in a page but does not have a page of its own. `paths` carries
+ * every co-published file in the same publish batch so a live-
+ * update listener can refresh a page whose plot data changed
+ * without listing the plot document as the primary path. */
+const docPublishedPayload = {
+  kind: z.literal("doc.published"),
+  path: z.string().min(1).max(4096),
+  revision: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "doc.published.revision must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
+    ),
+  route: z.string().min(1).max(4096).optional(),
+  paths: z.array(z.string().min(1).max(4096)).min(1).max(64).optional(),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
@@ -325,6 +361,7 @@ const eventVariants = [
       }
     }),
   z.object({ ...envelope, ...threadOrphanedPayload }).strict(),
+  z.object({ ...envelope, ...docPublishedPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -356,6 +393,7 @@ export const reviewEventKinds = [
   "comment.linked",
   "thread.reanchored",
   "thread.orphaned",
+  "doc.published",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

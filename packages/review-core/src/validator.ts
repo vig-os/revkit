@@ -47,6 +47,12 @@
 //                      redundant repeat (`already-orphaned`). Both
 //                      cases carry their own rejection kind so a
 //                      caller can branch without parsing messages.
+//   doc.published    — no thread state; always accepted. Records
+//                      that the agent wrote a new revision at
+//                      `path`; downstream `thread.reanchored` /
+//                      `thread.orphaned` events on threads that
+//                      lived on `path` fire from the re-anchor
+//                      pipeline the daemon triggers after the write.
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -312,6 +318,14 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       return { ok: true };
     }
     case "presence":
+      return { ok: true };
+    case "doc.published":
+      // No thread state to update: the event records that the agent
+      // wrote a new revision of `path`. Any thread on that path
+      // reaches the re-anchor pipeline through the daemon's
+      // `reanchor.refresh(path)` call, which emits its own
+      // `thread.reanchored`/`thread.orphaned` events. The event
+      // itself is stateless (like `presence` and `handover` above).
       return { ok: true };
     case "ask.created": {
       if (state.asks.has(event.askId)) {

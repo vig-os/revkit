@@ -15,10 +15,12 @@
 //      such an event on the append side, so a correctly-produced log
 //      never carries one — the skip is a safety net for a partial
 //      slice, not a silent cover-up.
-//   3. `handover`, `presence`, `ask.created` and `ask.answered` do not
-//      touch thread state; they are surfaced through the event stream
-//      elsewhere (delivery modes, ask routes). `reduce` leaves them out
-//      of the Thread view rather than shoehorning them into a comment.
+//   3. `handover`, `presence`, `ask.created`, `ask.answered` and
+//      `doc.published` do not touch thread state; they are surfaced
+//      through the event stream elsewhere (delivery modes, ask
+//      routes, the rail's page reload on publish). `reduce` leaves
+//      them out of the Thread view rather than shoehorning them
+//      into a comment.
 
 import type { ReviewEvent } from "./events.ts";
 import type { Comment, Thread } from "./thread.ts";
@@ -212,6 +214,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
     case "ask.answered":
     case "ask.cancelled":
     case "ask.expired":
+    case "doc.published":
       // Handled outside the Thread view — see the file header.
       return;
   }
