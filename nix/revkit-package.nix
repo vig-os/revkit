@@ -36,30 +36,49 @@
 #   - `HOME=$TMPDIR` and `BUN_INSTALL_CACHE_DIR=$TMPDIR/bun-cache` keep
 #     bun's per-user caches inside the build sandbox.
 #
-# Version pinning: the CLI's semver comes from the workspace root
-# `package.json` (single source of truth per ADR-0021). The Nix package
-# `version` attribute is derived the same way so `nix build` and
-# `bun run` cannot disagree.
+# Version pinning: the CLI's semver comes from `packages/cli/package.json`
+# — the single source of truth per ADR-0021, mirrored by
+# `packages/cli/src/index.ts`'s `VERSION` constant. The Nix package
+# `version` attribute is derived the same way so `nix build`, `bun run`
+# and `revkit --version` cannot disagree.
+#
+# Per-system deps hash: bun installs platform-native binaries
+# (`esbuild-linux-x64` vs `esbuild-darwin-arm64`, `sharp`, `rolldown`,
+# `lightningcss`, ...), so the FOD output differs by system. This module
+# takes `nodeModulesHashes = { <system> = "sha256-…"; }` and picks the
+# entry for the current system; a system with no entry evaluates to
+# `lib.fakeHash` so the first build on that system reports the correct
+# hash in its rejection message ("got: sha256-…"), which then goes back
+# into `nodeModulesHashes` under that system's key. CI captures each
+# system's hash by running `nix build .#revkit` on a matching runner and
+# reading the failure log.
 
 {
   lib,
   stdenvNoCC,
+  system,
   bun,
   cacert,
   makeWrapper,
   # Source root: the revkit repo (from flake.nix, `./.`).
   src,
-  # Optional deps hash — set on first build after `bun.lock` changes.
-  # Empty string means "trust me, use lib.fakeHash to force a rebuild".
-  nodeModulesHash ? lib.fakeHash,
+  # Per-system hashes. A missing system falls back to `lib.fakeHash` so
+  # the first build reports the correct hash in its rejection message.
+  nodeModulesHashes ? { },
 }:
 
 let
-  # Version read from the root package.json — the flake and the CLI
-  # never diverge. `version` may be missing on a workspace root during
-  # early development; fall back to "0.0.0" so the build still succeeds.
-  rootManifest = builtins.fromJSON (builtins.readFile "${src}/package.json");
-  version = rootManifest.version or "0.0.0";
+  # CLI package.json is the version source of truth (ADR-0021 SemVer via
+  # the devkit release train; `packages/cli/src/index.ts` reads the same
+  # value into its `VERSION` constant, and the Nix `version` picks it
+  # up here so all three agree).
+  cliManifest = builtins.fromJSON (builtins.readFile "${src}/packages/cli/package.json");
+  inherit (cliManifest) version;
+
+  # Hash for the CURRENT system (from `system` builder arg). A missing
+  # entry evaluates to `lib.fakeHash` so the first build fails loudly
+  # with the real hash to paste back into `nodeModulesHashes`.
+  nodeModulesHash = nodeModulesHashes.${system} or lib.fakeHash;
 
   # Manifest-only source for the FOD: bun install reads bun.lock and
   # every workspace package.json, and nothing else. Everything under a
@@ -167,13 +186,23 @@ let
       runHook preInstall
       mkdir -p $out
       # The root node_modules tree carries every hoisted dep and bun's
-      # isolated linker workspace (node_modules/.bun/*).
+      # isolated linker workspace (node_modules/.bun/*). Copying an
+      # ~400 MiB tree with `cp -r` runs the fixup phase over every path
+      # and doubles the closure size. Rsync with `--links` preserves
+      # bun's internal relative symlinks byte-for-byte; from the runtime
+      # derivation we then symlink this whole subtree into $out so the
+      # final package is O(#workspace-node-modules-entries), not
+      # O(dep-file-count).
       if [ -d node_modules ]; then
         cp -r node_modules $out/node_modules
       fi
       # Per-workspace node_modules directories: bun creates one under
-      # each workspace whose deps are not fully hoisted; we mirror them
-      # under the same relative paths so the runtime symlinks resolve.
+      # each workspace whose deps are not fully hoisted, plus the
+      # relative `@revkit/*` workspace symlinks (e.g.
+      # `packages/cli/node_modules/@revkit/review-core -> ../../../review-core`).
+      # These symlinks must resolve against the FINAL package's source
+      # tree, so the runtime derivation copies these small directories
+      # into place (~200 KiB combined).
       for pkg in packages/cli packages/review-core packages/components site; do
         if [ -d "$pkg/node_modules" ]; then
           mkdir -p "$out/$pkg"
@@ -205,9 +234,20 @@ stdenvNoCC.mkDerivation {
     mkdir -p $out/libexec/revkit $out/bin
     cp -r . $out/libexec/revkit/
 
-    # Overlay the vendored node_modules trees from the FOD.
+    # Overlay the vendored node_modules from the FOD:
+    #   - Root `node_modules/` — carries every dep and bun's isolated
+    #     linker `.bun/` store. No relative workspace links live here
+    #     (the four `@revkit/*` symlinks are all under per-workspace
+    #     node_modules); the whole tree is safe to SYMLINK into the
+    #     store, keeping the closure ~200 MiB rather than ~640 MiB
+    #     (source + duplicated deps).
+    #   - Per-workspace `node_modules/` — small (~200 KiB combined) and
+    #     carries relative `@revkit/*` symlinks (e.g.
+    #     `packages/cli/node_modules/@revkit/review-core -> ../../../review-core`)
+    #     that MUST resolve against $out's source tree, not the FOD's.
+    #     Copied so a naive follow of those links lands in $out.
     if [ -d ${nodeModules}/node_modules ]; then
-      cp -r ${nodeModules}/node_modules $out/libexec/revkit/node_modules
+      ln -s ${nodeModules}/node_modules $out/libexec/revkit/node_modules
     fi
     for pkg in packages/cli packages/review-core packages/components site; do
       if [ -d "${nodeModules}/$pkg/node_modules" ]; then

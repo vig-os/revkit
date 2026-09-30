@@ -42,6 +42,34 @@
       revkitLib = {
         hooks = import ./nix/hooks.nix { inherit (nixpkgs) lib; };
       };
+
+      # Per-system deps hashes captured by the `revkit-flake` matrix job
+      # (see `.github/workflows/revkit-flake.yml`). A system missing from
+      # this attrset falls back to `lib.fakeHash` inside the FOD builder
+      # so the first build on that system reports the correct hash in
+      # its rejection message.
+      #
+      # Bun installs platform-native binaries (esbuild-<os>-<arch>, sharp,
+      # rolldown, lightningcss …), so the FOD output DIFFERS per system —
+      # one hash for all four systems would fail everywhere but where it
+      # was captured. Systems verified by CI:
+      #   x86_64-linux, aarch64-linux, aarch64-darwin
+      # x86_64-darwin is intentionally NOT listed: GitHub-hosted `macos-*`
+      # runners are arm64-only, so verifying that system would need a
+      # self-hosted runner. `packages` is restricted to the three verified
+      # systems (see `packages.revkit` below) — a `nix build` on any
+      # other system fails at eval with a missing-attribute error rather
+      # than a mismatched hash at build time.
+      nodeModulesHashes = {
+        x86_64-linux = "sha256-wQ6uaPMSryTssbHgS8mFxgaE+zVQdTCl0s01lWMzBHU=";
+        aarch64-linux = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        aarch64-darwin = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      };
+
+      # Systems `packages` / `apps` are exposed on. Kept in lockstep with
+      # `nodeModulesHashes` so `nix flake show` and a downstream
+      # `revkit.packages.${system}` are always coherent.
+      supportedSystems = builtins.attrNames nodeModulesHashes;
     in
     (flake-utils.lib.eachDefaultSystem (
       system:
@@ -54,11 +82,10 @@
 
         # revkit CLI package (ADR-0010, D1). Reproducible Bun build with
         # a fixed-output node_modules derivation; see nix/revkit-package.nix
-        # for the split rationale. `nodeModulesHash` is captured after the
-        # first successful FOD build and bumped when `bun.lock` changes.
+        # for the split rationale.
         revkitPkg = pkgs.callPackage ./nix/revkit-package.nix {
+          inherit system nodeModulesHashes;
           src = ./.;
-          nodeModulesHash = "sha256-wQ6uaPMSryTssbHgS8mFxgaE+zVQdTCl0s01lWMzBHU=";
         };
 
         # ────────────────────────────────────────────────────────────────────
@@ -280,8 +307,12 @@
                   # so a commit that touches only those still fires
                   # the hook. CI runs `revkit check --online`
                   # unconditionally, so this is a local convenience
-                  # rather than the sole gate.
-                  files = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$|(?:^|/)(NOTICE|LICENSE|UPSTREAM)$";
+                  # rather than the sole gate. Kept in ONE place
+                  # (`nix/hooks.nix`) so a consumer using
+                  # `revkit.lib.hooks.mkHooks` and this repo's own
+                  # dev shell never disagree on which files fire the
+                  # hook.
+                  files = revkitLib.hooks.contentFiles;
                   pass_filenames = false;
                 };
                 # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
@@ -368,8 +399,18 @@
         # a reproducible `bin/revkit` that runs `--help`, `check` and `serve`
         # outside the repo. `packages.default` points at the same drv so
         # `nix build` and `nix run` work without an attribute name.
-        packages.revkit = revkitPkg;
-        packages.default = revkitPkg;
+        #
+        # Exposed ONLY for systems whose FOD deps hash is captured in
+        # `nodeModulesHashes` above (x86_64-linux, aarch64-linux,
+        # aarch64-darwin). On other systems (x86_64-darwin today), `nix
+        # build .#revkit` fails at eval with an "attribute missing"
+        # error rather than at build time with a mismatched hash.
+      }
+      // nixpkgs.lib.optionalAttrs (builtins.elem system supportedSystems) {
+        packages = {
+          revkit = revkitPkg;
+          default = revkitPkg;
+        };
 
         # `nix run .#revkit -- <args>` runs the CLI without a repo checkout
         # (nix downloads the flake, builds `packages.revkit`, invokes the

@@ -1,30 +1,32 @@
-# revkit flake outputs — build + template smoke (D1, ADR-0010, M5).
+# revkit flake outputs — cross-system build + template smoke (D1,
+# ADR-0010, M5).
 #
-# Verifies the M5 acceptance criteria on every PR touching the flake or
+# Verifies the M5 part 1 acceptance on every PR touching the flake or
 # the CLI:
-#   1. `nix build .#revkit` produces a reproducible CLI store path.
-#   2. `bin/revkit --help` and `bin/revkit --version` run outside the
-#      repo (proves the wrapper resolves its own libexec).
-#   3. `scripts/template-smoke.sh` scaffolds `templates.default` into a
-#      temp dir, runs `nix build` and `revkit check` in it, boots
-#      `revkit serve` on 127.0.0.1, probes it, and tears it down.
+#   1. `nix build .#revkit` produces a reproducible CLI store path on
+#      every supported system (x86_64-linux, aarch64-linux,
+#      aarch64-darwin). Bun installs platform-native binaries
+#      (esbuild-<os>-<arch>, sharp, rolldown, lightningcss, …), so
+#      the FOD deps hash differs per system — one hash for all
+#      systems would fail everywhere but where it was captured. This
+#      matrix runs on GitHub-hosted runners for each supported
+#      system; a hash mismatch surfaces the correct hash to paste
+#      back into `flake.nix`'s `nodeModulesHashes` attrset.
+#   2. `scripts/template-smoke.sh` scaffolds `templates.default` into
+#      a temp dir, runs `nix build` and `revkit check` in it, and
+#      verifies `--help` / `--version` from the packaged wrapper
+#      outside the checkout. Runs on Linux only — Nix flake init +
+#      the smoke's shell tooling assume a Linux/macOS shell layer
+#      that matches the runners' defaults.
 #
 # ADR-0014 secret discipline:
-#   - `pull_request` only, NEVER `pull_request_target` (a PR from a
-#     fork cannot mint tokens or read secrets).
-#   - `contents: read` is the only permission — the flake build reads
-#     the tree; nothing writes back.
+#   - `pull_request` only, NEVER `pull_request_target`.
+#   - `contents: read` is the only permission.
 #   - No environment secrets are used or exposed.
 #
-# The devkit-managed `ci.yml` does not build with nix (its lanes are
-# `just precommit` and `just test`), so this consumer-owned workflow
-# lives beside `revkit-guards.yml` as its M5 sibling: guards for the
-# authoring surface, flake for the distribution surface.
-#
-# Outside `CI Summary` for the same reason `revkit-guards` is — until
-# vig-os/devkit#1761 exposes a hook that folds a custom check into the
-# managed summary gate. Branch protection references this workflow by
-# name once M5 lands (a follow-up chore, not part of this PR).
+# `x86_64-darwin` is NOT verified today: GitHub-hosted `macos-*`
+# runners are arm64 only, so `flake.nix`'s `packages.revkit` refuses
+# to expose that system (see the `nodeModulesHashes` attrset).
 name: revkit-flake
 
 "on":
@@ -41,8 +43,25 @@ permissions:
 jobs:
   build:
     name: nix build .#revkit
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    strategy:
+      # Fail-fast off so a hash mismatch on one system doesn't hide
+      # mismatches on the other two (a single push captures all three
+      # hashes at once).
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64-linux — the default hosted runner for Ubuntu.
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          # aarch64-linux — arm64 Ubuntu, GitHub-hosted (free on
+          # public repos as of 2025).
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          # aarch64-darwin — macOS-14+/15 default is arm64.
+          - runner: macos-latest
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -55,7 +74,7 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Build revkit package
+      - name: Build revkit package for ${{ matrix.system }}
         # `.#revkit` and `.#default` should be the same drv; the second
         # build is a store-hit and cheap. `--print-out-paths` is the
         # evidence we want in the log.
@@ -65,12 +84,13 @@ jobs:
           nix build .#default --no-link --print-out-paths
 
       - name: Smoke — --version and --help outside the repo
-        # Runs from `/tmp` so a relative-import bug in the wrapper would
-        # be caught. Both must succeed with exit 0.
+        # Runs from a scratch dir so a relative-import bug in the
+        # wrapper would surface. Both must succeed with exit 0.
         run: |
           set -euxo pipefail
           store=$(nix build .#revkit --no-link --print-out-paths)
-          cd /tmp
+          mkdir -p /tmp/revkit-smoke
+          cd /tmp/revkit-smoke
           "$store/bin/revkit" --version
           "$store/bin/revkit" --help | head -5
 
@@ -93,6 +113,6 @@ jobs:
       - name: Run template smoke
         # Scaffolds the template into a temp dir, uses --override-input
         # to point at THIS checkout, runs revkit check, nix build, and
-        # serve. `scripts/template-smoke.sh` traps EXIT so no daemon
-        # leaks on failure.
+        # the wrapper's --help/--version. scripts/template-smoke.sh
+        # traps EXIT so no daemon leaks on failure.
         run: bash scripts/template-smoke.sh "${GITHUB_WORKSPACE}"

@@ -25,7 +25,16 @@
 
 { lib }:
 
-{
+rec {
+  # File-glob regex the `revkit-check` hook triggers on — every content
+  # extension revkit's rules look at, plus the extensionless vendored-
+  # code files (`NOTICE`, `LICENSE`, `UPSTREAM`) the ADR-0022 guard
+  # reads. Case-insensitive so `.MD` / `.MDX` count. Exported (as
+  # `contentFiles`) so the revkit repo's own `flake.nix` reads THIS
+  # value into its local hook rather than keeping a parallel string
+  # that could drift.
+  contentFiles = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$|(?:^|/)(NOTICE|LICENSE|UPSTREAM)$";
+
   # Function form so a consumer flake can pass the packaged revkit CLI
   # from THIS flake's per-system `packages` output. Called with:
   #   { revkit = revkit.packages.${system}.revkit; }
@@ -33,16 +42,15 @@
   mkHooks =
     {
       revkit,
-      # Extra file globs to consider (rare — the default covers every
-      # content extension revkit's rules look at). Passed through to
-      # every hook's `files` pattern.
+      # REPLACEMENT file-glob regex. When `null` (the default), the
+      # hook uses `contentFiles`; when a string, it REPLACES that
+      # pattern (it does not extend it — a consumer who wants to add
+      # a suffix without losing the base coverage must inline the
+      # concatenation themselves). Rare; the default covers every
+      # extension revkit's rules read.
       extraFiles ? null,
     }:
     let
-      # The surface `revkit check` walks. Kept in sync with the local
-      # hook wired in the top-level `flake.nix` and with the CLI's own
-      # walker exclusions. Case-insensitive so `.MD` / `.MDX` count.
-      contentFiles = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$|(?:^|/)(NOTICE|LICENSE|UPSTREAM)$";
       files = if extraFiles == null then contentFiles else extraFiles;
     in
     {
