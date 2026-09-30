@@ -1,6 +1,6 @@
 // Playwright leg of the revkit dogfood loop.
 //
-// Called by scripts/dogfood-channel.sh. Reads the daemon state from the
+// Called by packages/cli/src/dogfood/playwright.ts. Reads the daemon state from the
 // **isolated** state dir the shell created for this run, mints a fresh
 // launch URL through `POST /-/launch-code` (so the URL is single-use),
 // opens the built site in a real chromium page, selects text on a real
@@ -19,7 +19,7 @@
 //                                     tell OUR reply apart. The nonce echo
 //                                     is a LIVENESS marker only, not a
 //                                     lockdown proof — see
-//                                     scripts/dogfood-channel.sh:verify_claude_lockdown
+//                                     packages/cli/src/dogfood/verify.ts:verifyRunning
 //                                     for the real lockdown assertion.
 //   REVKIT_DOGFOOD_ARTIFACTS_DIR    — writable temp dir for screenshots.
 //   PLAYWRIGHT_BROWSERS_PATH        — chromium binary root (dev shell).
@@ -38,7 +38,7 @@
 
 // `@playwright/test` (not the bare `playwright` package) is what ships in
 // the site workspace, so this script runs from `site/` — see how
-// scripts/dogfood-channel.sh invokes it. The `chromium` and `Page` exports
+// packages/cli/src/dogfood/playwright.ts invokes it. The `chromium` and `Page` exports
 // are re-exported through `@playwright/test`, no test-runner state is used.
 import { chromium, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
@@ -214,7 +214,7 @@ async function main(): Promise<void> {
     // Round-4 change: the dogfood comment reads like a real reviewer's
     // note. No embedded imperative chain, no coerced tool call. The
     // lockdown is proven by the shell's pre-launch /proc inspection of
-    // the claude process (see scripts/dogfood-channel.sh:verify_claude_lockdown),
+    // the claude process (see packages/cli/src/dogfood/verify.ts:verifyRunning),
     // NOT by anything the model does with this comment. The comment
     // just carries a nonce so the harness can tell OUR test thread
     // apart from any other. If the agent declines the note (a good
@@ -278,7 +278,7 @@ async function main(): Promise<void> {
     if (!flush.ok) throw new Error(`handover flush failed: ${flush.status}`);
     console.log("handover flushed via POST /api/handover"); // guardrails-ok(no-debug-leftovers): CLI progress line
     // stdout is this script's contract — the caller shell
-    // (scripts/dogfood-channel.sh) tees each line into the dogfood
+    // (packages/cli/src/dogfood/main.ts) tees each line into the dogfood
     // transcript, so `console.log` IS the tracing facade here.
     console.log(`created thread ${created.id} (${created.comments.length} comment(s))`); // guardrails-ok(no-debug-leftovers): CLI progress line
 

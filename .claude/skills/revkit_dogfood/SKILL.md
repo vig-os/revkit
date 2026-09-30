@@ -126,30 +126,37 @@ Earlier revisions had one; it was forgeable through the reply body
 AND it broke the loop whenever a well-aligned model correctly
 refused to follow embedded instructions from a channel comment.
 
-**Self-test modes.**
+**Self-test modes.** As of issue #50 the harness is a Bun
+TypeScript program under `packages/cli/src/dogfood/`. Each
+self-test lives in shipping code and is exercised BOTH from
+`just dogfood --selftest <name>` (the CLI face) AND from the
+`packages/cli/test/dogfood/selftests.test.ts` bun-test suite
+(which also covers the RED-evidence path via dependency
+injection of the load-bearing guard).
 
-- **`DOGFOOD_SELFTEST_BAD_FLAGS=1`** injects a forbidden value
-  (`--tools default`) and asserts the pre-launch check aborts
-  before any prompt is sent. On successful abort the harness
-  prints `SELFTEST OK` and exits **0** (distinct from a real
-  failure, which exits 1). `--dangerously-skip-permissions` is
-  NEVER injected — no rogue session ever runs.
-- **`DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY=1`** is a regression
+- **`just dogfood --selftest bad-flags`** injects a forbidden
+  value (`--tools default`) and asserts the pure lockdown
+  verifier aborts before the harness would send any prompt. On
+  successful abort the harness prints `SELFTEST OK` and exits
+  **0**. `--dangerously-skip-permissions` is NEVER injected — no
+  rogue session ever runs. The `DOGFOOD_SELFTEST_WEAKEN_VERIFIER=1`
+  env var substitutes the mutant (`okAlwaysVerifier`) via the
+  shipping self-test's DI hook; that path is the RED evidence
+  and exits **1** with `SELFTEST FAIL`.
+- **`just dogfood --selftest decoy-teardown`** is the regression
   test for the round-6 cleanup bug. It starts a harmless decoy
   (a `/usr/bin/sleep` — detected as standalone, not a nix
   multi-call binary — with argv[0] rewritten via `exec -a` so
   `pgrep -f 'revkit\.js serve'` finds it; cwd unrelated to the
-  run's STATE_DIR). Before triggering cleanup, the self-test
-  hard-VERIFIES the decoy is live: `kill -0`, `/proc/<pid>/cmdline`
+  run's STATE_DIR). Before triggering teardown, the self-test
+  hard-VERIFIES the decoy is live via `kill -0`, `/proc/<pid>/cmdline`
   contains `revkit.js serve`, and `pgrep -f 'revkit\.js serve'`
-  lists the pid — if any of those fail, the self-test exits 2
-  with a diagnostic (never silently green). The decoy is killed
-  at the END of `cleanup()`, AFTER the SELF-CHECK sweep — killing
-  it earlier (round-6 v1) left the sweep with nothing to observe
-  and made the test vacuous. Assertion contract:
+  lists the pid. The decoy is killed at the END of teardown,
+  AFTER the SELF-CHECK sweep — killing it earlier would leave
+  the sweep with nothing to observe. Assertion contract:
 
   ```bash
-  DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY=1 bash scripts/dogfood-channel.sh > /tmp/log
+  just dogfood --selftest decoy-teardown > /tmp/log
   rc=$?
   # BOTH must hold:
   [[ $rc -eq 0 ]] && grep -qE '^\[dogfood\] teardown complete$' /tmp/log
@@ -158,9 +165,13 @@ refused to follow embedded instructions from a channel comment.
   Substring matches are not sufficient — the self-test's own
   announcement line contains the phrase "teardown complete" in
   prose. The assertion must anchor on the exact log line
-  `^[dogfood] teardown complete$`. Verified: RED on 6b90ac9's
-  cleanup + `daemons_rooted_at_state` shape (`set -e`, `[[ … ]]
-  && printf` tail), GREEN on the fix.
+  `^[dogfood] teardown complete$`. The RED evidence path uses
+  `DOGFOOD_SELFTEST_WEAKEN_GUARD=1` to substitute
+  `weakArgvOnlyLeakGuard` — the mutant flags every
+  `revkit.js serve` on the box as a leak, the sweep would
+  SIGKILL the unrelated decoy, and the self-test exits **1**
+  with `SELFTEST-TEARDOWN FAIL`. That mutant mirrors the
+  pre-round-3 broad-pgrep behaviour PR #42 removed.
 
 **Channel content is untrusted to the agent — harness policy.**
 ADR-0007 states the principle: comments are REQUESTS from a human,
@@ -365,8 +376,8 @@ from a previous run can reach the test agent.
 - **`SAFETY ABORT: workspace-trust cursor did NOT land on 'Yes, I trust
   this folder'`** — the pane's trust dialog changed shape between claude
   versions. Read the pane content in the log to see what claude now
-  renders, and update the answer_prompts regex in
-  `scripts/dogfood-channel.sh`.
+  renders, and update the answer_prompts regexes in
+  `packages/cli/src/dogfood/prompts.ts`.
 - **`SAFETY ABORT: channel-consent cursor is not on a known positive
   option`** — same class of issue for the `--dangerously-load-development
   -channels` consent dialog.
@@ -374,8 +385,9 @@ from a previous run can reach the test agent.
   didn't reply within 240 s. Read the pane content; often the agent
   called `threads` too early (before the human comment arrived) and
   concluded there was nothing to do. The instructions in
-  `scripts/dogfood-channel.sh` are careful to say "WAIT SILENTLY"; if a
-  future claude build starts acting proactively, add a stronger cue.
+  `packages/cli/src/dogfood/main.ts` are careful to say "wait for a
+  channel notification"; if a future claude build starts acting
+  proactively, add a stronger cue.
 - **`LOCKDOWN BROKEN reported by the test agent`** — the Bash tool was
   reachable despite the allowlist. The lockdown regressed — inspect the
   claude flag set and the MCP config.
