@@ -10,50 +10,111 @@
 
 /** Rail-side thread projection duck-type. Kept minimal — the rail
  * bundle deliberately does not import the review-core Zod schema,
- * so the browser payload stays small. */
+ * so the browser payload stays small. The comment createdAt is
+ * required so the unread derivation can watermark against agent
+ * activity, not against every touch (see `latestAgentActivityOf`). */
 export interface UnreadThread {
   readonly id: string;
   readonly status: "open" | "resolved" | "orphaned";
   readonly updatedAt: string;
-  readonly comments: ReadonlyArray<{ readonly author: { readonly kind: string } }>;
+  readonly comments: ReadonlyArray<{
+    readonly author: { readonly kind: string };
+    readonly createdAt: string;
+  }>;
   readonly resolvedBy?: { readonly kind: string };
+  readonly resolvedAt?: string;
 }
 
 /** Per-viewer "seen" state — a map from thread id to the
- * `updatedAt` value the viewer last acknowledged. Stored in
- * localStorage. A missing entry means "never seen"; an entry that
- * equals the current `updatedAt` means "up to date". */
+ * `latestAgentActivity` value the viewer last acknowledged
+ * (a `createdAt` or `resolvedAt` ISO timestamp — NOT `updatedAt`,
+ * which advances on every event including the reviewer's own
+ * resolve / reopen and pipeline re-anchors). Stored in
+ * localStorage. A missing entry means "never seen"; an entry equal
+ * to or newer than the current `latestAgentActivity` means "up to
+ * date". */
 export type SeenMap = Readonly<Record<string, string>>;
 
-/** localStorage key for the seen map. Scoped to the rail so a
- * different island on the same daemon origin (if any) does not
- * collide. Bumped only if the SeenMap shape changes. */
-export const SEEN_STORAGE_KEY = "revkit.rail.seen.v1";
+/** localStorage key prefix for the seen map. The daemon's
+ * `/-/health` `instanceId` is appended so a fresh daemon start
+ * (a new repo bound to the same loopback port, or a rebuild)
+ * gets a fresh bucket instead of inheriting stale marks from a
+ * previous review session on the same origin. Bumped only if
+ * the SeenMap shape changes. */
+export const SEEN_STORAGE_KEY_PREFIX = "revkit.rail.seen.v1";
+export function seenStorageKeyFor(instanceId: string | undefined): string {
+  if (instanceId === undefined || instanceId.length === 0) return SEEN_STORAGE_KEY_PREFIX;
+  return `${SEEN_STORAGE_KEY_PREFIX}.${instanceId}`;
+}
+// Kept for backward compatibility with earlier callers (the M2
+// unit tests still reference the plain constant). The rail itself
+// always keys through `seenStorageKeyFor`.
+export const SEEN_STORAGE_KEY = SEEN_STORAGE_KEY_PREFIX;
 
-/** True when the LAST touch on this thread was an agent action —
- * either the last comment is agent-authored, or the resolve was
- * done by the agent. A human replying to their own thread never
- * makes it "unread". */
+/** True when the thread has any agent activity — an agent-authored
+ * comment OR a resolve by an agent. Cheaper predicate for callers
+ * that only need the boolean; the value flavour is
+ * `latestAgentActivityOf`. */
 export function hasAgentActivity(thread: UnreadThread): boolean {
-  if (thread.status === "resolved" && thread.resolvedBy?.kind === "agent") return true;
-  const last = thread.comments[thread.comments.length - 1];
-  if (last === undefined) return false;
-  return last.author.kind === "agent";
+  return latestAgentActivityOf(thread) !== undefined;
 }
 
-/** Is this thread's latest version newer than the last one the
- * viewer marked seen? Returns true when the thread has never been
- * seen on this browser (missing map entry), OR when the thread's
- * `updatedAt` has advanced since the last seen mark. Only threads
- * with agent activity qualify as "unread"; a human's own reply is
- * always considered read. Storage-unavailable failure paths call
- * this with an EMPTY map, so the fallback IS "unread everything"
- * — the safe default. */
+/** The ISO timestamp of the newest agent-authored touch on this
+ * thread — the max of every agent comment's `createdAt` and, when
+ * the thread was resolved by an agent, `resolvedAt`. Returns
+ * undefined when no agent has touched the thread. This is the
+ * ONLY value the unread pill watermarks against; it deliberately
+ * ignores `updatedAt` because that field advances on every
+ * event, including the reviewer's own resolve / reopen and the
+ * re-anchor pipeline's `thread.reanchored` / `thread.orphaned`
+ * emissions (PR #62 review, issue #60 blocker). */
+export function latestAgentActivityOf(thread: UnreadThread): string | undefined {
+  let latest: string | undefined;
+  for (const comment of thread.comments) {
+    if (comment.author.kind !== "agent") continue;
+    if (latest === undefined || comment.createdAt > latest) latest = comment.createdAt;
+  }
+  if (
+    thread.status === "resolved" &&
+    thread.resolvedBy?.kind === "agent" &&
+    thread.resolvedAt !== undefined &&
+    (latest === undefined || thread.resolvedAt > latest)
+  ) {
+    latest = thread.resolvedAt;
+  }
+  return latest;
+}
+
+/** Is this thread carrying agent activity the viewer has not seen?
+ * "Unread" is true when `latestAgentActivityOf(thread)` is newer
+ * than the viewer's `seen[thread.id]` mark — never when the
+ * reviewer's own resolve, reopen, or a pipeline event bumped
+ * `updatedAt`. Storage-unavailable failure paths call this with
+ * an empty map, so the fallback default IS "unread everything
+ * agent-touched" — louder than silent, so a reviewer never
+ * misses an ack. */
 export function isThreadUnread(thread: UnreadThread, seen: SeenMap): boolean {
-  if (!hasAgentActivity(thread)) return false;
+  const latest = latestAgentActivityOf(thread);
+  if (latest === undefined) return false;
   const lastSeen = seen[thread.id];
   if (lastSeen === undefined) return true;
-  return thread.updatedAt > lastSeen;
+  return latest > lastSeen;
+}
+
+/** Prune entries in `seen` whose thread id is not in `ids`. Called
+ * on refetch so a resolved-then-deleted thread does not leak a
+ * seen mark forever. Returns a new map only if a prune actually
+ * happened, so callers can bail out of the write path when
+ * nothing changed. */
+export function pruneSeenMap(seen: SeenMap, ids: Iterable<string>): SeenMap {
+  const keep = new Set(ids);
+  let dropped = false;
+  const next: Record<string, string> = {};
+  for (const [id, ts] of Object.entries(seen)) {
+    if (keep.has(id)) next[id] = ts;
+    else dropped = true;
+  }
+  return dropped ? next : seen;
 }
 
 /** A short single-line excerpt of a comment body, for the
@@ -99,14 +160,19 @@ export function formatRelativeTime(iso: string, now: number = Date.now()): strin
   return `${Math.abs(value)} ${unit}${Math.abs(value) === 1 ? "" : "s"}${suffix}`;
 }
 
-/** Read the "seen" map from `localStorage`. Wrapped in try/catch;
- * a private window, cleared / blocked site data, or a throwing
+/** Read the "seen" map from `localStorage` under a given key.
+ * `key` defaults to the unversioned prefix so tests that predate
+ * per-instance keying keep working. Wrapped in try/catch; a
+ * private window, cleared / blocked site data, or a throwing
  * accessor all resolve to `{}` — the safe default, which shows
  * every agent-touched thread as unread. */
-export function readSeenMap(storage: Pick<Storage, "getItem"> | undefined = tryLocalStorage()): SeenMap {
+export function readSeenMap(
+  storage: Pick<Storage, "getItem"> | undefined = tryLocalStorage(),
+  key: string = SEEN_STORAGE_KEY_PREFIX,
+): SeenMap {
   if (storage === undefined) return {};
   try {
-    const raw = storage.getItem(SEEN_STORAGE_KEY);
+    const raw = storage.getItem(key);
     if (raw === null) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
@@ -120,14 +186,18 @@ export function readSeenMap(storage: Pick<Storage, "getItem"> | undefined = tryL
   }
 }
 
-/** Write the "seen" map to `localStorage`. Wrapped in try/catch:
- * a full quota or a blocked storage means the mark won't persist
- * across a reload, but the in-memory state still moves so the
- * current session isn't stuck. Never fatal. */
-export function writeSeenMap(next: SeenMap, storage: Pick<Storage, "setItem"> | undefined = tryLocalStorage()): void {
+/** Write the "seen" map to `localStorage` under a given key.
+ * Wrapped in try/catch: a full quota or a blocked storage means
+ * the mark won't persist across a reload, but the in-memory state
+ * still moves so the current session isn't stuck. Never fatal. */
+export function writeSeenMap(
+  next: SeenMap,
+  storage: Pick<Storage, "setItem"> | undefined = tryLocalStorage(),
+  key: string = SEEN_STORAGE_KEY_PREFIX,
+): void {
   if (storage === undefined) return;
   try {
-    storage.setItem(SEEN_STORAGE_KEY, JSON.stringify(next));
+    storage.setItem(key, JSON.stringify(next));
   } catch {
     // Storage unavailable / quota exceeded — the mark won't persist
     // across a reload, but the in-memory state still moves the

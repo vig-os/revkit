@@ -364,6 +364,62 @@
   margin-right: 0.5rem;
 }
 
+/* Bulk "Mark all seen" action in the rail header (PR #62 review).
+ * Only rendered when unread > 0, so it doesn't clutter the header
+ * on a quiet page. */
+.revkit-rail__mark-all-seen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.15rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  margin-right: 0.35rem;
+}
+
+.revkit-rail__mark-all-seen:hover,
+.revkit-rail__mark-all-seen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+/* Single polite live region for unread announcements — visually
+ * hidden but announced by screen readers. sr-only pattern. */
+.revkit-rail__unread-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Reopen button lives inside the collapsed row, so a reviewer
+ * can reopen a resolved thread with one click (no need to expand
+ * first). Smaller than the in-body reopen so a long list of
+ * collapsed rows stays scannable. */
+.revkit-rail__resolved-reopen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.1rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.72rem;
+  justify-self: end;
+  align-self: start;
+}
+
+.revkit-rail__resolved-reopen:hover,
+.revkit-rail__resolved-reopen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
 .revkit-rail__comments {
   list-style: none;
   padding: 0;

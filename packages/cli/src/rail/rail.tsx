@@ -22,26 +22,20 @@
 // runtime, which JIT-compiled templates via `new Function()` — that
 // widening is gone.
 
-import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 import {
   excerptOf,
   formatRelativeTime,
-  hasAgentActivity,
   isThreadUnread,
+  latestAgentActivityOf,
+  pruneSeenMap,
   readSeenMap as readSeenMapImpl,
-  SEEN_STORAGE_KEY,
+  seenStorageKeyFor,
   writeSeenMap as writeSeenMapImpl,
   type SeenMap,
-  type UnreadThread,
 } from "./unread.ts";
-// Re-export the pure helpers so `rail.tsx` remains the single
-// public entry point for unit tests. bun:test imports them from
-// here to keep the test-side surface stable while the browser
-// bundle continues to load only what it needs.
-export { excerptOf, formatRelativeTime, hasAgentActivity, isThreadUnread, SEEN_STORAGE_KEY };
-export type { SeenMap };
 // Round-2 refactor: the rail no longer parses mention structure
 // itself. The daemon parses every comment body at append time with
 // the real Markdown AST and writes the typed mention list onto the
@@ -350,17 +344,37 @@ async function reopenThread(threadId: string): Promise<void> {
   if (!response.ok) throw new Error(`POST /api/threads/:id/reopen failed: ${response.status}`);
 }
 
-// Local wrappers around the pure helpers in `./unread.ts`. Kept
-// here so the JSX can pass raw `RailThread` values into the
-// helpers even though the pure module types them as the smaller
-// `UnreadThread` duck-type. TypeScript's structural typing does
-// the widening for free.
+// Local wrappers around the pure helpers in `./unread.ts`. The
+// browser-side seen map is keyed by the daemon's per-start
+// `instanceId`, fetched once on mount via `GET /-/health`. The
+// helpers here fall back to the unversioned key when we haven't
+// received the id yet — that lasts ~1 refetch and the fall-back
+// bucket is empty in a fresh browser, so no leakage.
+let currentSeenKey: string | undefined;
 function readSeenMap(): SeenMap {
-  return readSeenMapImpl();
+  return readSeenMapImpl(undefined, currentSeenKey);
 }
 function writeSeenMap(next: SeenMap): void {
-  writeSeenMapImpl(next);
+  writeSeenMapImpl(next, undefined, currentSeenKey);
 }
+/** Fetch the daemon's `/-/health` payload and adopt its
+ * `instanceId` as the storage key. Called once on mount; a
+ * failure (rare — daemon is loopback) leaves the unversioned key,
+ * so the reviewer's local session still works. */
+async function fetchInstanceId(): Promise<string | undefined> {
+  try {
+    const response = await fetch("/-/health", { credentials: "same-origin" });
+    if (!response.ok) return undefined;
+    const parsed = (await response.json()) as { instanceId?: string };
+    return typeof parsed.instanceId === "string" ? parsed.instanceId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+/** How many unread threads render EXPANDED before the rest fall
+ * back to collapsed-with-pill. Tuned so a colleague opening a
+ * page with a long agent backlog can still scan the list. */
+const UNREAD_EXPANDED_LIMIT = 5;
 
 /** Compute the source-quote context for a selected text range. The
  * daemon's schema requires `exact` non-empty; `prefix` / `suffix` may
@@ -620,16 +634,147 @@ function Rail(): JSX.Element {
   // it in Escape's dispatch table.
   const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
   // Per-viewer "seen" marks for the unread pill (issue #60). Kept
-  // in localStorage; wrapped in try/catch. When the reviewer
-  // clicks an unread thread or hits "mark seen", the mark updates.
+  // in localStorage; wrapped in try/catch, keyed by the daemon's
+  // `instanceId` (fetched below) so a rebuild starts fresh. The
+  // stored value for each thread is the `latestAgentActivityOf`
+  // timestamp the reviewer acknowledged — NOT `updatedAt`, which
+  // advances on every event including the reviewer's own resolve /
+  // reopen and the re-anchor pipeline (PR #62 review, the L855
+  // pre-reopen mark was masking this).
   const [seenMap, setSeenMap] = createSignal<SeenMap>(readSeenMap());
+  // Fetch the daemon's instanceId once; then re-read the seen map
+  // under the correct key and prune it against the current thread
+  // list. A rebuild (new instanceId) sees an empty bucket, so the
+  // reviewer gets the fresh backlog — exactly the reviewer's
+  // expectation on a "did anything change while I was away" load.
+  void (async (): Promise<void> => {
+    const id = await fetchInstanceId();
+    if (id !== undefined) {
+      currentSeenKey = seenStorageKeyFor(id);
+      setSeenMap(readSeenMap());
+    }
+  })();
   const markThreadSeen = (thread: RailThread): void => {
     const current = seenMap();
-    if (current[thread.id] === thread.updatedAt) return;
-    const next: SeenMap = { ...current, [thread.id]: thread.updatedAt };
+    const latest = latestAgentActivityOf(thread);
+    if (latest === undefined) return; // Nothing agent-authored to acknowledge.
+    if (current[thread.id] === latest) return;
+    const next: SeenMap = { ...current, [thread.id]: latest };
     setSeenMap(next);
     writeSeenMap(next);
   };
+  /** Mark every currently-unread thread seen at its latest agent
+   * activity — the header "Mark all seen" bulk action. */
+  const markAllSeen = (): void => {
+    const response = threads();
+    if (response === undefined) return;
+    const current = seenMap();
+    let changed = false;
+    const next: Record<string, string> = { ...current };
+    for (const thread of response.threads) {
+      const latest = latestAgentActivityOf(thread);
+      if (latest === undefined) continue;
+      if (current[thread.id] === latest) continue;
+      next[thread.id] = latest;
+      changed = true;
+    }
+    if (!changed) return;
+    setSeenMap(next);
+    writeSeenMap(next);
+  };
+  // Prune stale seen entries whenever the thread list changes.
+  // A resolved-then-deleted thread would otherwise leak a mark
+  // forever; the browser's localStorage bucket is small (5 MB),
+  // so a long-lived repo would eventually run out.
+  createEffect(() => {
+    const response = threads();
+    if (response === undefined) return;
+    const current = seenMap();
+    const ids = response.threads.map((t) => t.id);
+    const pruned = pruneSeenMap(current, ids);
+    if (pruned === current) return;
+    setSeenMap(pruned);
+    writeSeenMap(pruned);
+  });
+  // The set of unread thread ids that are ALLOWED to auto-expand.
+  // Cap at UNREAD_EXPANDED_LIMIT so a browser opening on a page
+  // with 150 unread agent replies does not render 150 expanded
+  // threads at once. The remaining unread threads still carry the
+  // pill (so the reviewer can navigate to them) but stay collapsed.
+  // Ordering: latest agent activity first — the freshest N.
+  const autoExpandedUnread = createMemo<ReadonlySet<string>>(() => {
+    const response = threads();
+    if (response === undefined) return new Set();
+    const current = seenMap();
+    const withActivity: Array<{ id: string; ts: string }> = [];
+    for (const thread of response.threads) {
+      if (!isThreadUnread(thread, current)) continue;
+      const ts = latestAgentActivityOf(thread) ?? thread.updatedAt;
+      withActivity.push({ id: thread.id, ts });
+    }
+    withActivity.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+    return new Set(withActivity.slice(0, UNREAD_EXPANDED_LIMIT).map((entry) => entry.id));
+  });
+  /** Count of unread agent replies — read by the single polite
+   * live-region below so screen readers announce a summary once,
+   * instead of per-thread `role="status"` pills that would
+   * announce 150 times in a row. */
+  const unreadCount = createMemo<number>(() => {
+    const response = threads();
+    if (response === undefined) return 0;
+    const current = seenMap();
+    let n = 0;
+    for (const thread of response.threads) {
+      if (isThreadUnread(thread, current)) n += 1;
+    }
+    return n;
+  });
+  /** Resolved-thread count for the "Resolved (N)" pill in the
+   * rail header. Memoized so a re-render doesn't repeat the O(N)
+   * filter for the aria-label, header string and empty-state
+   * check — issue #60 exercised these together, so with 150
+   * threads the linear scan was running three times per render.
+   */
+  const resolvedCount = createMemo<number>(() => {
+    const response = threads();
+    if (response === undefined) return 0;
+    let n = 0;
+    for (const thread of response.threads) if (thread.status === "resolved") n += 1;
+    return n;
+  });
+  /** True when the whole thread list is empty — open, resolved,
+   * orphaned, everything. Drives the "No open threads yet."
+   * placeholder. */
+  const isThreadListEmpty = createMemo<boolean>(() => {
+    const response = threads();
+    return response === undefined || response.threads.length === 0;
+  });
+  /** Memoised main-list / sideline partition (PR #62 review nit).
+   * `mainListThreadsFor` and `sidelinedThreadsFor` each call
+   * `hasAnchorOnPage` per resolved thread, which walks the DOM
+   * with `document.querySelector('[data-src=...]')`. On a page
+   * with 150 resolved threads, running the partition twice per
+   * render (once for the main list, once for the sideline) was
+   * doing 300 DOM queries per state change. Compute both together,
+   * one DOM walk per resolved thread. */
+  const partition = createMemo<{ readonly main: readonly RailThread[]; readonly sidelined: readonly RailThread[] }>(
+    () => {
+      const response = threads();
+      if (response === undefined) return { main: [], sidelined: [] };
+      const main: RailThread[] = [];
+      const sidelined: RailThread[] = [];
+      for (const thread of response.threads) {
+        if (thread.status === "open") main.push(thread);
+        else if (thread.status === "resolved") {
+          if (hasAnchorOnPage(thread.anchor)) main.push(thread);
+          else sidelined.push(thread);
+        } else sidelined.push(thread);
+      }
+      return { main, sidelined };
+    },
+  );
+  const mainList = (): readonly RailThread[] => partition().main;
+  const sidelinedList = (): readonly RailThread[] => partition().sidelined;
   // Which resolved threads the reviewer has manually toggled on the
   // disclosure button — separate from the unread-driven auto
   // expansion. Per-session, not persisted. Two sets so a click on
@@ -644,10 +789,13 @@ function Rail(): JSX.Element {
   const isResolvedExpanded = (thread: RailThread): boolean => {
     // A manual collapse wins over any default. Then a manual expand
     // wins over the seen-default. Otherwise unread → expanded (issue
-    // #60 point 3); seen → collapsed.
+    // #60 point 3), but only for threads inside
+    // `autoExpandedUnread` — the N most-recent unread threads
+    // (PR #62 review: a fresh browser with 150 unread agent-resolved
+    // threads must not render 150 expanded rows).
     if (collapsedResolved().has(thread.id)) return false;
     if (expandedResolved().has(thread.id)) return true;
-    return isThreadUnread(thread, seenMap());
+    return autoExpandedUnread().has(thread.id);
   };
   const toggleResolvedExpansion = (thread: RailThread): void => {
     const wasExpanded = isResolvedExpanded(thread);
@@ -855,12 +1003,13 @@ function Rail(): JSX.Element {
   const doReopen = async (thread: RailThread): Promise<void> => {
     setError(undefined);
     try {
+      // The reviewer's own reopen is not agent activity, so
+      // `latestAgentActivityOf(thread)` — which is what
+      // `markThreadSeen` records now (PR #62 review) — is
+      // unchanged by the reopen. The old "mark seen at
+      // pre-reopen `updatedAt`" ceremony is gone; the pill was
+      // never going to fire from this action anyway.
       await reopenThread(thread.id);
-      // A reopen is the reviewer's action, so the thread is
-      // no longer unread. Mark seen at the *pre*-reopen version so
-      // the refetch's newer `updatedAt` immediately becomes visible
-      // in the actionable state.
-      markThreadSeen(thread);
       await refetch();
     } catch (cause) {
       setError((cause as Error).message);
@@ -921,14 +1070,23 @@ function Rail(): JSX.Element {
       </Show>
       <header class="revkit-rail__header">
         <h2 class="revkit-rail__title">Comments</h2>
-        <Show when={resolvedThreadsFor(threads()).length > 0}>
+        <Show when={resolvedCount() > 0}>
           <span
             class="revkit-rail__header-resolved-count"
             data-testid="revkit-rail-resolved-count"
-            aria-label={`${resolvedThreadsFor(threads()).length} resolved thread${resolvedThreadsFor(threads()).length === 1 ? "" : "s"}`}
+            aria-label={`${resolvedCount()} resolved thread${resolvedCount() === 1 ? "" : "s"}`}
           >
-            Resolved ({resolvedThreadsFor(threads()).length})
+            Resolved ({resolvedCount()})
           </span>
+        </Show>
+        <Show when={unreadCount() > 0}>
+          <button
+            type="button"
+            class="revkit-rail__mark-all-seen"
+            data-testid="revkit-rail-mark-all-seen"
+            onClick={() => markAllSeen()}
+            aria-label={`Mark all ${unreadCount()} unread agent repl${unreadCount() === 1 ? "y" : "ies"} as seen`}
+          >Mark all seen</button>
         </Show>
         <button
           type="button"
@@ -937,6 +1095,23 @@ function Rail(): JSX.Element {
           aria-label="refresh"
         >refresh</button>
       </header>
+      {/* Single polite live region for the unread count. PR #62
+          review a11y: a screen-reader user should hear one summary
+          ("3 unread agent replies") — not a per-thread barrage of
+          "agent replied — unread" from every pill's role=status. The
+          previous version put role=status on every pill; those pills
+          are now presentational and this region carries the announcement. */}
+      <div
+        class="revkit-rail__unread-live"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="revkit-rail-unread-live"
+      >
+        <Show when={unreadCount() > 0}>
+          {unreadCount()} unread agent repl{unreadCount() === 1 ? "y" : "ies"}
+        </Show>
+      </div>
       <section
         class="revkit-rail__mode"
         aria-label="delivery mode"
@@ -1102,7 +1277,7 @@ function Rail(): JSX.Element {
         })()}
       </Show>
       <ol class="revkit-rail__threads" aria-live="polite" data-testid="revkit-rail-threads">
-        <For each={mainListThreadsFor(threads())}>
+        <For each={mainList()}>
           {(thread: RailThread) => {
             // Issue #60: a resolved thread stays visible in place,
             // collapsed under a disclosure button. An "unread"
@@ -1163,7 +1338,6 @@ function Rail(): JSX.Element {
                   <Show when={unread()}>
                     <span
                       class="revkit-rail__pill revkit-rail__pill--unread"
-                      role="status"
                       data-testid="revkit-rail-unread-pill"
                     >
                       <span class="revkit-rail__pill-icon" aria-hidden="true">*</span>
@@ -1218,6 +1392,22 @@ function Rail(): JSX.Element {
                         {excerptOf(lastComment!.body)}
                       </p>
                     </Show>
+                    {/* PR #62 review nit: reopen is one click from
+                        the collapsed row, not two (expand → reopen).
+                        The button lives inside the summary so a
+                        reviewer scanning a long list of resolved
+                        threads can reopen without changing the row's
+                        rendered height. */}
+                    <button
+                      type="button"
+                      class="revkit-rail__resolved-reopen"
+                      data-testid="revkit-rail-collapsed-reopen"
+                      onClick={(event: MouseEvent): void => {
+                        event.stopPropagation();
+                        void doReopen(thread);
+                      }}
+                      aria-label={`reopen thread on ${thread.anchor.path}`}
+                    >reopen</button>
                   </div>
                 </Show>
                 <div
@@ -1325,10 +1515,10 @@ function Rail(): JSX.Element {
           }}
         </For>
       </ol>
-      <Show when={openThreadsFor(threads()).length === 0 && resolvedThreadsFor(threads()).length === 0}>
+      <Show when={isThreadListEmpty()}>
         <p class="revkit-rail__empty" data-testid="revkit-rail-empty">No open threads yet.</p>
       </Show>
-      <Show when={sidelinedThreadsFor(threads()).length > 0}>
+      <Show when={sidelinedList().length > 0}>
         {/* Sidelined panel (M2 item 5b, story A8 + issue #60).
             Lists threads that can't render inline — either
             orphaned (the re-anchoring pipeline couldn't place
@@ -1345,11 +1535,11 @@ function Rail(): JSX.Element {
           <h3 class="revkit-rail__orphans-title">
             Orphaned &amp; resolved
             <span class="revkit-rail__orphans-count" aria-label="count">
-              {" "}({sidelinedThreadsFor(threads()).length})
+              {" "}({sidelinedList().length})
             </span>
           </h3>
           <ol class="revkit-rail__orphans-list">
-            <For each={sidelinedThreadsFor(threads())}>
+            <For each={sidelinedList()}>
               {(thread: RailThread) => {
                 const unread = (): boolean => isThreadUnread(thread, seenMap());
                 const onThreadInteract = (): void => {
@@ -1389,7 +1579,6 @@ function Rail(): JSX.Element {
                     <Show when={unread()}>
                       <span
                         class="revkit-rail__pill revkit-rail__pill--unread"
-                        role="status"
                         data-testid="revkit-rail-unread-pill"
                       >
                         <span class="revkit-rail__pill-icon" aria-hidden="true">*</span>
@@ -1530,70 +1719,16 @@ function Rail(): JSX.Element {
   );
 }
 
-/** Partition helper — open threads only. Kept for tests that
- * exercise the old shape; the JSX now uses `mainListThreadsFor`
- * which folds open + resolved-with-anchor-on-page together. */
-export function openThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => thread.status === "open");
-}
-
-/** Partition helper — every resolved thread the daemon returned
- * for this page. Used for the "Resolved (N)" count in the header
- * (issue #60). Whether each one sits in the main list or the
- * sidelined section depends on whether its anchor is on the DOM,
- * but the header count is the same either way — a reviewer sees
- * one number and knows the review has that many closed threads. */
-export function resolvedThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => thread.status === "resolved");
-}
-
-/** Partition helper — orphaned threads only. Exported so tests
- * can assert on it directly; the JSX itself uses
- * `sidelinedThreadsFor` which folds orphans and resolved-off-page
- * threads together. See M2 item 5b: an orphan is a thread the
- * re-anchor pipeline could not place on the current revision. */
-export function orphanedThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => thread.status === "orphaned");
-}
-
 /** True when this line-anchored thread's block IS on the page.
  * A resolved thread whose anchor is on-page renders inline
  * collapsed next to its block; one whose anchor is missing
  * (source rebuilt, path deleted, unanchored) is moved into the
- * sidelined panel instead of vanishing. Issue #60. */
+ * sidelined panel instead of vanishing. Issue #60. Used by the
+ * memoized `partition` inside the Rail component, not called from
+ * unit tests — those cover the pure derivations in `unread.ts`. */
 function hasAnchorOnPage(anchor: RailAnchor): boolean {
   if (!isRailLineAnchor(anchor)) return false;
   return findBlockForAnchor(anchor) !== undefined;
-}
-
-/** Threads that render in the MAIN inline list: every open thread
- * plus every resolved thread whose anchor is on-page. Resolved
- * threads render collapsed unless the reviewer has expanded them
- * (or they're currently unread). Ordered like the daemon returned
- * them — `Thread.createdSeq` on the store side. */
-export function mainListThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => {
-    if (thread.status === "open") return true;
-    if (thread.status === "resolved") return hasAnchorOnPage(thread.anchor);
-    return false;
-  });
-}
-
-/** Threads that render in the SIDELINED (orphan / resolved-
- * anchorless) panel: every orphaned thread plus every resolved
- * thread whose anchor is NOT on the current page. The pipeline's
- * orphan reason still rides on the tile. Issue #60. */
-export function sidelinedThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => {
-    if (thread.status === "orphaned") return true;
-    if (thread.status === "resolved") return !hasAnchorOnPage(thread.anchor);
-    return false;
-  });
 }
 
 
