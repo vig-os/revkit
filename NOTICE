@@ -11,26 +11,24 @@ Third-party code
 The @revkit/components package vendors copy-in source from permissive-licensed
 upstreams (see docs/adr/0022-vendored-code-licenses.md). Each vendored drop
 lives in its own subdirectory beside the vendor README, with the upstream
-LICENSE and an UPSTREAM provenance file that records repo, commit, path and
-the declared SPDX license.
+LICENSE file and an UPSTREAM provenance file that records repo, commit, path
+and the declared SPDX license.
 
-The `revkit check` vendored-code guard enforces that each entry below points
-at a real subdirectory, that the LICENSE matches the SPDX-canonical text of
-the declared license, and that the entry's SPDX id equals the UPSTREAM
-license.
+The `revkit check` vendored-code guard enforces every STRUCTURAL rule (UPSTREAM
+key shape, `https://` repo with a host, full-40-char commit SHA, permitted
+SPDX id, layout, symlink refusal, NOTICE format), and requires that each
+entry below points at a real subdirectory whose UPSTREAM `license:` equals
+the entry's SPDX id.
+
+The LICENSE bytes themselves are gated by CODEOWNERS
+(`.github/CODEOWNERS`, `packages/components/vendor/` + `NOTICE` require the
+maintainer's review) rather than by a hand-rolled canonical-text matcher —
+an SPDX-template matcher that admits real upstream LICENSE variance
+(curly quotes, per-line comment prefixes, condensed paragraphs) while
+refusing adversarial appends belongs behind a well-tested library.
 
 Entries take the form (one per line, at the start of the line):
 
     - packages/components/vendor/<pkg> — <upstream URL> (SPDX: <id>)
 
 No third-party code is vendored yet.
-
-================================================================================
-Data files
-================================================================================
-
-The vendored-code guard uses the SPDX license-list-data plain-text templates
-(https://github.com/spdx/license-list-data, distributed under CC0-1.0) as
-its source of truth for canonical LICENSE text. Copies are stored under
-`packages/cli/src/rules/spdx-texts/` (MIT, BSD-2-Clause, BSD-3-Clause,
-Apache-2.0, ISC) and compared after copyright/year normalisation.

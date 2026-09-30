@@ -258,20 +258,6 @@
                   language = "system";
                   pass_filenames = false;
                 };
-                # The SPDX license-list-data plain-text templates
-                # under `packages/cli/src/rules/spdx-texts/` are the
-                # canonical source of truth the vendored-code rule
-                # compares against (ADR-0022). Keep them
-                # byte-for-byte as fetched from
-                # github.com/spdx/license-list-data — the trim /
-                # end-of-file hooks would otherwise silently drift
-                # the copies away from upstream between renewals.
-                trim-trailing-whitespace.excludes = [
-                  "^packages/cli/src/rules/spdx-texts/.*\\.txt$"
-                ];
-                end-of-file-fixer.excludes = [
-                  "^packages/cli/src/rules/spdx-texts/.*\\.txt$"
-                ];
               };
 
             # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the

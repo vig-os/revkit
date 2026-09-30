@@ -6,13 +6,9 @@
 //      be empty when the whole repo is vendored), and `license:`
 //      (exactly one SPDX id from the allowlist — no compound `AND` /
 //      `OR` / `WITH` expressions, no parentheses).
-//   2. `LICENSE` matches the SPDX-canonical text of the declared
-//      license (allowlist: MIT / BSD-2-Clause / BSD-3-Clause /
-//      Apache-2.0 / ISC). Comparison is after normalisation: strip
-//      the copyright line(s), strip year and holder placeholders,
-//      collapse whitespace + punctuation to single spaces, lowercase,
-//      and — for Apache-2.0 — allow the optional appendix by
-//      truncating both sides at `END OF TERMS AND CONDITIONS`.
+//   2. `LICENSE` is a real, non-symlinked file named exactly
+//      `LICENSE` (case-sensitive; `LICENSE.md` / `License` /
+//      `license` / `COPYING` get a rename hint).
 //   3. `NOTICE` at the repo root carries an entry of the form
 //      `- packages/components/vendor/<pkg> — <upstream URL> (SPDX: <id>)`
 //      whose id equals the UPSTREAM `license:`.
@@ -21,23 +17,32 @@
 //      `LICENSE`, `UPSTREAM` and `NOTICE` is a real file
 //      (lstat-checked); package dir names are unscoped.
 //
-// An earlier draft used a phrase heuristic (SPDX header first token,
-// then license-body regex patterns). It was fooled by cases such as
-// a `SPDX-License-Identifier` header of `MIT AND GPL-3.0-only` (took
-// MIT), an MIT text with Commons Clause or "Good, not Evil" appended
-// (matched MIT), a GPL body with an MIT appendix (matched MIT), an
-// AGPL body that mentions "Apache-2.0" (matched Apache-2.0), and a
-// BSD-4-Clause body looking like BSD-3-Clause. Phrase heuristics
-// cannot be made safe against a hostile LICENSE file. The rule now
-// does exact canonical-text comparison against the SPDX-declared
-// license, and refuses anything else.
+// Note on LICENSE-text matching. A first draft used phrase-level
+// heuristics; a second draft normalised both sides and compared
+// against SPDX plain-text templates. Both were bypassable: real
+// upstream LICENSE files vary widely (curly quotes, per-line
+// comment prefixes like `// `, condensed paragraphs), while an
+// adversary can add clauses whose normalised form still contains
+// the canonical text (Commons Clause after `END OF TERMS`, "Good,
+// not Evil", replaced condition lines). Text matching that both
+// admits real fixtures (shadcn-solid, kobalte, react, apache.org
+// LICENSE-2.0.txt, re2, freebsd COPYRIGHT) AND refuses adversarial
+// bodies needs a full SPDX-template matcher (SPDX License Matching
+// Guidelines v2.1 with template `<<var>>` / `<<beginOptional>>`
+// handling). That belongs behind a well-tested library, not a
+// hand-rolled normaliser here.
 //
-// Canonical texts live under `spdx-texts/` as plain files copied from
-// the SPDX license-list-data project (CC0-1.0); NOTICE credits them.
+// So the LICENSE-bytes gate is CODEOWNERS instead:
+// `packages/components/vendor/` requires the maintainer's review on
+// every PR (see `.github/CODEOWNERS`). This rule enforces every
+// STRUCTURAL check (UPSTREAM validity, symlink refusal, layout /
+// naming, NOTICE format + SPDX id echoing UPSTREAM) so the
+// maintainer's review is over a small, known-shaped surface — the
+// bytes themselves. The follow-up is tracked as an issue named in
+// the PR body.
 
 import { lstatSync, readdirSync, readFileSync, type Dirent } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import type { Diagnostic } from "../diagnostics.ts";
 
 /** Repo-relative POSIX path where vendored packages live (ADR-0022). */
@@ -61,76 +66,6 @@ export const ALLOWED_SPDX: readonly string[] = [
 const ALLOWED_SPDX_SET: ReadonlySet<string> = new Set(ALLOWED_SPDX);
 
 // -----------------------------------------------------------------------------
-// SPDX canonical texts
-// -----------------------------------------------------------------------------
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-
-/** Raw SPDX license-list-data plain-text templates for each allowed
- * license. Read once at module init so the per-check comparison stays
- * synchronous and allocation-free. */
-const CANONICAL_LICENSE_TEXT: ReadonlyMap<string, string> = new Map(
-  ALLOWED_SPDX.map((id) => [
-    id,
-    readFileSync(join(HERE, "spdx-texts", `${id}.txt`), "utf8"),
-  ]),
-);
-
-/** Normalise a LICENSE file for canonical comparison:
- *   - for `Apache-2.0`, truncate at `END OF TERMS AND CONDITIONS` so
- *     the optional "How to apply the Apache License" appendix on
- *     either side is ignored;
- *   - drop `Copyright ...` lines and `all rights reserved` lines
- *     (every real upstream personalises these);
- *   - strip `<year>` / `[year]` / `YYYY` / bare 4-digit years and
- *     `<copyright holders>` / `<owner>` / `<name of copyright holder>`
- *     placeholders;
- *   - lowercase everything and reduce runs of non-alphanumeric to a
- *     single space (absorbs punctuation, quote-style and layout
- *     differences without letting extra prose through).
- *
- * The SPDX templates fill the same slots (see `spdx-texts/*.txt`), so
- * a byte-perfect canonical file normalises to the same string as a
- * personalised real-world file — and any extra clause
- * (Commons Clause, "Good, not Evil", the BSD-4 advertising clause,
- * a GPL body next to an MIT header, ...) leaves body text that
- * fails equality. */
-export function normalizeLicense(text: string, spdx: string): string {
-  let t = text;
-  if (spdx === "Apache-2.0") {
-    const marker = "END OF TERMS AND CONDITIONS";
-    const idx = t.toUpperCase().indexOf(marker);
-    if (idx >= 0) t = t.slice(0, idx);
-  }
-  t = t
-    .split(/\r?\n/)
-    .filter((line) => !/copyright/i.test(line))
-    .filter((line) => !/^\s*all rights reserved\.?\s*$/i.test(line))
-    .join("\n");
-  t = t.replace(/\[year\]|<year>|\byyyy\b/gi, "");
-  t = t.replace(/<copyright holders?>|<owner>|<name of copyright holder>/gi, "");
-  t = t.replace(/\b(?:19|20)\d{2}\b/g, "");
-  return t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-/** Pre-normalised canonical texts so per-check comparison is a plain
- * string equality. */
-const CANONICAL_LICENSE_NORMALIZED: ReadonlyMap<string, string> = new Map(
-  [...CANONICAL_LICENSE_TEXT].map(([id, text]) => [id, normalizeLicense(text, id)]),
-);
-
-/** Compare a candidate LICENSE against the canonical text of a
- * declared SPDX id. Returns `true` on exact normalised match. */
-export function licenseTextMatchesDeclared(
-  licenseText: string,
-  declaredSpdx: string,
-): boolean {
-  const canonical = CANONICAL_LICENSE_NORMALIZED.get(declaredSpdx);
-  if (canonical === undefined) return false;
-  return normalizeLicense(licenseText, declaredSpdx) === canonical;
-}
-
-// -----------------------------------------------------------------------------
 // UPSTREAM parser
 // -----------------------------------------------------------------------------
 
@@ -139,9 +74,7 @@ const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 const SPDX_ID_RE = /^[A-Za-z0-9.\-+]+$/;
 /** Compound SPDX expression markers — bare AND/OR/WITH tokens or
  * parentheses. `AND` / `OR` / `WITH` are matched case-insensitively
- * with word boundaries so a plain word like "orchard" or "sword"
- * inside a `path:` value isn't caught (paths don't run through this
- * regex, so this is defence in depth). */
+ * with word boundaries. */
 const COMPOUND_SPDX_RE = /\b(?:AND|OR|WITH)\b|[()]/i;
 
 export interface UpstreamProblem {
@@ -261,9 +194,7 @@ export interface NoticeEntry {
 }
 
 /** Extract every NOTICE bullet entry as `{name: {spdx}}`. If the same
- * package appears twice, the first entry wins (a duplicate would be
- * reported by a separate check upstream if we wanted; the current
- * scope keeps it silent). */
+ * package appears twice, the first entry wins. */
 export function parseNoticeEntries(noticeText: string): Map<string, NoticeEntry> {
   const entries = new Map<string, NoticeEntry>();
   const re = new RegExp(NOTICE_ENTRY_RE.source, NOTICE_ENTRY_RE.flags);
@@ -475,18 +406,7 @@ export function checkVendoredCode(repoRoot: string): Diagnostic[] {
     const pkgRel = `${VENDOR_DIR}/${pkg}`;
     const pkgAbs = join(vendorAbs, pkg);
     const upstreamResult = readUpstream(pkgAbs, pkgRel, findings);
-    const licenseText = readLicense(pkgAbs, pkgRel, findings);
-
-    if (licenseText !== null && upstreamResult !== null && upstreamResult.license !== null) {
-      if (!licenseTextMatchesDeclared(licenseText, upstreamResult.license)) {
-        findings.push({
-          file: `${pkgRel}/LICENSE`,
-          line: 0,
-          rule: "vendored-code",
-          message: `LICENSE does not match the SPDX-canonical text of the declared license '${upstreamResult.license}'. Extra clauses (Commons Clause, "Good, not Evil", advertising, ...) and body mismatches (a different license entirely, or a body-plus-appendix that is not the Apache-2.0 "How to apply" appendix) all count. Copy the LICENSE from https://github.com/spdx/license-list-data if upstream drifted from the canonical text.`,
-        });
-      }
-    }
+    checkLicensePresent(pkgAbs, pkgRel, findings);
 
     const entry = noticeEntries.get(pkg);
     if (entry === undefined) {
@@ -558,8 +478,8 @@ function readUpstream(
     });
     return null;
   }
-  // Case-sensitive filename check: a `upstream` file (lowercase)
-  // must not satisfy the guard on macOS.
+  // Case-sensitive filename check: a lowercase `upstream` must not
+  // satisfy the guard on macOS.
   if (!siblingHasName(pkgAbs, "UPSTREAM")) {
     findings.push({
       file: `${pkgRel}/`,
@@ -602,11 +522,11 @@ function readUpstream(
   return result;
 }
 
-function readLicense(
+function checkLicensePresent(
   pkgAbs: string,
   pkgRel: string,
   findings: Diagnostic[],
-): string | null {
+): void {
   const licenseAbs = join(pkgAbs, "LICENSE");
   let stat;
   try {
@@ -616,8 +536,6 @@ function readLicense(
   }
   const nameOnDisk = siblingHasName(pkgAbs, "LICENSE");
   if (stat === null || !nameOnDisk) {
-    // Missing (or present only under a different-case name). The
-    // suggestion looks at case-sensitive sibling names.
     const rename = suggestLicenseRename(pkgAbs);
     const hint = rename !== null
       ? ` — a '${rename}' exists; rename it to 'LICENSE' (no extension) with the upstream file's bytes.`
@@ -628,7 +546,7 @@ function readLicense(
       rule: "vendored-code",
       message: `missing upstream LICENSE file (case-sensitive; the file must be named exactly 'LICENSE')${hint}`,
     });
-    return null;
+    return;
   }
   if (stat.isSymbolicLink()) {
     findings.push({
@@ -637,7 +555,7 @@ function readLicense(
       rule: "vendored-code",
       message: "LICENSE is a symlink — refused (it must be a real copy of the upstream LICENSE; a symlink to the repo's own LICENSE would silently drop upstream attribution).",
     });
-    return null;
+    return;
   }
   if (!stat.isFile()) {
     findings.push({
@@ -646,17 +564,8 @@ function readLicense(
       rule: "vendored-code",
       message: "LICENSE is not a regular file.",
     });
-    return null;
   }
-  try {
-    return readFileSync(licenseAbs, "utf8");
-  } catch (error) {
-    findings.push({
-      file: `${pkgRel}/LICENSE`,
-      line: 0,
-      rule: "vendored-code",
-      message: `cannot read LICENSE: ${(error as Error).message}.`,
-    });
-    return null;
-  }
+  // Present + real. Bytes are gated by CODEOWNERS review; this rule
+  // deliberately does NOT try to canonicalise / match against SPDX
+  // templates. See the header comment.
 }
