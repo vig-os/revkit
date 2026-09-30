@@ -190,6 +190,53 @@ describe("reduce — thread.orphaned", () => {
     expect(threads.get("th-1")?.updatedAt).toBe(t(2));
   });
 
+  test("carries the pipeline's `reason` onto Thread.orphanReason (PR #45 round-2 nit)", () => {
+    // The rail must render the pipeline's own explanation, not a
+    // synthesised sentence. The reducer plumbs `reason` from the
+    // event onto the derived Thread view so a rail refetch sees
+    // it verbatim.
+    const orphan: ReviewEvent = {
+      seq: 3,
+      ts: t(2),
+      actor: agentActor,
+      kind: "thread.orphaned",
+      threadId: "th-1",
+      revision: "e".repeat(64),
+      reason: "block deleted; no move detected.",
+    };
+    const threads = reduce([log[0]!, orphan]);
+    const thread = threads.get("th-1");
+    expect(thread?.status).toBe("orphaned");
+    expect(thread?.orphanReason).toBe("block deleted; no move detected.");
+  });
+
+  test("re-anchor un-orphans and CLEARS the stale orphanReason (mutation guard)", () => {
+    const orphan: ReviewEvent = {
+      seq: 3,
+      ts: t(2),
+      actor: agentActor,
+      kind: "thread.orphaned",
+      threadId: "th-1",
+      revision: "e".repeat(64),
+      reason: "block deleted; no move detected.",
+    };
+    const rediscovered: ReviewEvent = {
+      seq: 4,
+      ts: t(3),
+      actor: agentActor,
+      kind: "thread.reanchored",
+      threadId: "th-1",
+      anchor: { ...anchor, startLine: 44, endLine: 48, revision: "d".repeat(64) },
+      method: "fuzzy",
+      score: 0.87,
+    };
+    const threads = reduce([log[0]!, orphan, rediscovered]);
+    const thread = threads.get("th-1");
+    expect(thread?.status).toBe("open");
+    // Reason must NOT linger after un-orphan — the block came back.
+    expect(thread?.orphanReason).toBeUndefined();
+  });
+
   test("resolved thread that emits orphaned (byzantine slice): status stays resolved (defensive)", () => {
     // The append-side validator refuses this transition, so a well-
     // formed log never carries it — the reducer's guard is the safety

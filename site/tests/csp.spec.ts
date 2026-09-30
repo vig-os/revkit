@@ -309,7 +309,9 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
     // shortcut `/`), type a word we know is in the docs, and
     // assert at least one result appears — proving that:
     //   - `/pagefind/pagefind.js` loaded under `script-src`
-    //   - Pagefind's Worker spawned under `worker-src 'self'`
+    //   - Pagefind's Worker spawned under the path-scoped
+    //     `worker-src http://…/pagefind/` (M2 item 5b: no other Worker
+    //     src can spawn)
     //   - The .pagefind WASM instantiated under `'wasm-unsafe-eval'`
     //   - The .pf_meta / .pf_index / .pf_fragment blobs fetched
     //     under `connect-src 'self'` and served with an
@@ -473,7 +475,7 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
         "img-src 'self' data: https://avatars.githubusercontent.com; " +
         "font-src 'self'; " +
         `connect-src 'self' ws://127.0.0.1:${port} ws://localhost:${port}; ` +
-        "worker-src 'self'; " +
+        `worker-src http://127.0.0.1:${port}/pagefind/ http://localhost:${port}/pagefind/; ` +
         "frame-ancestors 'none'; " +
         "base-uri 'none'; " +
         "form-action 'self'; " +

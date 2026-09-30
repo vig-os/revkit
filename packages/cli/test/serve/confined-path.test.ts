@@ -115,6 +115,56 @@ describe("resolveWithinRoot", () => {
     const result = resolveWithinRoot(root, "/foo..bar.html");
     expect(result.ok).toBe(true);
   });
+
+  test("refuses a dot-directory (e.g. /.revkit/serve.json) — M2 item 5b, #41 carry-over", () => {
+    // The daemon must never serve `/.revkit/...` or `/.git/...`
+    // trees, even accidentally: dot-scoped directories carry
+    // machine state (session tokens, sqlite files) and version
+    // history (branch names, staged diffs). A stray `text/html`
+    // MIME on such a file would otherwise let a page fetch it
+    // over loopback and read it. The refusal must fire on the
+    // segment shape ALONE — no filesystem probe needed.
+    mkdirp(join(root, ".revkit"));
+    writeFileSync(join(root, ".revkit", "serve.json"), '{"secret": true}');
+    const result = resolveWithinRoot(root, "/.revkit/serve.json");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // Not-found is the right family: nothing exposed, nothing
+      // leaked. A distinct kind for "dot" would let a probe
+      // distinguish present-but-dot from truly-absent — we don't
+      // want that. The message names the mechanism.
+      expect(result.kind).toBe("not-found");
+      expect(result.message).toContain("dot");
+    }
+  });
+
+  test("refuses a dotfile (e.g. /.env)", () => {
+    // A dotfile at the root — a stray `.env` copied into `dist/`
+    // by a misconfigured build. Same refusal shape as a dot-dir.
+    writeFileSync(join(root, ".env"), "TOKEN=hunter2");
+    const result = resolveWithinRoot(root, "/.env");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.kind).toBe("not-found");
+  });
+
+  test("refuses a nested dot-directory (e.g. /docs/.git/HEAD)", () => {
+    // The refusal walks EVERY segment, not just the first. A
+    // dot-directory buried inside a non-dot parent is still
+    // refused.
+    mkdirp(join(root, "docs", ".git"));
+    writeFileSync(join(root, "docs", ".git", "HEAD"), "ref: refs/heads/main");
+    const result = resolveWithinRoot(root, "/docs/.git/HEAD");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.kind).toBe("not-found");
+  });
+
+  test("bare '.' segment (URL '/./index.html') stays legal — normalise drops it", () => {
+    // Sanity: a lone `.` is not a dot-directory. A legitimate URL
+    // containing `/./` (older Astro / Starlight builds emit these)
+    // must still resolve.
+    const result = resolveWithinRoot(root, "/./index.html");
+    expect(result.ok).toBe(true);
+  });
 });
 
 // A tiny "mkdir -p" wrapper used by the fixtures.

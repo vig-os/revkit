@@ -333,11 +333,30 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     "comment.replied",
     "thread.resolved",
     "thread.reopened",
+    // M2 item 5b: the daemon's re-anchoring pipeline emits
+    // `thread.reanchored` and `thread.orphaned` events. The channel
+    // client passes them through so the agent knows a thread it was
+    // tracking moved to a new position or lost its anchor — a short
+    // notice is enough for the agent to update its own state or
+    // reopen the thread with a diagnostic.
+    "thread.reanchored",
+    "thread.orphaned",
   ]);
   if (!relevantKinds.has(kind)) return undefined;
   const actor = event.actor as { readonly kind?: string; readonly id?: string; readonly displayName?: string } | undefined;
   if (actor === undefined) return undefined;
-  if (actor.kind === "agent") return undefined;
+  // The daemon's re-anchor actor is `{ kind: "agent", id: "revkit-reanchor" }`
+  // (see `reanchor-daemon.ts`). Its events are the ONE agent-kind
+  // event we surface to the channel — a human is not producing
+  // re-anchor events, so the general "hide agent echoes" rule would
+  // otherwise drop them. For non-reanchor kinds, keep the original
+  // "skip agent" behaviour (Claude does not need to hear about its
+  // own reply landing).
+  const isReanchorSystemEvent =
+    (kind === "thread.reanchored" || kind === "thread.orphaned") &&
+    actor.kind === "agent" &&
+    actor.id === "revkit-reanchor";
+  if (!isReanchorSystemEvent && actor.kind === "agent") return undefined;
   const threadId = typeof event.threadId === "string" ? event.threadId : undefined;
   const anchor = event.anchor as
     | { readonly path?: string; readonly startLine?: number; readonly endLine?: number }
@@ -393,6 +412,37 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     case "thread.reopened":
       content = `Thread ${safeThreadId} reopened by ${safeActor}.`;
       break;
+    case "thread.reanchored": {
+      // The pipeline may re-anchor a previously-orphaned thread
+      // (un-orphan) OR move an open thread to a new position. Both
+      // shapes carry a fresh anchor; the difference is context the
+      // channel client doesn't have here (would need to look up the
+      // previous status). Compose a single message that names the
+      // new location — the agent can react regardless.
+      const rawMethod = (event as unknown as { method?: unknown }).method;
+      const method =
+        typeof rawMethod === "string" ? escapeContentFragment(rawMethod) : "quote-exact";
+      content =
+        `Thread ${safeThreadId} re-anchored (${method}) — now at ` +
+        `${safePath}:${startLine ?? "?"}-${endLine ?? "?"}.`;
+      break;
+    }
+    case "thread.orphaned": {
+      // The pipeline could not place the thread on the current
+      // revision. The reason is untrusted (composed from the diff
+      // pipeline's own strings, but it lands in a channel content
+      // string that Claude Code wraps in a tag). Escape it.
+      const rawReason = (event as unknown as { reason?: unknown }).reason;
+      const reason =
+        typeof rawReason === "string"
+          ? escapeContentFragment(rawReason)
+          : "quoted text no longer at its recorded location";
+      put("kind", "reanchor_orphan");
+      content =
+        `Thread ${safeThreadId} orphaned — ${reason}. ` +
+        `The thread is kept and remains repliable / resolvable.`;
+      break;
+    }
     default:
       return undefined;
   }
