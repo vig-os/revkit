@@ -259,9 +259,9 @@ export type ReviewSubmissionEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
 /** Snapshot for a thread — one of three shapes (see
  * `mapThreadsToEvents` docstring). `live` means "use head";
  * `own-commit` provides the file's content at the thread's
- * originating commit (RIGHT-outdated) or the base commit
- * (LEFT-side); `unavailable` triggers the placeholder-anchor +
- * orphan path with the given reason. */
+ * originating commit (RIGHT-outdated) or the LEFT-side base
+ * commit (parent of `originalCommit`); `unavailable` triggers
+ * the honest-orphan path (see below) with the given reason. */
 export type ThreadSnapshot =
   | { readonly kind: "live" }
   | {
@@ -270,7 +270,29 @@ export type ThreadSnapshot =
       readonly revision: string;
       readonly oid: string;
     }
-  | { readonly kind: "unavailable"; readonly reason: string };
+  | { readonly kind: "unavailable"; readonly reason: SnapshotUnavailableReason };
+
+/** Machine-readable reasons for an unavailable snapshot. PR-43
+ * round-4 nit: `binary` and `truncated` are distinct from
+ * `not-found`; the daemon may show them differently. */
+export type SnapshotUnavailableReason =
+  | "not-found"          // the git object at the expression isn't in the repo any more
+  | "not-a-blob"         // the object exists but isn't a Blob (tree, tag, commit)
+  | "binary"             // GitHub reports the blob is binary — no text to anchor
+  | "truncated"          // GitHub declined to send the text (too large)
+  | "no-text"            // Blob returned but `text` was not a string
+  | "no-original-commit" // the comment carries no `originalCommit.oid`
+  | "no-parent"          // (LEFT-side) `originalCommit^` doesn't exist (root commit)
+  | "no-snapshot"        // resolveSnapshot returned nothing for the thread
+  | "mixed-sides"        // the range straddles LEFT+RIGHT; one blob can't hold both
+  | "fetch-failed";      // any network / GitHub error
+
+/** Return type for `GitHubAdapter.fetchBlobText`. Directly re-uses
+ * `SnapshotUnavailableReason` for the failure branch so a caller
+ * can propagate the exact reason into a `ThreadSnapshot`. */
+export type FetchBlobTextResult =
+  | { readonly kind: "text"; readonly text: string }
+  | { readonly kind: Exclude<SnapshotUnavailableReason, "no-original-commit" | "no-parent" | "no-snapshot" | "mixed-sides"> };
 
 /** Options for `submitReview`. `body` is the top-level review message. */
 export interface SubmitReviewInput {
@@ -701,7 +723,14 @@ export class GitHubAdapter {
         // a different head, so their line numbers don't match. The
         // caller (M3 daemon) decides whether to re-anchor the
         // drafts or ask the user to discard.
-        if (review.commitSha !== null && review.commitSha !== input.commitOid) {
+        //
+        // PR-43 round-4 nit: `commitSha === null` is treated the
+        // same as a mismatch. Fail-open under null (return
+        // `reused`) let a review with no known pinned commit slide
+        // through, hiding a genuine drift. `actualCommitOid: null`
+        // in the stale result flags the ambiguity so the caller
+        // (which asked for a SPECIFIC head) can still discard.
+        if (review.commitSha !== input.commitOid) {
           return {
             kind: "stale",
             review,
@@ -946,7 +975,7 @@ export class GitHubAdapter {
    * later `prepareReanchor(oldSource, newSource)` can run with
    * both texts in hand.
    */
-  static mapThreadsToEvents(input: {
+  static async mapThreadsToEvents(input: {
     readonly threads: readonly GhReviewThread[];
     readonly threadIdOf: (thread: GhReviewThread) => string;
     readonly commentIdOf: (thread: GhReviewThread, comment: GhReviewComment) => string;
@@ -966,14 +995,14 @@ export class GitHubAdapter {
      * `headSourceOf` is unavailable. If missing AND `headSourceOf`
      * doesn't return content, the thread is orphaned. */
     readonly quoteFor?: (thread: GhReviewThread) => { exact: string; prefix: string; suffix: string };
-  }): {
+  }): Promise<{
     readonly events: ReviewEventInput[];
     readonly orphanedThreadIds: readonly string[];
     /** Map of `revision → source text` — the daemon persists these
      * so a subsequent re-anchor has the OLD source at hand
      * (`prepareReanchor(oldSource, newSource)`). */
     readonly snapshots: Map<string, string>;
-  } {
+  }> {
     const events: ReviewEventInput[] = [];
     const orphaned: string[] = [];
     const snapshots = new Map<string, string>();
@@ -1003,23 +1032,45 @@ export class GitHubAdapter {
       let willOrphan = mapResult.kind === "orphan";
       let orphanReason: string | undefined =
         mapResult.kind === "orphan" ? mapResult.reason : undefined;
+      // "unavailable" forces orphan regardless of `isResolved`.
+      // PR-43 round-4 Blocker: a resolved+unavailable thread used
+      // to keep the head-revision placeholder and mark `resolved`,
+      // which pins it at wrong head lines with revision === head
+      // (the re-anchor pipeline's identity short-circuit then
+      // freezes it there). Orphaning wins over resolved when we
+      // don't have a trustworthy anchor; the resolved-on-GitHub
+      // fact is preserved in the orphan reason.
+      let forceOrphan = false;
 
       if (snapshot.kind === "unavailable") {
-        // Fall back to a head-side placeholder anchor and orphan.
-        const headRev = input.headRevisionOf(thread.path);
-        if (headRev === undefined) continue; // caller must log this
+        // NO head revision, NO head-relative lines. Use a
+        // deterministic non-file revision (SHA-256 of the FIRST
+        // COMMENT'S body prefixed with a namespace tag) so the
+        // anchor validates, is stable across imports, and cannot
+        // possibly collide with a real file's LF-content hash.
+        // Lines: `originalLine` (the coordinates GitHub recorded
+        // at comment time). The immediate `thread.orphaned`
+        // makes clear these lines are NOT authoritative on head.
         const endLine = thread.originalLine ?? thread.line ?? 1;
         const startLine = thread.originalStartLine ?? thread.startLine ?? endLine;
+        const revision = await revisionOf(
+          `<revkit:unanchored-import>\n<thread:${thread.id}>\n${firstComment.body}`,
+        );
         anchor = {
           path: thread.path,
           startLine,
           endLine,
           quote: input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body),
-          revision: headRev,
-          ...(input.headCommitOid !== undefined ? { commit: input.headCommitOid } : {}),
+          revision,
+          // NO `commit` — nothing to pin to.
         };
         willOrphan = true;
-        orphanReason = snapshot.reason;
+        forceOrphan = true;
+        // If GitHub had resolved it, preserve the fact in the
+        // reason string; the terminal event is still `orphaned`.
+        orphanReason = thread.isResolved
+          ? `${snapshot.reason};was-resolved-on-github`
+          : snapshot.reason;
       } else if (snapshot.kind === "own-commit") {
         // The authoritative branch: anchor in the coordinates of
         // the thread's own commit, with the quote cut from THAT
@@ -1031,20 +1082,25 @@ export class GitHubAdapter {
         // A comment can point at a line that no longer exists in
         // the file at its own commit (rare — GitHub is authoritative
         // on originalLine — but defensively check). If the quote's
-        // exact is empty, orphan.
+        // exact is empty, orphan without the head-side placeholder
+        // (same principle as the unavailable branch: no lying
+        // about head).
         if (quote.exact.length === 0) {
-          const headRev = input.headRevisionOf(thread.path);
-          if (headRev === undefined) continue;
+          const revision = await revisionOf(
+            `<revkit:unanchored-import>\n<thread:${thread.id}>\n${firstComment.body}`,
+          );
           anchor = {
             path: thread.path,
             startLine,
             endLine,
             quote: input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body),
-            revision: headRev,
-            ...(input.headCommitOid !== undefined ? { commit: input.headCommitOid } : {}),
+            revision,
           };
           willOrphan = true;
-          orphanReason = "empty-original-quote";
+          forceOrphan = true;
+          orphanReason = thread.isResolved
+            ? "empty-original-quote;was-resolved-on-github"
+            : "empty-original-quote";
         } else {
           const revision = snapshot.revision;
           snapshots.set(revision, snapshot.content);
@@ -1122,10 +1178,26 @@ export class GitHubAdapter {
         });
       }
 
-      // Terminal transition — resolved wins over orphan (human
-      // decision > machine classification). The validator refuses
-      // both from `open`.
-      if (thread.isResolved) {
+      // Terminal transition. Rules (PR-43 round-4):
+      //   - `forceOrphan` (snapshot unavailable / empty own-commit
+      //     quote): ALWAYS emit `thread.orphaned`, never
+      //     `thread.resolved`. The resolved-on-GitHub fact is
+      //     preserved in the orphan reason. This is what stops a
+      //     resolved+outdated+unavailable thread from freezing at
+      //     head lines forever.
+      //   - Otherwise resolved wins over willOrphan (human
+      //     decision > machine classification). Validator refuses
+      //     both from `open`, so only one may fire.
+      if (forceOrphan) {
+        orphaned.push(threadId);
+        events.push({
+          kind: "thread.orphaned",
+          actor: firstAuthor,
+          threadId,
+          revision: anchor.revision,
+          reason: orphanReason,
+        });
+      } else if (thread.isResolved) {
         const actor: Author =
           thread.resolvedByLogin !== null
             ? { kind: "gh-user", id: thread.resolvedByLogin, displayName: thread.resolvedByLogin }
@@ -1153,11 +1225,20 @@ export class GitHubAdapter {
   /**
    * Async convenience over `mapThreadsToEvents`: fetches each
    * thread's OWN-COMMIT content via GraphQL `object(expression:
-   * "oid:path")` and hands the results to the pure `mapThreadsToEvents`.
+   * "<oid>:<path>")`, and — for LEFT-side threads — the LEFT-side
+   * content from the parent of `originalCommit`
+   * (`<oid>^:<oldPath>`, git rev-parse syntax). Hands the results
+   * to the pure `mapThreadsToEvents`.
    *
-   * Callers that need custom snapshot resolution (a local worktree,
-   * a cached blob store) skip this and call `mapThreadsToEvents`
-   * directly.
+   * `oldPathOf(currentPath)` returns the file's name BEFORE the
+   * rename (a `previousFilename` from `listPullRequestFiles`) so
+   * a LEFT-side thread on a renamed file reads the file at its
+   * original name in the parent commit. When the callback is
+   * absent or returns undefined, the current path is used.
+   *
+   * Callers that need custom snapshot resolution (a local
+   * worktree, a cached blob store) skip this and call
+   * `mapThreadsToEvents` directly.
    */
   async importThreads(input: {
     readonly pr: PrRef;
@@ -1167,15 +1248,20 @@ export class GitHubAdapter {
     readonly headRevisionOf: (path: string) => string | undefined;
     readonly headSourceOf?: (path: string) => string | undefined;
     readonly headCommitOid?: string;
+    /** Return the OLD path for a currently-renamed file (from
+     * `PrFile.previousFilename`), so a LEFT-side thread reads the
+     * parent commit at its original name. */
+    readonly oldPathOf?: (currentPath: string) => string | undefined;
     readonly quoteFor?: (thread: GhReviewThread) => { exact: string; prefix: string; suffix: string };
   }): Promise<ReturnType<typeof GitHubAdapter.mapThreadsToEvents>> {
-    // Pre-fetch every thread's snapshot, deduping by (oid, path).
+    // Pre-fetch every thread's snapshot, deduping by (expression).
     const cache = new Map<string, ThreadSnapshot>();
     const snapshotFor = new Map<string, ThreadSnapshot>();
     for (const thread of input.threads) {
-      const key = `${thread.id}`;
+      const key = thread.id;
       const first = thread.comments[0];
       if (first === undefined) continue;
+
       // Live RIGHT thread: no fetch. Signalled by `line !== null`
       // AND diffSide==="RIGHT" AND subjectType==="LINE" AND not outdated.
       const isLive =
@@ -1183,34 +1269,73 @@ export class GitHubAdapter {
         thread.diffSide === "RIGHT" &&
         thread.subjectType === "LINE" &&
         !thread.isOutdated &&
-        thread.startDiffSide !== "LEFT";
+        (thread.startDiffSide === null || thread.startDiffSide === "RIGHT");
       if (isLive) {
         snapshotFor.set(key, { kind: "live" });
         continue;
       }
-      // Own-commit fetch. For RIGHT-side threads (including
-      // outdated) we use originalCommit.oid; for LEFT-side we
-      // fetch base-commit content at path.
-      const oid =
-        thread.diffSide === "LEFT" ? undefined /* base fallback below */ : first.originalCommitOid ?? undefined;
-      const cacheKey = `${oid ?? "BASE"}:${thread.path}`;
-      let snap = cache.get(cacheKey);
+
+      // Mixed-side threads (start on one side, end on the other):
+      // no single blob can hold the whole range. Orphan with a
+      // typed reason (PR-43 round-4 nit).
+      if (thread.startDiffSide !== null && thread.startDiffSide !== thread.diffSide) {
+        snapshotFor.set(key, { kind: "unavailable", reason: "mixed-sides" });
+        continue;
+      }
+
+      // File-subject threads: no line anchor to fetch content for.
+      // Fall through to the orphan-honest path in mapThreadsToEvents.
+      if (thread.subjectType === "FILE") {
+        snapshotFor.set(key, { kind: "unavailable", reason: "no-snapshot" });
+        continue;
+      }
+
+      const originalOid = first.originalCommitOid ?? null;
+      if (originalOid === null) {
+        snapshotFor.set(key, { kind: "unavailable", reason: "no-original-commit" });
+        continue;
+      }
+
+      // Build the expression for the blob to fetch. RIGHT-side
+      // uses the form OID+colon+path. LEFT-side uses the parent
+      // form OID+caret+colon+oldPath (parent of the commit the
+      // comment was made against, at the file's OLD name if the
+      // file was renamed in the PR).
+      let expression: string;
+      let referencedOid: string;
+      if (thread.diffSide === "LEFT") {
+        const oldPath = input.oldPathOf?.(thread.path) ?? thread.path;
+        expression = `${originalOid}^:${oldPath}`;
+        // For LEFT the recorded `oid` is the parent — resolved
+        // server-side, so we tag the snapshot with the syntactic
+        // form for clarity. The daemon persists snapshot content
+        // by REVISION (a SHA-256), so a human-readable oid here
+        // is diagnostic only.
+        referencedOid = `${originalOid}^`;
+      } else {
+        expression = `${originalOid}:${thread.path}`;
+        referencedOid = originalOid;
+      }
+
+      let snap = cache.get(expression);
       if (snap === undefined) {
         try {
-          const content =
-            oid !== undefined
-              ? await this.fetchBlobText({ owner: input.pr.owner, repo: input.pr.repo, oid, path: thread.path })
-              : null; // LEFT: caller-provided base commit content resolution
-          if (content === null) {
-            snap = { kind: "unavailable", reason: oid === undefined ? "left-side-no-base-oid" : "not-found" };
+          const result = await this.fetchBlobText({
+            owner: input.pr.owner,
+            repo: input.pr.repo,
+            expression,
+          });
+          if (result.kind === "text") {
+            const rev = await revisionOf(result.text);
+            snap = { kind: "own-commit", content: result.text, oid: referencedOid, revision: rev };
           } else {
-            const rev = await revisionOf(content);
-            snap = { kind: "own-commit", content, oid: oid!, revision: rev };
+            snap = { kind: "unavailable", reason: result.kind };
           }
-        } catch (err) {
-          snap = { kind: "unavailable", reason: `fetch-failed: ${(err as Error).message}` };
+        } catch {
+          // Any network / GitHub error → typed unavailable reason.
+          snap = { kind: "unavailable", reason: "fetch-failed" };
         }
-        cache.set(cacheKey, snap);
+        cache.set(expression, snap);
       }
       snapshotFor.set(key, snap);
     }
@@ -1228,36 +1353,30 @@ export class GitHubAdapter {
 
   /**
    * Fetch a blob's text content via GraphQL
-   * `repository.object(expression: "<oid>:<path>")`. Returns
-   * `null` when the object is missing, binary (isBinary) or
-   * truncated (isTruncated) — treated the same as "not text
-   * we can anchor to".
-   *
-   * Path is escaped for the expression string. `oid` is a git SHA
-   * (40-hex or 64-hex).
+   * `repository.object(expression: "<oid>:<path>")` (or any git
+   * rev-parse expression, e.g. `<oid>^:<path>` for the parent
+   * commit's version of the file — used by LEFT-side thread
+   * import). Returns a discriminated result so the caller can
+   * distinguish "the blob is binary" from "the object isn't in the
+   * repo any more" (PR-43 round-4 nit).
    */
   async fetchBlobText(input: {
     readonly owner: string;
     readonly repo: string;
-    readonly oid: string;
-    readonly path: string;
-  }): Promise<string | null> {
-    // The expression string is <oid>:<path>. Path is passed as
-    // part of a string literal — GraphQL variables don't reach the
-    // parser here, so it goes on the variables side of the
-    // expression and gets concatenated server-side. Use variables
-    // to avoid injection.
+    readonly expression: string;
+  }): Promise<FetchBlobTextResult> {
     const resp = await this.graphqlWithRetry<BlobTextGraphqlResponse>(FETCH_BLOB_TEXT_QUERY, {
       owner: input.owner,
       name: input.repo,
-      expression: `${input.oid}:${input.path}`,
+      expression: input.expression,
     });
     const object = resp.data.repository?.object ?? null;
-    if (object === null || object.__typename !== "Blob") return null;
-    if (object.isBinary === true) return null;
-    if (object.isTruncated === true) return null;
-    if (typeof object.text !== "string") return null;
-    return object.text;
+    if (object === null) return { kind: "not-found" };
+    if (object.__typename !== "Blob") return { kind: "not-a-blob" };
+    if (object.isBinary === true) return { kind: "binary" };
+    if (object.isTruncated === true) return { kind: "truncated" };
+    if (typeof object.text !== "string") return { kind: "no-text" };
+    return { kind: "text", text: object.text };
   }
 
   // --- Internals --- //

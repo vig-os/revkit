@@ -27,7 +27,7 @@ import {
 
 /** Stamp events with monotonic seq/ts so the reducer accepts them. */
 function stampEvents(
-  inputs: readonly ReturnType<typeof GitHubAdapter.mapThreadsToEvents>["events"][number][],
+  inputs: readonly Awaited<ReturnType<typeof GitHubAdapter.mapThreadsToEvents>>["events"][number][],
 ): readonly ReviewEvent[] {
   return inputs.map(
     (ev, i) =>
@@ -88,7 +88,7 @@ describe("mapThreadsToEvents — live RIGHT threads", () => {
   test("live RIGHT thread uses head revision, head-side quote, and does NOT emit thread.orphaned", async () => {
     // Ensure REV precomputed.
     if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
-    const { events, orphanedThreadIds, snapshots } = GitHubAdapter.mapThreadsToEvents({
+    const { events, orphanedThreadIds, snapshots } = await GitHubAdapter.mapThreadsToEvents({
       threads: [thread()],
       threadIdOf: (t) => `t-${t.id}`,
       commentIdOf: (_t, c) => `c-${c.databaseId}`,
@@ -128,7 +128,7 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
       originalLine: 3,
       isOutdated: true,
     });
-    const { events, orphanedThreadIds, snapshots } = GitHubAdapter.mapThreadsToEvents({
+    const { events, orphanedThreadIds, snapshots } = await GitHubAdapter.mapThreadsToEvents({
       threads: [t],
       threadIdOf: () => "T-outdated",
       commentIdOf: (_t, c) => `C${c.databaseId}`,
@@ -170,7 +170,7 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
     if (ORIGINAL_REV === "") ORIGINAL_REV = await revisionOf(ORIGINAL_SOURCE);
     if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
     const t = thread({ diffSide: "LEFT", originalLine: 2 });
-    const { events, orphanedThreadIds } = GitHubAdapter.mapThreadsToEvents({
+    const { events, orphanedThreadIds } = await GitHubAdapter.mapThreadsToEvents({
       threads: [t],
       threadIdOf: () => "T-left",
       commentIdOf: (_t, c) => `C${c.databaseId}`,
@@ -202,7 +202,7 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
       isOutdated: true,
       resolvedByLogin: "carol",
     });
-    const { events } = GitHubAdapter.mapThreadsToEvents({
+    const { events } = await GitHubAdapter.mapThreadsToEvents({
       threads: [t],
       threadIdOf: () => "T-both",
       commentIdOf: (_t, c) => `C${c.databaseId}`,
@@ -237,27 +237,374 @@ describe("mapThreadsToEvents — snapshot unavailable", () => {
   test("unavailable snapshot uses head-revision placeholder + orphans with reason", async () => {
     if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
     const t = thread({ isOutdated: true, line: null, originalLine: 3 });
-    const { events, orphanedThreadIds } = GitHubAdapter.mapThreadsToEvents({
+    const { events, orphanedThreadIds } = await GitHubAdapter.mapThreadsToEvents({
       threads: [t],
       threadIdOf: () => "T-un",
       commentIdOf: (_t, c) => `C${c.databaseId}`,
       headRevisionOf: () => HEAD_REV,
       headSourceOf: () => HEAD_SOURCE,
-      resolveSnapshot: () => ({ kind: "unavailable", reason: "deleted" }),
+      resolveSnapshot: () => ({ kind: "unavailable", reason: "not-found" }),
     });
     expect(orphanedThreadIds).toEqual(["T-un"]);
     const orphan = events.find((e) => e.kind === "thread.orphaned");
     if (orphan?.kind !== "thread.orphaned") throw new Error("kind");
-    expect(orphan.reason).toBe("deleted");
-    // Anchor still schema-valid (uses head revision as placeholder).
+    expect(orphan.reason).toBe("not-found");
+    // BLOCKER (PR-43 round-4): the anchor MUST NOT carry the head
+    // revision when the snapshot is unavailable — a head revision
+    // pins the thread at head lines that don't actually contain
+    // its content. We use a deterministic non-file revision
+    // (hash of the comment body under a namespace tag) instead.
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).toBe(HEAD_REV);
+    expect(created.anchor.revision).not.toBe(HEAD_REV);
+    expect(created.anchor.commit).toBeUndefined();
+  });
+});
+
+describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable NEVER pins at head", () => {
+  test("RES_OUT_UNAV: resolved+outdated+unavailable emits thread.orphaned (not resolved) and no head-relative anchor", async () => {
+    if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const t = thread({
+      line: null,
+      startLine: null,
+      originalLine: 40,
+      isOutdated: true,
+      isResolved: true,
+      resolvedByLogin: "carol",
+    });
+    const { events, orphanedThreadIds } = await GitHubAdapter.mapThreadsToEvents({
+      threads: [t],
+      threadIdOf: () => "RES_OUT_UNAV",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => HEAD_REV,
+      headSourceOf: () => HEAD_SOURCE,
+      // Content unavailable (deleted / binary / truncated / not-found).
+      resolveSnapshot: () => ({ kind: "unavailable", reason: "not-found" }),
+    });
+    // The terminal transition is thread.orphaned, not
+    // thread.resolved — resolved-on-GitHub is preserved in the
+    // reason string but the anchor is not authoritative.
+    expect(orphanedThreadIds).toEqual(["RES_OUT_UNAV"]);
+    const kinds = events.map((e) => e.kind);
+    expect(kinds).toContain("thread.orphaned");
+    expect(kinds).not.toContain("thread.resolved");
+    const orphan = events.find((e) => e.kind === "thread.orphaned")!;
+    if (orphan.kind !== "thread.orphaned") throw new Error("kind");
+    expect(orphan.reason).toContain("not-found");
+    expect(orphan.reason).toContain("was-resolved-on-github");
+    // Anchor: no head revision, no `commit` (nothing to pin to).
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    expect(created.anchor.revision).not.toBe(HEAD_REV);
+    expect(created.anchor.commit).toBeUndefined();
+  });
+
+  test("RES_LEFT_UNAV: resolved+LEFT+unavailable also emits thread.orphaned, not resolved", async () => {
+    if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const t = thread({
+      diffSide: "LEFT",
+      line: 7,
+      originalLine: 7,
+      isResolved: true,
+      resolvedByLogin: "carol",
+    });
+    const { events, orphanedThreadIds } = await GitHubAdapter.mapThreadsToEvents({
+      threads: [t],
+      threadIdOf: () => "RES_LEFT_UNAV",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => HEAD_REV,
+      headSourceOf: () => HEAD_SOURCE,
+      resolveSnapshot: () => ({ kind: "unavailable", reason: "not-found" }),
+    });
+    expect(orphanedThreadIds).toEqual(["RES_LEFT_UNAV"]);
+    const kinds = events.map((e) => e.kind);
+    expect(kinds).toContain("thread.orphaned");
+    expect(kinds).not.toContain("thread.resolved");
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    expect(created.anchor.revision).not.toBe(HEAD_REV);
+    expect(created.anchor.commit).toBeUndefined();
+  });
+
+  test("LEFTRES via importThreads: LEFT+resolved fetches parent-of-originalCommit blob (never head; never originalCommit alone)", async () => {
+    // Fake fetch: only allow `<oid>^:<path>` expressions to
+    // succeed. If importThreads tries `<oid>:<path>` for a LEFT
+    // thread, this returns null and the thread becomes
+    // unavailable — the assertion below would fail.
+    const captured: string[] = [];
+    const parentBlobText = "line 1\nline 2\nleft-side target\nline 4\n";
+    let parentRev = "";
+    const baseFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const body = JSON.parse((init as { body: string }).body) as {
+        query: string;
+        variables: { expression?: string };
+      };
+      if (/query FetchBlobText/.test(body.query)) {
+        const expr = body.variables.expression ?? "";
+        captured.push(expr);
+        if (expr.includes("^:")) {
+          return new Response(
+            JSON.stringify({
+              data: {
+                repository: {
+                  object: {
+                    __typename: "Blob",
+                    text: parentBlobText,
+                    isBinary: false,
+                    isTruncated: false,
+                  },
+                },
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        // NOT parent-of-originalCommit → refuse (return null).
+        return new Response(
+          JSON.stringify({ data: { repository: { object: null } } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    (baseFetch as { preconnect?: (url: string) => void }).preconnect = () => {};
+
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: baseFetch as unknown as typeof fetch,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    parentRev = await revisionOf(parentBlobText);
+    if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const t = thread({
+      diffSide: "LEFT",
+      startDiffSide: null,
+      line: 3,
+      startLine: null,
+      originalLine: 3,
+      originalStartLine: null,
+      isResolved: true,
+      resolvedByLogin: "carol",
+      comments: [
+        {
+          databaseId: 1,
+          nodeId: "n1",
+          body: "left comment",
+          authorLogin: "alice",
+          authorType: "User",
+          createdAt: "t1",
+          url: "u1",
+          originalCommitOid: "9".repeat(40),
+        },
+      ],
+    });
+    const { events } = await adapter.importThreads({
+      pr: { owner: "o", repo: "r", pullNumber: 1 },
+      threads: [t],
+      threadIdOf: () => "LEFTRES",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => HEAD_REV,
+    });
+    // Exactly the parent expression was queried.
+    expect(captured).toEqual([`${"9".repeat(40)}^:docs/x.mdx`]);
+    // Anchor uses the parent blob's revision, NOT head, and NOT
+    // originalCommit's own revision.
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    expect(created.anchor.revision).toBe(parentRev);
+    expect(created.anchor.revision).not.toBe(HEAD_REV);
+    // For a resolved thread with a KNOWN own-commit anchor, the
+    // pipeline emits thread.resolved (not orphaned).
+    const kinds = events.map((e) => e.kind);
+    expect(kinds).toContain("thread.resolved");
+    expect(kinds).not.toContain("thread.orphaned");
+    // No event carries head revision.
+    for (const e of events) {
+      if (e.kind === "comment.created") {
+        expect(e.anchor.revision).not.toBe(HEAD_REV);
+      }
+    }
+  });
+
+  test("importThreads: LEFT rename uses oldPathOf(current) → previousFilename", async () => {
+    const captured: string[] = [];
+    const parentBlobText = "old file contents\nline 2\n";
+    const baseFetch = async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const body = JSON.parse((init as { body: string }).body) as {
+        query: string;
+        variables: { expression?: string };
+      };
+      if (/query FetchBlobText/.test(body.query)) {
+        captured.push(body.variables.expression ?? "");
+        return new Response(
+          JSON.stringify({
+            data: {
+              repository: {
+                object: {
+                  __typename: "Blob",
+                  text: parentBlobText,
+                  isBinary: false,
+                  isTruncated: false,
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    (baseFetch as { preconnect?: (url: string) => void }).preconnect = () => {};
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: baseFetch as unknown as typeof fetch,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    const t = thread({
+      path: "docs/new-name.mdx",
+      diffSide: "LEFT",
+      line: 1,
+      originalLine: 1,
+      comments: [
+        {
+          databaseId: 1,
+          nodeId: "n1",
+          body: "left",
+          authorLogin: "alice",
+          authorType: "User",
+          createdAt: "t1",
+          url: "u1",
+          originalCommitOid: "5".repeat(40),
+        },
+      ],
+    });
+    await adapter.importThreads({
+      pr: { owner: "o", repo: "r", pullNumber: 1 },
+      threads: [t],
+      threadIdOf: () => "LEFT_RENAME",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => "0".repeat(64),
+      oldPathOf: (p) => (p === "docs/new-name.mdx" ? "docs/old-name.mdx" : undefined),
+    });
+    expect(captured).toEqual([`${"5".repeat(40)}^:docs/old-name.mdx`]);
+  });
+});
+
+describe("mapThreadsToEvents — mutant killers (own-commit revision, side isolation)", () => {
+  test("own-commit revision equals revisionOf(content) exactly", async () => {
+    const content = "some own-commit content\nline 2\nline 3\n";
+    const rev = await revisionOf(content);
+    const t = thread({ line: null, originalLine: 2, isOutdated: true });
+    const { events, snapshots } = await GitHubAdapter.mapThreadsToEvents({
+      threads: [t],
+      threadIdOf: () => "T",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => "0".repeat(64),
+      resolveSnapshot: () => ({ kind: "own-commit", content, oid: "9".repeat(40), revision: rev }),
+    });
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    // If a mutation replaces `snapshot.revision` with a different
+    // value, this fails.
+    expect(created.anchor.revision).toBe(rev);
+    // Snapshot map keyed by that revision.
+    expect(snapshots.get(rev)).toBe(content);
+  });
+
+  test("importThreads: RIGHT-side outdated uses originalCommitOid, LEFT uses originalCommitOid^", async () => {
+    // Two threads: one RIGHT-outdated, one LEFT. The recorder
+    // captures the exact expressions sent, so a bug that used the
+    // wrong side's oid would fail the equality check.
+    const rightSource = "R content\n";
+    const leftSource = "L content\n";
+    const captured: string[] = [];
+    const baseFetch = async (_input: string | URL | Request, init: RequestInit = {}) => {
+      const body = JSON.parse((init as { body: string }).body) as {
+        query: string;
+        variables: { expression?: string };
+      };
+      if (/query FetchBlobText/.test(body.query)) {
+        const expr = body.variables.expression ?? "";
+        captured.push(expr);
+        const text = expr.includes("^:") ? leftSource : rightSource;
+        return new Response(
+          JSON.stringify({
+            data: { repository: { object: { __typename: "Blob", text, isBinary: false, isTruncated: false } } },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    (baseFetch as { preconnect?: (url: string) => void }).preconnect = () => {};
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: baseFetch as unknown as typeof fetch,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    const outdatedRight = thread({
+      id: "T-R",
+      isOutdated: true,
+      line: null,
+      originalLine: 1,
+      comments: [
+        {
+          databaseId: 1, nodeId: "nR", body: "r", authorLogin: "a", authorType: "User",
+          createdAt: "t", url: "u", originalCommitOid: "a".repeat(40),
+        },
+      ],
+    });
+    const leftThread = thread({
+      id: "T-L",
+      diffSide: "LEFT",
+      line: 1,
+      originalLine: 1,
+      comments: [
+        {
+          databaseId: 2, nodeId: "nL", body: "l", authorLogin: "a", authorType: "User",
+          createdAt: "t", url: "u", originalCommitOid: "b".repeat(40),
+        },
+      ],
+    });
+    await adapter.importThreads({
+      pr: { owner: "o", repo: "r", pullNumber: 1 },
+      threads: [outdatedRight, leftThread],
+      threadIdOf: (t) => t.id,
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => "0".repeat(64),
+    });
+    // Order-preserving: RIGHT uses <oid>:path, LEFT uses <oid>^:path.
+    expect(captured.sort()).toEqual([
+      `${"a".repeat(40)}:docs/x.mdx`,
+      `${"b".repeat(40)}^:docs/x.mdx`,
+    ]);
+  });
+
+  test("fetchBlobText: binary and truncated map to their own reasons (not not-found)", async () => {
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: ((async () => new Response("", { status: 500 })) as unknown as typeof fetch),
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    // Replace `graphql` with a canned function per case.
+    const cases = [
+      { resp: { data: { repository: { object: { __typename: "Blob", isBinary: true } } } }, expected: "binary" as const },
+      { resp: { data: { repository: { object: { __typename: "Blob", isTruncated: true, text: "ignored" } } } }, expected: "truncated" as const },
+      { resp: { data: { repository: { object: null } } }, expected: "not-found" as const },
+      { resp: { data: { repository: { object: { __typename: "Tree" } } } }, expected: "not-a-blob" as const },
+    ];
+    for (const c of cases) {
+      // Stub the retry-wrapped GraphQL method for this test.
+      (adapter as unknown as { graphqlWithRetry: unknown }).graphqlWithRetry = async () => c.resp;
+      const r = await adapter.fetchBlobText({ owner: "o", repo: "r", expression: "abc:path" });
+      expect(r.kind).toBe(c.expected);
+    }
   });
 });
 
 describe("mapThreadsToEvents — multi-comment threads", () => {
-  test("first author is used for comment.created, replies use their own authors, parentId chain OK", () => {
+  test("first author is used for comment.created, replies use their own authors, parentId chain OK", async () => {
     const t = thread({
       comments: [
         {
@@ -270,7 +617,7 @@ describe("mapThreadsToEvents — multi-comment threads", () => {
         },
       ],
     });
-    const { events } = GitHubAdapter.mapThreadsToEvents({
+    const { events } = await GitHubAdapter.mapThreadsToEvents({
       threads: [t],
       threadIdOf: () => "T-multi",
       commentIdOf: (_t, c) => `C${c.databaseId}`,

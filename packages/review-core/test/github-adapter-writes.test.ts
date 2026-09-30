@@ -192,6 +192,43 @@ describe("findOrCreatePendingReview — contract", () => {
     }
   });
 
+  test("returns kind=stale when the reused pending review has a null commit (fails closed)", async () => {
+    // PR-43 round-4 nit: a null `commit.oid` USED to be treated as
+    // "no info, must be fine" (fail open) — returned `reused`. The
+    // caller had asked for a SPECIFIC commit, so any mismatch —
+    // including "unknown" — should surface. Now returns `stale`
+    // with `actualCommitOid: null`.
+    const { fetch, requests } = makeRecorder(
+      graphqlRouter({
+        ViewerLogin: () => ({ data: { viewer: { login: "gerchowl" } } }),
+        ViewerPendingReview: () => ({
+          data: {
+            node: {
+              __typename: "PullRequest",
+              reviews: {
+                nodes: [{ id: REVIEW_NODE_ID, databaseId: 1, state: "PENDING", commit: null }],
+              },
+            },
+          },
+        }),
+      }),
+    );
+    const adapter = new GitHubAdapter({ token: staticToken, fetch, retryPolicy: noRetry });
+    const result = await adapter.findOrCreatePendingReview({
+      pullRequestNodeId: PR_NODE_ID,
+      commitOid: COMMIT_OID,
+    });
+    expect(result.kind).toBe("stale");
+    if (result.kind !== "stale") throw new Error("unreachable");
+    expect(result.expectedCommitOid).toBe(COMMIT_OID);
+    expect(result.actualCommitOid).toBeNull();
+    // No AddReview mutation fired.
+    for (const req of requests) {
+      const b = req.body as { query: string };
+      expect(b.query).not.toContain("mutation AddReview");
+    }
+  });
+
   test("creates a new pending review via addPullRequestReview when none exists", async () => {
     const { fetch, requests } = makeRecorder(
       graphqlRouter({
@@ -984,4 +1021,97 @@ describe("error handling and rate limits", () => {
     expect(calls.get("AddThread")).toBe(1);
     expect(calls.get("SubmitReview")).toBe(1);
   });
+
+  // PR-43 round-4 nit: per-mutation mutant killer. Each entry
+  // point has its own test — a future edit routing ANY of them
+  // through `graphqlWithRetry` (which retries on RATE_LIMITED)
+  // turns exactly its test red.
+  const mutationEntries: Array<{
+    readonly name: string;
+    readonly graphqlOpName: string;
+    readonly run: (adapter: GitHubAdapter) => Promise<unknown>;
+  }> = [
+    {
+      name: "addPullRequestReview via findOrCreatePendingReview",
+      graphqlOpName: "AddReview",
+      run: (adapter) =>
+        adapter.findOrCreatePendingReview({
+          pullRequestNodeId: PR_NODE_ID,
+          commitOid: COMMIT_OID,
+          viewerLogin: "gerchowl",
+        }),
+    },
+    {
+      name: "addPullRequestReviewThread via addPendingReviewThread",
+      graphqlOpName: "AddThread",
+      run: (adapter) =>
+        adapter.addPendingReviewThread({
+          reviewId: REVIEW_NODE_ID,
+          path: "x.mdx",
+          body: "b",
+          line: 1,
+        }),
+    },
+    {
+      name: "updatePullRequestReviewComment via updatePendingReviewComment",
+      graphqlOpName: "UpdateComment",
+      run: (adapter) =>
+        adapter.updatePendingReviewComment({ commentNodeId: COMMENT_NODE_ID, body: "b" }),
+    },
+    {
+      name: "deletePullRequestReviewComment via deletePendingReviewComment",
+      graphqlOpName: "DeleteComment",
+      run: (adapter) => adapter.deletePendingReviewComment({ commentNodeId: COMMENT_NODE_ID }),
+    },
+    {
+      name: "deletePullRequestReview via deletePendingReview",
+      graphqlOpName: "DeleteReview",
+      run: (adapter) => adapter.deletePendingReview({ reviewId: REVIEW_NODE_ID }),
+    },
+    {
+      name: "submitPullRequestReview via submitReview",
+      graphqlOpName: "SubmitReview",
+      run: (adapter) => adapter.submitReview({ reviewId: REVIEW_NODE_ID, event: "COMMENT" }),
+    },
+  ];
+
+  for (const entry of mutationEntries) {
+    test(`${entry.name}: RATE_LIMITED response never retries (call count = 1)`, async () => {
+      // findOrCreatePendingReview calls ViewerPendingReview
+      // (read) FIRST — it doesn't fail, so the mutation is next.
+      // Answer the read once, then RATE_LIMITED on the mutation.
+      let mutationCalls = 0;
+      const { fetch } = makeRecorder((req) => {
+        const body = req.body as { query: string };
+        // The lookup path — succeeds so the mutation gets called.
+        if (/query ViewerPendingReview/.test(body.query)) {
+          return ok({ data: { node: { __typename: "PullRequest", reviews: { nodes: [] } } } });
+        }
+        // Any mutation → RATE_LIMITED.
+        if (/mutation \w+/.test(body.query)) {
+          mutationCalls++;
+          return ok({
+            data: null,
+            errors: [{ type: "RATE_LIMITED", message: "rate limited" }],
+          });
+        }
+        return new Response("unexpected op", { status: 500 });
+      });
+      const adapter = new GitHubAdapter({
+        token: staticToken,
+        fetch,
+        // Retry generously; if the mutation is (wrongly) routed
+        // through `graphqlWithRetry`, we'd see 3 calls, not 1.
+        retryPolicy: { maxAttempts: 3, baseDelayMs: 1, maxDelayMs: 100, jitterMs: 0 },
+        sleep: async () => {},
+      });
+      try {
+        await entry.run(adapter);
+      } catch {
+        // Expected — RATE_LIMITED surfaces as an error.
+      }
+      // ONE mutation call. Not two, not three.
+      expect(mutationCalls).toBe(1);
+    });
+  }
 });

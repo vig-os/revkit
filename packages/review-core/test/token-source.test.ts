@@ -43,25 +43,52 @@ describe("redactTokenInMessage", () => {
     expect(scrubbed).toContain("<redacted:ghtoken>");
   });
 
-  test("redacts even when the prefix is preceded by a word character (underscore, letter, digit)", () => {
-    // PR-43 round-3: matches ANYWHERE so `foo_ghp_...`, `aghp_...`
-    // and `9ghp_...` all get scrubbed. `\b` failed on `_`
-    // (word-char) and a lookbehind for non-word failed on letters.
-    const stray = "ghp_" + "a".repeat(40);
-    for (const preceder of ["prefix_", "a", "z", "9"]) {
-      const scrubbed = redactTokenInMessage(`${preceder}${stray} tail`, "");
-      expect(scrubbed).not.toContain(stray);
-      expect(scrubbed).toContain("<redacted:ghtoken>");
-    }
-  });
-
-  test("catches all five GitHub prefixes", () => {
+  test("catches all five GitHub prefixes at a word boundary", () => {
     for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]) {
       const token = prefix + "x".repeat(40);
       const scrubbed = redactTokenInMessage(`saw ${token} here`, "");
       expect(scrubbed).not.toContain(token);
       expect(scrubbed).toContain("<redacted:ghtoken>");
     }
+  });
+
+  test("redacts at various leak-shaped boundaries (space, =, :, \", newline, quote, start)", () => {
+    const token = "ghp_" + "a".repeat(40);
+    for (const preamble of ["", "token=", '"', 'msg: "', "value=\n", "prefix ", "prefix\t"]) {
+      const scrubbed = redactTokenInMessage(`${preamble}${token}`, "");
+      expect(scrubbed).not.toContain(token);
+      expect(scrubbed).toContain("<redacted:ghtoken>");
+    }
+  });
+
+  test("does NOT scrub prose collisions where the prefix sits mid-word", () => {
+    // PR-43 round-4: the earlier rule scrubbed `highs_and_lows...`
+    // because `ghs_` + `and_lows...` is a legal token shape. With
+    // the word-boundary check, prose shapes are safe.
+    const long = "and_lows_" + "A".repeat(30);
+    const before = `highs_${long}`;
+    const scrubbed = redactTokenInMessage(before, "");
+    // Nothing was redacted.
+    expect(scrubbed).toBe(before);
+    expect(scrubbed).not.toContain("<redacted:ghtoken>");
+  });
+
+  test("does NOT scrub letter- or digit-adjacent joins (aghp_..., 4ghs_...)", () => {
+    // Real tokens don't appear in these shapes; refusing the
+    // scrub is the safer default.
+    for (const preamble of ["a", "z", "9", "4"]) {
+      const s = `${preamble}ghp_${"a".repeat(40)}`;
+      const scrubbed = redactTokenInMessage(s, "");
+      expect(scrubbed).toBe(s);
+    }
+  });
+
+  test("does NOT scrub short strings shaped like a prefix (min tail 30)", () => {
+    // A 20-char tail (the round-3 minimum) was too short and
+    // caught prose. Now 30+ required.
+    const s = `ghp_${"a".repeat(20)}`;
+    const scrubbed = redactTokenInMessage(s, "");
+    expect(scrubbed).toBe(s);
   });
 });
 

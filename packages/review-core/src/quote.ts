@@ -7,61 +7,59 @@
 // identical text elsewhere in the file (a common template row) would
 // tie for the anchor.
 //
-// One source of truth: every producer that mints an anchor from source
-// text — the local rail, `check-dist`, the GitHub adapter's thread
-// import — calls `buildQuoteFromLines` (or `buildQuoteFromOffsets`)
-// here. A one-off ad-hoc slicer scattered across surfaces would drift
-// on line-ending or trimming choices; owning the function centrally
-// keeps the invariants identical.
+// **One source of truth.** This module is the single quote builder
+// every review-core surface uses (rail, check-dist, GitHub adapter's
+// thread import) and it **reuses** the reanchor engine's own
+// helpers (`toLF`, `buildLineStartIndex`, `lineToOffset`,
+// `DEFAULT_ANCHOR_CONTEXT_CHARS`) so a fresh quote and a
+// reanchored one carve out identical byte windows. Two copies
+// would drift on LF-normalisation or context length — the exact
+// class of bug PR-43 round-4 called out (a CRLF multi-line quote
+// that always orphans because the fresh producer keeps `\r\n` in
+// `exact` and the engine looks for LF).
 //
-// Line-ending handling: line-based inputs work on the source AS
-// GIVEN (no LF normalisation). The revision hash uses LF-normalised
-// content (see `revisionOf`), so a quote built from the raw source
-// and stored with an LF-normalised revision remains consistent as
-// long as the caller doesn't intermix representations. The
-// re-anchoring engine normalises to LF for its diff, so a `\r\n`
-// slice ends up trimmed to `\n` there; the quote stored here is
-// truthful to what the reviewer highlighted.
+// **LF normalisation.** Input source is passed through `toLF` before
+// slicing; `exact` / `prefix` / `suffix` are LF-only. The engine
+// runs on the LF form and the anchor's `revision` is the SHA-256
+// of the LF form (see `revisionOf`), so all three are consistent
+// end-to-end.
 //
 // Runtime-neutral: no `node:*` / `bun:*` imports.
 
 import type { TextQuote } from "./anchor.ts";
+import {
+  buildLineStartIndex,
+  DEFAULT_ANCHOR_CONTEXT_CHARS,
+  lineToOffset,
+  toLF,
+} from "./reanchor.ts";
 
-/** Default context window in characters on each side of the quote.
- * A block-quote fixture around 40 chars gives the re-anchoring
- * engine enough leverage to disambiguate a moved block from a
- * templated neighbour; more than that starts to include content
- * the reviewer might have edited between capture and re-anchor
- * (a false negative). The pipeline (ADR-0006) cares about
- * relative context length, not an exact number — 40 is a safe
- * default that matches the fixtures in `reanchor.test.ts`. */
-export const DEFAULT_QUOTE_CONTEXT_CHARS = 40;
+/** Default context window — reuses the reanchor engine's constant so
+ * both producers cut identical windows. */
+export const DEFAULT_QUOTE_CONTEXT_CHARS = DEFAULT_ANCHOR_CONTEXT_CHARS;
 
-/** Options for the quote builders. `contextChars` sets prefix/suffix
- * length in characters; the default is `DEFAULT_QUOTE_CONTEXT_CHARS`. */
+/** Options for the quote builders. `contextChars` defaults to
+ * `DEFAULT_QUOTE_CONTEXT_CHARS`. */
 export interface BuildQuoteOptions {
   readonly contextChars?: number;
 }
 
 /**
  * Build a `TextQuote` for the inclusive line range `startLine..endLine`
- * in `source`.
+ * in `source` (LF-normalised).
  *
- * Line numbers are 1-indexed and inclusive on both ends, matching the
- * anchor schema. If a line number lies outside the source, the range
- * is clamped to the file bounds (a start beyond the last line yields
- * an empty exact quote — the caller shouldn't be doing that, and the
- * anchor schema will reject it downstream).
+ * Line numbers are 1-indexed and inclusive on both ends, matching
+ * the anchor schema. If a line number lies outside the source, the
+ * range is clamped to the file bounds; a truly empty exact quote
+ * still returns a valid TextQuote shape (the anchor schema will
+ * refuse an empty `exact` downstream, which is the safe path).
  *
  * The `exact` slice starts at the first character of `startLine` and
  * ends at (but does NOT include) the newline that terminates
- * `endLine`. That matches how a reader would highlight the block —
- * body only, no trailing newline. When the last line is missing its
- * newline (EOF), the slice runs to end-of-source.
- *
- * `prefix` is the last `contextChars` characters of the source
- * BEFORE the quote; `suffix` is the first `contextChars` after it.
- * Both are empty at file bounds.
+ * `endLine`. Any `\r` before that newline is dropped by the LF
+ * normalisation — so a CRLF source produces the SAME quote as its
+ * LF counterpart, and the reanchor engine (which normalises
+ * likewise) will match it.
  */
 export function buildQuoteFromLines(
   source: string,
@@ -69,42 +67,28 @@ export function buildQuoteFromLines(
   endLine: number,
   options: BuildQuoteOptions = {},
 ): TextQuote {
-  const contextChars = Math.max(0, options.contextChars ?? DEFAULT_QUOTE_CONTEXT_CHARS);
+  const lf = toLF(source);
+  const index = buildLineStartIndex(lf);
+  const totalLines = Math.max(1, index.length);
 
-  // Build a line-start index once. `lineStartsOf(source)` returns the
-  // offset of the first character of each 1-indexed line, plus one
-  // past-the-end sentinel. `lineStartsOf` handles `\r\n` and lone
-  // `\r` as line terminators.
-  const starts = lineStartsOf(source);
-  const totalLines = starts.length - 1;
-  // Clamp; anchorSchema will refuse the anchor downstream if the
-  // caller ends up with an empty exact, but we still return a valid
-  // TextQuote shape here (empty exact would fail the anchor schema
-  // but the quote type itself carries it).
-  const clampedStart = Math.max(1, Math.min(startLine, Math.max(1, totalLines)));
-  const clampedEnd = Math.max(clampedStart, Math.min(endLine, Math.max(1, totalLines)));
-
-  const startOffset = starts[clampedStart - 1] ?? 0;
-  // End offset: one past the last character of `clampedEnd`. If
-  // `clampedEnd` is the last line, that's the end of source; else
-  // it's the offset just before the newline that terminates it —
-  // which is `starts[clampedEnd] - length-of-terminator`.
-  const endOffsetInclusiveOfNewline = starts[clampedEnd] ?? source.length;
-  const endOffset = trimTrailingLineTerminator(source, startOffset, endOffsetInclusiveOfNewline);
-
-  return buildQuoteFromOffsets(source, startOffset, endOffset, { contextChars });
+  const clampedStart = Math.max(1, Math.min(startLine, totalLines));
+  const clampedEnd = Math.max(clampedStart, Math.min(endLine, totalLines));
+  const startOffset = lineToOffset(index, clampedStart);
+  // End offset = start of the line AFTER `clampedEnd`, minus its
+  // terminator. When `clampedEnd` is the last line,
+  // `lineToOffset(index, N+1)` returns the LAST line's start (via
+  // its clamp), so we substitute `lf.length` for the true EOF.
+  const nextLineStart = clampedEnd + 1 > totalLines ? lf.length : lineToOffset(index, clampedEnd + 1);
+  const endOffset = trimTrailingNewline(lf, startOffset, nextLineStart);
+  return buildQuoteFromOffsets(lf, startOffset, endOffset, options);
 }
 
 /**
  * Build a `TextQuote` for the half-open character range
- * `[startOffset..endOffset)` in `source`. The offsets are byte-like
- * (JavaScript UTF-16 code-unit indices) and `endOffset` is
- * exclusive — the same convention `String.slice` uses.
- *
- * Callers that already know character offsets (e.g. from a DOM
- * selection or a build-time hast pass) use this directly;
- * `buildQuoteFromLines` is a convenience for the common
- * line-range shape.
+ * `[startOffset..endOffset)` in `source` (LF-normalised).
+ * `endOffset` is exclusive — the same convention `String.slice`
+ * uses. The caller is expected to have LF-normalised the source
+ * already (or use `buildQuoteFromLines`, which does it).
  */
 export function buildQuoteFromOffsets(
   source: string,
@@ -124,58 +108,17 @@ export function buildQuoteFromOffsets(
   };
 }
 
-/**
- * Compute the sorted offsets where each 1-indexed line starts.
- * Returned array has `n + 1` entries for an n-line source; the last
- * entry is `source.length` (past-the-end sentinel), so
- * `starts[k] - starts[k-1]` gives line `k`'s total length including
- * its terminator.
- *
- * Handles `\r\n`, lone `\n`, and lone `\r` as line terminators — the
- * caller doesn't need to LF-normalise first. A source without any
- * terminator counts as a single line.
- */
-export function lineStartsOf(source: string): number[] {
-  const starts: number[] = [0];
-  const len = source.length;
-  let i = 0;
-  while (i < len) {
-    const ch = source.charCodeAt(i);
-    if (ch === 0x0d /* \r */) {
-      // CRLF or lone CR — one line terminator either way; start of
-      // next line is after the sequence.
-      i++;
-      if (i < len && source.charCodeAt(i) === 0x0a /* \n */) i++;
-      starts.push(i);
-    } else if (ch === 0x0a /* \n */) {
-      i++;
-      starts.push(i);
-    } else {
-      i++;
-    }
+/** Drop a single trailing `\n` from the range so the quote's
+ * `exact` doesn't include the line terminator. `startOffset` is a
+ * floor — an empty range never rolls back below its start. */
+function trimTrailingNewline(source: string, startOffset: number, endOffset: number): number {
+  if (endOffset > startOffset && source.charCodeAt(endOffset - 1) === 0x0a /* \n */) {
+    return endOffset - 1;
   }
-  // Sentinel: one past the last character.
-  if (starts[starts.length - 1] !== len) {
-    starts.push(len);
-  }
-  return starts;
+  return endOffset;
 }
 
-/** Given the offset just past the last character of a line
- * (i.e. `lineStarts[nextLine]`), roll back the terminator so the
- * quote's `exact` doesn't include a trailing `\n` / `\r\n` / `\r`.
- * The `startOffset` is a floor — an empty range never rolls back
- * below its start. */
-function trimTrailingLineTerminator(source: string, startOffset: number, endOffsetInclusive: number): number {
-  let end = endOffsetInclusive;
-  if (end > startOffset) {
-    const ch = source.charCodeAt(end - 1);
-    if (ch === 0x0a /* \n */) {
-      end--;
-      if (end > startOffset && source.charCodeAt(end - 1) === 0x0d /* \r */) end--;
-    } else if (ch === 0x0d /* \r */) {
-      end--;
-    }
-  }
-  return end;
-}
+/** Backwards-compat re-export — some earlier tests imported
+ * `lineStartsOf` from this module. The reanchor engine's
+ * `buildLineStartIndex` is the one to use going forward. */
+export { buildLineStartIndex as lineStartsOf } from "./reanchor.ts";
