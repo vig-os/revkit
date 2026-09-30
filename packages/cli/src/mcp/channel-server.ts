@@ -228,15 +228,39 @@ interface WireComment {
   readonly author?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   readonly body: string;
 }
+/** A minimal duck type for the wire thread the daemon exposes.
+ * Issue #46 item 5: an anchor may be `line` (start/end present)
+ * OR `unanchored` (start/end absent, `kind: "unanchored"` set).
+ * The formatter guards on the presence of `startLine`/`endLine`
+ * so an imported unanchored thread never emits `L:undefined-undefined`. */
 interface WireThread {
   readonly id: string;
-  readonly status: "open" | "resolved";
+  /** Issue #46 item 5: `orphaned` is a real state (round-5;
+   * PR #45 renders the panel). The channel skips orphaned threads
+   * from the catch-up summary — they are handled by the rail's
+   * orphan panel, not the agent. */
+  readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: {
+    readonly kind?: "line" | "unanchored";
     readonly path: string;
-    readonly startLine: number;
-    readonly endLine: number;
+    readonly startLine?: number;
+    readonly endLine?: number;
+    readonly originalStartLine?: number;
+    readonly originalEndLine?: number;
   };
   readonly comments: readonly WireComment[];
+}
+
+/** Return `"<start>-<end>"` when both bounds are known integers, or
+ * `undefined` when either is absent (unanchored / imported thread).
+ * Callers render a file-level suffix in the undefined case rather
+ * than emit `undefined-undefined` (issue #46 item 5). */
+function renderAnchorRange(anchor: {
+  readonly startLine?: number;
+  readonly endLine?: number;
+}): string | undefined {
+  if (typeof anchor.startLine !== "number" || typeof anchor.endLine !== "number") return undefined;
+  return `${anchor.startLine}-${anchor.endLine}`;
 }
 
 /** Emit a compact "N thread(s) waiting on the agent" summary when
@@ -254,6 +278,9 @@ export function formatCatchupSummary(
   threads: readonly WireThread[],
 ): ChannelPayload | undefined {
   const waiting = threads.filter((thread) => {
+    // Issue #46 item 5: `resolved` and `orphaned` threads never
+    // wait on the agent — resolved is terminal, orphaned is
+    // shown by the rail's own orphan panel.
     if (thread.status !== "open") return false;
     const last = thread.comments[thread.comments.length - 1];
     if (last === undefined) return false;
@@ -264,8 +291,13 @@ export function formatCatchupSummary(
   const lines = sample.map((thread) => {
     const safeId = escapeContentFragment(thread.id);
     const safePath = escapeContentFragment(thread.anchor.path);
-    const range = `${thread.anchor.startLine}-${thread.anchor.endLine}`;
-    return `- ${safeId} at ${safePath}:${range}`;
+    // Issue #46 item 5: guard against `L:undefined-undefined` on
+    // an imported unanchored thread. An unanchored anchor has no
+    // `startLine`/`endLine`; render a file-level suffix instead.
+    const range = renderAnchorRange(thread.anchor);
+    return range === undefined
+      ? `- ${safeId} at ${safePath} (file-level)`
+      : `- ${safeId} at ${safePath}:${range}`;
   });
   const more = waiting.length > sample.length
     ? `\n(+${waiting.length - sample.length} more)`
@@ -343,6 +375,9 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
   let content: string;
   switch (kind) {
     case "comment.created":
+      // Issue #46 item 5: `?-?` is preferable to a literal
+      // `undefined-undefined`; keep the "?" fallback for unanchored
+      // shapes and null coalesce the anchor object itself too.
       content = safeBody !== undefined
         ? `New comment on ${safePath}:${startLine ?? "?"}-${endLine ?? "?"} from ${safeActor} — ${safeBody}`
         : `New comment on ${safePath} from ${safeActor}.`;

@@ -1148,6 +1148,13 @@ export class GitHubAdapter {
               ...(thread.resolvedByLogin !== null ? { resolvedByLogin: thread.resolvedByLogin } : {}),
             }
           : undefined;
+      // Issue #46 item 3: for a forced-orphan thread (unanchored
+      // anchor), no `thread.orphaned` event will follow, so carry
+      // the pipeline's reason ON `comment.created`. The reducer
+      // projects it onto `Thread.orphanReason` so the rail's
+      // orphan panel shows the unavailable reason
+      // (`diffhunk-mismatch`, `binary`, …).
+      const forcedOrphanReason = forceOrphan ? orphanReason : undefined;
 
       // --- Emit the events for the thread. ---
       events.push({
@@ -1158,6 +1165,7 @@ export class GitHubAdapter {
         anchor,
         body: firstComment.body,
         ...(externalMetadata !== undefined ? { external: externalMetadata } : {}),
+        ...(forcedOrphanReason !== undefined ? { orphanReason: forcedOrphanReason } : {}),
       });
       events.push({
         kind: "comment.linked",
@@ -1400,7 +1408,13 @@ export class GitHubAdapter {
           diffHunk: first.diffHunk,
           side,
         });
-        if (verification === "matched" || verification === "hunk-empty" || verification === "line-missing") {
+        // Issue #46 item 2: `hunk-empty` no longer exists — an
+        // empty / null hunk is now `mismatched` (no evidence for
+        // the blob). `line-missing` remains a "cannot verify but
+        // the blob shape is plausible" outcome that accepts the
+        // candidate (the comment's `originalLine` doesn't sit in
+        // this blob, so no side-line to check against).
+        if (verification === "matched" || verification === "line-missing") {
           chosen = snap;
           break;
         }
@@ -1700,27 +1714,58 @@ export function verifyContentAgainstDiffHunk(input: {
   readonly originalLine: number;
   readonly diffHunk: string | null;
   readonly side: "LEFT" | "RIGHT";
-}): "matched" | "mismatched" | "hunk-empty" | "line-missing" {
-  if (input.diffHunk === null || input.diffHunk.length === 0) return "hunk-empty";
+}): "matched" | "mismatched" | "line-missing" {
+  // Issue #46 item 2: a null / empty hunk gives no evidence the
+  // blob is the right one, so refuse. The schema records
+  // `diffHunk` as non-null on the wire; a null here means the
+  // fetch stripped it, which we cannot trust.
+  if (input.diffHunk === null || input.diffHunk.length === 0) return "mismatched";
   const lfContent = input.content.replace(/\r\n?/g, "\n");
   const lines = lfContent.split("\n");
   if (input.originalLine < 1 || input.originalLine > lines.length) return "line-missing";
-  const contentLine = lines[input.originalLine - 1] ?? "";
-  // Walk the diff hunk from the end backwards, finding the last
-  // line whose marker matches our side. Skip the `@@` header itself.
-  const hunkLines = input.diffHunk.split("\n");
+  // Issue #46 item 1: LF-normalise the hunk too. GitHub keeps the
+  // raw `\r\n` in `diffHunk` for CRLF files; round-5 stripped
+  // only the blob, so a CRLF file's hunk line (`" foo\r"`) never
+  // equalled its blob line (`" foo"`), and every imported
+  // CRLF-file thread went unanchored.
+  const lfHunk = input.diffHunk.replace(/\r\n?/g, "\n");
+  const hunkLines = lfHunk.split("\n");
   const sideMarker = input.side === "RIGHT" ? "+" : "-";
+  // Issue #46 item 2: walk EVERY side-line of the hunk against
+  // the corresponding blob line, not just the last. A wrong-base
+  // fetch that trivially matches the last line (`}`, blank, or a
+  // repeated token) would slip through the round-5 checker.
+  //
+  // The diff hunk ends at `originalLine`, so walk the hunk from
+  // its LAST line backwards, decrementing the content line number
+  // as we pass each side-line (context and same-side lines
+  // advance; other-side lines don't). Compare each side-line to
+  // the corresponding content line; a single mismatch fails the
+  // whole hunk. If no side-line was seen (malformed / empty hunk
+  // body), return `mismatched` — no evidence for the fetch.
+  let contentLineNo = input.originalLine;
+  let sawSideLine = false;
   for (let i = hunkLines.length - 1; i >= 0; i--) {
     const line = hunkLines[i] ?? "";
     if (line.startsWith("@@")) break;
     if (line.length === 0) continue;
     const marker = line.charAt(0);
-    if (marker === sideMarker || marker === " ") {
-      const stripped = line.slice(1);
-      return stripped === contentLine ? "matched" : "mismatched";
-    }
+    if (marker !== " " && marker !== "+" && marker !== "-" && marker !== "\\") continue;
+    // `\ No newline at end of file` — a positional marker, no
+    // content, doesn't participate in line counting.
+    if (marker === "\\") continue;
+    // The opposite side's lines don't appear in this blob at all,
+    // so skip without advancing the content line number.
+    if (marker !== " " && marker !== sideMarker) continue;
+    if (contentLineNo < 1) return "mismatched";
+    if (contentLineNo > lines.length) return "mismatched";
+    const stripped = line.slice(1);
+    const contentLine = lines[contentLineNo - 1] ?? "";
+    if (stripped !== contentLine) return "mismatched";
+    sawSideLine = true;
+    contentLineNo--;
   }
-  return "hunk-empty";
+  return sawSideLine ? "matched" : "mismatched";
 }
 
 function placeholderQuote(commentBody: string): { exact: string; prefix: string; suffix: string } {

@@ -100,6 +100,15 @@ const commentCreatedPayload = {
     })
     .strict()
     .optional(),
+  /** Issue #46 item 3: for a thread born unanchored (`anchor.kind ===
+   * "unanchored"`), the reducer projects this onto
+   * `Thread.orphanReason` so the rail's orphan panel shows the
+   * unavailable reason (`diffhunk-mismatch`, `binary`, …) rather
+   * than nothing. Ignored when the anchor is line-anchored — a
+   * line-anchored thread reaches `orphaned` via a `thread.orphaned`
+   * event, whose own `reason` field the reducer projects on that
+   * transition. */
+  orphanReason: z.string().min(1).optional(),
 } as const;
 
 const commentRepliedPayload = {

@@ -75,6 +75,36 @@ export const threadSchema = z
     createdAt: isoTimestamp,
     updatedAt: isoTimestamp,
     comments: z.array(commentSchema),
+    /** The reason string from the most recent `thread.orphaned`
+     * event on this thread, or the reason recorded on
+     * `comment.created` for a thread born unanchored. Present
+     * ONLY when `status === "orphaned"` and a reason was supplied;
+     * cleared by a subsequent `thread.reanchored` (which un-orphans
+     * the thread). Read by the rail's orphan panel so the human
+     * sees WHY the anchor was lost — the pipeline's own account
+     * rather than a synthesised sentence. Field name matches
+     * PR #45 for merge compatibility (issue #46). */
+    orphanReason: z.string().min(1).optional(),
+    /** Structured origin metadata for a thread imported from an
+     * external provider (currently GitHub). Projected from
+     * `comment.created.external` by the reducer so B4 two-way
+     * sync (ADR-0025 amendment) can reconcile local orphan state
+     * with the remote's `resolved` bit without regex-parsing prose.
+     * (Issue #46 item 3.) */
+    external: z
+      .object({
+        provider: z.literal("github"),
+        threadId: z.string().min(1),
+        resolved: z.boolean(),
+        resolvedByLogin: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    /** The status this thread was in BEFORE the most recent
+     * `thread.resolved` event, so `thread.reopened` restores the
+     * correct pre-resolve state (open or orphaned). Set on
+     * resolve, read on reopen. (Issue #46 item 4.) */
+    resumeStatus: z.enum(["open", "orphaned"]).optional(),
   })
   .strict();
 
