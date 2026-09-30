@@ -29,13 +29,63 @@
       nixpkgs,
       flake-utils,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    let
+      # ────────────────────────────────────────────────────────────────────
+      # revkit's own consumer-facing helpers (D1 / ADR-0010 / M5).
+      # System-independent, so they live outside `eachDefaultSystem`.
+      #
+      #   revkit.lib.hooks — reusable pre-commit hook definitions a
+      #     consumer flake merges into its devkit `hooks` block.
+      #   revkit.templates.default — `nix flake init -t github:vig-os/revkit`
+      #     scaffolds a minimal docs repo consuming this flake.
+      # ────────────────────────────────────────────────────────────────────
+      revkitLib = {
+        hooks = import ./nix/hooks.nix { inherit (nixpkgs) lib; };
+      };
+
+      # Per-system deps hashes captured by the `revkit-flake` matrix job
+      # (see `.github/workflows/revkit-flake.yml`). A system missing from
+      # this attrset falls back to `lib.fakeHash` inside the FOD builder
+      # so the first build on that system reports the correct hash in
+      # its rejection message.
+      #
+      # Bun installs platform-native binaries (esbuild-<os>-<arch>, sharp,
+      # rolldown, lightningcss …), so the FOD output DIFFERS per system —
+      # one hash for all four systems would fail everywhere but where it
+      # was captured. Systems verified by CI:
+      #   x86_64-linux, aarch64-linux, aarch64-darwin
+      # x86_64-darwin is intentionally NOT listed: GitHub-hosted `macos-*`
+      # runners are arm64-only, so verifying that system would need a
+      # self-hosted runner. `packages` is restricted to the three verified
+      # systems (see `packages.revkit` below) — a `nix build` on any
+      # other system fails at eval with a missing-attribute error rather
+      # than a mismatched hash at build time.
+      nodeModulesHashes = {
+        x86_64-linux = "sha256-raL8WRFsNe5HeX+nlh1PPUSWg9dutXAFPXwIruzIaCw=";
+        aarch64-linux = "sha256-p9H+EIRs6QBKm4iyC6p9EqFdvAbYR6zT0cgMns1W2m8=";
+        aarch64-darwin = "sha256-jhpEBgpR2FIOe/BtL5c+CcqjKcPWi8LAUnYHvlEHBqY=";
+      };
+
+      # Systems `packages` / `apps` are exposed on. Kept in lockstep with
+      # `nodeModulesHashes` so `nix flake show` and a downstream
+      # `revkit.packages.${system}` are always coherent.
+      supportedSystems = builtins.attrNames nodeModulesHashes;
+    in
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ vigos.overlays.default ];
           config.allowUnfree = true;
+        };
+
+        # revkit CLI package (ADR-0010, D1). Reproducible Bun build with
+        # a fixed-output node_modules derivation; see nix/revkit-package.nix
+        # for the split rationale.
+        revkitPkg = pkgs.callPackage ./nix/revkit-package.nix {
+          inherit system nodeModulesHashes;
+          src = ./.;
         };
 
         # ────────────────────────────────────────────────────────────────────
@@ -257,8 +307,12 @@
                   # so a commit that touches only those still fires
                   # the hook. CI runs `revkit check --online`
                   # unconditionally, so this is a local convenience
-                  # rather than the sole gate.
-                  files = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$|(?:^|/)(NOTICE|LICENSE|UPSTREAM)$";
+                  # rather than the sole gate. Kept in ONE place
+                  # (`nix/hooks.nix`) so a consumer using
+                  # `revkit.lib.hooks.mkHooks` and this repo's own
+                  # dev shell never disagree on which files fire the
+                  # hook.
+                  files = revkitLib.hooks.contentFiles;
                   pass_filenames = false;
                 };
                 # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
@@ -340,6 +394,59 @@
         # Future (upstream, opt-in): vigos may expose modular language shells —
         # e.g. `vigos.devShells.${system}.{cpp,geant4,dataAnalysis}` — that you
         # select without changing this scaffold. Out of scope today.
+
+        # revkit packages (D1 / ADR-0010 / M5). `nix build .#revkit` produces
+        # a reproducible `bin/revkit` that runs `--help`, `check` and `serve`
+        # outside the repo. `packages.default` points at the same drv so
+        # `nix build` and `nix run` work without an attribute name.
+        #
+        # Exposed ONLY for systems whose FOD deps hash is captured in
+        # `nodeModulesHashes` above (x86_64-linux, aarch64-linux,
+        # aarch64-darwin). On other systems (x86_64-darwin today), `nix
+        # build .#revkit` fails at eval with an "attribute missing"
+        # error rather than at build time with a mismatched hash.
       }
-    );
+      // nixpkgs.lib.optionalAttrs (builtins.elem system supportedSystems) {
+        packages = {
+          revkit = revkitPkg;
+          default = revkitPkg;
+        };
+
+        # `nix run .#revkit -- <args>` runs the CLI without a repo checkout
+        # (nix downloads the flake, builds `packages.revkit`, invokes the
+        # wrapper). Idiomatic per the flake schema.
+        apps.revkit = {
+          type = "app";
+          program = "${revkitPkg}/bin/revkit";
+        };
+      }
+    ))
+    //
+      # System-independent outputs (lib.hooks, templates.default).
+      {
+        lib = revkitLib;
+
+        templates.default = {
+          path = ./templates/default;
+          description = "Minimal revkit docs repo — a docs/ example, vocab, revkit-check hook, and a flake consuming revkit.packages.";
+          welcomeText = ''
+            # Welcome to revkit
+
+            A minimal revkit docs repo has been scaffolded here.
+
+            Next steps (M5 part 1):
+              direnv allow            # or: nix develop
+              revkit check            # run the ADR-0005 authoring guards
+              nix build               # runs revkit check under a docs derivation
+
+            `revkit serve` (the local review daemon that mounts the rail on
+            rendered pages) is M5 part 2 — needs a `revkit build` step that
+            renders this docs/ tree through revkit's packaged Astro/Starlight
+            site. Tracked at https://github.com/vig-os/revkit/issues/57.
+            Until it lands the daemon works but has no rendered content to serve.
+
+            Docs: https://github.com/vig-os/revkit
+          '';
+        };
+      };
 }
