@@ -57,7 +57,17 @@ export type CommentSyncState =
       readonly pendingCommentDatabaseId: number;
       readonly pendingCommentNodeId?: string;
     }
-  | { readonly kind: "failed"; readonly requestedAtSeq: number; readonly failedAtSeq: number; readonly reason: string };
+  | {
+      readonly kind: "failed";
+      readonly requestedAtSeq: number;
+      readonly failedAtSeq: number;
+      readonly reason: string;
+      /** Round-2: preserved from the latest sync_requested so the
+       * reconciler's retry path can look up a matching draft on
+       * GitHub. Absent only when a failed event lands with no
+       * preceding sync_requested (defensive path). */
+      readonly fingerprint?: SyncFingerprint;
+    };
 
 /** Data the reconciler needs to fingerprint a pending draft on
  * GitHub against a local `comment.sync_requested` intent. */
@@ -276,11 +286,20 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
           prev !== undefined && (prev.kind === "pending-sync" || prev.kind === "failed" || prev.kind === "synced")
             ? prev.requestedAtSeq
             : event.seq;
+        // Preserve the fingerprint from the latest sync_requested
+        // so the reconciler's retry can look up a matching draft.
+        const preservedFingerprint =
+          prev !== undefined && prev.kind === "pending-sync"
+            ? prev.fingerprint
+            : prev !== undefined && prev.kind === "failed"
+              ? prev.fingerprint
+              : undefined;
         syncState.set(event.commentId, {
           kind: "failed",
           requestedAtSeq,
           failedAtSeq: event.seq,
           reason: event.reason,
+          ...(preservedFingerprint !== undefined ? { fingerprint: preservedFingerprint } : {}),
         });
         break;
       }

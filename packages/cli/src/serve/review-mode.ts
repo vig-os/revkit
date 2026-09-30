@@ -533,6 +533,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
  * `failed`'s fingerprint isn't needed here. */
 function syncStateFingerprint(state: CommentSyncState): SyncFingerprint | undefined {
   if (state.kind === "pending-sync") return state.fingerprint;
+  if (state.kind === "failed") return state.fingerprint;
   return undefined;
 }
 

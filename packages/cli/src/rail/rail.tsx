@@ -525,6 +525,8 @@ function subscribeEvents(
           // move threads, but comment.linked can update a
           // thread's `external.github` field).
           event.kind === "comment.linked" ||
+          event.kind === "comment.sync_requested" ||
+          event.kind === "comment.sync_failed" ||
           event.kind === "review.opened" ||
           event.kind === "review.submitted" ||
           event.kind === "review.abandoned"
@@ -723,6 +725,8 @@ function Rail(): JSX.Element {
       // stale banner stay in sync with the log.
       if (
         event.kind === "comment.linked" ||
+        event.kind === "comment.sync_requested" ||
+        event.kind === "comment.sync_failed" ||
         event.kind === "review.opened" ||
         event.kind === "review.submitted" ||
         event.kind === "review.abandoned" ||
