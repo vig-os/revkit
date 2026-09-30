@@ -7,6 +7,13 @@
 [default.extend-words]
 # Shell scripting: sed label syntax uses 'ba' (branch to label 'a')
 ba = "ba"
+# Bitap (Wu-Manber) is the real name of the fuzzy string-matching algorithm
+# used by `diff-match-patch`'s `match_main` — cited in the re-anchoring
+# engine (ADR-0006, packages/review-core/src/reanchor.ts). Not a typo of
+# "bitmap".
+bitap = "bitap"
+Bitap = "Bitap"
+BITAP = "BITAP"
 # CVE policy term (#637): a finding "unexcepted" = not in the exception register
 unexcepted = "unexcepted"
 # version-check.sh duration placeholder (#759): 'Nd' = N days (cf. Nw/Nh/Nm)

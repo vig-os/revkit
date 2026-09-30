@@ -93,6 +93,30 @@ describe("validateNext — thread.reanchored", () => {
     if (result.ok) return;
     expect(result.rejection.kind).toBe("unknown-thread");
   });
+
+  test("refuses a reanchor whose anchor.path differs from the thread's file (cross-file-reanchor)", () => {
+    const state = emptyLogState();
+    validateNext(state, created("th-1", "c-1", 1));
+    const crossFile: ReviewEvent = {
+      seq: 2,
+      ts: t,
+      actor,
+      kind: "thread.reanchored",
+      threadId: "th-1",
+      anchor: {
+        ...anchor,
+        path: "docs/other-file.md",
+        revision: "b".repeat(64),
+        startLine: 3,
+        endLine: 3,
+      },
+      method: "quote-exact",
+    };
+    const result = validateNext(state, crossFile);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("cross-file-reanchor");
+  });
 });
 
 describe("validateNext — thread.orphaned", () => {
