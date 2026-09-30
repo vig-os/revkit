@@ -24,6 +24,7 @@ import { checkFrontmatter } from "./rules/frontmatter.ts";
 import { checkLinksFile } from "./rules/links.ts";
 import { checkNoHandRolledUiFile } from "./rules/no-hand-rolled-ui.ts";
 import { checkPlotSpecFile } from "./rules/plot-structure.ts";
+import { checkVendoredCode } from "./rules/vendored-code.ts";
 import type { LoadedVocabEntry } from "./rules/vocabulary.ts";
 import { checkVocabularyFile, loadVocab } from "./rules/vocabulary.ts";
 
@@ -237,6 +238,13 @@ export async function runCheck(
     findings.push(...checkPlotSpecFile(file.absolute, file.relative));
   }
 
+  // 5b) vendored-code (ADR-0022) — one shot per invocation because
+  //     the guard is repo-level (vendor tree ↔ NOTICE), not
+  //     per-file. A commit that only touches NOTICE or a vendored
+  //     LICENSE still fires it (the pre-commit `files` regex
+  //     includes both).
+  findings.push(...checkVendoredCode(repoRoot));
+
   // 6) --online allow-annotation verification. Runs after the offline
   //    pass so an offline failure short-circuits the network calls, and
   //    each `gh api` call happens at most once per issue per run. A bad
@@ -302,4 +310,5 @@ export const CHECK_RULES: readonly string[] = [
   "vocabulary",
   "links",
   "plot-structure",
+  "vendored-code",
 ];

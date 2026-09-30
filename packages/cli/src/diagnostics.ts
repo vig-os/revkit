@@ -16,6 +16,11 @@ export const ruleIds = [
   "vocabulary",
   "links",
   "plot-structure",
+  // Repo-level guard (ADR-0022): validates the vendor tree and the
+  // repo-root NOTICE together — runs once per invocation, not
+  // per-file, because a change to NOTICE alone still needs the
+  // guard to fire.
+  "vendored-code",
   // Output-gate rule (ADR-0012 defence in depth): runs on built HTML
   // after `astro build`, not on sources. Kept in the same diagnostic
   // shape so CI logs / editors handle it uniformly.

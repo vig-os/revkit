@@ -1,0 +1,24 @@
+revkit
+Copyright 2026 gerchowl (Lars Gerchow) and contributors
+
+This product is licensed under the Apache License, Version 2.0.
+See LICENSE for the full text.
+
+================================================================================
+Third-party code
+================================================================================
+
+The @revkit/components package vendors copy-in source from permissive-licensed
+upstreams (see docs/adr/0022-vendored-code-licenses.md). Each vendored drop
+lives in its own subdirectory beside the vendor README, with the upstream
+LICENSE and an UPSTREAM provenance file that records repo, commit and path.
+
+The `revkit check` vendored-code guard enforces that each entry below points
+at a real subdirectory and that every subdirectory carries LICENSE + UPSTREAM
+and appears here.
+
+Entries take the form (one per line):
+
+    - packages/components/vendor/<pkg> — <upstream URL> (SPDX: <id>)
+
+No third-party code is vendored yet.
