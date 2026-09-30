@@ -26,6 +26,8 @@
 import { parseArchive, type ThreadArchive } from "./export.ts";
 import { reviewEventSchema, type ReviewEvent, type ReviewEventInput } from "./events.ts";
 import { reduce } from "./reducer.ts";
+import { reduceAsks, selectAsks } from "./asks-view.ts";
+import type { AskFilter, AskRecord } from "./asks.ts";
 import type { Thread, ThreadFilter, ThreadStatus } from "./thread.ts";
 import { cloneLogState, emptyLogState, validateNext, type AppendRejection, type LogState } from "./validator.ts";
 
@@ -62,6 +64,13 @@ export interface ThreadStore {
 
   /** One thread by id, or undefined. */
   thread(id: string): Promise<Thread | undefined>;
+
+  /** All asks that pass the filter, ordered by `AskRecord.createdSeq`
+   * ascending (deterministic — same discipline as threads). */
+  asks(filter?: AskFilter): Promise<AskRecord[]>;
+
+  /** One ask by id, or undefined. */
+  ask(id: string): Promise<AskRecord | undefined>;
 }
 
 /** Thrown by any `ThreadStore.append` when the input is refused. Exposes
@@ -168,6 +177,15 @@ export class InMemoryThreadStore implements ThreadStore {
 
   async thread(id: string): Promise<Thread | undefined> {
     const derived = reduce(this.#events);
+    return derived.get(id);
+  }
+
+  async asks(filter?: AskFilter): Promise<AskRecord[]> {
+    return selectAsks(this.#events, filter);
+  }
+
+  async ask(id: string): Promise<AskRecord | undefined> {
+    const derived = reduceAsks(this.#events);
     return derived.get(id);
   }
 }

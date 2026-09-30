@@ -210,6 +210,8 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
     case "presence":
     case "ask.created":
     case "ask.answered":
+    case "ask.cancelled":
+    case "ask.expired":
       // Handled outside the Thread view — see the file header.
       return;
   }

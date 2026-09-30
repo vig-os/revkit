@@ -206,6 +206,50 @@ describe("POST /-/launch-code", () => {
     }
   });
 
+  test("deep-link: `next=/ask/<id>` is honoured (M2 item 7 — ask page is a daemon-virtual route, not a static file)", async () => {
+    // A daemon-virtual route (/ask/<id>) does not exist in the
+    // static dir, so the launch-code exchange must not fall back to
+    // `/`. The redirect target is validated by structural id shape
+    // (idSchema) so no scary characters get through.
+    const minted = await fetch(daemon.url + "/-/launch-code", {
+      method: "POST",
+      headers: {
+        host: `127.0.0.1:${daemon.port}`,
+        authorization: `Bearer ${daemon.agentToken}`,
+      },
+    });
+    const body = (await minted.json()) as { launchUrl: string };
+    const url = new URL(body.launchUrl);
+    url.searchParams.set("next", "/ask/ask-example-abc");
+    const redemption = await fetch(url, {
+      redirect: "manual",
+      headers: { host: `127.0.0.1:${daemon.port}` },
+    });
+    expect(redemption.status).toBe(302);
+    expect(redemption.headers.get("location")).toBe("/ask/ask-example-abc");
+  });
+
+  test("MUTATION: `next=/ask/<bad-id>` falls back to `/` — idSchema still gates the target", async () => {
+    // A `/ask/<...>` path with a bad-shape id must NOT be honoured.
+    const minted = await fetch(daemon.url + "/-/launch-code", {
+      method: "POST",
+      headers: {
+        host: `127.0.0.1:${daemon.port}`,
+        authorization: `Bearer ${daemon.agentToken}`,
+      },
+    });
+    const body = (await minted.json()) as { launchUrl: string };
+    const url = new URL(body.launchUrl);
+    // Contains a `<` — refused by idSchema.
+    url.searchParams.set("next", "/ask/<script>");
+    const redemption = await fetch(url, {
+      redirect: "manual",
+      headers: { host: `127.0.0.1:${daemon.port}` },
+    });
+    expect(redemption.status).toBe(302);
+    expect(redemption.headers.get("location")).toBe("/");
+  });
+
   test("startup launch code and a fresh minted code are independent (using one does not spend the other)", async () => {
     // Redeem the startup code — success.
     const startupUse = await fetch(daemon.launchUrl, {

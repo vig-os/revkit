@@ -53,3 +53,106 @@ call on a human.
   `findRunningDaemon` (auto-starting a fresh daemon via the plan default), verifies the daemons `instanceId` via
   `/-/health`, rebuilds the `DaemonClient` with the new port + token, and resubscribes from `min(lastSeenSeq, head)`
   so a fresh sqlite (head=0) does not stall on a stale resume point. Backoff is bounded (500 ms → 30 s).
+
+## Amendment (2026-09-30) — asks (M2 item 7, story A1)
+
+Details of the M2 asks build-out (issue #7):
+
+- **Wire.** Two MCP tools, `ask` and `await_answer`, alongside the existing `threads` / `reply` / `resolve` /
+  `review_url`. `ask` returns `{ ask, url }` immediately (the daemon assigns the id, writes `.revkit/asks/<id>.json`
+  at mode 0600, and appends `ask.created` to the event log); `await_answer` long-polls up to `timeout_ms` (capped at
+  9 s to stay under the MCP tool deadline) and returns as soon as a terminal `ask.*` event lands. A `pending` return
+  is normal — the agent calls again. The daemon pushes `ask.answered` over `/events`, so answer-to-agent latency is
+  under 1 second (measured: median ~15 ms in the MCP contract test).
+- **Lifecycle.** `pending` → `answered` | `cancelled` | `expired`. All four states live on the log (`ask.created`,
+  `ask.answered`, `ask.cancelled`, `ask.expired`); `validateNext` refuses any second terminal transition with
+  `ask-not-pending` naming the current status. Expiry is lazy: on `GET /api/asks[/:id]` and on the pre-answer sweep
+  the daemon appends `ask.expired` for any pending ask past its `expiresAtMs`, so a slow answer POST that raced the
+  deadline lands as `ask-not-pending` rather than winning silently.
+- **HTTP roles.** `POST /api/asks` is agent-bearer only; `POST /api/asks/:id/answer` is session-cookie only (bearer
+  alone is refused with 403 so a rogue agent cannot self-answer); `POST /api/asks/:id/cancel` is agent-bearer only.
+  Every write goes through the shared Origin gate + `Sec-Fetch-Site` check; the answer body has its own 256 KiB cap
+  on top of the 1 MiB request cap.
+- **`/ask/<id>` page.** Session-cookie authenticated HTML served by the daemon. The Solid island is compiled at
+  build time by `babel-preset-solid` (via `packages/cli/src/ask-page/bundle.ts`) and served at `/-/ask.js`; the CSP
+  names that exact path and never carries `'unsafe-eval'`. The record is inlined as a JSON `<script>` tag —
+  `encodeBootJson` escapes `</script`, `<!--` and `-->` so an agent-supplied `spec.title` cannot break out. All
+  visible strings land through Solid's text-node path, never `innerHTML`. axe passes at ADR-0017's strict "any
+  violation" gate on all six kinds (choice, rank, scale, text, region, review).
+
+## Amendment (2026-09-30) — asks PR #52 round-2 review
+
+Further refinements from PR #52 round-2:
+
+- **`encodeBootJson` emits VALID JSON.** The earlier `<\!--` / `--\>`
+  escapes were not legal JSON, so an agent title containing `-->`
+  (e.g. `"step 1 --> step 2"`) crashed `JSON.parse` in the browser
+  and `readBoot` silently returned nothing, leaving the page blank
+  while `await_answer` waited out the TTL. `<`, `>`, `&`, U+2028 and
+  U+2029 are now encoded as `<` / `>` / `&` /
+  ` ` / ` ` — valid JSON, safe inside a `<script>` block,
+  and lossless on round-trip. `readBoot` now fails LOUDLY on any
+  shape mismatch: a visible `[data-testid="revkit-ask-error"]`
+  state plus `console.error`, never a blank page.
+- **Answer-shape validation at the append boundary.** `validateNext`
+  now checks answer VALUES against the ask spec at
+  `ask.answered` time, not just the discriminant. Choice values
+  must be option ids (or `other:...` when `allowOther` is set);
+  scale values must be in `[min,max]` on an integer step index
+  (validated with a magnitude-scaled tolerance so large-range /
+  small-step scales like `0..1e9 step 0.001` do not falsely
+  reject); rank rankings must be exact permutations of the option
+  ids. Rejection kind: `answer-shape-mismatch`, with a `field` path.
+- **Scale UI does not preselect a value.** The earlier `(min+max)/2`
+  default landed off-step whenever `(max-min)/step` was odd
+  (e.g. 2.5 on a `1..4 step 1` scale) and the tightened validator
+  refused it — a human submitting the default could not answer.
+  The slider is now positioned via an INTEGER step index and the
+  submit button stays disabled until the human touches the
+  slider, so the "default" never biases the answer AND the
+  submitted value cannot leave the step lattice by construction.
+  `askSchema` also refuses at CREATION time any scale where
+  `(max - min)` is not a positive integer multiple of `step`.
+- **System actor for daemon-emitted events.** `authorKinds` gains
+  `"system"`; the lazy `ask.expired` sweep uses
+  `{kind:"system", id:"revkit-daemon"}` rather than reusing
+  `agent`. The rail carries a `--system` CSS modifier so these
+  events render distinctly.
+- **`/-/ask.js` scoped to `/ask/<id>` responses.** Every other HTML
+  page's `script-src` no longer allowlists the ask bundle; a
+  stored HTML that tries `<script src="/-/ask.js">` on `/` is
+  refused by the browser.
+- **`ask` MCP tool returns a ready-to-open launch URL.** The
+  daemon returns the same-origin `/ask/<id>` path, and the MCP
+  tool wraps it with a fresh single-use launch code (60 s TTL, one
+  code per ask) so the URL the agent hands the human is directly
+  clickable. `await_answer` registers its waiter BEFORE the fast-
+  path `getAsk` fetch, and disposes the waiter + timer if
+  `getAsk` throws — the earlier ordering could miss a terminal
+  event that landed during the fetch, and leaked timers on the
+  throw path.
+- **Ask-create disk-failure path.** The on-disk `.revkit/asks/<id>.json`
+  is written AFTER the event is accepted. If the write fails, the
+  daemon appends `ask.cancelled` (system actor), FANS the event on
+  `/events` like any other terminal transition, and returns 500
+  (server-side I/O failure) — not 400 with `path: ["id"]`, which
+  would be a client-shape complaint the client cannot act on.
+- **Replay policy for `answer-shape-mismatch`.** The stricter
+  validator can refuse answers that earlier commits on the same
+  branch wrote to the log. `SqliteThreadStore.open` ACCEPTS such
+  events on replay (with a `stderr` warning naming the ask id):
+  the reducer already projects the answer, and refusing to start
+  over historical data would strand a user on a fresh boot. New
+  appends still run the strict rule; every other rejection kind
+  remains fatal on replay.
+  **Cutoff (PR #52 round-3 review).** The reviewer asked whether
+  this leniency should be bounded to events whose schema version
+  predates the tightened check. **Individual `ReviewEvent`s do
+  not carry a `schemaVersion` field on the wire** — only
+  persisted *data files* (asks, threads archive) do, per
+  ADR-0003 / ADR-0021. There is therefore no per-event version
+  to gate on, and inventing a sentinel would be worse than a
+  bounded, explicit lenient replay. We leave the leniency as is;
+  when `CURRENT_SCHEMA_VERSION` bumps and the event log carries
+  a `schemaVersion` header, this replay branch is the natural
+  place to gate on it.

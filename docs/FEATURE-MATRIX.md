@@ -6,7 +6,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 
 | ID | Story | ADRs | Milestone | Tracking | Status |
 |---|---|---|---|---|---|
-| A1 | Rich question pages instead of chat prompts, answer to agent < 1 s | ADR-0007, ADR-0002, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
+| A1 | Rich question pages instead of chat prompts, answer to agent < 1 s | ADR-0007, ADR-0002, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 item 7) |
 | A2 | Inline comments on any block, persistent, structured to the agent | ADR-0002, ADR-0006, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
 | A3 | Threads with the agent anchored on a block | ADR-0007, ADR-0011, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
 | A4 | Agent publishes a report; page refreshes < 1 s without a full build | ADR-0001, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |

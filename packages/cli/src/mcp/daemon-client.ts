@@ -160,6 +160,76 @@ export class DaemonClient {
     return parsed;
   }
 
+  /** `POST /api/asks` — create a new question spec (M2 item 7,
+   * story A1). Returns `{ ask, url }` where `url` is the same-origin
+   * path the human opens (`/ask/<id>`). The `ttlMs` cap governs
+   * when the daemon emits `ask.expired` lazily.
+   *
+   * Caller is `revkit mcp`'s `ask` tool; the shape mirrors the
+   * daemon's `createAskRequestSchema` on purpose. */
+  async createAsk(spec: unknown, opts: { id?: string; ttlMs?: number } = {}): Promise<{ ask: unknown; url: string }> {
+    const body: Record<string, unknown> = { spec };
+    if (opts.id !== undefined) body.id = opts.id;
+    if (opts.ttlMs !== undefined) body.ttlMs = opts.ttlMs;
+    const response = await this.#fetch(`${this.#url}/api/asks`, {
+      method: "POST",
+      headers: this.#authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /api/asks → ${response.status} ${text}`,
+        response.status,
+        text,
+      );
+    }
+    return (await response.json()) as { ask: unknown; url: string };
+  }
+
+  /** `GET /api/asks/:id` — read the current state of an ask. */
+  async getAsk(id: string): Promise<unknown> {
+    const response = await this.#fetch(
+      `${this.#url}/api/asks/${encodeURIComponent(id)}`,
+      {
+        method: "GET",
+        headers: this.#authHeaders(),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon GET /api/asks/${id} → ${response.status}`,
+        response.status,
+        text,
+      );
+    }
+    const parsed = (await response.json()) as { ask: unknown };
+    return parsed.ask;
+  }
+
+  /** `POST /api/asks/:id/cancel`. */
+  async cancelAsk(id: string, reason?: string): Promise<unknown> {
+    const body = reason !== undefined ? { reason } : {};
+    const response = await this.#fetch(
+      `${this.#url}/api/asks/${encodeURIComponent(id)}/cancel`,
+      {
+        method: "POST",
+        headers: this.#authHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify(body),
+      },
+    );
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /api/asks/${id}/cancel → ${response.status} ${text}`,
+        response.status,
+        text,
+      );
+    }
+    return await response.json();
+  }
+
   /** `POST /api/threads/:id/resolve`. */
   async resolve(threadId: string, resolution?: string): Promise<AppendResponse> {
     const body = resolution !== undefined ? { resolution } : {};

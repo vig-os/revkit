@@ -35,6 +35,14 @@
 //                      /ask/<id> (§5.1, ADR-0007).
 //   ask.answered     — the human answered the question; the answer is
 //                      routed back to the agent through the channel.
+//   ask.cancelled    — the agent (or a supervisor) cancels a pending
+//                      ask before the human answers, e.g. because the
+//                      question is stale after a rebuild. Terminal.
+//   ask.expired      — a pending ask crossed its `expiresAt` deadline
+//                      without an answer. The daemon emits this
+//                      lazily on the next read, so a caller that
+//                      never polls still sees the terminal state on
+//                      its first `GET /api/asks/:id`. Terminal.
 //   comment.linked   — records an external mapping for a local comment
 //                      (M3 GitHub adapter, ADR-0025). Reserved on v0 so
 //                      M3 lands without a `schemaVersion` bump; the M2
@@ -156,13 +164,33 @@ const askCreatedPayload = {
   kind: z.literal("ask.created"),
   askId: idSchema,
   spec: askSchema,
-  url: z.string().min(1).optional(),
+  /** Same-origin path (e.g. `/ask/<id>`) or absolute URL the human
+   * opens to answer. Recorded on the event so a re-derivation of
+   * the asks view reproduces exactly what the agent got back from
+   * `ask` at creation time — even if the daemon later runs on a
+   * different port. Optional so an older log still parses. */
+  url: z.string().min(1).max(4096).optional(),
+  /** Wall-clock deadline (ms since epoch) after which the daemon
+   * lazily emits `ask.expired`. Optional — an ask with no deadline
+   * lives until answered or cancelled. */
+  expiresAtMs: z.number().int().positive().optional(),
 } as const;
 
 const askAnsweredPayload = {
   kind: z.literal("ask.answered"),
   askId: idSchema,
   answer: askAnswerSchema,
+} as const;
+
+const askCancelledPayload = {
+  kind: z.literal("ask.cancelled"),
+  askId: idSchema,
+  reason: z.string().min(1).max(4096).optional(),
+} as const;
+
+const askExpiredPayload = {
+  kind: z.literal("ask.expired"),
+  askId: idSchema,
 } as const;
 
 const commentLinkedPayload = {
@@ -256,6 +284,8 @@ const eventVariants = [
     }),
   z.object({ ...envelope, ...askCreatedPayload }).strict(),
   z.object({ ...envelope, ...askAnsweredPayload }).strict(),
+  z.object({ ...envelope, ...askCancelledPayload }).strict(),
+  z.object({ ...envelope, ...askExpiredPayload }).strict(),
   z
     .object({ ...envelope, ...commentLinkedPayload })
     .strict()
@@ -321,6 +351,8 @@ export const reviewEventKinds = [
   "presence",
   "ask.created",
   "ask.answered",
+  "ask.cancelled",
+  "ask.expired",
   "comment.linked",
   "thread.reanchored",
   "thread.orphaned",

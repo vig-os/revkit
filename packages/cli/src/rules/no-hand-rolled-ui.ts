@@ -82,9 +82,16 @@ const RULE_EXEMPT_PREFIXES: readonly string[] = [
  * `/events` endpoints), so it does not belong under
  * `packages/components/src/`. Since PR #22 the rail is JSX-compiled
  * at build time (`babel-preset-solid`) to keep `script-src` free of
- * `'unsafe-eval'` — hence the `.tsx` extension. */
+ * `'unsafe-eval'` — hence the `.tsx` extension.
+ *
+ * `packages/cli/src/ask-page/ask-page.tsx` — the `/ask/<id>`
+ * question page (M2 item 7, story A1). Same shape as the rail:
+ * bundled by `packages/cli/src/ask-page/bundle.ts` and served at
+ * `/-/ask.js`; no `site/` import path; JSX-compiled at build so
+ * CSP does not widen to `'unsafe-eval'`. */
 const RULE_EXEMPT_FILES: ReadonlySet<string> = new Set([
   "packages/cli/src/rail/rail.tsx",
+  "packages/cli/src/ask-page/ask-page.tsx",
 ]);
 
 /** Path prefixes where a code module is out of place: content is data.
