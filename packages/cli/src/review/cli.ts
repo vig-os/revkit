@@ -121,6 +121,13 @@ export interface RunReviewEnv {
    * boundary needs a stable per-install tag; the caller
    * (`packages/cli/src/index.ts:review`) mints or reads it once. */
   readonly localUserId: string;
+  /** Injectable `runCheck` function — the adversarial e2e tests
+   * (PR #48 round-4 requirement) inject a WEAKENED variant that
+   * drops one guard, to prove each RED evidence flips when the
+   * guard is removed. Every code path uses this seam, so the
+   * weakening is applied to the SHIPPING flow, not a local
+   * copy. When absent, the real `runCheck` is used. */
+  readonly _runCheck?: typeof runCheck;
   /** Skip `check-dist` — for tests that need to bypass the ADR-0012
    * output-gate sanitiser on a hand-rolled fake dist. NEVER set in
    * production; the CLI dispatcher never sets it. */
@@ -669,7 +676,8 @@ async function runCheckOnMaterialized(
   if (options.onlyPaths !== undefined) {
     files = files.filter((f) => options.onlyPaths!.has(f.relative));
   }
-  const output = await runCheck(materializedRoot, files, discovery.symlinks, {
+  const checkFn = env._runCheck ?? runCheck;
+  const output = await checkFn(materializedRoot, files, discovery.symlinks, {
     online: false,
     repoSlug: env.repoSlug,
     gh: env.gh,

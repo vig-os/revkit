@@ -6,5 +6,5 @@
     "types": ["astro/client", "node", "bun"]
   },
   "include": [".astro/types.d.ts", "**/*", "tests/**/*"],
-  "exclude": ["dist", "node_modules", "test-results", "playwright-report", "blob-report"]
+  "exclude": ["dist", "node_modules", "test-results", "playwright-report", "blob-report", ".revkit-review"]
 }

@@ -61,6 +61,40 @@ export const CONTENT_ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
  * and rebuilds `tooling` paths from base. */
 export type PathClass = "content" | "tooling";
 
+/** Basenames that are ALWAYS tooling — even under a content prefix,
+ * even with a content-allowed extension. Package manager manifests
+ * and lockfiles never belong in a content directory, so a PR that
+ * plants one there is refused (defense-in-depth against a
+ * content-directory smuggle; the manifests are only meaningful to
+ * package managers, but the CLASS of file is tooling and taking it
+ * from the PR head would violate ADR-0025's "content from head,
+ * tooling from base" rule regardless of location). */
+const ALWAYS_TOOLING_BASENAMES: ReadonlySet<string> = new Set([
+  "package.json",
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "pnpm-lock.yaml",
+  ".npmrc",
+  ".yarnrc",
+  ".yarnrc.yml",
+  ".pnpmrc",
+]);
+
+/** Path segments that are ALWAYS tooling if they appear ANYWHERE in
+ * the path. `node_modules/` is never valid inside a PR — it is
+ * derived from `package.json` on the reviewer's trusted toolchain,
+ * never authored. `.git/` cannot appear in a tree anyway (git
+ * refuses), but the segment check surfaces a clearer refusal if
+ * something ever conspired to smuggle one in. */
+const ALWAYS_TOOLING_SEGMENTS: ReadonlySet<string> = new Set([
+  "node_modules",
+  ".git",
+  ".direnv",
+]);
+
 /** Classify a repo-relative POSIX path. */
 export function classifyPath(path: string): PathClass {
   // Refuse any absolute path (should be repo-relative), any `..`
@@ -71,7 +105,17 @@ export function classifyPath(path: string): PathClass {
   if (path.length === 0) return "tooling";
   if (path.startsWith("/")) return "tooling";
   if (path.includes("\\")) return "tooling";
-  if (path.split("/").some((segment) => segment === "..")) return "tooling";
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "..")) return "tooling";
+
+  // ALWAYS-tooling segments — `node_modules/anything`,
+  // `.git/anything`, `.direnv/anything`. Applies before the prefix
+  // check so a `docs/x/node_modules/evil.js` (which starts with a
+  // content prefix and has a `.js` extension excluded from
+  // CONTENT_ALLOWED_EXTENSIONS anyway) surfaces the clearest reason
+  // — and a hypothetical future content extension that included
+  // `.js` still refuses this path.
+  if (segments.some((segment) => ALWAYS_TOOLING_SEGMENTS.has(segment))) return "tooling";
 
   // Prefix match.
   const onPrefix = CONTENT_ALLOWLIST_PREFIXES.some((prefix) => path.startsWith(prefix));
@@ -82,6 +126,14 @@ export function classifyPath(path: string): PathClass {
   // tooling (a Makefile-like file in `docs/` is not content).
   const slash = path.lastIndexOf("/");
   const basename = slash === -1 ? path : path.slice(slash + 1);
+
+  // ALWAYS-tooling basenames — `package.json`, lockfiles, `.npmrc`.
+  // A `docs/x/package.json` has `.json` in CONTENT_ALLOWED_EXTENSIONS
+  // and would otherwise be classified as content; this belt refuses
+  // it regardless of location (PR #48 round-4 nit: defense-in-depth
+  // against content-directory smuggle of package-manager metadata).
+  if (ALWAYS_TOOLING_BASENAMES.has(basename)) return "tooling";
+
   const dot = basename.lastIndexOf(".");
   if (dot <= 0) return "tooling"; // no ext, or dotfile like `.gitkeep`
   const ext = basename.slice(dot).toLowerCase();

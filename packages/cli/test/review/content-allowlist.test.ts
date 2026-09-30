@@ -119,6 +119,35 @@ describe("classifyPath — allow/deny decisions on the DEFAULT constants", () =>
     expect(classifyPath("docs/.gitkeep")).toBe("tooling");
     expect(classifyPath("docs/Makefile")).toBe("tooling");
   });
+
+  test("package-manager manifests under a content dir are TOOLING (defense-in-depth)", () => {
+    // A `package.json` at ANY path is tooling — the belt in
+    // classifyPath forces this classification even when the
+    // prefix + extension would otherwise pass (PR #48 round-4
+    // adversarial-e2e nit: refuse content-directory smuggle of
+    // package-manager metadata).
+    expect(classifyPath("docs/x/package.json")).toBe("tooling");
+    expect(classifyPath("site/src/content/docs/x/package.json")).toBe("tooling");
+    expect(classifyPath("plots/adv/package.json")).toBe("tooling");
+    expect(classifyPath("vocab/adv/package-lock.json")).toBe("tooling");
+    expect(classifyPath("docs/adv/bun.lock")).toBe("tooling");
+    expect(classifyPath("docs/adv/pnpm-lock.yaml")).toBe("tooling");
+    expect(classifyPath("site/src/content/docs/adv/.npmrc")).toBe("tooling");
+  });
+
+  test("node_modules/ segment anywhere is TOOLING (defense-in-depth)", () => {
+    // A `node_modules/` under content classifies as tooling by
+    // segment name, so tooling-diff catches the smuggle even for
+    // basenames whose extension IS in CONTENT_ALLOWED_EXTENSIONS
+    // (e.g. `.json`, `.md`) (PR #48 round-4 adversarial-e2e nit).
+    expect(classifyPath("docs/x/node_modules/evil.js")).toBe("tooling");
+    expect(classifyPath("docs/x/node_modules/pkg/package.json")).toBe("tooling");
+    expect(classifyPath("site/src/content/docs/x/node_modules/pwn.md")).toBe("tooling");
+    expect(classifyPath("plots/x/node_modules/pwn.json")).toBe("tooling");
+    // `.git/` and `.direnv/` segments too — never valid inside a PR.
+    expect(classifyPath("docs/x/.git/config")).toBe("tooling");
+    expect(classifyPath("docs/x/.direnv/lib/foo.js")).toBe("tooling");
+  });
 });
 
 describe("isUnderContentPrefix — reports directory-only match for diagnostics", () => {
