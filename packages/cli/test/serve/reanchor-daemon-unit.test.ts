@@ -428,6 +428,132 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
       await new Promise((r) => setTimeout(r, 100));
     }
     expect(anchoredAtV3).toBe(true);
+
+    // Round-5 extension of PROBE G (probe7): the write AFTER the
+    // rebind must ALSO be caught. Under the round-4 code the post-
+    // rebind fs.watch silently no-ops (a Bun/libuv issue where the
+    // inotify state for a renamed-away path stays broken) — the
+    // catch-up refresh fires once for the first write but every
+    // subsequent write is missed.
+    const readsBefore = env.rd.fileReadCount();
+    // Drop yet another version.
+    const v4 =
+      "# Doc\n\n" +
+      "Filler paragraph number 0 here.\n\n" +
+      "Filler paragraph number 1 here.\n\n" +
+      "Filler paragraph number 2 here.\n\n" +
+      "Filler paragraph number 3 here.\n\n" +
+      "Filler paragraph number 4 here.\n\n" +
+      "Filler paragraph number 5 here.\n\n" +
+      "Filler paragraph number 6 here.\n\n" +
+      "Filler paragraph number 7 here.\n\n" +
+      "Filler paragraph number 8 here.\n\n" +
+      "Filler paragraph number 9 here.\n\n" +
+      "Intro para.\n\n" + QUOTE + OUTRO;
+    writeFileSync(f, v4);
+    const v4Rev = await revisionOf(v4);
+    let anchoredAtV4 = false;
+    for (let i = 0; i < 40 && !anchoredAtV4; i++) {
+      const all = await env.store.threads();
+      const t = all.find((x) => x.id === T);
+      if (t?.anchor.revision === v4Rev) {
+        anchoredAtV4 = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(anchoredAtV4).toBe(true);
+    // The post-rebind polling fallback must have triggered a read.
+    expect(env.rd.fileReadCount()).toBeGreaterThan(readsBefore);
+  });
+
+  test("PROBE G rename-swap: the SECOND write after the rebind is caught too", async () => {
+    // Sibling of the rm-rf test: after `renameSync + mkdirSync`,
+    // the FIRST write is caught by the catch-up refresh, but under
+    // the round-4 code the fresh fs.watch silently no-ops on
+    // subsequent writes. The round-5 fix swaps to polling on
+    // rebind, so subsequent writes ARE seen.
+    const env = await setup({ fileDebounceMs: 30, dirRebindIntervalMs: 100 });
+    const f = join(env.root, "docs/a.md");
+    const v1 = mk(0);
+    writeFileSync(f, v1);
+    const T = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    await seedThread(env.store, v1, "docs/a.md", T);
+    await env.rd.reconcileWatchers();
+    await new Promise((r) => setTimeout(r, 100));
+
+    renameSync(join(env.root, "docs"), join(env.root, "docs-old"));
+    mkdirSync(join(env.root, "docs"));
+    const v2 = mk(2);
+    writeFileSync(f, v2);
+    // Wait for rebind + first catch-up.
+    const v2Rev = await revisionOf(v2);
+    let anchoredAtV2 = false;
+    for (let i = 0; i < 40 && !anchoredAtV2; i++) {
+      const all = await env.store.threads();
+      const t = all.find((x) => x.id === T);
+      if (t?.anchor.revision === v2Rev) {
+        anchoredAtV2 = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(anchoredAtV2).toBe(true);
+
+    // NOW: the second write. This is what the reviewer's probe7
+    // asserts — the fresh watcher (under round-4 code) does not
+    // fire, so this write is missed.
+    const readsBefore = env.rd.fileReadCount();
+    const v3 = mk(8);
+    writeFileSync(f, v3);
+    const v3Rev = await revisionOf(v3);
+    let anchoredAtV3 = false;
+    for (let i = 0; i < 40 && !anchoredAtV3; i++) {
+      const all = await env.store.threads();
+      const t = all.find((x) => x.id === T);
+      if (t?.anchor.revision === v3Rev) {
+        anchoredAtV3 = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(anchoredAtV3).toBe(true);
+    expect(env.rd.fileReadCount()).toBeGreaterThan(readsBefore);
+  });
+
+  test("PROBE J: a pre-5b thread at the current disk revision with NO snapshot is BACKFILLED on refresh, and survives the first edit", async () => {
+    // The reviewer's PROBE J: an existing daemon's db has threads
+    // whose anchor.revision equals the current disk hash but the
+    // snapshots table is empty (a pre-5b DB, or a snapshot that
+    // was pruned). Under the round-4 code the state-derived skip
+    // returned BEFORE `putSnapshotSafe`, so the snapshot was
+    // never backfilled — the first edit then orphaned the thread
+    // spuriously.
+    const env = await setup();
+    const f = join(env.root, "docs/a.md");
+    const v1 = mk(0);
+    writeFileSync(f, v1);
+    const T = "77777777-7777-4777-8777-777777777777";
+    await seedThread(env.store, v1, "docs/a.md", T);
+    // Delete the snapshot to simulate a pre-5b DB (or a GC that
+    // ran without the grace period).
+    env.store.gcSnapshots(new Set(), 0);
+    const v1Rev = await revisionOf(v1);
+    expect(env.store.getSnapshot(v1Rev)).toBeUndefined();
+
+    // Refresh on the unchanged file — the round-5 fix backfills the
+    // snapshot BEFORE the state-derived skip.
+    await env.rd.refresh("docs/a.md");
+    expect(env.store.getSnapshot(v1Rev)).toBe(v1);
+
+    // The first edit MUST re-anchor T, not orphan it.
+    const v2 = mk(2);
+    writeFileSync(f, v2);
+    await env.rd.refresh("docs/a.md");
+    const all = await env.store.threads();
+    const t = all.find((x) => x.id === T);
+    expect(t?.status).toBe("open");
+    expect(t?.anchor.startLine).toBe(lineOf(v2));
   });
 
   test("rejected append leaves the orphan check memo untouched so the thread stays eligible for retry", async () => {
