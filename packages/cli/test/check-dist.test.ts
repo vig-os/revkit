@@ -354,6 +354,240 @@ describe("check-dist — round-4 parse5 / rel-mix / CSS-unescape / srcset / scri
   });
 });
 
+describe("check-dist — issue #27 SVG url() presentation-attr fixtures", () => {
+  // Every fixture in this block is a bypass shape from issue #27
+  // that pre-hardening check-dist waved through — the source
+  // sanitiser (render-plot.ts) drops each one, but a hand-crafted or
+  // build-tool-emitted SVG could still reach the output gate.
+  //
+  // Mutation-check anchor: deleting the URL_BEARING_SVG_ATTRIBUTES
+  // walk in check-dist.ts (or the fresh-regex `for (…) of
+  // decoded.matchAll(…)` loop inside `cssValueFinding`) makes every
+  // assertion in this block regress to zero findings, so a future
+  // refactor that drops the scan trips loudly instead of silently.
+  //
+  // Each fixture asserts a specific bypass surface — no test just
+  // checks "some finding fires". Positive controls at the end of the
+  // block prove legitimate `url(#fragment)` refs and `<use
+  // href="#id">` are NOT refused (guards against a swing-too-far
+  // regression that would also reject Vega's real output).
+
+  test("fill=url(https://…) is refused (external URL in presentation attr)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(https://evil.example/x.png)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+    expect(findings.some((f) => f.message.includes("only same-document"))).toBe(true);
+  });
+
+  test("stroke=url(//host) is refused (protocol-relative URL)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect stroke="url(//evil.example/x.png)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("//evil.example"))).toBe(true);
+  });
+
+  test("cursor=url(https://…) is refused (tracker-pixel shape from issue #27)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect cursor="url(https://evil.example/pixel.png), pointer"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("clip-path=url(data:…) is refused (data URL in presentation attr)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect clip-path="url(data:image/svg+xml,<svg/>)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("data:"))).toBe(true);
+  });
+
+  test("mask=url(https://…#id) is refused (fragment inside a remote SVG is still a remote fetch)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect mask="url(https://evil.example/x.svg#m)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("marker-start=url(https://…) is refused", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><path marker-start="url(https://evil.example/m)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("CSS-escape variant `u\\rl(https://…)` is refused after cssUnescape", () => {
+    // Backslash-r in CSS = literal r, so `u\rl(` tokenizes as `url(`.
+    // Without cssUnescape the url regex would not fire on the raw
+    // attribute value.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="u\\rl(https://evil.example/x)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("hex-escape `\\75 rl(https://…)` is refused after cssUnescape", () => {
+    // \75 in CSS is 'u' — `\75 rl(` unescapes to `url(`.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="\\75 rl(https://evil.example/x)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("mixed-case `URL(https://…)` is refused (lowercased before scan)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="URL(https://evil.example/x)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("whitespace inside `url( … )` is refused (regex tolerates padding)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(   https://evil.example/x   )"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("CSS comment inside a presentation attr is stripped, then url() refused", () => {
+    // `cssUnescape` strips `/* … */` block comments before it runs
+    // the escape fold, so `/* c */url(https://…)` collapses to
+    // `url(https://…)` and refuses.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="/* c */url(https://evil.example/x)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("entity-encoded `&#x75;rl(https://…)` on an SVG presentation attr is refused (parse5 decodes entities)", () => {
+    // parse5 decodes HTML entities in attribute values, so the
+    // scanner sees the effective `url(https://…)` even though the
+    // source had an encoded 'u'.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="&#x75;rl(https://evil.example/x)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("nested url() inside image-set() is refused (image-set token fires first)", () => {
+    // image-set() itself is an out-of-origin fetcher — a value like
+    // `image-set(url(x))` refuses at the outer token so the finding
+    // names the more-specific loader (round-4 ordering guarantee).
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="image-set(url(https://evil.example/x) 1x)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("image-set"))).toBe(true);
+  });
+
+  test("positive control: fill=url(#gradient1) is ACCEPTED (Vega's real output shape)", () => {
+    // Vega emits a rect whose fill is a same-document url(#…) ref
+    // for gradient marks; a scan that also refused these would fail
+    // every real plot build. This is the guard against a
+    // swing-too-far regression.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="gradient1"/></defs>
+        <rect fill="url(#gradient1)" stroke="url(#gradient1)" clip-path="url(#clip_a)" mask="url(#m)"/>
+      </svg>
+    </body></html>`;
+    expect(scan(html)).toEqual([]);
+  });
+});
+
+describe("check-dist — issue #27 SVG <use href> fixtures", () => {
+  test("<use href=https://…> is refused (cross-origin use, tracked in #27)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><use href="https://evil.example/lib.svg#g"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("<use"))).toBe(true);
+    expect(findings.some((f) => f.message.includes("same-document"))).toBe(true);
+  });
+
+  test("<use xlink:href=https://…> is refused (xlink form still checked)", () => {
+    // A stale user agent might follow the xlink form even when
+    // SVG 2 says `href` wins, so a non-fragment `xlink:href` refuses
+    // regardless of what `href` says.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><use xlink:href="https://evil.example/lib.svg#g"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("<use xlink:href"))).toBe(true);
+  });
+
+  test("<use href=\"#ok\" xlink:href=https://…> is refused (both attrs checked, not just the SVG 2 precedence winner)", () => {
+    // Precedence guard: an attacker sets `href="#ok"` to satisfy a
+    // scanner that only checks the SVG 2 winner and hides the
+    // outbound URL in `xlink:href`. Both attributes are checked, so
+    // this refuses on the xlink form.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><use href="#ok" xlink:href="https://evil.example/lib.svg#g"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("<use xlink:href"))).toBe(true);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("<use href=/same-origin/path> is refused (must be #fragment, not path)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><use href="/assets/icons.svg#pencil"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("<use href"))).toBe(true);
+    expect(findings.some((f) => f.message.includes("same-document"))).toBe(true);
+  });
+
+  test("<use href=%23ok> is accepted after percent-decoding (%23 is the URL-encoded #)", () => {
+    // decodeUntilStable folds %23 → #; the fragment identifier is
+    // structurally the same as href="#ok", so the check passes.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><use href="%23ok"/></svg>
+    </body></html>`;
+    expect(scan(html)).toEqual([]);
+  });
+
+  test("<use href=%25%32%33ok> (nested-encoded #) is accepted (decodeUntilStable loops until fixed point)", () => {
+    // %25%32%33 → %23 → #. The stable-decode loop mirrors the
+    // script-src round-5 behaviour so a nested-encoded attack shape
+    // is normalised before the check.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><use href="%25%32%33ok"/></svg>
+    </body></html>`;
+    expect(scan(html)).toEqual([]);
+  });
+
+  test("<use href=\"\"> is refused (empty is not a #fragment)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><use href=""/></svg>
+    </body></html>`;
+    // Empty attribute value doesn't reach useHrefFinding (length ==
+    // 0 short-circuits). This test documents that intended behavior —
+    // an empty href is a no-op reference, not an outbound one.
+    expect(scan(html)).toEqual([]);
+  });
+
+  test("<use href=#ok> is accepted (positive control)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg">
+        <defs><symbol id="ok"><rect/></symbol></defs>
+        <use href="#ok"/>
+      </svg>
+    </body></html>`;
+    expect(scan(html)).toEqual([]);
+  });
+});
+
 describe("cssUnescape", () => {
   test("backslash-r produces literal r", () => {
     expect(cssUnescape("u\\rl(")).toBe("url(");

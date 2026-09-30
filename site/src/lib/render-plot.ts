@@ -275,8 +275,12 @@ function sanitizeUrlsInValue(value: string): string {
  * `url(#fragment)` reference (Vega uses these for gradient / clip
  * fills), so the value is rewritten rather than the attribute stripped.
  * `style` is intentionally NOT here — see the block comment on
- * ALLOWED_ATTRIBUTES for why raw CSS never survives. */
-const URL_BEARING_ATTRIBUTES: ReadonlySet<string> = new Set([
+ * ALLOWED_ATTRIBUTES for why raw CSS never survives.
+ *
+ * Exported so `revkit check-dist` can URL-scan the same set of
+ * presentation attributes at the output gate (issue #27) — one source
+ * of truth for which SVG attribute values can carry `url(…)`. */
+export const URL_BEARING_SVG_ATTRIBUTES: ReadonlySet<string> = new Set([
   "fill",
   "stroke",
   "clip-path",
@@ -285,7 +289,29 @@ const URL_BEARING_ATTRIBUTES: ReadonlySet<string> = new Set([
   "marker-start",
   "marker-mid",
   "marker-end",
+  // `cursor: url(…)` is a legitimate CSS presentation value; without it
+  // an attacker could point cursor at a tracker (`cursor="url(https://
+  // evil.example/pixel.png)"`) and check-dist would miss it. Added here
+  // so both the source sanitiser and check-dist rewrite / refuse it.
+  "cursor",
 ]);
+
+const URL_BEARING_ATTRIBUTES = URL_BEARING_SVG_ATTRIBUTES;
+
+/** Exported for `revkit check-dist` (issue #27): given a value from an
+ * SVG presentation attribute or a `style` value, decide whether the
+ * (unescaped) `url(…)` argument names a same-document fragment
+ * (`url(#gradient1)`). Anything else — `url(https://…)`, `url(//…)`,
+ * `url(data:…)`, `url()`, a nested URL — refuses. */
+export function isSameDocumentFragmentRef(raw: string): boolean {
+  return isSafeFragmentReference(raw);
+}
+
+/** Exported for `revkit check-dist`: the raw `url(…)` regex both
+ * sanitisers use. Kept as a source-of-truth export so the output gate
+ * cannot drift from the source sanitiser on which token shapes count
+ * as a `url(…)` (quoted, unquoted, whitespace-padded). */
+export const CSS_URL_VALUE_REGEX = URL_VALUE;
 
 function isSameDocumentFragment(value: string): boolean {
   return value.trim().startsWith("#");
