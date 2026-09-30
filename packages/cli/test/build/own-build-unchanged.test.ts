@@ -1,48 +1,87 @@
-// Regression test: with `REVKIT_CONSUMER_ROOT` UNSET, this repo's
-// own build produces the same NORMALISED HTML output as a stash-
-// and-rebuild that reverts the #57 changes. Issue #57's acceptance
-// calls this out explicitly ("this repo's own build must behave
-// exactly as today; prove that the built output is unchanged").
+// Rendering-pipeline digest test (issue #57, round-3 review).
 //
-// Astro's build IS NOT byte-for-byte reproducible — rolldown chunk
-// hashes and pagefind fingerprints shift between runs (a plain
-// `sha256` diff would flip on every CI run). What IS stable:
+// Builds a FIXED docs fixture (`packages/cli/test/build/fixtures/
+// pipeline-fixture/`) through the packaged flow (`nix build .#revkit`
+// + `revkit build --dir <fixture>`), canonicalises each rendered
+// HTML page and compares against a committed digest at
+// `packages/cli/test/build/fixtures/pipeline-digest.json`.
 //
-//   1. The set of HTML page paths.
-//   2. The visible TEXT of each page — every `<title>`, every
-//      `<h1>`/`<h2>`, every paragraph body. This is what a
-//      reviewer sees on the rendered page.
-//   3. The `data-src` anchor set — the shape the rail uses to
-//      pin comments.
+// **Why a fixture, not the live docs.** An earlier revision hashed
+// the live `docs/` tree, which meant every doc edit — an ADR add,
+// a matrix row bump — flipped the test red even though the
+// rendering pipeline was fine. CLAUDE.md's traceability rule
+// pushes most PRs to touch the matrix, so this test would have
+// been the noisiest guard in the repo. Fixing the input to a
+// checked-in fixture keeps the test focused on what it's ACTUALLY
+// testing: the astro config, the two rehype plugins, the docs
+// loader, the sidebar autogenerate, the katex asset materialise
+// — the pipeline, not the content.
 //
-// The test rebuilds the site, canonicalises each page (strips
-// asset-hashed URLs, template hashes, `<script>` bodies), and
-// compares against a committed digest at
-// `packages/cli/test/build/fixtures/own-build-digest.json`.
+// **Why the packaged CLI, not `runPackagedBuild` in-process.** The
+// packaged flow's staging strategy (per-entry symlinks into
+// `<pkgRoot>/node_modules/`) matches consumer reality: hoisted
+// deps in `/nix/store/…`. In a dev checkout, bun's isolated
+// linker layout puts transitive deps under `node_modules/.bun/…`
+// that the per-entry symlink cannot reach (astro's `require(
+// 'piccolore')` walks up from the staged path and fails), so
+// this test always runs against the nix-built CLI where the
+// hoisted layout matches production.
 //
-// Guarded by `REVKIT_E2E_BUILD=1` (which `just test` sets). Fast
-// (~3 s) once `bun install` has run.
+// **What the digest covers.** For each rendered `.html` page,
+// three pieces of the reviewer-facing output. First, the
+// frontmatter title Starlight renders in the head. Second, every
+// `data-src` attribute value stamped by rehype-data-src — a plugin
+// mutation that shifted end-line numbers would flip every anchor
+// and trip the digest. Third, the visible text of the page —
+// heading text, paragraph bodies, list items, link text.
 //
-// **RED on b3832661**: yes if a future change to own-repo mode
-// touches any visible text on any page (say, drops a heading,
-// changes rendered link text, or shifts a data-src). The digest
-// is committed AT b3832661 + this PR's docs edits, so a further
-// regression in own-repo mode surfaces here.
+// Chrome that shifts with the toolchain (rolldown chunk hashes,
+// `astro-<hash>` scope classes, expressive-code's minified inline
+// scripts, pagefind fingerprints) is stripped by `canonicalise`.
+//
+// **Regenerating.** When a legitimate pipeline change lands
+// (a new rehype plugin, a Starlight upgrade), set
+// `REVKIT_UPDATE_OWN_DIGEST=1` to make the test WRITE the
+// fixture-digest file instead of asserting against it. A `just`
+// recipe wraps this:
+//
+//     just update-own-digest
+//
+// Then commit the resulting `pipeline-digest.json`.
+//
+// **Guarded by `REVKIT_E2E_BUILD=1`** (which `just test` sets)
+// because the test builds the nix package and spawns astro.
 
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve as resolvePath } from "node:path";
 import { parseHTML } from "linkedom";
 
 const E2E = process.env.REVKIT_E2E_BUILD === "1";
-const CHECKOUT_ROOT = resolvePath(import.meta.dirname!, "..", "..", "..", "..");
+const UPDATE = process.env.REVKIT_UPDATE_OWN_DIGEST === "1";
 
-const scratchDirs: string[] = [];
+const CHECKOUT_ROOT = resolvePath(import.meta.dirname!, "..", "..", "..", "..");
+const FIXTURE_SRC = resolvePath(import.meta.dirname!, "fixtures", "pipeline-fixture");
+const DIGEST_PATH = resolvePath(import.meta.dirname!, "fixtures", "pipeline-digest.json");
+
+let consumerRoot: string;
+let distDir: string;
+
+const cleanup: string[] = [];
 afterAll(() => {
-  for (const d of scratchDirs) {
+  for (const d of cleanup) {
     try {
       rmSync(d, { recursive: true, force: true });
     } catch {
@@ -51,34 +90,64 @@ afterAll(() => {
   }
 });
 
-/** Canonicalise HTML for the "same content across runs" check.
- * Astro's build layers three sources of non-determinism on top of
- * the content — rolldown chunk hashes, per-scope class ids, and
- * starlight's own search DOM (which renders differently
- * depending on whether pagefind's index existed at build start).
- * A byte-level diff would flip on every CI run.
+beforeAll(() => {
+  if (!E2E) return;
+  // Build the nix package to warm the store path. The store output
+  // is retained by the daemon, so a follow-up `revkit build` call
+  // finds `bin/revkit` fast.
+  const store = execSync(`nix build .#revkit --no-link --print-out-paths`, {
+    cwd: CHECKOUT_ROOT,
+    encoding: "utf8",
+  })
+    .trim()
+    .split("\n")
+    .at(-1)!;
+  const revkitBin = join(store, "bin", "revkit");
+  expect(existsSync(revkitBin)).toBe(true);
+
+  // Copy the fixture to a scratch dir. Build writes to
+  // `<consumer>/.revkit/{build,dist,cache}/`; a build under the
+  // committed fixtures dir would leave state the `EXCLUDED_DIRS`
+  // walk still surfaces on a re-run.
+  consumerRoot = mkdtempSync(join(tmpdir(), "revkit-pipeline-fixture-"));
+  cleanup.push(consumerRoot);
+  cpSync(FIXTURE_SRC, consumerRoot, {
+    recursive: true,
+    dereference: true,
+    filter: (from) => !from.includes(".revkit/"),
+  });
+  rmSync(join(consumerRoot, ".revkit"), { recursive: true, force: true });
+
+  execSync(`"${revkitBin}" build --dir "${consumerRoot}"`, {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: mkdtempSync(join(tmpdir(), "revkit-pipeline-home-")),
+    },
+  });
+  distDir = join(consumerRoot, ".revkit", "dist");
+  expect(existsSync(distDir)).toBe(true);
+}, 15 * 60 * 1000);
+
+/** Canonicalise HTML for the "same pipeline output" check. Uses
+ * linkedom to parse (regex-based tag stripping trips CodeQL's
+ * `js/bad-tag-filter` on `<SCRIPT>` bypasses; a real parser
+ * handles that). Preserves:
  *
- * What matters for "own build unchanged" is that a reviewer sees
- * the same PAGE CONTENT: titles, prose, anchor targets,
- * `data-src` anchors. Everything else is chrome.
+ *   - `<title>` text;
+ *   - every `data-src` attribute value (order-sensitive within
+ *     a page, so a plugin change that reordered anchors would
+ *     also trip);
+ *   - visible text — every text node NOT inside a
+ *     `<script>/<style>/<template>`.
  *
- * Uses linkedom (already a dep for check-dist) to parse the HTML
- * and walk the DOM — a regex-based canonicalise would trip
- * CodeQL's `js/bad-tag-filter` + `js/incomplete-multi-character-
- * sanitization` rules, and reasonably so: regex-parsed HTML has
- * corner cases (`<SCRIPT>`, `<scrip<script>...</script>t>`) that
- * a proper parser handles. Test-only code, but the check is
- * enforced repo-wide. */
-function canonicalise(html: string): string {
+ * Everything else is chrome. */
+export function canonicalise(html: string): string {
   const { document } = parseHTML(html);
   const title = document.title ?? "";
   const anchors = Array.from(document.querySelectorAll("[data-src]"))
-    .map((el) => el.getAttribute("data-src") ?? "")
-    .sort();
-  // Walk the DOM, collect visible text. Skip the contents of
-  // <script>, <style>, <template> — those are chrome that shifts
-  // with the toolchain (asset hashes, minifier output).
-  const CHROME_TAGS: ReadonlySet<string> = new Set(["SCRIPT", "STYLE", "TEMPLATE"]);
+    .map((el) => el.getAttribute("data-src") ?? "");
+  const CHROME: ReadonlySet<string> = new Set(["SCRIPT", "STYLE", "TEMPLATE"]);
   const textFragments: string[] = [];
   const walk = (node: Node): void => {
     if (node.nodeType === 3 /* TEXT_NODE */) {
@@ -88,18 +157,20 @@ function canonicalise(html: string): string {
     }
     if (node.nodeType !== 1 /* ELEMENT_NODE */) return;
     const el = node as Element;
-    if (CHROME_TAGS.has(el.tagName.toUpperCase())) return;
+    if (CHROME.has(el.tagName.toUpperCase())) return;
     for (const child of Array.from(el.childNodes)) walk(child as Node);
   };
   walk(document.documentElement as unknown as Node);
-  return `TITLE:${title}\nANCHORS:\n${anchors.join("\n")}\nTEXT:\n${textFragments.join("\n")}`;
+  return (
+    "TITLE:" + title +
+    "\nANCHORS:\n" + anchors.join("\n") +
+    "\nTEXT:\n" + textFragments.join("\n")
+  );
 }
 
 /** Walk `root` and return `<rel-path>: sha256(canonicalise(html))`
- * for every `.html` file. Directories, images, scripts, and search
- * indexes are skipped — they change on unrelated toolchain bumps
- * and would make this test noisy. The HTML is the reviewer-facing
- * output; if the CANONICAL text is stable, own-repo mode is fine. */
+ * for every `.html` file. `pagefind` is skipped (it changes with
+ * Node bumps). */
 function digestHtml(root: string): Record<string, string> {
   const out: Record<string, string> = {};
   const stack: string[] = [root];
@@ -109,7 +180,6 @@ function digestHtml(root: string): Record<string, string> {
       const abs = join(cur, entry);
       const st = statSync(abs);
       if (st.isDirectory()) {
-        // Skip pagefind + search assets, they change on Node bumps.
         if (entry === "pagefind") continue;
         stack.push(abs);
       } else if (st.isFile() && entry.endsWith(".html")) {
@@ -119,54 +189,76 @@ function digestHtml(root: string): Record<string, string> {
       }
     }
   }
-  return out;
+  return Object.fromEntries(Object.entries(out).sort());
 }
 
-describe.skipIf(!E2E)("own build unchanged when REVKIT_CONSUMER_ROOT is unset", () => {
-  test("the page set + per-page HTML sha256 matches the committed digest", () => {
-    // The site build writes into `site/dist/`. `bun run build` uses
-    // the checkout's node_modules — we don't touch that. Clean
-    // dist before the build so a leftover file from a prior run
-    // doesn't contaminate the digest.
-    const dist = join(CHECKOUT_ROOT, "site", "dist");
-    rmSync(dist, { recursive: true, force: true });
-    // Fresh astro/vite caches too — a stale cache can mask a
-    // config-file change that would surface on a cold build.
-    rmSync(join(CHECKOUT_ROOT, "site", ".astro"), { recursive: true, force: true });
-    rmSync(join(CHECKOUT_ROOT, "site", "node_modules", ".vite"), { recursive: true, force: true });
+describe.skipIf(!E2E)("pipeline-digest — fixed docs fixture through the packaged flow", () => {
+  test("the built page set + per-page canonical hash matches the committed digest", () => {
+    const digest = digestHtml(distDir);
+    expect(Object.keys(digest).length).toBeGreaterThan(0);
 
-    // Explicitly clear REVKIT_CONSUMER_ROOT so a stray shell export
-    // never taints the own-build assertion.
-    const env = { ...process.env };
-    delete env.REVKIT_CONSUMER_ROOT;
-    delete env.REVKIT_ASTRO_CACHE_DIR;
-    delete env.REVKIT_VITE_CACHE_DIR;
-    execSync("bun run build", { cwd: join(CHECKOUT_ROOT, "site"), env, stdio: "pipe" });
+    if (UPDATE) {
+      // Regenerate mode. Writes the digest and passes — the
+      // developer commits the updated JSON.
+      writeFileSync(DIGEST_PATH, JSON.stringify(digest, null, 2) + "\n");
+      // eslint-disable-next-line no-console
+      console.log( // guardrails-ok(no-debug-leftovers): the recipe wants this
+        "REVKIT_UPDATE_OWN_DIGEST=1: wrote " + DIGEST_PATH,
+      );
+      return;
+    }
 
-    const rebuilt = digestHtml(dist);
-    const pageCount = Object.keys(rebuilt).length;
-    // Basic sanity: revkit currently builds 32 pages.
-    expect(pageCount).toBeGreaterThanOrEqual(30);
-
-    const digestPath = resolvePath(
-      import.meta.dirname!,
-      "fixtures",
-      "own-build-digest.json",
-    );
-    if (!existsSync(digestPath)) {
-      // Committed digest missing — write it once (running this
-      // test on a fresh checkout that doesn't yet have the
-      // fixture). The developer then commits the file. A missing
-      // digest is a FAIL so CI does not silently generate + pass.
+    if (!existsSync(DIGEST_PATH)) {
       throw new Error(
-        `own-build-unchanged: missing committed digest at ${digestPath}. ` +
-          `Run this test locally to generate it, then commit the result.`,
+        "pipeline-digest: missing committed digest at " + DIGEST_PATH + ". " +
+          "Run `just update-own-digest` (or `REVKIT_UPDATE_OWN_DIGEST=1 " +
+          "REVKIT_E2E_BUILD=1 bun test test/build/own-build-unchanged.test.ts`) " +
+          "to generate it, then commit the result.",
       );
     }
-    const committed: Record<string, string> = JSON.parse(readFileSync(digestPath, "utf8"));
-    // Compare — mismatch surfaces the diff by page path.
-    const rebuiltEntries = Object.entries(rebuilt).sort();
-    const committedEntries = Object.entries(committed).sort();
-    expect(rebuiltEntries).toEqual(committedEntries);
-  }, 300_000);
+    const committed: Record<string, string> = JSON.parse(readFileSync(DIGEST_PATH, "utf8"));
+    try {
+      expect(Object.entries(digest).sort()).toEqual(Object.entries(committed).sort());
+    } catch (error) {
+      const hint =
+        "\n\nIf this shift is INTENTIONAL (a plugin change, a Starlight upgrade), " +
+        "regenerate the digest:\n" +
+        "  just update-own-digest\n" +
+        "  # or:\n" +
+        "  REVKIT_UPDATE_OWN_DIGEST=1 REVKIT_E2E_BUILD=1 bun test test/build/own-build-unchanged.test.ts\n" +
+        "and commit fixtures/pipeline-digest.json.\n" +
+        "If it is UNINTENTIONAL, look for a change to `astro.config.mjs`, " +
+        "the rehype plugins, or the docs loader.\n";
+      if (error instanceof Error) {
+        error.message += hint;
+      }
+      throw error;
+    }
+  }, 15 * 60 * 1000);
+
+  test("digest CATCHES a plugin mutation on line numbers (end.line + 1)", () => {
+    // Read the fixture's index.html directly; canonicalise it,
+    // then simulate a plugin mutation by rewriting every
+    // `data-src` end-line to end.line + 1. If the canonical form
+    // is stable across the mutation, the digest is not tied to
+    // the plugin output — the guard would be useless. This
+    // asserts the mutation flips the canonical output.
+    const files = Object.keys(digestHtml(distDir));
+    expect(files.length).toBeGreaterThan(0);
+    const firstWithAnchor = files.find((f) => {
+      const html = readFileSync(join(distDir, f), "utf8");
+      return /data-src="[^"]+:\d+-\d+"/.test(html);
+    });
+    expect(firstWithAnchor).toBeDefined();
+    const original = readFileSync(join(distDir, firstWithAnchor!), "utf8");
+    const canonicalOriginal = canonicalise(original);
+
+    const mutated = original.replace(
+      /(data-src="[^:"]+:\d+-)(\d+)"/g,
+      (_m, prefix: string, endLine: string) => `${prefix}${Number(endLine) + 1}"`,
+    );
+    expect(mutated).not.toBe(original);
+    const canonicalMutated = canonicalise(mutated);
+    expect(canonicalMutated).not.toBe(canonicalOriginal);
+  }, 60_000);
 });

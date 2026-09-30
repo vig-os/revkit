@@ -51,6 +51,18 @@ See [revkit][revkit] for the architecture (DESIGN-0001, ADR-0001…0025).
 | `flake.nix` | Consumes `revkit.packages.<system>.revkit`. |
 | `.gitignore` | Ignores `.revkit/` (daemon state, build staging, dist — never committed). |
 
+## `docs/` — no symlinks
+
+`revkit build` refuses any symlink inside your `docs/` tree — the
+staging walker (`copyConfined`) fails fast whether the symlink
+escapes the docs root or stays inside it. This matches
+`revkit check`'s content-directory policy. If you have a
+legitimate reason to share content across pages, factor the shared
+text into a plain file and import it as MDX. A stray symlink from
+a `git-checkout` reset or a `just clean` script surfaces as a
+`revkit build: refusing symlink under the consumer's docs/ tree`
+error at build time.
+
 ## What `revkit check` enforces (ADR-0005)
 
 1. **component-registry:** MDX imports only from `@revkit/components` or Starlight.

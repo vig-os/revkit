@@ -1,0 +1,5 @@
+schemaVersion: 1
+entries:
+  - id: anchor
+    term: anchor
+    definition: The point a comment attaches to on a rendered page.
