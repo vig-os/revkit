@@ -175,10 +175,17 @@ let
       # `--production` drops devDependencies; `--ignore-scripts` avoids
       # non-deterministic lifecycle hooks; `--frozen-lockfile` fails
       # loudly on any drift between bun.lock and the manifests.
+      # `--linker=hoisted` produces a classic flat `node_modules/` tree
+      # (npm-style) instead of bun's default isolated `node_modules/.bun/`
+      # layout — the isolated store's slot-map ordering is
+      # NON-DETERMINISTIC on macOS across runs (arm64 CI captured two
+      # different NAR hashes for the same lockfile), while hoisted is
+      # a plain-file tree whose NAR content is stable.
       bun install \
         --frozen-lockfile \
         --production \
-        --ignore-scripts
+        --ignore-scripts \
+        --linker=hoisted
       runHook postBuild
     '';
 
@@ -234,27 +241,59 @@ stdenvNoCC.mkDerivation {
     mkdir -p $out/libexec/revkit $out/bin
     cp -r . $out/libexec/revkit/
 
-    # Overlay the vendored node_modules from the FOD:
-    #   - Root `node_modules/` — carries every dep and bun's isolated
-    #     linker `.bun/` store. No relative workspace links live here
-    #     (the four `@revkit/*` symlinks are all under per-workspace
-    #     node_modules); the whole tree is safe to SYMLINK into the
-    #     store, keeping the closure ~200 MiB rather than ~640 MiB
-    #     (source + duplicated deps).
-    #   - Per-workspace `node_modules/` — small (~200 KiB combined) and
-    #     carries relative `@revkit/*` symlinks (e.g.
-    #     `packages/cli/node_modules/@revkit/review-core -> ../../../review-core`)
-    #     that MUST resolve against $out's source tree, not the FOD's.
-    #     Copied so a naive follow of those links lands in $out.
+    # Overlay the vendored node_modules from the FOD. Hoisted layout:
+    #   $FOD/node_modules/*                   (~431 MiB, ~500 entries)
+    #   $FOD/node_modules/@revkit/{cli,components,review-core,site}
+    #                                         (relative symlinks pointing
+    #                                          at ../../packages/* and
+    #                                          ../../site — resolved
+    #                                          against the FOD's own
+    #                                          absent workspace source,
+    #                                          so they dangle IN THE FOD
+    #                                          and must be re-created
+    #                                          against $out's source)
+    #
+    # A whole-tree `ln -s $FOD/node_modules $out/.../node_modules` breaks
+    # workspace resolution — a relative symlink resolves against its
+    # PHYSICAL directory, not the alias that leads to it, so a follow
+    # from $out ends up in $FOD/packages/* (dangling). Per-entry
+    # symlinks keep 500 tiny store-references (a `dr-xr-xr-x` entry
+    # per dep) while the four `@revkit/*` links are re-created fresh so
+    # they resolve within $out. Closure shrinks from ~640 MiB (source +
+    # copied deps) to ~230 MiB (source + FOD-referenced deps + a
+    # per-entry-symlink directory).
     if [ -d ${nodeModules}/node_modules ]; then
-      ln -s ${nodeModules}/node_modules $out/libexec/revkit/node_modules
+      mkdir -p $out/libexec/revkit/node_modules
+      for entry in ${nodeModules}/node_modules/*; do
+        base=$(basename "$entry")
+        # `@revkit` is handled below with fresh relative symlinks into
+        # $out's workspace source; any OTHER `@scope` directory needs
+        # its per-package entries symlinked so the scope directory is
+        # a real directory in $out (npm resolvers walk into it).
+        if [ "$base" = "@revkit" ]; then
+          continue
+        fi
+        if [ -d "$entry" ] && [ "''${base:0:1}" = "@" ]; then
+          mkdir -p "$out/libexec/revkit/node_modules/$base"
+          for scoped in "$entry"/*; do
+            ln -s "$scoped" "$out/libexec/revkit/node_modules/$base/$(basename "$scoped")"
+          done
+        else
+          ln -s "$entry" "$out/libexec/revkit/node_modules/$base"
+        fi
+      done
+      # Fresh `@revkit/*` relative symlinks that resolve inside $out:
+      # `../../packages/<name>` from `.../node_modules/@revkit/<name>`
+      # → `$out/libexec/revkit/packages/<name>` (present).
+      mkdir -p "$out/libexec/revkit/node_modules/@revkit"
+      ln -s ../../packages/cli \
+        $out/libexec/revkit/node_modules/@revkit/cli
+      ln -s ../../packages/components \
+        $out/libexec/revkit/node_modules/@revkit/components
+      ln -s ../../packages/review-core \
+        $out/libexec/revkit/node_modules/@revkit/review-core
+      ln -s ../../site $out/libexec/revkit/node_modules/@revkit/site
     fi
-    for pkg in packages/cli packages/review-core packages/components site; do
-      if [ -d "${nodeModules}/$pkg/node_modules" ]; then
-        mkdir -p "$out/libexec/revkit/$pkg"
-        cp -r "${nodeModules}/$pkg/node_modules" "$out/libexec/revkit/$pkg/node_modules"
-      fi
-    done
 
     # Wrapper script: `bun` executes the CLI entry point directly (bun
     # runs .js that imports .ts, no transpile step needed). Keep the
