@@ -380,31 +380,15 @@ function svgPresentationAttrFindings(
     .map((finding) => `<${tagName} ${attrName}=${JSON.stringify(value)}> — ${finding}.`);
 }
 
-/** SVG elements that can carry a `href` / `xlink:href` attribute
- * that fetches / references another SVG element. The reviewer round
- * flagged that limiting the fragment-only rule to `<use>` alone
- * leaves `<linearGradient href="https://evil/g.svg#g">` and friends
- * open. */
-const SVG_HREF_ELEMENTS: ReadonlySet<string> = new Set([
-  "use",
-  "lineargradient",
-  "radialgradient",
-  "pattern",
-  "mask",
-  "filter",
-  "clippath",
-  "marker",
-  "symbol",
-  // <textPath href="#…"> is a legitimate same-doc reference; a
-  // cross-origin fetch here would be the same class of leak.
-  "textpath",
-  // <a href="…"> inside an SVG is a link and is refused entirely by
-  // the SVG element allowlist today (render-plot.ts drops <a>), but
-  // include it here in case a future allowlist change re-admits it.
-  "a",
-  // <animate*> elements are already refused (SMIL is on the refused
-  // list), so no entry needed for them.
-]);
+// The round-3 reviewer note dropped the `SVG_HREF_ELEMENTS` subset:
+// the fragment-only rule for `href` / `xlink:href` is now applied
+// inside the attribute walk itself on EVERY SVG element (matching
+// the source sanitiser's `keepAttribute` in render-plot.ts), so
+// `<tspan href>`, `<rect href>` and `<svg xlink:href="https://…">`
+// refuse alongside the element types listed in the previous round.
+// The predicate lives in `svgHrefRefusalReason` (css-url-scan.ts),
+// shared between the source sanitiser and this file — one function,
+// one list of behaviours to reason about.
 
 /** `<link>` policy handler. Rule of thumb: if `rel` contains ANY
  * fetching token, href must be same-origin (round-4 review closes the
@@ -588,35 +572,26 @@ export function scanDocument(document: ParseTreeNode, reportPath: string): Check
           findings.push({ file: reportPath, message: msg });
         }
       }
-    }
-
-    // Per-tag specials.
-    if (tagName === "link") linkElementFindings(element, findings, reportPath);
-    // Issue #27: SVG element `href` / `xlink:href` — must be a
-    // same-document `#fragment`. Applied to every SVG element that
-    // can carry a fetch-shaped href (see SVG_HREF_ELEMENTS), not
-    // just `<use>` — `<linearGradient href="https://evil/g.svg#g">`
-    // is the same fetch semantics as `<use href="…">`. Both
-    // attributes are checked when present; SVG 2 says `href` wins
-    // over `xlink:href` for rendering, but a stale user agent might
-    // follow the xlink form; a maliciously crafted document might
-    // set `href="#ok"` alongside `xlink:href="https://evil…"`.
-    // parse5 splits namespaced attributes into `prefix` + `name`,
-    // so `xlink:href` is `{ prefix: "xlink", name: "href" }` —
-    // rebuild the qualified name for the lookup.
-    if (isSvg && SVG_HREF_ELEMENTS.has(tagName)) {
-      for (const attr of element.attrs ?? []) {
-        const qualified = qualifiedAttrName(attr).toLowerCase();
-        if (qualified !== "href" && qualified !== "xlink:href") continue;
-        const message = svgHrefRefusalReason(attr.value);
+      // Issue #27 round 3: `href` / `xlink:href` on ANY SVG element
+      // must be a same-document `#ident` fragment. Round-2 restricted
+      // this to a subset of elements via `SVG_HREF_ELEMENTS`, which
+      // let `<tspan href>`, `<rect href>` and `<svg xlink:href>`
+      // through; the source sanitiser (render-plot.ts,
+      // `keepAttribute`) checks href on every element and this file
+      // now matches. Predicate shared via `svgHrefRefusalReason`.
+      if (isSvg && (lower === "href" || lower === "xlink:href")) {
+        const message = svgHrefRefusalReason(attrValue);
         if (message !== null) {
           findings.push({
             file: reportPath,
-            message: `refused <${rawTag} ${qualified}=${JSON.stringify(attr.value)}> — ${message}.`,
+            message: `refused <${rawTag} ${attrName}=${JSON.stringify(attrValue)}> — ${message}.`,
           });
         }
       }
     }
+
+    // Per-tag specials.
+    if (tagName === "link") linkElementFindings(element, findings, reportPath);
     if (tagName === "script") {
       const src = getAttr(element.attrs ?? [], "src");
       if (src.length > 0) {

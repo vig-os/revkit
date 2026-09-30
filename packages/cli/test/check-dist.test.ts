@@ -702,6 +702,127 @@ describe("check-dist — issue #27 SVG href / xlink:href fixtures (round 2, raw 
   });
 });
 
+describe("check-dist — issue #27 round-3 nit fixtures", () => {
+  // Nit 1a: mutation-check anchor for the M11 branch — turning
+  // REFUSED_SCHEME_IDENTS off must regress a real test. Round-2's
+  // scanner code had the check but no fixture asserted its effect.
+  test("ROUND-3 fill=javascript:alert(1) is refused (M11 mutation guard — REFUSED_SCHEME_IDENTS)", () => {
+    // A `javascript:` scheme in a CSS-shaped attribute value
+    // tokenises as `Ident("javascript") Colon <rest>`; the scanner
+    // refuses on that Ident+Colon pair. Without REFUSED_SCHEME_IDENTS
+    // the whole value passes and a real browser would execute the
+    // JS on any element that treats the value as a URL (SVG paint
+    // servers historically did).
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="javascript:alert(1)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("javascript:"))).toBe(true);
+  });
+
+  test("ROUND-3 cursor=vbscript:x is refused (M11 mutation guard — vbscript scheme)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect cursor="vbscript:x"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("vbscript:"))).toBe(true);
+  });
+
+  // Nit 1b: mutation-check anchor for the string-termination
+  // handling around `url("…")`. Round-2's `collectSingleStringArg`
+  // had a `first !== last` unterminated-string check (M9); the
+  // round-3 rewrite folds this into the "next non-whitespace token
+  // must be `)`" branch. A fixture that requires that terminating
+  // `)` check catches both mutations at once.
+  test("ROUND-3 fill=url(\"#ok\"a) is refused (extra token after quoted fragment before `)`)", () => {
+    // The url() call has the right String content and a `)`, but
+    // an extra Ident sits between them; the shape isn't the
+    // permitted `url("#ident")` and the scanner refuses. Turning
+    // off either the M9 termination check OR the "next-non-ws is
+    // `)`" check regresses this fixture.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill='url("#ok"a)'/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("only"))).toBe(true);
+  });
+
+  test("ROUND-3 fill=url(\"#ok\"     ) is ACCEPTED (whitespace-padded quoted fragment; positive control)", () => {
+    // The permissive counterpart of the previous test: the ONE
+    // allowed shape (whitespace between the closing quote and the
+    // closing paren) must not regress under the terminating-`)`
+    // check.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg">
+        <defs><linearGradient id="ok"/></defs>
+        <rect fill='url("#ok"     )'/>
+      </svg>
+    </body></html>`;
+    expect(scan(html)).toEqual([]);
+  });
+
+  // Nit 2: structural rule — refuse every String token that sits
+  // inside a function unless it forms the exact url-with-fragment
+  // shape. The round-2 scanner keyed on a small function-name
+  // denylist and let the rest through, so image(), cross-fade()
+  // and any made-up future function taking a URL string arg all
+  // slipped past. All refuse now.
+  test("ROUND-3 fill=image('https://…') is refused (structural rule)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="image('https://evil.example/x.png')"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("ROUND-3 fill=cross-fade('https://…' 50%, red) is refused (structural rule)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="cross-fade('https://evil.example/x.png' 50%, red)"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("ROUND-3 fill=foo('https://…') is refused (structural rule catches unknown functions too)", () => {
+    // A future URL-shaped function name we've never heard of. The
+    // structural rule refuses on the String argument alone, no
+    // denylist update required.
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect fill="foo('https://evil.example/x')"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  // Nit 3: `href` / `xlink:href` on EVERY SVG element must be a
+  // same-document `#ident` fragment. Round-2 restricted the check
+  // to a subset of elements and let `<tspan href>`, `<rect href>`
+  // and `<svg xlink:href>` through.
+  test("ROUND-3 <tspan href=https://…> is refused (href check applies to every SVG element)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><text><tspan href="https://evil.example/x.svg#g">x</tspan></text></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("ROUND-3 <rect href=https://…> is refused (rect isn't a traditional href element; still refused)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg"><rect href="https://evil.example/x.svg#g"/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("ROUND-3 <svg xlink:href=https://…> is refused (the root <svg> element itself)", () => {
+    const html = `<!doctype html><html><body>
+      <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="https://evil.example/x.svg#g"><rect/></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+});
+
 describe("check-dist — allowlist file integrity", () => {
   test("every SHA-256 in the allowlist is 64 hex chars", () => {
     for (const key of Object.keys((ALLOWLIST as { sha256: Record<string, string> }).sha256)) {

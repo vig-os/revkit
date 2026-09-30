@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused fill=javascript:alert(1) via REFUSED_SCHEME_IDENTS (round 3, nit 1a — M11 mutation guard) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><rect fill="javascript:alert(1)"/></svg>
+</body>
+</html>

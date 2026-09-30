@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused <tspan href=https://…> (round 3, nit 3 — every SVG element checked) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><text><tspan href="https://evil.example/x.svg#g">x</tspan></text></svg>
+</body>
+</html>

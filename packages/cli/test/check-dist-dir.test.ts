@@ -66,6 +66,15 @@ describe("check-dist — issue #27 fixture-directory end-to-end", () => {
       "use-href-external.html": "same-document",
       "use-href-percent23.html": "percent-encoded",
       "linear-gradient-href-external.html": "evil.example",
+      // Round 3 (nit 2): structural refusal for arbitrary URL-shaped
+      // functions like `image('https://…')`.
+      "svg-image-function.html": "evil.example",
+      // Round 3 (nit 3): href check applies to every SVG element,
+      // including <tspan>.
+      "svg-tspan-href-external.html": "evil.example",
+      // Round 3 (nit 1a): M11 mutation guard for the `javascript:`
+      // scheme in SVG presentation attribute values.
+      "style-javascript-scheme.html": "javascript:",
     };
     for (const [file, needle] of Object.entries(requiredFindings)) {
       const forFile = diagnostics.filter((d) => d.file === file);
