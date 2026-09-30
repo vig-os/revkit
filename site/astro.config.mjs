@@ -291,8 +291,50 @@ export default defineConfig({
       // hast (not in source) so `rehype-data-src` below stamps every
       // block with its ORIGINAL source line number; a source-side
       // strip shifted every anchor by 2 lines (PR #38 blocker 1).
-      [rehypeDropRepoDocTitle, { repoRoot: REPO_ROOT }],
-      [rehypeDataSrc, { repoRoot: REPO_ROOT }],
+      //
+      // `pathMap` — issue #57 blocker. In consumer mode, `revkit
+      // build` copies `<consumer>/docs/*` to `<staging>/src/content/
+      // docs/*` before spawning astro. Without a remap, both plugins
+      // see the staged path and either (rehype-data-src) stamp every
+      // block with `data-src=".revkit/build/…"` — pointing at a
+      // throwaway staging copy the reviewer never edits — or (drop-
+      // title) skip the leading-H1 drop because the staged path
+      // does not match `docs/**/*.md`. Remap the staged prefix back
+      // to `<consumer>/docs/` so anchors target the source (the
+      // path a comment reads, an agent edits, and a GitHub review
+      // targets) and the title drop still fires.
+      [
+        rehypeDropRepoDocTitle,
+        {
+          repoRoot: REPO_ROOT,
+          ...(CONSUMER_ROOT
+            ? {
+                pathMap: [
+                  {
+                    from: join(CONSUMER_ROOT, ".revkit", "build", "src", "content", "docs"),
+                    to: join(CONSUMER_ROOT, "docs"),
+                  },
+                ],
+              }
+            : {}),
+        },
+      ],
+      [
+        rehypeDataSrc,
+        {
+          repoRoot: REPO_ROOT,
+          ...(CONSUMER_ROOT
+            ? {
+                pathMap: [
+                  {
+                    from: join(CONSUMER_ROOT, ".revkit", "build", "src", "content", "docs"),
+                    to: join(CONSUMER_ROOT, "docs"),
+                  },
+                ],
+              }
+            : {}),
+        },
+      ],
     ],
   },
   // `cacheDir` — astro's default is `./node_modules/.astro`. In the

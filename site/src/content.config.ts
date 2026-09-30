@@ -14,7 +14,7 @@ import { docsSchema, i18nSchema } from "@astrojs/starlight/schema";
 import type { Loader } from "astro/loaders";
 import { file, glob } from "astro/loaders";
 import { existsSync } from "node:fs";
-import { join, resolve as resolvePath } from "node:path";
+import { resolve as resolvePath } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { plotsLoader } from "./content/loaders/plots.ts";
 import { repoDocsLoader } from "./content/loaders/repo-docs.ts";
@@ -142,8 +142,3 @@ export const collections = {
     schema: askSchema,
   }),
 };
-
-// Silence a lint pass that would flag `join` — kept alongside the
-// resolves above so a future consumer-mode loader that needs it
-// does not have to re-import.
-void join;

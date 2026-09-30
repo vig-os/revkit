@@ -4,8 +4,18 @@
   # The one revkit input this repo needs. Pin to a tag once revkit has a
   # release; the scaffold ships the floating default so a fresh checkout
   # works without extra flags. Bump deliberately.
+  #
+  # Until revkit's next release ships M5 (`packages.revkit`,
+  # `templates.default`, `lib.hooks`) to `main`, the floating default
+  # branch (`main`) has no `packages` output and evaluation fails with
+  # `attribute 'packages' missing`. Point at `dev` in the meantime:
+  #
+  #   revkit.url = "github:vig-os/revkit/dev";
+  #
+  # After the release, `github:vig-os/revkit` alone (or a pinned tag)
+  # works.
   inputs = {
-    revkit.url = "github:vig-os/revkit";
+    revkit.url = "github:vig-os/revkit/dev";
     # Follow revkit's pinned nixpkgs + flake-utils so the CLI's runtime
     # (Bun, deps) matches the version revkit was built with — no drift.
     nixpkgs.follows = "revkit/nixpkgs";

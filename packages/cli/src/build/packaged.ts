@@ -42,8 +42,8 @@
 
 import {
   copyFileSync,
-  cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
@@ -228,6 +228,61 @@ function symlinkEntries(srcDir: string, dstDir: string, skip: ReadonlySet<string
  *     plots/                   → <consumer>/plots/     (optional)
  *     .revkit/                 → <consumer>/.revkit/
  */
+/** Copy `from` to `to`, refusing every symlink in the tree that
+ * escapes `confineRoot` (real-path resolved once at the top). This is
+ * NOT the daemon's `resolveWithinRoot` — that primitive answers HTTP
+ * requests one path at a time; here we walk a whole tree and refuse
+ * fail-closed as we go. The two policies match ("no symlinks anywhere
+ * in the chain that resolve outside the root"), and both are audited
+ * whenever the shape of the containment check changes (see the header
+ * on `serve/confined-path.ts`).
+ *
+ * The rule is deliberately strict: any symlink under the consumer's
+ * `docs/` tree is refused, even one that points at a sibling INSIDE
+ * `docs/`. Docs authoring does not need symlinks; a link surface
+ * that big is not worth the review cost. `revkit check`'s file-
+ * discovery walker follows the same policy for content dirs.
+ *
+ * Exported for direct testing. */
+export function copyConfined(from: string, to: string, confineRoot: string): void {
+  const st = lstatSync(from);
+  if (st.isSymbolicLink()) {
+    throw new Error(
+      `revkit build: refusing symlink under the consumer's docs/ tree: ${from}. ` +
+        `Docs must be plain files or directories — a symlink under docs/ is refused ` +
+        `whether it escapes the root or not (matches revkit check's content-dir policy).`,
+    );
+  }
+  if (st.isDirectory()) {
+    mkdirSync(to, { recursive: true, mode: 0o755 });
+    // Belt-and-braces: the symlink refusal above catches any link.
+    // Also verify the physical `from` sits under `confineRoot` — a
+    // caller who passes a `from` outside `confineRoot` (a bug in
+    // the caller, not a hostile input) surfaces here rather than
+    // in a later I/O.
+    const fromReal = realpathSync(from);
+    if (fromReal !== confineRoot && !fromReal.startsWith(confineRoot + "/")) {
+      throw new Error(
+        `revkit build: refusing to copy from outside the consumer's docs/ tree: ` +
+          `${from} -> ${fromReal} (root ${confineRoot})`,
+      );
+    }
+    for (const name of readdirSync(from)) {
+      copyConfined(join(from, name), join(to, name), confineRoot);
+    }
+    return;
+  }
+  if (st.isFile()) {
+    copyFileSync(from, to);
+    return;
+  }
+  // Neither file nor directory nor symlink (fifo, socket, etc.).
+  // Refuse — none of them belong in a docs tree.
+  throw new Error(
+    `revkit build: refusing non-regular entry under the consumer's docs/ tree: ${from}`,
+  );
+}
+
 export function stageAstroRoot(options: {
   readonly consumerRoot: string;
   readonly packageRoot: string;
@@ -321,17 +376,23 @@ export function stageAstroRoot(options: {
   // `<staging>/@astrojs/starlight/routes/...` and fail with
   // ENOENT. The copy trades a small IO cost for a
   // whole-toolchain-simple path.
+  //
+  // The copy uses `copyConfined` (below) which refuses any
+  // symlink that would escape the consumer's docs root. Bare
+  // `cpSync({ dereference: true })` chases symlinks blindly, so
+  // a `docs/leak.md -> /etc/passwd` would land in
+  // `.revkit/dist/leak/index.html` — a whole-file exfiltration
+  // path visible via the daemon. The confined walker refuses
+  // BEFORE the copy, matching `revkit check`'s existing symlink
+  // refusal in content-owning dirs.
   const docsDst = join(contentDst, "docs");
   rmSync(docsDst, { recursive: true, force: true });
   mkdirSync(docsDst, { recursive: true, mode: 0o755 });
+  const consumerDocsReal = realpathSync(consumerDocsDir);
   for (const name of readdirSync(consumerDocsDir)) {
     const from = join(consumerDocsDir, name);
     const to = join(docsDst, name);
-    // `cpSync` walks and copies whole trees (files, nested dirs).
-    // `dereference: true` follows any symlinks in the consumer's
-    // docs so the packaged build sees the same content a plain
-    // `revkit check` sees, and refuses to write outside `to`.
-    cpSync(from, to, { recursive: true, dereference: true });
+    copyConfined(from, to, consumerDocsReal);
   }
 
   // node_modules — a REAL directory at staging with per-entry

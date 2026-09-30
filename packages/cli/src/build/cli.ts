@@ -29,20 +29,22 @@ export interface RunBuildEnv {
 }
 
 /** Parse args: `--dir <consumer-root>`, `--out <dist-dir>`,
- * `--skip-check` (M5 hidden — for the serve auto-build path which
- * has already validated the consumer), `--skip-check-dist` (tests
- * only; NEVER surfaced in HELP). */
+ * `--skip-check-dist` (test-only escape hatch; NEVER documented in
+ * HELP). No `--skip-check`: the authoring guards are load-bearing
+ * for build safety — see the confined staging walker below, which
+ * catches escaping symlinks BEFORE the check would have anyway.
+ * Removing --skip-check makes the two lines of defense
+ * unbypassable together (a reviewer that flipped a flag would
+ * otherwise skip the check and rely only on the staging refusal). */
 export interface ParsedBuildArgs {
   readonly dir?: string;
   readonly out?: string;
-  readonly skipCheck: boolean;
   readonly skipCheckDist: boolean;
 }
 
 export function parseBuildArgs(args: readonly string[]): { ok: true; parsed: ParsedBuildArgs } | { ok: false; message: string } {
   let dir: string | undefined;
   let out: string | undefined;
-  let skipCheck = false;
   let skipCheckDist = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -64,8 +66,6 @@ export function parseBuildArgs(args: readonly string[]): { ok: true; parsed: Par
       i++;
     } else if (arg?.startsWith("--out=")) {
       out = arg.slice("--out=".length);
-    } else if (arg === "--skip-check") {
-      skipCheck = true;
     } else if (arg === "--skip-check-dist") {
       // Test-only escape hatch. Not documented in HELP; a caller
       // that sets this MUST have another output-gate in front of
@@ -80,7 +80,6 @@ export function parseBuildArgs(args: readonly string[]): { ok: true; parsed: Par
     parsed: {
       ...(dir !== undefined ? { dir } : {}),
       ...(out !== undefined ? { out } : {}),
-      skipCheck,
       skipCheckDist,
     },
   };
@@ -125,35 +124,37 @@ export async function runBuildCommand(
   stdoutLines.push(`revkit build: consumer=${prettyPath(env.cwd, consumerRoot)}`);
   stdoutLines.push(`revkit build: dist=${prettyPath(env.cwd, distOutDir)}`);
 
-  // 1. revkit check on the consumer tree (skip only for the serve
-  //    auto-build path, where the caller has already run check).
-  if (!parsed.parsed.skipCheck) {
-    try {
-      const discovery = walkForCheckables(consumerRoot);
-      const files = toCheckFiles(discovery.files, consumerRoot);
-      const output = await runCheck(consumerRoot, files, discovery.symlinks, {
-        online: false,
-        repoSlug: env.repoSlug,
-        gh: async () => ({ stdout: "", stderr: "", exitCode: 1 }),
-      });
-      if (output.exitCode !== 0) {
-        return {
-          exitCode: 1,
-          stdout: stdoutLines.join("\n") + "\n",
-          stderr:
-            `revkit build: 'revkit check' failed on the consumer tree:\n` +
-            output.lines.join("\n") +
-            "\n",
-        };
-      }
-      stdoutLines.push(`revkit build: check ok (${files.length} files)`);
-    } catch (error) {
+  // 1. revkit check on the consumer tree. ALWAYS runs — no
+  //    --skip-check: the authoring guards catch symlink escapes,
+  //    hand-rolled UI, unknown vocab, missing links and inline
+  //    plot data BEFORE the build sees them. The confined staging
+  //    walker (`copyConfined` in packaged.ts) is a second line of
+  //    defense against escaping symlinks; both must run.
+  try {
+    const discovery = walkForCheckables(consumerRoot);
+    const files = toCheckFiles(discovery.files, consumerRoot);
+    const output = await runCheck(consumerRoot, files, discovery.symlinks, {
+      online: false,
+      repoSlug: env.repoSlug,
+      gh: async () => ({ stdout: "", stderr: "", exitCode: 1 }),
+    });
+    if (output.exitCode !== 0) {
       return {
         exitCode: 1,
         stdout: stdoutLines.join("\n") + "\n",
-        stderr: `revkit build: check failed: ${(error as Error).message}\n`,
+        stderr:
+          `revkit build: 'revkit check' failed on the consumer tree:\n` +
+          output.lines.join("\n") +
+          "\n",
       };
     }
+    stdoutLines.push(`revkit build: check ok (${files.length} files)`);
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: stdoutLines.join("\n") + "\n",
+      stderr: `revkit build: check failed: ${(error as Error).message}\n`,
+    };
   }
 
   // 2. Packaged build.

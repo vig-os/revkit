@@ -3,7 +3,12 @@
 A minimal revkit docs repo. Scaffolded by:
 
 ```bash
+# After the next release lands M5 on main:
 nix flake init -t github:vig-os/revkit
+
+# Until then, target the dev branch — main does not yet carry
+# `packages.revkit` / `templates.default`:
+nix flake init -t github:vig-os/revkit/dev
 ```
 
 ## Three commands

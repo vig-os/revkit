@@ -122,15 +122,32 @@ test -f "$smoke_dir/.revkit/dist/index.html" || {
   echo "smoke: FAIL — expected .revkit/dist/index.html after build" >&2
   exit 1
 }
-# Deliberate assertion: the built page must contain the docs body,
-# so the smoke fails on the failure it exists to catch (an empty-
-# dist regression that produced only `_katex/` earlier surfaced
-# because this check would have missed it — we assert real content).
-grep -qi 'welcome' "$smoke_dir/.revkit/dist/index.html" || {
-  echo "smoke: FAIL — .revkit/dist/index.html has no 'welcome' text (docs did not render)" >&2
+# Deliberate assertion: the built page must contain the docs BODY
+# text, not just the frontmatter title. `welcome` alone matches
+# `<title>Welcome | revkit</title>` even when the body is empty,
+# so we look for a fragment that only appears in the prose. This
+# is the check that flips RED on the "0 pages, only _katex" bug
+# an earlier draft shipped.
+grep -q 'What this is' "$smoke_dir/.revkit/dist/index.html" || {
+  echo "smoke: FAIL — .revkit/dist/index.html has no 'What this is' body text (docs did not render)" >&2
   head -80 "$smoke_dir/.revkit/dist/index.html" >&2
   exit 1
 }
+# ADR-0006 anchoring — the rendered page must carry a
+# `data-src="docs/…mdx:…"` attribute pointing at the SOURCE path,
+# not the throwaway staging copy under `.revkit/build/`.
+# (Issue #57 blocker: without the pathMap remap, this fails and
+# every rail comment lands on a path no one edits.)
+if ! grep -qE 'data-src="docs/[a-z0-9._/-]+\.mdx?:[0-9]+-[0-9]+"' "$smoke_dir/.revkit/dist/index.html"; then
+  echo "smoke: FAIL — no data-src=\"docs/*.mdx:…\" anchor in the rendered page" >&2
+  grep -oE 'data-src="[^"]+"' "$smoke_dir/.revkit/dist/index.html" | head -5 >&2
+  exit 1
+fi
+if grep -qE 'data-src="\.revkit/build/' "$smoke_dir/.revkit/dist/index.html"; then
+  echo "smoke: FAIL — data-src still points at the staging path" >&2
+  grep -oE 'data-src="[^"]+"' "$smoke_dir/.revkit/dist/index.html" | head -5 >&2
+  exit 1
+fi
 # The nix store is read-only — assert the build wrote NOTHING into
 # the packaged site directory (the trusted stack). Look for a
 # recent write under any /nix/store path the CLI touched.
@@ -179,9 +196,9 @@ if [ "$status" != "200" ]; then
   head -80 "$smoke_dir/page.html" >&2
   exit 1
 fi
-# Rendered doc content (from the template's docs/index.mdx).
-grep -qi 'welcome' "$smoke_dir/page.html" || {
-  echo "smoke: FAIL — GET / body does not contain the rendered doc text" >&2
+# Rendered doc BODY content (from the template's docs/index.mdx).
+grep -q 'What this is' "$smoke_dir/page.html" || {
+  echo "smoke: FAIL — GET / body does not contain 'What this is' (doc body missing)" >&2
   head -80 "$smoke_dir/page.html" >&2
   exit 1
 }

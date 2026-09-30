@@ -9,7 +9,7 @@
 // deterministic — a reviewer scrolling to a rule always sees the same
 // section, and CI diffs against a prior run stay small.
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Parent } from "mdast";
 import type { AllowAnnotation } from "./allow-annotation.ts";
@@ -159,20 +159,28 @@ export async function runCheck(
   }
 
   // Vocabulary is loaded once so a rule run over 200 files parses the
-  // YAML exactly once. Errors surface as one diagnostic against the YAML
-  // file itself — the check should not silently pass when vocab is broken.
+  // YAML exactly once. A MISSING vocab file is treated as an empty
+  // vocab (issue #57 nit): the site build already treats vocab as
+  // optional (`content.config.ts` uses an empty inline loader when
+  // the consumer omits `vocab/terms.yaml`), and `check` should match
+  // — a repo without any `<Term id>` usages does not need a vocab.
+  // A file that exists but fails to parse still produces a finding.
   const vocabYamlPath = join(repoRoot, "vocab", "terms.yaml");
   let vocab: LoadedVocabEntry[];
-  try {
-    vocab = loadVocab(vocabYamlPath);
-  } catch (error) {
-    findings.push({
-      file: "vocab/terms.yaml",
-      line: 0,
-      rule: "vocabulary",
-      message: `failed to load vocab: ${(error as Error).message}`,
-    });
+  if (!existsSync(vocabYamlPath)) {
     vocab = [];
+  } else {
+    try {
+      vocab = loadVocab(vocabYamlPath);
+    } catch (error) {
+      findings.push({
+        file: "vocab/terms.yaml",
+        line: 0,
+        rule: "vocabulary",
+        message: `failed to load vocab: ${(error as Error).message}`,
+      });
+      vocab = [];
+    }
   }
 
   // Parse each content file ONCE and hand the mdast root to every
