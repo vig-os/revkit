@@ -75,4 +75,14 @@ describe("dispatch", () => {
     expect(result.stderr).toContain("exactly one non-empty argument");
     expect(result.exitCode).toBe(ExitCode.usage);
   });
+
+  test("serve with a bad --port value exits with usage error", async () => {
+    // `serve` is a recognised subcommand as of M2 item 2; a bad value
+    // is rejected before the daemon boots (no port is bound). Kept in
+    // this file so the full subcommand table is covered here.
+    const result = await dispatch(["serve", "--port", "notanumber"], noopEnv);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("--port");
+    expect(result.exitCode).toBe(ExitCode.usage);
+  });
 });
