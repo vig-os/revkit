@@ -133,9 +133,20 @@ export function analyseEsm(estree: unknown, esmLine: number): EsmAnalysis {
       continue;
     }
     for (const spec of decl.specifiers) {
+      // Namespace imports (`import * as X from …`) refuse content-
+      // wide (round-5 review): a namespace binding exposes every
+      // export from the module, so the Card/LinkCard named-export
+      // denylist would not apply to `X.Card`. Named + default only.
+      if (spec.type === "ImportNamespaceSpecifier") {
+        violations.push({
+          line,
+          kind: "unexpected-top-level",
+          message: `content ESM block uses a namespace import (\`import * as ${spec.local.name}\`) from ${JSON.stringify(specifier)} — refused (named imports only; denylisted named exports must remain unreachable).`,
+        });
+        continue;
+      }
       if (
         spec.type !== "ImportDefaultSpecifier"
-        && spec.type !== "ImportNamespaceSpecifier"
         && spec.type !== "ImportSpecifier"
       ) {
         violations.push({
@@ -146,7 +157,7 @@ export function analyseEsm(estree: unknown, esmLine: number): EsmAnalysis {
         continue;
       }
       // `imported.name` is present on ImportSpecifier only; ES modules
-      // treat default / namespace bindings as having no original name.
+      // treat default bindings as having no original name.
       const importedName = spec.type === "ImportSpecifier"
         ? spec.imported?.name ?? null
         : null;

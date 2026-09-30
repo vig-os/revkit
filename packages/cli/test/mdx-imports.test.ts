@@ -44,10 +44,12 @@ describe("analyseEsm", () => {
     expect(analysis.bindings[0]?.specifier).toBe("@revkit/components/Plot");
   });
 
-  test("namespace import binds its local name", () => {
+  test("namespace import is refused (round-5: `import * as X` would sidestep the named-export denylist)", () => {
     const estree = firstEsmEstree(`import * as C from "@revkit/components";\n\ntext\n`);
     const analysis = analyseEsm(estree, 1);
-    expect(analysis.bindings[0]?.localName).toBe("C");
+    expect(analysis.bindings).toEqual([]);
+    expect(analysis.violations[0]?.kind).toBe("unexpected-top-level");
+    expect(analysis.violations[0]?.message).toContain("namespace import");
   });
 
   test("side-effect-only import (`import \"foo\"`) is a violation", () => {

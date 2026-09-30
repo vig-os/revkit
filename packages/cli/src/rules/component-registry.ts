@@ -82,25 +82,45 @@ function refusedNamedExportReason(specifier: string, importedName: string): stri
   return `import of ${JSON.stringify(importedName)} from ${JSON.stringify(specifier)} is refused (source-side sink not yet sanitised; see follow-up issue "re-admit Starlight Card/LinkCard with prop sanitisation").`;
 }
 
-/** Return `true` when `specifier` names one of the allowed roots
- * exactly or one of their subpaths (`@revkit/components/Plot`).
+/** Import specifiers that accept SUBPATHS: `@revkit/components/Plot`
+ * is a legitimate registered component (see the Plot.astro proxy),
+ * so subpaths under this root pass. Only one root gets this
+ * treatment. */
+const SUBPATH_ALLOWED_ROOTS: ReadonlySet<string> = new Set([
+  "@revkit/components",
+]);
+
+/** Import specifiers accepted only as the EXACT root — no subpaths.
+ * `@astrojs/starlight/components` (the Starlight component module)
+ * is the one entry: allowing subpaths would let content reach
+ * `@astrojs/starlight/components/Select.astro` and other internal
+ * files that are not on the component-set roster (round-5 review).
+ * The Card / CardGrid / LinkCard named-export denylist still holds
+ * on the root path. */
+const EXACT_ONLY_ROOTS: ReadonlySet<string> = new Set([
+  "@astrojs/starlight/components",
+]);
+
+/** Return `true` when `specifier` names one of the allowed roots.
+ * `@revkit/components` accepts subpaths (`.../Plot`);
+ * `@astrojs/starlight/components` accepts the exact root only.
  * Relative imports (`./`, `../`) always return `false` — content
  * imports the registered set by bare specifier only. `..` anywhere
- * in the specifier (e.g. `@revkit/components/../evil`) also refuses,
- * so a subpath cannot walk out of the allowed root. */
+ * in the specifier refuses so a subpath cannot walk out of the
+ * allowed root. */
 export function isAllowedImportSpecifier(specifier: string): boolean {
   if (specifier.startsWith(".") || specifier.startsWith("/")) return false;
-  // Path traversal: reject any `..` segment inside the specifier. A
-  // resolver may treat `@revkit/components/../secrets/env` as reaching
-  // outside the root; refuse it at the syntax level, not by trusting
-  // the resolver to be strict.
   if (specifier.split("/").some((segment) => segment === "..")) return false;
-  // Test-only paths are never importable, no matter which root they
-  // sit under — a fixture or unit test is not a registered component.
+  // Test-only paths are never importable — a fixture or unit test is
+  // not a registered component.
   if (/(?:^|\/)([^/]+\.)?test(?:\.[jt]sx?)?(?:$|\/)/i.test(specifier)) return false;
-  return ALLOWED_IMPORT_SPECIFIERS.some(
-    (root) => specifier === root || specifier.startsWith(`${root}/`),
-  );
+  for (const root of SUBPATH_ALLOWED_ROOTS) {
+    if (specifier === root || specifier.startsWith(`${root}/`)) return true;
+  }
+  for (const root of EXACT_ONLY_ROOTS) {
+    if (specifier === root) return true;
+  }
+  return false;
 }
 
 /** Attribute names never allowed on a content element. `style` is

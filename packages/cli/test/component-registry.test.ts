@@ -506,6 +506,48 @@ See [ref].
     expect(result.diagnostics).toEqual([]);
   });
 
+  test("round-5: import from a Starlight SUBPATH (`/Select.astro`) is refused", () => {
+    // Starlight's component module is allowed EXACT only — a subpath
+    // would reach internal files that are not on the component-set
+    // roster.
+    const source = `import Select from "@astrojs/starlight/components/Select.astro";
+
+<Select />
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    const finding = result.diagnostics.find((d) => d.message.includes("Select.astro"));
+    expect(finding).toBeDefined();
+    expect(finding?.rule).toBe("component-registry");
+  });
+
+  test("round-5: import from `@astrojs/starlight/components/StarlightPage.astro` is refused", () => {
+    const source = `import Page from "@astrojs/starlight/components/StarlightPage.astro";
+
+<Page />
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics.some((d) => d.message.includes("StarlightPage"))).toBe(true);
+  });
+
+  test("round-5: namespace import from `@revkit/components` is refused (would sidestep the named-export denylist)", () => {
+    const source = `import * as R from "@revkit/components";
+
+<R.Callout kind="info" title="ok">body</R.Callout>
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    const finding = result.diagnostics.find((d) => d.message.includes("namespace import"));
+    expect(finding).toBeDefined();
+  });
+
+  test("round-5: namespace import from `@astrojs/starlight/components` is refused", () => {
+    const source = `import * as S from "@astrojs/starlight/components";
+
+<S.Aside type="tip">bad</S.Aside>
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics.some((d) => d.message.includes("namespace import"))).toBe(true);
+  });
+
   test("nit 1: unparsable MDX produces a `file:line` diagnostic, not a stack trace", () => {
     // MDX-invalid content: unclosed JSX + stray `<!` — the parser
     // throws; the rule must catch and produce a diagnostic.

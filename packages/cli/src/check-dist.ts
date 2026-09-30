@@ -289,16 +289,44 @@ function srcsetFindings(
   return findings;
 }
 
-/** Script src path normalization: refuse `..` segments (a `..` in
- * `/_astro/../evil.js` would still start with the allowed prefix but
- * escape the chunk directory at request time). */
-function scriptSrcRefusal(src: string): string | null {
-  if (!src.startsWith(ALLOWED_SCRIPT_SRC_PREFIX)) {
-    return `refused <script src=${JSON.stringify(src)}> — script sources must be under ${JSON.stringify(ALLOWED_SCRIPT_SRC_PREFIX)}.`;
+/** Percent-decode `input` repeatedly until stable — a nested
+ * encoding like `%252e%252e` (double-encoded `..`) survives one
+ * `decodeURIComponent` pass. Refuses invalid encodings by throwing;
+ * a bounded loop keeps a pathological input from spinning. Round-5
+ * review: `/_astro/%2e%2e/evil.js` decodes to `/_astro/../evil.js`,
+ * which would then have to fail the `..`-segment check. */
+export function decodeUntilStable(input: string, maxRounds: number = 8): string {
+  let current = input;
+  for (let i = 0; i < maxRounds; i += 1) {
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      throw new Error(`invalid percent-encoding in ${JSON.stringify(input)}`);
+    }
+    if (next === current) return next;
+    current = next;
   }
-  const segments = src.split("/");
+  throw new Error(`percent-encoding did not stabilise after ${maxRounds} rounds in ${JSON.stringify(input)}`);
+}
+
+/** Script src path normalization: refuse `..` segments (a `..` in
+ * `/_astro/../evil.js` would still start with the allowed prefix
+ * but escape the chunk directory at request time). Percent-decode
+ * first so `%2e%2e` and `%252e%252e` (nested) are also caught. */
+function scriptSrcRefusal(src: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeUntilStable(src);
+  } catch (error) {
+    return `refused <script src=${JSON.stringify(src)}> — ${(error as Error).message}.`;
+  }
+  if (!decoded.startsWith(ALLOWED_SCRIPT_SRC_PREFIX)) {
+    return `refused <script src=${JSON.stringify(src)}> — script sources must be under ${JSON.stringify(ALLOWED_SCRIPT_SRC_PREFIX)} (decoded: ${JSON.stringify(decoded)}).`;
+  }
+  const segments = decoded.split("/");
   if (segments.some((s) => s === "..")) {
-    return `refused <script src=${JSON.stringify(src)}> — path traversal (\`..\`) inside script src.`;
+    return `refused <script src=${JSON.stringify(src)}> — path traversal (\`..\`) inside script src (decoded: ${JSON.stringify(decoded)}).`;
   }
   return null;
 }

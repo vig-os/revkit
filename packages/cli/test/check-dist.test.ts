@@ -299,6 +299,35 @@ describe("check-dist — round-4 parse5 / rel-mix / CSS-unescape / srcset / scri
     expect(findings.some((f) => f.message.includes("path traversal"))).toBe(true);
   });
 
+  test("round-5: script src `/_astro/%2e%2e/evil.js` is refused (percent-decoded traversal)", () => {
+    // %2e%2e decodes to ..; without percent-decoding the prefix
+    // check would pass and the segment check would miss the
+    // traversal.
+    const html = `<!doctype html><html><body>
+      <script src="/_astro/%2e%2e/evil.js"></script>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("path traversal"))).toBe(true);
+  });
+
+  test("round-5: nested-encoded script src (`%252e%252e`) is refused (decodeUntilStable)", () => {
+    // %252e decodes to %2e, then %2e decodes to `.`. The stable
+    // decode loop catches this.
+    const html = `<!doctype html><html><body>
+      <script src="/_astro/%252e%252e/evil.js"></script>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("path traversal"))).toBe(true);
+  });
+
+  test("round-5: invalid percent-encoding in script src is refused", () => {
+    const html = `<!doctype html><html><body>
+      <script src="/_astro/%zz/evil.js"></script>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("invalid percent-encoding"))).toBe(true);
+  });
+
   test("CSS unescape: image-set(https://evil…) is refused", () => {
     const html = `<!doctype html><html><body>
       <span style="background: image-set(url('https://evil.example/x.png') 1x)">x</span>
