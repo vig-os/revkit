@@ -11,14 +11,26 @@ Third-party code
 The @revkit/components package vendors copy-in source from permissive-licensed
 upstreams (see docs/adr/0022-vendored-code-licenses.md). Each vendored drop
 lives in its own subdirectory beside the vendor README, with the upstream
-LICENSE and an UPSTREAM provenance file that records repo, commit and path.
+LICENSE and an UPSTREAM provenance file that records repo, commit, path and
+the declared SPDX license.
 
 The `revkit check` vendored-code guard enforces that each entry below points
-at a real subdirectory and that every subdirectory carries LICENSE + UPSTREAM
-and appears here.
+at a real subdirectory, that the LICENSE matches the SPDX-canonical text of
+the declared license, and that the entry's SPDX id equals the UPSTREAM
+license.
 
-Entries take the form (one per line):
+Entries take the form (one per line, at the start of the line):
 
     - packages/components/vendor/<pkg> — <upstream URL> (SPDX: <id>)
 
 No third-party code is vendored yet.
+
+================================================================================
+Data files
+================================================================================
+
+The vendored-code guard uses the SPDX license-list-data plain-text templates
+(https://github.com/spdx/license-list-data, distributed under CC0-1.0) as
+its source of truth for canonical LICENSE text. Copies are stored under
+`packages/cli/src/rules/spdx-texts/` (MIT, BSD-2-Clause, BSD-3-Clause,
+Apache-2.0, ISC) and compared after copyright/year normalisation.

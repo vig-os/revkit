@@ -65,7 +65,14 @@ const CONSIDERED_EXTENSIONS: ReadonlySet<string> = new Set([
 /** POSIX-relative directory prefixes where a symlink is refused
  * outright. Astro follows symlinks during `astro build`, so a symlink
  * that lives in a content or UI directory can render whatever the
- * target holds. */
+ * target holds. The vendor tree
+ * (`packages/components/vendor/`) is refused too — a symlinked
+ * vendored package or LICENSE could point at the repo's own code
+ * (silently smuggling a permissive-license claim onto AGPL code, or
+ * dropping upstream attribution). The vendored-code rule
+ * (rules/vendored-code.ts) also lstat-checks these files at read
+ * time; both layers agree so the enforcement holds under `--staged`,
+ * an explicit-path run and a full workspace walk. */
 const SYMLINK_REFUSED_PREFIXES: readonly string[] = [
   "docs/",
   "site/src/content/",
@@ -73,6 +80,7 @@ const SYMLINK_REFUSED_PREFIXES: readonly string[] = [
   "site/src/pages/",
   "site/src/layouts/",
   "packages/components/src/",
+  "packages/components/vendor/",
   "plots/",
   "vocab/",
 ];
