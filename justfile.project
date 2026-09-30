@@ -77,7 +77,7 @@ test *args:
     @if [ ! -f package.json ]; then \
       echo "just test: no package.json — skipping"; \
     else \
-      cd packages/cli && bun test {{ args }} && cd ../.. && \
+      REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test {{ args }}' && \
       cd packages/review-core && bun test {{ args }} && cd ../.. && \
       cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
       just check && \

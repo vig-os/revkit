@@ -25,6 +25,8 @@ import { findRepoRootByPackageJson } from "./repo-root.ts";
 import { runServeCommand } from "./serve/cli.ts";
 import { runMcpCommand } from "./mcp/cli.ts";
 import { runOpenCommand } from "./open-cli.ts";
+import { runReviewCommand, defaultReviewEnv } from "./review/cli.ts";
+import { spawnGit } from "./git-runner.ts";
 import { runEventsCommand } from "./events-cli.ts";
 import { runHookCommand } from "./hook-cli.ts";
 import { runModeCommand } from "./mode-cli.ts";
@@ -45,6 +47,7 @@ Usage:
   revkit serve [--dir <path>] [--port <n>]
   revkit mcp [--dir <path>]
   revkit open [<path>]
+  revkit review <pr-number|url> [--trust <sha>] [--no-serve] [--repo <slug>]
   revkit mode [handover | live | quiet]
   revkit events --follow [--since <n>] [--dir <path>]
   revkit hook user-prompt-submit
@@ -69,6 +72,20 @@ bound to 127.0.0.1 on a random free port (--port 0), serving
 WebSocket) and the launch-code → session-cookie flow. Prints the
 launch URL on stdout; the agent bearer token is written to
 .revkit/serve.json at mode 600. Ctrl-C stops gracefully.
+
+review (ADR-0025, M3 part 2a) resolves a PR through the reviewer's
+own 'gh auth token', fetches the head + base commits into the local
+object DB, refuses forks and any PR that changes tooling unless
+--trust <sha> pins to the current head, then materializes a safe
+worktree under .revkit/review/<pr>-<sha>/ with TOOLING files from
+base and CONTENT files (docs/, vocab/, plots/, site/src/content/ —
+allowlisted extensions only) from the PR head. Symlinks that escape,
+submodules and unsupported tree modes are refused. 'revkit check'
+runs on the PR content before serving. Existing PR review threads
+are imported through the GitHub adapter into the daemon's thread
+store; the rail shows them as the docs render today. The daemon
+inherits ADR-0013's auth/CSP unchanged. Use --no-serve to prepare
+the review without starting the daemon.
 
 mcp is a stdio MCP server (ADR-0007): declares the 'claude/channel'
 capability, exposes tools 'threads'/'reply'/'resolve' that proxy to
@@ -198,6 +215,77 @@ export async function dispatch(
   if (first === "open") {
     const outcome = await runOpenCommand(rest, { cwd: env.cwd });
     return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
+  }
+
+  if (first === "review") {
+    const { startDaemon } = await import("./serve/daemon.ts");
+    const { readOrMintLocalUserId } = await import("./serve/cli.ts");
+    // Mint / read the local user id EARLY so runReviewCommand
+    // receives a stable value and there is no dead-code fallback
+    // branch (PR #48 round-2 nit).
+    let localUserId: string;
+    try {
+      const repoRoot = findRepoRootByPackageJson(env.cwd);
+      localUserId = readOrMintLocalUserId(repoRoot);
+    } catch {
+      // No package.json marker means the review command will
+      // itself refuse in the same way `just check` does; use a
+      // stable string here so the fallback is deterministic.
+      localUserId = "local-review";
+    }
+    const reviewEnv = {
+      ...defaultReviewEnv(env.cwd, VERSION, env.repoSlug, localUserId),
+      gh: env.gh,
+      git: spawnGit,
+      // Wire the daemon start to the built `site/dist` inside the
+      // materialised worktree. The daemon keeps ADR-0013 auth/CSP
+      // unchanged — we only vary the dir it serves and the sqlite
+      // it opens.
+      startServe: async ({
+        distDir,
+        sqlitePath,
+        repoRoot,
+        localUserId,
+      }: {
+        readonly materializedRoot: string;
+        readonly distDir: string;
+        readonly sqlitePath: string;
+        readonly repoRoot: string;
+        readonly localUserId: string;
+      }) => {
+        const handle = await startDaemon({
+          dir: distDir,
+          repoRoot,
+          sqlitePath,
+          version: VERSION,
+          localUserId,
+          port: 0,
+          announce: false,
+          installSignalHandlers: true,
+        });
+        const blockForever = new Promise<void>((resolveDone) => {
+          const originalStop = handle.stop.bind(handle);
+          handle.stop = async (): Promise<void> => {
+            await originalStop();
+            resolveDone();
+          };
+        });
+        return {
+          url: handle.url,
+          port: handle.port,
+          launchUrl: handle.launchUrl,
+          blockForever,
+          stop: () => handle.stop(),
+        };
+      },
+    };
+    const outcome = await runReviewCommand(rest, reviewEnv);
+    return {
+      stdout: outcome.stdout,
+      stderr: outcome.stderr,
+      exitCode: outcome.exitCode,
+      ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
+    };
   }
 
   if (first === "events") {

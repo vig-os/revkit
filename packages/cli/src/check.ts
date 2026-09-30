@@ -9,6 +9,7 @@
 // deterministic — a reviewer scrolling to a rule always sees the same
 // section, and CI diffs against a prior run stay small.
 
+import { readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Parent } from "mdast";
 import type { AllowAnnotation } from "./allow-annotation.ts";
@@ -24,6 +25,7 @@ import { checkFrontmatter } from "./rules/frontmatter.ts";
 import { checkLinksFile } from "./rules/links.ts";
 import { checkNoHandRolledUiFile } from "./rules/no-hand-rolled-ui.ts";
 import { checkPlotSpecFile } from "./rules/plot-structure.ts";
+import { checkVegaUntrusted } from "./rules/vega-untrusted.ts";
 import { checkVendoredCode } from "./rules/vendored-code.ts";
 import type { LoadedVocabEntry } from "./rules/vocabulary.ts";
 import { checkVocabularyFile, loadVocab } from "./rules/vocabulary.ts";
@@ -77,12 +79,29 @@ export interface CheckFile {
   readonly relative: string;
 }
 
+/** Trust posture the check runs under (ADR-0025, PR #48 round-2).
+ *
+ * - `trusted`: the default. Content comes from the reviewer's own
+ *   checkout or the local pre-commit path. Allow-annotations honour
+ *   their escape-hatch, since a maintainer authored them.
+ * - `untrusted`: content comes from a PR head that the reviewer has
+ *   NOT authored. The check refuses every allow-annotation from the
+ *   PR (it has not passed a hosted `--online` verification the local
+ *   reviewer can trust), and it applies the vega-lite executable-key
+ *   refusal (no `expr` / `signal` / `calculate` at build time).
+ *   Every other guard (component-registry, no-hand-rolled-ui,
+ *   vocabulary, links, plot-structure, frontmatter, vendored-code)
+ *   still runs. */
+export type Trust = "trusted" | "untrusted";
+
 /** Options carried through the orchestrator. `--online` toggles the
- * gh-api verification of allow annotations. */
+ * gh-api verification of allow annotations. `trust` picks the trust
+ * posture (see `Trust`); defaults to `trusted`. */
 export interface CheckOptions {
   readonly online: boolean;
   readonly repoSlug: string;
   readonly gh: GhRunner;
+  readonly trust?: Trust;
 }
 
 /** The check's public result: rendered lines + the numeric exit code. */
@@ -180,6 +199,15 @@ export async function runCheck(
   }
 
   // 1) component-registry — plus allow-annotation harvest.
+  const trust: Trust = options.trust ?? "trusted";
+  // Under untrusted mode, feed the rule the set of DECLARED
+  // component subpaths — derived from
+  // `packages/components/package.json`'s exports map — so
+  // `@revkit/components/Plot` (the documented import used in the
+  // site's own MDX) passes while a fantasy subpath is refused
+  // (PR #48 round-4 blocker 1a).
+  const untrustedAllowedSubpaths =
+    trust === "untrusted" ? readComponentsExports(repoRoot) : undefined;
   const usedAllowAnnotations: {
     readonly file: string;
     readonly line: number;
@@ -190,6 +218,7 @@ export async function runCheck(
       entry.source,
       entry.file.relative,
       entry.root ?? undefined,
+      { trust, ...(untrustedAllowedSubpaths !== undefined ? { untrustedAllowedSubpaths } : {}) },
     );
     findings.push(...result.diagnostics);
     for (const used of result.usedAllowAnnotations) {
@@ -244,6 +273,12 @@ export async function runCheck(
   // 5) plot-structure — schema + confined sibling files.
   for (const file of plotFiles) {
     findings.push(...checkPlotSpecFile(file.absolute, file.relative));
+    // Untrusted-mode-only: also refuse executable vega keys
+    // (`expr` / `signal` / `calculate` / `update` / `on`). See
+    // `rules/vega-untrusted.ts` and ADR-0021 / ADR-0025.
+    if (trust === "untrusted") {
+      findings.push(...checkVegaUntrusted(file.absolute, file.relative));
+    }
   }
 
   // 5b) vendored-code (ADR-0022) — one shot per invocation because
@@ -320,3 +355,46 @@ export const CHECK_RULES: readonly string[] = [
   "plot-structure",
   "vendored-code",
 ];
+
+/** Read `packages/components/package.json`'s `exports` map and
+ * return the SET of full subpath specifiers (like
+ * `"@revkit/components/Plot"`). Under untrusted PR review, only
+ * these subpaths are admitted — a fantasy `.../Playground` is
+ * refused. Falls back to an empty set (which admits only the exact
+ * root specifiers) when the file is missing or malformed; the check
+ * still refuses subpaths in that case rather than opening the gate.
+ * (PR #48 round-4 blocker 1a.) */
+export function readComponentsExports(repoRoot: string): ReadonlySet<string> {
+  const out = new Set<string>();
+  const pkgPath = join(repoRoot, "packages", "components", "package.json");
+  let raw: string;
+  try {
+    raw = readFileSync(pkgPath, "utf8");
+  } catch {
+    return out;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return out;
+  }
+  if (parsed === null || typeof parsed !== "object") return out;
+  const pkgName = (parsed as { name?: unknown }).name;
+  const exportsMap = (parsed as { exports?: unknown }).exports;
+  if (typeof pkgName !== "string" || pkgName.length === 0) return out;
+  if (exportsMap === null || typeof exportsMap !== "object") return out;
+  for (const key of Object.keys(exportsMap as Record<string, unknown>)) {
+    // `"."` is the root, admitted separately. Every other key
+    // starts with `"./"` — turn it into the FULL specifier.
+    if (key === ".") continue;
+    if (!key.startsWith("./")) continue;
+    // Refuse wildcards for now: a `./features/*` key would let
+    // any subpath resolve, which is exactly what untrusted mode
+    // means to close. If revkit ever adds a wildcard export, the
+    // allowlist gate needs a targeted widening + a fresh review.
+    if (key.includes("*")) continue;
+    out.add(`${pkgName}${key.slice(1)}`);
+  }
+  return out;
+}
