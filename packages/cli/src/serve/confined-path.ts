@@ -2,11 +2,27 @@
 // the daemon's static server (`static-server.ts`) leans on to refuse path
 // traversal and symlink escape.
 //
-// The three rules (same shape as `site/src/lib/plot-file-io.ts`'s
-// `readConfinedSibling`, but the URL shape is different — plot data
-// files are sibling filenames like `data.csv`, not URL paths like
-// `/foo/bar.js` — so the shape check differs while the containment
-// primitives are the same):
+// The **containment rules** (rules 2 and 3 below) are shared with the
+// plot-data reader in `@revkit/site`
+// (`site/src/lib/plot-file-io.ts`'s `readConfinedSibling`, which
+// `@revkit/cli` already depends on transitively). The two implementations
+// stay separate for two concrete reasons:
+//
+// - The URL shape checked by rule 1 differs: the plot helper's
+//   `isSiblingFilename` refuses a leading `/` and any scheme (a plot's
+//   `data.url` is a bare filename or a subdirectory-nested filename),
+//   while the daemon receives HTTP URL paths that start with `/` and
+//   need URL-decoding before the same segment refusal applies. A
+//   shared entry point would end up as two thin wrappers around a
+//   third primitive.
+// - The plot helper is `async` (it calls `readFile` after resolving),
+//   the daemon's static server is called synchronously per request
+//   (`Bun.file` handles the async read itself); one file's I/O style
+//   would have to change to share the primitive.
+//
+// Both files are audited together whenever the primitive changes.
+//
+// The three rules:
 //
 // 1. **Path shape:** the resolved candidate must sit under the pre-
 //    resolved `rootReal`. `..` segments in the decoded URL path are

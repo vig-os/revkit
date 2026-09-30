@@ -23,15 +23,16 @@
 // same function against `port: 0` and a temporary directory.
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, extname } from "node:path";
+import { chmodSync, mkdirSync } from "node:fs";
+import { dirname, extname, relative as relativePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
+import { z } from "zod";
 import {
+  threadStatusSchema,
   type Author,
   type ReviewEvent,
   type ReviewEventInput,
   type ThreadFilter,
-  type ThreadStatus,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
 import { openStaticServer } from "./static-server.ts";
@@ -147,11 +148,35 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // Make sure `.revkit/` exists before opening the sqlite file —
   // `bun:sqlite` creates the file but not the parent directory, and
   // `writeServeState` (below) also assumes the directory is there.
+  // Directory mode is 0700 so a curious peer user cannot list the
+  // sqlite / cookie files; the sqlite file itself is chmodded to
+  // 0600 alongside its WAL sidecars.
   const sqlitePath = options.sqlitePath ?? `${options.repoRoot}/.revkit/threads.sqlite`;
   if (sqlitePath !== ":memory:") {
-    mkdirSync(dirname(sqlitePath), { recursive: true });
+    mkdirSync(dirname(sqlitePath), { recursive: true, mode: 0o700 });
+    // Re-chmod: on an existing `.revkit/` mkdir won't downgrade the
+    // mode, and umask-clamped creation may have missed the setuid-off
+    // bits on odd filesystems. Force 0700.
+    try {
+      chmodSync(dirname(sqlitePath), 0o700);
+    } catch {
+      // A caller-supplied dir may be a symlink chain we cannot
+      // chmod; not fatal.
+    }
   }
   const store = SqliteThreadStore.open({ filename: sqlitePath });
+  if (sqlitePath !== ":memory:") {
+    // Chmod the sqlite file and its WAL sidecars to 0600. Sidecars
+    // may not exist yet — chmod is best-effort per path.
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try {
+        chmodSync(sqlitePath + suffix, 0o600);
+      } catch {
+        // File does not exist yet (WAL/SHM created on first write) —
+        // fine.
+      }
+    }
+  }
   const staticServer = openStaticServer(options.dir);
   const bus = new EventBus();
 
@@ -288,10 +313,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     );
   }
 
+  // Emit repo-relative paths in structured logs and on stdout so the
+  // caller's absolute filesystem layout does not leak into
+  // scrollback or a shipped log — defence in depth for ADR-0020,
+  // since a home directory path can carry the operator's username.
+  const dirDisplay = repoRelativeDisplay(options.repoRoot, options.dir);
   logger.info("serve.start", {
     pid: process.pid,
     port,
-    dir: options.dir,
+    dir: dirDisplay,
     version: options.version,
   });
 
@@ -300,9 +330,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // agent token file exists (mode 600) — not the token value.
     process.stdout.write(
       `revkit serve: listening on ${boundUrl}\n` +
-        `  serve on: ${options.dir}\n` +
+        `  serve on: ${dirDisplay}\n` +
         `  launch:   ${launchUrl}   (single-use, expires in 60s)\n` +
-        `  agent token in ${options.repoRoot}/.revkit/serve.json (mode 600)\n`,
+        `  agent token in .revkit/serve.json (mode 600)\n`,
     );
   }
 
@@ -364,40 +394,70 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
     const method = request.method.toUpperCase();
 
-    // Non-GET/HEAD requests: enforce Origin + Sec-Fetch-Site.
-    if (method !== "GET" && method !== "HEAD") {
-      const origin = request.headers.get("origin");
-      if (!isLoopbackOrigin(origin, port)) {
-        logger.warn("request.rejected.origin", { requestId, origin: origin ?? "" });
-        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
-      }
-      const sfs = request.headers.get("sec-fetch-site");
-      if (!isSecFetchAcceptable(sfs)) {
-        logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs ?? "" });
-        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
-      }
-    }
-
     // Launch-code exchange. GET only; the redirect strips the code.
+    // The launch code is a one-shot secret so there is no CSRF-shape
+    // attack against this endpoint — anyone with the code has, by
+    // definition, been handed access.
     if (method === "GET" && url.pathname === "/-/auth") {
       return handleAuthExchange(url, requestId);
     }
 
-    // `/events` — SSE by default, WebSocket on upgrade.
+    // `/events` — SSE by default, WebSocket on upgrade. Origin check
+    // runs inside the handler after we know which credential the
+    // caller presented (a bearer-authenticated non-browser client may
+    // omit Origin; a cookie-authenticated browser must not).
     if (url.pathname === "/events") {
       if (method !== "GET") return methodNotAllowed();
       return handleEvents(request, url, srv, requestId);
     }
 
-    // JSON API. Everything under `/api/` requires either the session
-    // cookie or the agent bearer token.
+    // JSON API. Same Origin discipline as `/events`, enforced inside
+    // the handler.
     if (url.pathname === "/api/threads" || url.pathname.startsWith("/api/threads/")) {
       return handleApi(request, url, method, requestId);
     }
 
-    // Static files. GET / HEAD only.
+    // Static files. GET / HEAD only. Static output is public — no
+    // cookie, no user data returned in the body — so no Origin check
+    // is needed and the daemon serves them to whoever asks over the
+    // loopback interface.
     if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
     return handleStatic(request, url, requestId);
+  }
+
+  /** Enforce the Origin discipline for a cookie-or-bearer authenticated
+   * endpoint (ADR-0013 + the round-1 review fix). Rules:
+   *
+   * - If the caller carries a valid agent bearer token, an absent
+   *   Origin is accepted (non-browser MCP clients omit it); a present
+   *   Origin must still match the daemon's own origin.
+   * - Otherwise, the caller is presumed to be a browser tab (session
+   *   cookie); Origin must be present AND match the daemon's own
+   *   origin. This blocks a page on `127.0.0.1:<other-port>` from
+   *   riding the browser's cookie jar into a WebSocket / SSE / API
+   *   call, which the browser cookie model would otherwise allow
+   *   (loopback ports do not partition cookies by port).
+   * - `Sec-Fetch-Site` when present must be `same-origin` / `none`;
+   *   absent is accepted (older browsers, non-browser callers).
+   *
+   * Returns a Response on rejection or undefined on pass. */
+  function checkOrigin(request: Request, requestId: string, hasValidBearer: boolean): Response | undefined {
+    const origin = request.headers.get("origin");
+    if (origin === null) {
+      if (hasValidBearer) return undefined;
+      logger.warn("request.rejected.origin", { requestId, reason: "missing" });
+      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+    }
+    if (!isLoopbackOrigin(origin, port)) {
+      logger.warn("request.rejected.origin", { requestId, origin });
+      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+    }
+    const sfs = request.headers.get("sec-fetch-site");
+    if (!isSecFetchAcceptable(sfs)) {
+      logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs ?? "" });
+      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+    }
+    return undefined;
   }
 
   function methodNotAllowed(): Response {
@@ -429,6 +489,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // ── API branch ────────────────────────────────────────────────────
 
   async function handleApi(request: Request, url: URL, method: string, requestId: string): Promise<Response> {
+    // Origin gate runs BEFORE authentication so a page from another
+    // loopback port cannot smuggle the browser's session cookie into
+    // a same-site API call (browsers do not partition cookies by port).
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+
     const actor = identifyActor(request);
     if (actor === undefined) {
       logger.warn("api.rejected.auth", { requestId, path: url.pathname });
@@ -445,9 +513,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         const parts = statusParam
           .split(",")
           .map((s) => s.trim())
-          .filter((s) => s.length > 0) as ThreadStatus[];
-        if (parts.length === 1) filter.status = parts[0];
-        else if (parts.length > 1) filter.status = parts;
+          .filter((s) => s.length > 0);
+        // Validate each part against review-core's `ThreadStatus`
+        // enum instead of casting — an unknown status silently
+        // matches nothing today and would confuse a caller.
+        const parsedStatus = z.array(threadStatusSchema).min(1).safeParse(parts);
+        if (!parsedStatus.success) {
+          return badRequest([{ code: "custom", path: ["status"], message: "invalid status value(s)" }]);
+        }
+        if (parsedStatus.data.length === 1) filter.status = parsedStatus.data[0];
+        else filter.status = parsedStatus.data;
       }
       const threads = await store.threads(filter);
       return jsonResponse({ threads, head: store.head() });
@@ -455,9 +530,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
     // POST /api/threads
     if (url.pathname === "/api/threads" && method === "POST") {
-      const body = await parseJsonBody(request);
-      const parsed = createThreadRequestSchema.safeParse(body);
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      const parsed = createThreadRequestSchema.safeParse(bodyRead.value);
       if (!parsed.success) return badRequest(parsed.error.issues);
+      if (!enforceCommentBodyLimit(parsed.data.body)) return payloadTooLarge();
       const threadId = parsed.data.threadId ?? randomUUID();
       const commentId = parsed.data.commentId ?? randomUUID();
       const input: ReviewEventInput = {
@@ -474,12 +551,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Paths of shape /api/threads/:id/(replies|resolve|reopen)
     const match = url.pathname.match(/^\/api\/threads\/([^/]+)\/(replies|resolve|reopen)$/);
     if (match !== null && method === "POST") {
-      const threadId = decodeURIComponent(match[1] ?? "");
+      // `decodeURIComponent` throws `URIError` on a malformed percent
+      // escape ("%zz"); catch it and turn it into a 400 rather than
+      // letting it surface as a 500.
+      let threadId: string;
+      try {
+        threadId = decodeURIComponent(match[1] ?? "");
+      } catch {
+        return badRequest([{ code: "custom", path: ["threadId"], message: "invalid percent-encoding" }]);
+      }
       const kind = match[2];
-      const body = await parseJsonBody(request);
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      const body = bodyRead.value;
       if (kind === "replies") {
         const parsed = replyRequestSchema.safeParse(body);
         if (!parsed.success) return badRequest(parsed.error.issues);
+        if (!enforceCommentBodyLimit(parsed.data.body)) return payloadTooLarge();
         const commentId = parsed.data.commentId ?? randomUUID();
         const input: ReviewEventInput = {
           kind: "comment.replied",
@@ -570,10 +658,18 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // ── /events branch ────────────────────────────────────────────────
 
   async function handleEvents(request: Request, url: URL, srv: Server<WebSocketData>, requestId: string): Promise<Response | undefined> {
+    // Origin gate first, for the same reason as `/api/*`: a browser
+    // page on another loopback port could otherwise open a WebSocket
+    // and receive live event frames on the daemon's cookie jar
+    // (WebSocket does not enforce same-origin at the socket layer).
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+
     const forParam = url.searchParams.get("for");
     if (forParam === "agent") {
-      const bearer = bearerFromHeader(request.headers.get("authorization"));
-      if (bearer === undefined || !auth.isAgent(bearer)) {
+      if (!hasValidBearer) {
         logger.warn("events.rejected.agent-token", { requestId });
         return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
       }
@@ -582,20 +678,24 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // channel client that attaches without `?for=agent` (agent side)
       // still authenticates via the bearer token.
       const cookieValue = readCookie(request.headers.get("cookie"), cookieName(port));
-      const bearer = bearerFromHeader(request.headers.get("authorization"));
-      if (!auth.hasSession(cookieValue) && !auth.isAgent(bearer)) {
+      if (!auth.hasSession(cookieValue) && !hasValidBearer) {
         logger.warn("events.rejected.no-session", { requestId });
         return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
       }
     }
 
     // Compute the resume point. `Last-Event-ID` (SSE spec) wins; then
-    // `?since=`; default is 0 (send everything).
+    // `?since=`; default is 0 (send everything). Strict decimal —
+    // `Number.parseInt("10abc")` returns 10 which would silently
+    // accept a garbage query; a regex refuses that.
     const lastEventId = request.headers.get("last-event-id");
     const sinceParam = url.searchParams.get("since");
     const rawSince = lastEventId ?? sinceParam ?? "0";
+    if (!/^[0-9]+$/.test(rawSince)) {
+      return badRequest([{ code: "custom", path: ["since"], message: "invalid since" }]);
+    }
     const since = Number.parseInt(rawSince, 10);
-    if (!Number.isFinite(since) || since < 0) {
+    if (!Number.isFinite(since) || since < 0 || since > Number.MAX_SAFE_INTEGER) {
       return badRequest([{ code: "custom", path: ["since"], message: "invalid since" }]);
     }
 
@@ -752,12 +852,61 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
 // ── local helpers ──────────────────────────────────────────────────
 
-async function parseJsonBody(request: Request): Promise<unknown> {
-  try {
-    return await request.json();
-  } catch {
-    return undefined;
+/** Render `absolute` relative to `repoRoot` for logs and stdout. Falls
+ * back to the absolute path when `absolute` lies outside `repoRoot`
+ * (a `--dir` pointing at some other directory on disk); the caller has
+ * asked us to serve that path, so hiding it in a log would be
+ * worse than an absolute leak. */
+function repoRelativeDisplay(repoRoot: string, absolute: string): string {
+  const rel = relativePath(repoRoot, absolute);
+  if (rel === "" || rel.startsWith("..")) return absolute;
+  return rel.split(/[\\/]/).join("/");
+}
+
+/** Hard caps for `/api/*` request bodies. A malformed or malicious
+ * caller cannot use a huge body to eat memory or fill the sqlite
+ * `payload` column. */
+const MAX_BODY_BYTES = 1_048_576; // 1 MiB whole request
+export const MAX_COMMENT_BODY_BYTES = 65_536; // 64 KiB per comment body
+
+/** Read the request body with a cap. Returns `{ ok: true, value }` on
+ * success, `{ ok: false, kind: "too-large" | "invalid" }` on rejection.
+ * `too-large` becomes a 413; `invalid` a 400. */
+async function readCappedJsonBody(request: Request): Promise<
+  | { ok: true; value: unknown }
+  | { ok: false; kind: "too-large" | "invalid" }
+> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const declaredLen = Number.parseInt(declared, 10);
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
+      return { ok: false, kind: "too-large" };
+    }
   }
+  let raw: ArrayBuffer;
+  try {
+    raw = await request.arrayBuffer();
+  } catch {
+    return { ok: false, kind: "invalid" };
+  }
+  // Content-Length is client-controlled — belt-and-braces on the
+  // actual number of bytes read.
+  if (raw.byteLength > MAX_BODY_BYTES) return { ok: false, kind: "too-large" };
+  const text = new TextDecoder().decode(raw);
+  if (text.length === 0) return { ok: true, value: undefined };
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false, kind: "invalid" };
+  }
+}
+
+/** Enforce a per-body character cap on a request that carries a
+ * `body` string field (a comment body or a reply). Returns undefined
+ * when clear, or a 413 Response when the body exceeds
+ * MAX_COMMENT_BODY_BYTES. */
+function enforceCommentBodyLimit(body: string): boolean {
+  return Buffer.byteLength(body, "utf8") <= MAX_COMMENT_BODY_BYTES;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -772,6 +921,15 @@ function jsonResponse(body: unknown, status = 200): Response {
 function badRequest(issues: unknown): Response {
   const response = new Response(JSON.stringify({ error: "invalid-body", issues }), {
     status: 400,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+  response.headers.set("x-content-type-options", "nosniff");
+  return response;
+}
+
+function payloadTooLarge(): Response {
+  const response = new Response(JSON.stringify({ error: "payload-too-large" }), {
+    status: 413,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
   response.headers.set("x-content-type-options", "nosniff");

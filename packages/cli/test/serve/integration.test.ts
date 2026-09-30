@@ -2,17 +2,19 @@
 //
 // Each test starts a real in-process daemon against a random port and
 // a temporary directory that plays the role of `site/dist`, exercises
-// the surface (fetch / WebSocket / SSE / signals), and stops.
+// the surface (fetch / WebSocket / SSE / signals / raw TCP for
+// traversal cases the URL parser would normalise), and stops.
 //
-// Non-tautology stance: every security assertion was verified to fail
-// when the corresponding guard is removed (see the notes on each
-// `test(...)` block). The API round-trip asserts on delivered event
-// payloads (seq, kind, anchor, body), not on "did the server respond
-// at all"; a broken store or event bus fails these.
+// The API round-trip asserts on delivered event payloads (seq, kind,
+// anchor, body), not on "did the server respond at all" — a broken
+// store or event bus fails these. The security cases each have a
+// mutation partner (a paired test that goes red when the guard is
+// removed); see the top-of-suite table in the PR body.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { connect } from "node:net";
 import { join } from "node:path";
 import type { Anchor } from "@revkit/review-core";
 
@@ -36,6 +38,42 @@ interface ThreadsResponse {
 }
 async function json<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
+}
+
+/** Send an HTTP/1.1 GET over a raw TCP socket, exactly as a hostile
+ * client would, without letting any URL parser normalise the target.
+ * Returns the parsed status and the response body. Used by the
+ * traversal tests, where `fetch()` collapses `/../` before it hits
+ * the wire and would make the guard look untested. */
+async function rawHttpGet(port: number, rawTarget: string): Promise<{ status: number; body: string }> {
+  const request =
+    `GET ${rawTarget} HTTP/1.1\r\n` +
+    `Host: 127.0.0.1:${port}\r\n` +
+    `Connection: close\r\n\r\n`;
+  return new Promise((resolveOuter, rejectOuter) => {
+    const socket = connect(port, "127.0.0.1", () => {
+      socket.write(request);
+    });
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk: Buffer | string) => {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk);
+    });
+    socket.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const headerEnd = raw.indexOf("\r\n\r\n");
+      const headerSection = headerEnd === -1 ? raw : raw.slice(0, headerEnd);
+      const bodySection = headerEnd === -1 ? "" : raw.slice(headerEnd + 4);
+      const firstLine = headerSection.split("\r\n")[0] ?? "";
+      const match = firstLine.match(/^HTTP\/1\.\d (\d{3})/);
+      const status = match !== null ? Number.parseInt(match[1] ?? "0", 10) : 0;
+      resolveOuter({ status, body: bodySection });
+    });
+    socket.on("error", (error) => rejectOuter(error));
+    setTimeout(() => {
+      socket.destroy();
+      rejectOuter(new Error("rawHttpGet timeout"));
+    }, 2000);
+  });
 }
 import { serveStatePath } from "../../src/serve/serve-state.ts";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
@@ -163,10 +201,18 @@ describe("revkit serve — security", () => {
   test("refuses /api/* without a valid agent token or session cookie", async () => {
     const ctx = await startCtx();
     try {
-      const noAuth = await fetch(ctx.handle.url + "/api/threads");
-      expect(noAuth.status).toBe(401);
+      // Origin check runs first: a request that carries neither a
+      // valid bearer nor a legitimate loopback Origin is 403 (the
+      // request could be a cross-origin browser attack). The 401
+      // arm is exercised in the "same-origin no-auth" test below.
+      const noAuthNoOrigin = await fetch(ctx.handle.url + "/api/threads");
+      expect(noAuthNoOrigin.status).toBe(403);
       const badToken = await fetch(ctx.handle.url + "/api/threads", {
-        headers: { host: `127.0.0.1:${ctx.handle.port}`, authorization: "Bearer wrong-token" },
+        headers: {
+          host: `127.0.0.1:${ctx.handle.port}`,
+          origin: `http://127.0.0.1:${ctx.handle.port}`,
+          authorization: "Bearer wrong-token",
+        },
       });
       expect(badToken.status).toBe(401);
     } finally {
@@ -175,11 +221,141 @@ describe("revkit serve — security", () => {
     }
   });
 
-  test("refuses /events?for=agent without the agent token", async () => {
+  test("refuses /api/* with a matching Origin but no credential (401, not 403)", async () => {
+    // This is the mutation partner to the previous test: with a
+    // legitimate loopback Origin the auth check is the one that runs
+    // — flipping `identifyActor`'s branch back to always-authenticated
+    // would turn this test red.
     const ctx = await startCtx();
     try {
+      const response = await fetch(ctx.handle.url + "/api/threads", {
+        headers: loopbackHeaders(ctx.handle.port),
+      });
+      expect(response.status).toBe(401);
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses /events?for=agent without the agent token (foreign Origin → 403)", async () => {
+    const ctx = await startCtx();
+    try {
+      // No Origin, no bearer → 403 at the Origin gate. Reproduces
+      // the cross-site WebSocket attack shape below via curl (a
+      // browser page could send this with cookies riding along).
       const noAuth = await fetch(ctx.handle.url + "/events?for=agent");
+      expect(noAuth.status).toBe(403);
+      // With a matching Origin but no bearer, the agent-token check
+      // is what refuses (401) — a distinct mutation target.
+      const sameOriginNoBearer = await fetch(ctx.handle.url + "/events?for=agent", {
+        headers: loopbackHeaders(ctx.handle.port),
+      });
+      expect(sameOriginNoBearer.status).toBe(401);
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses /events with a foreign Origin, even with a session cookie (cross-site WebSocket hijack)", async () => {
+    // Reproduces the round-1 blocker: a page on `127.0.0.1:<other-port>`
+    // that runs `new WebSocket("ws://127.0.0.1:<daemon>/events")`
+    // would share the browser's cookie jar and receive `comment.created`
+    // frames (body included). The Origin check must refuse the
+    // upgrade AND the SSE version.
+    const ctx = await startCtx();
+    try {
+      const cookie = await ctx.cookieFor(ctx.handle.launchCode);
+      // SSE with a foreign Origin: browser would set Sec-Fetch-Site:
+      // cross-site; the check catches even absent that header.
+      const sse = await fetch(ctx.handle.url + "/events", {
+        headers: {
+          host: `127.0.0.1:${ctx.handle.port}`,
+          origin: `http://127.0.0.1:${ctx.handle.port + 1}`,
+          cookie,
+        },
+      });
+      expect(sse.status).toBe(403);
+      // WebSocket upgrade with a foreign Origin and the cookie:
+      // must NOT get 101. curl's `--http1.1 --upgrade` handshake is
+      // driven here through fetch with `upgrade: websocket` and a
+      // fake Sec-WebSocket-Key.
+      const ws = await fetch(ctx.handle.url + "/events", {
+        headers: {
+          host: `127.0.0.1:${ctx.handle.port}`,
+          origin: `http://127.0.0.1:${ctx.handle.port + 1}`,
+          cookie,
+          upgrade: "websocket",
+          connection: "Upgrade",
+          // RFC 6455 requires a 16-byte random nonce; we generate it
+          // per run so gitleaks does not flag a static string.
+          "sec-websocket-key": Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString("base64"),
+          "sec-websocket-version": "13",
+        },
+      });
+      // 403 (Origin refused) rather than 101 (switching protocols).
+      expect(ws.status).toBe(403);
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses default /events (no ?for=agent) without a session cookie or bearer", async () => {
+    // Mutation partner for the cookie check on the default `/events`
+    // branch: with a matching same-origin Origin (past the Origin
+    // gate) and no cookie / bearer, the request must be 401. Disabling
+    // the `hasSession && !hasValidBearer` guard makes this test go
+    // red.
+    const ctx = await startCtx();
+    try {
+      const noAuth = await fetch(ctx.handle.url + "/events", {
+        headers: loopbackHeaders(ctx.handle.port),
+      });
       expect(noAuth.status).toBe(401);
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts default /events with a valid session cookie (mutation partner)", async () => {
+    // Mutation partner for the cookie *acceptance*: exchanging the
+    // launch code for a session cookie and using it on default
+    // `/events` (SSE) must succeed. Removing `auth.hasSession` from
+    // `identifyActor` / the events check would turn this test red.
+    const ctx = await startCtx();
+    try {
+      const cookie = await ctx.cookieFor(ctx.handle.launchCode);
+      const response = await fetch(ctx.handle.url + "/events", {
+        headers: loopbackHeaders(ctx.handle.port, { cookie }),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      await response.body?.cancel();
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts /events?for=agent from an MCP-style caller with a valid bearer and no Origin", async () => {
+    // Non-browser MCP clients do not set Origin. The Origin gate
+    // must allow that case as long as the bearer is valid. This is
+    // the mutation partner to "no Origin → 403": flipping the
+    // bearer allowance would turn this test red.
+    const ctx = await startCtx();
+    try {
+      const response = await fetch(ctx.handle.url + "/events?for=agent", {
+        headers: {
+          host: `127.0.0.1:${ctx.handle.port}`,
+          authorization: `Bearer ${ctx.handle.agentToken}`,
+        },
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      await response.body?.cancel();
     } finally {
       await ctx.handle.stop();
       rmSync(ctx.root, { recursive: true, force: true });
@@ -223,38 +399,31 @@ describe("revkit serve — security", () => {
     }
   });
 
-  test("path traversal (/../) is refused", async () => {
+  test("path traversal shapes are refused when sent over a raw TCP socket", async () => {
+    // A `fetch()` client normalises `/foo/../bar` to `/bar` on the
+    // client side, which means the daemon never sees `..` — the guard
+    // is not exercised. To test the guard, we open a raw TCP socket
+    // to the daemon and write the HTTP request line ourselves,
+    // preserving `%2e%2e`, `..%2f`, backslashes and double-encoded
+    // forms. Each candidate must NOT succeed and must NOT leak the
+    // outside file's contents.
     const ctx = await startCtx();
     try {
-      const response = await fetch(ctx.handle.url + "/../outside/secret.txt", {
-        headers: { host: `127.0.0.1:${ctx.handle.port}` },
-      });
-      // The URL constructor normalises `/../` at the client side; if it
-      // does, `..` is gone by the time the server sees the request, so
-      // the response is a legitimate 404 for /outside/secret.txt (which
-      // does not exist inside dist). Both 400 (traversal refused) and
-      // 404 (not-found inside dist) are correct rejections. Assert on
-      // the family: never a 200, never a leak of the file contents.
-      expect(response.status).not.toBe(200);
-      const body = await response.text();
-      expect(body).not.toContain("SECRET");
-    } finally {
-      await ctx.handle.stop();
-      rmSync(ctx.root, { recursive: true, force: true });
-    }
-  });
-
-  test("URL-encoded path traversal (%2e%2e) is refused", async () => {
-    const ctx = await startCtx();
-    try {
-      // Build the URL manually to keep the %2e%2e encoding; the URL
-      // constructor would normalise `..` but leaves `%2e%2e` alone,
-      // which is exactly the shape a bypass attempt uses.
-      const raw = `http://127.0.0.1:${ctx.handle.port}/%2e%2e/outside/secret.txt`;
-      const response = await fetch(raw, { headers: { host: `127.0.0.1:${ctx.handle.port}` } });
-      expect(response.status).not.toBe(200);
-      const body = await response.text();
-      expect(body).not.toContain("SECRET");
+      const attacks = [
+        "/../outside/secret.txt",
+        "/%2e%2e/outside/secret.txt",
+        "/..%2foutside/secret.txt",
+        "/..%2Foutside/secret.txt",
+        "/%2e%2e%2foutside/secret.txt",
+        "/%2E%2E%2Foutside/secret.txt",
+        "/sub/..%2f..%2foutside/secret.txt",
+        "/%252e%252e/outside/secret.txt", // double-encoded — daemon decodes once, so `%2e%2e` remains and is refused by shape or 404
+      ];
+      for (const attack of attacks) {
+        const { status, body } = await rawHttpGet(ctx.handle.port, attack);
+        expect(status, `attack '${attack}' should NOT succeed`).not.toBe(200);
+        expect(body, `attack '${attack}' body must not carry SECRET`).not.toContain("SECRET");
+      }
     } finally {
       await ctx.handle.stop();
       rmSync(ctx.root, { recursive: true, force: true });
