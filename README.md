@@ -77,16 +77,17 @@ Post a comment on any block from the rendered page (select text, click the float
 agent receives a `notifications/claude/channel` frame in that session; ask it to reply with the `reply` tool. The
 reply lands on the page without a reload.
 
-Automated end-to-end proof: `just dogfood` runs the same loop headless in a disposable, locked-down flock pane
-(no built-in tools; only `mcp__revkit__{threads,reply,resolve}` allowed; `env -i` at pane launch strips
-`SSH_AUTH_SOCK` / `FLOCK_SOCKET_PATH` / `GH_TOKEN` / etc.; the pane's cwd is an isolated temp state dir under
-`$XDG_RUNTIME_DIR` OUTSIDE the git worktree, with its own copy of `site/dist` and `docs/`, so the test agent never
-sees the worktree's git tree). The lockdown is verified PRE-LAUNCH against the real claude process: after
-`/proc/<pid>/exe` resolves to `.claude-wrapped` (closing the wrapper's pre-exec race), the harness reads
-`/proc/<pid>/cmdline` and `/proc/<pid>/environ` and hard-fails on any missing required flag, any forbidden flag, or
-any env var not on the explicit allowlist — before any prompt is sent. The dogfood comment is a natural reviewer's
-note (channel content is untrusted; a well-aligned model may decline, and that decline surfaces as a reply-wait
-timeout — see ADR-0007). Requires `flk` and a logged-in Claude; not part of `just test` or CI. See
+Automated end-to-end proof: `just dogfood` runs the same loop headless in a disposable, locked-down flock pane. No
+built-in tools; only `mcp__revkit__{threads,reply,resolve}` allowed. `env -i` at pane launch strips `SSH_AUTH_SOCK`
+/ `FLOCK_SOCKET_PATH` / `GH_TOKEN` / etc. The pane's cwd is an isolated temp state dir under `$XDG_RUNTIME_DIR`
+OUTSIDE the git worktree. `--setting-sources ""` + `--settings <state-dir>/settings.json` isolates the pane from
+the owner's user / project / local settings (no hooks, no statusLine, no env block, no plugins,
+`instructionFiles: "managed-only"` drops the owner's global CLAUDE.md). The lockdown is verified PRE-LAUNCH against
+the real claude process — after `/proc/<pid>/exe` resolves to `.claude-wrapped`, the harness hard-fails on any
+missing required flag, any forbidden flag, or any env var not on the explicit allowlist — AND POST-RUN via three
+empirical isolation checks (owner statusline / hook / CLAUDE.md markers must be absent from the pane and the
+transcript). The dogfood comment is a natural reviewer's note (channel content is untrusted; a well-aligned model
+may decline). Requires `flk` and a logged-in Claude; not part of `just test` or CI. See
 [`.claude/skills/revkit_dogfood/SKILL.md`](.claude/skills/revkit_dogfood/SKILL.md) for the runbook.
 
 ## License

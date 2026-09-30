@@ -6,17 +6,20 @@
 # over the `revkit` MCP channel, the agent replies through the `reply` tool
 # and resolves the thread, and the reply appears in the page in real time.
 #
-# Round-4 hardening (PR #42 review round 3):
+# Round-5 hardening (PR #42 review round 4):
+#
+#   Round-4 verified the CLI flags but the child claude inherited
+#   the OWNER's settings via CLAUDE_CONFIG_DIR — statusLine, hooks,
+#   env block, plugins, AND the owner's global CLAUDE.md. Round-5
+#   plugs that leak.
 #
 #   The lockdown proof is the PRE-LAUNCH /proc check on the real
-#   claude process, NOT any model behaviour. The old post-run "did the
-#   agent write the denial text" gate was dropped: it was forgeable
-#   (the reply body was model output the harness ended up trusting)
-#   AND it broke the loop whenever a well-aligned model correctly
-#   refused to follow embedded instructions from a channel comment —
-#   which is the exact behaviour we WANT (see ADR-0007's channel
-#   section). Channel comments are requests from a human, not
-#   instructions, and the agent may decline.
+#   claude process, NOT any model behaviour. The old post-run "did
+#   the agent write the denial text" gate was dropped in round-4:
+#   forgeable (the reply body was model output) AND broke the loop
+#   whenever a well-aligned model correctly refused to follow
+#   embedded instructions from a channel comment (ADR-0007: channel
+#   comments are requests from a human, not instructions).
 #
 #   1. **Verifiable lockdown, pre-launch.** BEFORE any prompt is sent,
 #      the harness finds the child claude by its unique argv (the
@@ -57,14 +60,30 @@
 #      `.revkit/` state, isolated `mcp-config.json`, and copies of
 #      `site/dist` and `docs/` live there. `rm -rf`'d on teardown.
 #   5. **`env -i` at pane launch.**
-#   6. **Self-test mode.** `DOGFOOD_SELFTEST_BAD_FLAGS=1` injects a
+#   6. **Owner-profile isolation (round-5 blocker).** `CLAUDE_CONFIG_DIR`
+#      still points at the owner's `~/.claude` (that's where OAuth
+#      lives; copying it is out of bounds), but the child claude
+#      launches with `--setting-sources ""` (blocks owner user /
+#      project / local settings from loading) AND `--settings
+#      <state-dir>/settings.json` (loads OUR isolated file with no
+#      hooks, no statusLine, no env block, no plugins,
+#      `instructionFiles: "managed-only"` — drops the owner's
+#      CLAUDE.md — and `permissions.defaultMode: "dontAsk"` +
+#      an `allow` list of only the three revkit MCP tools). Verified
+#      per run via three EMPIRICAL post-run checks (statusline
+#      markers absent from pane, hook markers absent from pane,
+#      owner-CLAUDE.md fingerprint absent from
+#      `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl`). At teardown
+#      the harness removes ONLY this run's profile dir (containment-
+#      checked), leaving prior leftovers for a coordinator decision.
+#   7. **Self-test mode.** `DOGFOOD_SELFTEST_BAD_FLAGS=1` injects a
 #      forbidden argv value (`--tools default`) and asserts the
 #      pre-launch verify aborts BEFORE any prompt is sent. Success
 #      prints `SELFTEST OK` and exits 0 (distinct from a real
 #      failure). `--dangerously-skip-permissions` is NEVER injected —
 #      no rogue session ever runs.
-#   7. **Deterministic daemon kill + leak-by-cwd sweep.**
-#   8. **daemon.log holds a plaintext launch code — treated
+#   8. **Deterministic daemon kill + leak-by-cwd sweep.**
+#   9. **daemon.log holds a plaintext launch code — treated
 #      accordingly.** Unlinked on teardown unless
 #      `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1`; then `?code=…` is
 #      redacted in place.
@@ -295,9 +314,35 @@ cleanup() {
     fi
     rm -rf "${STATE_DIR}" 2>/dev/null || true
   fi
-  # 4. Drop the throw-away `.daemon.pid` file from an older revision.
+  # 4. Round-5 blocker: this run's profile dir under
+  #    `${CLAUDE_CONFIG_DIR}/projects/` holds the transcript and
+  #    memory for the test agent. Delete ONLY this run's dir; do
+  #    NOT touch older leftovers (the reviewer wants those left in
+  #    place for a coordinator decision). The dir name is claude's
+  #    slugified STATE_DIR path: `/` → `-`. Belt-and-braces: refuse
+  #    to `rm` unless the resolved path is under
+  #    `${CLAUDE_CONFIG_DIR_VAL}/projects/` AND contains the
+  #    literal `revkit-dogfood` marker AND matches the STATE_DIR
+  #    slug for THIS run.
+  if [[ -n "${STATE_DIR}" && -n "${CLAUDE_CONFIG_DIR_VAL:-}" ]]; then
+    # Slugify: replace every `/` with `-`. `/run/user/1004/revkit-dogfood-XYZ`
+    # → `-run-user-1004-revkit-dogfood-XYZ`.
+    local run_slug="${STATE_DIR//\//-}"
+    local projects_root="${CLAUDE_CONFIG_DIR_VAL}/projects"
+    local project_dir="${projects_root}/${run_slug}"
+    if [[ -d "${project_dir}" \
+      && "${project_dir}" == "${projects_root}/"* \
+      && "${project_dir}" == *"revkit-dogfood"* \
+      && "${project_dir}" == *"${STATE_DIR##*/}"* ]]; then
+      log "removing this run's profile dir: ${project_dir}"
+      rm -rf "${project_dir}" 2>/dev/null || true
+    elif [[ -d "${project_dir}" ]]; then
+      log "SAFETY: profile dir '${project_dir}' failed containment check; NOT removing"
+    fi
+  fi
+  # 5. Drop the throw-away `.daemon.pid` file from an older revision.
   rm -f "${DOGFOOD_DIR}/.daemon.pid" 2>/dev/null || true
-  # 5. `daemon.log` holds a plaintext launch code (`?code=…`). By
+  # 6. `daemon.log` holds a plaintext launch code (`?code=…`). By
   #    default we unlink it on teardown; a caller who wants to keep it
   #    for post-mortem can set `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1` and
   #    we redact instead. The `?code=` redaction rewrites the file in
@@ -409,6 +454,46 @@ cat > "${STATE_DIR}/mcp-config.json" <<EOF
 }
 EOF
 STATE_MCP_CONFIG="${STATE_DIR}/mcp-config.json"
+
+# Round-5 blocker: without `--setting-sources ""` + `--settings <file>`,
+# the test agent inherits the OWNER's user / project / local settings
+# — which means the owner's SessionStart / UserPromptSubmit hooks,
+# statusLine command, env block, and plugins all run inside the test
+# pane, AND the owner's global CLAUDE.md lands in the test agent's
+# context. Hooks are shell commands that run regardless of --tools,
+# and the settings `env` block is applied AFTER our /proc environ
+# check, so the pre-launch lockdown claim was false without this.
+#
+# The isolated settings.json:
+#   - no hooks (drops SessionStart / UserPromptSubmit / etc.)
+#   - no statusLine (drops the owner's flk statusline)
+#   - no env (blocks the settings env-injection path around /proc)
+#   - no plugins
+#   - `permissions.defaultMode: "dontAsk"` and an `allow` list of
+#     ONLY the three revkit MCP tools (belt to the --allowedTools braces)
+#   - `instructionFiles: "managed-only"` — the ONE claude-side flag
+#     that stops the user's / project's CLAUDE.md from loading into
+#     the session context (per the wrapper's own help text: "the
+#     project's and your own instruction files are dropped; the
+#     organization's managed CLAUDE.md and memory stay"). Verified
+#     empirically per run — see require_no_owner_claudemd below.
+cat > "${STATE_DIR}/settings.json" <<'EOF'
+{
+  "$note": "Isolated per-run settings for the revkit dogfood test session. Loaded via --settings; --setting-sources '' blocks user/project/local settings from also loading. See scripts/dogfood-channel.sh.",
+  "hooks": {},
+  "env": {},
+  "instructionFiles": "managed-only",
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "mcp__revkit__threads",
+      "mcp__revkit__reply",
+      "mcp__revkit__resolve"
+    ]
+  }
+}
+EOF
+STATE_SETTINGS="${STATE_DIR}/settings.json"
 log "isolated state dir: ${STATE_DIR} (outside the git worktree)"
 
 # ── step 4: start the daemon INSIDE the isolated state dir ──────────────
@@ -483,6 +568,13 @@ CLAUDE_ARGV=(
   --permission-mode dontAsk
   --tools ""
   --allowedTools "${ALLOWED_TOOLS_ARR[@]}"
+  # Round-5 blocker fix: block the owner's user/project/local
+  # settings from loading (SessionStart/UserPromptSubmit hooks,
+  # statusLine command, env block, plugins), then load OUR
+  # per-run settings.json instead. Verified via /proc cmdline
+  # (both flags on the required list below).
+  --setting-sources ""
+  --settings "${STATE_SETTINGS}"
 )
 
 # ── step 5.5: SELF-TEST — DOGFOOD_SELFTEST_BAD_FLAGS=1 ──────────────────
@@ -599,6 +691,8 @@ verify_claude_lockdown() {
     "--tools"
     "--allowedTools"
     "--dangerously-load-development-channels"
+    "--setting-sources"
+    "--settings"
   )
   local flag
   for flag in "${required[@]}"; do
@@ -655,6 +749,29 @@ verify_claude_lockdown() {
     if [[ "${cmd_arr[i]}" == "--tools" ]]; then
       if [[ -n "${cmd_arr[i+1]:-}" ]]; then
         log "LOCKDOWN-VERIFY: --tools != '' (was: '${cmd_arr[i+1]:-<missing>}')"
+        die "lockdown verification failed"
+      fi
+    fi
+  done
+
+  # 5b. --setting-sources VALUE is exactly the empty string, so
+  # no user / project / local settings load. `--restricted` also
+  # sets it to `""` internally; we want the same effect without
+  # needing --restricted's other consequences.
+  for ((i=0; i<${#cmd_arr[@]}; i++)); do
+    if [[ "${cmd_arr[i]}" == "--setting-sources" ]]; then
+      if [[ -n "${cmd_arr[i+1]:-}" ]]; then
+        log "LOCKDOWN-VERIFY: --setting-sources != '' (was: '${cmd_arr[i+1]:-<missing>}')"
+        die "lockdown verification failed"
+      fi
+    fi
+  done
+
+  # 5c. --settings VALUE is our absolute path.
+  for ((i=0; i<${#cmd_arr[@]}; i++)); do
+    if [[ "${cmd_arr[i]}" == "--settings" ]]; then
+      if [[ "${cmd_arr[i+1]:-}" != "${STATE_SETTINGS}" ]]; then
+        log "LOCKDOWN-VERIFY: --settings value != ${STATE_SETTINGS} (was: '${cmd_arr[i+1]:-<missing>}')"
         die "lockdown verification failed"
       fi
     fi
@@ -782,7 +899,7 @@ verify_claude_lockdown() {
     done < <(tr ':' '\n' <<<"${ld_value}")
   fi
 
-  log "lockdown verified OK for claude pid ${claude_pid} (exe=${exe_link}): 6 required flags present, 4 forbidden flags absent, env is the explicit allowlist (5 ours + 5 wrapper-added)"
+  log "lockdown verified OK for claude pid ${claude_pid} (exe=${exe_link}): 8 required flags present with correct values, 4 forbidden flags absent, env is the explicit allowlist (5 ours + 5 wrapper-added)"
 }
 
 # In self-test mode we EXPECT verify_claude_lockdown to `die`. The
@@ -995,6 +1112,109 @@ fi
 # well-aligned model correctly refused to follow embedded
 # instructions from a channel comment (which is the behaviour
 # ADR-0007 wants: channel content is untrusted).
+
+# ── step 10: EMPIRICAL isolation checks ─────────────────────────────────
+# Round-5 blocker: verify that the owner's settings really did not
+# leak into the test session. Three independent proofs, all hard
+# failures. If any one of these fires, the isolation as-configured is
+# incomplete and the harness has NOT proven what it claims to.
+
+# 10a. Owner's statusLine did NOT render in the test pane's footer.
+#      A user-configured statusLine typically emits a branch marker
+#      (`⑂`), context progress bars (`▓░`), or `ctx `/`5h `/`7d ` uptime
+#      indicators. A bare `⏵⏵ don't ask on … · ← for agents` footer
+#      is what a session with NO statusLine setting produces.
+STATUSLINE_MARKERS=('⑂' '5h ▓' '7d ▓' 'ctx ▓' 'ctx ░')
+require_no_owner_statusline() {
+  local screen
+  screen="$(flk agent read "${PANE_ID}" --lines 400 2>/dev/null | jq -r '.result.read.text // ""')"
+  local m
+  for m in "${STATUSLINE_MARKERS[@]}"; do
+    if grep -qF "${m}" <<<"${screen}"; then
+      log "ISOLATION FAIL: pane footer contains statusline marker '${m}' — owner's statusLine leaked"
+      return 1
+    fi
+  done
+  log "isolation proof (statusline): pane has NO owner-statusline markers — good"
+  return 0
+}
+
+# 10b. No SessionStart / UserPromptSubmit / other hook fired in the
+#      test pane. `flk hook` output labels itself; a `settings.json`
+#      hook that ran anything would leave shell output (or `[hook: `,
+#      or `SessionStart`) somewhere in the pane read.
+HOOK_MARKERS=('[hook:' 'SessionStart' 'UserPromptSubmit' 'PreToolUse' 'PostToolUse' 'Stop hook')
+require_no_hooks_fired() {
+  local screen
+  screen="$(flk agent read "${PANE_ID}" --lines 400 2>/dev/null | jq -r '.result.read.text // ""')"
+  local m
+  for m in "${HOOK_MARKERS[@]}"; do
+    if grep -qF "${m}" <<<"${screen}"; then
+      log "ISOLATION FAIL: pane contains hook marker '${m}' — owner's hook leaked"
+      return 1
+    fi
+  done
+  log "isolation proof (hooks): pane has NO hook-fire markers — good"
+  return 0
+}
+
+# 10c. The test agent's transcript does NOT include the owner's
+#      global CLAUDE.md. Claude Code writes per-project transcripts
+#      as JSONL under `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl`.
+#      Grep those files for a distinctive phrase from the owner's
+#      global CLAUDE.md (`Global Claude preferences`). If it's there
+#      the `instructionFiles: "managed-only"` setting didn't take
+#      effect and the isolation is incomplete.
+#
+#      We derive the marker at RUN time from the owner's actual
+#      CLAUDE.md file (if present) so this check works on any
+#      machine, but require the file exist and be non-empty to
+#      derive a non-trivial substring — if the owner has no global
+#      CLAUDE.md, there's nothing to leak and we short-circuit.
+require_no_owner_claudemd_in_transcript() {
+  local owner_claudemd="${CLAUDE_CONFIG_DIR_VAL}/CLAUDE.md"
+  if [[ ! -s "${owner_claudemd}" ]]; then
+    log "isolation proof (CLAUDE.md): owner has no global CLAUDE.md at ${owner_claudemd} — nothing to leak"
+    return 0
+  fi
+  # Take the first non-empty, non-heading line as our fingerprint.
+  # Trim to <= 120 chars to keep the grep argument short. If the
+  # first non-heading line is very short (<20 chars) prefer the
+  # first heading, since a short line is more likely to appear in
+  # unrelated prose.
+  local marker
+  marker="$(grep -m 1 -E '^[^#[:space:]].{20,}' "${owner_claudemd}" 2>/dev/null | head -c 120 || true)"
+  if [[ -z "${marker}" ]]; then
+    marker="$(head -n 1 "${owner_claudemd}" 2>/dev/null | head -c 120 || true)"
+  fi
+  if [[ -z "${marker}" ]]; then
+    log "isolation proof (CLAUDE.md): owner's CLAUDE.md is unreadable / empty; skipping transcript check"
+    return 0
+  fi
+  local run_slug="${STATE_DIR//\//-}"
+  local project_dir="${CLAUDE_CONFIG_DIR_VAL}/projects/${run_slug}"
+  if [[ ! -d "${project_dir}" ]]; then
+    log "isolation proof (CLAUDE.md): profile dir ${project_dir} does not exist — nothing to grep, session may have been so short no transcript was written"
+    return 0
+  fi
+  local hits
+  hits="$(grep -lF "${marker}" "${project_dir}"/*.jsonl 2>/dev/null | head -3 || true)"
+  if [[ -n "${hits}" ]]; then
+    log "ISOLATION FAIL: owner's global CLAUDE.md marker present in transcript file(s):"
+    printf '%s\n' "${hits}" | log_block "transcript-hit" || true
+    return 1
+  fi
+  log "isolation proof (CLAUDE.md): transcript files under ${project_dir} do NOT contain the owner's CLAUDE.md marker — good"
+  return 0
+}
+
+isolation_bad=0
+require_no_owner_statusline    || isolation_bad=1
+require_no_hooks_fired         || isolation_bad=1
+require_no_owner_claudemd_in_transcript || isolation_bad=1
+if [[ ${isolation_bad} -ne 0 ]]; then
+  die "isolation proof failed — the test agent inherited some part of the owner's Claude profile despite --setting-sources '' + --settings <state>/settings.json"
+fi
 
 log "END-TO-END loop succeeded — nonce=${NONCE}"
 exit 0

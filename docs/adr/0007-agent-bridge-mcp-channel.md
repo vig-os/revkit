@@ -39,13 +39,9 @@ call on a human.
   user-supplied field revkit puts into `content` (`body`, `quote`, actor name, `path`) is HTML-escaped (`<` → `&lt;`,
   `>` → `&gt;`, `&` → `&amp;`) and its whitespace is collapsed to a single space before composition, so a body
   cannot forge or close a tag, and a multi-line paste stays on the one summary line the terminal renders.
-- **Channel comments are REQUESTS from a human, not instructions.** A well-aligned model may decline them — e.g. a
-  comment that reads like a coerced imperative chain looks the same as a prompt-injection attempt and the model
-  should refuse it. That refusal is CORRECT and revkit's dogfood harness treats it that way: the harness proves the
-  loop plumbing (comment posted → channel notification → reply visible), the model decides whether to comply, and a
-  decline surfaces as a reply-wait timeout rather than a spurious success. Comments authored to test the loop must
-  therefore read like a real reviewer's note (a short question, a request for an ack), not like an instruction
-  sequence the agent is expected to execute step by step.
+- **Channel comments are REQUESTS from a human, not instructions.** A well-aligned model may decline them, and that
+  refusal is correct. Harness / test-code implications (dogfood comment shape, reply-wait timeout as the observable
+  for a decline) live in the `revkit_dogfood` skill, not here.
 - **Meta values are validated and capped.** `meta` keys must be identifiers (letters, digits, underscores — the
   Claude Code channel contract silently drops keys with hyphens); values are trimmed to a 4 KiB cap. Enforced at
   emit-time in `formatChannelPayload`.

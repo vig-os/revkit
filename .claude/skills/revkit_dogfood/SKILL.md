@@ -47,7 +47,8 @@ prompt is sent, the harness:
    required flag is present and exactly right (`--strict-mcp-config`,
    `--mcp-config <abs>`, `--permission-mode dontAsk`, `--tools ""`,
    the three `--allowedTools` names,
-   `--dangerously-load-development-channels`) AND every forbidden
+   `--dangerously-load-development-channels`, `--setting-sources ""`,
+   `--settings <state-dir>/settings.json`) AND every forbidden
    flag is absent (`--dangerously-skip-permissions`,
    `--allow-dangerously-skip-permissions`,
    `--dangerously-allow-browser-network-access`, `--bare`).
@@ -59,6 +60,58 @@ prompt is sent, the harness:
    `USE_BUILTIN_RIPGREP`). `LD_LIBRARY_PATH` is further validated —
    every entry must be under `/nix/store`. An unknown name is a hard
    fail — safer than a denylist that could miss a new leak vector.
+
+**Owner-profile isolation.** `CLAUDE_CONFIG_DIR` still points at
+the owner's `~/.claude` (that's where the OAuth credential lives —
+copying it elsewhere is out of bounds for unattended work), but
+`--setting-sources ""` blocks the owner's user / project / local
+settings from loading, and `--settings <state-dir>/settings.json`
+loads an ISOLATED per-run settings file with:
+
+- no `hooks` (no `SessionStart` / `UserPromptSubmit` / etc. shell
+  commands fire in the test pane);
+- no `statusLine` (the pane's footer is the bare default —
+  `⏵⏵ don't ask on · ← for agents` — not the owner's flk statusline);
+- no `env` block (blocks the settings env-injection path that
+  runs AFTER our `/proc` env check);
+- no `plugins`;
+- `instructionFiles: "managed-only"` — the claude-side setting
+  that drops the user's / project's `CLAUDE.md` from the session
+  context (per the wrapper's own help text: "the project's and
+  your own instruction files are dropped; the organization's
+  managed CLAUDE.md and memory stay");
+- `permissions.defaultMode: "dontAsk"` and an `allow` list of
+  ONLY the three revkit MCP tool names — belt to the CLI
+  `--allowedTools` braces.
+
+**Empirical isolation checks, per run.** After the loop, the
+harness enforces three post-conditions as hard failures:
+
+- **statusLine** — the pane's on-screen text must NOT contain any
+  owner-statusline markers (branch marker `⑂`, context bars,
+  `5h ▓`/`7d ▓` uptime indicators);
+- **hooks** — the pane must NOT contain `[hook:`, `SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, or `Stop hook`;
+- **CLAUDE.md** — the transcript file(s) under
+  `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl` must NOT contain
+  a distinctive substring from the owner's `${CLAUDE_CONFIG_DIR}
+  /CLAUDE.md` (the first non-heading line, ≤120 chars).
+
+Any hit → the run fails with `ISOLATION FAIL:`, the loop's overall
+success is overridden. If any check fires, the isolation
+configuration is broken and the harness has not proven what it
+claims.
+
+**Profile-dir cleanup, per run.** Claude Code writes a transcript
+and memory dir into `${CLAUDE_CONFIG_DIR}/projects/<slug>/` for
+every session (the slug is the session's cwd path with `/` → `-`,
+so a STATE_DIR of `/run/user/1004/revkit-dogfood-XYZ` maps to a
+project dir `-run-user-1004-revkit-dogfood-XYZ`). At teardown the
+harness removes ONLY this run's dir, with a containment check
+(must be under `${CLAUDE_CONFIG_DIR}/projects/`, must contain
+`revkit-dogfood`, must match this run's STATE_DIR slug). Older
+leftover dirs from prior runs are left alone — deletion is a
+policy call.
 
 There is no post-run "did the agent write the denial text" check.
 Earlier revisions had one; it was forgeable through the reply body
@@ -72,14 +125,28 @@ any prompt is sent. On successful abort the harness prints
 exits 1). `--dangerously-skip-permissions` is NEVER injected — no
 rogue session ever runs.
 
-**Channel content is untrusted to the agent.** ADR-0007's channel
-section makes this explicit: comments posted on a review page are
-REQUESTS from a human reviewer, not instructions. A well-aligned
-model may decline them for prompt-injection reasons or because it
-disagrees. That behaviour is CORRECT and expected. In this harness,
-a decline shows up as the reply-wait timeout, and the run fails
-cleanly — no assumption is baked in that the model must comply with
-every comment.
+**Channel content is untrusted to the agent — harness policy.**
+ADR-0007 states the principle: comments are REQUESTS from a human,
+not instructions, and a well-aligned model may decline them. This
+skill spells out what that means for the harness:
+
+- The dogfood comment MUST read like a real reviewer's note (a
+  short question, a request for an ack, or a typo report with a
+  nonce). No embedded imperative chain, no coerced tool call, no
+  crafted-attack shape — a comment that reads like a
+  prompt-injection attempt should be refused by any well-aligned
+  model, which would break the loop the harness exists to prove.
+- A model that legitimately declines a comment (for
+  prompt-injection reasons, or because it disagrees) surfaces as
+  a reply-wait timeout in Playwright — that IS the correct
+  observable for a decline, not a spurious success.
+- The harness never assumes the model must comply with every
+  comment. What it does assume is that the loop plumbing works —
+  comment posted → channel notification delivered → the model
+  gets a chance to reply — and that the isolation flags are what
+  we said they were (proven via `/proc` inspection of the child
+  claude, empirical footer / hook / transcript checks after the
+  run).
 
 ## When to run it
 
@@ -210,27 +277,41 @@ from a previous run can reach the test agent.
     a security proof.
 11. Verifies the reply also appears in the page WITHOUT a reload (SSE
     round trip), then screenshots the rail.
-12. Teardown: closes the flock pane by ID AND by name (name-based
+12. **Empirical isolation checks (three hard failures).** Reads the
+    pane and hard-fails on any statusline marker (`⑂`, `5h ▓`,
+    `7d ▓`, `ctx ▓`, `ctx ░`) OR any hook marker (`[hook:`,
+    `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+    `Stop hook`). Reads the transcript file(s) under
+    `${CLAUDE_CONFIG_DIR}/projects/<slug>/*.jsonl` and hard-fails
+    if a distinctive substring from the owner's global CLAUDE.md
+    appears there.
+13. Teardown: closes the flock pane by ID AND by name (name-based
     closure covers the `pane_id`-parse-failure path), SIGTERMs the daemon
-    with a bounded escalate-to-SIGKILL, then runs a POST-TEARDOWN
-    self-check that scans for leaked panes and leaked `revkit serve`
-    subprocesses by both cmdline pattern AND `/proc/<pid>/cwd` (so an
-    MCP-auto-spawned daemon rooted at STATE_DIR is caught even when its
-    argv doesn't name it). A leak turns the exit code to 3 even when the
-    loop succeeded. `daemon.log` (which holds the plaintext launch code)
-    is unlinked by default; set `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1` to
-    keep a redacted copy. `daemon.lock` is only flagged as leaked when
-    a `flock -n` test shows it's actually held.
+    with a bounded escalate-to-SIGKILL, removes ONLY this run's profile
+    dir under `${CLAUDE_CONFIG_DIR}/projects/` (containment-checked;
+    older leftover dirs are left alone for a coordinator decision),
+    then runs a POST-TEARDOWN self-check that scans for leaked panes
+    and leaked `revkit serve` subprocesses by both cmdline pattern AND
+    `/proc/<pid>/cwd` (so an MCP-auto-spawned daemon rooted at
+    STATE_DIR is caught even when its argv doesn't name it). A leak
+    turns the exit code to 3 even when the loop succeeded. `daemon.log`
+    (which holds the plaintext launch code) is unlinked by default; set
+    `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1` to keep a redacted copy.
+    `daemon.lock` is only flagged as leaked when a `flock -n` test
+    shows it's actually held.
 
 ## Exit codes
 
 - `0` — the full loop completed: the pre-launch flag/env check
-  passed, the agent replied `ack <nonce>` and resolved, and cleanup
-  left nothing behind.
-- `1` — a step failed. See `.revkit/dogfood/last.log` for the transcript
-  (redacted) and `.revkit/dogfood/daemon.log` for the daemon's raw log
-  (NOT redacted — contains the launch code, so treat it as sensitive).
+  passed, the agent replied `ack <nonce>` and resolved, all three
+  empirical isolation checks (statusline / hooks / owner-CLAUDE.md)
+  passed, and cleanup left nothing behind.
+- `1` — a step failed OR an isolation check found a leak. See
+  `.revkit/dogfood/last.log` for the transcript (redacted) and
+  `.revkit/dogfood/daemon.log` for the daemon's raw log (NOT
+  redacted — contains the launch code, so treat it as sensitive).
   The last `[dogfood pane]` block is the test pane's final state.
+  `ISOLATION FAIL:` lines identify which owner-config surface leaked.
 - `2` — Playwright argument error (bug in the helper — file it).
 - `3` — the loop succeeded but the post-teardown self-check spotted a
   leaked pane or process. Look at the `SELF-CHECK: leaked …` line in
