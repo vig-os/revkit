@@ -20,12 +20,14 @@ SPDX id, layout, symlink refusal, NOTICE format), and requires that each
 entry below points at a real subdirectory whose UPSTREAM `license:` equals
 the entry's SPDX id.
 
-The LICENSE bytes themselves are gated by CODEOWNERS
-(`.github/CODEOWNERS`, `packages/components/vendor/` + `NOTICE` require the
-maintainer's review) rather than by a hand-rolled canonical-text matcher —
-an SPDX-template matcher that admits real upstream LICENSE variance
+The LICENSE bytes themselves are checked by **manual review only** until the
+SPDX-template matcher tracked in #33 lands. `.github/CODEOWNERS` REQUESTS the
+maintainer's review on `packages/components/vendor/` and `NOTICE`, but the
+CODEOWNERS file becomes an enforced gate only once branch protection on
+`dev` requires code-owner review (an org-config change outside this repo).
+An SPDX-template matcher that admits real upstream LICENSE variance
 (curly quotes, per-line comment prefixes, condensed paragraphs) while
-refusing adversarial appends belongs behind a well-tested library.
+refusing adversarial appends belongs behind a well-tested library — see #33.
 
 Entries take the form (one per line, at the start of the line):
 

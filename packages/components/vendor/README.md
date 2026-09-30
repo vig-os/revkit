@@ -5,8 +5,10 @@ Under this directory, `@revkit/components` will vendor **copy-in source** — st
 directory ships with the package and the contract is written down before the first drop.
 
 The `revkit check` **`vendored-code`** guard (ADR-0022) enforces every STRUCTURAL rule below. LICENSE **bytes** are
-gated by CODEOWNERS: `packages/components/vendor/` and `NOTICE` require the maintainer's review on every PR
-(`.github/CODEOWNERS`). See "Why not text-matching?" below.
+checked by **manual review only** until the SPDX-template matcher tracked in #33 lands. `.github/CODEOWNERS`
+REQUESTS the maintainer's review on `packages/components/vendor/` and `NOTICE`, but the CODEOWNERS file becomes an
+enforced gate only once branch protection on `dev` requires code-owner review (an org-config change outside this
+repo). See "Why not text-matching?" below.
 
 ## Contract
 
@@ -16,9 +18,9 @@ must contain:
 1. The upstream source files, unmodified except where the port note in the file header explains why.
 2. An upstream **`LICENSE`** file at the root of the subdirectory. The file must exist, be a real regular file
    (no symlinks), and be named exactly `LICENSE` (case matters — `LICENSE.md`, `License`, `license`, `COPYING`
-   get a rename hint so macOS behaves like Linux CI). The **bytes** are the reviewer's job — see
-   `.github/CODEOWNERS`. If the source is one of MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0 or ISC, copy the
-   upstream `LICENSE` verbatim.
+   get a rename hint so macOS behaves like Linux CI). The **bytes** are checked by manual review (see "Why not
+   text-matching?" below and #33). If the source is one of MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0 or ISC,
+   copy the upstream `LICENSE` verbatim.
 3. An **`UPSTREAM`** provenance file at the root of the subdirectory. Simple `key: value` grammar, one per line;
    blank lines and `#` comments ignored; duplicate keys refused:
 
@@ -72,9 +74,11 @@ either extreme leaves a bypass:
   belongs behind a well-tested library, not a hand-rolled normaliser.
 
 Rather than ship a heuristic that passes some cases and refuses others, this rule leaves the LICENSE bytes to
-CODEOWNERS. The maintainer reviews a small, known-shaped surface (one LICENSE file + one UPSTREAM per drop, with
-every structural check already green). A proper SPDX-template matcher is tracked as a follow-up (see the issue
-named in PR #30).
+**manual review** until #33 (proper SPDX-template matcher behind a vetted library) lands. `.github/CODEOWNERS`
+REQUESTS the maintainer's review on `packages/components/vendor/` and `NOTICE`; that becomes an ENFORCED gate
+only once branch protection on `dev` requires code-owner review (an org-config change outside this repo).
+Meanwhile the maintainer reviews a small, known-shaped surface (one LICENSE file + one UPSTREAM per drop, with
+every structural check already green).
 
 ## Procedure — vendor a new upstream package
 
@@ -93,13 +97,17 @@ named in PR #30).
    phantom, or SPDX-mismatched.
 6. Commit inside the dev shell so the pre-commit `revkit-check` hook runs the same guard against your staged
    changes.
-7. Open the PR. CODEOWNERS auto-requests the maintainer; the LICENSE bytes get reviewed on the diff.
+7. Open the PR. CODEOWNERS auto-REQUESTS the maintainer; the LICENSE bytes are reviewed on the diff. That review
+   is a REQUEST, not a merge block, until branch protection on `dev` requires code-owner review (an org-config
+   change outside this repo) — and it stays REQUEST-ONLY until the SPDX-template matcher in #33 lands, so treat
+   the reviewer's LICENSE-bytes sign-off as load-bearing when merging.
 
 ## Allowed licenses
 
 Only **permissive licenses compatible with Apache-2.0** may be vendored: MIT, BSD-2-Clause, BSD-3-Clause, ISC,
 Apache-2.0. Copyleft (GPL / LGPL / AGPL / MPL / EPL / SSPL) or anything unrecognised is refused at the UPSTREAM
-`license:` level; CODEOWNERS catches anything that slips past the SPDX id (a mis-declared LICENSE, for example).
+`license:` level; the maintainer's manual LICENSE-bytes review (as requested by CODEOWNERS) catches anything that
+slips past the SPDX id (a mis-declared LICENSE, for example) — see #33 for the automated follow-up.
 
 ## Not-a-dependency
 

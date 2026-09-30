@@ -408,15 +408,18 @@ describe("vendored-code — symlinks + filesystem safety", () => {
 
     // The workspace walk surfaces the symlink under the refused
     // prefix as a DiscoveredSymlink, which the check orchestrator
-    // then reports with the `no-hand-rolled-ui` rule id (that's the
-    // shared symlink-refusal message).
+    // then reports with the `vendored-code` rule id (that's the
+    // guard that owns the vendor tree per ADR-0022 — the general
+    // `no-hand-rolled-ui` attribution is reserved for content / UI
+    // symlinks).
     const { files, symlinks } = walkForCheckables(root);
     const nestedRel = "packages/components/vendor/nested/sub/x.ts";
     expect(symlinks.some((s) => s.posixPath === nestedRel)).toBe(true);
     expect(files.some((f) => f.endsWith("/sub/x.ts"))).toBe(false);
 
     // Full-pipeline: runCheck emits a diagnostic for the nested
-    // symlink, and the whole invocation returns a non-zero exit.
+    // symlink attributed to `vendored-code`, and the whole
+    // invocation returns a non-zero exit.
     const output = await runCheck(
       root,
       toCheckFiles(files, root),
@@ -428,7 +431,11 @@ describe("vendored-code — symlinks + filesystem safety", () => {
       },
     );
     expect(output.exitCode).toBe(1);
-    expect(output.lines.some((line) => line.includes(nestedRel) && line.includes("symlink"))).toBe(true);
+    const nestedLine = output.lines.find((line) => line.includes(nestedRel));
+    expect(nestedLine).toBeDefined();
+    expect(nestedLine).toContain("symlink");
+    expect(nestedLine).toContain("vendored-code");
+    expect(nestedLine).not.toContain("no-hand-rolled-ui");
   });
 });
 

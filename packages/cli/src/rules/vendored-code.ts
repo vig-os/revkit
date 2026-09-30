@@ -32,14 +32,16 @@
 // handling). That belongs behind a well-tested library, not a
 // hand-rolled normaliser here.
 //
-// So the LICENSE-bytes gate is CODEOWNERS instead:
-// `packages/components/vendor/` requires the maintainer's review on
-// every PR (see `.github/CODEOWNERS`). This rule enforces every
+// So LICENSE bytes are checked by MANUAL REVIEW until the
+// SPDX-template matcher tracked in #33 lands. `.github/CODEOWNERS`
+// REQUESTS the maintainer's review on `packages/components/vendor/`
+// and `NOTICE`, but that becomes an ENFORCED merge gate only once
+// branch protection on `dev` requires code-owner review — an
+// org-config change outside this repo. This rule enforces every
 // STRUCTURAL check (UPSTREAM validity, symlink refusal, layout /
 // naming, NOTICE format + SPDX id echoing UPSTREAM) so the
 // maintainer's review is over a small, known-shaped surface — the
-// bytes themselves. The follow-up is tracked as an issue named in
-// the PR body.
+// LICENSE bytes themselves.
 
 import { lstatSync, readdirSync, readFileSync, type Dirent } from "node:fs";
 import { join } from "node:path";
