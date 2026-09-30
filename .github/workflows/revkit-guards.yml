@@ -64,6 +64,8 @@ jobs:
   typecheck:
     name: just lint (typecheck)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
       - name: Checkout repository

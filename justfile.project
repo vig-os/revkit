@@ -29,17 +29,20 @@ info:
 # they REPORT the skip instead of no-oping in silence — matching devkit's own
 # language-neutral guard style — but do not assume Python tooling is present.
 
-# Run TypeScript / Astro type checks across the workspace.
+# Run TypeScript / Astro type checks across the workspace: `astro check` in
+# site, then the `typecheck` script of every packages/* member that defines
+# one, so a new package joins without a recipe edit.
 [group('quality')]
 lint:
-    @if [ -f package.json ]; then \
-      cd site && bun run check && cd .. && \
-      cd packages/cli && bun run typecheck && cd ../.. && \
-      cd packages/components && bun run typecheck && cd ../.. && \
-      cd packages/review-core && bun run typecheck; \
-    else \
-      echo "just lint: no package.json — skipping"; \
-    fi
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f package.json ]; then echo "just lint: no package.json — skipping"; exit 0; fi
+    (cd site && bun run check)
+    for manifest in packages/*/package.json; do
+      if jq -e '.scripts.typecheck' "$manifest" >/dev/null; then
+        (cd "$(dirname "$manifest")" && bun run typecheck)
+      fi
+    done
 
 # Format source (Biome is not wired in M1 — the guardrails hooks enforce the
 # rules that matter here; add Biome in the next PR if a veto reviewer wants
@@ -75,7 +78,7 @@ test *args:
       echo "just test: no package.json — skipping"; \
     else \
       cd packages/cli && bun test {{ args }} && cd ../.. && \
-      cd packages/review-core && bun test {{ args }} && bun run typecheck && cd ../.. && \
+      cd packages/review-core && bun test {{ args }} && cd ../.. && \
       cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
       just check && \
       just e2e; \
