@@ -124,8 +124,6 @@ export function anchorToPrComment(
   files: readonly PrFile[],
   options: AnchorMapOptions = {},
 ): AnchorMapResult {
-  const allowFileFallback = options.allowFileFallback ?? true;
-
   const file = findFile(files, anchor.path);
   if (file === undefined) {
     return {
@@ -133,16 +131,37 @@ export function anchorToPrComment(
       reason: `anchor path '${anchor.path}' is not in this PR's file list`,
     };
   }
-  // The RESOLVED filename is what GitHub sees post-rename. A rename
-  // comment must reference the new name, not the old one.
+  // Parse the patch here (the uncached path). `PrContext.mapAnchor`
+  // takes the cached-hunks path via `anchorToPrCommentWithHunks`.
+  let hunks: Hunk[] | null;
+  try {
+    hunks = parsePatch(file.patch ?? "");
+  } catch (err) {
+    return {
+      kind: "reject",
+      reason: `failed to parse patch for '${file.filename}': ${(err as Error).message}`,
+    };
+  }
+  return anchorToPrCommentWithHunks(anchor, file, hunks, options);
+}
+
+/** Same as `anchorToPrComment`, but takes the (possibly cached) hunks
+ * and the resolved file directly. `PrContext` calls this for its
+ * cached path; the public `anchorToPrComment` uses it after parsing.
+ * PR-43 round-3 nit: `PrContext.mapAnchor` used to call
+ * `anchorToPrComment(anchor, this.files)` and pay the parse cost on
+ * every lookup — the cache was there but nothing read from it. */
+export function anchorToPrCommentWithHunks(
+  anchor: Pick<Anchor, "path" | "startLine" | "endLine">,
+  file: PrFile,
+  hunks: Hunk[] | null,
+  options: AnchorMapOptions = {},
+): AnchorMapResult {
+  const allowFileFallback = options.allowFileFallback ?? true;
   const resolvedPath = file.filename;
 
   // BLOCKER 4 (PR-43): anchor made against the OLD name of a renamed
-  // file. The anchor's lines describe base-revision content; mapping
-  // them onto the new file's RIGHT side would put the comment on
-  // whatever happens to sit at those line numbers post-rename —
-  // often unrelated. File-level fallback on the NEW path, preamble
-  // records the old range on the old path.
+  // file. Old-side lines cannot map to new-file RIGHT-side lines.
   if (file.previousFilename !== undefined && anchor.path === file.previousFilename) {
     if (!allowFileFallback) {
       return {
@@ -172,20 +191,6 @@ export function anchorToPrComment(
     };
   }
 
-  const patch = file.patch ?? "";
-  let hunks: Hunk[] | null;
-  try {
-    hunks = parsePatch(patch);
-  } catch (err) {
-    // A malformed patch is surfaced as a rejection rather than a
-    // silent file fallback: the caller wants to see this fail, not
-    // to quietly downgrade every anchor to file-level.
-    return {
-      kind: "reject",
-      reason: `failed to parse patch for '${resolvedPath}': ${(err as Error).message}`,
-    };
-  }
-
   if (hunks === null) {
     if (!allowFileFallback) {
       return {
@@ -193,10 +198,6 @@ export function anchorToPrComment(
         reason: `file '${resolvedPath}' has no patch (binary or too large); line comments not addressable`,
       };
     }
-    // GitHub's REST envelope makes no reliable distinction between
-    // "binary" and "declined patch (huge)" — both come back with
-    // `patch` absent. Report one reason for both; the caller may
-    // narrow via `PrFile.status`/`.changes` if it has them.
     return {
       kind: "file",
       target: { subjectType: "file", path: resolvedPath },

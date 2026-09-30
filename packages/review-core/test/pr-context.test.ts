@@ -109,4 +109,44 @@ describe("PrContext", () => {
     // Second call — same error, cached (not a fresh parse).
     expect(() => ctx.hunks("broken.mdx")).toThrow();
   });
+
+  test("mapAnchor() reuses the cache — parseCount == 1 across 200 lookups on the same file", () => {
+    // PR-43 round-3 nit: `PrContext.mapAnchor` used to call
+    // `anchorToPrComment(anchor, this.files)` and pay the parse
+    // cost on every lookup. Now it goes through `hunks()`, so
+    // `parseCount` stays at 1 for a single file across many maps.
+    const ctx = new PrContext(FILES);
+    const anchor = {
+      path: "docs/a.mdx",
+      startLine: 2,
+      endLine: 3,
+      quote: { exact: "add-a\nadd-b", prefix: "", suffix: "" },
+      revision: "0".repeat(64),
+    };
+    for (let i = 0; i < 200; i++) {
+      const result = ctx.mapAnchor(anchor);
+      expect(result.kind).toBe("line");
+    }
+    expect(ctx.parseCount).toBe(1);
+  });
+
+  test("mapAnchor() on the OLD name still uses the new-name cache (rename path)", () => {
+    const ctx = new PrContext(FILES);
+    // Anchor on old name — expected: file fallback with reason
+    // `renamed-file-old-path`. This exercises the code path that
+    // goes through `hunks(file.filename)` (the NEW name).
+    for (let i = 0; i < 10; i++) {
+      const result = ctx.mapAnchor({
+        path: "docs/original.mdx",
+        startLine: 1,
+        endLine: 1,
+        quote: { exact: "old", prefix: "", suffix: "" },
+        revision: "0".repeat(64),
+      });
+      expect(result.kind).toBe("file");
+    }
+    // 1 parse for docs/renamed.mdx; no double-parse under the OLD
+    // name.
+    expect(ctx.parseCount).toBe(1);
+  });
 });

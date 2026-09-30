@@ -11,6 +11,7 @@
 export { anchorPathSchema, anchorSchema, textQuoteSchema, type Anchor, type TextQuote } from "./anchor.ts";
 export {
   anchorToPrComment,
+  anchorToPrCommentWithHunks,
   fileFallbackPreamble,
   findFile,
   prCommentToAnchor,
@@ -35,12 +36,14 @@ export {
   GITHUB_API_VERSION,
   GitHubAdapter,
   GitHubApiError,
+  GitHubRateLimitError,
   githubExternal,
   nextPageUrl,
   PrContext,
   retryAfterMs,
   shouldRetry,
   type AddPendingReviewThreadInput,
+  type FindOrCreatePendingReviewResult,
   type GhReviewComment,
   type GhReviewThread,
   type GitHubAdapterOptions,
@@ -51,6 +54,7 @@ export {
   type RetryPolicy,
   type ReviewSubmissionEvent,
   type SubmitReviewInput,
+  type ThreadSnapshot,
 } from "./github-adapter.ts";
 export {
   newSideLines,
@@ -61,6 +65,13 @@ export {
   type HunkLine,
   type HunkLineKind,
 } from "./patch.ts";
+export {
+  buildQuoteFromLines,
+  buildQuoteFromOffsets,
+  DEFAULT_QUOTE_CONTEXT_CHARS,
+  lineStartsOf,
+  type BuildQuoteOptions,
+} from "./quote.ts";
 export { redactTokenInMessage, type TokenSource } from "./token-source.ts";
 export { ID_REGEX, idSchema, isValidId } from "./id.ts";
 export { isValidRepoRelativePath } from "./path.ts";

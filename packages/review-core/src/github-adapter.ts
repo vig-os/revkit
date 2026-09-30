@@ -50,6 +50,7 @@
 
 import {
   anchorToPrComment,
+  anchorToPrCommentWithHunks,
   fileFallbackPreamble,
   prCommentToAnchor,
   type AnchorMapOptions,
@@ -62,6 +63,8 @@ import type { Anchor } from "./anchor.ts";
 import type { Author } from "./author.ts";
 import type { ReviewEventInput } from "./events.ts";
 import { newSideLines, parsePatch, type Hunk } from "./patch.ts";
+import { buildQuoteFromLines } from "./quote.ts";
+import { revisionOf } from "./revision.ts";
 import type { ExternalRef } from "./thread.ts";
 import { redactTokenInMessage, type TokenSource } from "./token-source.ts";
 
@@ -190,6 +193,11 @@ export interface GhReviewComment {
   readonly authorType: "User" | "Bot" | "Unknown";
   readonly createdAt: string;
   readonly url: string;
+  /** The commit SHA the comment was originally made against.
+   * Present on both `PullRequestReviewComment.originalCommit` and
+   * ${GraphQL} — used to fetch the file at that commit so a stable
+   * anchor can be built (PR-43 round-3, Blocker 2). */
+  readonly originalCommitOid: string | null;
 }
 
 /** Input for `addPendingReviewThread`. `reviewId` is the GraphQL id
@@ -212,9 +220,18 @@ export interface AddPendingReviewThreadInput {
   readonly subjectType?: "LINE" | "FILE";
 }
 
-/** A pending review-comment as returned by GraphQL (the first
- * comment of an `addPullRequestReviewThread` reply, plus the shape
- * `listPendingReviewComments` returns). */
+/** A pending review-comment as returned by GraphQL. The GraphQL
+ * `PullRequestReviewComment` type does NOT expose `side` /
+ * `startSide` — those live on `PullRequestReviewThread`, which is
+ * one level up. Callers that need the side query the parent thread
+ * via `listReviewThreads` (which does expose `diffSide` /
+ * `startDiffSide`). Included fields:
+ *
+ * `line`  — current head-side position, null if the comment is
+ *           outdated (its lines no longer resolve on head).
+ * `originalLine` / `originalStartLine` — the coordinates on the
+ *           commit the comment was made against; kept even when
+ *           `line` is null. */
 export interface PendingReviewComment {
   readonly nodeId: string;
   readonly databaseId: number;
@@ -222,8 +239,8 @@ export interface PendingReviewComment {
   readonly body: string;
   readonly line: number | null;
   readonly startLine: number | null;
-  readonly side: "RIGHT" | "LEFT" | null;
-  readonly startSide: "RIGHT" | "LEFT" | null;
+  readonly originalLine: number | null;
+  readonly originalStartLine: number | null;
   readonly subjectType: "LINE" | "FILE";
   readonly url: string;
 }
@@ -239,6 +256,22 @@ export interface PendingReview {
 
 export type ReviewSubmissionEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
 
+/** Snapshot for a thread — one of three shapes (see
+ * `mapThreadsToEvents` docstring). `live` means "use head";
+ * `own-commit` provides the file's content at the thread's
+ * originating commit (RIGHT-outdated) or the base commit
+ * (LEFT-side); `unavailable` triggers the placeholder-anchor +
+ * orphan path with the given reason. */
+export type ThreadSnapshot =
+  | { readonly kind: "live" }
+  | {
+      readonly kind: "own-commit";
+      readonly content: string;
+      readonly revision: string;
+      readonly oid: string;
+    }
+  | { readonly kind: "unavailable"; readonly reason: string };
+
 /** Options for `submitReview`. `body` is the top-level review message. */
 export interface SubmitReviewInput {
   readonly reviewId: string;
@@ -250,13 +283,17 @@ export interface SubmitReviewInput {
 
 /** Thrown by every failing adapter call. `status` is the HTTP status
  * (0 for a network error before a response landed). `documentationUrl`
- * mirrors GitHub's field so a caller can surface it. */
+ * mirrors GitHub's field so a caller can surface it. `headers` (when
+ * present) exposes `Retry-After` and `x-ratelimit-*` so the retry
+ * loop can honour GitHub's own advice — carrying them on the error
+ * is the seam PR-43 round-3 asked for. */
 export class GitHubApiError extends Error {
   readonly status: number;
   readonly method: string;
   readonly url: string;
   readonly documentationUrl?: string;
   readonly retryable: boolean;
+  readonly headers?: Headers;
 
   constructor(init: {
     message: string;
@@ -265,6 +302,7 @@ export class GitHubApiError extends Error {
     url: string;
     documentationUrl?: string;
     retryable?: boolean;
+    headers?: Headers;
   }) {
     super(init.message);
     this.name = "GitHubApiError";
@@ -273,8 +311,34 @@ export class GitHubApiError extends Error {
     this.url = init.url;
     this.documentationUrl = init.documentationUrl;
     this.retryable = init.retryable ?? false;
+    this.headers = init.headers;
   }
 }
+
+/** Typed rate-limit outcome — thrown by the retry loop when the
+ * server tells us to wait longer than the configured cap. Callers
+ * (M3 daemon; hosted worker) show a "come back later" message
+ * rather than blocking. */
+export class GitHubRateLimitError extends GitHubApiError {
+  readonly retryAfterMs: number;
+  constructor(init: ConstructorParameters<typeof GitHubApiError>[0] & { retryAfterMs: number }) {
+    super({ ...init, retryable: true });
+    this.name = "GitHubRateLimitError";
+    this.retryAfterMs = init.retryAfterMs;
+  }
+}
+
+/** Typed staleness outcome for `findOrCreatePendingReview`. The
+ * caller inspects `.kind`. */
+export type FindOrCreatePendingReviewResult =
+  | { readonly kind: "reused"; readonly review: PendingReview }
+  | { readonly kind: "created"; readonly review: PendingReview }
+  | {
+      readonly kind: "stale";
+      readonly review: PendingReview;
+      readonly expectedCommitOid: string;
+      readonly actualCommitOid: string | null;
+    };
 
 // --- Rate limiting helpers --- //
 
@@ -293,17 +357,28 @@ export function shouldRetry(status: number, headers: Headers, bodyText: string):
   return false;
 }
 
-/** Extract a delay in ms from a `Retry-After` header (seconds) or from
- * `x-ratelimit-reset` (epoch seconds). Falls back to the caller's
- * default when neither is present.
+/** Extract a delay in ms from a `Retry-After` header (seconds OR
+ * HTTP-date) or from `x-ratelimit-reset` (epoch seconds). Falls
+ * back to the caller's default when neither is present.
  *
  * `now` is injectable so tests are deterministic. */
 export function retryAfterMs(headers: Headers, defaultMs: number, now: () => number = Date.now): number {
   const retryAfter = headers.get("retry-after");
   if (retryAfter !== null) {
-    const seconds = Number.parseInt(retryAfter, 10);
-    if (Number.isFinite(seconds) && seconds >= 0) {
-      return seconds * 1000;
+    const trimmed = retryAfter.trim();
+    // Numeric form — seconds (RFC 9110 §10.2.3).
+    if (/^\d+(\.\d+)?$/.test(trimmed)) {
+      const seconds = Number.parseFloat(trimmed);
+      if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+    } else {
+      // HTTP-date form — parse via Date. Refuse if it can't parse,
+      // rather than silently falling through.
+      const millis = Date.parse(trimmed);
+      if (Number.isFinite(millis)) {
+        const delta = millis - now();
+        if (delta > 0) return delta;
+        return 0; // date already past → retry now
+      }
     }
   }
   const reset = headers.get("x-ratelimit-reset");
@@ -328,6 +403,11 @@ export class PrContext {
   private readonly filesByPreviousName = new Map<string, PrFile>();
   private readonly hunksCache = new Map<string, Hunk[] | null | Error>();
   private readonly rightLinesCache = new Map<string, Set<number> | null>();
+  /** Per-instance counter — bumped when a `hunks()` call falls back
+   * to a fresh parse. Tests read it to assert cache hits vs misses,
+   * since a "did it use the cache" property is exactly what the
+   * PR-43 round-3 nit was about. */
+  parseCount = 0;
   readonly files: readonly PrFile[];
 
   constructor(files: readonly PrFile[]) {
@@ -356,6 +436,7 @@ export class PrContext {
     }
     const file = this.filesByName.get(filename);
     if (file === undefined) return null;
+    this.parseCount++;
     try {
       const parsed = parsePatch(file.patch ?? "");
       this.hunksCache.set(filename, parsed);
@@ -376,9 +457,31 @@ export class PrContext {
     return set;
   }
 
-  /** Map an anchor to a PR-comment target using the cached patches. */
+  /** Map an anchor to a PR-comment target using the cached patches
+   * and file lookup. Never re-parses a patch across repeated calls
+   * for the same file (PR-43 round-3 nit). Falls back to the pure
+   * `anchorToPrComment` behaviour when the file isn't in the PR
+   * (a REJECT with a clear message). */
   mapAnchor(anchor: Anchor, options?: AnchorMapOptions): AnchorMapResult {
-    return anchorToPrComment(anchor, this.files, options);
+    const file = this.findFile(anchor.path);
+    if (file === undefined) {
+      return {
+        kind: "reject",
+        reason: `anchor path '${anchor.path}' is not in this PR's file list`,
+      };
+    }
+    // `hunks()` is keyed on the CURRENT filename — if the anchor's
+    // path is the OLD (rename) name, resolve to the new name first.
+    let hunks: Hunk[] | null;
+    try {
+      hunks = this.hunks(file.filename);
+    } catch (err) {
+      return {
+        kind: "reject",
+        reason: `failed to parse patch for '${file.filename}': ${(err as Error).message}`,
+      };
+    }
+    return anchorToPrCommentWithHunks(anchor, file, hunks, options);
   }
 }
 
@@ -511,6 +614,7 @@ export class GitHubAdapter {
                 c.author?.__typename === "Bot" ? "Bot" : c.author?.__typename === "User" ? "User" : "Unknown",
               createdAt: c.createdAt,
               url: c.url,
+              originalCommitOid: c.originalCommit?.oid ?? null,
             });
           }
           hasMore = conn.pageInfo.hasNextPage;
@@ -574,7 +678,7 @@ export class GitHubAdapter {
     readonly pullRequestNodeId: string;
     readonly commitOid: string;
     readonly viewerLogin?: string;
-  }): Promise<PendingReview> {
+  }): Promise<FindOrCreatePendingReviewResult> {
     const login = input.viewerLogin ?? (await this.viewerLogin());
     // 1. Look up an existing pending review by author.
     const existing = await this.graphqlWithRetry<PendingReviewLookupResponse>(
@@ -585,21 +689,40 @@ export class GitHubAdapter {
     if (node !== undefined && node !== null && node.__typename === "PullRequest") {
       const pending = node.reviews?.nodes.find((r) => r.state === "PENDING");
       if (pending !== undefined) {
-        return {
+        const review: PendingReview = {
           id: pending.id,
           databaseId: pending.databaseId ?? 0,
           commitSha: pending.commit?.oid ?? null,
           state: pending.state,
         };
+        // PR-43 round-3 (Blocker 3): head-move detection. A pending
+        // review pinned to an older commit MUST NOT be silently
+        // reused — the reviewer's draft comments were made against
+        // a different head, so their line numbers don't match. The
+        // caller (M3 daemon) decides whether to re-anchor the
+        // drafts or ask the user to discard.
+        if (review.commitSha !== null && review.commitSha !== input.commitOid) {
+          return {
+            kind: "stale",
+            review,
+            expectedCommitOid: input.commitOid,
+            actualCommitOid: review.commitSha,
+          };
+        }
+        return { kind: "reused", review };
       }
     }
-    // 2. Create one.
-    const created = await this.graphqlWithRetry<AddReviewMutationResponse>(ADD_REVIEW_MUTATION, {
+    // 2. Create one. NOTE: mutation goes through `graphql` (not
+    // `graphqlWithRetry`) — mutations must NEVER auto-retry
+    // (idempotency risk: a retried `addPullRequestReview` could
+    // create a second pending review if the first response was
+    // dropped between the server and us).
+    const created = await this.graphql<AddReviewMutationResponse>(ADD_REVIEW_MUTATION, {
       pullRequestId: input.pullRequestNodeId,
       commitOID: input.commitOid,
     });
-    const review = created.data.addPullRequestReview?.pullRequestReview;
-    if (review === undefined || review === null) {
+    const created_ = created.data.addPullRequestReview?.pullRequestReview;
+    if (created_ === undefined || created_ === null) {
       throw new GitHubApiError({
         message: `findOrCreatePendingReview: addPullRequestReview returned no review`,
         status: 0,
@@ -608,10 +731,13 @@ export class GitHubAdapter {
       });
     }
     return {
-      id: review.id,
-      databaseId: review.databaseId ?? 0,
-      commitSha: review.commit?.oid ?? null,
-      state: review.state,
+      kind: "created",
+      review: {
+        id: created_.id,
+        databaseId: created_.databaseId ?? 0,
+        commitSha: created_.commit?.oid ?? null,
+        state: created_.state,
+      },
     };
   }
 
@@ -639,7 +765,10 @@ export class GitHubAdapter {
         variables.startSide = input.startSide ?? variables.side;
       }
     }
-    const result = await this.graphqlWithRetry<AddThreadMutationResponse>(
+    // Mutation — never auto-retry (idempotency risk: a retried
+    // `addPullRequestReviewThread` could double-post if the first
+    // response was dropped between the server and us).
+    const result = await this.graphql<AddThreadMutationResponse>(
       ADD_THREAD_MUTATION,
       variables,
     );
@@ -668,33 +797,39 @@ export class GitHubAdapter {
       body: first.body,
       line: thread.line ?? null,
       startLine: thread.startLine ?? null,
-      side: thread.diffSide,
-      startSide: thread.startDiffSide,
+      originalLine: thread.line ?? null,
+      originalStartLine: thread.startLine ?? null,
       subjectType: thread.subjectType,
       url: first.url,
     };
   }
 
   /** Edit the body of a pending (or published) review comment. Only
-   * the comment's own author can update. */
+   * the comment's own author can update. Mutation — no auto-retry
+   * (would re-edit on a dropped response, which for an idempotent
+   * update is technically fine but we keep the rule uniform:
+   * mutations go through `graphql`, reads go through
+   * `graphqlWithRetry`). */
   async updatePendingReviewComment(input: {
     readonly commentNodeId: string;
     readonly body: string;
   }): Promise<void> {
-    await this.graphqlWithRetry(UPDATE_COMMENT_MUTATION, {
+    await this.graphql(UPDATE_COMMENT_MUTATION, {
       pullRequestReviewCommentId: input.commentNodeId,
       body: input.body,
     });
   }
 
-  /** Delete one draft review comment. Removes an empty parent thread. */
+  /** Delete one draft review comment. Removes an empty parent thread.
+   * Mutation — no auto-retry. */
   async deletePendingReviewComment(input: { readonly commentNodeId: string }): Promise<void> {
-    await this.graphqlWithRetry(DELETE_COMMENT_MUTATION, { id: input.commentNodeId });
+    await this.graphql(DELETE_COMMENT_MUTATION, { id: input.commentNodeId });
   }
 
-  /** Discard the entire pending review — drops every draft comment. */
+  /** Discard the entire pending review — drops every draft comment.
+   * Mutation — no auto-retry. */
   async deletePendingReview(input: { readonly reviewId: string }): Promise<void> {
-    await this.graphqlWithRetry(DELETE_REVIEW_MUTATION, { pullRequestReviewId: input.reviewId });
+    await this.graphql(DELETE_REVIEW_MUTATION, { pullRequestReviewId: input.reviewId });
   }
 
   /** List every comment attached to a review (pending or submitted).
@@ -717,8 +852,8 @@ export class GitHubAdapter {
           body: c.body,
           line: c.line ?? null,
           startLine: c.startLine ?? null,
-          side: c.side ?? null,
-          startSide: c.startSide ?? null,
+          originalLine: c.originalLine ?? null,
+          originalStartLine: c.originalStartLine ?? null,
           subjectType: c.subjectType ?? "LINE",
           url: c.url,
         });
@@ -734,14 +869,16 @@ export class GitHubAdapter {
     });
   }
 
-  /** Submit a pending review (COMMENT / APPROVE / REQUEST_CHANGES). */
+  /** Submit a pending review (COMMENT / APPROVE / REQUEST_CHANGES).
+   * Mutation — no auto-retry (double-submit would either 422 or
+   * produce a duplicate review). */
   async submitReview(input: SubmitReviewInput): Promise<void> {
     const variables: Record<string, unknown> = {
       pullRequestReviewId: input.reviewId,
       event: input.event,
     };
     if (input.body !== undefined) variables.body = input.body;
-    await this.graphqlWithRetry(SUBMIT_REVIEW_MUTATION, variables);
+    await this.graphql(SUBMIT_REVIEW_MUTATION, variables);
   }
 
   /** Look up the authenticated user's login (`viewer { login }`).
@@ -764,53 +901,91 @@ export class GitHubAdapter {
 
   // --- Thread mapping --- //
 
-  /** Map GitHub review threads to review-core thread events.
+  /**
+   * Map GitHub review threads to review-core thread events, using
+   * an **own-commit anchor** for every imported thread.
    *
-   * For each thread we emit:
-   *   1. `comment.created` — anchor from the thread's line/side, or
-   *      (for outdated / LEFT / file threads) from `originalLine`
-   *      with the head revision as a placeholder. Recording an
-   *      anchor lets the reducer materialise the thread; the
-   *      following `thread.orphaned` marks that the anchor is
-   *      NOT authoritative.
-   *   2. `comment.linked` — the GitHub external ids.
-   *   3. `comment.replied` + `comment.linked` for each subsequent
-   *      comment (parentId chained to the previous comment).
-   *   4. Either `thread.orphaned` (the anchor doesn't resolve on
-   *      the head — outdated / LEFT / file / mixed-sides) OR
-   *      `thread.resolved` (the thread was resolved on GitHub —
-   *      actor is `resolvedByLogin` when known). Never both: the
-   *      validator refuses two terminal transitions from `open`,
-   *      and human resolution wins over an orphan classification.
+   * PR-43 round-3 (Blocker 2): a thread whose lines don't resolve
+   * on head (outdated / LEFT / file / mixed-sides) used to get an
+   * anchor stamped with the head revision but at `originalLine`.
+   * That's a wrong anchor — the head content at that line doesn't
+   * match, and any re-anchor short-circuits on the identity check.
    *
-   * Callers provide `revisionOf(path)` — the SHA-256 of the file's
-   * PR-head content, LF-normalised (`revisionOf` from
-   * `./revision.ts`). Threads on files without a revision are
-   * skipped (the caller should log this).
+   * The principled fix: anchor every imported thread in the
+   * coordinates of the commit its comment was made against
+   * (`originalCommit.oid`), with a `revision` computed from the
+   * file's content at THAT commit and a quote cut from THAT
+   * content. The daemon's re-anchoring engine
+   * (`prepareReanchor` / `reanchorWith`) can then map the anchor
+   * to head using the same machinery it uses for local rebuilds,
+   * emitting `thread.reanchored` / `thread.orphaned` as
+   * appropriate. The adapter deliberately does NOT reanchor
+   * itself: separation of concerns.
    *
-   * `quoteFor(thread)` returns the text-quote selector. A caller
-   * with the file's head content builds a real selector; a caller
-   * without one may return `{exact: comment.body, prefix: "", suffix: ""}`
-   * as a placeholder — the review-core schema requires a non-empty
-   * `exact`. */
+   * The `resolveSnapshot` callback returns one of three shapes:
+   *   - `{ kind: "live" }`      — the thread is a live RIGHT-side
+   *                                thread with `line` populated on
+   *                                head; use head revision +
+   *                                head-side quote (which the
+   *                                caller provides via `headSourceOf`).
+   *   - `{ kind: "own-commit",
+   *        content, oid }`      — the file content at the thread's
+   *                                originating commit; anchor built
+   *                                from THIS content.
+   *   - `{ kind: "unavailable",
+   *        reason }`            — content couldn't be fetched
+   *                                (deleted, binary, too large).
+   *                                The thread is orphaned with the
+   *                                stated reason; anchor uses the
+   *                                head revision + originalLine as
+   *                                a placeholder that the validator
+   *                                will accept.
+   *
+   * Returns the events plus a `snapshots` map keyed on revision.
+   * The daemon (M3 part 2 item 5b) persists those snapshots so a
+   * later `prepareReanchor(oldSource, newSource)` can run with
+   * both texts in hand.
+   */
   static mapThreadsToEvents(input: {
     readonly threads: readonly GhReviewThread[];
     readonly threadIdOf: (thread: GhReviewThread) => string;
     readonly commentIdOf: (thread: GhReviewThread, comment: GhReviewComment) => string;
-    readonly revisionOf: (path: string) => string | undefined;
-    readonly commitId?: string;
-    readonly quoteFor: (thread: GhReviewThread) => { exact: string; prefix: string; suffix: string };
+    /** SHA-256 of the head-side file content for a live RIGHT thread.
+     * The daemon reads it from disk; the adapter never fetches it. */
+    readonly headRevisionOf: (path: string) => string | undefined;
+    /** Head-side file content for a live RIGHT thread — used to cut
+     * the text-quote selector. Optional; if omitted, `quoteFor` is
+     * called instead. */
+    readonly headSourceOf?: (path: string) => string | undefined;
+    /** Snapshot resolver — see method docstring. */
+    readonly resolveSnapshot: (thread: GhReviewThread) => ThreadSnapshot;
+    /** Head-side commit oid — attached to the anchor's `commit`
+     * field for live RIGHT threads. */
+    readonly headCommitOid?: string;
+    /** Optional fallback quote builder for live RIGHT threads when
+     * `headSourceOf` is unavailable. If missing AND `headSourceOf`
+     * doesn't return content, the thread is orphaned. */
+    readonly quoteFor?: (thread: GhReviewThread) => { exact: string; prefix: string; suffix: string };
   }): {
     readonly events: ReviewEventInput[];
     readonly orphanedThreadIds: readonly string[];
+    /** Map of `revision → source text` — the daemon persists these
+     * so a subsequent re-anchor has the OLD source at hand
+     * (`prepareReanchor(oldSource, newSource)`). */
+    readonly snapshots: Map<string, string>;
   } {
     const events: ReviewEventInput[] = [];
     const orphaned: string[] = [];
+    const snapshots = new Map<string, string>();
+
     for (const thread of input.threads) {
       if (thread.comments.length === 0) continue;
       const threadId = input.threadIdOf(thread);
-      const revision = input.revisionOf(thread.path);
-      if (revision === undefined) continue;
+      const firstComment = thread.comments[0];
+      if (firstComment === undefined) continue;
+      const firstAuthor: Author = ghAuthorToReviewCoreAuthor(firstComment);
+
+      // What kind of anchor should this thread carry?
       const mapResult = prCommentToAnchor({
         path: thread.path,
         line: thread.line,
@@ -823,34 +998,94 @@ export class GitHubAdapter {
         isOutdated: thread.isOutdated,
       });
 
-      let startLine: number;
-      let endLine: number;
-      const willOrphan = mapResult.kind === "orphan";
-      if (mapResult.kind === "line") {
-        startLine = mapResult.startLine;
-        endLine = mapResult.endLine;
+      const snapshot = input.resolveSnapshot(thread);
+      let anchor: Anchor | undefined;
+      let willOrphan = mapResult.kind === "orphan";
+      let orphanReason: string | undefined =
+        mapResult.kind === "orphan" ? mapResult.reason : undefined;
+
+      if (snapshot.kind === "unavailable") {
+        // Fall back to a head-side placeholder anchor and orphan.
+        const headRev = input.headRevisionOf(thread.path);
+        if (headRev === undefined) continue; // caller must log this
+        const endLine = thread.originalLine ?? thread.line ?? 1;
+        const startLine = thread.originalStartLine ?? thread.startLine ?? endLine;
+        anchor = {
+          path: thread.path,
+          startLine,
+          endLine,
+          quote: input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body),
+          revision: headRev,
+          ...(input.headCommitOid !== undefined ? { commit: input.headCommitOid } : {}),
+        };
+        willOrphan = true;
+        orphanReason = snapshot.reason;
+      } else if (snapshot.kind === "own-commit") {
+        // The authoritative branch: anchor in the coordinates of
+        // the thread's own commit, with the quote cut from THAT
+        // content and the revision hashed from it. The daemon's
+        // re-anchor engine now has an honest starting point.
+        const endLine = thread.originalLine ?? thread.line ?? 1;
+        const startLine = thread.originalStartLine ?? thread.startLine ?? endLine;
+        const quote = buildQuoteFromLines(snapshot.content, startLine, endLine);
+        // A comment can point at a line that no longer exists in
+        // the file at its own commit (rare — GitHub is authoritative
+        // on originalLine — but defensively check). If the quote's
+        // exact is empty, orphan.
+        if (quote.exact.length === 0) {
+          const headRev = input.headRevisionOf(thread.path);
+          if (headRev === undefined) continue;
+          anchor = {
+            path: thread.path,
+            startLine,
+            endLine,
+            quote: input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body),
+            revision: headRev,
+            ...(input.headCommitOid !== undefined ? { commit: input.headCommitOid } : {}),
+          };
+          willOrphan = true;
+          orphanReason = "empty-original-quote";
+        } else {
+          const revision = snapshot.revision;
+          snapshots.set(revision, snapshot.content);
+          anchor = {
+            path: thread.path,
+            startLine,
+            endLine,
+            quote,
+            revision,
+            commit: snapshot.oid,
+          };
+        }
       } else {
-        // Anchor is a placeholder — the subsequent `thread.orphaned`
-        // tells the reducer this is not authoritative. Prefer
-        // originalLine (the coordinates the reviewer saw when they
-        // commented) so the placeholder is at least meaningful.
-        endLine = thread.originalLine ?? thread.line ?? 1;
-        startLine = thread.originalStartLine ?? thread.startLine ?? endLine;
+        // "live" — a RIGHT-side thread with resolved lines on head.
+        const headRev = input.headRevisionOf(thread.path);
+        if (headRev === undefined) continue;
+        const endLine =
+          mapResult.kind === "line" ? mapResult.endLine : thread.line ?? thread.originalLine ?? 1;
+        const startLine =
+          mapResult.kind === "line"
+            ? mapResult.startLine
+            : thread.startLine ?? thread.originalStartLine ?? endLine;
+        const headSrc = input.headSourceOf?.(thread.path);
+        const quote =
+          headSrc !== undefined
+            ? buildQuoteFromLines(headSrc, startLine, endLine)
+            : input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body);
+        if (headSrc !== undefined) snapshots.set(headRev, headSrc);
+        anchor = {
+          path: thread.path,
+          startLine,
+          endLine,
+          quote,
+          revision: headRev,
+          ...(input.headCommitOid !== undefined ? { commit: input.headCommitOid } : {}),
+        };
       }
 
-      const quote = input.quoteFor(thread);
-      const firstComment = thread.comments[0];
-      if (firstComment === undefined) continue;
+      if (anchor === undefined) continue;
 
-      const anchor: Anchor = {
-        path: thread.path,
-        startLine,
-        endLine,
-        quote,
-        revision,
-        ...(input.commitId !== undefined ? { commit: input.commitId } : {}),
-      };
-      const firstAuthor: Author = ghAuthorToReviewCoreAuthor(firstComment);
+      // --- Emit the events for the thread. ---
       events.push({
         kind: "comment.created",
         actor: firstAuthor,
@@ -888,12 +1123,9 @@ export class GitHubAdapter {
       }
 
       // Terminal transition — resolved wins over orphan (human
-      // decision > machine classification), and the validator
-      // refuses both (only one may transition an open thread).
+      // decision > machine classification). The validator refuses
+      // both from `open`.
       if (thread.isResolved) {
-        // Prefer resolvedByLogin as the actor; fall back to the
-        // last commenter when GitHub didn't populate it (very old
-        // resolutions).
         const actor: Author =
           thread.resolvedByLogin !== null
             ? { kind: "gh-user", id: thread.resolvedByLogin, displayName: thread.resolvedByLogin }
@@ -905,23 +1137,127 @@ export class GitHubAdapter {
           resolution: "resolved on GitHub",
         });
       } else if (willOrphan) {
-        // The `unknown` actor for an orphan isn't a real user event —
-        // it's a machine-observed classification. Use the first
-        // comment's author as the actor (a plausible bearer of the
-        // decision) and record the revision. Downstream readers
-        // that want the reason inspect the anchor + the fact that
-        // status ended up `orphaned`.
         orphaned.push(threadId);
         events.push({
           kind: "thread.orphaned",
           actor: firstAuthor,
           threadId,
-          revision,
-          reason: mapResult.kind === "orphan" ? mapResult.reason : undefined,
+          revision: anchor.revision,
+          reason: orphanReason,
         });
       }
     }
-    return { events, orphanedThreadIds: orphaned };
+    return { events, orphanedThreadIds: orphaned, snapshots };
+  }
+
+  /**
+   * Async convenience over `mapThreadsToEvents`: fetches each
+   * thread's OWN-COMMIT content via GraphQL `object(expression:
+   * "oid:path")` and hands the results to the pure `mapThreadsToEvents`.
+   *
+   * Callers that need custom snapshot resolution (a local worktree,
+   * a cached blob store) skip this and call `mapThreadsToEvents`
+   * directly.
+   */
+  async importThreads(input: {
+    readonly pr: PrRef;
+    readonly threads: readonly GhReviewThread[];
+    readonly threadIdOf: (thread: GhReviewThread) => string;
+    readonly commentIdOf: (thread: GhReviewThread, comment: GhReviewComment) => string;
+    readonly headRevisionOf: (path: string) => string | undefined;
+    readonly headSourceOf?: (path: string) => string | undefined;
+    readonly headCommitOid?: string;
+    readonly quoteFor?: (thread: GhReviewThread) => { exact: string; prefix: string; suffix: string };
+  }): Promise<ReturnType<typeof GitHubAdapter.mapThreadsToEvents>> {
+    // Pre-fetch every thread's snapshot, deduping by (oid, path).
+    const cache = new Map<string, ThreadSnapshot>();
+    const snapshotFor = new Map<string, ThreadSnapshot>();
+    for (const thread of input.threads) {
+      const key = `${thread.id}`;
+      const first = thread.comments[0];
+      if (first === undefined) continue;
+      // Live RIGHT thread: no fetch. Signalled by `line !== null`
+      // AND diffSide==="RIGHT" AND subjectType==="LINE" AND not outdated.
+      const isLive =
+        thread.line !== null &&
+        thread.diffSide === "RIGHT" &&
+        thread.subjectType === "LINE" &&
+        !thread.isOutdated &&
+        thread.startDiffSide !== "LEFT";
+      if (isLive) {
+        snapshotFor.set(key, { kind: "live" });
+        continue;
+      }
+      // Own-commit fetch. For RIGHT-side threads (including
+      // outdated) we use originalCommit.oid; for LEFT-side we
+      // fetch base-commit content at path.
+      const oid =
+        thread.diffSide === "LEFT" ? undefined /* base fallback below */ : first.originalCommitOid ?? undefined;
+      const cacheKey = `${oid ?? "BASE"}:${thread.path}`;
+      let snap = cache.get(cacheKey);
+      if (snap === undefined) {
+        try {
+          const content =
+            oid !== undefined
+              ? await this.fetchBlobText({ owner: input.pr.owner, repo: input.pr.repo, oid, path: thread.path })
+              : null; // LEFT: caller-provided base commit content resolution
+          if (content === null) {
+            snap = { kind: "unavailable", reason: oid === undefined ? "left-side-no-base-oid" : "not-found" };
+          } else {
+            const rev = await revisionOf(content);
+            snap = { kind: "own-commit", content, oid: oid!, revision: rev };
+          }
+        } catch (err) {
+          snap = { kind: "unavailable", reason: `fetch-failed: ${(err as Error).message}` };
+        }
+        cache.set(cacheKey, snap);
+      }
+      snapshotFor.set(key, snap);
+    }
+    return GitHubAdapter.mapThreadsToEvents({
+      threads: input.threads,
+      threadIdOf: input.threadIdOf,
+      commentIdOf: input.commentIdOf,
+      headRevisionOf: input.headRevisionOf,
+      headSourceOf: input.headSourceOf,
+      headCommitOid: input.headCommitOid,
+      quoteFor: input.quoteFor,
+      resolveSnapshot: (thread) => snapshotFor.get(thread.id) ?? { kind: "unavailable", reason: "no-snapshot" },
+    });
+  }
+
+  /**
+   * Fetch a blob's text content via GraphQL
+   * `repository.object(expression: "<oid>:<path>")`. Returns
+   * `null` when the object is missing, binary (isBinary) or
+   * truncated (isTruncated) — treated the same as "not text
+   * we can anchor to".
+   *
+   * Path is escaped for the expression string. `oid` is a git SHA
+   * (40-hex or 64-hex).
+   */
+  async fetchBlobText(input: {
+    readonly owner: string;
+    readonly repo: string;
+    readonly oid: string;
+    readonly path: string;
+  }): Promise<string | null> {
+    // The expression string is <oid>:<path>. Path is passed as
+    // part of a string literal — GraphQL variables don't reach the
+    // parser here, so it goes on the variables side of the
+    // expression and gets concatenated server-side. Use variables
+    // to avoid injection.
+    const resp = await this.graphqlWithRetry<BlobTextGraphqlResponse>(FETCH_BLOB_TEXT_QUERY, {
+      owner: input.owner,
+      name: input.repo,
+      expression: `${input.oid}:${input.path}`,
+    });
+    const object = resp.data.repository?.object ?? null;
+    if (object === null || object.__typename !== "Blob") return null;
+    if (object.isBinary === true) return null;
+    if (object.isTruncated === true) return null;
+    if (typeof object.text !== "string") return null;
+    return object.text;
   }
 
   // --- Internals --- //
@@ -972,6 +1308,7 @@ export class GitHubAdapter {
       url,
       documentationUrl,
       retryable: shouldRetry(res.status, res.headers, text),
+      headers: res.headers,
     });
   }
 
@@ -1015,6 +1352,7 @@ export class GitHubAdapter {
         method: "POST",
         url: this.graphqlUrl,
         retryable: shouldRetry(res.status, res.headers, text),
+        headers: res.headers,
       });
     }
     let parsed: T & { errors?: Array<{ message: string; type?: string }> };
@@ -1029,12 +1367,19 @@ export class GitHubAdapter {
       });
     }
     if (parsed.errors !== undefined && parsed.errors.length > 0) {
+      // PR-43 round-3: GraphQL rate-limit surfaces as a 200 with
+      // `errors[].type === "RATE_LIMITED"`. Mark it retryable so
+      // the retry loop wakes up (and the daemon shows the right
+      // "come back later" state rather than a generic error).
+      const rateLimited = parsed.errors.some((e) => e.type === "RATE_LIMITED");
       const messages = parsed.errors.map((e) => e.message).join("; ");
       throw new GitHubApiError({
         message: `graphql errors: ${redactTokenInMessage(messages, token)}`,
         status: res.status,
         method: "POST",
         url: this.graphqlUrl,
+        retryable: rateLimited,
+        headers: res.headers,
       });
     }
     return parsed as T;
@@ -1050,13 +1395,28 @@ export class GitHubAdapter {
       try {
         return await op();
       } catch (err) {
-        const e = err as GitHubApiError & { headers?: Headers };
-        if (attempt >= max || !isRetryable(e)) throw err;
-        const headers = extractHeaders(e);
-        const base = retryAfterMs(headers, this.retryPolicy.baseDelayMs * 2 ** (attempt - 1), this.now);
-        const capped = Math.min(base, this.retryPolicy.maxDelayMs);
+        if (!(err instanceof GitHubApiError) || !err.retryable) throw err;
+        // Cap check: if the server tells us to wait longer than the
+        // policy's maxDelayMs, refuse to sleep — throw a typed
+        // rate-limit error so the daemon can show "come back
+        // later" rather than block for minutes. This is the
+        // "beyond the cap" path PR-43 round-3 named.
+        const headers = err.headers ?? new Headers();
+        const advised = retryAfterMs(headers, this.retryPolicy.baseDelayMs * 2 ** (attempt - 1), this.now);
+        if (advised > this.retryPolicy.maxDelayMs) {
+          throw new GitHubRateLimitError({
+            message: `rate limit: server advises ${advised} ms wait, exceeding maxDelayMs=${this.retryPolicy.maxDelayMs}`,
+            status: err.status,
+            method: err.method,
+            url: err.url,
+            documentationUrl: err.documentationUrl,
+            headers: err.headers,
+            retryAfterMs: advised,
+          });
+        }
+        if (attempt >= max) throw err;
         const jitter = Math.floor(Math.random() * this.retryPolicy.jitterMs);
-        await this.sleep(capped + jitter);
+        await this.sleep(advised + jitter);
       }
     }
     // Unreachable — the loop either returns or throws.
@@ -1092,6 +1452,19 @@ export function composeFileFallbackBody(
 
 // --- Internal helpers --- //
 
+/** Fallback text-quote for a thread whose file content is
+ * unavailable AND no `quoteFor` callback was supplied. The
+ * anchor schema requires a non-empty `exact`; we use the
+ * comment body's first non-empty line, truncated to 200 chars,
+ * so downstream consumers see something meaningful. The
+ * following `thread.orphaned` event makes the placeholder
+ * nature explicit. */
+function placeholderQuote(commentBody: string): { exact: string; prefix: string; suffix: string } {
+  const firstLine = commentBody.split(/\r?\n/).find((line) => line.trim().length > 0) ?? commentBody;
+  const trimmed = firstLine.trim().slice(0, 200);
+  return { exact: trimmed.length > 0 ? trimmed : "(imported thread — quote unavailable)", prefix: "", suffix: "" };
+}
+
 function ghAuthorToReviewCoreAuthor(comment: GhReviewComment): Author {
   const login = comment.authorLogin ?? "ghost";
   return {
@@ -1123,21 +1496,9 @@ function mapReviewThread(node: ReviewThreadGraphqlNode): GhReviewThread {
       authorType: c.author?.__typename === "Bot" ? "Bot" : c.author?.__typename === "User" ? "User" : "Unknown",
       createdAt: c.createdAt,
       url: c.url,
+      originalCommitOid: c.originalCommit?.oid ?? null,
     })),
   };
-}
-
-function isRetryable(err: unknown): boolean {
-  if (err === null || typeof err !== "object") return false;
-  const anyErr = err as { retryable?: boolean };
-  return anyErr.retryable === true;
-}
-
-/** GitHubApiError doesn't currently carry the response headers; the
- * retry loop falls back to `baseDelayMs`. Kept as a hook for a
- * future change that would attach headers on the thrown error. */
-function extractHeaders(_err: unknown): Headers {
-  return new Headers();
 }
 
 const defaultSleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1261,6 +1622,7 @@ interface ReviewCommentGraphqlNode {
   readonly createdAt: string;
   readonly url: string;
   readonly author: { readonly login: string; readonly __typename: string } | null;
+  readonly originalCommit: { readonly oid: string } | null;
 }
 
 interface PendingReviewCommentGraphqlNode {
@@ -1270,8 +1632,8 @@ interface PendingReviewCommentGraphqlNode {
   readonly body: string;
   readonly line?: number | null;
   readonly startLine?: number | null;
-  readonly side?: "RIGHT" | "LEFT" | null;
-  readonly startSide?: "RIGHT" | "LEFT" | null;
+  readonly originalLine?: number | null;
+  readonly originalStartLine?: number | null;
   readonly subjectType?: "LINE" | "FILE";
   readonly url: string;
 }
@@ -1335,7 +1697,64 @@ interface ViewerLoginResponse {
   };
 }
 
+interface BlobTextGraphqlResponse {
+  readonly data: {
+    readonly repository: {
+      readonly object: {
+        readonly __typename: string;
+        readonly text?: string | null;
+        readonly isBinary?: boolean | null;
+        readonly isTruncated?: boolean | null;
+      } | null;
+    } | null;
+  };
+}
+
 // --- GraphQL documents (verified via introspection; see file header) --- //
+
+/** Every GraphQL document the adapter sends, exported so the schema
+ * validator (`test/graphql-schema.test.ts`) can walk them against
+ * the introspected schema fixture. If a new document is added below,
+ * add it to this map — the test iterates the object and validates
+ * each entry. */
+export const GITHUB_GRAPHQL_DOCUMENTS = {
+  get ReviewThreads() {
+    return REVIEW_THREADS_QUERY;
+  },
+  get ThreadComments() {
+    return THREAD_COMMENTS_QUERY;
+  },
+  get ReviewComments() {
+    return REVIEW_COMMENTS_QUERY;
+  },
+  get ViewerLogin() {
+    return VIEWER_LOGIN_QUERY;
+  },
+  get FetchBlobText() {
+    return FETCH_BLOB_TEXT_QUERY;
+  },
+  get ViewerPendingReview() {
+    return VIEWER_PENDING_REVIEW_QUERY;
+  },
+  get AddReview() {
+    return ADD_REVIEW_MUTATION;
+  },
+  get AddThread() {
+    return ADD_THREAD_MUTATION;
+  },
+  get UpdateComment() {
+    return UPDATE_COMMENT_MUTATION;
+  },
+  get DeleteComment() {
+    return DELETE_COMMENT_MUTATION;
+  },
+  get DeleteReview() {
+    return DELETE_REVIEW_MUTATION;
+  },
+  get SubmitReview() {
+    return SUBMIT_REVIEW_MUTATION;
+  },
+} as const;
 
 const REVIEW_THREADS_QUERY = /* GraphQL */ `
   query ReviewThreads($owner: String!, $name: String!, $number: Int!, $cursor: String) {
@@ -1365,6 +1784,7 @@ const REVIEW_THREADS_QUERY = /* GraphQL */ `
                 createdAt
                 url
                 author { login __typename }
+                originalCommit { oid }
               }
             }
           }
@@ -1388,6 +1808,7 @@ const THREAD_COMMENTS_QUERY = /* GraphQL */ `
             createdAt
             url
             author { login __typename }
+            originalCommit { oid }
           }
         }
       }
@@ -1409,8 +1830,8 @@ const REVIEW_COMMENTS_QUERY = /* GraphQL */ `
             body
             line
             startLine
-            side
-            startSide
+            originalLine
+            originalStartLine
             subjectType
             url
           }
@@ -1422,6 +1843,21 @@ const REVIEW_COMMENTS_QUERY = /* GraphQL */ `
 
 const VIEWER_LOGIN_QUERY = /* GraphQL */ `
   query ViewerLogin { viewer { login } }
+`;
+
+const FETCH_BLOB_TEXT_QUERY = /* GraphQL */ `
+  query FetchBlobText($owner: String!, $name: String!, $expression: String!) {
+    repository(owner: $owner, name: $name) {
+      object(expression: $expression) {
+        __typename
+        ... on Blob {
+          text
+          isBinary
+          isTruncated
+        }
+      }
+    }
+  }
 `;
 
 const VIEWER_PENDING_REVIEW_QUERY = /* GraphQL */ `

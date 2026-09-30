@@ -63,11 +63,15 @@ export function redactTokenInMessage(message: string, token: string): string {
   // GitHub token prefixes plus a plausible tail (letters, digits,
   // underscore). Length 20+ narrows the match away from prose.
   //
-  // Cannot use `\b` for the start boundary: `_` is a word character
-  // in JS regex, so `\bghp_` fails to match on `foo_ghp_...`. Use
-  // an explicit lookbehind for a non-alphanumeric character or the
-  // start of the string (PR-43 nit).
-  out = out.replace(/(?<![A-Za-z0-9])(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}/g, "<redacted:ghtoken>");
+  // Deliberately no start-boundary check: `\b` treats `_` as a word
+  // character (so `\bghp_` fails on `foo_ghp_...`), and a lookbehind
+  // for `[^A-Za-z0-9]` still misses `aghp_...` (a letter — a common
+  // shape in log lines where a variable name runs into the value).
+  // Matching the prefix anywhere accepts the rare over-redaction of
+  // an in-word coincidence (a Base64 payload happening to contain
+  // `ghp_` followed by 20+ chars is essentially never a false
+  // positive worth optimising for). PR-43 round-3.
+  out = out.replace(/(gh[opusr]_|github_pat_)[A-Za-z0-9_]{20,}/g, "<redacted:ghtoken>");
   // `Authorization: Bearer <anything up to whitespace or quote>`.
   out = out.replace(/(Authorization:\s*Bearer\s+)[^\s"']+/gi, "$1<redacted>");
   return out;

@@ -172,6 +172,105 @@ describe("GitHubAdapter over fixtures — listReviewThreads (GraphQL)", () => {
     expect(bot!.comments[0]!.authorType).toBe("Bot");
   });
 
+  test("paginates the OUTER reviewThreads cursor (mutation guard: cursor advances, no stop-after-page-1)", async () => {
+    // Mutation guards for the OUTER cursor: (a) cursor not
+    // advancing → infinite loop / test times out on cap; (b) stop
+    // after page 1 → only threads from page 1 returned.
+    const seenCursors: (string | null)[] = [];
+    let outerPage = 0;
+    const routes: Record<string, (init: RequestInit) => Response> = {
+      [`POST ${DEFAULT_GITHUB_GRAPHQL_URL}`]: (init) => {
+        const body = JSON.parse((init as { body: string }).body) as {
+          query: string;
+          variables: { cursor?: string | null };
+        };
+        // Only ReviewThreads here; inner queries not triggered
+        // because each thread has hasNextPage=false.
+        outerPage++;
+        seenCursors.push(body.variables.cursor ?? null);
+        if (outerPage === 1) {
+          return json({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    pageInfo: { hasNextPage: true, endCursor: "outer-A" },
+                    nodes: [
+                      {
+                        id: "PRRT_p1",
+                        path: "a.mdx",
+                        isResolved: false,
+                        isOutdated: false,
+                        line: 1,
+                        startLine: null,
+                        originalLine: 1,
+                        originalStartLine: null,
+                        diffSide: "RIGHT",
+                        startDiffSide: null,
+                        subjectType: "LINE",
+                        resolvedBy: null,
+                        comments: {
+                          pageInfo: { hasNextPage: false, endCursor: null },
+                          nodes: [{ id: "c1", databaseId: 1, body: "b1", createdAt: "t1", url: "u1", author: null, originalCommit: { oid: "1".repeat(40) } }],
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          });
+        }
+        if (outerPage === 2) {
+          return json({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                    nodes: [
+                      {
+                        id: "PRRT_p2",
+                        path: "b.mdx",
+                        isResolved: false,
+                        isOutdated: false,
+                        line: 1,
+                        startLine: null,
+                        originalLine: 1,
+                        originalStartLine: null,
+                        diffSide: "RIGHT",
+                        startDiffSide: null,
+                        subjectType: "LINE",
+                        resolvedBy: null,
+                        comments: {
+                          pageInfo: { hasNextPage: false, endCursor: null },
+                          nodes: [{ id: "c2", databaseId: 2, body: "b2", createdAt: "t2", url: "u2", author: null, originalCommit: { oid: "1".repeat(40) } }],
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          });
+        }
+        return new Response("bad outer page", { status: 500 });
+      },
+    };
+    const adapter = new GitHubAdapter({
+      token: staticToken,
+      fetch: makeFetch(routes),
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    const threads = await adapter.listReviewThreads({ owner: "vig-os", repo: "revkit", pullNumber: 8 });
+    expect(threads.length).toBe(2);
+    // Both threads present (stop-after-page-1 would drop the second).
+    expect(threads.map((t) => t.id)).toEqual(["PRRT_p1", "PRRT_p2"]);
+    // Cursor advanced from null → outer-A (cursor-not-advancing
+    // would loop forever until the page cap trips).
+    expect(seenCursors).toEqual([null, "outer-A"]);
+  });
+
   test("paginates the inner comments connection when a thread has more than one page", async () => {
     // Mutation guard: if the inner cursor is not advanced (e.g. a
     // future edit accidentally passes null on every follow-up

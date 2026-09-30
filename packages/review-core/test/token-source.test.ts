@@ -43,15 +43,16 @@ describe("redactTokenInMessage", () => {
     expect(scrubbed).toContain("<redacted:ghtoken>");
   });
 
-  test("redacts even when the prefix is preceded by an underscore or other word char", () => {
-    // PR-43 nit: `\b` fails at `foo_ghp_...` because `_` is a word
-    // character in JS regex — the underscore before `ghp_` is a
-    // "boundary" of length zero to `\b`, so no boundary triggers.
-    // The lookbehind fix must catch this shape.
+  test("redacts even when the prefix is preceded by a word character (underscore, letter, digit)", () => {
+    // PR-43 round-3: matches ANYWHERE so `foo_ghp_...`, `aghp_...`
+    // and `9ghp_...` all get scrubbed. `\b` failed on `_`
+    // (word-char) and a lookbehind for non-word failed on letters.
     const stray = "ghp_" + "a".repeat(40);
-    const scrubbed = redactTokenInMessage(`prefix_${stray} suffix`, "");
-    expect(scrubbed).not.toContain(stray);
-    expect(scrubbed).toContain("<redacted:ghtoken>");
+    for (const preceder of ["prefix_", "a", "z", "9"]) {
+      const scrubbed = redactTokenInMessage(`${preceder}${stray} tail`, "");
+      expect(scrubbed).not.toContain(stray);
+      expect(scrubbed).toContain("<redacted:ghtoken>");
+    }
   });
 
   test("catches all five GitHub prefixes", () => {
