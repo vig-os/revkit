@@ -135,6 +135,13 @@ export interface ReanchorDaemonOptions {
    * value so a probe-G reproduction settles inside a few hundred
    * ms. */
   readonly dirRebindIntervalMs?: number;
+  /** **Test-only.** Called during `doRefresh` after the file has
+   * been read + hashed but before any state is consulted. A probe
+   * awaits this to sequence a concurrent write against the pipeline
+   * (round-4 blocker A regression test). Production callers never
+   * pass one. Throwing from the hook is caught and logged; the
+   * refresh continues. */
+  readonly postReadHook?: (path: string, newRevision: string) => Promise<void> | void;
   /** Injected clock (ms) for tests. */
   readonly nowMs?: () => number;
 }
@@ -208,6 +215,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     buildDebounceMs = DEFAULT_BUILD_DEBOUNCE_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     dirRebindIntervalMs = DEFAULT_BUILD_REBIND_INTERVAL_MS,
+    postReadHook,
   } = options;
 
   const actor: Author = { kind: "agent", id: REANCHOR_ACTOR_ID };
@@ -224,25 +232,17 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     dirty: boolean;
   }
   const inflight = new Map<string, InflightState>();
-  /** Per-path record of the last revision the PIPELINE ran against.
-   *
-   * **Correctness first.** The previous shape (mtime + size cache)
-   * had two bugs (PR #45 round-3 blocker):
-   *
-   *   - a write between the read and a post-read `statSync` paired
-   *     the new (mtime, size) with the OLD revision, so every later
-   *     refresh short-circuited on stale content (probe A);
-   *   - a same-size edit whose mtime was restored by `touch -r`,
-   *     `cp -p`, `rsync -t` or `tar x` was invisible to the cache
-   *     forever (probe F).
-   *
-   * The fix: always read and hash the file (cheap under the 5 MiB
-   * cap), and use the CONTENT revision as the cache key. If
-   * `revisionOf(content) === lastProcessedRevision`, the pipeline
-   * is skipped (the identity short-circuit in `reanchorWith` would
-   * emit nothing anyway); otherwise the pipeline runs and the new
-   * revision is stored. The stat race is gone by construction. */
-  const lastProcessedRevision = new Map<string, string>();
+  /** Per-orphaned-thread record of the revision at which the
+   * pipeline last checked it. Keyed on `(threadId)` so it is
+   * naturally per-thread (round-4 blocker 1 fix). Set only after a
+   * successful check where the thread stayed orphaned; the next
+   * refresh at the SAME `newRevision` skips this thread. An
+   * un-orphan event (`thread.reanchored`) leaves the memo behind
+   * but the thread's status flips to `open`, so subsequent
+   * up-to-date checks look at `anchor.revision` instead — the memo
+   * is inert. `reconcileWatchers` sweeps entries for threads no
+   * longer under a watcher, so the map stays bounded. */
+  const orphanCheckRevision = new Map<string, string>();
   /** Per-directory watcher, fanned out to the set of threaded
    * basenames inside. Round-3 nit: the previous code installed one
    * watcher per file, all bound to the SAME parent inode; five
@@ -271,6 +271,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     /** Set when the parent dir itself was removed and the watcher
      * needs a rebind (probe G). */
     needsRebind: boolean;
+    /** (dev, ino) captured at bind time. The rebind probe
+     * compares the current dir's inode against this; a mismatch
+     * (rename-away + recreate with a fresh inode) means the
+     * watcher is bound to a dead inode and must be reinstalled,
+     * even though `existsSync(dir)` says the path exists. Round-4
+     * blocker G(a). */
+    boundIdent?: { dev: number; ino: number };
   }
   const dirWatchers = new Map<string, DirectoryWatcher>();
   /** Per-path debounce timer for the fan-out. */
@@ -381,7 +388,6 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       // reveal WHICH failure mode fired (matches
       // `UNIFORM_ANCHOR_REJECTION`'s privacy stance) — an operator
       // reads the daemon's own log for the specific cause.
-      lastProcessedRevision.delete(path);
       logger.warn("reanchor.source.rejected", { path, reason: resolved.reason });
       await orphanAll(
         path,
@@ -391,13 +397,20 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
     const { revision: newRevision, source: newSource } = resolved;
 
-    // Content-addressed short-circuit: if the file has the same
-    // revision as the last successful pipeline run, the pipeline
-    // would emit `anchored` for every thread (identity short-circuit
-    // in `reanchorWith`). Skip the work. The read + hash still ran,
-    // so a same-size + preserved-mtime edit (probe F) is caught by
-    // the revision comparison — there is NO stat shortcut left.
-    if (lastProcessedRevision.get(path) === newRevision) return;
+    // **Barrier hook (test-only).** A caller may inject
+    // `postReadHook(path, revision)` to synchronise a probe between
+    // the read+hash and everything else. Production code never
+    // provides one; the round-4 blocker A regression test injects a
+    // hook that pauses here while a second write lands, then lets
+    // the run continue. Without the hook the doRefresh is a simple
+    // linear read → decide → pipeline.
+    if (postReadHook !== undefined) {
+      try {
+        await postReadHook(path, newRevision);
+      } catch {
+        // Test-only; a hook throwing must not crash the daemon.
+      }
+    }
 
     // Fetch open + orphaned threads on this path. `resolved` threads
     // are not tracked — the human/agent's final word stands.
@@ -408,6 +421,28 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       putSnapshotSafe(newRevision, newSource);
       return;
     }
+
+    // **State-derived skip (round-4 blocker 1 fix).** The previous
+    // "last processed revision per path" cache broke when threads
+    // changed: a resolved thread that reopens, or a POST that lands
+    // a new thread at an older revision, both leave the cache
+    // pointing at a revision the pipeline never processed for
+    // *those* threads. Skipping under a per-path key would then
+    // silently strand the newly-eligible threads at their old
+    // anchor.
+    //
+    // Derive the decision from state: skip the pipeline only if
+    // every OPEN thread's `anchor.revision` already matches the
+    // current on-disk revision AND every ORPHANED thread was
+    // already checked against this exact revision (memo:
+    // `orphanCheckRevision`). If any thread is behind, run the
+    // pipeline. This is naturally correct across resolve/reopen and
+    // late-POST cases without invalidation hooks.
+    const allUpToDate = threads.every((thread) => {
+      if (thread.status === "open") return thread.anchor.revision === newRevision;
+      return orphanCheckRevision.get(thread.id) === newRevision;
+    });
+    if (allUpToDate) return;
 
     // Group by old revision so `prepareReanchor` runs once per (old,
     // new) pair rather than once per thread.
@@ -425,8 +460,15 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
 
     for (const [oldRevision, bucket] of byRevision) {
       // Identity: nothing changed on the file since the anchor was
-      // taken. Skip — the pipeline's `anchored` result is a no-op.
-      if (oldRevision === newRevision) continue;
+      // taken. Skip pipeline work, but memo the orphan check so a
+      // subsequent refresh at the same revision short-circuits at
+      // the state-derived skip above.
+      if (oldRevision === newRevision) {
+        for (const thread of bucket) {
+          if (thread.status === "orphaned") orphanCheckRevision.set(thread.id, newRevision);
+        }
+        continue;
+      }
 
       const oldSource = store.getSnapshot(oldRevision);
       if (oldSource === undefined) {
@@ -435,14 +477,25 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         // "missing snapshot" reason. The alternative — silently
         // guessing — would be worse than orphaning (ADR-0006).
         for (const thread of bucket) {
-          if (thread.status === "orphaned") continue;
-          await emitEvent({
+          if (thread.status === "orphaned") {
+            // Already orphaned; no event to emit, but memo the
+            // check at the current revision so a repeat refresh
+            // skips this thread.
+            orphanCheckRevision.set(thread.id, newRevision);
+            continue;
+          }
+          const seq = await tryEmitEvent({
             kind: "thread.orphaned",
             actor,
             threadId: thread.id,
             revision: newRevision,
             reason: `no snapshot for the anchor's revision ${oldRevision.slice(0, 12)}… (rebuild predates the daemon or the snapshot was pruned).`,
           });
+          // Only memo when the append landed. A rejected event
+          // (validator refusal, sqlite error) leaves the thread
+          // eligible for retry — the state-derived skip fires
+          // again on the next refresh (round-4 blocker 1 nit).
+          if (seq !== null) orphanCheckRevision.set(thread.id, newRevision);
         }
         continue;
       }
@@ -458,14 +511,18 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
           errorKind: (error as Error).name,
         });
         for (const thread of bucket) {
-          if (thread.status === "orphaned") continue;
-          await emitEvent({
+          if (thread.status === "orphaned") {
+            orphanCheckRevision.set(thread.id, newRevision);
+            continue;
+          }
+          const seq = await tryEmitEvent({
             kind: "thread.orphaned",
             actor,
             threadId: thread.id,
             revision: newRevision,
             reason: `re-anchor pipeline failed to prepare context: ${(error as Error).message}`,
           });
+          if (seq !== null) orphanCheckRevision.set(thread.id, newRevision);
         }
         continue;
       }
@@ -473,22 +530,26 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       for (const thread of bucket) {
         const result = await reanchorWith(ctx, thread.anchor);
         if (result.kind === "anchored") continue;
-        // A resolved thread's re-anchor still fires from the pipeline
-        // above (we filter to open+orphaned), but the validator refuses
-        // `thread.orphaned` for a non-open thread. Skip a repeat-orphan
-        // for an already-orphaned thread whose outcome is orphan again.
-        if (result.kind === "orphaned" && thread.status === "orphaned") continue;
+        if (result.kind === "orphaned" && thread.status === "orphaned") {
+          // Already orphaned and still orphaned — no event, but
+          // memo the check at newRevision.
+          orphanCheckRevision.set(thread.id, newRevision);
+          continue;
+        }
         const event = reanchorEvent(thread.id, actor, result);
         if (event === null) continue;
-        await emitEvent(event);
+        const seq = await tryEmitEvent(event);
+        // A rejected append leaves the memo untouched — retry on
+        // the next refresh. A successful append that moved a
+        // thread from `orphaned` → `open` leaves the stale memo,
+        // but the state-derived skip now checks `anchor.revision`
+        // (open) so the memo is inert.
+        if (seq !== null && result.kind === "orphaned") {
+          orphanCheckRevision.set(thread.id, newRevision);
+        }
       }
     }
 
-    // Record the revision the pipeline finished on. A future
-    // refresh reading the same content skips at the top; a refresh
-    // reading a different revision runs the pipeline (correctly, on
-    // the fresh content) and updates this entry.
-    lastProcessedRevision.set(path, newRevision);
     pipelineRunCount += 1;
 
     // Opportunistic GC. Cheap when nothing changed, bounded by
@@ -496,10 +557,15 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     await gcOnce();
   }
 
-  /** Append the event to the store and fan it out on the bus. Errors
-   * are logged (never thrown) — a re-anchor loop must not crash the
-   * daemon. */
-  async function emitEvent(input: ReviewEventInput): Promise<void> {
+  /** Append the event to the store and fan it out on the bus.
+   * Returns the assigned `seq` on success, or `null` when the
+   * append was rejected (a validator refusal, a sqlite error).
+   * Errors are logged (never thrown) — a re-anchor loop must not
+   * crash the daemon, and the caller uses the return value to
+   * decide whether to memo the orphan check: a rejected append
+   * MUST leave the thread eligible for retry on the next refresh
+   * (round-4 blocker 1 nit). */
+  async function tryEmitEvent(input: ReviewEventInput): Promise<number | null> {
     let seq: number;
     try {
       seq = await store.append(input);
@@ -516,7 +582,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
           errorKind: (error as Error).name,
         });
       }
-      return;
+      return null;
     }
     // Fan out. `since(seq - 1)` is the cheap way to grab exactly the
     // row we just wrote.
@@ -525,6 +591,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     if (event !== undefined) {
       void bus.publish(event);
     }
+    return seq;
   }
 
   /** Wrap `store.putSnapshot` in a try/catch so a sqlite-side error
@@ -543,7 +610,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
   async function orphanAll(path: string, reason: string): Promise<void> {
     const threads = await store.threads({ path, status: "open" });
     for (const thread of threads) {
-      await emitEvent({
+      await tryEmitEvent({
         kind: "thread.orphaned",
         actor,
         threadId: thread.id,
@@ -638,13 +705,22 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
   /** Try `fs.watch(dir)`, fall back to polling on error. `needsRebind`
    * is set when the directory disappears (probe G); the rebind loop
    * below (`rebindMissingDirWatchers`) reinstalls the watcher when
-   * the dir returns. */
+   * the dir returns.
+   *
+   * Captures `boundIdent = (dev, ino)` at bind time so the rebind
+   * probe can spot a rename-swap: the path exists, but its inode
+   * differs from the one we bound to (round-4 blocker G(a)). */
   function installDirectoryWatcher(dir: string, dw: DirectoryWatcher): void {
     if (forcePoll) {
       installDirectoryPolling(dir, dw);
       return;
     }
-    if (!existsSync(dir)) {
+    let boundIdent: { dev: number; ino: number } | undefined;
+    try {
+      const st = statSync(dir);
+      boundIdent = { dev: st.dev, ino: st.ino };
+    } catch {
+      // Directory does not exist; arm polling + mark rebind.
       dw.needsRebind = true;
       installDirectoryPolling(dir, dw);
       return;
@@ -693,6 +769,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       });
       dw.watcher = watcher;
       dw.needsRebind = false;
+      dw.boundIdent = boundIdent;
       // If a polling fallback was previously installed, tear it down
       // — the fs.watch is now live.
       if (dw.poll !== undefined) {
@@ -700,6 +777,12 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         dw.poll = undefined;
         dw.pollStat = undefined;
       }
+      // Round-4 blocker G(b): after a fresh bind we may have missed
+      // events between the old watcher dying and the new one
+      // installing. Trigger a refresh for every tracked path so
+      // an already-written file is reprocessed against the current
+      // content.
+      for (const trackedPath of dw.basenames.values()) fireForPath(trackedPath);
     } catch {
       installDirectoryPolling(dir, dw);
     }
@@ -783,12 +866,14 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     if (stopped) return;
     const all = await store.threads();
     const wanted = new Set<string>();
+    const trackedThreadIds = new Set<string>();
     for (const thread of all) {
       // Only watch open+orphaned threads. A resolved thread's
       // source-file edit does not need to re-anchor it (respect
       // the resolution).
       if (thread.status === "resolved") continue;
       wanted.add(thread.anchor.path);
+      trackedThreadIds.add(thread.id);
     }
     for (const path of wanted) ensureWatcher(path);
     // Tear down any tracked path no longer wanted. Iterate a
@@ -801,26 +886,71 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     for (const path of trackedPaths) {
       if (!wanted.has(path)) tearDownWatcher(path);
     }
-    // Rebind directory watchers whose parent came back. Cheap:
-    // touches only entries flagged `needsRebind`.
+    // Rebind directory watchers whose parent came back or whose
+    // inode changed underneath.
     rebindMissingDirWatchers();
+    // Prune the orphan-check memo of threads no longer tracked.
+    // Bounded: even under an adversarial mass-orphan-then-resolve
+    // pattern the map only grows for threads that are currently
+    // orphaned.
+    for (const id of orphanCheckRevision.keys()) {
+      if (!trackedThreadIds.has(id)) orphanCheckRevision.delete(id);
+    }
   }
 
   /** Reinstall any directory watcher whose parent directory has
-   * returned. Called from `reconcileWatchers` (a POST /api/threads
-   * has landed) and from the periodic build-watcher rebind probe
-   * (which already ticks every `DEFAULT_BUILD_REBIND_INTERVAL_MS`).
+   * returned OR whose inode changed underneath us. Called from
+   * `reconcileWatchers` (a POST /api/threads has landed) and from
+   * the periodic rebind probe.
+   *
+   * **Two rebind triggers** (round-4 blocker G):
+   *
+   *   (a) `dw.needsRebind` was set — the watcher errored, or the
+   *       fs.watch callback saw the dir vanish. Standard case.
+   *   (b) The dir EXISTS and the watcher LIVES, but the current
+   *       `(dev, ino)` differs from the one captured at bind time.
+   *       Happens on `renameSync(dir, dir + "-old"); mkdirSync(dir)`:
+   *       the old dir kept its inode (moved with the rename), a
+   *       fresh inode was created for the new dir, and the watcher
+   *       is now bound to the DEAD one. Without this check the
+   *       daemon silently misses every subsequent event.
+   *
    * The polling fallback for a missing dir keeps firing refreshes
-   * that orphan the thread; once the dir returns we swap back to
-   * the cheap `fs.watch` path. */
+   * until the fs.watch is confirmed installed — the installer
+   * clears the poll on success. */
   function rebindMissingDirWatchers(): void {
     for (const [dir, dw] of dirWatchers) {
-      if (!dw.needsRebind) continue;
-      if (!existsSync(dir)) continue;
-      // Directory came back. If a polling fallback is running, keep
-      // it up until the fs.watch is confirmed installed — installer
-      // clears it on success.
-      installDirectoryWatcher(dir, dw);
+      // Explicit rebind flag (needsRebind path).
+      if (dw.needsRebind) {
+        if (!existsSync(dir)) continue;
+        installDirectoryWatcher(dir, dw);
+        continue;
+      }
+      // Silent inode swap — dir looks fine but the watcher is bound
+      // to a dead inode.
+      if (dw.watcher !== undefined && dw.boundIdent !== undefined) {
+        let currentIdent: { dev: number; ino: number } | undefined;
+        try {
+          const st = statSync(dir);
+          currentIdent = { dev: st.dev, ino: st.ino };
+        } catch {
+          // Dir gone since; the next tick's `needsRebind` path handles it.
+          continue;
+        }
+        if (
+          currentIdent.dev !== dw.boundIdent.dev ||
+          currentIdent.ino !== dw.boundIdent.ino
+        ) {
+          try {
+            dw.watcher.close();
+          } catch {
+            // Already closed.
+          }
+          dw.watcher = undefined;
+          dw.needsRebind = true;
+          installDirectoryWatcher(dir, dw);
+        }
+      }
     }
   }
 
