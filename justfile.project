@@ -251,8 +251,8 @@ claude-plugin ref="":
 # See `.claude/skills/revkit_dogfood/SKILL.md` for the full runbook and the
 # failure playbook.
 [group('agent')]
-dogfood:
-    scripts/dogfood-channel.sh
+dogfood *args:
+    bun packages/cli/src/dogfood/main.ts {{ args }}
 
 # -------------------------------------------------------------------------------
 # CLOUDFLARE
