@@ -16,7 +16,7 @@ import { z } from "zod";
  * the M3 local PR review surface, ADR-0025). Its `id` is opaque to the
  * daemon — an install-scoped user tag written by the CLI — so a
  * rename or a machine move never invalidates old comments. */
-export const authorKinds = ["gh-user", "local", "guest", "team", "role", "agent"] as const;
+export const authorKinds = ["gh-user", "local", "guest", "team", "role", "agent", "system"] as const;
 export type AuthorKind = (typeof authorKinds)[number];
 
 /** Author of an event — a typed mention with an id and an optional display
@@ -25,7 +25,12 @@ export type AuthorKind = (typeof authorKinds)[number];
  * `role` ("author" | "reviewers" | "owners"), a guest invite id for
  * `guest`, the agent's registered channel name for `agent`, or an
  * install-scoped user tag for `local` (the M2 daemon's loopback
- * session). */
+ * session), or a well-known component name for `system` (a
+ * daemon-emitted event that has no human or agent origin — e.g.
+ * `revkit-daemon` on `ask.expired` from the lazy expiry sweep, or
+ * `revkit-reanchor` from the re-anchoring pipeline). PR #52 review:
+ * a `system` kind is preferred over reusing `agent` for events the
+ * agent never actually authored. */
 export const authorSchema = z
   .object({
     kind: z.enum(authorKinds),

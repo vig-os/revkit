@@ -97,7 +97,21 @@ const askVariants = [
 ] as const;
 
 /** Discriminated union on `kind` so an invalid kind fails with a message
- * that lists the allowed set; cross-field refinements ride on top. */
+ * that lists the allowed set. The `superRefine` below adds two
+ * cross-field checks the discriminant cannot see:
+ *
+ *   - `choice`/`rank`: option ids are UNIQUE across `options[]`
+ *     (duplicates would let the daemon route an answer to two
+ *     rows in one call). Reports the offending index in the path.
+ *   - `scale`: `min < max` (equal or flipped is not a scale).
+ *
+ * ANSWER-side validation (that a `choice.value` is an option id,
+ * a `rank.ranking` is a permutation of the option ids, a
+ * `scale.value` is in [min, max] on a step) lives with the event
+ * log in `validator.ts::validateAnswerAgainstSpec`, run at
+ * `ask.answered` append-time; PR #52 review pointed out that
+ * doing it only here would leave a client-side bypass writing a
+ * malformed answer to the log. */
 export const askSchema = z.discriminatedUnion("kind", askVariants).superRefine((ask, ctx) => {
   if (ask.kind === "choice" || ask.kind === "rank") {
     const seen = new Map<string, number>();
@@ -114,12 +128,36 @@ export const askSchema = z.discriminatedUnion("kind", askVariants).superRefine((
       }
     }
   }
-  if (ask.kind === "scale" && !(ask.min < ask.max)) {
-    ctx.addIssue({
-      code: "custom",
-      path: ["max"],
-      message: `scale: max (${ask.max}) must be greater than min (${ask.min}).`,
-    });
+  if (ask.kind === "scale") {
+    if (!(ask.min < ask.max)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["max"],
+        message: `scale: max (${ask.max}) must be greater than min (${ask.min}).`,
+      });
+      return;
+    }
+    // PR #52 round-2 review — the span (max - min) MUST be an
+    // integer multiple of step. If it isn't, `max` is not itself
+    // a valid answer value on the step lattice, and the slider's
+    // default (min + i * step for the last valid i) is
+    // strictly less than max, which is a UX surprise on top of
+    // the correctness hazard. `(max - min) / step` is checked
+    // with a tolerance scaled to the magnitudes involved so
+    // decimal steps (0.1, 0.001) don't fail on binary-float
+    // representation noise.
+    const step = ask.step ?? 1;
+    const span = ask.max - ask.min;
+    const nRaw = span / step;
+    const n = Math.round(nRaw);
+    const tolerance = 1e-9 * Math.max(1, Math.abs(ask.max), Math.abs(ask.min), Math.abs(span));
+    if (n <= 0 || Math.abs(span - n * step) > tolerance) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["step"],
+        message: `scale: (max - min) = ${span} must be a positive integer multiple of step (${step}); got ${nRaw}.`,
+      });
+    }
   }
 });
 
@@ -175,3 +213,76 @@ export const askAnswerSchema = z.discriminatedUnion("kind", [
 ]);
 
 export type AskAnswer = z.infer<typeof askAnswerSchema>;
+
+// ── Lifecycle ─────────────────────────────────────────────────────
+
+/** Lifecycle of one ask (DESIGN-0001 §5.1, ADR-0007).
+ *
+ * - `pending`   — the ask exists and is awaiting an answer.
+ * - `answered`  — the human answered; `AskRecord.answer` carries the
+ *                 payload and `AskRecord.answeredAt` the ts.
+ * - `cancelled` — the agent cancelled the ask (e.g. it went stale
+ *                 after a rebuild). Terminal.
+ * - `expired`   — the ask crossed its `expiresAtMs` deadline. Terminal.
+ *
+ * A terminal ask stays in the log — the audit trail keeps every
+ * question the agent raised, even the ones nobody answered.
+ */
+export const askStatuses = ["pending", "answered", "cancelled", "expired"] as const;
+export type AskStatus = (typeof askStatuses)[number];
+export const askStatusSchema = z.enum(askStatuses);
+
+/** The `.revkit/asks/<id>.json` file's on-disk shape — the SAME
+ * fields as an `Ask` (spec-only, `id` = filename per ADR-0007). We
+ * keep the field name distinct from `Ask` so a caller reading a
+ * committed spec off disk with `askFileSchema.parse` gets the exact
+ * same shape as one produced by the daemon. */
+export const askFileSchema = askSchema;
+export type AskFile = z.infer<typeof askFileSchema>;
+
+/** Derived view of one ask, reduced from `ask.created`,
+ * `ask.answered`, `ask.cancelled` and `ask.expired` events (see
+ * `asks-view.ts`). This is what `AsksStore.ask(id)` returns — the
+ * `/api/asks/:id` daemon endpoint serves it verbatim, and the
+ * `/ask/<id>` page renders it. Only the fields relevant to the
+ * current state are set: `answer` / `answeredAt` on `answered`,
+ * `cancelReason` / `cancelledAt` on `cancelled`, `expiredAt` on
+ * `expired`. */
+export const askRecordSchema = z
+  .object({
+    id: z.string().min(1),
+    spec: askSchema,
+    status: askStatusSchema,
+    /** Same-origin path the human opens (`/ask/<id>`) or an absolute
+     * URL when the daemon knows its public origin. */
+    url: z.string().min(1).optional(),
+    /** Wall-clock ms since epoch, when the ask was created. Copied
+     * from the `ask.created` event's `ts` (ISO) → `Date.parse` so
+     * a caller doing math on ages does not re-parse. */
+    createdAtMs: z.number().int().nonnegative(),
+    /** ISO timestamp of the `ask.created` event. */
+    createdAt: z.string().min(1),
+    /** Deadline (ms since epoch) recorded on `ask.created`. Absent
+     * when the caller passed no `ttlMs`. */
+    expiresAtMs: z.number().int().positive().optional(),
+    answer: askAnswerSchema.optional(),
+    answeredAt: z.string().min(1).optional(),
+    cancelReason: z.string().min(1).optional(),
+    cancelledAt: z.string().min(1).optional(),
+    expiredAt: z.string().min(1).optional(),
+    /** Monotone seq of the `ask.created` event — the deterministic
+     * key `selectAsks` orders on. */
+    createdSeq: z.number().int().positive(),
+  })
+  .strict();
+export type AskRecord = z.infer<typeof askRecordSchema>;
+
+/** Filter for `AsksStore.asks(filter?)`. `status` accepts a single
+ * value or an array; the daemon's `GET /api/asks?status=` accepts
+ * a comma-list. */
+export const askFilterSchema = z
+  .object({
+    status: z.union([askStatusSchema, z.array(askStatusSchema).min(1)]).optional(),
+  })
+  .strict();
+export type AskFilter = z.infer<typeof askFilterSchema>;

@@ -91,12 +91,26 @@ export { isValidRepoRelativePath } from "./path.ts";
 export { authorKinds, authorSchema, type Author, type AuthorKind } from "./author.ts";
 export {
   askAnswerSchema,
+  askFileSchema,
+  askFilterSchema,
   askKinds,
+  askRecordSchema,
   askSchema,
+  askStatusSchema,
+  askStatuses,
   type Ask,
   type AskAnswer,
+  type AskFile,
+  type AskFilter,
   type AskKind,
+  type AskRecord,
+  type AskStatus,
 } from "./asks.ts";
+export {
+  matchesAskFilter,
+  reduceAsks,
+  selectAsks,
+} from "./asks-view.ts";
 export { exportArchive, parseArchive, threadArchiveSchema, type ThreadArchive } from "./export.ts";
 export {
   DEFAULT_DELIVERY_MODE,
@@ -180,6 +194,7 @@ export { isoTimestamp } from "./timestamp.ts";
 export {
   cloneLogState,
   emptyLogState,
+  validateAnswerAgainstSpec,
   validateNext,
   type LogState,
   type ValidationResult,

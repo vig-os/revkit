@@ -260,6 +260,18 @@
   color: var(--revkit-rail-accent);
 }
 
+/* System actor (PR #52 round-2 review): daemon-emitted events with
+ * no human or agent origin — the lazy `ask.expired` sweep, the
+ * re-anchor pipeline. Muted foreground with a monospaced feel
+ * makes them visually distinct from `agent`, `local`, and
+ * `gh-user`, so a reviewer scanning the rail can tell "the daemon
+ * did this" at a glance. */
+.revkit-rail__author-kind--system {
+  color: var(--revkit-rail-muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-weight: 500;
+}
+
 .revkit-rail__body {
   margin: 0;
   white-space: pre-wrap;

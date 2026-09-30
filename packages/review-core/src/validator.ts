@@ -25,9 +25,14 @@
 //   presence         — REMOVED from durable log in M2 item 6 round 2.
 //                      Now broadcast ephemerally over /events only.
 //   ask.created      — the askId must be new (`duplicate-ask`).
-//   ask.answered     — the askId must be a prior `ask.created` and not
-//                      already answered (`unknown-ask`,
-//                      `duplicate-answer`).
+//   ask.answered     — the askId must be a prior `ask.created` and still
+//                      pending (`unknown-ask`, `ask-not-pending`); the
+//                      answer's `kind` must match the spec's `kind`
+//                      (`answer-kind-mismatch`).
+//   ask.cancelled    — the askId must be a prior `ask.created` and
+//                      still pending (`unknown-ask`, `ask-not-pending`).
+//   ask.expired      — the askId must be a prior `ask.created` and
+//                      still pending (`unknown-ask`, `ask-not-pending`).
 //   comment.linked   — the commentId must exist; a commentId may be
 //                      linked once (a second link is `duplicate-link`).
 //   thread.reanchored — the threadId must exist AND the event's
@@ -50,7 +55,7 @@
 // hold one long-lived `LogState`; `parseArchive` builds a fresh one and
 // throws it away.
 
-import type { AskKind } from "./asks.ts";
+import type { Ask, AskAnswer, AskKind, AskStatus } from "./asks.ts";
 import type { ReviewEvent } from "./events.ts";
 import type { ThreadStatus } from "./thread.ts";
 
@@ -82,10 +87,16 @@ export interface LogState {
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
   readonly commentIndex: Map<string, string>;
-  /** askId → { kind, answered? }. `kind` is stored so `ask.answered`
-   * can be refused when the answer's discriminant does not match the
-   * ask's kind (a `scale` answer on a `text` ask, and so on). */
-  readonly asks: Map<string, { kind: AskKind; answered: boolean }>;
+  /** askId → { spec, status }. The FULL spec is kept so
+   * `ask.answered` can validate the answer's SHAPE against the
+   * question — not just the discriminant. PR #52 review: the
+   * daemon otherwise accepted `answer.value = "zzz"` on a `choice`
+   * with `allowOther: false`, `99999` on a 1..5 scale, `["nope"]`
+   * on a `rank` whose options never contained `nope`, and so on.
+   * `status` gates all three terminal transitions (answered /
+   * cancelled / expired) — the validator refuses any of them on
+   * an ask that is already terminal. */
+  readonly asks: Map<string, { spec: Ask; status: AskStatus }>;
   /** commentId → set of already-linked backends, so a second link to
    * the same backend on the same comment can be rejected without
    * silently overwriting the first. */
@@ -129,9 +140,12 @@ export function cloneLogState(state: LogState): LogState {
       commentIds: new Set(entry.commentIds),
     });
   }
-  const asks = new Map<string, { kind: AskKind; answered: boolean }>();
+  const asks = new Map<string, { spec: Ask; status: AskStatus }>();
   for (const [id, entry] of state.asks) {
-    asks.set(id, { kind: entry.kind, answered: entry.answered });
+    // Copying the spec by reference is fine here: Zod has already
+    // validated it, and nothing between validator dry-runs mutates
+    // it.
+    asks.set(id, { spec: entry.spec, status: entry.status });
   }
   const commentLinks = new Map<string, Set<string>>();
   for (const [id, backends] of state.commentLinks) {
@@ -159,8 +173,25 @@ export type AppendRejection =
   | { kind: "unknown-comment"; commentId: string; message: string }
   | { kind: "duplicate-ask"; askId: string; message: string }
   | { kind: "unknown-ask"; askId: string; message: string }
+  /** Kept as a distinct kind so a caller can special-case
+   * "the answer beat a cancel" without parsing the message. Emitted
+   * only when an `ask.answered` targets an already-answered ask. */
   | { kind: "duplicate-answer"; askId: string; message: string }
+  /** `ask.answered`, `ask.cancelled` or `ask.expired` targeting an
+   * ask that is no longer pending (already answered / cancelled /
+   * expired). Carries the current status so a race between two
+   * terminal events (e.g. concurrent cancel + answer) surfaces
+   * which one won. */
+  | { kind: "ask-not-pending"; askId: string; currentStatus: AskStatus; attempted: "answered" | "cancelled" | "expired"; message: string }
   | { kind: "answer-kind-mismatch"; askId: string; askKind: AskKind; answerKind: AskKind; message: string }
+  /** The answer's kind matches the ask's, but the VALUES fail
+   * the ask's own constraints (choice value not in options
+   * unless allowOther; scale out of [min,max] or off-step;
+   * rank not an exact permutation of the option ids; text
+   * over the 65 535-char cap). PR #52 review. `field` is the
+   * dotted path of the offending field so a caller can point
+   * the user at it. */
+  | { kind: "answer-shape-mismatch"; askId: string; askKind: AskKind; field: string; message: string }
   | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
   | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string }
   | { kind: "already-orphaned"; threadId: string; message: string }
@@ -297,7 +328,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      state.asks.set(event.askId, { kind: event.spec.kind, answered: false });
+      state.asks.set(event.askId, { spec: event.spec, status: "pending" });
       return { ok: true };
     }
     case "ask.answered": {
@@ -312,7 +343,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      if (ask.answered) {
+      if (ask.status === "answered") {
         return {
           ok: false,
           rejection: {
@@ -322,19 +353,79 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      if (event.answer.kind !== ask.kind) {
+      if (ask.status !== "pending") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "ask-not-pending",
+            askId: event.askId,
+            currentStatus: ask.status,
+            attempted: "answered",
+            message: `ask.answered: ask '${event.askId}' is '${ask.status}' — a terminal state cannot be answered.`,
+          },
+        };
+      }
+      if (event.answer.kind !== ask.spec.kind) {
         return {
           ok: false,
           rejection: {
             kind: "answer-kind-mismatch",
             askId: event.askId,
-            askKind: ask.kind,
+            askKind: ask.spec.kind,
             answerKind: event.answer.kind,
-            message: `ask.answered: ask '${event.askId}' is a '${ask.kind}' question, so the answer.kind must be '${ask.kind}' — got '${event.answer.kind}'.`,
+            message: `ask.answered: ask '${event.askId}' is a '${ask.spec.kind}' question, so the answer.kind must be '${ask.spec.kind}' — got '${event.answer.kind}'.`,
           },
         };
       }
-      ask.answered = true;
+      // PR #52 review: the answer's kind matches, but the values
+      // must ALSO conform to the ask's own constraints (a `choice`
+      // value must be an option id unless allowOther; a `scale`
+      // value must be in [min,max] on a step; a `rank` must be an
+      // exact permutation of the option ids). Kind-matched-but-
+      // shape-wrong lands as `answer-shape-mismatch`.
+      const shapeIssue = validateAnswerAgainstSpec(ask.spec, event.answer);
+      if (shapeIssue !== undefined) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "answer-shape-mismatch",
+            askId: event.askId,
+            askKind: ask.spec.kind,
+            field: shapeIssue.field,
+            message: `ask.answered: ask '${event.askId}': ${shapeIssue.message}`,
+          },
+        };
+      }
+      ask.status = "answered";
+      return { ok: true };
+    }
+    case "ask.cancelled":
+    case "ask.expired": {
+      const ask = state.asks.get(event.askId);
+      const attempted = event.kind === "ask.cancelled" ? "cancelled" : "expired";
+      if (ask === undefined) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-ask",
+            askId: event.askId,
+            message: `${event.kind}: ask '${event.askId}' does not exist (no prior ask.created).`,
+          },
+        };
+      }
+      if (ask.status !== "pending") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "ask-not-pending",
+            askId: event.askId,
+            currentStatus: ask.status,
+            attempted,
+            message: `${event.kind}: ask '${event.askId}' is '${ask.status}' — a terminal state cannot transition.`,
+          },
+        };
+      }
+      ask.status = attempted === "cancelled" ? "cancelled" : "expired";
       return { ok: true };
     }
     case "thread.reanchored": {
@@ -466,6 +557,158 @@ function unknownThread(threadId: string, eventKind: string): ValidationResult {
       message: `${eventKind}: thread '${threadId}' does not exist — a '${eventKind}' event needs a prior 'comment.created'.`,
     },
   };
+}
+
+/** Cross-check the answer's values against the ask spec's own
+ * constraints, once we already know `answer.kind === spec.kind`
+ * (the earlier discriminant guard). Returns `undefined` on pass,
+ * or `{ field, message }` on failure — the field name is the
+ * dotted path (`"value"`, `"ranking"`) so a client can render the
+ * error against the right widget. The rules mirror what the
+ * `/ask/<id>` UI would already refuse; the validator being the
+ * authority prevents a client-side bypass from writing a
+ * malformed answer to the log.
+ *
+ * Cap for free-form text on `choice`/`scale`/`region`/`review` is
+ * 4096 chars (matches the `note` cap the CLI expects). `text.text`
+ * caps at 65 535 to line up with the HTML `maxLength` the page
+ * renders. */
+export function validateAnswerAgainstSpec(spec: Ask, answer: AskAnswer): { readonly field: string; readonly message: string } | undefined {
+  const CAP_NOTE = 4096;
+  const CAP_TEXT = 65_535;
+  switch (answer.kind) {
+    case "choice": {
+      if (spec.kind !== "choice") return { field: "kind", message: `internal: kind mismatch (${spec.kind} vs ${answer.kind}).` };
+      const allowedIds = new Set(spec.options.map((o) => o.id));
+      const isOtherToken = (value: string): boolean => spec.allowOther === true && value.startsWith("other:");
+      const check = (value: string, path: string): { field: string; message: string } | undefined => {
+        if (value.length > CAP_NOTE) return { field: path, message: `value too long (${value.length} > ${CAP_NOTE}).` };
+        if (allowedIds.has(value)) return undefined;
+        if (isOtherToken(value)) return undefined;
+        return { field: path, message: `value '${value}' is not one of the ask's options (${[...allowedIds].join(", ")})${spec.allowOther === true ? " and does not carry the 'other:' prefix" : " and allowOther is false"}.` };
+      };
+      if (Array.isArray(answer.value)) {
+        if (spec.multi !== true) return { field: "value", message: "spec.multi is false, so `value` must be a single option id, not an array." };
+        if (answer.value.length === 0) return { field: "value", message: "empty array — pick at least one option." };
+        const seen = new Set<string>();
+        for (let i = 0; i < answer.value.length; i++) {
+          const v = answer.value[i]!;
+          if (seen.has(v)) return { field: `value[${i}]`, message: `duplicate option id '${v}'.` };
+          seen.add(v);
+          const issue = check(v, `value[${i}]`);
+          if (issue !== undefined) return issue;
+        }
+      } else {
+        if (spec.multi === true) return { field: "value", message: "spec.multi is true, so `value` must be an array of option ids." };
+        const issue = check(answer.value, "value");
+        if (issue !== undefined) return issue;
+      }
+      if (answer.note !== undefined && answer.note.length > CAP_NOTE) {
+        return { field: "note", message: `note too long (${answer.note.length} > ${CAP_NOTE}).` };
+      }
+      return undefined;
+    }
+    case "rank": {
+      if (spec.kind !== "rank") return { field: "kind", message: `internal: kind mismatch.` };
+      const optionIds = spec.options.map((o) => o.id);
+      const optionSet = new Set(optionIds);
+      if (answer.ranking.length !== optionIds.length) {
+        return { field: "ranking", message: `ranking length ${answer.ranking.length} does not match option count ${optionIds.length}.` };
+      }
+      const seen = new Set<string>();
+      for (let i = 0; i < answer.ranking.length; i++) {
+        const v = answer.ranking[i]!;
+        if (seen.has(v)) return { field: `ranking[${i}]`, message: `duplicate id '${v}' — ranking must be a permutation.` };
+        seen.add(v);
+        if (!optionSet.has(v)) return { field: `ranking[${i}]`, message: `id '${v}' is not one of the ask's options.` };
+      }
+      return undefined;
+    }
+    case "scale": {
+      if (spec.kind !== "scale") return { field: "kind", message: `internal: kind mismatch.` };
+      if (!Number.isFinite(answer.value)) return { field: "value", message: `value must be a finite number.` };
+      // PR #52 round-3 review — tolerance is anchored to `step`
+      // (so whole values cannot slip through: `1e9 + 0.4` on
+      // `0..1e9 step 1` had a diff of 0.4 that the earlier
+      // magnitude-scaled tolerance of ~1 accepted), with an
+      // additional epsilon-of-magnitude floor for the case
+      // where the reconstruction `min + i*step` itself carries
+      // binary-float noise proportional to the values involved
+      // (e.g. `999_999_999.999` on `0..1e9 step 0.001` —
+      // reconstruction accumulates ~3e-6 of double-precision
+      // noise, far above `step * 1e-6` = 1e-9). The two
+      // components together are still bounded by a small
+      // fraction of `step`, so whole-value drift is still
+      // refused. Separately, the integer-step-index bounds
+      // check below refuses `index < 0` or `index > stepsInSpan`
+      // outright.
+      const step = spec.step ?? 1;
+      const rawIndex = (answer.value - spec.min) / step;
+      const index = Math.round(rawIndex);
+      const reconstructed = spec.min + index * step;
+      const magnitude = Math.max(Math.abs(spec.min), Math.abs(spec.max), Math.abs(answer.value));
+      const tolerance = Math.max(
+        Math.abs(step) * 1e-6,
+        magnitude * Number.EPSILON * 16,
+        Number.EPSILON * 8,
+      );
+      if (Math.abs(answer.value - reconstructed) > tolerance) {
+        return { field: "value", message: `value ${answer.value} is not on a step of ${step} from min ${spec.min} (nearest step: ${reconstructed}).` };
+      }
+      // Range check: value must reconstruct into [min, max]. The
+      // integer-step-index bounds check below is the load-bearing
+      // guard; this one names the failure clearly for a value
+      // that landed clean of the step lattice but past the
+      // endpoints.
+      if (answer.value < spec.min - tolerance || answer.value > spec.max + tolerance) {
+        return { field: "value", message: `value ${answer.value} is outside [${spec.min}, ${spec.max}].` };
+      }
+      // Integer-step-index bounds — the definitive check. A
+      // spec that already survived `askSchema` has
+      // `(max - min) / step` as an integer, so `stepsInSpan`
+      // is exact. `index < 0 || index > stepsInSpan` refuses
+      // anything half-a-step past either endpoint that could
+      // otherwise slip through the range check by tolerance.
+      const stepsInSpan = Math.round((spec.max - spec.min) / step);
+      if (index < 0 || index > stepsInSpan) {
+        return { field: "value", message: `value ${answer.value} maps to step index ${index}, outside [0, ${stepsInSpan}].` };
+      }
+      if (answer.note !== undefined && answer.note.length > CAP_NOTE) {
+        return { field: "note", message: `note too long (${answer.note.length} > ${CAP_NOTE}).` };
+      }
+      return undefined;
+    }
+    case "text": {
+      if (spec.kind !== "text") return { field: "kind", message: `internal: kind mismatch.` };
+      if (answer.text.length > CAP_TEXT) return { field: "text", message: `text too long (${answer.text.length} > ${CAP_TEXT}).` };
+      return undefined;
+    }
+    case "region": {
+      if (spec.kind !== "region") return { field: "kind", message: `internal: kind mismatch.` };
+      // `askAnswerSchema` already enforces at least two coords, but
+      // the arity should be even (point = 2, brush = 4, polygon = 2k).
+      if (answer.coordinates.length % 2 !== 0) {
+        return { field: "coordinates", message: `coordinates must have an even length (got ${answer.coordinates.length}).` };
+      }
+      for (let i = 0; i < answer.coordinates.length; i++) {
+        const c = answer.coordinates[i]!;
+        if (!Number.isFinite(c)) return { field: `coordinates[${i}]`, message: `coordinate must be finite.` };
+      }
+      if (answer.note !== undefined && answer.note.length > CAP_NOTE) {
+        return { field: "note", message: `note too long (${answer.note.length} > ${CAP_NOTE}).` };
+      }
+      return undefined;
+    }
+    case "review": {
+      if (spec.kind !== "review") return { field: "kind", message: `internal: kind mismatch.` };
+      // The discriminated union already restricts `decision` to
+      // the three enum values; nothing further to check.
+      if (answer.note !== undefined && answer.note.length > CAP_NOTE) {
+        return { field: "note", message: `note too long (${answer.note.length} > ${CAP_NOTE}).` };
+      }
+      return undefined;
+    }
+  }
 }
 
 function duplicateComment(commentId: string): ValidationResult {

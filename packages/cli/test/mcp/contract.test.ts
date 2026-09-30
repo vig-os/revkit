@@ -171,12 +171,27 @@ describe("revkit mcp — channel + tools contract", () => {
     await tearDown(ctx);
   });
 
-  test("tools/list advertises threads, reply, resolve with expected shape", async () => {
+  test("tools/list advertises threads, reply, resolve, review_url, ask, await_answer with expected shape", async () => {
     const listing = await ctx.client.listTools();
     const names = listing.tools.map((t) => t.name).sort();
-    // M2 item 6 (delivery modes + presence): the `mode` and
-    // `presence` tools joined the listing.
-    expect(names).toEqual(["mode", "presence", "reply", "resolve", "review_url", "threads"]);
+    // M2 item 6 (delivery modes + presence) + M2 item 7 (asks):
+    // `mode`, `presence`, `ask`, `await_answer` joined the listing.
+    expect(names).toEqual([
+      "ask",
+      "await_answer",
+      "mode",
+      "presence",
+      "reply",
+      "resolve",
+      "review_url",
+      "threads",
+    ]);
+    const ask = listing.tools.find((t) => t.name === "ask");
+    expect(ask?.inputSchema.required).toEqual(["spec"]);
+    expect(ask?.inputSchema.additionalProperties).toBe(false);
+    const awaitAnswer = listing.tools.find((t) => t.name === "await_answer");
+    expect(awaitAnswer?.inputSchema.required).toEqual(["id"]);
+    expect(awaitAnswer?.inputSchema.additionalProperties).toBe(false);
     const reply = listing.tools.find((t) => t.name === "reply");
     expect(reply?.inputSchema.required).toEqual(["thread_id", "parent_id", "body"]);
     const threads = listing.tools.find((t) => t.name === "threads");

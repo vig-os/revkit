@@ -75,6 +75,21 @@ describe("no-hand-rolled-ui — UI-shaped files", () => {
     expect(checkNoHandRolledUiFile("packages/cli/test/foo.test.jsx")).toEqual([]);
     expect(checkNoHandRolledUiFile("site/src/lib/render-plot.test.ts")).toEqual([]);
   });
+
+  test("the two narrow exempt UI files (rail + ask-page) are allowed by exact path only", () => {
+    // These two are the only .tsx files outside `UI_ALLOWED_PREFIXES`
+    // the rule steps aside for — the daemon-served overlays.
+    expect(checkNoHandRolledUiFile("packages/cli/src/rail/rail.tsx")).toEqual([]);
+    expect(checkNoHandRolledUiFile("packages/cli/src/ask-page/ask-page.tsx")).toEqual([]);
+    // A sibling .tsx under the same dirs is NOT exempt — the
+    // whole-file allowlist would let a future commit sneak
+    // hand-rolled UI in next to the allowed file. This is the
+    // narrow-carveout property the rule doc promises.
+    const asSibling = checkNoHandRolledUiFile("packages/cli/src/rail/rail-extra.tsx");
+    expect(asSibling).toHaveLength(1);
+    const asSibling2 = checkNoHandRolledUiFile("packages/cli/src/ask-page/other-widget.tsx");
+    expect(asSibling2).toHaveLength(1);
+  });
 });
 
 describe("no-hand-rolled-ui — code modules in content directories", () => {
