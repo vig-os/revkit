@@ -49,7 +49,7 @@ import {
 } from "./auth.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
-import { removeServeState, writeServeState, type ServeState } from "./serve-state.ts";
+import { acquireAndPublish, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
 import {
   createThreadRequestSchema,
@@ -144,24 +144,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
   const requestedPort = options.port ?? 0;
 
-  // Make sure `.revkit/` exists before opening the sqlite file —
-  // `bun:sqlite` creates the file but not the parent directory, and
-  // `writeServeState` (below) also assumes the directory is there.
-  // Directory mode is 0700 so a curious peer user cannot list the
-  // sqlite / cookie files; the sqlite file itself is chmodded to
-  // 0600 alongside its WAL sidecars.
+  // `.revkit/` mode is owned by `acquireAndPublish` / `writeServeState`
+  // (see serve-state.ts) — it does the mkdir+chmod so both the sqlite
+  // and the state file land in a 0700 dir. Historically the daemon
+  // did it too; the duplicate was flagged in round 3 as "two owners
+  // for the same setting" — one owner (serve-state) does it now.
   const sqlitePath = options.sqlitePath ?? `${options.repoRoot}/.revkit/threads.sqlite`;
   if (sqlitePath !== ":memory:") {
     mkdirSync(dirname(sqlitePath), { recursive: true, mode: 0o700 });
-    // Re-chmod: on an existing `.revkit/` mkdir won't downgrade the
-    // mode, and umask-clamped creation may have missed the setuid-off
-    // bits on odd filesystems. Force 0700.
-    try {
-      chmodSync(dirname(sqlitePath), 0o700);
-    } catch {
-      // A caller-supplied dir may be a symlink chain we cannot
-      // chmod; not fatal.
-    }
   }
   const store = SqliteThreadStore.open({
     filename: sqlitePath,
@@ -294,11 +284,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const boundUrl = `http://127.0.0.1:${port}`;
   const launchUrl = `${boundUrl}/-/auth?code=${launchCode}`;
 
-  // Per-start instance id, echoed by `GET /-/health` so a probe can
-  // tell whether the port answers as THIS daemon (or a foreign
-  // process that reclaimed the pid + port pair).
+  // Per-start opaque id, echoed by `GET /-/health` so a client can
+  // confirm the port answers as THIS daemon, and required by
+  // `serve.json`'s ownership check on shutdown.
   const instanceId = mintToken();
-  const state: ServeState & { readonly instanceId: string } = {
+  const state: ServeState = {
     pid: process.pid,
     port,
     url: boundUrl,
@@ -307,42 +297,26 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     version: options.version,
     instanceId,
   };
-  const writeResult = await writeServeState(options.repoRoot, state, {
-    probeDaemon: async (existing) => {
-      // Fetch `/-/health` on the existing daemon's URL. If the
-      // response's instanceId matches the file's, we treat it as
-      // ours (should not happen — we would still be running); if it
-      // does not answer, or answers something else, treat as "other"
-      // so the state file is replaced.
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 500);
-        try {
-          const r = await fetch(existing.url + "/-/health", {
-            headers: { host: `127.0.0.1:${existing.port}` },
-            signal: controller.signal,
-          });
-          if (!r.ok) return "other";
-          const body = (await r.json()) as { instanceId?: unknown };
-          if (typeof body.instanceId === "string" && body.instanceId.length > 0) return "revkit";
-          return "other";
-        } finally {
-          clearTimeout(timer);
-        }
-      } catch {
-        return "other";
-      }
-    },
-  });
-  if (!writeResult.ok) {
-    // Another daemon owns the file — release our own port and refuse.
+  // `acquireAndPublish` (serve-state.ts) tries to take the OS-held
+  // lock on `.revkit/daemon.lock` and, on success, atomically
+  // writes serve.json. The lock is the single source of truth for
+  // "is another daemon running" — it is fcntl-based and the kernel
+  // releases it only on process exit, so a SIGSTOPped or hung
+  // daemon still holds it. The returned `release()` cleans up the
+  // state file (only if the on-disk `instanceId` still matches
+  // ours) and drops the lock.
+  const publish = acquireAndPublish(options.repoRoot, state);
+  if (publish.kind === "already-running") {
     server.stop(true);
     store.close();
     staticServer.close();
-    const existing = writeResult.refused.state;
+    const existing = publish.state;
+    const where = existing !== undefined
+      ? `pid ${existing.pid}, ${existing.url}`
+      : "no advertisement on disk";
     throw new Error(
-      `revkit serve: another daemon is running (pid ${existing.pid}, ${existing.url}). ` +
-        `Stop it, or wait for it to release '.revkit/serve.json'.`,
+      `revkit serve: another daemon holds .revkit/daemon.lock (${where}). ` +
+        `Stop it, then retry.`,
     );
   }
 
@@ -404,7 +378,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
       store.close();
       staticServer.close();
-      removeServeState(options.repoRoot);
+      // `publish.release()` does the ownership-checked unlink of
+      // serve.json AND drops the OS-held lock. If a racing daemon
+      // took over serve.json (impossible while we hold the lock,
+      // but defensive), the release refuses to delete their file.
+      publish.release();
       for (const { signal, handler } of signalHandlersInstalled) {
         process.off(signal, handler);
       }

@@ -1,45 +1,58 @@
-// `.revkit/serve.json` — the state file the daemon writes at startup
-// and removes on clean shutdown (DESIGN-0001 §5, ADR-0013).
+// `.revkit/serve.json` — advertisement only (round 3, PR #36).
+//
+// The daemon's identity and mutual-exclusion guarantee live in
+// `.revkit/daemon.lock` — an OS-held `flock(2)` LOCK_EX held for the
+// process's lifetime (see `daemon-lock.ts`). `serve.json` is what
+// this file is now: a small JSON record advertising the running
+// daemon's `port`, `url`, `agentToken`, `startedAt`, `version` and
+// per-start `instanceId` for consumers (`revkit mcp`, later, and
+// tests) that need to find the daemon.
 //
 // Fields (`ServeState`):
-//   pid        — the daemon's process id; a stale file (dead pid) is
-//                detected on next start and replaced.
+//   pid        — the daemon's process id (advisory; the lock is what
+//                actually mediates single-instance).
 //   port       — the loopback port the daemon bound to.
 //   url        — `http://127.0.0.1:<port>` for convenience.
-//   agentToken — the bearer token the MCP client / channel presents on
-//                `/api/*` and `/events?for=agent`.
-//   startedAt  — ISO-8601 with offset (start-of-serve timestamp; a
-//                staleness diagnostic).
+//   agentToken — the bearer token the MCP client / channel presents
+//                on `/api/*` and `/events?for=agent`.
+//   startedAt  — ISO-8601 with offset (start-of-serve timestamp).
 //   version    — the daemon's own version string (revkit `VERSION`).
+//   instanceId — per-start opaque random id. Round-3 removeServeState
+//                refuses to delete the file unless its recorded
+//                `instanceId` matches ours, so daemon A's shutdown
+//                cannot delete daemon B's file after a stale-file
+//                takeover (the corner case the round-3 review
+//                reproduced with SIGSTOP + probe misclassification).
 //
-// **Mode 600.** The file carries a token. Write path:
-//   1. `open(tmpPath, O_WRONLY|O_CREAT|O_EXCL, 0600)`
-//   2. write JSON, fsync, close
-//   3. rename(tmpPath, finalPath)
-// This is atomic on POSIX (rename within the same directory) and gives
-// the final file the 0600 mode from the moment it exists. The tempfile
-// carries a random suffix so two daemons cannot collide on it.
+// **Mode 600.** The file carries the agent token. Write path:
+//   1. `openSync(tmp, "wx", 0o600)` (O_EXCL create at mode 0600)
+//   2. writeSync + fsyncSync + closeSync
+//   3. `chmodSync(tmp, 0o600)` (in case the umask clamped the mode)
+//   4. `renameSync(tmp, final)` — atomic rename within the same
+//      directory. Any consumer that opens `serve.json` either sees
+//      the old fully-written file or the new fully-written file,
+//      never a partial write.
 //
-// **Stale detection.** On startup, if `.revkit/serve.json` exists and
-// its `pid` process is alive AND belongs to the current user AND that
-// pid was not the daemon before (checked by re-reading after acquiring
-// the fs write intent), the daemon refuses to start (another daemon is
-// running). Otherwise the file is replaced.
+// A restart that finds an existing `serve.json` treats it as stale
+// whenever the daemon-lock is free (or its content is unparsable /
+// missing fields) — the lock is the source of truth, so no port
+// probe / pid check is needed.
 
 import {
   chmodSync,
   closeSync,
   existsSync,
   fsyncSync,
-  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { acquireDaemonLock } from "./daemon-lock.ts";
 
 /** The wire shape of `.revkit/serve.json`. */
 export interface ServeState {
@@ -49,36 +62,38 @@ export interface ServeState {
   readonly agentToken: string;
   readonly startedAt: string;
   readonly version: string;
-  /** Per-start random id, echoed by `GET /-/health` so a subsequent
-   * launch can tell whether the port answers as THIS daemon or as a
-   * foreign process that happened to reclaim the pid + port. Optional
-   * on the wire so an older `serve.json` still parses. */
+  /** Per-start opaque id echoed by `GET /-/health` and required by
+   * `removeServeState` for the ownership check. Optional on the
+   * wire so an older `serve.json` still parses; when missing,
+   * `removeServeState` refuses to delete (a file without an
+   * instanceId cannot be proved ours). */
   readonly instanceId?: string;
 }
 
 /** Filename constants. Kept here so a rename lands in one place. */
 export const SERVE_STATE_DIR = ".revkit";
 export const SERVE_STATE_FILE = "serve.json";
+export const DAEMON_LOCK_FILE = "daemon.lock";
 
 /** Absolute path to `.revkit/serve.json` under `repoRoot`. */
 export function serveStatePath(repoRoot: string): string {
   return join(repoRoot, SERVE_STATE_DIR, SERVE_STATE_FILE);
 }
 
-/** Outcome of `readServeState`. `missing` when the file does not
- * exist; `unparsable` when the file exists but is malformed
- * (truncated, empty, missing fields, not JSON). The caller decides
- * whether to treat unparsable as stale — see `writeServeState`. */
+/** Absolute path to `.revkit/daemon.lock` under `repoRoot`. */
+export function daemonLockPath(repoRoot: string): string {
+  return join(repoRoot, SERVE_STATE_DIR, DAEMON_LOCK_FILE);
+}
+
+/** Outcome of `readServeStateVerbose`. `missing` when the file
+ * does not exist; `unparsable` when the file exists but is malformed
+ * (truncated, empty, missing fields, not JSON). */
 export type ReadOutcome =
   | { kind: "ok"; state: ServeState }
   | { kind: "missing" }
   | { kind: "unparsable"; reason: string };
 
-/** Try to read the current state file. Returns a typed outcome so a
- * caller can distinguish "no file" from "file present but broken";
- * the previous `throw on parse error` behaviour blocked every restart
- * after a crash that left a truncated file behind, and turned into a
- * bare `JSON Parse error` on the console. */
+/** Read the state file and return a typed outcome. */
 export function readServeStateVerbose(repoRoot: string): ReadOutcome {
   const path = serveStatePath(repoRoot);
   if (!existsSync(path)) return { kind: "missing" };
@@ -125,28 +140,10 @@ export function readServeStateVerbose(repoRoot: string): ReadOutcome {
   };
 }
 
-/** Back-compat wrapper for callers that only want the parsed state and
- * `undefined` for either "missing" or "unparsable". Preserved so a
- * test / caller that predates `readServeStateVerbose` still works;
- * new code should use the verbose form for stale-detection paths. */
+/** Convenience wrapper: undefined for either missing or unparsable. */
 export function readServeState(repoRoot: string): ServeState | undefined {
   const outcome = readServeStateVerbose(repoRoot);
   return outcome.kind === "ok" ? outcome.state : undefined;
-}
-
-/** Is the given pid a live process? Uses `kill(pid, 0)` — throws
- * ESRCH if the process does not exist, EPERM if it exists but is
- * owned by another user (still "alive" for our purpose). */
-export function isPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "EPERM") return true;
-    return false;
-  }
 }
 
 /** Reason `writeServeState` refused to write. `state` is the existing
@@ -155,169 +152,111 @@ export function isPidAlive(pid: number): boolean {
  * user wants). */
 export interface WriteRefused {
   readonly kind: "already-running";
-  readonly state: ServeState;
+  readonly state: ServeState | undefined;
 }
 
-/** Options for `writeServeState`. `probeDaemon` is an escape hatch a
- * caller injects to distinguish a reused pid (another program that
- * happened to reclaim the number, or a live daemon whose port fell
- * over) from a real live daemon that still owns `serve.json`. Return
- * `"revkit"` when the port answers as our daemon and `"other"` when
- * the port answers something else or nothing at all. Default: assume
- * a live pid IS a live daemon (conservative — refuse the second
- * start). */
-export interface WriteServeStateOptions {
-  readonly probeDaemon?: (state: ServeState) => Promise<"revkit" | "other">;
-}
-
-/** Try to write the state atomically at mode 600. Refuses if a live
- * daemon already owns the file (`already-running`). Replaces a stale
- * file (dead pid, empty, truncated, unparsable, or a live pid whose
- * port does not respond as our daemon) without asking.
+/** Write `state` to `.revkit/serve.json` atomically at mode 0600.
  *
- * **Atomicity via link().** A temp file is created at mode 0600,
- * fsync'd, then `linkSync` moved to the final name. `link` fails
- * with EEXIST if the final name already exists, giving the same
- * mutual exclusion as O_EXCL create, and the temp file is fully
- * written before it ever appears at the final name. This closes the
- * round-2 nit: a crash between `openSync(..., "wx")` and `writeSync`
- * used to leave an empty `serve.json` behind and block every
- * restart with a bare `JSON Parse error`. With link(), the final
- * name only ever holds a fully-written record.
+ * **Precondition**: the caller MUST hold `.revkit/daemon.lock` via
+ * `acquireDaemonLock` (see `daemon-lock.ts`). The lock is the source
+ * of truth for single-instance; this function is unconditional
+ * because the lock has already excluded any peer.
  *
- * **Stale detection.** An existing file is stale when:
- *   1. its pid is dead;
- *   2. its content is empty / truncated / unparsable AND
- *      `probeDaemon` confirms the recorded port does not answer as
- *      our daemon (defence against a truncated file left behind by
- *      a live daemon: refuse rather than steal);
- *   3. its pid is alive but `probeDaemon` returns `"other"` (a
- *      reused pid, or a wedged daemon whose HTTP surface is down).
- * A stale file is unlinked and the link retry succeeds; a live one
- * refuses the second start. */
-export async function writeServeState(
-  repoRoot: string,
-  state: ServeState,
-  options: WriteServeStateOptions = {},
-): Promise<{ ok: true } | { ok: false; refused: WriteRefused }> {
+ * Atomicity: tmp file (O_EXCL create at 0600) → write → fsync →
+ * close → chmod 0600 (defence against umask clamping) → rename.
+ * Rename is atomic on POSIX within the same directory. Any partial
+ * state on a crash lives in the tmp file, which we leave for the
+ * next start to notice / ignore. */
+export function writeServeState(repoRoot: string, state: ServeState): void {
   const path = serveStatePath(repoRoot);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const tmpSuffix = randomBytes(6).toString("hex");
+  const tmpPath = `${path}.${tmpSuffix}.tmp`;
+  const fd = openSync(tmpPath, "wx", 0o600);
   try {
-    chmodSync(dirname(path), 0o700);
-  } catch {
-    // Not fatal — a caller-supplied dir may not be chmod-able.
+    const payload = JSON.stringify(state, null, 2) + "\n";
+    writeSync(fd, payload);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
+  chmodSync(tmpPath, 0o600);
+  renameSync(tmpPath, path);
+}
 
-  const linkWithTemp = (): { ok: true } | { ok: false; code: string } => {
-    const tmpSuffix = randomBytes(6).toString("hex");
-    const tmpPath = `${path}.${tmpSuffix}.tmp`;
-    let fd: number;
-    try {
-      fd = openSync(tmpPath, "wx", 0o600);
-    } catch (error) {
-      // A duplicate suffix is astronomically unlikely (48 random
-      // bits); still surface it cleanly.
-      return { ok: false, code: (error as NodeJS.ErrnoException).code ?? "TMP_OPEN" };
-    }
-    try {
-      const payload = JSON.stringify(state, null, 2) + "\n";
-      writeSync(fd, payload);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    // Force 0o600 in case the umask clamped the create mode.
-    chmodSync(tmpPath, 0o600);
-    try {
-      linkSync(tmpPath, path);
-    } catch (error) {
-      // Clean up the tmp file whether the link succeeded or not.
-      try { unlinkSync(tmpPath); } catch { /* already unlinked */ }
-      return { ok: false, code: (error as NodeJS.ErrnoException).code ?? "LINK" };
-    }
-    // Link succeeded — the tmp file's ID is now at two paths; unlink
-    // the tmp path so we do not leak.
-    try { unlinkSync(tmpPath); } catch { /* fine */ }
-    return { ok: true };
-  };
+/** Reason a caller tried to start but the lock was already held. */
+export interface StaleFileClaim {
+  readonly stateFile: ServeState | undefined;
+  readonly reason: string;
+}
 
-  const firstAttempt = linkWithTemp();
-  if (firstAttempt.ok) return { ok: true };
-  if (firstAttempt.code !== "EEXIST") {
-    throw new Error(`writeServeState: unexpected error creating ${path}: ${firstAttempt.code}`);
-  }
+/** Try to acquire the daemon lock and (once acquired) publish
+ * `state` to `serve.json`. Returns `{ ok: true, release }` where
+ * `release` un-locks + removes the state file (only if it still
+ * carries our `instanceId`); returns `{ ok: false, refused }` when
+ * another daemon holds the lock, with the existing state advertised
+ * on disk (which may be stale — the caller decides).
+ *
+ * Callers keep the returned `release` alive for the daemon's
+ * lifetime. On process exit (including SIGKILL), the OS releases
+ * the lock; `serve.json` stays behind and is treated as stale on
+ * the next start. */
+export interface AcquiredDaemon {
+  readonly kind: "ok";
+  release(): void;
+}
+export interface RefusedDaemon {
+  readonly kind: "already-running";
+  readonly state: ServeState | undefined;
+  readonly reason: string;
+}
 
-  // File exists — decide whose.
-  const outcome = readServeStateVerbose(repoRoot);
-  if (outcome.kind === "ok") {
-    const existing = outcome.state;
-    const pidAlive = existing.pid !== state.pid && isPidAlive(existing.pid);
-    if (pidAlive) {
-      // A live pid could be a real daemon or a reclaimed pid. Ask
-      // the probe: does the recorded port answer as ours? If yes,
-      // refuse. If it answers as something else (or not at all),
-      // treat as stale.
-      const probe = options.probeDaemon;
-      if (probe === undefined) return { ok: false, refused: { kind: "already-running", state: existing } };
-      let probeResult: "revkit" | "other";
-      try {
-        probeResult = await probe(existing);
-      } catch {
-        // A probe that throws is inconclusive — treat as live
-        // (conservative refuse).
-        return { ok: false, refused: { kind: "already-running", state: existing } };
-      }
-      if (probeResult === "revkit") {
-        return { ok: false, refused: { kind: "already-running", state: existing } };
-      }
-      // Reused-pid or wedged daemon — treat as stale.
-    }
-    // Stale (dead pid or reused pid). Fall through to the unlink +
-    // retry path below.
-  } else if (outcome.kind === "unparsable") {
-    // A truncated / empty / non-JSON file. If the recorded port on
-    // disk can't be trusted, fall back on "if we cannot read it,
-    // treat as stale". A concurrent live daemon that wrote such a
-    // file did so between open and write of THIS PR's O_EXCL path
-    // — which we replaced with link(); the new path never leaves
-    // that shape. Unparsable → stale.
-    // (`outcome.reason` is included in the removal log the daemon
-    // emits above via writeServeState's return value.)
-  }
-
-  // Stale (or a leftover from our own crashed prior run). Unlink and
-  // retry the link ONCE — if another racing daemon beats us to it,
-  // we report them as already-running.
-  try {
-    unlinkSync(path);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") throw error;
-  }
-  const secondAttempt = linkWithTemp();
-  if (secondAttempt.ok) return { ok: true };
-  if (secondAttempt.code !== "EEXIST") {
-    throw new Error(`writeServeState: unexpected error creating ${path}: ${secondAttempt.code}`);
-  }
-  const raced = readServeState(repoRoot);
-  return {
-    ok: false,
-    refused: {
+export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
+  const lockPath = daemonLockPath(repoRoot);
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  const lock = acquireDaemonLock(lockPath);
+  if (lock === null) {
+    return {
       kind: "already-running",
-      state: raced ?? {
-        pid: -1,
-        port: 0,
-        url: "",
-        agentToken: "",
-        startedAt: "",
-        version: "",
-      },
+      state: readServeState(repoRoot),
+      reason: "another revkit daemon holds .revkit/daemon.lock",
+    };
+  }
+  // We have the lock. Any existing `serve.json` is stale (an
+  // exited-uncleanly daemon left it behind). Overwrite it.
+  writeServeState(repoRoot, state);
+  let released = false;
+  return {
+    kind: "ok",
+    release(): void {
+      if (released) return;
+      released = true;
+      // Only remove `serve.json` if it still carries OUR
+      // instanceId. A racing daemon could conceivably have taken
+      // over during our shutdown; do not delete their advertisement.
+      const current = readServeStateVerbose(repoRoot);
+      if (
+        current.kind === "ok" &&
+        current.state.instanceId !== undefined &&
+        state.instanceId !== undefined &&
+        current.state.instanceId === state.instanceId
+      ) {
+        try {
+          unlinkSync(serveStatePath(repoRoot));
+        } catch {
+          // Fine if it is already gone.
+        }
+      }
+      lock.release();
     },
   };
 }
 
-/** Remove the state file. Idempotent — a shutdown path calls this even
- * if the file was never written (aborted start). */
+/** Remove `.revkit/serve.json` unconditionally. Kept for
+ * back-compatibility with tests and for shutdown paths that never
+ * acquired the lock (a startup abort). Callers that ran through
+ * `acquireAndPublish` MUST use its `release()` instead so the
+ * ownership check applies. */
 export function removeServeState(repoRoot: string): void {
   const path = serveStatePath(repoRoot);
   try {
@@ -327,4 +266,23 @@ export function removeServeState(repoRoot: string): void {
     if (code === "ENOENT") return;
     throw error;
   }
+}
+
+/** Consumer helper: find a running daemon by checking the lock. If
+ * the lock is free, the state file — even if it exists — is stale.
+ * Kept small so `revkit mcp` and other clients can import one
+ * function to answer "is the daemon up, and if so where". */
+export function findRunningDaemon(repoRoot: string): ServeState | undefined {
+  const lockPath = daemonLockPath(repoRoot);
+  if (!existsSync(lockPath)) return undefined;
+  // Probe: can we acquire the lock? If yes, no daemon owns it —
+  // release immediately and report undefined (any serve.json is
+  // stale). If no (SQLITE_BUSY-shape / null), a daemon owns it.
+  const attempt = acquireDaemonLock(lockPath);
+  if (attempt !== null) {
+    attempt.release();
+    return undefined;
+  }
+  // Lock is held by someone. Return the advertisement.
+  return readServeState(repoRoot);
 }

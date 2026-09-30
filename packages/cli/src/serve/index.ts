@@ -6,11 +6,15 @@
 export { startDaemon, type DaemonHandle, type StartDaemonOptions } from "./daemon.ts";
 export { runServeCommand } from "./cli.ts";
 export {
-  serveStatePath,
+  acquireAndPublish,
+  daemonLockPath,
+  findRunningDaemon,
   readServeState,
-  writeServeState,
+  readServeStateVerbose,
   removeServeState,
-  isPidAlive,
+  serveStatePath,
+  writeServeState,
   type ServeState,
 } from "./serve-state.ts";
+export { acquireDaemonLock, type DaemonLock } from "./daemon-lock.ts";
 export { SqliteThreadStore, type SqliteThreadStoreOptions } from "./sqlite-store.ts";

@@ -179,6 +179,28 @@ describe("revkit serve — security", () => {
     }
   });
 
+  test("refuses a request with a matching Origin but Sec-Fetch-Site: same-site", async () => {
+    // Round-3 survivor: the "Origin present" branch previously only
+    // returned early on `sfs === "same-origin"`, but did not refuse
+    // a mismatched-but-present sfs. A page on the same site but a
+    // different port sends Origin=<port>+Sec-Fetch-Site=same-site.
+    // Mutation: drop the `sfs !== "same-origin"` check → this test
+    // flips 403 → 200.
+    const ctx = await startCtx();
+    try {
+      const response = await fetch(ctx.handle.url + "/api/threads", {
+        headers: loopbackHeaders(ctx.handle.port, {
+          authorization: `Bearer ${ctx.handle.agentToken}`,
+          "sec-fetch-site": "same-site",
+        }),
+      });
+      expect(response.status).toBe(403);
+    } finally {
+      await ctx.handle.stop();
+      rmSync(ctx.root, { recursive: true, force: true });
+    }
+  });
+
   test("refuses a POST with Sec-Fetch-Site: cross-site", async () => {
     const ctx = await startCtx();
     try {
