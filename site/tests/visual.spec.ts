@@ -81,16 +81,20 @@ const GLOBAL_MASK_SELECTORS = [
   "site-search button[data-open-modal]",
 ];
 
-/** Page-specific mask selectors. Every ADR and DESIGN doc body renders
- * a `- Date: YYYY-MM-DD` line as an `<li>` at the top of the page
+/** Page-specific mask selectors. Every ADR body renders a
+ * `- Date: YYYY-MM-DD` line as an `<li>` at the top of the page
  * (verified against `dist/adr/0001-.../index.html`). Masking that
  * one line only — not the whole first paragraph — keeps the
  * surrounding structure in the baseline. `:has-text(...)` is
  * Playwright's engine extension for locators, not a CSS selector, so
- * pass through `page.locator(...)` (which `mask` accepts). */
+ * pass through `page.locator(...)` (which `mask` accepts).
+ *
+ * DESIGN-0001 has no equivalent `Date:` line in its body — verified:
+ * `grep -c "Date:" dist/designs/design-0001-.../index.html` is 0. No
+ * entry needed. (PR #31 review round 2 dropped a stale `design` mask
+ * that matched nothing.) */
 const PAGE_MASK_SELECTORS: Record<string, readonly string[]> = {
   adr: ["main li:has-text('Date:')"],
-  design: ["main li:has-text('Date:')"],
 };
 
 for (const pageCase of PAGES) {
