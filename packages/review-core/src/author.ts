@@ -8,15 +8,24 @@ import { z } from "zod";
 
 /** The kinds of actor an event or a mention may reference (ADR-0011). Kept
  * as a const tuple so the Zod enum, TypeScript type and any downstream
- * consumer iterate the same list. */
-export const authorKinds = ["gh-user", "guest", "team", "role", "agent"] as const;
+ * consumer iterate the same list.
+ *
+ * `local` is the M2 daemon's own human session (`revkit serve` on
+ * loopback, ADR-0013): a human comes in through the launch-code cookie
+ * with no hosted identity, no invite and no gh token yet (that lives on
+ * the M3 local PR review surface, ADR-0025). Its `id` is opaque to the
+ * daemon — an install-scoped user tag written by the CLI — so a
+ * rename or a machine move never invalidates old comments. */
+export const authorKinds = ["gh-user", "local", "guest", "team", "role", "agent"] as const;
 export type AuthorKind = (typeof authorKinds)[number];
 
 /** Author of an event — a typed mention with an id and an optional display
  * name. `id` is the surface-appropriate identifier: a GitHub login for
  * `gh-user`, an org/team slug for `team`, one of the fixed role names for
  * `role` ("author" | "reviewers" | "owners"), a guest invite id for
- * `guest`, or the agent's registered channel name for `agent`. */
+ * `guest`, the agent's registered channel name for `agent`, or an
+ * install-scoped user tag for `local` (the M2 daemon's loopback
+ * session). */
 export const authorSchema = z
   .object({
     kind: z.enum(authorKinds),

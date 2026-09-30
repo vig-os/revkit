@@ -37,6 +37,8 @@ export {
 } from "./schema-version.ts";
 export {
   InMemoryThreadStore,
+  matchesFilter,
+  selectThreads,
   ThreadStoreAppendError,
   ThreadStoreImportError,
   type AppendRejection,

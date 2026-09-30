@@ -23,3 +23,15 @@ Mentioning someone without access offers an invite (write access only).
 ## Acceptance (2026-09-29)
 
 - CODEOWNERS is parsed at build time and cached with the site; `@owners` resolves against that snapshot.
+
+## Amendment (2026-09-30)
+
+- The M2 daemon (`revkit serve`, ADR-0013) accepts a human through the launch-code → session-cookie flow with **no
+  hosted identity, no invite and no `gh` token yet** (the `gh` `TokenSource` arrives on the M3 local PR review
+  surface, ADR-0025 surface a). Extend the actor kinds with `local`: the local loopback session's author. Its `id`
+  is an opaque install-scoped tag (written by the CLI to `.revkit/local-user` at mode 600), so a display-name change
+  or a machine move never invalidates old comments — the same durability guarantee the other kinds carry.
+- On the M3 hosted mirror, a `local`-authored comment is posted under **the reviewer's own `gh` identity** through
+  the ADR-0025 GitHub adapter (the daemon holds the `gh auth token` in memory, ADR-0013 / ADR-0014). The mirrored
+  comment shows the reviewer's login on GitHub; the `local` kind is only how the local log records the actor for
+  events that never leave loopback.
