@@ -18,5 +18,17 @@
 packages/cli/src/dist-check-allowlist.json     @gerchowl
 packages/cli/src/rules/frontmatter.ts          @gerchowl
 packages/cli/src/rules/component-registry.ts   @gerchowl
+packages/cli/src/rules/vendored-code.ts        @gerchowl
 packages/cli/src/url-scheme.ts                 @gerchowl
 packages/cli/src/check-dist.ts                 @gerchowl
+
+# Vendored third-party source (ADR-0022). Every LICENSE / UPSTREAM /
+# source drop here is the maintainer's manual audit: the
+# `vendored-code` guard enforces the STRUCTURE (UPSTREAM shape,
+# symlink refusal, layout, NOTICE format + SPDX id echoing UPSTREAM)
+# but the LICENSE BYTES are gated by this CODEOWNERS entry — an
+# SPDX-canonical text matcher that admits real upstream LICENSE
+# variance while refusing adversarial appends belongs behind a
+# well-tested library (see the follow-up issue named in PR #30).
+packages/components/vendor/                    @gerchowl
+NOTICE                                         @gerchowl

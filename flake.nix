@@ -250,7 +250,15 @@
                   enable = true;
                   entry = "packages/cli/bin/revkit-check-hook.sh";
                   language = "system";
-                  files = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$";
+                  # Ordinary content extensions PLUS the extensionless
+                  # files the ADR-0022 vendored-code guard reads
+                  # (repo-root `NOTICE`, and every `LICENSE` /
+                  # `UPSTREAM` under `packages/components/vendor/`) —
+                  # so a commit that touches only those still fires
+                  # the hook. CI runs `revkit check --online`
+                  # unconditionally, so this is a local convenience
+                  # rather than the sole gate.
+                  files = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$|(?:^|/)(NOTICE|LICENSE|UPSTREAM)$";
                   pass_filenames = false;
                 };
                 # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged

@@ -38,7 +38,8 @@ Usage:
   revkit escalate "<need>"
 
 Guards (ADR-0005):
-  component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure.
+  component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure,
+  vendored-code (ADR-0022: vendor tree + NOTICE contract).
 
 check-dist is the ADR-0012 output-gate sanitiser: parses every built
 HTML with a real DOM parser and refuses on* attrs, javascript: /

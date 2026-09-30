@@ -58,6 +58,17 @@ export const UI_ALLOWED_PREFIXES: readonly string[] = [
   "site/src/pages/",
 ];
 
+/** Path prefixes this rule steps aside for. Vendored source
+ * (`packages/components/vendor/<pkg>/…`) is governed by the
+ * `vendored-code` rule (ADR-0022) instead: it enforces the LICENSE /
+ * UPSTREAM / NOTICE contract and prevents the vendor tree from being
+ * imported directly (consumers go through the `@revkit/components`
+ * barrel). Applying the UI-directory allowlist here as well would
+ * make the first real drop of upstream `.tsx` files unshippable. */
+const RULE_EXEMPT_PREFIXES: readonly string[] = [
+  "packages/components/vendor/",
+];
+
 /** Path prefixes where a code module is out of place: content is data.
  *
  * `docs/` — top-level repo docs (ADRs, designs, feature matrix).
@@ -136,6 +147,15 @@ function isUnderContentDir(posixRepoRelative: string): boolean {
 export function checkNoHandRolledUiFile(posixRepoRelative: string): Diagnostic[] {
   const ext = extname(posixRepoRelative).toLowerCase();
   const findings: Diagnostic[] = [];
+
+  // Vendored code lives outside this rule's jurisdiction (ADR-0022):
+  // the `vendored-code` rule owns the LICENSE / UPSTREAM / NOTICE
+  // contract, and vendor code is imported only via the components
+  // barrel. Return early so the first real vendored `.tsx` isn't
+  // caught as hand-rolled UI.
+  if (RULE_EXEMPT_PREFIXES.some((prefix) => startsWithCI(posixRepoRelative, prefix))) {
+    return findings;
+  }
 
   // Branch A: component-shaped file outside allowed UI trees.
   if (UI_EXTENSIONS.has(ext) && !isTestFile(posixRepoRelative)) {

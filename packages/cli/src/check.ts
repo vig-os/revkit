@@ -24,6 +24,7 @@ import { checkFrontmatter } from "./rules/frontmatter.ts";
 import { checkLinksFile } from "./rules/links.ts";
 import { checkNoHandRolledUiFile } from "./rules/no-hand-rolled-ui.ts";
 import { checkPlotSpecFile } from "./rules/plot-structure.ts";
+import { checkVendoredCode } from "./rules/vendored-code.ts";
 import type { LoadedVocabEntry } from "./rules/vocabulary.ts";
 import { checkVocabularyFile, loadVocab } from "./rules/vocabulary.ts";
 
@@ -121,12 +122,20 @@ export async function runCheck(
   // 0) Symlinks under content/UI trees — Astro follows them at build,
   //    so refusing at discovery keeps a `docs/evil.md -> /etc/passwd`
   //    kind of link from ever reaching a rendered page (bypass #5).
+  //    A symlink under `packages/components/vendor/` is attributed to
+  //    the `vendored-code` rule instead — that's the guard that owns
+  //    the vendor tree (ADR-0022), so a maintainer chasing the
+  //    diagnostic to its rule finds it there rather than in
+  //    `no-hand-rolled-ui`.
   for (const symlink of symlinks) {
+    const isUnderVendor = symlink.posixPath.startsWith("packages/components/vendor/");
     findings.push({
       file: symlink.posixPath,
       line: 0,
-      rule: "no-hand-rolled-ui",
-      message: "symlink refused (Astro follows symlinks during build; use a copy or a `.md` reference instead).",
+      rule: isUnderVendor ? "vendored-code" : "no-hand-rolled-ui",
+      message: isUnderVendor
+        ? "symlink refused inside packages/components/vendor/ — copy the file or directory in as a real copy (ADR-0022)."
+        : "symlink refused (Astro follows symlinks during build; use a copy or a `.md` reference instead).",
     });
   }
 
@@ -237,6 +246,13 @@ export async function runCheck(
     findings.push(...checkPlotSpecFile(file.absolute, file.relative));
   }
 
+  // 5b) vendored-code (ADR-0022) — one shot per invocation because
+  //     the guard is repo-level (vendor tree ↔ NOTICE), not
+  //     per-file. A commit that only touches NOTICE or a vendored
+  //     LICENSE still fires it (the pre-commit `files` regex
+  //     includes both).
+  findings.push(...checkVendoredCode(repoRoot));
+
   // 6) --online allow-annotation verification. Runs after the offline
   //    pass so an offline failure short-circuits the network calls, and
   //    each `gh api` call happens at most once per issue per run. A bad
@@ -302,4 +318,5 @@ export const CHECK_RULES: readonly string[] = [
   "vocabulary",
   "links",
   "plot-structure",
+  "vendored-code",
 ];
