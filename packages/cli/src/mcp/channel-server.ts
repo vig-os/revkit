@@ -754,8 +754,17 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
           waiter = undefined;
         };
         // Fast path: read the current record. A terminal state that
-        // already landed does not need to wait.
-        const current = await client.getAsk(parsed.data.id);
+        // already landed does not need to wait. PR #52 round-2 review
+        // — if `getAsk` throws, dispose the waiter (and clear its
+        // timer) before re-raising so the tool-call error path does
+        // not leak a timer or an entry in `askWaiters`.
+        let current: unknown;
+        try {
+          current = await client.getAsk(parsed.data.id);
+        } catch (error) {
+          disposeWaiter();
+          throw error;
+        }
         const status = (current as { status?: string } | undefined)?.status;
         if (status === "answered" || status === "cancelled" || status === "expired") {
           disposeWaiter();

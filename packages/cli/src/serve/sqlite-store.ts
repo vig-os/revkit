@@ -123,7 +123,21 @@ export class SqliteThreadStore implements ThreadStore {
   }
 
   /** Open the store, run the schema-up migration, rehydrate the
-   * validator state from the existing events and cache the head. */
+   * validator state from the existing events and cache the head.
+   *
+   * **Replay policy for `answer-shape-mismatch` (PR #52 round-2
+   * review, ADR-0007 amendment).** The M2 item-7 branch tightened
+   * `validateNext` to check ask-answer values against the ask
+   * spec — a change stricter than earlier commits on the same
+   * branch. Any log written by an earlier commit could therefore
+   * carry an `ask.answered` event that fails the new rule. We
+   * **accept** such events on replay: log a warning that names
+   * the ask id, and advance the validator state as if the event
+   * had been accepted (so the ask reaches `answered`, matching
+   * what the reducer would already project). New appends still
+   * run the strict rule via `append()`. Every OTHER rejection
+   * kind (`invalid-shape`, `duplicate-thread`, `unknown-parent`,
+   * …) is still fatal — those signal real log corruption. */
   static open(options: SqliteThreadStoreOptions): SqliteThreadStore {
     const db = new Database(options.filename, { create: true });
     db.exec(SCHEMA_SQL);
@@ -136,10 +150,23 @@ export class SqliteThreadStore implements ThreadStore {
       const event = reviewEventSchema.parse(JSON.parse(row.payload));
       const result = validateNext(state, event);
       if (!result.ok) {
-        // A file on disk that no longer parses is a data-corruption
-        // event, not something to paper over — refusing loudly is the
-        // only safe move. The daemon prints a stable message that names
-        // the file so the user can archive it and start clean.
+        if (result.rejection.kind === "answer-shape-mismatch" && event.kind === "ask.answered") {
+          // Log and advance state to `answered` — the reducer
+          // already projects the answer, and refusing to start
+          // over a historical answer is worse than accepting
+          // it. Uses stderr since the store has no logger
+          // handle at this call site; the daemon logs the count
+          // once it has a logger.
+          process.stderr.write(
+            `SqliteThreadStore.open: accepting historical ask.answered on ask '${event.askId}' whose value fails the current answer-shape check ` +
+              `(${result.rejection.field}: ${result.rejection.message}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
+          );
+          const ask = state.asks.get(event.askId);
+          if (ask !== undefined) ask.status = "answered";
+          if (event.seq > head) head = event.seq;
+          continue;
+        }
+        // Any other rejection is real corruption — refuse loudly.
         db.close();
         throw new Error(
           `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.displayName ?? options.filename}' and start clean, or restore from backup.`,

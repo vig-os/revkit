@@ -11,6 +11,7 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  askSchema,
   CURRENT_SCHEMA_VERSION,
   emptyLogState,
   InMemoryThreadStore,
@@ -294,6 +295,50 @@ describe("validateAnswerAgainstSpec — answer values must conform to the ask", 
     const issue = validateAnswerAgainstSpec(spec, { kind: "scale", value: 3 });
     expect(issue?.field).toBe("value");
     expect(issue?.message).toContain("not on a step");
+  });
+
+  test("PR #52 round-2 review — scale spec with an off-step span (min=1,max=4,step=2 → span 3) is refused by askSchema", () => {
+    // The reviewer's failure mode: an off-span spec would accept
+    // itself but then reject its own default answer.
+    // askSchema.superRefine catches this at CREATION time; the
+    // daemon's `POST /api/asks` refuses with a Zod-issue 400.
+    const spec = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      kind: "scale",
+      title: "off-step",
+      min: 1,
+      max: 4,
+      step: 2, // span=3 is not a multiple of 2
+    };
+    // Round-trip through the ask schema — a strict `.strict()`
+    // refinement rejects with a message on `step`.
+    const result = askSchema.safeParse(spec);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(JSON.stringify(result.error.issues)).toContain("step");
+  });
+
+  test("PR #52 round-2 review — scale on 1..4 step 1 (odd span): value 2 is accepted, value 2.5 (old midpoint) is refused", () => {
+    // The reviewer's repro: `(1+4)/2 = 2.5` is off-step. The
+    // integer-step-index validator refuses 2.5 with a clear
+    // message and accepts 1, 2, 3, 4.
+    const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 1, max: 4, step: 1 };
+    for (const v of [1, 2, 3, 4]) {
+      expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: v }), `value=${v}`).toBeUndefined();
+    }
+    const bad = validateAnswerAgainstSpec(spec, { kind: "scale", value: 2.5 });
+    expect(bad?.message).toContain("not on a step");
+  });
+
+  test("PR #52 round-2 review — scale tolerance scales with magnitude (999_999_999.999 on 0..1e9 step 0.001 is on-step)", () => {
+    // Large-magnitude scales with a tiny step: binary-float noise
+    // grows with the magnitude, and the earlier `1e-9` tolerance
+    // (unscaled) rejected legitimate answers. The scaled
+    // tolerance accepts values that reconstruct within
+    // proportional noise.
+    const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 0, max: 1_000_000_000, step: 0.001 };
+    // 999_999_999.999 = min + (999_999_999_999 * step) — a valid step.
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 999_999_999.999 })).toBeUndefined();
   });
 
   test("rank: ranking must be an exact permutation of the option ids", () => {

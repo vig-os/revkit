@@ -326,12 +326,33 @@ function renderRank(spec: RankSpec, onAnswer: (a: Answer) => void): JSX.Element 
 }
 
 function renderScale(spec: ScaleSpec, onAnswer: (a: Answer) => void): JSX.Element {
+  // PR #52 round-2 review — position the slider using an INTEGER
+  // step index (0..n), and reconstruct the value as `min + i*step`
+  // on submit. The earlier `(min+max)/2` default was off-step
+  // whenever `(max-min)/step` was odd (e.g. 1..4 with step 1
+  // defaulted to 2.5 and the validator refused the answer). With
+  // an integer index no reconstruction can leave the step
+  // lattice.
+  //
+  // UX: NO preselection — the human must touch the slider before
+  // submit is enabled, so a "default" cannot bias the answer.
+  // The slider still needs a rendered position; we place it at
+  // step index 0 (min) visually and swap in the touched value
+  // only after the first input event.
   const step = spec.step ?? 1;
-  const [value, setValue] = createSignal((spec.min + spec.max) / 2);
+  const stepsInSpan = Math.max(1, Math.round((spec.max - spec.min) / step));
+  const [index, setIndex] = createSignal(0);
+  const [touched, setTouched] = createSignal(false);
   const [note, setNote] = createSignal("");
+  const currentValue = (): number => spec.min + index() * step;
   const submit = (): void => {
+    if (!touched()) return;
     const trimmed = note().trim();
-    onAnswer({ kind: "scale", value: value(), ...(trimmed.length > 0 ? { note: trimmed } : {}) });
+    onAnswer({
+      kind: "scale",
+      value: currentValue(),
+      ...(trimmed.length > 0 ? { note: trimmed } : {}),
+    });
   };
   return (
     <form
@@ -349,13 +370,21 @@ function renderScale(spec: ScaleSpec, onAnswer: (a: Answer) => void): JSX.Elemen
         <input
           id="revkit-ask-scale"
           type="range"
-          min={spec.min}
-          max={spec.max}
-          step={step}
-          value={value()}
-          onInput={(e: InputEvent) => setValue(Number((e.currentTarget as HTMLInputElement).value))}
+          min={0}
+          max={stepsInSpan}
+          step={1}
+          value={index()}
+          data-testid="revkit-ask-scale-input"
+          onInput={(e: InputEvent) => {
+            setIndex(Number.parseInt((e.currentTarget as HTMLInputElement).value, 10));
+            setTouched(true);
+          }}
         />
-        <output aria-live="polite" class="revkit-ask__scale-value">{value()}</output>
+        <output aria-live="polite" class="revkit-ask__scale-value" data-testid="revkit-ask-scale-value">
+          <Show when={touched()} fallback={<span class="revkit-ask__scale-hint">(pick a value)</span>}>
+            {currentValue()}
+          </Show>
+        </output>
       </div>
       <div class="revkit-ask__field">
         <label for="revkit-ask-note">Note (optional):</label>
@@ -367,7 +396,12 @@ function renderScale(spec: ScaleSpec, onAnswer: (a: Answer) => void): JSX.Elemen
           onInput={(e: InputEvent) => setNote((e.currentTarget as HTMLInputElement).value)}
         />
       </div>
-      <button type="submit" class="revkit-ask__submit" data-testid="revkit-ask-submit">
+      <button
+        type="submit"
+        class="revkit-ask__submit"
+        data-testid="revkit-ask-submit"
+        disabled={!touched()}
+      >
         Submit answer
       </button>
     </form>

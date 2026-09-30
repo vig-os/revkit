@@ -1513,23 +1513,30 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           askId,
           errorKind: (error as Error).name,
         });
-        // Best-effort cancel of the just-appended ask so a retry
-        // with a fresh id does not stumble on a half-created one.
-        // (The cancel event may itself fail if the ask was
-        // already terminal-transitioned — swallow, this is a
-        // safety net.)
+        // PR #52 round-2 review — cancel the just-appended ask and
+        // FAN THE EVENT out on `/events` like any other terminal
+        // transition, so `await_answer` waiters and the rail
+        // notice the ask no longer exists. Returns 500 (a
+        // server-side I/O failure — the client's request was
+        // well-formed) rather than a 400 with `path: ["id"]`
+        // (a client shape complaint).
         try {
-          await store.append({
+          const cancelSeq = await store.append({
             kind: "ask.cancelled",
             actor: systemActor,
             askId,
             reason: "file-write-failed",
           });
+          const cancelEvents = await store.since(cancelSeq - 1);
+          const cancelEvent = cancelEvents.find((e) => e.seq === cancelSeq);
+          if (cancelEvent !== undefined) void bus.publish(cancelEvent);
         } catch {
-          // Cancel is best-effort — the ask is still in the log
-          // as pending. The reader path sees it and can retry.
+          // Cancel is best-effort — if it also failed, the ask is
+          // still on the log as pending and a subsequent read
+          // will report it. Not silent: the earlier logger.error
+          // has already reported the I/O failure.
         }
-        return badRequest([{ code: "custom", path: ["id"], message: "ask-file-write-failed" }]);
+        return internalServerError({ error: "ask-file-write-failed" });
       }
       const record = await store.ask(askId);
       return jsonResponse({ ask: record, url: urlPath }, 201);
@@ -1705,6 +1712,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   /** 413 body used by the request-size caps. */
   function payloadTooLarge(): Response {
     const response = new Response(JSON.stringify({ error: "payload-too-large" }), { status: 413 });
+    return withHygiene(response, "json", "application/json; charset=utf-8");
+  }
+
+  /** 500 JSON body used by the ask-create disk-failure path — a
+   * server-side I/O failure, NOT a client shape complaint. Kept
+   * separate from `badRequest` so the error kind never lands
+   * inside a `path: ["id"]` shape a client might parse as
+   * "reject this id and use another one." PR #52 round-2 review. */
+  function internalServerError(body: { readonly error: string }): Response {
+    const response = new Response(JSON.stringify(body), { status: 500 });
     return withHygiene(response, "json", "application/json; charset=utf-8");
   }
 }

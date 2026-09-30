@@ -247,6 +247,63 @@ describe("MCP ask + await_answer", () => {
     expect(elapsed).toBeLessThan(600);
   });
 
+  test("PR #52 round-2 review — if getAsk throws, await_answer disposes the waiter + timer and rethrows", async () => {
+    // Route await_answer through a channel-server wired to a
+    // stub DaemonClient whose `getAsk` throws. If the fix is in
+    // place, the waiter entry the tool registered is removed and
+    // its timer cleared before the throw propagates.
+    const ctx = ctxRef!;
+    // Create a real ask so we have a valid id.
+    const created = parseToolResult(
+      await ctx.client.callTool({ name: "ask", arguments: { spec: choiceSpec } }),
+    );
+    const askId = (created.ask as { id: string }).id;
+    // Point a NEW channel-server at a stub client that always
+    // throws on `getAsk`. The subscriber is a no-op so no events
+    // fire — the only path is `getAsk`.
+    const { InMemoryTransport: TxA } = await import("@modelcontextprotocol/sdk/inMemory.js");
+    const { Client: ClientA } = await import("@modelcontextprotocol/sdk/client/index.js");
+    const { startChannelServer } = await import("../../src/mcp/channel-server.ts");
+    const stubClient = {
+      listThreads: async () => ({ threads: [], head: 0 }),
+      getAsk: async (): Promise<unknown> => { throw new Error("getAsk-throw-under-test"); },
+      createAsk: async () => ({ ask: {}, url: "" }),
+      cancelAsk: async () => ({}),
+      reply: async () => ({}),
+      resolve: async () => ({}),
+      mintLaunchUrl: async () => ({ launchUrl: "http://x/", ttlMs: 0 }),
+    } as unknown as import("../../src/mcp/daemon-client.ts").DaemonClient;
+    const [cTx, sTx] = TxA.createLinkedPair();
+    const stubChannel = await startChannelServer({
+      client: stubClient,
+      url: ctx.daemon.url,
+      agentToken: ctx.daemon.agentToken,
+      transport: sTx,
+      // No-op subscriber — we never fire events; the throw path
+      // is what we're testing.
+      subscribeEvents: () => ({ onEvent: () => {}, close: () => {}, done: Promise.resolve() }),
+    });
+    try {
+      const stubMcp = new ClientA(
+        { name: "revkit-mcp-ask-tools-stub", version: "0.0.0-test" },
+        { capabilities: {} },
+      );
+      await stubMcp.connect(cTx);
+      const result = await stubMcp.callTool({
+        name: "await_answer",
+        arguments: { id: askId, timeout_ms: 500 },
+      });
+      // The tool surfaces the throw as an `isError` result — the
+      // load-bearing assertion is that the tool RETURNS (does not
+      // hang past the timeout) with the expected error text.
+      expect((result as { isError?: boolean }).isError).toBe(true);
+      const text = (result as { content: readonly { text: string }[] }).content[0]!.text;
+      expect(text).toContain("getAsk-throw-under-test");
+    } finally {
+      await stubChannel.stop();
+    }
+  });
+
   test("await_answer returns immediately when the ask is already terminal (fast path)", async () => {
     const ctx = ctxRef!;
     const created = parseToolResult(

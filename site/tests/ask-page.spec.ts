@@ -213,7 +213,7 @@ test.describe("/ask/<id> — six kinds render, answer, and pass axe", () => {
     expect(record.answer).toEqual({ kind: "rank", ranking: ["b", "a", "c"] });
   });
 
-  test("scale: submit the mid-range default", async ({ page }) => {
+  test("scale: submit disabled until the slider is touched; keyboard picks a value on 0..10", async ({ page }) => {
     const { id } = await createAsk(ctx, {
       schemaVersion: 1,
       kind: "scale",
@@ -223,11 +223,76 @@ test.describe("/ask/<id> — six kinds render, answer, and pass axe", () => {
     });
     await openAskPage(ctx, page, id);
     await scanAxeOnRoot(page);
-    await page.locator('[data-testid="revkit-ask-submit"]').click();
+    // PR #52 round-2 review — no preselected default. Submit is
+    // disabled until the slider is touched, and the visible
+    // output reads "(pick a value)" until then.
+    const submit = page.locator('[data-testid="revkit-ask-submit"]');
+    await expect(submit).toBeDisabled();
+    await expect(page.locator('[data-testid="revkit-ask-scale-value"]')).toContainText("pick a value");
+    // Drive the slider from the keyboard — from step 0, arrow-right
+    // three times lands on step 3 (value 3 on `min=0, step=1`).
+    const range = page.locator('[data-testid="revkit-ask-scale-input"]');
+    await range.focus();
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await expect(submit).toBeEnabled();
+    await submit.click();
     await expect(page.locator('[data-testid="revkit-ask-root"]')).toHaveAttribute("data-status", "answered", { timeout: 5000 });
     const record = await readAsk(ctx, id);
     expect(record.status).toBe("answered");
-    expect((record.answer as { value: number }).value).toBe(5);
+    expect((record.answer as { value: number }).value).toBe(3);
+  });
+
+  test("PR #52 round-2 review — scale on 1..4 (odd span, off-step midpoint would be 2.5): default is not preselected, and a submitted value is a valid step", async ({ page }) => {
+    // Repro of the round-2 blocker: `(min+max)/2 = 2.5` is off
+    // the step lattice on `1..4 step 1`, so the old code refused
+    // its own default. With the fix, the default is not
+    // preselected — submit is disabled until touch — and the
+    // integer-step-index representation makes it impossible to
+    // land off the lattice.
+    const { id } = await createAsk(ctx, {
+      schemaVersion: 1,
+      kind: "scale",
+      title: "1..4",
+      min: 1,
+      max: 4,
+      step: 1,
+    });
+    await openAskPage(ctx, page, id);
+    await scanAxeOnRoot(page);
+    await expect(page.locator('[data-testid="revkit-ask-submit"]')).toBeDisabled();
+    // From step 0 (value 1), arrow-right once reaches step 1 (value 2).
+    const range = page.locator('[data-testid="revkit-ask-scale-input"]');
+    await range.focus();
+    await page.keyboard.press("ArrowRight");
+    await expect(page.locator('[data-testid="revkit-ask-submit"]')).toBeEnabled();
+    await page.locator('[data-testid="revkit-ask-submit"]').click();
+    await expect(page.locator('[data-testid="revkit-ask-root"]')).toHaveAttribute("data-status", "answered", { timeout: 5000 });
+    const record = await readAsk(ctx, id);
+    expect((record.answer as { value: number }).value).toBe(2);
+  });
+
+  test("PR #52 round-2 review — scale on 0..9 step 3: only 0, 3, 6, 9 are reachable, and submit lands on a valid step", async ({ page }) => {
+    const { id } = await createAsk(ctx, {
+      schemaVersion: 1,
+      kind: "scale",
+      title: "0..9, step 3",
+      min: 0,
+      max: 9,
+      step: 3,
+    });
+    await openAskPage(ctx, page, id);
+    await scanAxeOnRoot(page);
+    // From step 0 (value 0), two arrow-rights land on step 2 (value 6).
+    const range = page.locator('[data-testid="revkit-ask-scale-input"]');
+    await range.focus();
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowRight");
+    await page.locator('[data-testid="revkit-ask-submit"]').click();
+    await expect(page.locator('[data-testid="revkit-ask-root"]')).toHaveAttribute("data-status", "answered", { timeout: 5000 });
+    const record = await readAsk(ctx, id);
+    expect((record.answer as { value: number }).value).toBe(6);
   });
 
   test("text: type an answer and submit", async ({ page }) => {

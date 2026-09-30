@@ -128,12 +128,36 @@ export const askSchema = z.discriminatedUnion("kind", askVariants).superRefine((
       }
     }
   }
-  if (ask.kind === "scale" && !(ask.min < ask.max)) {
-    ctx.addIssue({
-      code: "custom",
-      path: ["max"],
-      message: `scale: max (${ask.max}) must be greater than min (${ask.min}).`,
-    });
+  if (ask.kind === "scale") {
+    if (!(ask.min < ask.max)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["max"],
+        message: `scale: max (${ask.max}) must be greater than min (${ask.min}).`,
+      });
+      return;
+    }
+    // PR #52 round-2 review — the span (max - min) MUST be an
+    // integer multiple of step. If it isn't, `max` is not itself
+    // a valid answer value on the step lattice, and the slider's
+    // default (min + i * step for the last valid i) is
+    // strictly less than max, which is a UX surprise on top of
+    // the correctness hazard. `(max - min) / step` is checked
+    // with a tolerance scaled to the magnitudes involved so
+    // decimal steps (0.1, 0.001) don't fail on binary-float
+    // representation noise.
+    const step = ask.step ?? 1;
+    const span = ask.max - ask.min;
+    const nRaw = span / step;
+    const n = Math.round(nRaw);
+    const tolerance = 1e-9 * Math.max(1, Math.abs(ask.max), Math.abs(ask.min), Math.abs(span));
+    if (n <= 0 || Math.abs(span - n * step) > tolerance) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["step"],
+        message: `scale: (max - min) = ${span} must be a positive integer multiple of step (${step}); got ${nRaw}.`,
+      });
+    }
   }
 });
 

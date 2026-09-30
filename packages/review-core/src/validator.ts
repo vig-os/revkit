@@ -623,18 +623,39 @@ export function validateAnswerAgainstSpec(spec: Ask, answer: AskAnswer): { reado
     case "scale": {
       if (spec.kind !== "scale") return { field: "kind", message: `internal: kind mismatch.` };
       if (!Number.isFinite(answer.value)) return { field: "value", message: `value must be a finite number.` };
-      if (answer.value < spec.min || answer.value > spec.max) {
+      // PR #52 round-2 review — check via INTEGER step indices,
+      // with a tolerance scaled to the magnitudes involved. The
+      // earlier `(value - min) / step` at fixed `1e-9` tolerance
+      // failed on large-magnitude scales (e.g. 999_999_999.999
+      // on `0..1e9` with step 0.001) because binary-float
+      // representation error grows with the magnitude. The
+      // integer form `i = round((value - min) / step)` +
+      // `reconstructed = min + i*step` isolates the noise to
+      // ONE multiplication + subtraction, and we compare on
+      // the reconstruction (not the ratio).
+      const step = spec.step ?? 1;
+      const rawIndex = (answer.value - spec.min) / step;
+      const index = Math.round(rawIndex);
+      const reconstructed = spec.min + index * step;
+      const tolerance = 1e-9 * Math.max(1, Math.abs(answer.value), Math.abs(spec.min), Math.abs(spec.max));
+      if (Math.abs(answer.value - reconstructed) > tolerance) {
+        return { field: "value", message: `value ${answer.value} is not on a step of ${step} from min ${spec.min} (nearest step: ${reconstructed}).` };
+      }
+      // Range check ALSO uses the same tolerance so a value that
+      // is on-step but at max reconstructs to slightly above max
+      // via binary-float error and is not falsely refused.
+      if (answer.value < spec.min - tolerance || answer.value > spec.max + tolerance) {
         return { field: "value", message: `value ${answer.value} is outside [${spec.min}, ${spec.max}].` };
       }
-      const step = spec.step ?? 1;
-      // Step alignment: `(value - min) / step` should be an integer
-      // within floating-point tolerance. `Number.EPSILON` on a value
-      // in the mid-hundreds is safe; a tolerance of `step * 1e-9`
-      // matches the widget's own precision.
-      const stepsFromMin = (answer.value - spec.min) / step;
-      const roundedSteps = Math.round(stepsFromMin);
-      if (Math.abs(stepsFromMin - roundedSteps) > 1e-9) {
-        return { field: "value", message: `value ${answer.value} is not on a step of ${step} from min ${spec.min}.` };
+      // Bounds on the index (needed too — if value equals max
+      // within tolerance but index rounded to n+1, the range
+      // check above passed but the step index is out of the
+      // valid [0, n] range for a spec that already survived
+      // the `askSchema` (max - min) / step check).
+      const span = spec.max - spec.min;
+      const stepsInSpan = Math.round(span / step);
+      if (index < 0 || index > stepsInSpan) {
+        return { field: "value", message: `value ${answer.value} maps to step ${index}, outside [0, ${stepsInSpan}].` };
       }
       if (answer.note !== undefined && answer.note.length > CAP_NOTE) {
         return { field: "note", message: `note too long (${answer.note.length} > ${CAP_NOTE}).` };
