@@ -13,6 +13,20 @@ State lives in **`.revkit/run/HANDOFF.md`** (gitignored) and on GitHub (mileston
 checklists). Never in conversation memory alone: every chunk ends with a self-compaction, so write down what the next
 iteration needs.
 
+## Starting a run
+
+From the repo root, once per run (the lock makes a second start a no-op, so it is safe on every resume):
+
+```bash
+rm -f .revkit/run/STOP .revkit/run/DONE   # only when the owner starts a new run
+pane=$(flk agent get "$FLOCK_PANE_ID" | jq -er '.result.agent.pane_id // .result.pane_id')
+setsid nohup .claude/skills/revkit_run/watchdog.sh "$pane" \
+  "Watchdog: the revkit run looks stalled. Use the revkit_run skill: check running subagents and open PRs (no duplicates), then continue from .revkit/run/HANDOFF.md." \
+  >/dev/null 2>&1 &
+```
+
+Both scripts log to `.revkit/run/run.log`.
+
 ## One iteration = one chunk
 
 A chunk is one checklist item of the current milestone's tracking issue (e.g. #6 for M1), delivered as one PR into
@@ -32,7 +46,7 @@ A chunk is one checklist item of the current milestone's tracking issue (e.g. #6
    helper **detached** and end the turn:
 
    ```bash
-   pane=$(flk agent get "$FLOCK_PANE_ID" | jq -r '.result.agent.pane_id // .result.pane_id')
+   pane=$(flk agent get "$FLOCK_PANE_ID" | jq -er '.result.agent.pane_id // .result.pane_id')
    setsid nohup .claude/skills/revkit_run/self-compact.sh "$pane" \
      "Keep: revkit unattended run state is in .revkit/run/HANDOFF.md; follow the revkit_run skill." \
      "Continue the revkit run: use the revkit_run skill and .revkit/run/HANDOFF.md for the next chunk." \
@@ -53,7 +67,7 @@ A chunk is one checklist item of the current milestone's tracking issue (e.g. #6
 
 ## Watchdog
 
-`watchdog.sh <pane> <prompt>` runs detached for the whole run and types a nudge when the pane has been idle for
+`watchdog.sh` (started above, one instance per run dir) types a nudge when the pane has been idle for
 45 min (hung subagent, lost notification, usage limit). On a nudge: check running subagents (never spawn a duplicate),
 their branches and PRs, then continue from HANDOFF.md. When the goal is reached or nothing unblocked is left,
 `touch .revkit/run/DONE` so the watchdog exits, then `flk notification`.
