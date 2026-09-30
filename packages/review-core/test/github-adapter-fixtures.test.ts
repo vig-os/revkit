@@ -160,6 +160,9 @@ describe("GitHubAdapter over fixtures — listReviewThreads (GraphQL)", () => {
       expect(typeof t.originalLine).toBe("number");
       expect(t.diffSide).toBe("RIGHT");
       expect(t.comments.length).toBeGreaterThan(0);
+      // The new query captures subjectType and resolvedBy.
+      expect(t.subjectType).toBe("LINE");
+      expect(t.resolvedByLogin).not.toBeNull();
     }
     // Bot-authored comments carry an authorType of `Bot`.
     const bot = threads.find((t) =>
@@ -167,6 +170,109 @@ describe("GitHubAdapter over fixtures — listReviewThreads (GraphQL)", () => {
     );
     expect(bot).toBeDefined();
     expect(bot!.comments[0]!.authorType).toBe("Bot");
+  });
+
+  test("paginates the inner comments connection when a thread has more than one page", async () => {
+    // Mutation guard: if the inner cursor is not advanced (e.g. a
+    // future edit accidentally passes null on every follow-up
+    // request), the fake here refuses the second request. Also
+    // catches "stop after page 1" — the second page is dropped,
+    // so the assertion on comment count goes red.
+    const seenCursors: (string | null)[] = [];
+    let threadPage = 0;
+    const routes: Record<string, (init: RequestInit) => Response> = {
+      [`POST ${DEFAULT_GITHUB_GRAPHQL_URL}`]: (init) => {
+        const body = JSON.parse((init as { body: string }).body) as {
+          query: string;
+          variables: { cursor?: string | null; threadId?: string };
+        };
+        if (/query ReviewThreads/.test(body.query)) {
+          threadPage++;
+          if (threadPage > 1) return json({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
+          return json({
+            data: {
+              repository: {
+                pullRequest: {
+                  reviewThreads: {
+                    pageInfo: { hasNextPage: false, endCursor: null },
+                    nodes: [
+                      {
+                        id: "PRRT_paged",
+                        path: "file.mdx",
+                        isResolved: false,
+                        isOutdated: false,
+                        line: 3,
+                        startLine: null,
+                        originalLine: 3,
+                        originalStartLine: null,
+                        diffSide: "RIGHT",
+                        startDiffSide: null,
+                        subjectType: "LINE",
+                        resolvedBy: null,
+                        comments: {
+                          pageInfo: { hasNextPage: true, endCursor: "cursor-A" },
+                          nodes: [
+                            {
+                              id: "c1",
+                              databaseId: 1,
+                              body: "first",
+                              createdAt: "t1",
+                              url: "u1",
+                              author: { login: "alice", __typename: "User" },
+                            },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          });
+        }
+        // Inner ThreadComments query.
+        seenCursors.push(body.variables.cursor ?? null);
+        if (body.variables.cursor === "cursor-A") {
+          return json({
+            data: {
+              node: {
+                __typename: "PullRequestReviewThread",
+                comments: {
+                  pageInfo: { hasNextPage: true, endCursor: "cursor-B" },
+                  nodes: [
+                    { id: "c2", databaseId: 2, body: "second", createdAt: "t2", url: "u2", author: { login: "bob", __typename: "User" } },
+                  ],
+                },
+              },
+            },
+          });
+        }
+        if (body.variables.cursor === "cursor-B") {
+          return json({
+            data: {
+              node: {
+                __typename: "PullRequestReviewThread",
+                comments: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    { id: "c3", databaseId: 3, body: "third", createdAt: "t3", url: "u3", author: { login: "carol", __typename: "User" } },
+                  ],
+                },
+              },
+            },
+          });
+        }
+        return new Response("bad cursor", { status: 500 });
+      },
+    };
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: makeFetch(routes), retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 } });
+    const threads = await adapter.listReviewThreads({ owner: "vig-os", repo: "revkit", pullNumber: 999 });
+    expect(threads.length).toBe(1);
+    // 1 (initial) + 2 (paginated) = 3 comments.
+    expect(threads[0]!.comments.length).toBe(3);
+    expect(threads[0]!.comments.map((c) => c.databaseId)).toEqual([1, 2, 3]);
+    // Cursor advanced from A → B, not stuck.
+    expect(seenCursors).toEqual(["cursor-A", "cursor-B"]);
   });
 });
 

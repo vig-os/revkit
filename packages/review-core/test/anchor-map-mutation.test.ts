@@ -115,7 +115,10 @@ describe("mutation guards — anchor → PR line", () => {
     expect((result.target as { line?: number }).line).toBeUndefined();
   });
 
-  test("M6: renamed file — anchor by old path resolves to the new path", () => {
+  test("M6: renamed file — new-name anchor line-maps, old-name anchor file-falls-back", () => {
+    // BLOCKER 4 (PR-43): the NEW name resolves normally, but the
+    // OLD name must NEVER map onto RIGHT lines (base-file lines
+    // don't correspond to new-file line numbers).
     const files: PrFile[] = [
       {
         filename: "docs/renamed.mdx",
@@ -124,12 +127,22 @@ describe("mutation guards — anchor → PR line", () => {
         patch: "@@ -1,1 +1,1 @@\n" + "-was\n" + "+is\n",
       },
     ];
-    const result = anchorToPrComment({ path: "docs/original.mdx", startLine: 1, endLine: 1 }, files);
-    expect(result.kind).toBe("line");
-    if (result.kind !== "line") throw new Error("expected line");
-    // The comment must target the NEW name, not the old — GitHub
-    // returns 422 on a comment targeting `previous_filename`.
-    expect(result.target.path).toBe("docs/renamed.mdx");
+    const newNameResult = anchorToPrComment(
+      { path: "docs/renamed.mdx", startLine: 1, endLine: 1 },
+      files,
+    );
+    expect(newNameResult.kind).toBe("line");
+    if (newNameResult.kind !== "line") throw new Error("expected line");
+    expect(newNameResult.target.path).toBe("docs/renamed.mdx");
+
+    const oldNameResult = anchorToPrComment(
+      { path: "docs/original.mdx", startLine: 1, endLine: 1 },
+      files,
+    );
+    expect(oldNameResult.kind).toBe("file");
+    if (oldNameResult.kind !== "file") throw new Error("expected file");
+    expect(oldNameResult.target.path).toBe("docs/renamed.mdx");
+    expect(oldNameResult.reason).toBe("renamed-file-old-path");
   });
 
   test("M7: Link parsing extracts only the rel=\"next\" URL, and returns null when absent", () => {

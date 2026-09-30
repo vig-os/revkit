@@ -67,13 +67,28 @@ export type AnchorMapResult =
   | { readonly kind: "reject"; readonly reason: string };
 
 /** Why an anchor fell back to a file-level comment. Recorded so the
- * caller can print a diagnostic and prepend it to the comment body. */
+ * caller can print a diagnostic and prepend it to the comment body.
+ *
+ * `no-patch` covers both binaries and diffs GitHub declined to send
+ * (typically too-large): the REST envelope makes no reliable
+ * distinction on its own — both come back with the `patch` field
+ * absent — so the mapper doesn't invent one. The `PrFile.status`
+ * field a caller has in hand may narrow it (`added` + no patch is
+ * usually a binary; `modified` + `changes > 0` + no patch is
+ * usually truncated), but that inference belongs at the call site.
+ *
+ * `renamed-file-old-path` fires when the anchor's `path` matches a
+ * file's `previousFilename`. The anchor's lines refer to the BASE
+ * revision (the old file); mapping them onto the NEW file's RIGHT
+ * side would silently place the comment on unrelated content. The
+ * safe outcome is a file-level comment on the new path noting the
+ * original range. */
 export type FileFallbackReason =
   | "no-patch"
   | "range-outside-hunk"
   | "range-crosses-hunk-boundary"
   | "deleted-file"
-  | "binary-file";
+  | "renamed-file-old-path";
 
 /** Options for `anchorToPrComment`. `allowFileFallback` defaults to
  * `true` (ADR-0025's file-level fallback). Pass `false` when the
@@ -86,13 +101,17 @@ export interface AnchorMapOptions {
  * Map a review-core anchor to a PR-comment target.
  *
  * The mapping rules, in order:
- *   1. Find the file in `files` by `anchor.path` OR by
- *      `previousFilename === anchor.path` (renames: an anchor made
- *      against the old name still maps).
- *   2. If the file is binary / patchless / deleted, fall back to a
- *      file-level comment on the RESOLVED filename (or the previous
- *      filename for a deleted file).
- *   3. Parse the patch. If every line in `anchor.startLine..endLine`
+ *   1. Find the file in `files` by `anchor.path` (current name) OR by
+ *      `previousFilename === anchor.path` (renames).
+ *   2. If the anchor's path matches the OLD name of a renamed file
+ *      (i.e. it refers to base-revision lines), fall back to a
+ *      file-level comment on the NEW path. Do NOT map old-name
+ *      lines onto new-file RIGHT-side lines: the hunk header is a
+ *      new-file coordinate, so equal line numbers name unrelated
+ *      content (PR-43 blocker 4).
+ *   3. If the file is patchless / deleted, fall back to a
+ *      file-level comment on the RESOLVED filename.
+ *   4. Parse the patch. If every line in `anchor.startLine..endLine`
  *      is on the RIGHT side of some hunk, emit a line comment (with
  *      `startLine` when the range spans more than one line). If the
  *      range extends outside a hunk OR crosses a gap between two
@@ -117,6 +136,27 @@ export function anchorToPrComment(
   // The RESOLVED filename is what GitHub sees post-rename. A rename
   // comment must reference the new name, not the old one.
   const resolvedPath = file.filename;
+
+  // BLOCKER 4 (PR-43): anchor made against the OLD name of a renamed
+  // file. The anchor's lines describe base-revision content; mapping
+  // them onto the new file's RIGHT side would put the comment on
+  // whatever happens to sit at those line numbers post-rename —
+  // often unrelated. File-level fallback on the NEW path, preamble
+  // records the old range on the old path.
+  if (file.previousFilename !== undefined && anchor.path === file.previousFilename) {
+    if (!allowFileFallback) {
+      return {
+        kind: "reject",
+        reason: `anchor path '${anchor.path}' is the OLD name of renamed file '${resolvedPath}'; ` +
+          `old-side lines cannot map to new-file RIGHT-side lines`,
+      };
+    }
+    return {
+      kind: "file",
+      target: { subjectType: "file", path: resolvedPath },
+      reason: "renamed-file-old-path",
+    };
+  }
 
   if (file.status === "removed") {
     if (!allowFileFallback) {
@@ -153,10 +193,14 @@ export function anchorToPrComment(
         reason: `file '${resolvedPath}' has no patch (binary or too large); line comments not addressable`,
       };
     }
+    // GitHub's REST envelope makes no reliable distinction between
+    // "binary" and "declined patch (huge)" — both come back with
+    // `patch` absent. Report one reason for both; the caller may
+    // narrow via `PrFile.status`/`.changes` if it has them.
     return {
       kind: "file",
       target: { subjectType: "file", path: resolvedPath },
-      reason: patch.startsWith("Binary files ") || patch.startsWith("GIT binary patch") ? "binary-file" : "no-patch",
+      reason: "no-patch",
     };
   }
 
@@ -273,29 +317,50 @@ export interface PrCommentSource {
 
 /** The outcome of mapping a GitHub comment back to an anchor position.
  *
- * `kind: "line"` — the comment is on RIGHT side and has a resolved
- * `line`, so we can hand callers a `(path, startLine, endLine)` tuple.
- * `kind: "orphan"` — the comment is on LEFT, or its position no longer
- * resolves (outdated), or it's file-level; the caller records it as
- * an orphaned or file-scoped thread. */
+ * `kind: "line"` — the comment is on RIGHT side, has a resolved `line`
+ * and (for a multi-line range) a matching RIGHT `startSide`, so we can
+ * hand callers a `(path, startLine, endLine)` tuple whose bounds both
+ * name head-revision lines.
+ * `kind: "orphan"` — the comment is on LEFT, its position no longer
+ * resolves (outdated), its start/end sides disagree, or it's file-level.
+ * The caller keeps the thread as `status: "orphaned"`. */
 export type PrCommentToAnchorResult =
   | { readonly kind: "line"; readonly path: string; readonly startLine: number; readonly endLine: number }
   | { readonly kind: "orphan"; readonly path: string; readonly reason: OrphanReason };
 
-export type OrphanReason = "left-side" | "outdated" | "file-level" | "unresolved-line";
+/** Why a comment could not be mapped to a head-revision line range.
+ * `mixed-sides` is the case where `startSide !== side` (a range whose
+ * two ends live on different revisions — GitHub emits this shape for
+ * some cross-side selections; there is no single line span in the
+ * current head that both bounds name). */
+export type OrphanReason =
+  | "left-side"
+  | "outdated"
+  | "file-level"
+  | "unresolved-line"
+  | "mixed-sides";
 
 /**
  * Map a GitHub review comment back to a review-core anchor position.
  *
- * A LEFT-side comment or a comment whose current `line` is null (marked
- * outdated by GitHub because the range no longer resolves on the head)
- * is returned as `orphan`. The caller keeps the thread — never drops
- * it — under `status: "orphaned"` and can still show the reviewer's
- * body, matching the review-core convention (ADR-0006).
+ * The rules (strict on purpose — an anchor that both bounds don't
+ * confirm as head-revision lines is a wrong-place risk, so orphan
+ * rather than guess):
  *
- * File-level comments (subject_type = file, or line missing without an
- * outdated marker) come back as `orphan` with `reason: "file-level"`
- * so the caller can render them under the file rather than a line.
+ * 1. `subjectType === "file"` → orphan, `file-level`.
+ * 2. `side === "LEFT"` (or `diffSide === "LEFT"` when only that is
+ *    present) → orphan, `left-side`.
+ * 3. `isOutdated === true` → orphan, `outdated`.
+ * 4. `line` missing / null → orphan, `unresolved-line`.
+ * 5. `startLine` present AND `startSide !== side` (or `startSide` is
+ *    `LEFT`) → orphan, `mixed-sides`. A multi-line RIGHT/LEFT range
+ *    has its two ends on DIFFERENT revisions; the RIGHT end names a
+ *    head line but the LEFT start names a base line, so no single
+ *    `[startLine..endLine]` on the head captures the range.
+ * 6. Otherwise: `startLine ?? line` .. `line`, both on the RIGHT.
+ *
+ * The caller keeps orphaned threads (ADR-0006) and can still show the
+ * reviewer's body — only the anchor is unavailable.
  */
 export function prCommentToAnchor(comment: PrCommentSource): PrCommentToAnchorResult {
   if (comment.subjectType === "file") {
@@ -310,11 +375,22 @@ export function prCommentToAnchor(comment: PrCommentSource): PrCommentToAnchorRe
   }
   const endLine = comment.line;
   if (endLine === null || endLine === undefined) {
-    // No current position and no outdated flag — treat as file-level.
-    // This happens on GraphQL responses for comments that GitHub
-    // considers file-scoped without setting `isOutdated`.
     return { kind: "orphan", path: comment.path, reason: "unresolved-line" };
   }
-  const startLine = comment.startLine ?? endLine;
-  return { kind: "line", path: comment.path, startLine, endLine };
+  const startLine = comment.startLine ?? null;
+  const startSide = comment.startSide ?? null;
+  if (startLine !== null) {
+    // A multi-line range. At this point `side === "RIGHT"` (we
+    // returned above on LEFT). The two ends must both be RIGHT — a
+    // mixed range (start on LEFT, end on RIGHT) doesn't name a
+    // head-side span. `startSide === null` is treated as "assumed
+    // same as side" (GraphQL sometimes omits it on single-side
+    // ranges); anything else must equal `RIGHT`. Orphan otherwise
+    // (BLOCKER 3, PR-43).
+    if (startSide !== null && startSide !== "RIGHT") {
+      return { kind: "orphan", path: comment.path, reason: "mixed-sides" };
+    }
+    return { kind: "line", path: comment.path, startLine, endLine };
+  }
+  return { kind: "line", path: comment.path, startLine: endLine, endLine };
 }

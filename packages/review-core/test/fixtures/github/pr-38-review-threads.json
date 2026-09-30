@@ -19,7 +19,15 @@
               "originalStartLine": null,
               "diffSide": "RIGHT",
               "startDiffSide": null,
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
               "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNDoyNzoyMFrO9s_WjA=="
+                },
                 "nodes": [
                   {
                     "id": "PRRC_kwDOUyqeeM72z9aM",
@@ -46,7 +54,15 @@
               "originalStartLine": null,
               "diffSide": "RIGHT",
               "startDiffSide": null,
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
               "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNDoyNzoyMFrO9s_Wow=="
+                },
                 "nodes": [
                   {
                     "id": "PRRC_kwDOUyqeeM72z9aj",
@@ -73,7 +89,15 @@
               "originalStartLine": null,
               "diffSide": "RIGHT",
               "startDiffSide": null,
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
               "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNDoyNzoyMFrO9s_Wqg=="
+                },
                 "nodes": [
                   {
                     "id": "PRRC_kwDOUyqeeM72z9aq",
@@ -100,7 +124,15 @@
               "originalStartLine": 50,
               "diffSide": "RIGHT",
               "startDiffSide": "RIGHT",
+              "subjectType": "LINE",
+              "resolvedBy": {
+                "login": "github-advanced-security[bot]"
+              },
               "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": "Y3Vyc29yOnYyOpK0MjAyNi0wOS0zMFQwNTowODo0MVrO9tLI9Q=="
+                },
                 "nodes": [
                   {
                     "id": "PRRC_kwDOUyqeeM720sj1",

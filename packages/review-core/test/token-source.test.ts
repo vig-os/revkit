@@ -42,6 +42,26 @@ describe("redactTokenInMessage", () => {
     expect(scrubbed).not.toContain(pat);
     expect(scrubbed).toContain("<redacted:ghtoken>");
   });
+
+  test("redacts even when the prefix is preceded by an underscore or other word char", () => {
+    // PR-43 nit: `\b` fails at `foo_ghp_...` because `_` is a word
+    // character in JS regex — the underscore before `ghp_` is a
+    // "boundary" of length zero to `\b`, so no boundary triggers.
+    // The lookbehind fix must catch this shape.
+    const stray = "ghp_" + "a".repeat(40);
+    const scrubbed = redactTokenInMessage(`prefix_${stray} suffix`, "");
+    expect(scrubbed).not.toContain(stray);
+    expect(scrubbed).toContain("<redacted:ghtoken>");
+  });
+
+  test("catches all five GitHub prefixes", () => {
+    for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]) {
+      const token = prefix + "x".repeat(40);
+      const scrubbed = redactTokenInMessage(`saw ${token} here`, "");
+      expect(scrubbed).not.toContain(token);
+      expect(scrubbed).toContain("<redacted:ghtoken>");
+    }
+  });
 });
 
 describe("TokenSource interface", () => {

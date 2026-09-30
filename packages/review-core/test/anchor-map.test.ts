@@ -135,7 +135,11 @@ describe("anchorToPrComment — rejects and fallbacks", () => {
     expect(result.reason).toBe("deleted-file");
   });
 
-  test("falls back to file-level on a binary file", () => {
+  test("falls back to file-level on a binary file (reported as no-patch)", () => {
+    // GitHub's REST envelope omits `patch` for binaries as it does
+    // for too-large diffs. The mapper reports one reason for both,
+    // and the caller may narrow via `PrFile.status` / `.changes`
+    // when it has them.
     const files = [file("assets/logo.png", "Binary files a/assets/logo.png and b/assets/logo.png differ\n")];
     const result = anchorToPrComment(
       { path: "assets/logo.png", startLine: 1, endLine: 1 },
@@ -143,7 +147,7 @@ describe("anchorToPrComment — rejects and fallbacks", () => {
     );
     expect(result.kind).toBe("file");
     if (result.kind !== "file") throw new Error("unreachable");
-    expect(result.reason).toBe("binary-file");
+    expect(result.reason).toBe("no-patch");
   });
 
   test("falls back to file-level when patch is absent (huge diff)", () => {
@@ -157,7 +161,12 @@ describe("anchorToPrComment — rejects and fallbacks", () => {
     expect(result.reason).toBe("no-patch");
   });
 
-  test("resolves an anchor made against the OLD path of a renamed file", () => {
+  test("falls back to file-level when anchored to the OLD path of a renamed file", () => {
+    // BLOCKER 4 (PR-43): an anchor whose path matches the OLD name
+    // describes base-revision lines. Mapping those onto new-file
+    // RIGHT lines would put the comment on whatever happens to sit
+    // at those line numbers — often unrelated content. The safe
+    // outcome is a file-level comment on the NEW path.
     const files: PrFile[] = [
       {
         filename: "docs/new-name.mdx",
@@ -170,11 +179,48 @@ describe("anchorToPrComment — rejects and fallbacks", () => {
       { path: "docs/old-name.mdx", startLine: 1, endLine: 1 },
       files,
     );
+    expect(result.kind).toBe("file");
+    if (result.kind !== "file") throw new Error("unreachable");
+    expect(result.target.path).toBe("docs/new-name.mdx");
+    expect(result.reason).toBe("renamed-file-old-path");
+  });
+
+  test("maps an anchor made against the NEW path of a renamed file to line coordinates", () => {
+    // The new-path anchor describes head-revision lines — safe to
+    // map onto the RIGHT side normally.
+    const files: PrFile[] = [
+      {
+        filename: "docs/new-name.mdx",
+        previousFilename: "docs/old-name.mdx",
+        status: "renamed",
+        patch: "@@ -1,1 +1,1 @@\n" + "-was old\n" + "+is new\n",
+      },
+    ];
+    const result = anchorToPrComment(
+      { path: "docs/new-name.mdx", startLine: 1, endLine: 1 },
+      files,
+    );
     expect(result.kind).toBe("line");
     if (result.kind !== "line") throw new Error("unreachable");
-    // Comment must reference the RESOLVED (new) filename, not the old.
     expect(result.target.path).toBe("docs/new-name.mdx");
     expect(result.target.line).toBe(1);
+  });
+
+  test("refuses old-path renames when allowFileFallback is false", () => {
+    const files: PrFile[] = [
+      {
+        filename: "docs/new.mdx",
+        previousFilename: "docs/old.mdx",
+        status: "renamed",
+        patch: "@@ -1,1 +1,1 @@\n" + "-was\n" + "+is\n",
+      },
+    ];
+    const result = anchorToPrComment(
+      { path: "docs/old.mdx", startLine: 1, endLine: 1 },
+      files,
+      { allowFileFallback: false },
+    );
+    expect(result.kind).toBe("reject");
   });
 
   test("surfaces a malformed patch as a reject, not a silent file fallback", () => {
@@ -268,6 +314,58 @@ describe("prCommentToAnchor", () => {
   test("falls back to diffSide when side is absent (GraphQL naming)", () => {
     const result = prCommentToAnchor({ path: "docs/x.mdx", line: 3, diffSide: "LEFT" });
     expect(result).toEqual({ kind: "orphan", path: "docs/x.mdx", reason: "left-side" });
+  });
+
+  test("orphans a mixed-sides range (RIGHT end, LEFT start)", () => {
+    // BLOCKER 3 (PR-43): `startSide: "LEFT"` and `side: "RIGHT"`
+    // means start=7 is a base-file line and end=9 is a head-file
+    // line. No single `[startLine..endLine]` on the head captures
+    // that range — orphan it, do not collapse the sides silently.
+    const result = prCommentToAnchor({
+      path: "docs/x.mdx",
+      line: 9,
+      startLine: 7,
+      side: "RIGHT",
+      startSide: "LEFT",
+    });
+    expect(result).toEqual({ kind: "orphan", path: "docs/x.mdx", reason: "mixed-sides" });
+  });
+
+  test("orphans when only the START is on LEFT and end is RIGHT (still mixed)", () => {
+    const result = prCommentToAnchor({
+      path: "docs/x.mdx",
+      line: 9,
+      startLine: 7,
+      side: "RIGHT",
+      startSide: "LEFT",
+    });
+    expect(result.kind).toBe("orphan");
+    if (result.kind !== "orphan") throw new Error("unreachable");
+    expect(result.reason).toBe("mixed-sides");
+  });
+
+  test("accepts a multi-line range when both sides are RIGHT", () => {
+    const result = prCommentToAnchor({
+      path: "docs/x.mdx",
+      line: 12,
+      startLine: 8,
+      side: "RIGHT",
+      startSide: "RIGHT",
+    });
+    expect(result).toEqual({ kind: "line", path: "docs/x.mdx", startLine: 8, endLine: 12 });
+  });
+
+  test("accepts a multi-line range when startSide is absent (defaults to same as side)", () => {
+    // GraphQL sometimes omits startSide on a single-side range; the
+    // safe default is same-as-side. We accept as line — this is
+    // NOT the mixed case.
+    const result = prCommentToAnchor({
+      path: "docs/x.mdx",
+      line: 12,
+      startLine: 8,
+      side: "RIGHT",
+    });
+    expect(result).toEqual({ kind: "line", path: "docs/x.mdx", startLine: 8, endLine: 12 });
   });
 });
 
