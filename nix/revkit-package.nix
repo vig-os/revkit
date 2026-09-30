@@ -192,24 +192,19 @@ let
     installPhase = ''
       runHook preInstall
       mkdir -p $out
-      # The root node_modules tree carries every hoisted dep and bun's
-      # isolated linker workspace (node_modules/.bun/*). Copying an
-      # ~400 MiB tree with `cp -r` runs the fixup phase over every path
-      # and doubles the closure size. Rsync with `--links` preserves
-      # bun's internal relative symlinks byte-for-byte; from the runtime
-      # derivation we then symlink this whole subtree into $out so the
-      # final package is O(#workspace-node-modules-entries), not
-      # O(dep-file-count).
+      # Hoisted layout produces one classic flat `node_modules/` tree at
+      # the workspace root; per-workspace `packages/*/node_modules/` are
+      # created only when a dep cannot hoist. We copy every tree the FOD
+      # produced under the same relative paths — the runtime derivation
+      # then symlinks each entry into $out (per-entry, not whole-tree,
+      # so relative `@revkit/*` links inside the FOD's own
+      # `node_modules/@revkit/` can be re-created against $out's source).
       if [ -d node_modules ]; then
         cp -r node_modules $out/node_modules
       fi
-      # Per-workspace node_modules directories: bun creates one under
-      # each workspace whose deps are not fully hoisted, plus the
-      # relative `@revkit/*` workspace symlinks (e.g.
-      # `packages/cli/node_modules/@revkit/review-core -> ../../../review-core`).
-      # These symlinks must resolve against the FINAL package's source
-      # tree, so the runtime derivation copies these small directories
-      # into place (~200 KiB combined).
+      # Per-workspace `node_modules` — hoisted rarely creates them, but
+      # when a dep pins a conflicting version bun does. Kept for parity;
+      # a no-op with the current lockfile.
       for pkg in packages/cli packages/review-core packages/components site; do
         if [ -d "$pkg/node_modules" ]; then
           mkdir -p "$out/$pkg"
@@ -259,9 +254,15 @@ stdenvNoCC.mkDerivation {
     # from $out ends up in $FOD/packages/* (dangling). Per-entry
     # symlinks keep 500 tiny store-references (a `dr-xr-xr-x` entry
     # per dep) while the four `@revkit/*` links are re-created fresh so
-    # they resolve within $out. Closure shrinks from ~640 MiB (source +
-    # copied deps) to ~230 MiB (source + FOD-referenced deps + a
-    # per-entry-symlink directory).
+    # they resolve within $out.
+    #
+    # Sizes as measured locally (x86_64-linux, bun 1.3.13):
+    #   $out itself           5.8 MiB   (source + per-entry symlinks)
+    #   $out closure       501.5 MiB   (adds the FOD ~431 MiB + bun ~68 MiB)
+    # A `cp -r` of the FOD's node_modules into $out would DUPLICATE the
+    # entire dep tree — $out ~440 MiB, closure ~940 MiB. Per-entry
+    # symlinks keep the FOD as the ONE copy of the ~500 deps; the
+    # closure is dominated by the FOD path, not by $out.
     if [ -d ${nodeModules}/node_modules ]; then
       mkdir -p $out/libexec/revkit/node_modules
       for entry in ${nodeModules}/node_modules/*; do

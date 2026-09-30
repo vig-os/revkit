@@ -136,7 +136,7 @@ command (`revkit serve`) currently binds and serves whatever tree is passed to `
 called out explicitly on the [FEATURE-MATRIX](../FEATURE-MATRIX.md) D1 row and blocks the row from flipping to
 `shipped`.
 
-What is missing (M5 part 2):
+What is missing (M5 part 2, tracked at [vig-os/revkit#57](https://github.com/vig-os/revkit/issues/57)):
 
 - **`revkit build [--dir <root>]`** — renders the consumer's `docs/` (plus `vocab/`, `plots/`) with revkit's
   PACKAGED site. Uses the packaged `node_modules/.bin/astro` by ABSOLUTE PATH (no `bunx`, no PATH lookup),

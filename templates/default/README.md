@@ -14,7 +14,8 @@ revkit check       # run the ADR-0005 authoring guards on this tree
 nix build          # runs `revkit check` inside a docs derivation
 ```
 
-`revkit serve` (the local review daemon that mounts the rail on rendered pages) is **M5 part 2** — see
+`revkit serve` (the local review daemon that mounts the rail on rendered pages) is **M5 part 2**, tracked at
+[vig-os/revkit#57](https://github.com/vig-os/revkit/issues/57) — see also
 [revkit's DESIGN-0002 §5](https://github.com/vig-os/revkit/blob/main/docs/designs/DESIGN-0002-devkit-review-module.md#5-gap-between-m5-part-1-and-full-d1-acceptance).
 It needs a `revkit build` step (not yet shipped) that renders this `docs/` tree through revkit's packaged
 Astro/Starlight site. Until then the daemon works but has no rendered content to serve.

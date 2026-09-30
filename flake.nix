@@ -434,10 +434,16 @@
 
             A minimal revkit docs repo has been scaffolded here.
 
-            Next steps:
+            Next steps (M5 part 1):
               direnv allow            # or: nix develop
               revkit check            # run the ADR-0005 authoring guards
-              revkit serve            # boot the local review daemon (M2)
+              nix build               # runs revkit check under a docs derivation
+
+            `revkit serve` (the local review daemon that mounts the rail on
+            rendered pages) is M5 part 2 — needs a `revkit build` step that
+            renders this docs/ tree through revkit's packaged Astro/Starlight
+            site. Tracked at https://github.com/vig-os/revkit/issues/57.
+            Until it lands the daemon works but has no rendered content to serve.
 
             Docs: https://github.com/vig-os/revkit
           '';

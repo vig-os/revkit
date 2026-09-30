@@ -22,9 +22,13 @@ This is a docs repository that consumes the revkit flake:
 - **`revkit check`** enforces the five authoring guards from ADR-0005:
   component registry, no hand-rolled UI, vocabulary, links, plot
   structure — plus the vendored-code contract from ADR-0022.
-- **`revkit serve`** boots the local review daemon on `127.0.0.1`; a
-  reviewer opens it in a browser and comments on any block. Comments
-  flow back to the authoring agent through the M2 MCP channel.
+- **`revkit serve`** will boot the local review daemon on `127.0.0.1`
+  once M5 part 2 lands: rendering this `docs/` tree through revkit's
+  packaged Astro/Starlight site (`revkit build`) and having `serve`
+  mount the rail on the rendered pages. Tracked at
+  [vig-os/revkit#57](https://github.com/vig-os/revkit/issues/57).
+  Until then the daemon binary is available but has no rendered
+  content to serve — the two commands below are what M5 part 1 ships.
 
 ## Two commands (M5 part 1)
 

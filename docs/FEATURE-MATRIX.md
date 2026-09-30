@@ -28,7 +28,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | C4 | Plots are spec + data side files, never inline | ADR-0004, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C5 | LaTeX math rendered at build, no client JS | ADR-0001 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C6 | Phone / tablet / desktop layouts, stock Starlight sidebar + prev/next (ADR-0001 amendment) | ADR-0001, ADR-0017, ADR-0018, ADR-0019 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
-| D1 | Any repo adopts revkit with one flake input + one line | ADR-0010, ADR-0021 | M5 | [#10](https://github.com/vig-os/revkit/issues/10) | partial (M5 part 1 shipped: `packages.revkit`, `templates.default`, `lib.hooks`; NEEDS `revkit build` + `serve` auto-build to render consumer docs — see [DESIGN-0002](designs/DESIGN-0002-devkit-review-module.md) §6 gap) |
+| D1 | Any repo adopts revkit with one flake input + one line | ADR-0010, ADR-0021 | M5 | [#10](https://github.com/vig-os/revkit/issues/10), [#57](https://github.com/vig-os/revkit/issues/57) (part 2) | partial (M5 part 1 shipped: `packages.revkit`, `templates.default`, `lib.hooks`; NEEDS `revkit build` + `serve` auto-build to render consumer docs — see [DESIGN-0002 §5](designs/DESIGN-0002-devkit-review-module.md#5-gap-between-m5-part-1-and-full-d1-acceptance) gap, tracked at [#57](https://github.com/vig-os/revkit/issues/57)) |
 | D2 | Per-org hosting with GitHub-org auth | ADR-0008, ADR-0014, ADR-0015, ADR-0020 | M4 | [#9](https://github.com/vig-os/revkit/issues/9) | planned |
 | E1 | Static by default, JS only where interaction needs it | ADR-0001, ADR-0002, ADR-0004 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 
