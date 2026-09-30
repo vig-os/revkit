@@ -76,7 +76,6 @@ test *args:
       cd packages/cli && bun test {{ args }} && cd ../.. && \
       cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
       just check && \
-      just build && \
       just e2e; \
     fi
 
@@ -107,11 +106,17 @@ test-cov *args:
     fi
 
 # Run the Playwright browser suite by itself (skips the bun unit tests).
+# ALWAYS builds first: axe over stale HTML and visual baselines against
+# stale HTML both silently pass a regression that landed after the last
+# build (PR #31 review, the low-contrast paragraph reproducer). One
+# build per run — `just test` calls this recipe, so the outer `just
+# build` step used to double up and has been removed there.
 [group('test')]
 e2e *args:
     @if [ ! -f site/package.json ]; then \
       echo "just e2e: no site/package.json — skipping"; \
     else \
+      just build && \
       cd site && bun run test:e2e -- {{ args }}; \
     fi
 
@@ -121,12 +126,15 @@ e2e *args:
 # resulting image diff in code review, and commit the updated files.
 # Extra args pass through to Playwright (e.g.
 # `just e2e-update visual.spec.ts -g phone` narrows the update).
+# Also builds first — same reason as `just e2e`, otherwise a stale
+# `dist/` would snapshot the previous build.
 [group('test')]
 e2e-update *args:
     @if [ ! -f site/package.json ]; then \
       echo "just e2e-update: no site/package.json — skipping"; \
     else \
-      cd site && bun run test:e2e -- --update-snapshots {{ args }}; \
+      just build && \
+      cd site && bun run test:e2e -- --update-snapshots=all {{ args }}; \
     fi
 
 # -------------------------------------------------------------------------------

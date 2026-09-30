@@ -30,6 +30,14 @@
 import { expect, test } from "@playwright/test";
 import { preparePageForVisual, VIEWPORTS, waitForFontsReady } from "./fixtures/visual";
 
+// Zero retries for the visual suite even under CI's default of 2:
+// a flaky screenshot is a real signal (nondeterministic rendering,
+// masked region drift, font not loading) and hiding it under a retry
+// would let the flake grow into a false negative (PR #31 review). The
+// rest of the e2e suite keeps CI's retries; only screenshots are
+// pinned to strict-one-pass here.
+test.describe.configure({ retries: 0 });
+
 interface PageCase {
   readonly slug: string;
   readonly route: string;
@@ -54,25 +62,35 @@ const PAGES: readonly PageCase[] = [
   { slug: "math-plots", route: "/math-and-plots/", description: "math + inline-SVG plot" },
 ];
 
-/** CSS selectors to mask on every page. These regions are either
- * environmental (dates, versions), user-scoped (theme, search), or would
- * otherwise cause deterministic-but-unwanted per-run drift. Kept in one
- * place so a new case does not have to relist them. */
+/** CSS selectors to mask on every page. These regions are user-scoped
+ * (theme select state, remembered in localStorage) or would otherwise
+ * cause per-run drift. Verified against the built HTML — every selector
+ * here matches at least one node on the pages under test; earlier
+ * guesses (`[data-theme-selector]`, `.sl-search-button`,
+ * `dialog.pagefind-ui`) matched nothing and were removed in PR #31
+ * review round 1. */
 const GLOBAL_MASK_SELECTORS = [
-  // Starlight's persistent theme select — its selected value depends on
-  // localStorage state from previous navigations.
-  '[data-theme-selector], starlight-theme-select',
-  // Starlight's search input placeholder can shift width by a pixel across
-  // Pagefind index rebuilds.
-  '.sl-search-button, dialog.pagefind-ui',
+  // Starlight's theme select emits `<starlight-theme-select>` for the
+  // desktop toolbar and again for the mobile menu — its picker state
+  // depends on `localStorage.starlight-theme`.
+  "starlight-theme-select",
+  // Starlight's search entry point renders as `<site-search>` wrapping
+  // a `button[data-open-modal]`. The button's disabled/enabled state
+  // depends on whether Pagefind's JS has hydrated, which is timing-
+  // sensitive on cold caches.
+  "site-search button[data-open-modal]",
 ];
 
-/** Page-specific mask selectors. The ADR + design body renders a
- * `- Date: YYYY-MM-DD` line at the top; masking that line only (not the
- * whole first paragraph) preserves surrounding structure in the baseline. */
+/** Page-specific mask selectors. Every ADR and DESIGN doc body renders
+ * a `- Date: YYYY-MM-DD` line as an `<li>` at the top of the page
+ * (verified against `dist/adr/0001-.../index.html`). Masking that
+ * one line only — not the whole first paragraph — keeps the
+ * surrounding structure in the baseline. `:has-text(...)` is
+ * Playwright's engine extension for locators, not a CSS selector, so
+ * pass through `page.locator(...)` (which `mask` accepts). */
 const PAGE_MASK_SELECTORS: Record<string, readonly string[]> = {
-  adr: ["main :is(p, li):has-text('Date:')"],
-  design: ["main :is(p, li):has-text('Date:')"],
+  adr: ["main li:has-text('Date:')"],
+  design: ["main li:has-text('Date:')"],
 };
 
 for (const pageCase of PAGES) {

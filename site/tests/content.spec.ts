@@ -3,27 +3,14 @@
 // directory (ADR-0003) — these tests exercise the built artefact so a
 // regression in the loader, the schema layer or the sidebar wiring trips.
 //
-// Each page assertion also runs an axe-core scan (ADR-0017) so the shared
-// docs surface stays WCAG 2.2 AA-clean as pages are added.
+// Accessibility scanning of these pages lives in the site-wide gate
+// (`a11y.spec.ts`, ADR-0017); the per-page serious/critical scans that
+// used to sit next to each content assertion have been removed to
+// avoid duplicating the coverage the strict any-violation gate
+// already gives.
 import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
-
-/** Blocking axe violations only — matches the landing-page smoke's bar and
- * matches the ADR-0017 gate (advisory findings shouldn't fail CI). */
-async function expectNoBlockingViolations(page: import("@playwright/test").Page): Promise<void> {
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
-    .analyze();
-  const blocking = results.violations.filter(
-    (violation) => violation.impact === "serious" || violation.impact === "critical",
-  );
-  expect(
-    blocking,
-    `serious/critical axe violations: ${JSON.stringify(blocking, null, 2)}`,
-  ).toEqual([]);
-}
 
 /** Count the ADR source files at the repo's `docs/adr/` — the ADR index
  * table on the built site is derived from this same set, so deriving the
@@ -48,7 +35,6 @@ test("ADR page renders its title, body status line and sidebar badge", async ({ 
   const sidebarLink = page.locator('nav a[aria-current="page"]');
   await expect(sidebarLink).toContainText("ADR-0001");
   await expect(sidebarLink.locator(".sl-badge")).toHaveText("Accepted");
-  await expectNoBlockingViolations(page);
 });
 
 test("ADR index page renders a table with one row per ADR file on disk", async ({ page }) => {
@@ -59,7 +45,6 @@ test("ADR index page renders a table with one row per ADR file on disk", async (
   const dataRows = page.locator("main table tbody tr");
   await expect(dataRows).toHaveCount(adrSourceFileCount);
   await expect(page.locator("main").getByRole("link", { name: /^0001$/ })).toBeVisible();
-  await expectNoBlockingViolations(page);
 });
 
 test("ADR index links click through to the sibling ADR page (link rewriting)", async ({ page }) => {
@@ -108,7 +93,6 @@ test("DESIGN-0001 page renders", async ({ page }) => {
     /DESIGN-0001/,
   );
   await expect(page.getByRole("heading", { name: "1. User stories" })).toBeVisible();
-  await expectNoBlockingViolations(page);
 });
 
 test("Feature matrix page renders a table with a row per story", async ({ page }) => {
@@ -121,7 +105,6 @@ test("Feature matrix page renders a table with a row per story", async ({ page }
   // the table must render with at least the A1 story row.
   await expect(page.locator("main table tbody").first()).toBeVisible();
   await expect(page.locator("main").getByText(/A1/).first()).toBeVisible();
-  await expectNoBlockingViolations(page);
 });
 
 test("sidebar groups Design, ADRs and Feature matrix around Start", async ({ page }) => {

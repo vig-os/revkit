@@ -125,6 +125,15 @@ export async function installDeterministicFonts(page: Page): Promise<void> {
       `@font-face { font-family: "${entry.family}"; src: url("${FONT_ROUTE_PREFIX}${entry.urlName}") format("truetype"); font-weight: ${entry.weight}; font-style: ${entry.style}; font-display: block; }`,
   ).join("\n");
 
+  // Keep KaTeX's own `@font-face` families in force: math glyphs are
+  // resolved through `KaTeX_Main`, `KaTeX_Math` etc. (self-hosted from
+  // `/_katex/fonts/*` per ADR-0012), so an unconditional `*` override
+  // would silently swap DejaVu in for math symbols and make the visual
+  // baselines pass even if the KaTeX font pipeline broke (PR #31 review:
+  // deleting `dist/_katex/fonts` was undetected). The `:not(.katex,
+  // .katex *)` guards on the two overrides below skip every node inside
+  // a `.katex` container, so math still renders in the KaTeX family and
+  // a broken font path trips the baselines. Regular prose stays on DejaVu.
   const overrideCss = `
 ${fontFaces}
 :root {
@@ -135,10 +144,10 @@ ${fontFaces}
   --font-sans: "${FONT_FAMILY_SANS}", sans-serif;
   --font-mono: "${FONT_FAMILY_MONO}", monospace;
 }
-*, *::before, *::after {
+:not(.katex, .katex *) {
   font-family: "${FONT_FAMILY_SANS}", sans-serif !important;
 }
-code, kbd, samp, pre, pre *, .expressive-code *, code * {
+:is(code, kbd, samp, pre, pre *, .expressive-code *, code *):not(.katex, .katex *) {
   font-family: "${FONT_FAMILY_MONO}", monospace !important;
 }
 `;

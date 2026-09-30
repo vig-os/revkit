@@ -4,27 +4,13 @@
 // rehype pipeline, in the plots loader, in the `<Plot>` component, or in
 // the CSP-friendly SVG shape trips.
 //
-// Every page assertion also runs an axe-core scan (ADR-0017) so the math
-// + plots surface stays WCAG 2.2 AA-clean.
-import AxeBuilder from "@axe-core/playwright";
+// Accessibility scanning of the math + plots page lives in the site-wide
+// gate (`a11y.spec.ts`, ADR-0017); the per-page serious/critical scan
+// that used to sit at the end of this file has been removed to avoid
+// duplicating the coverage the strict any-violation gate already gives.
 import { expect, test } from "@playwright/test";
 
 const PAGE = "/math-and-plots/";
-
-/** Blocking axe violations only — matches the landing-page smoke's bar
- * and matches the ADR-0017 gate (advisory findings shouldn't fail CI). */
-async function expectNoBlockingViolations(page: import("@playwright/test").Page): Promise<void> {
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
-    .analyze();
-  const blocking = results.violations.filter(
-    (violation) => violation.impact === "serious" || violation.impact === "critical",
-  );
-  expect(
-    blocking,
-    `serious/critical axe violations: ${JSON.stringify(blocking, null, 2)}`,
-  ).toEqual([]);
-}
 
 test("KaTeX renders math at build with no raw $ delimiters left over", async ({ page }) => {
   await page.goto(PAGE);
@@ -171,9 +157,4 @@ test("math + plots page loads the same script set as a page without them", async
     extras,
     `math + plots page loaded scripts an ADR page did not: ${JSON.stringify(extras)}`,
   ).toEqual([]);
-});
-
-test("axe finds no serious/critical violations on the math + plots page", async ({ page }) => {
-  await page.goto(PAGE);
-  await expectNoBlockingViolations(page);
 });

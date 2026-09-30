@@ -1,11 +1,12 @@
 // M1 smoke test: the site builds, the landing page loads, the registered
 // Callout component from `@revkit/components` renders through the Astro +
-// Solid pipeline, and axe-core (ADR-0017) finds no serious/critical
-// accessibility violations.
+// Solid pipeline. The dedicated site-wide axe gate lives in
+// `a11y.spec.ts` (ADR-0017), so the per-page serious/critical scan that
+// used to sit here has been removed — the strict any-violation gate on
+// the site-wide spec covers the landing page along with the other 30.
 //
 // This is intentionally small — the full e2e suite (comment rail, question
 // kinds, re-anchoring across a rebuild) is ADR-0016's job in M2/M3.
-import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
 test("landing page renders with a heading", async ({ page }) => {
@@ -29,20 +30,4 @@ test("landing page renders the Callout from @revkit/components", async ({ page }
   await expect(callout).toHaveClass(/\brevkit-callout--info\b/);
   await expect(callout.locator(".revkit-callout__title")).toHaveText("M1 preview");
   await expect(callout.locator(".revkit-callout__body")).toContainText("M1 scaffold");
-});
-
-test("landing page has no serious/critical axe violations", async ({ page }) => {
-  await page.goto("/");
-  const results = await new AxeBuilder({ page })
-    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
-    .analyze();
-
-  const blocking = results.violations.filter(
-    (violation) => violation.impact === "serious" || violation.impact === "critical",
-  );
-
-  expect(
-    blocking,
-    `serious/critical axe violations: ${JSON.stringify(blocking, null, 2)}`,
-  ).toEqual([]);
 });
