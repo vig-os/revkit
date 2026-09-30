@@ -58,6 +58,44 @@ frame:
 The event kinds `thread.reanchored` and `thread.orphaned` carry these outcomes; the wire methods are `quote-exact`
 (unchanged / moved) and `fuzzy` (modified). Fuzzy carries the similarity score.
 
+## Amendment (2026-09-30, M2 item 5b — daemon integration)
+
+Wiring the re-anchoring engine (M2 item 5a) into the live daemon (`revkit serve`):
+
+- **Revision snapshots.** The daemon's sqlite store carries a `snapshots(revision, source, bytes, created_at)` table
+  keyed on the revision hash. When a thread is created, the daemon stores the LF-normalised source under the same
+  revision the anchor carries. Content-addressed dedup: a second thread on the same file at the same revision is an
+  idempotent `INSERT OR IGNORE`. Additive migration: an existing pre-5b db opens cleanly (no `snapshots` table → the
+  schema-up creates it empty). The 5 MiB anchor-source cap (`resolveAnchorSource`) already gates what lands here.
+- **Actor for pipeline events.** `thread.reanchored` and `thread.orphaned` events emitted by the daemon carry actor
+  `{ kind: "agent", id: "revkit-reanchor" }` — a namespaced id under the existing `agent` kind so no schema bump is
+  needed. A channel client can filter these system events from human posts and from the user's own Claude Code
+  session (`id: "agent"` or a per-session id).
+- **Triggers, layered.** The daemon runs THREE complementary triggers, each of which is correct on its own. Together
+  they close every gap:
+  1. **Lazy — before `/api/threads` GET and before `/events` catch-up.** Guaranteed correct: even if watchers miss
+     an event or the site was edited while the daemon was down, the next read re-anchors before serving. This is
+     the ONE trigger that alone makes the pipeline correct; the others exist for interactive latency.
+  2. **File watcher on anchored source files** (`fs.watch` with a `stat`-poll fallback on WSL / FUSE / bind mounts).
+     Debounced at 300 ms so a save-burst coalesces. Per-path watcher installed lazily when the first thread on that
+     path lands; torn down when no threads remain.
+  3. **Build watcher on `site/dist`** (`fs.watch` recursive). Debounced at 500 ms so an Astro build settles before
+     the daemon reads back. Triggers a `refreshAll()` — every threaded path.
+- **Per-path mutex.** `refresh(path)` serialises through a `Map<string, Promise<void>>`. A second concurrent call
+  joins the in-flight promise; different paths run concurrently. `prepareReanchor` runs ONCE per (oldRev, newRev)
+  pair even when N threads on the same file re-anchor together.
+- **Bounded.** A file over the 5 MiB cap, a symlink escape, or a missing file orphans every thread on that path
+  with a uniform reason ("source file unavailable at re-anchor time…"). A missing snapshot for a thread's
+  revision orphans the thread ("no snapshot for the anchor's revision…"). The pipeline never hangs and never
+  guesses.
+- **Rail integration.** The rail shows re-anchored threads live at their new position (SSE fires on
+  `thread.reanchored`, the rail refetches, the `data-src` lookup on the block finds the new line range).
+  Orphaned threads move into a dedicated **Orphan panel** with the original quote, a "was at L…" note, and the
+  pipeline's reason; orphans stay repliable and resolvable. A subsequent `thread.reanchored` on the same thread
+  unorphans it back to `open` (reducer rule).
+- **Channel notice.** The MCP channel server surfaces re-anchor and orphan events as short, escaped notifications
+  to the agent — enough for the agent to update its own state or explain the transition to the human. The
+  existing tag-forgery escape (`escapeContentFragment`) applies to every field before it lands in `content`.
 ## Amendment (PR-43 round-5): the `unanchored` anchor kind
 
 An imported thread whose source content cannot be fetched (blob deleted / binary / truncated / diffHunk verification

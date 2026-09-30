@@ -171,6 +171,80 @@ describe("daemon-bootstrap", () => {
     expect(spawnedDetached).toBe(true);
   });
 
+  // Mutation H (PR #38 round-4 review): `ensureDaemon` MUST apply
+  // `filteredDaemonEnv()` to the spawn's env — the daemon must not
+  // inherit `NODE_OPTIONS`, `LD_PRELOAD`, an agent's private
+  // tokens, etc. Before this test, the spawn stub bypassed the
+  // computed env entirely, so removing the filter from the
+  // production path did not turn any test red. Now the hook
+  // receives `env` and the assertion confirms both a keep and a
+  // drop, so dropping `filteredDaemonEnv` here flips it red.
+  test("MUTATION H: spawn env is the filtered allowlist, not the raw parent env", async () => {
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    const state = fixtureState({ instanceId: "post-filter" });
+    let call = 0;
+    // Inject a hostile-looking parent env: PATH must survive the
+    // filter, NIX_LD / NODE_OPTIONS / a fake token must not.
+    const originalEnv = { ...process.env };
+    process.env["NIX_LD"] = "/malicious/ld.so";
+    process.env["NODE_OPTIONS"] = "--inspect";
+    process.env["REVKIT_AGENT_TOKEN"] = "leaked-token";
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => {
+          call++;
+          return call === 1 ? undefined : state;
+        },
+        spawn: (opts) => {
+          spawnedEnv = opts.env;
+          return { pid: 999 };
+        },
+        sleep: async () => {},
+        pollIntervalMs: 5,
+        waitMs: 60_000,
+      });
+    } finally {
+      // Restore parent env so this test never leaks into a sibling.
+      delete process.env["NIX_LD"];
+      delete process.env["NODE_OPTIONS"];
+      delete process.env["REVKIT_AGENT_TOKEN"];
+      for (const [k, v] of Object.entries(originalEnv)) if (v !== undefined && !(k in process.env)) process.env[k] = v;
+    }
+    // PATH is on the allowlist, so it must survive.
+    expect(spawnedEnv?.["PATH"]).toBeDefined();
+    // Every hostile name must have been stripped.
+    expect(spawnedEnv?.["NIX_LD"]).toBeUndefined();
+    expect(spawnedEnv?.["NODE_OPTIONS"]).toBeUndefined();
+    expect(spawnedEnv?.["REVKIT_AGENT_TOKEN"]).toBeUndefined();
+  });
+
+  // Sibling to Mutation H: the `onSpawn` hook is called with the
+  // child pid so the shared daemon-registry can bookmark it for
+  // the end-of-suite hygiene sweep (Nit C — PID reuse). Missing
+  // this call once let a killed pid stay unregistered; a later
+  // recycled OS pid would then be SIGTERMed by the sweep.
+  test("onSpawn hook receives the child pid", async () => {
+    const state = fixtureState({ instanceId: "post-hook" });
+    let call = 0;
+    let observedPid: number | undefined;
+    await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => {
+        call++;
+        return call === 1 ? undefined : state;
+      },
+      spawn: () => ({ pid: 4242 }),
+      onSpawn: (pid) => {
+        observedPid = pid;
+      },
+      sleep: async () => {},
+      pollIntervalMs: 5,
+      waitMs: 60_000,
+    });
+    expect(observedPid).toBe(4242);
+  });
+
   test("times out when the spawned daemon never takes the lock", async () => {
     let now = 0;
     const clock = (): number => now;

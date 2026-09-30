@@ -316,3 +316,68 @@
   outline: 2px solid var(--revkit-rail-accent);
   outline-offset: 2px;
 }
+
+/*
+ * Orphan panel (M2 item 5b, story A8).
+ *
+ * A separated region below the open-threads list. Visually
+ * distinct — muted background, warning border on the left edge —
+ * so the reviewer can spot which threads no longer anchor to a
+ * currently-rendered block. Keyboard-accessible; the reply /
+ * resolve buttons participate in the same tab order as open
+ * threads.
+ */
+.revkit-rail__orphans {
+  margin-top: 1rem;
+  padding: 0.75rem 0.5rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 15%, transparent);
+}
+
+.revkit-rail__orphans-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--revkit-rail-fg);
+}
+
+.revkit-rail__orphans-count {
+  color: var(--revkit-rail-muted);
+  font-weight: 400;
+}
+
+.revkit-rail__orphans-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.revkit-rail__thread--orphaned {
+  border-left: 3px solid var(--revkit-rail-accent);
+  padding-left: 0.5rem;
+  background: color-mix(in srgb, var(--revkit-rail-fg) 3%, transparent);
+}
+
+.revkit-rail__thread-anchor--orphaned {
+  color: var(--revkit-rail-muted);
+  font-style: italic;
+  margin: 0 0 0.35rem;
+}
+
+.revkit-rail__orphan-quote {
+  margin: 0.35rem 0;
+  padding: 0.35rem 0.5rem;
+  border-left: 2px solid color-mix(in srgb, var(--revkit-rail-fg) 20%, transparent);
+  color: var(--revkit-rail-fg);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.revkit-rail__orphan-reason {
+  margin: 0.35rem 0;
+  color: var(--revkit-rail-muted);
+  font-size: 0.8rem;
+}

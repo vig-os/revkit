@@ -52,7 +52,26 @@ const wallClock: Clock = () => new Date().toISOString();
  * appends a new event). `synchronous = NORMAL` is the WAL-recommended
  * setting — durable across a process crash, not across a machine
  * crash, which matches the ADR-0006 "log is the source of truth"
- * property. */
+ * property.
+ *
+ * **Snapshots (M2 item 5b).** `snapshots(revision PRIMARY KEY, source
+ * TEXT, bytes INTEGER, created_at TEXT)` holds the LF-normalised
+ * source text an anchor was made against, content-addressed by
+ * revision hash. The re-anchoring pipeline reads `source` for the
+ * old revision, runs `prepareReanchor(source, currentSource)`, and
+ * (for each thread) reduces the outcome to a `thread.reanchored`
+ * or `thread.orphaned` event. `bytes` is stored so the GC (see
+ * `snapshotBytes()`) can name the total footprint in a log line
+ * without reading every row.
+ *
+ * **Migration.** Every DDL statement is `IF NOT EXISTS`. An
+ * existing DB from a pre-5b daemon has no `snapshots` table and
+ * opens cleanly — the table is created on first `open()`, empty,
+ * and the daemon backfills a snapshot for each existing thread's
+ * anchor as new events land or via lazy refresh on the next GET
+ * (the pipeline orphans if a snapshot is missing, so an already-
+ * stale thread on an already-changed file still transitions
+ * correctly). */
 const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -62,6 +81,12 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
+CREATE TABLE IF NOT EXISTS snapshots (
+  revision TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  bytes INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
 `;
 
 /** Options for the store. `clock` is injected so tests can pin the
@@ -252,4 +277,131 @@ export class SqliteThreadStore implements ThreadStore {
   head(): number {
     return this.#head;
   }
+
+  // ---------- Revision snapshots (M2 item 5b) ----------
+
+  /** Insert (or leave unchanged) the LF-normalised source text for
+   * `revision`. Content-addressed: a second call with the same
+   * `revision` and equal `source` is a no-op (rows are keyed on
+   * `revision`). `source` is stored verbatim — the caller is
+   * responsible for LF normalisation before hashing and inserting;
+   * `revisionOf(source)` in review-core is the one place LF
+   * normalisation happens, so callers should route through the
+   * pair. `bytes` is `Buffer.byteLength(source, "utf8")` (not
+   * `source.length`), so JS surrogate pairs count correctly against
+   * the 5 MiB cap. Returns true when a new row was inserted, false
+   * when the revision was already present.
+   *
+   * **Cap.** The 5 MiB anchor-source cap in `resolveAnchorSource`
+   * already refuses larger files before their revision is computed,
+   * so a snapshot arriving here has passed that gate. This method
+   * does NOT re-check the cap — it is called from the daemon's own
+   * write path, never from user input. */
+  putSnapshot(revision: string, source: string): boolean {
+    // `INSERT OR IGNORE` on a PRIMARY KEY collision keeps content-
+    // addressed dedup cheap. `changes` on the run result tells us
+    // whether we inserted or ignored.
+    const bytes = Buffer.byteLength(source, "utf8");
+    const ts = this.#clock();
+    const result = this.#db
+      .prepare(
+        "INSERT OR IGNORE INTO snapshots (revision, source, bytes, created_at) VALUES (?, ?, ?, ?)",
+      )
+      .run(revision, source, bytes, ts);
+    return result.changes > 0;
+  }
+
+  /** Read the snapshot for `revision`, or undefined if none is
+   * stored. The re-anchoring pipeline calls this with the anchor's
+   * revision to obtain the old source it was made against. */
+  getSnapshot(revision: string): string | undefined {
+    const row = this.#db
+      .query<{ source: string }, [string]>(
+        "SELECT source FROM snapshots WHERE revision = ? LIMIT 1",
+      )
+      .get(revision);
+    return row?.source;
+  }
+
+  /** Total bytes stored in the snapshots table. Diagnostic only —
+   * a log line before/after a GC pass names the delta. */
+  snapshotBytes(): number {
+    const row = this.#db
+      .query<{ total: number | null }, []>("SELECT COALESCE(SUM(bytes), 0) AS total FROM snapshots")
+      .get();
+    return row?.total ?? 0;
+  }
+
+  /** All snapshot revisions currently held, sorted. Diagnostic — the
+   * GC pass computes its delete set inside a transaction and does
+   * not need this. */
+  snapshotRevisions(): string[] {
+    const rows = this.#db
+      .query<{ revision: string }, []>("SELECT revision FROM snapshots ORDER BY revision ASC")
+      .all();
+    return rows.map((row) => row.revision);
+  }
+
+  /** Delete snapshots not in `retain` AND older than the grace
+   * period `graceMs`. Returns the number of rows deleted so the
+   * daemon can log a reclamation size.
+   *
+   * **The race** (PR #45 round-2 nit). `retain` is computed
+   * application-side from the event log (threads are a JS reduction
+   * of events, not a SQL view), so a concurrent `POST /api/threads`
+   * that inserts a fresh snapshot AFTER `retain` was computed but
+   * BEFORE this call runs would otherwise see its snapshot deleted:
+   * the new revision is in the on-disk `snapshots` table but is not
+   * in `retain`. The grace period closes the race: any snapshot
+   * created within `graceMs` of NOW is retained regardless of the
+   * `retain` set, so a fresh POST's snapshot always survives the
+   * next GC round.
+   *
+   * The SELECT + DELETEs run inside ONE `BEGIN IMMEDIATE`
+   * transaction so a `putSnapshot` racing this GC either lands
+   * entirely before or entirely after the sweep — never mid-scan.
+   * `retain` is treated as read-only. */
+  gcSnapshots(retain: ReadonlySet<string>, graceMs: number = DEFAULT_SNAPSHOT_GC_GRACE_MS): number {
+    // Compare against the STORE's own clock, not `Date.now()`, so a
+    // test that pins the clock can drive the grace window
+    // deterministically (PR #45 round-3 nit). The clock returns an
+    // ISO-8601 string; `Date.parse` inverts it.
+    const nowMs = Date.parse(this.#clock());
+    const cutoffMs = nowMs - graceMs;
+    // Turn the retain set into a stable, quoted SQL list. sqlite's
+    // parameterised `IN (?, ?, …)` needs one placeholder per value,
+    // which is awkward at scale; the retain set is small (one
+    // revision per open+resolved+orphaned thread — a few hundred at
+    // most on a realistic project), so building the list in JS and
+    // filtering in-memory is fine. We STILL run the SELECT inside
+    // the transaction so the row set is snapshot-consistent with the
+    // DELETE.
+    const selectStmt = this.#db.query<{ revision: string; created_at: string }, []>(
+      "SELECT revision, created_at FROM snapshots",
+    );
+    const deleteStmt = this.#db.prepare("DELETE FROM snapshots WHERE revision = ?");
+    let deleted = 0;
+    const txn = this.#db.transaction((): void => {
+      const rows = selectStmt.all();
+      for (const row of rows) {
+        if (retain.has(row.revision)) continue;
+        const createdMs = Date.parse(row.created_at);
+        if (Number.isFinite(createdMs) && createdMs > cutoffMs) continue;
+        deleteStmt.run(row.revision);
+        deleted += 1;
+      }
+    });
+    // `bun:sqlite` transactions default to DEFERRED; call
+    // `.immediate()` so we take the write lock at BEGIN and no
+    // concurrent writer sneaks a fresh row in between our SELECT
+    // and DELETEs.
+    txn.immediate();
+    return deleted;
+  }
 }
+
+/** Default grace period for `gcSnapshots`. A snapshot created within
+ * this window is retained regardless of the `retain` set. 30 s is
+ * comfortably wider than the request-plus-refresh round-trip on any
+ * realistic workload. Tests pass `0` to force an immediate sweep. */
+export const DEFAULT_SNAPSHOT_GC_GRACE_MS = 30_000;

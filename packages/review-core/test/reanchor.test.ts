@@ -1172,3 +1172,109 @@ describe("reanchorEvent", () => {
 // Keep the DEFAULT_MIN_MOVE_CONTEXT export exercised so removing it
 // fails at compile time, not only at runtime.
 void DEFAULT_MIN_MOVE_CONTEXT;
+
+// ---------- Round-6 carry-over: deep-freeze on ReanchorContext ----------
+
+describe("prepareReanchor — deep-freeze of the shared context", () => {
+  test("MUTATION: diffs and line-index arrays are frozen (splice / push refused)", async () => {
+    // A concurrent `reanchorWith` batch (item 5b's daemon path) must
+    // never observe a mutated diff or a spliced line index. The
+    // freeze is what enforces that at runtime; without it, a buggy
+    // consumer could corrupt classification silently. Assert that
+    // the frozen state is genuine, not shallow-frozen.
+    const oldSrc = "line 1\nline 2\nline 3\n";
+    const newSrc = "line 1\nline 2 edited\nline 3\n";
+    const ctx = await prepareReanchor(oldSrc, newSrc);
+    expect(Object.isFrozen(ctx)).toBe(true);
+    expect(Object.isFrozen(ctx.diffs)).toBe(true);
+    expect(Object.isFrozen(ctx.oldLineIndex)).toBe(true);
+    expect(Object.isFrozen(ctx.newLineIndex)).toBe(true);
+    // Every diff tuple frozen too — otherwise a splice of the tuple's
+    // op or text would still corrupt the pipeline in place.
+    for (const diff of ctx.diffs) expect(Object.isFrozen(diff)).toBe(true);
+    // Mutation attempts either throw (strict mode, as bun test runs)
+    // or are silently no-op'd. Both are acceptable; the assertion is
+    // that the read after the attempt reflects NO mutation.
+    const originalDiffLen = ctx.diffs.length;
+    const originalFirstLine = ctx.oldLineIndex[0];
+    try {
+      (ctx.diffs as unknown as Array<[number, string]>).push([0, "nope"]);
+    } catch {
+      // Frozen — throws.
+    }
+    try {
+      (ctx.oldLineIndex as unknown as number[]).push(999);
+    } catch {
+      // Frozen — throws.
+    }
+    expect(ctx.diffs.length).toBe(originalDiffLen);
+    expect(ctx.oldLineIndex[0]).toBe(originalFirstLine);
+  });
+});
+
+// ---------- Round-6 carry-over: M3 same-paragraph documented behaviour ----------
+
+// The reviewer's "M3" thought experiment (round-6 carry-over): given
+//
+//   OLD: `A the key is set here. B. C.`
+//   NEW: `A. B. Later the key is set elsewhere. C.`
+//
+// what should happen to an anchor on "the key is set"? The engine
+// follows the DIFF (ADR-0006 amendment 2026-09-30). `diff_main`
+// identifies `the key is set ` as an EQUAL segment — the same
+// character sequence lives in both sources — so `classifySpan`
+// returns `unchanged` for the anchor's span, and the pipeline maps
+// the anchor through `diff_xIndex` to its new offset. The boundary-
+// class check passes (both boundaries are mid-line: space + space
+// before, space + space after), so the pipeline emits
+// `kind: "moved"`, `method: "quote-exact"`.
+//
+// This is the "diff decides WHERE" principle in action: the diff
+// proved the phrase moved intact from one sentence to another, and
+// the pipeline follows that mechanical fact. It does NOT reason
+// about paragraph semantics (which would be a rewrite where a
+// human might disagree with the outcome). The line range in the
+// rebuilt anchor reflects the new position; the prefix/suffix are
+// recut around it. A subsequent rebuild sees a coherent anchor.
+//
+// Documented so anyone reading the reviewer's M3 note against
+// tomorrow's diff engine change knows exactly which behaviour is
+// contracted and which is emergent.
+
+describe("reanchor — M3 same-paragraph documented behaviour", () => {
+  test("phrase moves via diff — pipeline follows via quote-exact, records new offset", async () => {
+    const OLD = "A the key is set here. B. C.\n";
+    const NEW = "A. B. Later the key is set elsewhere. C.\n";
+    const oldQuote = "the key is set";
+    const oldStart = OLD.indexOf(oldQuote);
+    const oldEnd = oldStart + oldQuote.length;
+    const anchor = await partialAnchorForSource(
+      "docs/m3.md",
+      OLD,
+      oldStart,
+      oldEnd,
+      8,
+    );
+    const result = await reanchor(anchor, OLD, NEW);
+    // The pipeline follows the diff — kind is "moved" (the
+    // physical phrase moved), method is "quote-exact" (no fuzzy
+    // score was needed).
+    expect(result.kind).toBe("moved");
+    if (result.kind !== "moved") return;
+    expect(result.method).toBe("quote-exact");
+    // The rebuilt anchor points at the phrase in the new source,
+    // and the recut prefix/suffix reflect its new context.
+    expect(result.anchor.quote.exact).toBe(oldQuote);
+    const newIndex = NEW.indexOf(oldQuote);
+    // buildAnchor slices context around startOffset — the
+    // recut prefix ends where the phrase begins.
+    expect(NEW.slice(newIndex - result.anchor.quote.prefix.length, newIndex))
+      .toBe(result.anchor.quote.prefix);
+    // Line number is 1 in both (single-line file); the mechanism is
+    // the same on multi-line prose.
+    expect(result.anchor.startLine).toBe(1);
+    // Coherent-anchor invariant holds by the general fixture; this
+    // repeats it locally for the M3 note's readers.
+    expectCoherent(result, NEW);
+  });
+});

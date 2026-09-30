@@ -166,7 +166,11 @@ describe("reducer: unanchored anchor → thread starts orphaned", () => {
     expect(second.ok).toBe(false);
   });
 
-  test("a subsequent thread.resolved is refused (not open)", () => {
+  test("a subsequent thread.resolved from `orphaned` IS accepted (issue #46 item 4)", () => {
+    // Previously (round-5) refused: `orphaned → resolved` wasn't
+    // a legal transition, so a human couldn't dismiss an
+    // imported-orphaned thread. Issue #46 item 4 opens it up so
+    // the human decision reaches the log.
     const state = emptyLogState();
     validateNext(
       state,
@@ -181,6 +185,7 @@ describe("reducer: unanchored anchor → thread starts orphaned", () => {
         body: "b",
       }),
     );
+    expect(state.threads.get("T1")?.status).toBe("orphaned");
     const res = validateNext(
       state,
       reviewEventSchema.parse({
@@ -192,7 +197,9 @@ describe("reducer: unanchored anchor → thread starts orphaned", () => {
         resolution: "late",
       }),
     );
-    expect(res.ok).toBe(false);
+    expect(res.ok).toBe(true);
+    expect(state.threads.get("T1")?.status).toBe("resolved");
+    expect(state.threads.get("T1")?.resumeStatus).toBe("orphaned");
   });
 });
 

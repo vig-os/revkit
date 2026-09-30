@@ -34,12 +34,34 @@ interface RailAuthor {
   readonly id: string;
   readonly displayName?: string;
 }
-interface RailAnchor {
+/** A line anchor — the shape existing threads carry. `kind` is
+ * absent on the wire for backward compat. */
+interface RailLineAnchor {
+  readonly kind?: "line";
   readonly path: string;
   readonly startLine: number;
   readonly endLine: number;
   readonly quote: { readonly exact: string; readonly prefix: string; readonly suffix: string };
   readonly revision: string;
+}
+/** An unanchored anchor — issue #46 item 5. Imported threads
+ * whose source content couldn't be fetched carry this shape.
+ * The rail renders these under the file with a file-level
+ * label; no `L<n>-L<m>` (which would print `Lundefined`). */
+interface RailUnanchoredAnchor {
+  readonly kind: "unanchored";
+  readonly path: string;
+  readonly originalStartLine?: number;
+  readonly originalEndLine?: number;
+}
+type RailAnchor = RailLineAnchor | RailUnanchoredAnchor;
+/** True when `anchor` carries `startLine`/`endLine`/`quote` — i.e.
+ * a line-anchored thread. `kind === "unanchored"` (or the
+ * absence of `startLine`) puts a thread in the file-level path,
+ * where none of `L<n>-L<m>`, `focusAnchor`, or the quote are
+ * used. */
+function isRailLineAnchor(anchor: RailAnchor): anchor is RailLineAnchor {
+  return anchor.kind !== "unanchored" && typeof (anchor as RailLineAnchor).startLine === "number";
 }
 interface RailComment {
   readonly id: string;
@@ -50,9 +72,24 @@ interface RailComment {
 }
 interface RailThread {
   readonly id: string;
-  readonly status: "open" | "resolved";
+  /** `orphaned` (M2 item 5b + issue #46): the re-anchoring pipeline
+   * could not find the thread on a later revision (ADR-0006), OR
+   * the thread was imported from GitHub without an anchor (PR #43,
+   * `anchor.kind === "unanchored"`). The thread is kept, still
+   * repliable / resolvable, and surfaced in the orphan panel with
+   * a "was at L…" note (line-anchored) or a file-level line
+   * (unanchored). A subsequent `thread.reanchored` unorphans it
+   * back to `open`. */
+  readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: RailAnchor;
   readonly comments: readonly RailComment[];
+  /** Reason string projected from the pipeline's
+   * `thread.orphaned.reason` or, for a thread born unanchored,
+   * `comment.created.orphanReason`. Read by the orphan panel so
+   * the human sees WHY the anchor was lost — the pipeline's own
+   * account rather than a synthesised sentence. Absent when no
+   * reason was supplied. (PR #45 round-2 + issue #46 item 3.) */
+  readonly orphanReason?: string;
 }
 interface RailListResponse {
   readonly threads: readonly RailThread[];
@@ -91,20 +128,36 @@ async function revisionHex(text: string): Promise<string> {
  * open elsewhere. */
 async function fetchThreads(): Promise<RailListResponse> {
   const paths = collectPagePaths();
+  // Ask for both open AND orphaned threads on THIS page. The rail
+  // renders open threads inline against the block they anchor to,
+  // and orphaned threads in the dedicated panel (M2 item 5b).
+  // Resolved threads are not surfaced here (the review is over) —
+  // an orphaned thread that gets re-anchored becomes `open` again
+  // via the reducer's un-orphan rule (ADR-0006 amendment).
+  const statusFilter = "open,orphaned";
   if (paths.length === 0) {
-    const response = await fetch("/api/threads", {
-      credentials: "same-origin",
-      headers: { accept: "application/json" },
-    });
+    const response = await fetch(
+      "/api/threads?status=" + encodeURIComponent(statusFilter),
+      {
+        credentials: "same-origin",
+        headers: { accept: "application/json" },
+      },
+    );
     if (!response.ok) throw new Error(`GET /api/threads failed: ${response.status}`);
     return (await response.json()) as RailListResponse;
   }
   const responses = await Promise.all(
     paths.map((path) =>
-      fetch("/api/threads?path=" + encodeURIComponent(path), {
-        credentials: "same-origin",
-        headers: { accept: "application/json" },
-      }).then(async (r) => {
+      fetch(
+        "/api/threads?path=" +
+          encodeURIComponent(path) +
+          "&status=" +
+          encodeURIComponent(statusFilter),
+        {
+          credentials: "same-origin",
+          headers: { accept: "application/json" },
+        },
+      ).then(async (r) => {
         if (!r.ok) throw new Error(`GET /api/threads?path=${path} failed: ${r.status}`);
         return (await r.json()) as RailListResponse;
       }),
@@ -241,7 +294,13 @@ function subscribeEvents(onBump: () => void): () => void {
           event.kind === "comment.created" ||
           event.kind === "comment.replied" ||
           event.kind === "thread.resolved" ||
-          event.kind === "thread.reopened"
+          event.kind === "thread.reopened" ||
+          // M2 item 5b: re-anchor + orphan events move a thread to a
+          // new block (or to the orphan panel) without a page reload.
+          // Same refetch strategy — cheap, keeps the rail's model of
+          // the world identical to the daemon's authoritative state.
+          event.kind === "thread.reanchored" ||
+          event.kind === "thread.orphaned"
         ) {
           onBump();
         }
@@ -270,6 +329,10 @@ function subscribeEvents(onBump: () => void): () => void {
  * `anchor.path:start-end`. Used to scroll a thread's anchor into view
  * when the reviewer opens it in the rail. */
 function findBlockForAnchor(anchor: RailAnchor): HTMLElement | undefined {
+  // Issue #46 item 5: an unanchored anchor has no line range —
+  // nothing on the page to scroll to. Skip the DOM lookup rather
+  // than emit `docs/x.mdx:undefined-undefined`.
+  if (!isRailLineAnchor(anchor)) return undefined;
   const wanted = `${anchor.path}:${anchor.startLine}-${anchor.endLine}`;
   const el = document.querySelector<HTMLElement>(`[data-src="${cssEscape(wanted)}"]`);
   return el ?? undefined;
@@ -289,9 +352,13 @@ function cssEscape(value: string): string {
  * complementary region (ADR-0017). */
 function Rail(): JSX.Element {
   const [threads, { refetch }] = createResource(fetchThreads);
+  // The composer builds a fresh line anchor from the reviewer's
+  // selection; nothing in this path is ever unanchored. Type as
+  // `RailLineAnchor` so `.startLine` / `.endLine` type-check
+  // without narrowing.
   const [composerAnchor, setComposerAnchor] = createSignal<{
     readonly element: HTMLElement;
-    readonly anchor: RailAnchor;
+    readonly anchor: RailLineAnchor;
     readonly quote: string;
   } | undefined>(undefined);
   const [error, setError] = createSignal<string | undefined>(undefined);
@@ -315,9 +382,11 @@ function Rail(): JSX.Element {
   // affordance is where the eye is. Second, the `c` keyboard
   // shortcut and the "comment on selection" button inside the rail
   // panel (both wired up further down).
+  // Selection always builds a fresh LINE anchor from the reviewer's
+  // range in the DOM — nothing on this path is ever unanchored.
   const [selection, setSelection] = createSignal<{
     readonly block: HTMLElement;
-    readonly anchor: RailAnchor;
+    readonly anchor: RailLineAnchor;
     readonly quote: string;
     readonly rect: { readonly top: number; readonly left: number; readonly width: number; readonly height: number };
   } | undefined>(undefined);
@@ -594,7 +663,7 @@ function Rail(): JSX.Element {
         })()}
       </Show>
       <ol class="revkit-rail__threads" aria-live="polite" data-testid="revkit-rail-threads">
-        <For each={threads()?.threads ?? []}>
+        <For each={openThreadsFor(threads())}>
           {(thread: RailThread) => (
             <li
               class={`revkit-rail__thread revkit-rail__thread--${thread.status}`}
@@ -605,9 +674,26 @@ function Rail(): JSX.Element {
                 type="button"
                 class="revkit-rail__thread-anchor"
                 onClick={() => focusAnchor(thread.anchor)}
+                data-anchor-kind={isRailLineAnchor(thread.anchor) ? "line" : "unanchored"}
               >
                 <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
-                <span class="revkit-rail__thread-lines">L{thread.anchor.startLine}–{thread.anchor.endLine}</span>
+                <Show
+                  when={isRailLineAnchor(thread.anchor)}
+                  fallback={
+                    // Issue #46 item 5: an unanchored thread renders a
+                    // file-level label, never `Lundefined`. The
+                    // orphan reason (`diffhunk-mismatch`, `binary`, …)
+                    // rides beside it when present, so the reviewer
+                    // sees WHY the anchor was lost.
+                    <span class="revkit-rail__thread-lines revkit-rail__thread-lines--file">
+                      (file-level{thread.orphanReason !== undefined ? ` — ${thread.orphanReason}` : ""})
+                    </span>
+                  }
+                >
+                  <span class="revkit-rail__thread-lines">
+                    L{(thread.anchor as RailLineAnchor).startLine}–{(thread.anchor as RailLineAnchor).endLine}
+                  </span>
+                </Show>
               </button>
               <ol class="revkit-rail__comments">
                 <For each={thread.comments}>
@@ -682,10 +768,194 @@ function Rail(): JSX.Element {
           )}
         </For>
       </ol>
-      <Show when={(threads()?.threads.length ?? 0) === 0}>
+      <Show when={openThreadsFor(threads()).length === 0}>
         <p class="revkit-rail__empty" data-testid="revkit-rail-empty">No open threads yet.</p>
       </Show>
+      <Show when={orphanedThreadsFor(threads()).length > 0}>
+        {/* Orphan panel (M2 item 5b, story A8). Lists threads the
+            re-anchoring pipeline could not find on the current
+            revision, with the original quote, the file, the "was at
+            L…" note, and the pipeline's reason. Orphaned threads
+            stay repliable and resolvable — the human/agent can
+            still act on them; they just aren't tied to a
+            currently-rendered block. Keyboard-accessible via the
+            same button tab order as open threads. axe: labelled
+            landmark region with `aria-label`. */}
+        <section
+          class="revkit-rail__orphans"
+          aria-label="orphaned review threads"
+          data-testid="revkit-rail-orphans"
+        >
+          <h3 class="revkit-rail__orphans-title">
+            Orphaned threads
+            <span class="revkit-rail__orphans-count" aria-label="count">
+              {" "}({orphanedThreadsFor(threads()).length})
+            </span>
+          </h3>
+          <ol class="revkit-rail__orphans-list">
+            <For each={orphanedThreadsFor(threads())}>
+              {(thread: RailThread) => (
+                <li
+                  class="revkit-rail__thread revkit-rail__thread--orphaned"
+                  data-thread-id={thread.id}
+                  data-testid="revkit-rail-orphan"
+                >
+                  <p class="revkit-rail__thread-anchor revkit-rail__thread-anchor--orphaned">
+                    <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
+                    <Show
+                      when={isRailLineAnchor(thread.anchor)}
+                      fallback={
+                        <span
+                          class="revkit-rail__thread-lines revkit-rail__thread-lines--file"
+                          data-testid="revkit-rail-orphan-file-scope"
+                        >
+                          (file-level — no source location)
+                        </span>
+                      }
+                    >
+                      {(() => {
+                        const la = thread.anchor as RailLineAnchor;
+                        return (
+                          <span class="revkit-rail__thread-lines">
+                            was at L{la.startLine}–{la.endLine}
+                          </span>
+                        );
+                      })()}
+                    </Show>
+                  </p>
+                  <Show when={isRailLineAnchor(thread.anchor)}>
+                    {(() => {
+                      const la = thread.anchor as RailLineAnchor;
+                      return (
+                        <blockquote class="revkit-rail__orphan-quote" aria-label="original quote">
+                          "{la.quote.exact}"
+                        </blockquote>
+                      );
+                    })()}
+                  </Show>
+                  <p class="revkit-rail__orphan-reason" data-testid="revkit-rail-orphan-reason">
+                    {orphanReasonFor(thread)}
+                  </p>
+                  <ol class="revkit-rail__comments">
+                    <For each={thread.comments}>
+                      {(comment: RailComment) => (
+                        <li class="revkit-rail__comment">
+                          <p class="revkit-rail__author">
+                            <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
+                            <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
+                          </p>
+                          <p class="revkit-rail__body">{comment.body}</p>
+                        </li>
+                      )}
+                    </For>
+                  </ol>
+                  <div class="revkit-rail__thread-actions">
+                    <Show
+                      when={replyDraftFor() === thread.id}
+                      fallback={
+                        <>
+                          <button
+                            type="button"
+                            class="revkit-rail__reply"
+                            data-testid="revkit-rail-orphan-reply"
+                            onClick={() => setReplyDraftFor(thread.id)}
+                          >reply</button>
+                          <button
+                            type="button"
+                            class="revkit-rail__resolve"
+                            data-testid="revkit-rail-orphan-resolve"
+                            onClick={() => void doResolve(thread)}
+                          >resolve</button>
+                        </>
+                      }
+                    >
+                      <form
+                        class="revkit-rail__reply-form"
+                        onSubmit={(event: SubmitEvent): void => {
+                          event.preventDefault();
+                          const form = event.currentTarget as HTMLFormElement;
+                          const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+                          if (textarea === null || textarea.value.trim().length === 0) return;
+                          void submitReply(thread, textarea.value.trim());
+                        }}
+                      >
+                        <label class="revkit-rail__label">
+                          <span class="revkit-rail__label-text">Reply</span>
+                          <textarea
+                            required
+                            rows="2"
+                            data-testid="revkit-rail-orphan-reply-input"
+                            aria-label="reply body"
+                          ></textarea>
+                        </label>
+                        <div class="revkit-rail__actions">
+                          <button
+                            type="button"
+                            class="revkit-rail__cancel"
+                            onClick={() => setReplyDraftFor(undefined)}
+                          >cancel</button>
+                          <button
+                            type="submit"
+                            class="revkit-rail__submit"
+                            data-testid="revkit-rail-orphan-reply-submit"
+                          >post reply</button>
+                        </div>
+                      </form>
+                    </Show>
+                  </div>
+                </li>
+              )}
+            </For>
+          </ol>
+        </section>
+      </Show>
     </aside>
+  );
+}
+
+/** Partition helper — open threads only (the main list). Kept out
+ * of the JSX to make the count-check in the `Show` block below
+ * readable. */
+function openThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
+  if (response === undefined) return [];
+  return response.threads.filter((thread) => thread.status === "open");
+}
+
+/** Partition helper — orphaned threads only (the orphan panel).
+ * See M2 item 5b: an orphan is a thread the re-anchor pipeline
+ * could not place on the current revision. */
+function orphanedThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
+  if (response === undefined) return [];
+  return response.threads.filter((thread) => thread.status === "orphaned");
+}
+
+/** Render the orphan panel's reason line. Priority order:
+ *
+ *   1. The pipeline's own reason from the reducer (Thread.
+ *      orphanReason, plumbed through from thread.orphaned's payload
+ *      — PR #45 round-2 fix). This is the diff engine's account of
+ *      WHY the anchor was lost ("block deleted; no move detected."
+ *      or "modified: quote similarity 0.32 < gate 0.4."), which is
+ *      what the human actually needs.
+ *   2. A generic fallback for backwards-compat: an orphan event
+ *      without a reason (from an older daemon) still gets a
+ *      readable line. */
+function orphanReasonFor(thread: RailThread): string {
+  if (thread.orphanReason !== undefined && thread.orphanReason.length > 0) {
+    return thread.orphanReason;
+  }
+  if (!isRailLineAnchor(thread.anchor)) {
+    // Unanchored thread with no supplied reason — the pipeline
+    // couldn't map it to a source range at all.
+    return (
+      `This thread has no source location under ${thread.anchor.path}. ` +
+      `The thread is kept — reply or resolve it here.`
+    );
+  }
+  return (
+    `The quoted text no longer appears at ${thread.anchor.path}:` +
+    `L${thread.anchor.startLine}–${thread.anchor.endLine}. ` +
+    `The thread is kept — reply or resolve it here.`
   );
 }
 

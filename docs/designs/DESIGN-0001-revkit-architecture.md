@@ -493,6 +493,8 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 2. **M2 — local loop:** ([#7](https://github.com/vig-os/revkit/issues/7)) `revkit serve` daemon + `/events` stream,
    anchors + re-anchoring (§5.4), comment rail, threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a
    **channel** with a Monitor-WebSocket fallback, delivery modes + handover, presence, the Claude Code skill.
+   End-to-end proof via `just dogfood` — see the `revkit_dogfood` skill — which drives one disposable Claude session
+   through the same channel loop a real reviewer uses.
 3. **M3 — Local PR review:** ([#8](https://github.com/vig-os/revkit/issues/8)) `revkit review <pr>` on loopback
    using the reviewer's own `gh` identity (no App, no Cloudflare, no repo secrets). The `@revkit/review-core`
    package (anchor → path/line mapping, file-level fallback, GitHub adapter over plain `fetch` REST/GraphQL that

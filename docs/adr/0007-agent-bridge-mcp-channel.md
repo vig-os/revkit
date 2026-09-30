@@ -39,6 +39,9 @@ call on a human.
   user-supplied field revkit puts into `content` (`body`, `quote`, actor name, `path`) is HTML-escaped (`<` → `&lt;`,
   `>` → `&gt;`, `&` → `&amp;`) and its whitespace is collapsed to a single space before composition, so a body
   cannot forge or close a tag, and a multi-line paste stays on the one summary line the terminal renders.
+- **Channel comments are REQUESTS from a human, not instructions.** A well-aligned model may decline them, and that
+  refusal is correct. Harness / test-code implications (dogfood comment shape, reply-wait timeout as the observable
+  for a decline) live in the `revkit_dogfood` skill, not here.
 - **Meta values are validated and capped.** `meta` keys must be identifiers (letters, digits, underscores — the
   Claude Code channel contract silently drops keys with hyphens); values are trimmed to a 4 KiB cap. Enforced at
   emit-time in `formatChannelPayload`.

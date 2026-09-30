@@ -89,9 +89,18 @@ describe("buildCspHeader — directive shape", () => {
     expect(csp["style-src"]).toEqual(["'self'", "'unsafe-inline'"]);
   });
 
-  test("worker-src is 'self' (pagefind's search Worker)", () => {
-    const csp = parseCsp(buildCspHeader(ctxWith()));
-    expect(csp["worker-src"]).toEqual(["'self'"]);
+  test("worker-src is path-scoped to /pagefind/ on BOTH loopback aliases (M2 item 5b: closes the 'any Worker' hole)", () => {
+    const csp = parseCsp(buildCspHeader(ctxWith({ port: 42421 })));
+    // Path-scope means: only pages under `/pagefind/` may become a
+    // Worker script. `worker-src 'self'` (the previous shape) would
+    // let a stored HTML instantiate `new Worker("/-/anything.js")`.
+    expect(csp["worker-src"]).toEqual([
+      "http://127.0.0.1:42421/pagefind/",
+      "http://localhost:42421/pagefind/",
+    ]);
+    // Sanity: the bare 'self' keyword is gone — a mutation that
+    // widens it back would trip this.
+    expect(csp["worker-src"]).not.toContain("'self'");
   });
 
   test("img-src is 'self' + data: + github avatars (ADR-0012 verbatim)", () => {
@@ -134,7 +143,7 @@ describe("buildCspHeader — directive shape", () => {
       "img-src 'self' data: https://avatars.githubusercontent.com; " +
       "font-src 'self'; " +
       "connect-src 'self' ws://127.0.0.1:4321 ws://localhost:4321; " +
-      "worker-src 'self'; " +
+      "worker-src http://127.0.0.1:4321/pagefind/ http://localhost:4321/pagefind/; " +
       "frame-ancestors 'none'; " +
       "base-uri 'none'; " +
       "form-action 'self'; " +

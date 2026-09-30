@@ -112,6 +112,14 @@ export interface ChannelServerOptions {
   readonly reconnectToolDeadlineMs?: number;
   /** Test hook: sleep function (ms). */
   readonly sleep?: (ms: number) => Promise<void>;
+  /** Test hook: pre-seed the prime step's threads listing. When
+   * set, `primeAndSubscribe` uses this value instead of calling
+   * `currentClient.listThreads()`. Only used by tests that need to
+   * exercise the tool-call path without a real daemon-side listing
+   * (e.g. the 401-triggers-reconnect scenario, where the initial
+   * client's bearer is stale and would 403 at `/api/threads`
+   * before the tool is ever invoked). */
+  readonly initialListing?: { readonly threads: readonly unknown[]; readonly head: number };
 }
 
 /** One running channel server. `stop()` is idempotent and closes
@@ -228,15 +236,39 @@ interface WireComment {
   readonly author?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   readonly body: string;
 }
+/** A minimal duck type for the wire thread the daemon exposes.
+ * Issue #46 item 5: an anchor may be `line` (start/end present)
+ * OR `unanchored` (start/end absent, `kind: "unanchored"` set).
+ * The formatter guards on the presence of `startLine`/`endLine`
+ * so an imported unanchored thread never emits `L:undefined-undefined`. */
 interface WireThread {
   readonly id: string;
-  readonly status: "open" | "resolved";
+  /** Issue #46 item 5: `orphaned` is a real state (round-5;
+   * PR #45 renders the panel). The channel skips orphaned threads
+   * from the catch-up summary — they are handled by the rail's
+   * orphan panel, not the agent. */
+  readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: {
+    readonly kind?: "line" | "unanchored";
     readonly path: string;
-    readonly startLine: number;
-    readonly endLine: number;
+    readonly startLine?: number;
+    readonly endLine?: number;
+    readonly originalStartLine?: number;
+    readonly originalEndLine?: number;
   };
   readonly comments: readonly WireComment[];
+}
+
+/** Return `"<start>-<end>"` when both bounds are known integers, or
+ * `undefined` when either is absent (unanchored / imported thread).
+ * Callers render a file-level suffix in the undefined case rather
+ * than emit `undefined-undefined` (issue #46 item 5). */
+function renderAnchorRange(anchor: {
+  readonly startLine?: number;
+  readonly endLine?: number;
+}): string | undefined {
+  if (typeof anchor.startLine !== "number" || typeof anchor.endLine !== "number") return undefined;
+  return `${anchor.startLine}-${anchor.endLine}`;
 }
 
 /** Emit a compact "N thread(s) waiting on the agent" summary when
@@ -254,6 +286,9 @@ export function formatCatchupSummary(
   threads: readonly WireThread[],
 ): ChannelPayload | undefined {
   const waiting = threads.filter((thread) => {
+    // Issue #46 item 5: `resolved` and `orphaned` threads never
+    // wait on the agent — resolved is terminal, orphaned is
+    // shown by the rail's own orphan panel.
     if (thread.status !== "open") return false;
     const last = thread.comments[thread.comments.length - 1];
     if (last === undefined) return false;
@@ -264,8 +299,13 @@ export function formatCatchupSummary(
   const lines = sample.map((thread) => {
     const safeId = escapeContentFragment(thread.id);
     const safePath = escapeContentFragment(thread.anchor.path);
-    const range = `${thread.anchor.startLine}-${thread.anchor.endLine}`;
-    return `- ${safeId} at ${safePath}:${range}`;
+    // Issue #46 item 5: guard against `L:undefined-undefined` on
+    // an imported unanchored thread. An unanchored anchor has no
+    // `startLine`/`endLine`; render a file-level suffix instead.
+    const range = renderAnchorRange(thread.anchor);
+    return range === undefined
+      ? `- ${safeId} at ${safePath} (file-level)`
+      : `- ${safeId} at ${safePath}:${range}`;
   });
   const more = waiting.length > sample.length
     ? `\n(+${waiting.length - sample.length} more)`
@@ -301,11 +341,30 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     "comment.replied",
     "thread.resolved",
     "thread.reopened",
+    // M2 item 5b: the daemon's re-anchoring pipeline emits
+    // `thread.reanchored` and `thread.orphaned` events. The channel
+    // client passes them through so the agent knows a thread it was
+    // tracking moved to a new position or lost its anchor — a short
+    // notice is enough for the agent to update its own state or
+    // reopen the thread with a diagnostic.
+    "thread.reanchored",
+    "thread.orphaned",
   ]);
   if (!relevantKinds.has(kind)) return undefined;
   const actor = event.actor as { readonly kind?: string; readonly id?: string; readonly displayName?: string } | undefined;
   if (actor === undefined) return undefined;
-  if (actor.kind === "agent") return undefined;
+  // The daemon's re-anchor actor is `{ kind: "agent", id: "revkit-reanchor" }`
+  // (see `reanchor-daemon.ts`). Its events are the ONE agent-kind
+  // event we surface to the channel — a human is not producing
+  // re-anchor events, so the general "hide agent echoes" rule would
+  // otherwise drop them. For non-reanchor kinds, keep the original
+  // "skip agent" behaviour (Claude does not need to hear about its
+  // own reply landing).
+  const isReanchorSystemEvent =
+    (kind === "thread.reanchored" || kind === "thread.orphaned") &&
+    actor.kind === "agent" &&
+    actor.id === "revkit-reanchor";
+  if (!isReanchorSystemEvent && actor.kind === "agent") return undefined;
   const threadId = typeof event.threadId === "string" ? event.threadId : undefined;
   const anchor = event.anchor as
     | { readonly path?: string; readonly startLine?: number; readonly endLine?: number }
@@ -343,6 +402,9 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
   let content: string;
   switch (kind) {
     case "comment.created":
+      // Issue #46 item 5: `?-?` is preferable to a literal
+      // `undefined-undefined`; keep the "?" fallback for unanchored
+      // shapes and null coalesce the anchor object itself too.
       content = safeBody !== undefined
         ? `New comment on ${safePath}:${startLine ?? "?"}-${endLine ?? "?"} from ${safeActor} — ${safeBody}`
         : `New comment on ${safePath} from ${safeActor}.`;
@@ -358,6 +420,37 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     case "thread.reopened":
       content = `Thread ${safeThreadId} reopened by ${safeActor}.`;
       break;
+    case "thread.reanchored": {
+      // The pipeline may re-anchor a previously-orphaned thread
+      // (un-orphan) OR move an open thread to a new position. Both
+      // shapes carry a fresh anchor; the difference is context the
+      // channel client doesn't have here (would need to look up the
+      // previous status). Compose a single message that names the
+      // new location — the agent can react regardless.
+      const rawMethod = (event as unknown as { method?: unknown }).method;
+      const method =
+        typeof rawMethod === "string" ? escapeContentFragment(rawMethod) : "quote-exact";
+      content =
+        `Thread ${safeThreadId} re-anchored (${method}) — now at ` +
+        `${safePath}:${startLine ?? "?"}-${endLine ?? "?"}.`;
+      break;
+    }
+    case "thread.orphaned": {
+      // The pipeline could not place the thread on the current
+      // revision. The reason is untrusted (composed from the diff
+      // pipeline's own strings, but it lands in a channel content
+      // string that Claude Code wraps in a tag). Escape it.
+      const rawReason = (event as unknown as { reason?: unknown }).reason;
+      const reason =
+        typeof rawReason === "string"
+          ? escapeContentFragment(rawReason)
+          : "quoted text no longer at its recorded location";
+      put("kind", "reanchor_orphan");
+      content =
+        `Thread ${safeThreadId} orphaned — ${reason}. ` +
+        `The thread is kept and remains repliable / resolvable.`;
+      break;
+    }
     default:
       return undefined;
   }
@@ -474,15 +567,23 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       // as the tool's own error — reconnecting would not help and
       // would mask the real message from the caller (PR #38
       // round-3 review: reconnect only on transport / 5xx).
-      if (error instanceof DaemonHttpError && error.status >= 400 && error.status < 500) {
+      //
+      // EXCEPTION: a 401 means our BEARER is stale. A daemon that
+      // died and restarted on the SAME loopback port mints a fresh
+      // agentToken, so the client we still hold rejects us with 401
+      // even though the request itself was well-formed. This IS a
+      // "reconnect and re-discover" signal — the round-4 review
+      // spotted this hole. Fall through to the reconnect path.
+      if (error instanceof DaemonHttpError && error.status >= 400 && error.status < 500 && error.status !== 401) {
         return {
           isError: true,
           content: [{ type: "text", text: `revkit mcp: tool '${toolName}' rejected by daemon (${error.status}): ${error.body || error.message}` }],
         };
       }
-      // Transport failures (fetch rejected) and 5xx: the daemon
-      // is unavailable or errored server-side; reconnect ONCE
-      // within the bounded deadline. The background subscriber
+      // Transport failures (fetch rejected), 401 (fresh daemon at
+      // the same URL → stale bearer), and 5xx: the daemon is
+      // unavailable, restarted, or errored server-side; reconnect
+      // ONCE within the bounded deadline. The background subscriber
       // keeps trying with capped backoff.
       if (options.discover !== undefined && !stopped) {
         try {
@@ -537,8 +638,11 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   const primeAndSubscribe = async (): Promise<void> => {
     // 1. Fetch the current state — gives us `head` and the open
-    //    threads for the catchup decision.
-    const listing = await currentClient.listThreads();
+    //    threads for the catchup decision. Tests may pre-seed via
+    //    `initialListing` (round-4 401-reconnect scenario).
+    const listing = options.initialListing !== undefined
+      ? { threads: options.initialListing.threads, head: options.initialListing.head }
+      : await currentClient.listThreads();
     lastSeenSeq = listing.head ?? 0;
     const summary = formatCatchupSummary(listing.threads as readonly WireThread[]);
     if (summary !== undefined) {

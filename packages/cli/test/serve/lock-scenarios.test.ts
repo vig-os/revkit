@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, re
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { acquireAndPublish, daemonLockPath, findRunningDaemon, readServeState } from "../../src/serve/serve-state.ts";
+import { registerDaemonPid, unregisterDaemonPid } from "../helpers/daemon-registry.ts";
 
 const cliBin = resolve(import.meta.dirname, "..", "..", "bin", "revkit.js");
 
@@ -25,13 +26,27 @@ function tmpRepo(): string {
 
 /** Spawn a `revkit serve --port 0 --dir <root>` subprocess. Returns
  * when stdout advertises "listening on http://…" — or throws on
- * exit / timeout. The `env` override supports the HTTP_PROXY test. */
+ * exit / timeout. The `env` override supports the HTTP_PROXY test.
+ *
+ * PR #38 round-4 review nits B + C: every real spawn here registers
+ * its pid with the shared `daemon-registry` so `daemon-hygiene.test.ts`
+ * detects a leftover child that a `finally` block missed, and
+ * unregisters on the child's `exit` event so a recycled OS pid the
+ * kernel later hands to something unrelated is never SIGTERMed by
+ * the sweep. */
 async function spawnDaemon(root: string, env: NodeJS.ProcessEnv = {}): Promise<{ proc: ChildProcess; port: number; stdout: string; stderr: string }> {
   const proc = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", root], {
     cwd: root,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, ...env },
   });
+  if (typeof proc.pid === "number") {
+    registerDaemonPid(proc.pid);
+    // Unregister on the child's own `exit` — the sweep must not chase
+    // a pid the OS may have recycled to an unrelated process.
+    const pid = proc.pid;
+    proc.on("exit", () => unregisterDaemonPid(pid));
+  }
   const buffers = { stdout: "", stderr: "" };
   proc.stdout?.on("data", (c: Buffer) => (buffers.stdout += c.toString("utf8")));
   proc.stderr?.on("data", (c: Buffer) => (buffers.stderr += c.toString("utf8")));
@@ -52,6 +67,25 @@ async function spawnDaemon(root: string, env: NodeJS.ProcessEnv = {}): Promise<{
   });
   if ("error" in listen) throw new Error(listen.error);
   return { proc, port: listen.port, stdout: buffers.stdout, stderr: buffers.stderr };
+}
+
+/** `spawn(...)` a `revkit serve` that we EXPECT to fail (lock is
+ * held). Same registry discipline as `spawnDaemon` — the OS still
+ * hands us a pid before the child exits, so we bookmark it and
+ * clear the bookmark on the (imminent) exit. Round-4 nit B/C:
+ * previously these three inline spawns were unregistered. */
+function spawnLosingDaemon(root: string, env: NodeJS.ProcessEnv = process.env): ChildProcess {
+  const proc = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", root], {
+    cwd: root,
+    stdio: ["ignore", "pipe", "pipe"],
+    env,
+  });
+  if (typeof proc.pid === "number") {
+    registerDaemonPid(proc.pid);
+    const pid = proc.pid;
+    proc.on("exit", () => unregisterDaemonPid(pid));
+  }
+  return proc;
 }
 
 async function waitExit(proc: ChildProcess, ms = 3000): Promise<number | null> {
@@ -83,11 +117,7 @@ describe("round-3 blocker-1 scenarios", () => {
   test("a second `revkit serve` while the first runs is refused", async () => {
     const first = await spawnDaemon(root);
     try {
-      const second = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", root], {
-        cwd: root,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      });
+      const second = spawnLosingDaemon(root);
       let stderr = "";
       second.stderr?.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
       const code = await waitExit(second, 5000);
@@ -110,11 +140,7 @@ describe("round-3 blocker-1 scenarios", () => {
       first.proc.kill("SIGSTOP");
       // Give the OS a moment to stop the process.
       await new Promise((r) => setTimeout(r, 200));
-      const second = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", root], {
-        cwd: root,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      });
+      const second = spawnLosingDaemon(root);
       let stderr = "";
       second.stderr?.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
       const code = await waitExit(second, 5000);
@@ -157,15 +183,11 @@ describe("round-3 blocker-1 scenarios", () => {
   test("HTTP_PROXY set on the second start does not defeat the lock", async () => {
     const first = await spawnDaemon(root);
     try {
-      const second = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", root], {
-        cwd: root,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          HTTP_PROXY: "http://127.0.0.1:9",
-          HTTPS_PROXY: "http://127.0.0.1:9",
-          NO_PROXY: "",
-        },
+      const second = spawnLosingDaemon(root, {
+        ...process.env,
+        HTTP_PROXY: "http://127.0.0.1:9",
+        HTTPS_PROXY: "http://127.0.0.1:9",
+        NO_PROXY: "",
       });
       let stderr = "";
       second.stderr?.on("data", (c: Buffer) => (stderr += c.toString("utf8")));
