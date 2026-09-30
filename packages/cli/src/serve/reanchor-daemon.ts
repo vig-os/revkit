@@ -85,6 +85,30 @@ import { REANCHOR_SOURCE_MAX_BYTES, resolveSourceUnderRoot } from "./anchor-sour
  * filter on it without seeing the user's own agent id. */
 export const REANCHOR_ACTOR_ID = "revkit-reanchor";
 
+/** Runtime guard: is this thread's anchor a LINE anchor (has a
+ * revision + quote) rather than an UNANCHORED one (PR #43's
+ * import shape — no revision, no quote, orphaned from birth)?
+ *
+ * The re-anchoring pipeline runs on line anchors only: an
+ * unanchored thread has nothing for `reanchorWith` to work on,
+ * and the reducer treats it as `orphaned` from creation. This
+ * daemon must skip it in every place we would otherwise touch
+ * `anchor.revision` — the derived-skip check, the snapshot
+ * backfill, the orphan memo, and `refreshAll` / `reconcileWatchers`
+ * bookkeeping. (Coordinator note, 2026-09-30.)
+ *
+ * Kept as a local runtime guard so this file compiles both against
+ * the pre-#43 review-core (line anchors only; the check reduces
+ * to `revision !== undefined`) AND the post-#43 review-core (which
+ * exports its own `isLineAnchor`). After the rebase onto dev this
+ * helper is a candidate to drop in favour of the shared one. */
+export function isLineAnchorLocal(anchor: unknown): anchor is { path: string; revision: string; startLine: number; endLine: number } {
+  if (anchor === null || typeof anchor !== "object") return false;
+  const a = anchor as Record<string, unknown>;
+  if (a.kind === "unanchored") return false;
+  return typeof a.revision === "string" && typeof a.path === "string";
+}
+
 /** Debounce for the anchored-file watcher. A single edit fires 2–3
  * OS-level events (write, stat, close); 300 ms coalesces them into
  * one re-anchor pass without noticeably delaying the interactive
@@ -451,7 +475,14 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // `orphanCheckRevision`). If any thread is behind, run the
     // pipeline. This is naturally correct across resolve/reopen and
     // late-POST cases without invalidation hooks.
-    const allUpToDate = threads.every((thread) => {
+    // Filter out unanchored threads (PR #43) — they have no
+    // revision / no quote, the reducer stamps them `orphaned` at
+    // creation, and the pipeline has nothing to do with them.
+    // Coordinator note 2026-09-30.
+    const pipelineThreads = threads.filter((thread) => isLineAnchorLocal(thread.anchor));
+    if (pipelineThreads.length === 0) return;
+
+    const allUpToDate = pipelineThreads.every((thread) => {
       if (thread.status === "open") return thread.anchor.revision === newRevision;
       return orphanCheckRevision.get(thread.id) === newRevision;
     });
@@ -460,7 +491,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // Group by old revision so `prepareReanchor` runs once per (old,
     // new) pair rather than once per thread.
     const byRevision = new Map<string, Thread[]>();
-    for (const thread of threads) {
+    for (const thread of pipelineThreads) {
       const existing = byRevision.get(thread.anchor.revision);
       if (existing !== undefined) existing.push(thread);
       else byRevision.set(thread.anchor.revision, [thread]);
@@ -635,23 +666,32 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
 
   async function refreshAll(): Promise<void> {
     if (stopped) return;
-    // Every path that currently has a thread. Reading via
-    // `store.threads()` (no filter) is O(events); for a repo with
-    // a moderate log this is a few ms.
+    // Every path that currently has a LINE-anchored thread. Reading
+    // via `store.threads()` (no filter) is O(events); for a repo
+    // with a moderate log this is a few ms. Unanchored threads (PR
+    // #43) contribute nothing here — they have no revision to
+    // re-anchor against.
     const all = await store.threads();
     const paths = new Set<string>();
-    for (const thread of all) paths.add(thread.anchor.path);
+    for (const thread of all) {
+      if (!isLineAnchorLocal(thread.anchor)) continue;
+      paths.add(thread.anchor.path);
+    }
     await Promise.all([...paths].map((path) => refresh(path)));
   }
 
   async function gcOnce(): Promise<void> {
     if (stopped) return;
-    // Retain every revision an open OR orphaned thread points at.
-    // Resolved threads keep their snapshot too — a `thread.reopened`
-    // event later would want to re-anchor against it.
+    // Retain every revision an open OR orphaned LINE-anchored
+    // thread points at. Resolved threads keep their snapshot too
+    // — a `thread.reopened` event later would want to re-anchor
+    // against it. Unanchored threads (PR #43) have no revision.
     const all = await store.threads();
     const retain = new Set<string>();
-    for (const thread of all) retain.add(thread.anchor.revision);
+    for (const thread of all) {
+      if (!isLineAnchorLocal(thread.anchor)) continue;
+      retain.add(thread.anchor.revision);
+    }
     try {
       const deleted = store.gcSnapshots(retain);
       if (deleted > 0) {
@@ -906,8 +946,15 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     for (const thread of all) {
       // Only watch open+orphaned threads. A resolved thread's
       // source-file edit does not need to re-anchor it (respect
-      // the resolution).
+      // the resolution). Unanchored threads (PR #43) have no
+      // revision to watch against — the reducer treats them as
+      // orphaned-from-birth and the rail renders them at the
+      // file level.
       if (thread.status === "resolved") continue;
+      if (!isLineAnchorLocal(thread.anchor)) {
+        trackedThreadIds.add(thread.id);
+        continue;
+      }
       wanted.add(thread.anchor.path);
       trackedThreadIds.add(thread.id);
     }

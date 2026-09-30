@@ -28,6 +28,7 @@ import { revisionOf, type Anchor, type ReviewEventInput } from "@revkit/review-c
 import { EventBus } from "../../src/serve/event-bus.ts";
 import { makeLogger } from "../../src/serve/logger.ts";
 import {
+  isLineAnchorLocal,
   startReanchorDaemon,
   type ReanchorDaemonHandle,
   type ReanchorDaemonOptions,
@@ -554,6 +555,41 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     const t = all.find((x) => x.id === T);
     expect(t?.status).toBe("open");
     expect(t?.anchor.startLine).toBe(lineOf(v2));
+  });
+
+  test("isLineAnchorLocal — skips PR #43 unanchored anchors, accepts line anchors", () => {
+    // Coordinator note 2026-09-30: PR #43 adds an unanchored anchor
+    // shape (`{kind: "unanchored", path, originalStartLine?}`) with
+    // no revision + no quote. The daemon must skip such threads in
+    // every place we would otherwise touch `anchor.revision`. This
+    // test pins the runtime guard shape so a future rebase onto dev
+    // (which brings in review-core's own `isLineAnchor`) has an
+    // anchor of comparison. Full integration test lands in the
+    // rebase — the schema on this branch does not yet accept an
+    // unanchored anchor at append time.
+    // Positive: a line anchor.
+    expect(
+      isLineAnchorLocal({
+        path: "docs/a.md",
+        startLine: 5,
+        endLine: 5,
+        quote: { exact: "x", prefix: "", suffix: "" },
+        revision: "a".repeat(64),
+      }),
+    ).toBe(true);
+    // Negative: an unanchored anchor.
+    expect(
+      isLineAnchorLocal({
+        kind: "unanchored",
+        path: "docs/a.md",
+        originalStartLine: 5,
+      }),
+    ).toBe(false);
+    // Defensive negatives.
+    expect(isLineAnchorLocal(undefined)).toBe(false);
+    expect(isLineAnchorLocal(null)).toBe(false);
+    expect(isLineAnchorLocal({ path: "docs/a.md" })).toBe(false);
+    expect(isLineAnchorLocal({ path: "docs/a.md", revision: 42 })).toBe(false);
   });
 
   test("rejected append leaves the orphan check memo untouched so the thread stays eligible for retry", async () => {
