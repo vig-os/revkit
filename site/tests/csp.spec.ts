@@ -464,9 +464,11 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
         "default-src 'none'; " +
         "script-src " +
           `http://127.0.0.1:${port}/-/rail.js ` +
+          `http://127.0.0.1:${port}/-/ask.js ` +
           `http://127.0.0.1:${port}/_astro/ ` +
           `http://127.0.0.1:${port}/pagefind/ ` +
           `http://localhost:${port}/-/rail.js ` +
+          `http://localhost:${port}/-/ask.js ` +
           `http://localhost:${port}/_astro/ ` +
           `http://localhost:${port}/pagefind/ ` +
           "'wasm-unsafe-eval' " +

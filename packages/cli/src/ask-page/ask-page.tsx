@@ -122,18 +122,25 @@ function readBoot(): Boot | undefined {
   }
 }
 
-/** Fetch the latest AskRecord over the cookie-authenticated JSON API. */
+/** Fetch the latest AskRecord over the cookie-authenticated JSON API.
+ * Unwraps the `{ ask }` envelope the daemon returns — the daemon's
+ * write path returns `{ seq, event }` and the read path returns
+ * `{ ask }`, matching the threads API's shape. */
 async function fetchAsk(id: string): Promise<AskRecord> {
   const response = await fetch(`/api/asks/${encodeURIComponent(id)}`, {
     credentials: "same-origin",
     headers: { accept: "application/json" },
   });
   if (!response.ok) throw new Error(`GET /api/asks/${id} failed: ${response.status}`);
-  return (await response.json()) as AskRecord;
+  const parsed = (await response.json()) as { ask: AskRecord };
+  return parsed.ask;
 }
 
-/** POST the answer. Returns the updated record on success. */
-async function submitAnswer(id: string, answer: Answer): Promise<AskRecord> {
+/** POST the answer. Fire-and-forget on success — the caller triggers
+ * a `refetch()` to pick up the new record. The daemons write path
+ * returns `{seq, event}`, not the derived record, so we do not
+ * bother parsing the body here. */
+async function submitAnswer(id: string, answer: Answer): Promise<void> {
   const response = await fetch(`/api/asks/${encodeURIComponent(id)}/answer`, {
     method: "POST",
     credentials: "same-origin",
@@ -144,7 +151,6 @@ async function submitAnswer(id: string, answer: Answer): Promise<AskRecord> {
     const text = await response.text().catch(() => "");
     throw new Error(`POST /api/asks/${id}/answer failed: ${response.status} ${text}`);
   }
-  return (await response.json()) as AskRecord;
 }
 
 // ── Kind renderers ────────────────────────────────────────────────
@@ -179,22 +185,22 @@ function renderChoice(spec: ChoiceSpec, onAnswer: (a: Answer) => void): JSX.Elem
       ...(trimmedNote.length > 0 ? { note: trimmedNote } : {}),
     });
   };
+  const groupRole = spec.multi === true ? "group" : "radiogroup";
   return (
     <form
       class="revkit-ask__form"
-      role="radiogroup"
       aria-label={spec.title}
       onSubmit={(e: SubmitEvent) => {
         e.preventDefault();
         submit();
       }}
     >
-      <ul class="revkit-ask__options">
+      <div class="revkit-ask__options" role={groupRole} aria-label={spec.title}>
         <For each={spec.options}>
           {(option: Option): JSX.Element => {
             const id = `revkit-ask-choice-${option.id}`;
             return (
-              <li class="revkit-ask__option">
+              <div class="revkit-ask__option">
                 <label class="revkit-ask__option-label" for={id}>
                   <input
                     type={spec.multi === true ? "checkbox" : "radio"}
@@ -209,11 +215,11 @@ function renderChoice(spec: ChoiceSpec, onAnswer: (a: Answer) => void): JSX.Elem
                 <Show when={option.preview !== undefined}>
                   <div class="revkit-ask__option-preview" data-preview={option.preview} />
                 </Show>
-              </li>
+              </div>
             );
           }}
         </For>
-      </ul>
+      </div>
       <Show when={spec.allowOther === true}>
         <div class="revkit-ask__field">
           <label for="revkit-ask-other">Or write your own:</label>
@@ -504,7 +510,6 @@ function renderReview(spec: ReviewSpec, onAnswer: (a: Answer) => void): JSX.Elem
   return (
     <form
       class="revkit-ask__form"
-      role="radiogroup"
       aria-label={spec.title}
       onSubmit={(e: SubmitEvent) => {
         e.preventDefault();
@@ -512,13 +517,13 @@ function renderReview(spec: ReviewSpec, onAnswer: (a: Answer) => void): JSX.Elem
       }}
     >
       <p class="revkit-ask__review-target">Review target: {spec.target}</p>
-      <ul class="revkit-ask__options">
+      <div class="revkit-ask__options" role="radiogroup" aria-label={spec.title}>
         <For each={["approve", "request-changes", "comment"] as const}>
           {(id): JSX.Element => {
             const label = id === "request-changes" ? "Request changes" : id === "approve" ? "Approve" : "Comment";
             const domId = `revkit-ask-review-${id}`;
             return (
-              <li class="revkit-ask__option">
+              <div class="revkit-ask__option">
                 <label class="revkit-ask__option-label" for={domId}>
                   <input
                     type="radio"
@@ -530,11 +535,11 @@ function renderReview(spec: ReviewSpec, onAnswer: (a: Answer) => void): JSX.Elem
                   />
                   <span class="revkit-ask__option-text">{label}</span>
                 </label>
-              </li>
+              </div>
             );
           }}
         </For>
-      </ul>
+      </div>
       <div class="revkit-ask__field">
         <label for="revkit-ask-note">Note (optional):</label>
         <input
@@ -630,55 +635,59 @@ function AskPage(props: { boot: Boot }): JSX.Element {
   };
 
   return (
-    <div class="revkit-ask" data-testid="revkit-ask-root" data-status={record()?.status ?? "pending"}>
-      <header class="revkit-ask__header">
-        <h1 class="revkit-ask__title">{record()?.spec.title ?? ""}</h1>
-        <p class="revkit-ask__kind">Kind: {record()?.spec.kind ?? ""}</p>
-        <Show when={record()?.spec.prompt !== undefined}>
-          <p class="revkit-ask__prompt">{record()?.spec.prompt}</p>
-        </Show>
-      </header>
-      <main class="revkit-ask__body">
-        <Show
-          when={record() !== undefined && record()!.status === "pending"}
-          fallback={
-            <section class="revkit-ask__terminal" data-testid="revkit-ask-terminal">
-              <p class="revkit-ask__terminal-status">
-                This question is <strong>{record()?.status}</strong>.
-              </p>
-              <Show when={record()?.status === "answered"}>
-                <pre class="revkit-ask__answer"><code>{JSON.stringify(record()?.answer, null, 2)}</code></pre>
-              </Show>
-              <Show when={record()?.status === "cancelled" && record()?.cancelReason !== undefined}>
-                <p>Reason: {record()?.cancelReason}</p>
-              </Show>
-            </section>
-          }
-        >
-          {renderKind(record()!)}
-        </Show>
-        <Show when={error() !== undefined}>
-          <p class="revkit-ask__error" role="alert">{error()}</p>
-        </Show>
-        <Show when={submitting()}>
-          <p class="revkit-ask__submitting" aria-live="polite">Submitting…</p>
-        </Show>
-      </main>
-    </div>
+    <Show when={record()} fallback={<div class="revkit-ask" data-testid="revkit-ask-root" data-status="pending" />}>
+      {(current) => (
+        <div class="revkit-ask" data-testid="revkit-ask-root" data-status={current().status}>
+          <header class="revkit-ask__header">
+            <h1 class="revkit-ask__title">{current().spec.title}</h1>
+            <p class="revkit-ask__kind">Kind: {current().spec.kind}</p>
+            <Show when={current().spec.prompt !== undefined}>
+              <p class="revkit-ask__prompt">{current().spec.prompt}</p>
+            </Show>
+          </header>
+          <main class="revkit-ask__body">
+            <Show
+              when={current().status === "pending"}
+              fallback={
+                <section class="revkit-ask__terminal" data-testid="revkit-ask-terminal">
+                  <p class="revkit-ask__terminal-status">
+                    This question is <strong>{current().status}</strong>.
+                  </p>
+                  <Show when={current().status === "answered"}>
+                    <pre class="revkit-ask__answer"><code>{JSON.stringify(current().answer, null, 2)}</code></pre>
+                  </Show>
+                  <Show when={current().status === "cancelled" && current().cancelReason !== undefined}>
+                    <p>Reason: {current().cancelReason}</p>
+                  </Show>
+                </section>
+              }
+            >
+              {renderKind(current())}
+            </Show>
+            <Show when={error() !== undefined}>
+              <p class="revkit-ask__error" role="alert">{error()}</p>
+            </Show>
+            <Show when={submitting()}>
+              <p class="revkit-ask__submitting" aria-live="polite">Submitting…</p>
+            </Show>
+          </main>
+        </div>
+      )}
+    </Show>
   );
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────
 
-function boot(): void {
-  const boot = readBoot();
+function mountAskPage(): void {
+  const bootRecord = readBoot();
   const mount = document.getElementById("revkit-ask-mount");
-  if (boot === undefined || mount === null) return;
-  render(() => <AskPage boot={boot} />, mount);
+  if (bootRecord === undefined || mount === null) return;
+  render(() => <AskPage boot={bootRecord} />, mount);
 }
 
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", boot, { once: true });
+  document.addEventListener("DOMContentLoaded", mountAskPage, { once: true });
 } else {
-  boot();
+  mountAskPage();
 }

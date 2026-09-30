@@ -806,6 +806,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Take the pathname component only — drop query / fragment
     // that a URL parser might have kept.
     const pathOnly = next.split("?")[0]!.split("#")[0]!;
+    // Allow known daemon-virtual routes that do not live in the
+    // static dir. Today: `/ask/<idSchema>` (M2 item 7 — the ask
+    // page). The path segment must pass `isValidId` so no scary
+    // characters slip through, and the tail after the id must be
+    // empty (no `/ask/x/y`, no `/ask/x?...` — the query lives in
+    // `next` and is preserved as `next` is what we return). This
+    // is the SOLE list — the reason `safeNextRedirect` is not the
+    // right place to widen to "any daemon route" is that widening
+    // is the door open-redirect protection is built to close.
+    const askMatch = pathOnly.match(/^\/ask\/([^/]+)$/);
+    if (askMatch !== null) {
+      const askId = askMatch[1] ?? "";
+      if (isValidId(askId)) return next;
+      return undefined;
+    }
     // Resolve inside the served dir.
     const resolved = staticServer.resolve(pathOnly);
     if (!resolved.ok) return undefined;
@@ -1332,15 +1347,30 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
   async function handleAskPage(request: Request, url: URL, method: string, requestId: string): Promise<Response> {
     void method;
-    // Origin gate for a browser GET: `Sec-Fetch-Site: same-origin`
-    // is what a same-origin navigation sends (Origin is omitted on
-    // top-level navigations, per Fetch §3.3.3). The bearer path
-    // exists for a test client that wants to fetch the page HTML
-    // without a cookie; it bypasses the cookie check below.
+    // Same-origin discipline for a page navigation is lighter than
+    // for an API POST: a top-level navigation lands with
+    // `Sec-Fetch-Site: none` (URL bar, launch link click, 302 from
+    // `/-/auth`), and a cross-site link would be `cross-site`. We
+    // refuse `cross-site` explicitly and accept `same-origin` /
+    // `same-site` / `none` (or a missing header). The page's own CSP
+    // (`frame-ancestors 'none'`) blocks foreign iframes; a foreign
+    // page's `<a href>` following that lands here as `cross-site`
+    // and is refused below. The bearer path (test client) is
+    // accepted regardless.
     const bearer = bearerFromHeader(request.headers.get("authorization"));
     const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
-    const originRejection = checkOrigin(request, requestId, hasValidBearer);
-    if (originRejection !== undefined) return originRejection;
+    const origin = request.headers.get("origin");
+    const sfs = request.headers.get("sec-fetch-site");
+    if (!hasValidBearer) {
+      if (origin !== null && !isLoopbackOrigin(origin, port)) {
+        logger.warn("ask.page.rejected.origin", { requestId, origin });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      if (sfs === "cross-site") {
+        logger.warn("ask.page.rejected.sec-fetch", { requestId, reason: sfs });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+    }
 
     // Session cookie required for the human path. A page without a
     // cookie 302s through the launch-code exchange so a click on
