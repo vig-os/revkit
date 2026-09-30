@@ -10,7 +10,9 @@ import {
   applyResponseHeaders,
   ASTRO_SCRIPTS_URL_PREFIX,
   buildCspHeader,
+  buildMinimalCspHeader,
   hexToBase64,
+  PAGEFIND_URL_PREFIX,
   permissionsPolicyValue,
   RAIL_SCRIPT_URL_PATH,
   type HeaderContext,
@@ -20,7 +22,6 @@ function ctxWith(overrides: Partial<HeaderContext> = {}): HeaderContext {
   return {
     port: 12345,
     inlineScriptHashes: [],
-    cspHashesLoaded: true,
     ...overrides,
   };
 }
@@ -43,57 +44,54 @@ describe("buildCspHeader — directive shape", () => {
     expect(csp["default-src"]).toEqual(["'none'"]);
   });
 
-  test("script-src names /-/rail.js AND /_astro/ AT the daemon origin (path-scoped)", () => {
+  test("script-src names /-/rail.js AND /_astro/ AND /pagefind/ for BOTH loopback aliases", () => {
     const csp = parseCsp(buildCspHeader(ctxWith({ port: 42421 })));
     const sources = csp["script-src"];
     expect(sources).toBeDefined();
-    // Both exact-path URLs must be listed. A source without a
-    // trailing slash matches exactly one URL; with a trailing slash
-    // it matches any file underneath.
-    expect(sources).toContain(`http://127.0.0.1:42421${RAIL_SCRIPT_URL_PATH}`);
-    expect(sources).toContain(`http://127.0.0.1:42421${ASTRO_SCRIPTS_URL_PREFIX}`);
+    // Both aliases (127.0.0.1 and localhost) x three path prefixes.
+    for (const origin of ["http://127.0.0.1:42421", "http://localhost:42421"]) {
+      expect(sources).toContain(`${origin}${RAIL_SCRIPT_URL_PATH}`);
+      expect(sources).toContain(`${origin}${ASTRO_SCRIPTS_URL_PREFIX}`);
+      expect(sources).toContain(`${origin}${PAGEFIND_URL_PREFIX}`);
+    }
     // Never widens to a bare `'self'` (which would allow ANY script
     // under the origin) — the mutation partner below asserts the
     // opposite direction.
     expect(sources).not.toContain("'self'");
-    // 'unsafe-inline' is REFUSED in script-src regardless of what
-    // the site tries to ship inline. Inline scripts run only through
-    // a matching sha256 source.
     expect(sources).not.toContain("'unsafe-inline'");
-    // ADR-0013 amendment (2026-09-30): the rail bundle is now
-    // JSX-compiled at build time with `babel-preset-solid`, so
-    // there is no runtime `new Function()` / `eval()` and
-    // `'unsafe-eval'` MUST NOT appear in `script-src`. If a
-    // regression reintroduces the `solid-js/html` runtime, this
-    // assertion flips red.
+    // `'unsafe-eval'` (arbitrary JS eval) is refused. The narrow
+    // `'wasm-unsafe-eval'` is intentional — pagefind's Worker
+    // compiles a .wasm blob.
     expect(sources).not.toContain("'unsafe-eval'");
+    expect(sources).toContain("'wasm-unsafe-eval'");
   });
 
-  test("script-src carries the sha256 hashes from `cspHashesLoaded`", () => {
+  test("script-src carries the sha256 hashes from `inlineScriptHashes` (base64-encoded)", () => {
     const hex = "a".repeat(64);
     const csp = parseCsp(buildCspHeader(ctxWith({ inlineScriptHashes: [hex] })));
     const sources = csp["script-src"]!;
-    // The header form uses base64 (not hex) — CSP-hash syntax.
     expect(sources).toContain(`'sha256-${hexToBase64(hex)}'`);
   });
 
-  test("MUTATION: cspHashesLoaded=false removes hash sources (fail-closed)", () => {
-    const hex = "a".repeat(64);
-    const csp = parseCsp(
-      buildCspHeader(ctxWith({ inlineScriptHashes: [hex], cspHashesLoaded: false })),
-    );
+  test("empty inlineScriptHashes → no sha256 sources (no artefact = no inline allowance)", () => {
+    // With the shipped `dist-check-allowlist.json` set the daemon
+    // uses in production this array is non-empty; here we prove the
+    // header builder emits ZERO `sha256-…` sources when the set is
+    // empty — the fail-closed shape.
+    const csp = parseCsp(buildCspHeader(ctxWith({ inlineScriptHashes: [] })));
     const sources = csp["script-src"]!;
-    // No sha256- entries — the artefact is missing.
     expect(sources.some((s) => s.startsWith("'sha256-"))).toBe(false);
   });
 
   test("style-src includes 'unsafe-inline' (Starlight / expressive-code / KaTeX inject inline styles)", () => {
-    // Not a nice-to-have: dropping this directive breaks Starlight's
-    // theme toggle and the KaTeX math renderer at first paint.
-    // ADR-0012 accepted the trade — styles cannot execute script,
-    // so widening `style-src` does not enable XSS.
+    // ADR-0012 accepted the trade — styles cannot execute script.
     const csp = parseCsp(buildCspHeader(ctxWith()));
     expect(csp["style-src"]).toEqual(["'self'", "'unsafe-inline'"]);
+  });
+
+  test("worker-src is 'self' (pagefind's search Worker)", () => {
+    const csp = parseCsp(buildCspHeader(ctxWith()));
+    expect(csp["worker-src"]).toEqual(["'self'"]);
   });
 
   test("img-src is 'self' + data: + github avatars (ADR-0012 verbatim)", () => {
@@ -101,9 +99,9 @@ describe("buildCspHeader — directive shape", () => {
     expect(csp["img-src"]).toEqual(["'self'", "data:", "https://avatars.githubusercontent.com"]);
   });
 
-  test("connect-src covers 'self' AND the explicit ws:// origin (older browsers)", () => {
+  test("connect-src covers 'self' AND both explicit ws:// aliases (older browsers)", () => {
     const csp = parseCsp(buildCspHeader(ctxWith({ port: 9999 })));
-    expect(csp["connect-src"]).toEqual(["'self'", "ws://127.0.0.1:9999"]);
+    expect(csp["connect-src"]).toEqual(["'self'", "ws://127.0.0.1:9999", "ws://localhost:9999"]);
   });
 
   test("navigation guards: frame-ancestors 'none', base-uri 'none', form-action 'self', object-src 'none'", () => {
@@ -112,6 +110,46 @@ describe("buildCspHeader — directive shape", () => {
     expect(csp["base-uri"]).toEqual(["'none'"]);
     expect(csp["form-action"]).toEqual(["'self'"]);
     expect(csp["object-src"]).toEqual(["'none'"]);
+  });
+
+  test("BYTE-EXACT: the emitted header string matches the pinned form (mutation guard on the whole header)", () => {
+    // A hex hash and its exact base64 form — pinned so a change in
+    // `hexToBase64`'s output goes red here as well.
+    const hex = "1cbb968b5e6d5421bb29ba088f699949436448c3a5bd060192062fce0a172aa9";
+    const b64 = "HLuWi15tVCG7KboIj2mZSUNkSMOlvQYBkgYvzgoXKqk=";
+    expect(hexToBase64(hex)).toBe(b64);
+    const value = buildCspHeader({ port: 4321, inlineScriptHashes: [hex] });
+    const expected =
+      "default-src 'none'; " +
+      "script-src " +
+        "http://127.0.0.1:4321/-/rail.js " +
+        "http://127.0.0.1:4321/_astro/ " +
+        "http://127.0.0.1:4321/pagefind/ " +
+        "http://localhost:4321/-/rail.js " +
+        "http://localhost:4321/_astro/ " +
+        "http://localhost:4321/pagefind/ " +
+        "'wasm-unsafe-eval' " +
+        `'sha256-${b64}'; ` +
+      "style-src 'self' 'unsafe-inline'; " +
+      "img-src 'self' data: https://avatars.githubusercontent.com; " +
+      "font-src 'self'; " +
+      "connect-src 'self' ws://127.0.0.1:4321 ws://localhost:4321; " +
+      "worker-src 'self'; " +
+      "frame-ancestors 'none'; " +
+      "base-uri 'none'; " +
+      "form-action 'self'; " +
+      "object-src 'none'";
+    expect(value).toBe(expected);
+  });
+});
+
+describe("buildMinimalCspHeader — SVG + XML (documents that can run script when opened directly)", () => {
+  test("XML: default-src 'none' + frame-ancestors 'none'", () => {
+    expect(buildMinimalCspHeader("xml")).toBe("default-src 'none'; frame-ancestors 'none'");
+  });
+
+  test("SVG gets `sandbox` as well (ADR-0012: SVG can carry <script>, sandbox denies it)", () => {
+    expect(buildMinimalCspHeader("svg")).toBe("default-src 'none'; frame-ancestors 'none'; sandbox");
   });
 });
 
@@ -131,9 +169,6 @@ describe("hexToBase64", () => {
 describe("permissionsPolicyValue", () => {
   test("names every high-risk feature with an empty allowlist", () => {
     const value = permissionsPolicyValue();
-    // A handful of representative names — the full list is in
-    // `headers.ts` and adding one shouldn't require touching this
-    // test. If a name is dropped, one of these fails.
     for (const name of ["camera", "microphone", "geolocation", "payment", "usb", "publickey-credentials-get"]) {
       expect(value).toContain(`${name}=()`);
     }
@@ -141,9 +176,10 @@ describe("permissionsPolicyValue", () => {
 });
 
 describe("applyResponseHeaders — per-kind wiring", () => {
-  test("html: CSP + hygiene triplet + no Cache-Control", () => {
+  test("html: FULL CSP + hygiene triplet + no Cache-Control", () => {
     const r = applyResponseHeaders(new Response("x", { status: 200 }), "html", "text/html; charset=utf-8", ctxWith());
     expect(r.headers.get("content-security-policy")).toContain("default-src 'none'");
+    expect(r.headers.get("content-security-policy")).toContain("script-src ");
     expect(r.headers.get("x-content-type-options")).toBe("nosniff");
     expect(r.headers.get("referrer-policy")).toBe("no-referrer");
     expect(r.headers.get("cross-origin-opener-policy")).toBe("same-origin");
@@ -155,19 +191,30 @@ describe("applyResponseHeaders — per-kind wiring", () => {
     expect(r.headers.get("cache-control")).toBeNull();
   });
 
-  test("asset: NO CSP header, but full hygiene triplet still applied", () => {
+  test("asset: NO CSP header (browser applies embedding doc's CSP; Workers keep their own fetch)", () => {
     const r = applyResponseHeaders(new Response("x", { status: 200 }), "asset", "text/javascript; charset=utf-8", ctxWith());
     expect(r.headers.get("content-security-policy")).toBeNull();
     expect(r.headers.get("x-content-type-options")).toBe("nosniff");
     expect(r.headers.get("cross-origin-resource-policy")).toBe("same-origin");
   });
 
-  test("json: nosniff + Cache-Control: no-store", () => {
+  test("svg: MINIMAL CSP with `sandbox` appended", () => {
+    const r = applyResponseHeaders(new Response("<svg/>", { status: 200 }), "svg", "image/svg+xml", ctxWith());
+    expect(r.headers.get("content-security-policy")).toBe(
+      "default-src 'none'; frame-ancestors 'none'; sandbox",
+    );
+  });
+
+  test("xml: MINIMAL CSP (no sandbox — sitemap.xml is a document but has no untrusted-upload posture)", () => {
+    const r = applyResponseHeaders(new Response("<?xml?>", { status: 200 }), "xml", "application/xml; charset=utf-8", ctxWith());
+    expect(r.headers.get("content-security-policy")).toBe("default-src 'none'; frame-ancestors 'none'");
+  });
+
+  test("json: NO CSP header + nosniff + Cache-Control: no-store", () => {
     const r = applyResponseHeaders(new Response("{}", { status: 200 }), "json", "application/json; charset=utf-8", ctxWith());
     expect(r.headers.get("content-type")).toBe("application/json; charset=utf-8");
     expect(r.headers.get("x-content-type-options")).toBe("nosniff");
     expect(r.headers.get("cache-control")).toBe("no-store");
-    // No CSP on a JSON body: nothing to load.
     expect(r.headers.get("content-security-policy")).toBeNull();
   });
 
@@ -177,8 +224,6 @@ describe("applyResponseHeaders — per-kind wiring", () => {
       headers: { "cache-control": "no-cache, no-transform", "content-type": "text/event-stream; charset=utf-8" },
     });
     const r = applyResponseHeaders(source, "sse", undefined, ctxWith());
-    // MUTATION check: if headers.ts started overwriting Cache-Control
-    // for SSE, this line flips to "no-store" and the test goes red.
     expect(r.headers.get("cache-control")).toBe("no-cache, no-transform");
   });
 
@@ -189,34 +234,44 @@ describe("applyResponseHeaders — per-kind wiring", () => {
     });
     const r = applyResponseHeaders(source, "auth", undefined, ctxWith());
     expect(r.headers.get("cache-control")).toBe("no-store");
-    // Set-Cookie survives.
     expect(r.headers.get("set-cookie")).toContain("HttpOnly");
   });
 });
 
-describe("MUTATION guards — the tests that fail if a directive is dropped", () => {
+describe("MUTATION guards — the tests that fail if a directive is dropped or widened", () => {
   test("MUTATION: removing default-src from the builder leaves nothing to catch script fallbacks", () => {
-    // This test asserts the header CONTAINS the directive, so a
-    // patch that drops the `default-src 'none'` line flips it red.
     const csp = buildCspHeader(ctxWith());
     expect(csp).toContain("default-src 'none'");
   });
   test("MUTATION: neither 'unsafe-inline' nor 'unsafe-eval' may appear in script-src", () => {
-    // A regression that widened `script-src` to include
-    // `'unsafe-inline'` (a plausible "just make it work" patch),
-    // or that reintroduced `'unsafe-eval'` (from re-adopting the
-    // `solid-js/html` runtime), must fail here. `style-src` may
-    // legitimately carry `'unsafe-inline'`, so we extract the
-    // script-src portion.
+    // `style-src` may legitimately carry `'unsafe-inline'`, so we
+    // extract the script-src portion. `'wasm-unsafe-eval'` is
+    // intentional (pagefind) and is NOT `'unsafe-eval'`.
     const csp = buildCspHeader(ctxWith());
     const scriptSrc = parseCsp(csp)["script-src"]!.join(" ");
     expect(scriptSrc).not.toContain("'unsafe-inline'");
-    expect(scriptSrc).not.toContain("'unsafe-eval'");
+    // Regex boundary catches `'unsafe-eval'` but not `'wasm-unsafe-eval'`.
+    expect(/(?:^|\s)'unsafe-eval'(?:\s|$)/.test(scriptSrc)).toBe(false);
   });
   test("MUTATION: applyResponseHeaders MUST set x-content-type-options on every response kind", () => {
-    for (const kind of ["html", "asset", "json", "sse", "auth", "text"] as const) {
+    for (const kind of ["html", "asset", "svg", "xml", "json", "sse", "auth", "text"] as const) {
       const r = applyResponseHeaders(new Response(""), kind, undefined, ctxWith());
       expect(r.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+  });
+  test("MUTATION: document-shaped kinds carry a CSP; asset/JSON/text kinds do NOT (Worker fetch would break)", () => {
+    // Split by kind: HTML gets the full policy; SVG and XML get
+    // the minimal one (plus optional sandbox on SVG); every other
+    // kind (asset, json, sse, auth, text) omits the CSP header.
+    const withCsp = ["html", "svg", "xml"] as const;
+    const withoutCsp = ["asset", "json", "sse", "auth", "text"] as const;
+    for (const kind of withCsp) {
+      const r = applyResponseHeaders(new Response(""), kind, undefined, ctxWith());
+      expect(r.headers.get("content-security-policy")).toContain("default-src 'none'");
+    }
+    for (const kind of withoutCsp) {
+      const r = applyResponseHeaders(new Response(""), kind, undefined, ctxWith());
+      expect(r.headers.get("content-security-policy")).toBeNull();
     }
   });
 });

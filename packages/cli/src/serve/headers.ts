@@ -19,19 +19,26 @@
 // convention in ADR-0012 is a HOSTED origin concern (many co-tenant
 // preview paths share one origin), and the local daemon serves one
 // project at a time from an isolated loopback origin. `script-src`
-// still names the exact path — `/-/rail.js` and `/_astro/` — so a
-// stored HTML with any other script src (an /_astro/ moved to a
-// different prefix, a /-/foo.js smuggled into a fixture) is refused
-// by the browser as a policy violation.
+// still names the exact path — `/-/rail.js`, `/_astro/`, and
+// `/pagefind/` — so a stored HTML with any other script src is
+// refused by the browser as a policy violation.
 
-/** Kind of response the daemon is about to return. Governs which
- * `Cache-Control` applies and whether the CSP is attached (only HTML
- * carries CSP — a stylesheet or JS file has no need for it and some
- * browsers reject it as noise). */
+/** Kind of response the daemon is about to return. Governs which CSP
+ * shape it carries and which `Cache-Control` applies. */
 export type ResponseKind =
   | "html"
-  /** JS bundle we ship (rail bundle, or a static /_astro/ file). */
+  /** JS bundle we ship (rail bundle, or a static /_astro/ file), a
+   * CSS file, an image, a font, a `.wasm` blob, a `.pf_meta` /
+   * `.pf_index` / `.pf_fragment` search chunk — anything a document
+   * loads as a subresource. Assets get NO CSP header of their own:
+   * browsers apply the embedding document's CSP to subresource
+   * fetches, and a Worker (Pagefind's runtime) whose response
+   * carries a restrictive CSP would have its own `fetch` denied. */
   | "asset"
+  /** SVG served as its own document (browser can open it directly). */
+  | "svg"
+  /** XML served as its own document (`sitemap.xml`, feed). */
+  | "xml"
   /** JSON body from `/api/*` or `/-/health`. */
   | "json"
   /** SSE event stream from `/events`. */
@@ -45,15 +52,13 @@ export type ResponseKind =
 export interface HeaderContext {
   /** Loopback port the daemon bound to. */
   readonly port: number;
-  /** Distinct SHA-256 hex digests of the inline scripts the site
-   * build emitted (from `csp-hashes.json`, ADR-0012). Empty when the
-   * artefact is missing — the daemon fails closed by omitting hashes
-   * from `script-src` (inline scripts then refuse in the browser). */
+  /** Distinct SHA-256 hex digests of the inline scripts allowed by
+   * the running revkit version. These come from the COMMITTED,
+   * reviewed set (`packages/cli/src/dist-check-allowlist.json`), not
+   * from anything the served dir carries — ADR-0012 rule "the daemon
+   * applies the allowlist of the revkit version it runs, never
+   * hashes found in an artifact". */
   readonly inlineScriptHashes: readonly string[];
-  /** Whether the CSP allowlist artefact was loaded. `false` means we
-   * are serving fail-closed: inline scripts and Starlight islands
-   * will not run. The daemon logs the state on startup. */
-  readonly cspHashesLoaded: boolean;
 }
 
 /** Where the rail bundle lives on the daemon. Kept as a constant so
@@ -64,6 +69,15 @@ export const RAIL_SCRIPT_URL_PATH = "/-/rail.js";
  * `<script src>` starts with this prefix (`check-dist.ts` enforces the
  * same on the built HTML). */
 export const ASTRO_SCRIPTS_URL_PREFIX = "/_astro/";
+
+/** Starlight ships client-side search via pagefind, which loads
+ * `/pagefind/pagefind.js` and spawns a Worker fetching `.pagefind`
+ * / `.pf_meta` / `.pf_fragment` / `.pf_index` / `.pf_filter` and a
+ * WebAssembly blob. `script-src` and `worker-src` allow the whole
+ * `/pagefind/` prefix; the WASM instantiation gets `'wasm-unsafe-eval'`
+ * (the narrow WASM-only keyword — not `'unsafe-eval'`, which would
+ * allow `eval` / `new Function()` on any script). */
+export const PAGEFIND_URL_PREFIX = "/pagefind/";
 
 /** Denied Permissions-Policy features. The daemon UI is a reader-and-
  * comment surface — none of these features is ever needed, so we
@@ -113,28 +127,41 @@ export function permissionsPolicyValue(): string {
   return DENIED_PERMISSIONS.map((name) => `${name}=()`).join(", ");
 }
 
-/** Build the daemon's Content-Security-Policy value.
+/** The two loopback origins the daemon's `isLoopbackHost` accepts —
+ * `127.0.0.1:<port>` and `localhost:<port>`. `script-src`,
+ * `worker-src` and the WebSocket `connect-src` list both so a page
+ * opened at either origin loads the same set of assets under the
+ * same policy. Kept small (two aliases only); a browser that opens
+ * a foreign public IP whose DNS points at 127.0.0.1 fails the Host
+ * check well before the CSP fires. */
+function loopbackOrigins(port: number, scheme: "http" | "ws"): readonly string[] {
+  return [`${scheme}://127.0.0.1:${port}`, `${scheme}://localhost:${port}`];
+}
+
+/** Build the daemon's Content-Security-Policy value for an HTML
+ * response.
  *
  * Design notes:
  *
  * - `default-src 'none'` — nothing is allowed unless a specific
  *   directive names it.
  * - `script-src` names the EXACT paths the daemon serves scripts
- *   from: `/-/rail.js` (the rail bundle) and `/_astro/` (Astro's
- *   chunk directory). CSP L3 allows a path component in a source
- *   expression, and Chromium / Firefox / WebKit all support it. In
- *   addition, every inline-script SHA-256 the site build emitted is
- *   listed — Starlight and its theme-toggle bootstrap use inline
- *   scripts (the same hashes `check-dist` enforces on disk). If
- *   `cspHashesLoaded` is false we omit the hashes: any inline
- *   script then refuses in the browser, and the daemon logs the
- *   startup message.
- *   `'unsafe-eval'` is NOT in this directive. The rail is now JSX-
- *   compiled at build time by `babel-preset-solid` (see
- *   `rail/bundle.ts`), so the bundle contains no `eval` or
- *   `new Function(...)` — the previous `solid-js/html` runtime,
- *   which forced `'unsafe-eval'`, has been replaced. ADR-0013
- *   amendment (2026-09-30) documents the switch.
+ *   from, once per loopback alias (`127.0.0.1:<port>` and
+ *   `localhost:<port>`): `/-/rail.js` (the rail bundle), `/_astro/`
+ *   (Astro's chunk directory), and `/pagefind/` (Starlight's
+ *   client-side search runtime). CSP L3 allows a path component in
+ *   a source expression, and Chromium / Firefox / WebKit all
+ *   support it. In addition, every inline-script SHA-256 the
+ *   running revkit version allowlists is listed — Starlight and its
+ *   theme-toggle bootstrap use inline scripts (the same hashes
+ *   `check-dist` enforces on disk). `'unsafe-eval'` is NOT in this
+ *   directive; the rail is JSX-compiled at build time by
+ *   `babel-preset-solid` and produces no `eval()` / `new Function()`
+ *   at runtime. `'wasm-unsafe-eval'` is the narrow WASM-only
+ *   keyword pagefind's compiled `.wasm` needs to instantiate; it
+ *   does NOT permit `eval()` or `new Function()` on JS.
+ * - `worker-src` — pagefind uses `new Worker(...)` for its indexer.
+ *   `'self'` covers the same origin.
  * - `style-src 'self' 'unsafe-inline'` — Starlight and expressive-
  *   code inject inline styles for syntax highlighting; KaTeX styles
  *   are self-hosted so `'self'` covers them, but the theme-toggle
@@ -144,15 +171,10 @@ export function permissionsPolicyValue(): string {
  *   emit style hashes (not available at Astro 7.3.5). ADR-0012's
  *   original text lists this as an accepted trade-off.
  * - `img-src` and `font-src` keep the ADR-0012 allowlist as-is.
- * - `connect-src 'self'` — CSP L3 defines `'self'` to include the
- *   same-origin WebSocket scheme (ws/wss). Chromium (since Chrome
- *   96) and Firefox (since Firefox 99) implement it. We also list
- *   the explicit `ws://127.0.0.1:<port>` origin: a browser that
- *   normalises `ws://` to `http://` (Safari on older iOS) then
- *   still matches. Listing both is redundant on modern browsers
- *   and forward-compatible; the ADR-0012 host-mode text names only
- *   `'self'` and this daemon path amends it (ADR-0013 amendment
- *   2026-09-30).
+ * - `connect-src 'self'` covers pagefind's `.pf_meta` / `.pf_index`
+ *   / `.pf_fragment` fetches. CSP L3 defines `'self'` to include the
+ *   same-origin WebSocket scheme (ws/wss); we also list the explicit
+ *   `ws://` origins for older WebKit builds.
  * - `frame-ancestors 'none'`, `base-uri 'none'`, `object-src 'none'`,
  *   `form-action 'self'` — verbatim from ADR-0012.
  */
@@ -160,19 +182,27 @@ export function buildCspHeader(ctx: HeaderContext): string {
   const scriptSources: string[] = [];
   // Path-scoped script sources. CSP treats a source with a trailing
   // slash as "any file under this path"; a source WITHOUT a trailing
-  // slash matches exactly one URL.
-  scriptSources.push(`http://127.0.0.1:${ctx.port}${RAIL_SCRIPT_URL_PATH}`);
-  scriptSources.push(`http://127.0.0.1:${ctx.port}${ASTRO_SCRIPTS_URL_PREFIX}`);
-  if (ctx.cspHashesLoaded) {
-    for (const hex of ctx.inlineScriptHashes) {
-      // Hashes in CSP use base64, not hex. `check-dist.ts` stores hex
-      // digests (they are easier to eyeball in a diff); `sha256Hex`
-      // there produced them. We convert to base64 here so the header
-      // is a valid CSP source.
-      scriptSources.push(`'sha256-${hexToBase64(hex)}'`);
-    }
+  // slash matches exactly one URL. Emit one entry per loopback alias
+  // so a page opened at http://localhost:<port>/ loads the same set
+  // as a page opened at http://127.0.0.1:<port>/.
+  for (const origin of loopbackOrigins(ctx.port, "http")) {
+    scriptSources.push(`${origin}${RAIL_SCRIPT_URL_PATH}`);
+    scriptSources.push(`${origin}${ASTRO_SCRIPTS_URL_PREFIX}`);
+    scriptSources.push(`${origin}${PAGEFIND_URL_PREFIX}`);
   }
-  const wsOrigin = `ws://127.0.0.1:${ctx.port}`;
+  // `'wasm-unsafe-eval'` is the narrow WASM-only keyword: it lets
+  // `WebAssembly.compile` / `WebAssembly.instantiate` compile a byte
+  // sequence into a module. It does NOT permit `eval()` or
+  // `new Function()` on JavaScript strings. Required by pagefind
+  // (Starlight search).
+  scriptSources.push("'wasm-unsafe-eval'");
+  for (const hex of ctx.inlineScriptHashes) {
+    // Hashes in CSP use base64, not hex. `dist-check-allowlist.json`
+    // stores hex digests (easier to eyeball in a diff); we convert
+    // to base64 here so the header is a valid CSP source.
+    scriptSources.push(`'sha256-${hexToBase64(hex)}'`);
+  }
+  const wsOrigins = loopbackOrigins(ctx.port, "ws");
   // Order chosen so the header reads top-down like the ADR text —
   // default first, script/style next, then fetch destinations, then
   // navigation guards. Semicolon-separated is the CSP spec form.
@@ -182,12 +212,38 @@ export function buildCspHeader(ctx: HeaderContext): string {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: https://avatars.githubusercontent.com",
     "font-src 'self'",
-    `connect-src 'self' ${wsOrigin}`,
+    `connect-src 'self' ${wsOrigins.join(" ")}`,
+    "worker-src 'self'",
     "frame-ancestors 'none'",
     "base-uri 'none'",
     "form-action 'self'",
     "object-src 'none'",
   ];
+  return directives.join("; ");
+}
+
+/** Build the MINIMAL CSP the daemon puts on a NON-HTML response the
+ * browser could still open AS ITS OWN DOCUMENT — an SVG at `/foo.svg`
+ * (script can run inside SVG) or an XML feed at `/sitemap.xml` (an
+ * XSLT-styled XML also renders as a document). The value denies
+ * scripting and framing:
+ *
+ *   `default-src 'none'; frame-ancestors 'none'`
+ *
+ * plus `sandbox` on SVG (ADR-0012's upload-handling rule: an SVG can
+ * carry `<script>`, but the browser treats a sandboxed document as
+ * an opaque origin with no script).
+ *
+ * DO NOT call this for other asset kinds (JS chunk, CSS, font,
+ * image, JSON body, .wasm, .pf_meta): those render as source or
+ * media when opened directly (no script execution), and attaching a
+ * CSP with `default-src 'none'` to a JS response that a Worker will
+ * later load DENIES the Worker's own `fetch()` — Pagefind's search
+ * runtime is a concrete case (issue #22 review). Assets carry NO
+ * CSP header. */
+export function buildMinimalCspHeader(kind: "svg" | "xml"): string {
+  const directives = ["default-src 'none'", "frame-ancestors 'none'"];
+  if (kind === "svg") directives.push("sandbox");
   return directives.join("; ");
 }
 
@@ -223,15 +279,21 @@ export function applyResponseHeaders(
     response.headers.set("content-type", contentType);
   }
 
-  // CSP goes on every HTML response. A JS/CSS/image asset served
-  // from `/_astro/`, the rail bundle, or the site's public/ folder
-  // does not need CSP itself — browsers apply the CSP of the
-  // embedding document. Applying it here anyway is safe (browsers
-  // ignore CSP on non-document responses) but adds bytes; the
-  // header omission is a deliberate optimisation and covered by the
-  // unit tests.
+  // CSP: HTML gets the full policy. SVG and XML get the minimal
+  // policy (`default-src 'none'; frame-ancestors 'none'`, plus
+  // `sandbox` on SVG) — those two are the non-HTML shapes the
+  // browser will still render AS A DOCUMENT when opened directly,
+  // and script can execute inside both. Every other asset (JS
+  // bundle, CSS, image, font, JSON, .wasm, .pf_meta) carries NO
+  // CSP header: browsers apply the embedding document's CSP to
+  // subresource loads, and a Worker (Pagefind's search runtime)
+  // whose script response carries `default-src 'none'` has its
+  // own `fetch()` denied inside the Worker — see the issue #22
+  // review's second blocker.
   if (kind === "html") {
     response.headers.set("content-security-policy", buildCspHeader(ctx));
+  } else if (kind === "svg" || kind === "xml") {
+    response.headers.set("content-security-policy", buildMinimalCspHeader(kind));
   }
 
   // Cache-Control: never cache API JSON or the auth exchange (the

@@ -10,7 +10,6 @@
     "dev": "astro dev",
     "prebuild": "bun run scripts/copy-katex-assets.ts",
     "build": "astro build",
-    "postbuild": "bun run scripts/emit-csp-hashes.ts",
     "preview": "astro preview",
     "astro": "astro",
     "check": "astro check",

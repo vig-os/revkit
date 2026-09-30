@@ -66,7 +66,15 @@ import {
   resolveRequestSchema,
 } from "./api-schemas.ts";
 import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
-import { loadCspHashes } from "./csp-hashes.ts";
+// The inline-script hash allowlist is the SAME committed set that
+// `revkit check-dist` enforces: `dist-check-allowlist.json`'s
+// `sha256` keys, shipped with the running revkit version. This
+// follows ADR-0012's "the Worker applies the allowlist of the
+// revkit version it runs, never hashes found in an artifact"
+// exactly — and, on the daemon, closes the M3 hazard where a PR-
+// controlled build could plant its own hashes into an artefact
+// under `dist/`.
+import ALLOWLIST_JSON from "../dist-check-allowlist.json" with { type: "json" };
 
 /** Public options accepted by the daemon. */
 export interface StartDaemonOptions {
@@ -186,28 +194,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const staticServer = openStaticServer(options.dir);
   const bus = new EventBus();
 
-  // Load the inline-script hash allowlist (ADR-0012, issue #22). The
-  // artefact lives at `<dir>/.revkit/csp-hashes.json` and is emitted
-  // by `site/scripts/emit-csp-hashes.ts` from the same parse5 walk
-  // `revkit check-dist` uses — one source of truth for what a
-  // Starlight build ships as an inline bootstrap. Fail closed: a
-  // missing artefact means we serve HTML without any inline-script
-  // hash allowlisted; the theme-toggle bootstrap in Starlight then
-  // does not run. A startup log line names the artefact path and
-  // reason so the operator sees why. `revkit serve` never widens
-  // the CSP to compensate.
-  const cspLoad = loadCspHashes(options.dir);
-  if (cspLoad.loaded) {
-    logger.info("csp.hashes.loaded", {
-      count: cspLoad.hashes.length,
-      artefact: repoRelativeDisplay(options.repoRoot, cspLoad.artefactPath),
-    });
-  } else {
-    logger.warn("csp.hashes.missing", {
-      artefact: repoRelativeDisplay(options.repoRoot, cspLoad.artefactPath),
-      reason: cspLoad.reason,
-    });
-  }
+  // Inline-script hash allowlist (ADR-0012 rule "the daemon applies
+  // the allowlist of the revkit version it runs, never hashes found
+  // in an artifact"): the SHA-256 hex keys in the committed
+  // `dist-check-allowlist.json` — the same set `revkit check-dist`
+  // enforces on disk. Read from the CLI package itself. If a served
+  // dir happens to ship a `.revkit/csp-hashes.json` file, the daemon
+  // IGNORES it: whoever controls the build output must not control
+  // `script-src` (this is the M3 PR-preview attacker model; ADR-0013
+  // amendment 2026-09-30 fixes the earlier design).
+  const cspHashes: readonly string[] = Object.freeze(
+    Array.from(new Set(Object.keys(ALLOWLIST_JSON.sha256 as Record<string, unknown>))).sort(),
+  );
+  logger.info("csp.hashes.loaded", { count: cspHashes.length });
 
   const agentToken = mintToken();
   const launchCode = mintToken();
@@ -324,12 +323,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // Header context (ADR-0012 CSP + hygiene). Bound now that we have
   // the port. The context is IMMUTABLE for the lifetime of the
   // daemon — every response goes through `applyResponseHeaders` in
-  // `withHygiene`, so a hash change on disk after start is ignored
-  // (fresh daemon, fresh policy). Captured by closure below.
+  // `withHygiene`, so nothing on disk after start can widen it.
   const headerCtx: HeaderContext = {
     port,
-    inlineScriptHashes: cspLoad.loaded ? cspLoad.hashes : [],
-    cspHashesLoaded: cspLoad.loaded,
+    inlineScriptHashes: cspHashes,
   };
 
   // Per-start opaque id, echoed by `GET /-/health` so a client can
@@ -1048,13 +1045,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       logger.warn("static.rejected.mime", { requestId, path: decodedPath });
       return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
     }
-    // `kind: "html"` gets the full CSP header. Everything else is an
-    // asset (JS chunk, CSS, image, font, JSON side file); browsers
-    // apply the embedding document's CSP to fetched subresources, so
-    // an asset does not need one of its own. The hygiene triplet
-    // (nosniff / no-referrer / cross-origin isolation / permissions
-    // policy) still lands on every response.
-    const staticKind: ResponseKind = contentType.startsWith("text/html") ? "html" : "asset";
+    // `kind: "html"` gets the full CSP header. SVG carries `kind:
+    // "svg"` (script can run inside SVG; ADR-0012 mandates
+    // `sandbox` on served SVG); XML carries `kind: "xml"` (an
+    // XSLT-styled XML also renders as a document). Everything
+    // else is an ordinary asset (JS chunk, CSS, image, font, JSON
+    // side file, `.wasm`, `.pf_meta`); those carry NO CSP header
+    // — browsers apply the embedding document's CSP to
+    // subresource fetches, and a Worker's own `fetch()` would be
+    // denied by an inherited `default-src 'none'`.
+    const staticKind: ResponseKind = contentType.startsWith("text/html")
+      ? "html"
+      : contentType.startsWith("image/svg+xml")
+        ? "svg"
+        : contentType.startsWith("application/xml") || contentType.startsWith("text/xml")
+          ? "xml"
+          : "asset";
     if (request.method === "HEAD") {
       const size = staticServer.size(result.absolutePath);
       return withHygiene(new Response(null, { status: 200, headers: { "content-length": String(size) } }), staticKind, contentType);

@@ -67,17 +67,25 @@ export const UI_ALLOWED_PREFIXES: readonly string[] = [
  * make the first real drop of upstream `.tsx` files unshippable. */
 const RULE_EXEMPT_PREFIXES: readonly string[] = [
   "packages/components/vendor/",
-  // The daemon's own overlay UI (the "rail") is bundled by
-  // `packages/cli/src/rail/bundle.ts` and served from the daemon at
-  // `/-/rail.js`. It is not a page-composition component (nothing in
-  // `site/` imports it, and it depends on the daemon's `/api/*` and
-  // `/events` endpoints), so it does not belong under
-  // `packages/components/src/`. Since PR #22 the rail is JSX-compiled
-  // at build time (`babel-preset-solid`) to keep `script-src` free of
-  // `'unsafe-eval'` — hence the `.tsx` extension — and this exemption
-  // lets that file live where the bundler expects it.
-  "packages/cli/src/rail/",
 ];
+
+/** Exact paths of individual files this rule steps aside for. Narrow
+ * exemptions belong here (a single file), not in
+ * `RULE_EXEMPT_PREFIXES` — a whole-directory carve-out would exempt
+ * hand-rolled UI a future commit could quietly add next to the
+ * allowed file.
+ *
+ * `packages/cli/src/rail/rail.tsx` — the daemon's own overlay UI
+ * (bundled by `packages/cli/src/rail/bundle.ts` and served at
+ * `/-/rail.js`). Not a page-composition component (nothing in
+ * `site/` imports it; it depends on the daemon's `/api/*` and
+ * `/events` endpoints), so it does not belong under
+ * `packages/components/src/`. Since PR #22 the rail is JSX-compiled
+ * at build time (`babel-preset-solid`) to keep `script-src` free of
+ * `'unsafe-eval'` — hence the `.tsx` extension. */
+const RULE_EXEMPT_FILES: ReadonlySet<string> = new Set([
+  "packages/cli/src/rail/rail.tsx",
+]);
 
 /** Path prefixes where a code module is out of place: content is data.
  *
@@ -164,6 +172,9 @@ export function checkNoHandRolledUiFile(posixRepoRelative: string): Diagnostic[]
   // barrel. Return early so the first real vendored `.tsx` isn't
   // caught as hand-rolled UI.
   if (RULE_EXEMPT_PREFIXES.some((prefix) => startsWithCI(posixRepoRelative, prefix))) {
+    return findings;
+  }
+  if (RULE_EXEMPT_FILES.has(posixRepoRelative.toLowerCase())) {
     return findings;
   }
 

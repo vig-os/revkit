@@ -39,6 +39,27 @@ const MIME_BY_EXT: Readonly<Record<string, string>> = {
   ".otf": "font/otf",
   ".wasm": "application/wasm",
   ".pdf": "application/pdf",
+  // Pagefind (Starlight client-side search) ships an opaque binary
+  // index split across four extensions plus a gzipped-wasm blob:
+  //   `.pf_meta`    — small language-scoped metadata blob
+  //   `.pf_index`   — the sharded search index
+  //   `.pf_fragment` — a document snippet
+  //   `.pf_filter`   — filter-facet payloads (only ships if the
+  //                    build enables filters; kept in the allowlist
+  //                    so a Starlight upgrade that turns filters on
+  //                    doesn't silently 404)
+  //   `.pagefind`   — the gzipped WebAssembly module Pagefind
+  //                    fetches into a Worker
+  // All five are binary opaque blobs Pagefind interprets itself; the
+  // browser never parses them as media, so a generic
+  // `application/octet-stream` type is correct. `X-Content-Type-Options:
+  // nosniff` (attached by `headers.ts`) keeps the browser from ever
+  // reinterpreting the bytes as another type. See issue #22 review.
+  ".pf_meta": "application/octet-stream",
+  ".pf_index": "application/octet-stream",
+  ".pf_fragment": "application/octet-stream",
+  ".pf_filter": "application/octet-stream",
+  ".pagefind": "application/octet-stream",
 };
 
 /** Return the Content-Type for a file's lowercased extension (with the

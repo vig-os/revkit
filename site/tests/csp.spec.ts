@@ -14,7 +14,8 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +24,6 @@ import { registerDaemonPid, unregisterDaemonPid } from "../../packages/cli/test/
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
 const DIST = resolve(__dirname, "..", "dist");
-const CSP_ARTEFACT_REL = ".revkit/csp-hashes.json";
 
 interface DaemonCtx {
   readonly child: ChildProcess;
@@ -33,38 +33,36 @@ interface DaemonCtx {
   readonly launchUrl: string;
 }
 
-/** Spawn a daemon rooted at a temp `--dir` that COPIES two files out
- * of the real built dist: `index.html` (the landing page) and the
- * emitted `.revkit/csp-hashes.json` so the CSP `sha256-...` sources
- * include the real Starlight hashes.
- *
- * We do not point `--dir` at `site/dist` directly because
- * `daemon-cross-site.spec.ts` and `rail-roundtrip.spec.ts` do the
- * same thing (one temp root per daemon so `.revkit/daemon.lock` does
- * not collide with a real dogfood daemon running elsewhere). */
-async function bootDaemon(pages: readonly { rel: string; body: string }[]): Promise<DaemonCtx> {
+interface BootDaemonOptions {
+  /** Files to write into the served `dist/`. */
+  readonly pages: readonly { rel: string; body: string }[];
+  /** Whole directories to copy verbatim out of the real built dist
+   * (`site/dist/`). Used for `/pagefind/` and `/_astro/` in the
+   * search spec; each copied directory shows up under the daemon's
+   * served root at the same relative path. */
+  readonly copyDistDirs?: readonly string[];
+}
+
+/** Spawn a daemon rooted at a temp `--dir` that carries the pages
+ * (and optional real-build directories) the test needs. */
+async function bootDaemon(options: BootDaemonOptions): Promise<DaemonCtx> {
   const root = mkdtempSync(join(tmpdir(), "revkit-csp-e2e-"));
   const dist = join(root, "dist");
   mkdirSync(dist, { recursive: true });
   // Package the tree the daemon will serve.
-  for (const page of pages) {
+  for (const page of options.pages) {
     const abs = join(dist, page.rel);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, page.body, "utf8");
   }
-  // Copy the real emitter's csp-hashes.json so the daemon's CSP
-  // includes the Starlight inline-script hashes. If the artefact is
-  // missing (a partial build), fail loudly here — the CSP spec is
-  // meaningless without a real hash set.
-  const artefactSrc = join(DIST, CSP_ARTEFACT_REL);
-  if (!existsSync(artefactSrc)) {
-    rmSync(root, { recursive: true, force: true });
-    throw new Error(
-      `CSP spec: ${CSP_ARTEFACT_REL} missing under site/dist; run \`just build\` first.`,
-    );
+  for (const rel of options.copyDistDirs ?? []) {
+    const src = join(DIST, rel);
+    if (!existsSync(src)) {
+      rmSync(root, { recursive: true, force: true });
+      throw new Error(`CSP spec: ${rel} missing under site/dist; run \`just build\` first.`);
+    }
+    cpSync(src, join(dist, rel), { recursive: true });
   }
-  mkdirSync(join(dist, ".revkit"), { recursive: true });
-  writeFileSync(join(dist, CSP_ARTEFACT_REL), readFileSync(artefactSrc));
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "revkit", private: true, type: "module" }));
 
   const child = spawn("bun", [REVKIT_BIN, "serve", "--port", "0", "--dir", dist], {
@@ -170,7 +168,11 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
       }
     }
     expect(pages.length).toBeGreaterThan(0);
-    const daemon = await bootDaemon(pages);
+    // Copy Astro's chunk directory too — the page HTML references
+    // `<script src="/_astro/…">`; without those files the browser
+    // gets 404s and the page's own bootstrap never runs (masking
+    // any late CSP violation).
+    const daemon = await bootDaemon({ pages, copyDistDirs: ["_astro"] });
     try {
       for (const p of pages) {
         const readViolations = await collectCspViolations(page);
@@ -221,7 +223,7 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
         <div id="target">before</div>
         <script id="attacker">document.getElementById('target').textContent = 'RAN';</script>
       </body></html>`;
-    const daemon = await bootDaemon([{ rel: "injected.html", body: injected }]);
+    const daemon = await bootDaemon({ pages: [{ rel: "injected.html", body: injected }] });
     try {
       const readViolations = await collectCspViolations(page);
       const response = await page.goto(daemon.url + "/injected.html", { waitUntil: "networkidle" });
@@ -252,7 +254,7 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
     // that broke one of these paths would surface as a CSP
     // violation captured by the init-script listener.
     const landing = readFileSync(join(DIST, "index.html"), "utf8");
-    const daemon = await bootDaemon([{ rel: "index.html", body: landing }]);
+    const daemon = await bootDaemon({ pages: [{ rel: "index.html", body: landing }] });
     try {
       const readViolations = await collectCspViolations(page);
       // 1) Cookie-log in. The launch endpoint 302s to `/`; use
@@ -295,6 +297,232 @@ test.describe("ADR-0012 CSP + response hygiene on `revkit serve` @chromium-only"
         violations,
         `CSP fired while the browser tab exercised the API/SSE: ${JSON.stringify(violations, null, 2)}`,
       ).toEqual([]);
+    } finally {
+      await shutdownDaemon(daemon);
+    }
+  });
+
+  test("Starlight search (pagefind) loads, returns a result, and fires ZERO CSP violations", async ({ page, context }) => {
+    // Load a real Starlight page whose HTML carries the search
+    // trigger + `<site-search>` custom element, plus the full
+    // `/_astro/` and `/pagefind/` trees. Then open search (kbd
+    // shortcut `/`), type a word we know is in the docs, and
+    // assert at least one result appears — proving that:
+    //   - `/pagefind/pagefind.js` loaded under `script-src`
+    //   - Pagefind's Worker spawned under `worker-src 'self'`
+    //   - The .pagefind WASM instantiated under `'wasm-unsafe-eval'`
+    //   - The .pf_meta / .pf_index / .pf_fragment blobs fetched
+    //     under `connect-src 'self'` and served with an
+    //     `application/octet-stream` MIME (no `nosniff` refusal)
+    // If any of those pieces regressed, the search box shows
+    // "no results" or a CSP violation fires — both flip this test.
+    const landingHtml = readFileSync(join(DIST, "index.html"), "utf8");
+    const daemon = await bootDaemon({
+      pages: [{ rel: "index.html", body: landingHtml }],
+      copyDistDirs: ["_astro", "pagefind"],
+    });
+    try {
+      const readViolations = await collectCspViolations(page);
+      // Capture console errors: if pagefind's Worker throws while
+      // compiling the wasm or fetching the index, the browser
+      // reports it on the main-thread console. Surfacing those in
+      // the failure message keeps CI diagnosable.
+      const consoleErrors: string[] = [];
+      page.on("console", (msg) => {
+        if (msg.type() === "error") {
+          const loc = msg.location();
+          consoleErrors.push(`${msg.text()} @ ${loc.url}:${loc.lineNumber}`);
+        }
+      });
+      const requestFailures: string[] = [];
+      page.on("requestfailed", (req) => {
+        requestFailures.push(`${req.method()} ${req.url()} — ${req.failure()?.errorText ?? "unknown"}`);
+      });
+      const httpErrors: string[] = [];
+      const pagefindResponses: string[] = [];
+      // `page.on("response")` sees main-thread and Worker responses
+      // in recent Playwright, but the Worker's `fetch` goes through
+      // the browser context's network stack; `context.on` catches
+      // both. Register on the context so Pagefind's Worker fetches
+      // (`/pagefind/*.pf_meta`, `/pagefind/wasm.en.pagefind`) are
+      // captured too.
+      context.on("response", (resp) => {
+        if (resp.status() >= 400) httpErrors.push(`${resp.status()} ${resp.request().method()} ${resp.url()}`);
+        if (resp.url().includes("/pagefind/")) pagefindResponses.push(`${resp.status()} ${resp.url()}`);
+      });
+      await page.goto(daemon.url + "/", { waitUntil: "domcontentloaded" });
+      // Open Starlight's search dialog by clicking its
+      // `data-open-modal` button (the keyboard shortcut is
+      // Cmd/Ctrl+K, but the click path is more deterministic
+      // across platforms). The button lives inside the
+      // `<site-search>` custom element in the top nav.
+      await page.locator("site-search button[data-open-modal]").click();
+      // Starlight's Search.astro loads Pagefind's UI lazily on
+      // dialog open; the actual `<input>` is `pagefind-ui__search-input`,
+      // rendered by Pagefind into the `<dialog>` body after
+      // `/pagefind/pagefind-ui.js` finishes fetching + running.
+      const searchInput = page.locator("site-search dialog[open] input.pagefind-ui__search-input");
+      await searchInput.waitFor({ state: "visible", timeout: 10_000 });
+      await searchInput.fill("channel");
+      // Pagefind is worker-driven; give it a beat to fetch its
+      // .pf_meta / wasm blob, run the query, and paint results.
+      // Assert on the search results list Pagefind's own UI
+      // component populates. The Starlight processResult wrapper
+      // strips the `.pagefind-ui__result-link` class in some
+      // versions; accept either the class OR any `<a>` that carries
+      // an `href` inside the results list Pagefind renders.
+      const anyResultLink = page.locator("site-search dialog[open] .pagefind-ui__results a[href]");
+      try {
+        await anyResultLink.first().waitFor({ state: "visible", timeout: 15_000 });
+      } catch (e) {
+        // Enrich the failure with browser-side context so a CI
+        // failure is diagnosable without a headed run.
+        const diagBody = await page.locator("site-search dialog[open]").innerHTML().catch(() => "<no dialog>");
+        const violations = await readViolations();
+        throw new Error(
+          `pagefind result never appeared.\n` +
+            `CSP violations: ${JSON.stringify(violations, null, 2)}\n` +
+            `console errors: ${JSON.stringify(consoleErrors, null, 2)}\n` +
+            `request failures: ${JSON.stringify(requestFailures, null, 2)}\n` +
+            `HTTP >=400 responses: ${JSON.stringify(httpErrors, null, 2)}\n` +
+            `pagefind responses: ${JSON.stringify(pagefindResponses, null, 2)}\n` +
+            `dialog inner HTML: ${diagBody.slice(0, 3000)}\n` +
+            `original: ${(e as Error).message}`,
+        );
+      }
+      const resultCount = await anyResultLink.count();
+      expect(resultCount, "pagefind must return at least one result for 'channel'").toBeGreaterThan(0);
+      // No CSP violations while search compiled, spawned a Worker,
+      // fetched .pagefind assets, and rendered results.
+      const violations = await readViolations();
+      expect(
+        violations,
+        `CSP fired during pagefind search: ${JSON.stringify(violations, null, 2)}`,
+      ).toEqual([]);
+    } finally {
+      await shutdownDaemon(daemon);
+    }
+  });
+
+  test("localhost:<port> works too: same CSP shape, same rail bundle loads, no violations", async ({ page }) => {
+    // The daemon accepts both `127.0.0.1:<port>` and
+    // `localhost:<port>` as valid Host / Origin values. If the CSP
+    // named only the 127.0.0.1 alias, opening the daemon at
+    // `http://localhost:<port>/` would refuse the rail bundle
+    // load (`/-/rail.js` at the localhost origin is a different
+    // URL from the CSP's 127.0.0.1 source). Prove both aliases
+    // work with a fresh landing page fetched over `localhost`.
+    const landing = readFileSync(join(DIST, "index.html"), "utf8");
+    const daemon = await bootDaemon({
+      pages: [{ rel: "index.html", body: landing }],
+      copyDistDirs: ["_astro"],
+    });
+    try {
+      const readViolations = await collectCspViolations(page);
+      const localhostUrl = `http://localhost:${daemon.port}/`;
+      const response = await page.goto(localhostUrl, { waitUntil: "domcontentloaded" });
+      expect(response?.status()).toBe(200);
+      const csp = response!.headers()["content-security-policy"]!;
+      // Both aliases named in the header.
+      expect(csp).toContain(`http://127.0.0.1:${daemon.port}/-/rail.js`);
+      expect(csp).toContain(`http://localhost:${daemon.port}/-/rail.js`);
+      await page.waitForTimeout(200);
+      const violations = await readViolations();
+      expect(
+        violations,
+        `CSP fired on localhost:<port> load: ${JSON.stringify(violations, null, 2)}`,
+      ).toEqual([]);
+    } finally {
+      await shutdownDaemon(daemon);
+    }
+  });
+
+  test("BYTE-EXACT: the CSP header on a served HTML page matches the pinned shape", async ({ page }) => {
+    // A byte-exact assertion catches ordering drifts and stray
+    // whitespace that `toContain` would miss. The Playwright test
+    // asserts against the header the browser actually received;
+    // the unit test in `test/serve/headers.test.ts` asserts on
+    // the pure builder output.
+    const landing = `<!doctype html><html><head><title>x</title></head><body></body></html>`;
+    const daemon = await bootDaemon({ pages: [{ rel: "index.html", body: landing }] });
+    try {
+      const response = await page.goto(daemon.url + "/", { waitUntil: "domcontentloaded" });
+      const csp = response!.headers()["content-security-policy"]!;
+      // The set of committed inline-script hashes lives in
+      // `packages/cli/src/dist-check-allowlist.json`. Load it from
+      // disk here so the test tracks whatever the CLI ships with.
+      const allowlistJson = JSON.parse(
+        readFileSync(resolve(__dirname, "..", "..", "packages", "cli", "src", "dist-check-allowlist.json"), "utf8"),
+      ) as { sha256: Record<string, unknown> };
+      const hexToBase64 = (hex: string): string => Buffer.from(hex, "hex").toString("base64");
+      const sortedHashes = Array.from(new Set(Object.keys(allowlistJson.sha256))).sort();
+      const hashSources = sortedHashes.map((hex) => `'sha256-${hexToBase64(hex)}'`).join(" ");
+      const port = daemon.port;
+      const expected =
+        "default-src 'none'; " +
+        "script-src " +
+          `http://127.0.0.1:${port}/-/rail.js ` +
+          `http://127.0.0.1:${port}/_astro/ ` +
+          `http://127.0.0.1:${port}/pagefind/ ` +
+          `http://localhost:${port}/-/rail.js ` +
+          `http://localhost:${port}/_astro/ ` +
+          `http://localhost:${port}/pagefind/ ` +
+          "'wasm-unsafe-eval' " +
+          hashSources + "; " +
+        "style-src 'self' 'unsafe-inline'; " +
+        "img-src 'self' data: https://avatars.githubusercontent.com; " +
+        "font-src 'self'; " +
+        `connect-src 'self' ws://127.0.0.1:${port} ws://localhost:${port}; ` +
+        "worker-src 'self'; " +
+        "frame-ancestors 'none'; " +
+        "base-uri 'none'; " +
+        "form-action 'self'; " +
+        "object-src 'none'";
+      expect(csp).toBe(expected);
+    } finally {
+      await shutdownDaemon(daemon);
+    }
+  });
+
+  test("a forged `.revkit/csp-hashes.json` in the served dir is ignored; extra inline script is blocked", async ({ page }) => {
+    // Reproduces the ADR-0012 rule "the daemon applies the
+    // allowlist of the revkit version it runs, never hashes found
+    // in an artifact". A PR-controlled build in M3 could plant a
+    // forged hashes file next to its own extra inline `<script>`;
+    // the daemon must not honour it.
+    const forgedInline = "console.log('attacker inline');";
+    const forgedHex = createHash("sha256").update(Buffer.from(forgedInline, "utf8")).digest("hex");
+    const injected =
+      "<!doctype html><html><head><title>x</title></head>" +
+      "<body><div id='target'>before</div>" +
+      `<script id="attacker">${forgedInline}</script>` +
+      "</body></html>";
+    const daemon = await bootDaemon({ pages: [{ rel: "injected.html", body: injected }] });
+    try {
+      // 1) Plant the forged hashes file next to the page. The
+      //    daemon must not read it.
+      mkdirSync(join(daemon.root, "dist", ".revkit"), { recursive: true });
+      writeFileSync(
+        join(daemon.root, "dist", ".revkit", "csp-hashes.json"),
+        JSON.stringify({ version: 1, algorithm: "sha256", hashes: [forgedHex] }),
+      );
+      // 2) The daemon reads the artefact only at startup, and by
+      //    design ignores what the served dir carries — so the
+      //    header on the response must already lack the forged
+      //    hash even without a restart. Assert it.
+      const readViolations = await collectCspViolations(page);
+      const response = await page.goto(daemon.url + "/injected.html", { waitUntil: "networkidle" });
+      const csp = response!.headers()["content-security-policy"]!;
+      const b64 = Buffer.from(forgedHex, "hex").toString("base64");
+      expect(csp, "forged hash MUST NOT appear in the daemon's CSP").not.toContain(b64);
+      // The inline script must not have executed under the CSP.
+      const text = await page.locator("#target").textContent();
+      expect(text).toBe("before");
+      const violations = await readViolations();
+      expect(
+        violations.some((v) => v.violatedDirective.startsWith("script-src")),
+        `forged inline script should have fired a script-src violation: ${JSON.stringify(violations, null, 2)}`,
+      ).toBe(true);
     } finally {
       await shutdownDaemon(daemon);
     }
