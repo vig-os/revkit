@@ -115,6 +115,20 @@ e2e *args:
       cd site && bun run test:e2e -- {{ args }}; \
     fi
 
+# Regenerate the visual-regression baselines committed under
+# `site/tests/visual.spec.ts-snapshots/`. Intentional-only: run this
+# when a PR means to change what the site looks like, review the
+# resulting image diff in code review, and commit the updated files.
+# Extra args pass through to Playwright (e.g.
+# `just e2e-update visual.spec.ts -g phone` narrows the update).
+[group('test')]
+e2e-update *args:
+    @if [ ! -f site/package.json ]; then \
+      echo "just e2e-update: no site/package.json — skipping"; \
+    else \
+      cd site && bun run test:e2e -- --update-snapshots {{ args }}; \
+    fi
+
 # -------------------------------------------------------------------------------
 # DEPENDENCIES
 # -------------------------------------------------------------------------------
