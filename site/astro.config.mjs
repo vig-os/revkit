@@ -96,7 +96,7 @@ export default defineConfig({
       // stock sidebar + prev/next — the groups below are all config, no
       // component override; each group's ordered items also drive
       // Starlight's built-in `pagination` (prev/next links at the bottom
-      // of every doc page, kbd-navigable at desktop and phone width).
+      // of every doc page, rendered at desktop and phone width).
       sidebar: [
         {
           label: "Start",

@@ -32,7 +32,8 @@ deferred until revkit owns compiled code.
 ## Amendment (2026-09-30)
 
 Navigation uses Starlight's **stock sidebar and prev/next**, plus its built-in responsive layout — no custom
-"train-line" component, no sidebar override. Doc sets (ADRs, design docs, feature matrix, and future sets under
-`docs/sets/*`) map to sidebar groups in `site/astro.config.mjs`; Starlight's default pagination gives the
-prev/next chain a train line would otherwise carry. Owner decision (2026-09-30): stay minimal on modification and
-maximal on the impact of having a review tool at all. Status remains **Accepted**.
+"train-line" component, no sidebar override. Doc sets (ADRs, design docs, feature matrix today; future sets
+under `docs/sets/*` will map the same way once a loader exists) map to sidebar groups in
+`site/astro.config.mjs`; Starlight's default pagination gives the prev/next chain a train line would otherwise
+carry. Owner decision (2026-09-30): stay minimal on modification and maximal on the impact of having a review
+tool at all. Status remains **Accepted**.

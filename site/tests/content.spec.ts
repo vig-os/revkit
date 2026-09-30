@@ -144,14 +144,18 @@ test("ADR page carries the sidebar's ADR group and Starlight prev/next at deskto
   // silently drops the ADR group, or a Starlight upgrade that changes the
   // prev/next markup, trips here rather than in review. `toBeAttached` is
   // enough for the sidebar: on phone width Starlight keeps the same nav
-  // tree in the DOM behind the mobile menu button.
+  // tree in the DOM behind the mobile menu button. The locator is scoped
+  // to `nav[aria-label="Main"]` — Starlight's own label for the sidebar,
+  // the one the built HTML emits — so a stray "ADRs" match elsewhere in
+  // the page (e.g. body prose) does not satisfy the assertion.
   for (const viewport of [
     { width: 1280, height: 800 },
     { width: 375, height: 667 },
   ]) {
     await page.setViewportSize(viewport);
     await page.goto("/adr/0001-static-first-site-stack/");
-    await expect(page.locator("nav").getByText("ADRs", { exact: true }).first()).toBeAttached();
+    const sidebar = page.locator('nav[aria-label="Main"]');
+    await expect(sidebar.getByText("ADRs", { exact: true }).first()).toBeAttached();
     await expect(page.locator("a[rel='prev']")).toHaveCount(1);
     await expect(page.locator("a[rel='next']")).toHaveCount(1);
   }
