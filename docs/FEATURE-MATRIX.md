@@ -14,13 +14,14 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | A6 | Suggested edits on rendered text land in the source | ADR-0006 | M6 | [#11](https://github.com/vig-os/revkit/issues/11) | planned |
 | A7 | Co-editing the source beside the rendered view (later) | ADR-0006, ADR-0023 (deferred) | M7 | [#12](https://github.com/vig-os/revkit/issues/12) | planned |
 | A8 | Comments survive rebuilds; re-anchor, never lost (orphaned) | ADR-0006, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
-| B1 | CI builds a preview and posts the link, pinging requested reviewers | ADR-0008, ADR-0012, ADR-0014 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
-| B2 | Comments become PR review comments on file + line, as the reviewer | ADR-0003, ADR-0006, ADR-0009, ADR-0011, ADR-0012 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
-| B3 | Submit the review (comment / approve / request changes) from the page | ADR-0009, ADR-0012 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
-| B4 | Existing PR threads shown on the page, two-way | ADR-0006, ADR-0008, ADR-0009, ADR-0012 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
-| B5 | Non-GitHub reviewers via personal invite links (Authentik later) | ADR-0008, ADR-0009, ADR-0011, ADR-0012, ADR-0014, ADR-0015 | M4 | [#9](https://github.com/vig-os/revkit/issues/9), [#4](https://github.com/vig-os/revkit/issues/4) | planned |
-| B6 | Agent picks up the review, fixes, replies, resolves | ADR-0003 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
-| B7 | Review code diffs with inline comments mapped to PR lines | ADR-0024, ADR-0006, ADR-0009 | M8 | [#15](https://github.com/vig-os/revkit/issues/15) | planned |
+| B0 | Review a PR locally with my own gh identity (no App, no Cloudflare) | ADR-0006, ADR-0009, ADR-0013, ADR-0025 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
+| B1 | CI builds a preview and posts the link, pinging requested reviewers | ADR-0008, ADR-0012, ADR-0014, ADR-0025 | M4 | [#9](https://github.com/vig-os/revkit/issues/9) | planned |
+| B2 | Comments become PR review comments on file + line, as the reviewer | ADR-0003, ADR-0006, ADR-0009, ADR-0011, ADR-0012, ADR-0025 | M3 (local) / M4 (hosted) | [#8](https://github.com/vig-os/revkit/issues/8), [#9](https://github.com/vig-os/revkit/issues/9) | planned |
+| B3 | Submit the review (comment / approve / request changes) from the page | ADR-0009, ADR-0012, ADR-0025 | M3 (local) / M4 (hosted) | [#8](https://github.com/vig-os/revkit/issues/8), [#9](https://github.com/vig-os/revkit/issues/9) | planned |
+| B4 | Existing PR threads shown on the page, two-way | ADR-0006, ADR-0008, ADR-0009, ADR-0012, ADR-0025 | M3 (local) / M4 (hosted) | [#8](https://github.com/vig-os/revkit/issues/8), [#9](https://github.com/vig-os/revkit/issues/9) | planned |
+| B5 | Non-GitHub reviewers via personal invite links (Authentik later) | ADR-0008, ADR-0009, ADR-0011, ADR-0012, ADR-0014, ADR-0015, ADR-0025 | M4 | [#9](https://github.com/vig-os/revkit/issues/9), [#4](https://github.com/vig-os/revkit/issues/4) | planned |
+| B6 | Agent picks up the review, fixes, replies, resolves | ADR-0003, ADR-0025 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
+| B7 | Review code diffs with inline comments mapped to PR lines | ADR-0024, ADR-0006, ADR-0009, ADR-0025 | M8 | [#15](https://github.com/vig-os/revkit/issues/15) | planned |
 | C1 | Registered components only; hand-rolled UI blocked; escalation | ADR-0002, ADR-0005, ADR-0022 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C2 | Vocabulary defined once; undefined terms and redefinitions flagged | ADR-0003, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C3 | Links and doc sets validated; no orphans | ADR-0001, ADR-0003, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
