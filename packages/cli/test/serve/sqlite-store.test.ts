@@ -142,6 +142,168 @@ describe("SqliteThreadStore", () => {
     rmSync(filename, { force: true });
   });
 
+  test("snapshot round-trip: putSnapshot then getSnapshot returns the exact source (content-addressed)", () => {
+    const filename = tmpDb();
+    const store = SqliteThreadStore.open({ filename });
+    const source = "# X\n\nline 3\nline 4\n";
+    const revision = "a".repeat(64);
+    // First put reports "inserted".
+    expect(store.putSnapshot(revision, source)).toBe(true);
+    // Second put on the same (revision, source) is a no-op — the
+    // content-addressed key already exists.
+    expect(store.putSnapshot(revision, source)).toBe(false);
+    // Round-trip.
+    expect(store.getSnapshot(revision)).toBe(source);
+    // A missing revision returns undefined (not null, not a throw).
+    expect(store.getSnapshot("b".repeat(64))).toBeUndefined();
+    // `snapshotBytes` reports the utf-8 byte length.
+    expect(store.snapshotBytes()).toBe(Buffer.byteLength(source, "utf8"));
+    // `snapshotRevisions` lists what's stored.
+    expect(store.snapshotRevisions()).toEqual([revision]);
+    store.close();
+    rmSync(filename, { force: true });
+  });
+
+  test("snapshot GC deletes revisions not in the retain set (mutation guard)", () => {
+    const filename = tmpDb();
+    const store = SqliteThreadStore.open({ filename });
+    const revA = "a".repeat(64);
+    const revB = "b".repeat(64);
+    const revC = "c".repeat(64);
+    store.putSnapshot(revA, "A source");
+    store.putSnapshot(revB, "B source");
+    store.putSnapshot(revC, "C source");
+    // Retain only revB; A and C should go.
+    const deleted = store.gcSnapshots(new Set([revB]));
+    expect(deleted).toBe(2);
+    expect(store.snapshotRevisions()).toEqual([revB]);
+    expect(store.getSnapshot(revA)).toBeUndefined();
+    expect(store.getSnapshot(revB)).toBe("B source");
+    expect(store.getSnapshot(revC)).toBeUndefined();
+    // Idempotent — a second GC with the same retain set is a no-op.
+    expect(store.gcSnapshots(new Set([revB]))).toBe(0);
+    // Empty retain set clears the table.
+    expect(store.gcSnapshots(new Set())).toBe(1);
+    expect(store.snapshotRevisions()).toEqual([]);
+    expect(store.snapshotBytes()).toBe(0);
+    store.close();
+    rmSync(filename, { force: true });
+  });
+
+  test("MIGRATION: a pre-5b db (events table only, no snapshots table) opens cleanly", () => {
+    // Simulate the on-disk shape a v0 daemon left: the events table
+    // exists with real rows, but the snapshots table has never been
+    // created. Opening the store must apply the additive migration
+    // silently — the existing data must remain intact, and the
+    // new snapshot methods must work.
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
+    const filename = tmpDb();
+    // Bootstrap with ONLY the events table (mimicking the pre-5b
+    // SCHEMA_SQL — no `snapshots` table).
+    const bootstrap = new Database(filename, { create: true });
+    bootstrap.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      CREATE TABLE events (
+        seq INTEGER PRIMARY KEY,
+        ts TEXT NOT NULL,
+        payload TEXT NOT NULL
+      );
+      CREATE INDEX events_ts ON events (ts);
+    `);
+    // Insert a valid event under the pre-5b shape.
+    const event = {
+      seq: 1,
+      ts: "2026-09-30T10:00:00Z",
+      actor: { kind: "local", id: "u1" },
+      kind: "comment.created",
+      threadId: "t1",
+      commentId: "c1",
+      anchor,
+      body: "why 30s?",
+    };
+    bootstrap
+      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+      .run(1, "2026-09-30T10:00:00Z", JSON.stringify(event));
+    bootstrap.close();
+
+    // Now open with the current store. The migration adds `snapshots`.
+    const store = SqliteThreadStore.open({ filename });
+    // Existing thread is still there.
+    const listAsync = store.threads();
+    expect(listAsync).toBeDefined();
+    // The snapshot API works on the migrated DB.
+    expect(store.putSnapshot("d".repeat(64), "hello")).toBe(true);
+    expect(store.getSnapshot("d".repeat(64))).toBe("hello");
+    store.close();
+    rmSync(filename, { force: true });
+  });
+
+  test("accepts and reduces thread.reanchored + thread.orphaned events (round-6 carry-over)", async () => {
+    // Round-6 nit: a `bun:sqlite` runtime test that
+    // `thread.reanchored` and `thread.orphaned` events flow through
+    // the store without being refused, and that the reducer sees
+    // their effect on thread status. This closes the gap where the
+    // schema accepts the events but the daemon's writer might mis-
+    // append them.
+    const filename = tmpDb();
+    const store = SqliteThreadStore.open({ filename });
+    // Seed a thread.
+    await store.append({
+      kind: "comment.created",
+      actor: { kind: "local", id: "u1" },
+      threadId: "t1",
+      commentId: "c1",
+      anchor,
+      body: "why 30s?",
+    });
+    // Re-anchor to a NEW revision at a different line — the
+    // validator accepts a re-anchor when the path stays the same.
+    const NEW_REVISION = "b".repeat(64);
+    const reanchoredAnchor = {
+      ...anchor,
+      startLine: 50,
+      endLine: 54,
+      revision: NEW_REVISION,
+    };
+    await store.append({
+      kind: "thread.reanchored",
+      actor: { kind: "agent", id: "revkit-reanchor" },
+      threadId: "t1",
+      anchor: reanchoredAnchor,
+      method: "quote-exact",
+    });
+    // The thread's anchor moved and it's still open — the reducer
+    // (through selectThreads) reflects the new position.
+    let listed = await store.threads();
+    expect(listed.length).toBe(1);
+    expect(listed[0]?.anchor.startLine).toBe(50);
+    expect(listed[0]?.anchor.endLine).toBe(54);
+    expect(listed[0]?.status).toBe("open");
+    // Orphan it.
+    await store.append({
+      kind: "thread.orphaned",
+      actor: { kind: "agent", id: "revkit-reanchor" },
+      threadId: "t1",
+      revision: NEW_REVISION,
+      reason: "quoted text removed",
+    });
+    listed = await store.threads();
+    expect(listed[0]?.status).toBe("orphaned");
+    // Round-trip through export/import — the archive carries these
+    // events and a fresh store replays them.
+    const archive = await exportArchive(store);
+    store.close();
+    const dest = SqliteThreadStore.open({ filename: tmpDb() });
+    await dest.import(archive);
+    const restored = await dest.threads();
+    expect(restored.length).toBe(1);
+    expect(restored[0]?.status).toBe("orphaned");
+    expect(restored[0]?.anchor.startLine).toBe(50);
+    dest.close();
+    rmSync(filename, { force: true });
+  });
+
   test("import merges an archive whose seqs are strictly greater than head", async () => {
     const filenameA = tmpDb();
     const filenameB = tmpDb();

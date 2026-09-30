@@ -100,7 +100,15 @@ describe("HTML responses carry the ADR-0012 CSP", () => {
     for (const hex of CURRENT_ALLOWLIST_HASHES) {
       expect(csp!).toContain(`'sha256-${hexToBase64(hex)}'`);
     }
-    expect(csp!).toContain("worker-src 'self'");
+    // Path-scoped to /pagefind/ on BOTH loopback aliases (M2 item 5b
+    // carry-over from #41 review — closes the "any Worker" hole).
+    // The header carries a single `worker-src` directive listing
+    // both origins after the prefix.
+    expect(csp!).toContain(
+      `worker-src http://127.0.0.1:${ctx.handle.port}/pagefind/ http://localhost:${ctx.handle.port}/pagefind/`,
+    );
+    // Sanity: the previous `worker-src 'self'` is gone.
+    expect(csp!).not.toContain("worker-src 'self'");
     expect(csp!).toContain("'wasm-unsafe-eval'");
   });
 
@@ -131,7 +139,7 @@ describe("HTML responses carry the ADR-0012 CSP", () => {
       "img-src 'self' data: https://avatars.githubusercontent.com; " +
       "font-src 'self'; " +
       `connect-src 'self' ws://127.0.0.1:${port} ws://localhost:${port}; ` +
-      "worker-src 'self'; " +
+      `worker-src http://127.0.0.1:${port}/pagefind/ http://localhost:${port}/pagefind/; ` +
       "frame-ancestors 'none'; " +
       "base-uri 'none'; " +
       "form-action 'self'; " +

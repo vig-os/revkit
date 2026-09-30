@@ -81,6 +81,18 @@ export function resolveWithinRoot(rootReal: string, pathname: string): ResolveRe
     }
     // `.` is dropped by `normalize` below, so we do not refuse it
     // outright — a legitimate URL might carry it.
+    // Dot-directories and dotfiles: refuse any segment that begins
+    // with `.` and is not a bare `.` (which `normalize` drops).
+    // The daemon does not serve `/.git/…`, `/.revkit/…` or any
+    // other dot-scoped tree — these are IDE / VCS / tool-state
+    // directories that ended up in a served output only by
+    // mistake, and revealing them over loopback still leaks
+    // history. `.well-known/*` is not used by revkit; if a future
+    // ADR needs it, this refusal is the one place to open a hole.
+    // (M2 item 5b carry-over from #41 review.)
+    if (segment.length > 1 && segment.charCodeAt(0) === 0x2e /* . */) {
+      return { ok: false, kind: "not-found", message: "dot-prefixed path segment refused" };
+    }
   }
   // Reassemble the path via `normalize` so an OS-specific separator
   // does not sneak in. `segments` has already stripped leading slashes

@@ -38,10 +38,9 @@ import {
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
-import { readFileSync as readFileSyncNode, realpathSync as realpathSyncNode, statSync as statSyncNode } from "node:fs";
-import { resolve as resolvePath } from "node:path";
-import { resolveWithinRoot as resolveWithinRootStrict } from "./confined-path.ts";
 import { openStaticServer } from "./static-server.ts";
+import { resolveAnchorSource } from "./anchor-source.ts";
+import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
 import { contentTypeForExtension } from "./mime.ts";
 import {
   AuthState,
@@ -112,6 +111,14 @@ export interface StartDaemonOptions {
   /** Whether to install SIGINT / SIGTERM handlers. On by default in
    * the CLI; off in tests (they call `stop()` directly). */
   readonly installSignalHandlers?: boolean;
+  /** Test-only overrides for the re-anchoring daemon (M2 item 5b).
+   * Production callers omit — the defaults (fs.watch, 300 ms file
+   * debounce, 500 ms build debounce) match the ADR-0006 M2 design.
+   * A test injects a shorter debounce or forces polling so the spec
+   * runs in ms. */
+  readonly reanchor?: Partial<
+    Omit<ReanchorDaemonOptions, "store" | "bus" | "repoRoot" | "distDir" | "logger">
+  >;
 }
 
 /** A handle on a running daemon. `stop()` is idempotent and removes
@@ -194,6 +201,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const staticServer = openStaticServer(options.dir);
   const bus = new EventBus();
 
+  // Re-anchoring daemon (M2 item 5b, story A8). Watches anchored
+  // source files + the site's `dist` for changes, re-runs the
+  // review-core pipeline for every open/orphaned thread whose file
+  // moved, and appends `thread.reanchored`/`thread.orphaned`
+  // events. Also serves the lazy trigger the request path calls
+  // from `/api/threads` and `/events` catch-up. Watches use
+  // `fs.watch` with a polling fallback (WSL, containerised bind
+  // mounts). See `reanchor-daemon.ts`.
+  const reanchor = startReanchorDaemon({
+    store,
+    bus,
+    repoRoot: options.repoRoot,
+    distDir: options.dir,
+    logger,
+    ...(options.reanchor ?? {}),
+  });
+
   // Inline-script hash allowlist (ADR-0012 rule "the daemon applies
   // the allowlist of the revkit version it runs, never hashes found
   // in an artifact"): the SHA-256 hex keys in the committed
@@ -271,6 +295,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       async open(ws) {
         const data = ws.data;
         try {
+          // Lazy re-anchor trigger (M2 item 5b): a WebSocket
+          // subscriber's initial prime is symmetric with the SSE
+          // path — re-anchor before shipping the resume slice.
+          await reanchor.refreshAll();
           const primer = await store.since(data.since);
           for (const event of primer) ws.send(JSON.stringify(event));
           const subscriber = new WebSocketSubscriber(ws);
@@ -416,6 +444,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       for (const timer of keepaliveTimers) clearInterval(timer);
       keepaliveTimers.clear();
       bus.closeAll();
+      // Tear down the re-anchor watchers BEFORE closing the store —
+      // a fire-and-forget refresh queued mid-shutdown would
+      // otherwise try to write to a closed sqlite handle.
+      try {
+        await reanchor.stop();
+      } catch {
+        // Best-effort — a failure to close a watcher never blocks shutdown.
+      }
       try {
         server.stop(true);
       } catch {
@@ -714,6 +750,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         if (parsedStatus.data.length === 1) filter.status = parsedStatus.data[0];
         else filter.status = parsedStatus.data;
       }
+      // Lazy re-anchor trigger (M2 item 5b): a page-load fetch is
+      // the moment the human is about to look at the rail, so we
+      // pay the re-anchor cost here even if the watcher missed the
+      // event or the site was edited while the daemon was down.
+      // Serialised per-path in `reanchor-daemon.ts`, so a repeated
+      // call joins the in-flight promise.
+      if (filter.path !== undefined) {
+        await reanchor.refresh(filter.path);
+      } else {
+        await reanchor.refreshAll();
+      }
       const threads = await store.threads(filter);
       return jsonResponse({ threads, head: store.head() });
     }
@@ -741,6 +788,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         ...parsed.data.anchor,
         revision: anchorResolution.revision,
       };
+      // Snapshot the source under this revision so the re-anchoring
+      // pipeline (M2 item 5b) can read it back on a later rebuild.
+      // Content-addressed — a second thread on the same revision is
+      // an idempotent INSERT OR IGNORE. The daemon's own read path is
+      // the only writer, so a hostile client cannot flood the table.
+      try {
+        store.putSnapshot(anchorResolution.revision, anchorResolution.source);
+      } catch (error) {
+        logger.warn("snapshot.put.failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+      }
       const threadId = parsed.data.threadId ?? randomUUID();
       const commentId = parsed.data.commentId ?? randomUUID();
       const input: ReviewEventInput = {
@@ -846,6 +906,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // response, and the bus already isolates delivery failures per
       // subscriber.
       void bus.publish(event);
+    }
+    // Reconcile the re-anchor watchers so a NEW thread on a NEW
+    // path gets a watcher installed immediately (fire-and-forget:
+    // the daemon does not block the POST response on this).
+    const reanchorInternal = reanchor as unknown as {
+      reconcileWatchers?: () => Promise<void>;
+    };
+    if (reanchorInternal.reconcileWatchers !== undefined) {
+      void reanchorInternal.reconcileWatchers();
     }
     logger.info("api.append.ok", {
       requestId,
@@ -971,6 +1040,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // Prime with the resume slice — the client should see the
         // past before the future.
         try {
+          // Lazy re-anchor trigger (M2 item 5b): a fresh subscriber
+          // (a channel client reconnecting, a page load's
+          // EventSource) is a moment we can pay the re-anchor cost
+          // before the first frame goes out. This is what keeps the
+          // catch-up correct after a daemon restart — any file that
+          // changed while the daemon was down is re-anchored here.
+          await reanchor.refreshAll();
           const primer = await store.since(since);
           for (const event of primer) controller.enqueue(encoder.encode(sseFrame(event)));
         } catch (error) {
@@ -1206,54 +1282,10 @@ function enforceCommentBodyLimit(body: string): boolean {
   return Buffer.byteLength(body, "utf8") <= MAX_COMMENT_BODY_BYTES;
 }
 
-/** Cap on a source file the daemon will read to compute a
- * revision. 5 MiB is comfortable for even the largest reasonable
- * document; a file over the cap gets the same generic
- * "anchor.path is not a valid anchor target" refusal (below) so
- * the daemon does not become an oracle for which oversized files
- * exist in the repo. (PR #38 round-2 review.) */
-const ANCHOR_SOURCE_MAX_BYTES = 5 * 1024 * 1024;
-
-/** Resolve an anchor's `path` under the repo root, confirm the file
- * exists, and return `revisionOf(sourceContents)`.
- *
- * Uses the shared `resolveWithinRoot` confinement helper (realpath +
- * lstat, refuses symlinks that escape the repo) so a hostile anchor
- * cannot chase a symlink into `/etc`. Path shape is already checked
- * by `anchorPathSchema`; this step adds the filesystem containment,
- * a size cap, and revision computation.
- *
- * Every rejection returns the SAME `reason` string ("anchor.path is
- * not a valid anchor target in the repository") so the response
- * body cannot be used to distinguish "missing file", "over cap", or
- * "symlink escape" — a caller either has the file or does not.
- * (PR #38 round-2 review.) */
-export async function resolveAnchorSource(
-  anchor: Anchor,
-  repoRoot: string,
-): Promise<{ ok: true; revision: string } | { ok: false; reason: string }> {
-  const UNIFORM_REJECTION = "anchor.path is not a valid anchor target in the repository";
-  // Use the shared confinement helper: it realpaths the root and
-  // refuses `..`, symlinks that escape, and non-file entries.
-  const rootReal = realpathSyncNode(resolvePath(repoRoot));
-  const resolved = resolveWithinRootStrict(rootReal, "/" + anchor.path);
-  if (!resolved.ok) return { ok: false, reason: UNIFORM_REJECTION };
-  let stat;
-  try {
-    stat = statSyncNode(resolved.absolutePath);
-  } catch {
-    return { ok: false, reason: UNIFORM_REJECTION };
-  }
-  if (!stat.isFile()) return { ok: false, reason: UNIFORM_REJECTION };
-  if (stat.size > ANCHOR_SOURCE_MAX_BYTES) {
-    return { ok: false, reason: UNIFORM_REJECTION };
-  }
-  let contents: string;
-  try {
-    contents = readFileSyncNode(resolved.absolutePath, "utf8");
-  } catch {
-    return { ok: false, reason: UNIFORM_REJECTION };
-  }
-  const revision = await revisionOf(contents);
-  return { ok: true, revision };
-}
+// `resolveAnchorSource` (server-side revision authority) and its
+// counterpart `resolveSourceUnderRoot` (path-only for the M2 item 5b
+// re-anchoring service) now live in `anchor-source.ts` so the
+// re-anchoring service can import them without a circular dep on
+// this file. Re-exported here to keep the existing test imports
+// working.
+export { resolveAnchorSource };

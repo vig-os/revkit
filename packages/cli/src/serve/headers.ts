@@ -203,6 +203,17 @@ export function buildCspHeader(ctx: HeaderContext): string {
     scriptSources.push(`'sha256-${hexToBase64(hex)}'`);
   }
   const wsOrigins = loopbackOrigins(ctx.port, "ws");
+  // Path-scope worker-src to `/pagefind/` on BOTH loopback aliases.
+  // Pagefind is the ONLY runtime the daemon serves a Worker for
+  // today; naming the exact prefix means a future stored HTML that
+  // tries `new Worker("/-/anything.js")` is refused by the browser
+  // as a CSP violation, closing the narrowest hole the previous
+  // `worker-src 'self'` left open. Same shape as script-src's
+  // pagefind entry — one path scope, two aliases. (M2 item 5b
+  // carry-over from #41 review.)
+  const workerSources = loopbackOrigins(ctx.port, "http").map(
+    (origin) => `${origin}${PAGEFIND_URL_PREFIX}`,
+  );
   // Order chosen so the header reads top-down like the ADR text —
   // default first, script/style next, then fetch destinations, then
   // navigation guards. Semicolon-separated is the CSP spec form.
@@ -213,7 +224,7 @@ export function buildCspHeader(ctx: HeaderContext): string {
     "img-src 'self' data: https://avatars.githubusercontent.com",
     "font-src 'self'",
     `connect-src 'self' ${wsOrigins.join(" ")}`,
-    "worker-src 'self'",
+    `worker-src ${workerSources.join(" ")}`,
     "frame-ancestors 'none'",
     "base-uri 'none'",
     "form-action 'self'",

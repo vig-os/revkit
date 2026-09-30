@@ -50,7 +50,13 @@ interface RailComment {
 }
 interface RailThread {
   readonly id: string;
-  readonly status: "open" | "resolved";
+  /** `orphaned` was added in M2 item 5b: the re-anchoring pipeline
+   * (ADR-0006, `@revkit/review-core`'s `reanchor.ts`) could not
+   * find the thread on a later revision of the source file. The
+   * thread is kept, still repliable / resolvable, and surfaced in
+   * the orphan panel with a "was at L…" note. A subsequent
+   * `thread.reanchored` unorphans it back to `open`. */
+  readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: RailAnchor;
   readonly comments: readonly RailComment[];
 }
@@ -91,20 +97,36 @@ async function revisionHex(text: string): Promise<string> {
  * open elsewhere. */
 async function fetchThreads(): Promise<RailListResponse> {
   const paths = collectPagePaths();
+  // Ask for both open AND orphaned threads on THIS page. The rail
+  // renders open threads inline against the block they anchor to,
+  // and orphaned threads in the dedicated panel (M2 item 5b).
+  // Resolved threads are not surfaced here (the review is over) —
+  // an orphaned thread that gets re-anchored becomes `open` again
+  // via the reducer's un-orphan rule (ADR-0006 amendment).
+  const statusFilter = "open,orphaned";
   if (paths.length === 0) {
-    const response = await fetch("/api/threads", {
-      credentials: "same-origin",
-      headers: { accept: "application/json" },
-    });
+    const response = await fetch(
+      "/api/threads?status=" + encodeURIComponent(statusFilter),
+      {
+        credentials: "same-origin",
+        headers: { accept: "application/json" },
+      },
+    );
     if (!response.ok) throw new Error(`GET /api/threads failed: ${response.status}`);
     return (await response.json()) as RailListResponse;
   }
   const responses = await Promise.all(
     paths.map((path) =>
-      fetch("/api/threads?path=" + encodeURIComponent(path), {
-        credentials: "same-origin",
-        headers: { accept: "application/json" },
-      }).then(async (r) => {
+      fetch(
+        "/api/threads?path=" +
+          encodeURIComponent(path) +
+          "&status=" +
+          encodeURIComponent(statusFilter),
+        {
+          credentials: "same-origin",
+          headers: { accept: "application/json" },
+        },
+      ).then(async (r) => {
         if (!r.ok) throw new Error(`GET /api/threads?path=${path} failed: ${r.status}`);
         return (await r.json()) as RailListResponse;
       }),
@@ -241,7 +263,13 @@ function subscribeEvents(onBump: () => void): () => void {
           event.kind === "comment.created" ||
           event.kind === "comment.replied" ||
           event.kind === "thread.resolved" ||
-          event.kind === "thread.reopened"
+          event.kind === "thread.reopened" ||
+          // M2 item 5b: re-anchor + orphan events move a thread to a
+          // new block (or to the orphan panel) without a page reload.
+          // Same refetch strategy — cheap, keeps the rail's model of
+          // the world identical to the daemon's authoritative state.
+          event.kind === "thread.reanchored" ||
+          event.kind === "thread.orphaned"
         ) {
           onBump();
         }
@@ -594,7 +622,7 @@ function Rail(): JSX.Element {
         })()}
       </Show>
       <ol class="revkit-rail__threads" aria-live="polite" data-testid="revkit-rail-threads">
-        <For each={threads()?.threads ?? []}>
+        <For each={openThreadsFor(threads())}>
           {(thread: RailThread) => (
             <li
               class={`revkit-rail__thread revkit-rail__thread--${thread.status}`}
@@ -682,10 +710,154 @@ function Rail(): JSX.Element {
           )}
         </For>
       </ol>
-      <Show when={(threads()?.threads.length ?? 0) === 0}>
+      <Show when={openThreadsFor(threads()).length === 0}>
         <p class="revkit-rail__empty" data-testid="revkit-rail-empty">No open threads yet.</p>
       </Show>
+      <Show when={orphanedThreadsFor(threads()).length > 0}>
+        {/* Orphan panel (M2 item 5b, story A8). Lists threads the
+            re-anchoring pipeline could not find on the current
+            revision, with the original quote, the file, the "was at
+            L…" note, and the pipeline's reason. Orphaned threads
+            stay repliable and resolvable — the human/agent can
+            still act on them; they just aren't tied to a
+            currently-rendered block. Keyboard-accessible via the
+            same button tab order as open threads. axe: labelled
+            landmark region with `aria-label`. */}
+        <section
+          class="revkit-rail__orphans"
+          aria-label="orphaned review threads"
+          data-testid="revkit-rail-orphans"
+        >
+          <h3 class="revkit-rail__orphans-title">
+            Orphaned threads
+            <span class="revkit-rail__orphans-count" aria-label="count">
+              {" "}({orphanedThreadsFor(threads()).length})
+            </span>
+          </h3>
+          <ol class="revkit-rail__orphans-list">
+            <For each={orphanedThreadsFor(threads())}>
+              {(thread: RailThread) => (
+                <li
+                  class="revkit-rail__thread revkit-rail__thread--orphaned"
+                  data-thread-id={thread.id}
+                  data-testid="revkit-rail-orphan"
+                >
+                  <p class="revkit-rail__thread-anchor revkit-rail__thread-anchor--orphaned">
+                    <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
+                    <span class="revkit-rail__thread-lines">
+                      was at L{thread.anchor.startLine}–{thread.anchor.endLine}
+                    </span>
+                  </p>
+                  <blockquote class="revkit-rail__orphan-quote" aria-label="original quote">
+                    "{thread.anchor.quote.exact}"
+                  </blockquote>
+                  <p class="revkit-rail__orphan-reason" data-testid="revkit-rail-orphan-reason">
+                    {orphanReasonFor(thread)}
+                  </p>
+                  <ol class="revkit-rail__comments">
+                    <For each={thread.comments}>
+                      {(comment: RailComment) => (
+                        <li class="revkit-rail__comment">
+                          <p class="revkit-rail__author">
+                            <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
+                            <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
+                          </p>
+                          <p class="revkit-rail__body">{comment.body}</p>
+                        </li>
+                      )}
+                    </For>
+                  </ol>
+                  <div class="revkit-rail__thread-actions">
+                    <Show
+                      when={replyDraftFor() === thread.id}
+                      fallback={
+                        <>
+                          <button
+                            type="button"
+                            class="revkit-rail__reply"
+                            data-testid="revkit-rail-orphan-reply"
+                            onClick={() => setReplyDraftFor(thread.id)}
+                          >reply</button>
+                          <button
+                            type="button"
+                            class="revkit-rail__resolve"
+                            data-testid="revkit-rail-orphan-resolve"
+                            onClick={() => void doResolve(thread)}
+                          >resolve</button>
+                        </>
+                      }
+                    >
+                      <form
+                        class="revkit-rail__reply-form"
+                        onSubmit={(event: SubmitEvent): void => {
+                          event.preventDefault();
+                          const form = event.currentTarget as HTMLFormElement;
+                          const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+                          if (textarea === null || textarea.value.trim().length === 0) return;
+                          void submitReply(thread, textarea.value.trim());
+                        }}
+                      >
+                        <label class="revkit-rail__label">
+                          <span class="revkit-rail__label-text">Reply</span>
+                          <textarea
+                            required
+                            rows="2"
+                            data-testid="revkit-rail-orphan-reply-input"
+                            aria-label="reply body"
+                          ></textarea>
+                        </label>
+                        <div class="revkit-rail__actions">
+                          <button
+                            type="button"
+                            class="revkit-rail__cancel"
+                            onClick={() => setReplyDraftFor(undefined)}
+                          >cancel</button>
+                          <button
+                            type="submit"
+                            class="revkit-rail__submit"
+                            data-testid="revkit-rail-orphan-reply-submit"
+                          >post reply</button>
+                        </div>
+                      </form>
+                    </Show>
+                  </div>
+                </li>
+              )}
+            </For>
+          </ol>
+        </section>
+      </Show>
     </aside>
+  );
+}
+
+/** Partition helper — open threads only (the main list). Kept out
+ * of the JSX to make the count-check in the `Show` block below
+ * readable. */
+function openThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
+  if (response === undefined) return [];
+  return response.threads.filter((thread) => thread.status === "open");
+}
+
+/** Partition helper — orphaned threads only (the orphan panel).
+ * See M2 item 5b: an orphan is a thread the re-anchor pipeline
+ * could not place on the current revision. */
+function orphanedThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
+  if (response === undefined) return [];
+  return response.threads.filter((thread) => thread.status === "orphaned");
+}
+
+/** Best-effort human reason for an orphan. The daemon does not
+ * ship the reason on the `Thread` view today (the reason lives
+ * inside the `thread.orphaned` event), so the rail composes a
+ * generic sentence from the anchor's path + line range. A future
+ * ADR that extends the Thread view with `lastOrphanReason` would
+ * let this render the exact pipeline-reason string. */
+function orphanReasonFor(thread: RailThread): string {
+  return (
+    `The quoted text no longer appears at ${thread.anchor.path}:` +
+    `L${thread.anchor.startLine}–${thread.anchor.endLine}. ` +
+    `The thread is kept — reply or resolve it here.`
   );
 }
 

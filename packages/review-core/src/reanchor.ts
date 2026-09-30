@@ -612,19 +612,29 @@ export async function prepareReanchor(
   dmp.Diff_Timeout = options.diffTimeoutSeconds ?? DEFAULT_DIFF_TIMEOUT_SECONDS;
   const diffs = dmp.diff_main(oldLF, newLF) as Diff[];
   dmp.diff_cleanupSemantic(diffs);
-  // Freeze the context so a caller (item 5b, or a test) cannot
+  // Deep-freeze the context so a caller (item 5b, or a test) cannot
   // mutate the shared diff or the shared line indices while another
-  // in-flight `reanchorWith` call is walking them. `Object.freeze`
-  // is shallow, but the arrays and strings inside are treated as
-  // read-only by the pipeline and never appended to.
+  // in-flight `reanchorWith` call is walking them. `Object.freeze` is
+  // shallow, so we freeze the arrays AND every inner diff tuple —
+  // otherwise a hostile / buggy caller could still splice `diffs`,
+  // append to `oldLineIndex`, or mutate a `[op, text]` diff tuple in
+  // place. The pipeline treats these as read-only, so the freeze is
+  // an assertion the runtime enforces. Item 5b runs many
+  // `reanchorWith` calls against the same context concurrently under
+  // `Promise.all`; a mid-flight mutation from another handler would
+  // corrupt the classification silently.
+  const oldLineIndex = Object.freeze(buildLineStartIndex(oldLF));
+  const newLineIndex = Object.freeze(buildLineStartIndex(newLF));
+  for (const diff of diffs) Object.freeze(diff);
+  Object.freeze(diffs);
   return Object.freeze({
     oldLF,
     newLF,
     oldRevision,
     newRevision,
     diffs,
-    oldLineIndex: buildLineStartIndex(oldLF),
-    newLineIndex: buildLineStartIndex(newLF),
+    oldLineIndex,
+    newLineIndex,
   });
 }
 
