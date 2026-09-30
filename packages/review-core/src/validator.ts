@@ -28,6 +28,16 @@
 //                      `duplicate-answer`).
 //   comment.linked   — the commentId must exist; a commentId may be
 //                      linked once (a second link is `duplicate-link`).
+//   thread.reanchored — the threadId must exist. Accepted on any
+//                       status; the reducer un-orphans a re-anchored
+//                       thread and leaves resolved/open otherwise.
+//   thread.orphaned  — the threadId must exist and its status must be
+//                      `open`: a `resolved` thread is not tracked by
+//                      the pipeline (the human/agent's final word),
+//                      and an already-`orphaned` thread would be a
+//                      redundant repeat (`already-orphaned`). Both
+//                      cases carry their own rejection kind so a
+//                      caller can branch without parsing messages.
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -118,7 +128,8 @@ export type AppendRejection =
   | { kind: "duplicate-answer"; askId: string; message: string }
   | { kind: "answer-kind-mismatch"; askId: string; askKind: AskKind; answerKind: AskKind; message: string }
   | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
-  | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string };
+  | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string }
+  | { kind: "already-orphaned"; threadId: string; message: string };
 
 export type ValidationResult = { ok: true } | { ok: false; rejection: AppendRejection };
 
@@ -272,6 +283,42 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
         };
       }
       ask.answered = true;
+      return { ok: true };
+    }
+    case "thread.reanchored": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      // A re-anchor un-orphans a previously-orphaned thread — the
+      // reducer records the anchor change and moves the status back
+      // to open. The validator only needs to track status here (the
+      // anchor lives outside `LogState`).
+      if (thread.status === "orphaned") thread.status = "open";
+      return { ok: true };
+    }
+    case "thread.orphaned": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (thread.status === "orphaned") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "already-orphaned",
+            threadId: event.threadId,
+            message: `thread.orphaned: thread '${event.threadId}' is already orphaned — the pipeline is idempotent, so a redundant orphan is refused.`,
+          },
+        };
+      }
+      if (thread.status !== "open") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-open",
+            threadId: event.threadId,
+            message: `thread.orphaned: thread '${event.threadId}' is not open (current status: ${thread.status}) — the pipeline only tracks open threads.`,
+          },
+        };
+      }
+      thread.status = "orphaned";
       return { ok: true };
     }
     case "comment.linked": {

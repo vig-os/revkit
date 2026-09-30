@@ -21,13 +21,29 @@ export {
 export { exportArchive, parseArchive, threadArchiveSchema, type ThreadArchive } from "./export.ts";
 export {
   presenceStateSchema,
+  reanchorMethodSchema,
   reviewEventKinds,
   reviewEventSchema,
   type PresenceState,
+  type ReanchorEventMethod,
   type ReviewEvent,
   type ReviewEventInput,
   type ReviewEventKind,
 } from "./events.ts";
+export {
+  DEFAULT_MATCH_DISTANCE,
+  DEFAULT_MIN_FUZZY_SCORE,
+  diffMapLines,
+  fuzzyLocateQuote,
+  mapAnchorRange,
+  reanchor,
+  reanchorEvent,
+  verifyQuoteInMappedRange,
+  type LineRange,
+  type ReanchorMethod,
+  type ReanchorOptions,
+  type ReanchorResult,
+} from "./reanchor.ts";
 export { reduce } from "./reducer.ts";
 export { GIT_COMMIT_HEX_REGEX, GIT_SHA_HEX_REGEX, SHA256_HEX_REGEX, revisionOf } from "./revision.ts";
 export {

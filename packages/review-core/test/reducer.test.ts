@@ -118,6 +118,93 @@ describe("reduce — total on byzantine slices", () => {
   });
 });
 
+describe("reduce — thread.reanchored", () => {
+  test("updates the anchor and stamps updatedAt, leaves an open thread open", () => {
+    const newAnchor = {
+      ...anchor,
+      startLine: 42,
+      endLine: 46,
+      revision: "b".repeat(64),
+    };
+    const reanchored: ReviewEvent = {
+      seq: 5,
+      ts: t(4),
+      actor: agentActor,
+      kind: "thread.reanchored",
+      threadId: "th-1",
+      anchor: newAnchor,
+      method: "quote-exact",
+    };
+    const threads = reduce([...log.slice(0, 2), reanchored]);
+    const thread = threads.get("th-1");
+    expect(thread).toBeDefined();
+    if (!thread) return;
+    expect(thread.status).toBe("open");
+    expect(thread.anchor).toEqual(newAnchor);
+    expect(thread.updatedAt).toBe(t(4));
+  });
+
+  test("un-orphans a previously-orphaned thread (status → open, new anchor)", () => {
+    const orphan: ReviewEvent = {
+      seq: 5,
+      ts: t(4),
+      actor: agentActor,
+      kind: "thread.orphaned",
+      threadId: "th-1",
+      revision: "c".repeat(64),
+      reason: "block deleted on prior rebuild",
+    };
+    const rediscovered: ReviewEvent = {
+      seq: 6,
+      ts: t(5),
+      actor: agentActor,
+      kind: "thread.reanchored",
+      threadId: "th-1",
+      anchor: { ...anchor, startLine: 44, endLine: 48, revision: "d".repeat(64) },
+      method: "fuzzy",
+      score: 0.87,
+    };
+    // Use the open-thread log slice (create + reply), then orphan, then re-anchor.
+    const threads = reduce([...log.slice(0, 2), orphan, rediscovered]);
+    const thread = threads.get("th-1");
+    expect(thread?.status).toBe("open");
+    expect(thread?.anchor.startLine).toBe(44);
+  });
+});
+
+describe("reduce — thread.orphaned", () => {
+  test("open thread → orphaned; updatedAt stamped", () => {
+    const orphan: ReviewEvent = {
+      seq: 3,
+      ts: t(2),
+      actor: agentActor,
+      kind: "thread.orphaned",
+      threadId: "th-1",
+      revision: "e".repeat(64),
+      reason: "block deleted",
+    };
+    const threads = reduce([log[0]!, orphan]);
+    expect(threads.get("th-1")?.status).toBe("orphaned");
+    expect(threads.get("th-1")?.updatedAt).toBe(t(2));
+  });
+
+  test("resolved thread that emits orphaned (byzantine slice): status stays resolved (defensive)", () => {
+    // The append-side validator refuses this transition, so a well-
+    // formed log never carries it — the reducer's guard is the safety
+    // net for a partial slice.
+    const orphan: ReviewEvent = {
+      seq: 4,
+      ts: t(3),
+      actor: agentActor,
+      kind: "thread.orphaned",
+      threadId: "th-1",
+      revision: "f".repeat(64),
+    };
+    const threads = reduce([...log.slice(0, 3), orphan]); // includes thread.resolved
+    expect(threads.get("th-1")?.status).toBe("resolved");
+  });
+});
+
 describe("reduce — comment.linked", () => {
   test("merges an external github ref onto the referenced comment", () => {
     const linked: ReviewEvent = {

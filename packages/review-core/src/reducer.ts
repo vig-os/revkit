@@ -8,11 +8,12 @@
 //      of the log; `reduce` re-sorts to make it idempotent regardless of
 //      how the caller stored them.
 //   2. `comment.replied`, `thread.resolved`, `thread.reopened`,
-//      `comment.linked` and `handover` for a subject that has not been
-//      created yet in the slice are skipped so the reducer stays total
-//      on any slice `since(seq)` might return. The store's `validateNext`
-//      refuses such an event on the append side, so a correctly-produced
-//      log never carries one — the skip is a safety net for a partial
+//      `thread.reanchored`, `thread.orphaned`, `comment.linked` and
+//      `handover` for a subject that has not been created yet in the
+//      slice are skipped so the reducer stays total on any slice
+//      `since(seq)` might return. The store's `validateNext` refuses
+//      such an event on the append side, so a correctly-produced log
+//      never carries one — the skip is a safety net for a partial
 //      slice, not a silent cover-up.
 //   3. `handover`, `presence`, `ask.created` and `ask.answered` do not
 //      touch thread state; they are surfaced through the event stream
@@ -92,6 +93,42 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       threads.set(event.threadId, {
         ...thread,
         status: "open",
+        updatedAt: event.ts,
+      });
+      return;
+    }
+    case "thread.reanchored": {
+      const thread = threads.get(event.threadId);
+      if (thread === undefined) return;
+      // The pipeline (ADR-0006 Acceptance) may have re-anchored a
+      // thread that was orphaned on a previous rebuild — the block came
+      // back on this revision. Move it back to `open` so the rail no
+      // longer marks it stray; if it was resolved, respect that
+      // (resolution is a human/agent decision the re-anchor does not
+      // overrule). `open` is the only status the un-orphaning transition
+      // targets.
+      const nextStatus = thread.status === "orphaned" ? "open" : thread.status;
+      threads.set(event.threadId, {
+        ...thread,
+        anchor: event.anchor,
+        status: nextStatus,
+        updatedAt: event.ts,
+      });
+      return;
+    }
+    case "thread.orphaned": {
+      const thread = threads.get(event.threadId);
+      if (thread === undefined) return;
+      // Only `open` threads are tracked by the pipeline; `validateNext`
+      // refuses a `thread.orphaned` on a `resolved` or already-
+      // `orphaned` thread on the append side. In a partial slice the
+      // reducer still guards defensively — leave a non-open status
+      // untouched rather than fabricate a transition the log never
+      // authorised.
+      if (thread.status !== "open") return;
+      threads.set(event.threadId, {
+        ...thread,
+        status: "orphaned",
         updatedAt: event.ts,
       });
       return;
