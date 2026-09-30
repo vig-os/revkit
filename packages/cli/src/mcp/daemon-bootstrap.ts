@@ -30,6 +30,7 @@
 
 import { resolve as resolvePath } from "node:path";
 import { findRunningDaemon, type ServeState } from "../serve/serve-state.ts";
+import { stripTrailingSlashes } from "./daemon-client.ts";
 
 /** Options for `ensureDaemon`. */
 export interface BootstrapOptions {
@@ -183,7 +184,7 @@ export async function verifyDaemonInstance(
   advertisedInstanceId: string,
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<boolean> {
-  const response = await fetchImpl(`${url.replace(/\/+$/, "")}/-/health`, {
+  const response = await fetchImpl(`${stripTrailingSlashes(url)}/-/health`, {
     method: "GET",
     headers: { accept: "application/json" },
   });

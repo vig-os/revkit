@@ -19,6 +19,8 @@
 // even if it did, no header = "not a browser navigation", which the
 // daemon accepts for a bearer-authenticated caller.
 
+import { stripTrailingSlashes } from "./daemon-client.ts";
+
 /** One review event as seen from the wire. The subscriber does not
  * validate against `reviewEventSchema` — the daemon already validated
  * before appending — but does insist on `seq` being an integer so
@@ -72,7 +74,7 @@ export function startEventSubscriber(options: EventSubscriberOptions): EventSubs
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
   const baseDelay = options.baseRetryDelayMs ?? 500;
   const maxDelay = options.maxRetryDelayMs ?? 30_000;
-  const url = new URL(options.url.replace(/\/+$/, "") + "/events");
+  const url = new URL(stripTrailingSlashes(options.url) + "/events");
   url.searchParams.set("for", "agent");
 
   let closed = false;

@@ -49,7 +49,7 @@ export class DaemonClient {
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: DaemonClientOptions) {
-    this.#url = options.url.replace(/\/+$/, "");
+    this.#url = stripTrailingSlashes(options.url);
     this.#token = options.agentToken;
     this.#fetch = options.fetch ?? globalThis.fetch;
   }
@@ -122,4 +122,15 @@ export class DaemonClient {
     }
     return (await response.json()) as AppendResponse;
   }
+}
+
+/** Strip any trailing slashes from a URL. Kept as a small loop
+ * rather than `.replace(/\/+$/, "")` — the regex form is linear on
+ * a well-formed URL, but CodeQL flags the anchored `+` as a
+ * polynomial-regex hazard on uncontrolled input. A loop makes the
+ * bounded-iteration guarantee explicit. */
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 0x2f) end--;
+  return end === value.length ? value : value.slice(0, end);
 }
