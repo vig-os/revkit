@@ -54,6 +54,7 @@ export {
   PrContext,
   retryAfterMs,
   shouldRetry,
+  verifyContentAgainstDiffHunk,
   type AddPendingReviewThreadInput,
   type FindOrCreatePendingReviewResult,
   type GhReviewComment,

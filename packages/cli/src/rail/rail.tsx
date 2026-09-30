@@ -34,12 +34,34 @@ interface RailAuthor {
   readonly id: string;
   readonly displayName?: string;
 }
-interface RailAnchor {
+/** A line anchor — the shape existing threads carry. `kind` is
+ * absent on the wire for backward compat. */
+interface RailLineAnchor {
+  readonly kind?: "line";
   readonly path: string;
   readonly startLine: number;
   readonly endLine: number;
   readonly quote: { readonly exact: string; readonly prefix: string; readonly suffix: string };
   readonly revision: string;
+}
+/** An unanchored anchor — issue #46 item 5. Imported threads
+ * whose source content couldn't be fetched carry this shape.
+ * The rail renders these under the file with a file-level
+ * label; no `L<n>-L<m>` (which would print `Lundefined`). */
+interface RailUnanchoredAnchor {
+  readonly kind: "unanchored";
+  readonly path: string;
+  readonly originalStartLine?: number;
+  readonly originalEndLine?: number;
+}
+type RailAnchor = RailLineAnchor | RailUnanchoredAnchor;
+/** True when `anchor` carries `startLine`/`endLine`/`quote` — i.e.
+ * a line-anchored thread. `kind === "unanchored"` (or the
+ * absence of `startLine`) puts a thread in the file-level path,
+ * where none of `L<n>-L<m>`, `focusAnchor`, or the quote are
+ * used. */
+function isRailLineAnchor(anchor: RailAnchor): anchor is RailLineAnchor {
+  return anchor.kind !== "unanchored" && typeof (anchor as RailLineAnchor).startLine === "number";
 }
 interface RailComment {
   readonly id: string;
@@ -50,9 +72,17 @@ interface RailComment {
 }
 interface RailThread {
   readonly id: string;
-  readonly status: "open" | "resolved";
+  /** Issue #46 item 5: `orphaned` is a real state (round-5
+   * introduced it; PR #45 renders the panel). The rail must not
+   * assume line-anchored on any status — an orphaned thread may
+   * carry a line anchor OR an unanchored one. */
+  readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: RailAnchor;
   readonly comments: readonly RailComment[];
+  /** Optional reason string projected from the pipeline's
+   * `thread.orphaned.reason` or `comment.created.orphanReason`.
+   * Rendered next to the file path on orphaned threads. */
+  readonly orphanReason?: string;
 }
 interface RailListResponse {
   readonly threads: readonly RailThread[];
@@ -270,6 +300,10 @@ function subscribeEvents(onBump: () => void): () => void {
  * `anchor.path:start-end`. Used to scroll a thread's anchor into view
  * when the reviewer opens it in the rail. */
 function findBlockForAnchor(anchor: RailAnchor): HTMLElement | undefined {
+  // Issue #46 item 5: an unanchored anchor has no line range —
+  // nothing on the page to scroll to. Skip the DOM lookup rather
+  // than emit `docs/x.mdx:undefined-undefined`.
+  if (!isRailLineAnchor(anchor)) return undefined;
   const wanted = `${anchor.path}:${anchor.startLine}-${anchor.endLine}`;
   const el = document.querySelector<HTMLElement>(`[data-src="${cssEscape(wanted)}"]`);
   return el ?? undefined;
@@ -289,9 +323,13 @@ function cssEscape(value: string): string {
  * complementary region (ADR-0017). */
 function Rail(): JSX.Element {
   const [threads, { refetch }] = createResource(fetchThreads);
+  // The composer builds a fresh line anchor from the reviewer's
+  // selection; nothing in this path is ever unanchored. Type as
+  // `RailLineAnchor` so `.startLine` / `.endLine` type-check
+  // without narrowing.
   const [composerAnchor, setComposerAnchor] = createSignal<{
     readonly element: HTMLElement;
-    readonly anchor: RailAnchor;
+    readonly anchor: RailLineAnchor;
     readonly quote: string;
   } | undefined>(undefined);
   const [error, setError] = createSignal<string | undefined>(undefined);
@@ -315,9 +353,11 @@ function Rail(): JSX.Element {
   // affordance is where the eye is. Second, the `c` keyboard
   // shortcut and the "comment on selection" button inside the rail
   // panel (both wired up further down).
+  // Selection always builds a fresh LINE anchor from the reviewer's
+  // range in the DOM — nothing on this path is ever unanchored.
   const [selection, setSelection] = createSignal<{
     readonly block: HTMLElement;
-    readonly anchor: RailAnchor;
+    readonly anchor: RailLineAnchor;
     readonly quote: string;
     readonly rect: { readonly top: number; readonly left: number; readonly width: number; readonly height: number };
   } | undefined>(undefined);
@@ -605,9 +645,26 @@ function Rail(): JSX.Element {
                 type="button"
                 class="revkit-rail__thread-anchor"
                 onClick={() => focusAnchor(thread.anchor)}
+                data-anchor-kind={isRailLineAnchor(thread.anchor) ? "line" : "unanchored"}
               >
                 <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
-                <span class="revkit-rail__thread-lines">L{thread.anchor.startLine}–{thread.anchor.endLine}</span>
+                <Show
+                  when={isRailLineAnchor(thread.anchor)}
+                  fallback={
+                    // Issue #46 item 5: an unanchored thread renders a
+                    // file-level label, never `Lundefined`. The
+                    // orphan reason (`diffhunk-mismatch`, `binary`, …)
+                    // rides beside it when present, so the reviewer
+                    // sees WHY the anchor was lost.
+                    <span class="revkit-rail__thread-lines revkit-rail__thread-lines--file">
+                      (file-level{thread.orphanReason !== undefined ? ` — ${thread.orphanReason}` : ""})
+                    </span>
+                  }
+                >
+                  <span class="revkit-rail__thread-lines">
+                    L{(thread.anchor as RailLineAnchor).startLine}–{(thread.anchor as RailLineAnchor).endLine}
+                  </span>
+                </Show>
               </button>
               <ol class="revkit-rail__comments">
                 <For each={thread.comments}>
