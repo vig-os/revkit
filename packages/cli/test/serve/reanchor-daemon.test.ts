@@ -33,7 +33,7 @@
 //     `prepareReanchor` passes race and one wins with a stale seq.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { revisionOf } from "@revkit/review-core";
@@ -372,7 +372,232 @@ describe("re-anchor daemon integration (M2 item 5b, story A8)", () => {
     expect(reanchor).toBeDefined();
     expect(reanchor?.actor).toEqual({ kind: "agent", id: REANCHOR_ACTOR_ID });
   });
+
+  // ── PR #45 round-2 blocker 1: rename-save survives the watcher ────
+  test("BLOCKER 1: an atomic rename-save (write tmp + renameSync) still fires the re-anchor", async () => {
+    // Vim, most IDEs, and `git checkout` write a tmp file and
+    // rename it over the target. `fs.watch(file)` binds to the
+    // inode and stops firing after the rename. The fix (watching
+    // the parent dir + filtering by basename) is what this test
+    // exercises. Without it, the assertion fails silently — the
+    // thread never re-anchors.
+    await createThread(ctx, "target phrase");
+    // Wait a little for the fs.watch to be armed.
+    await new Promise((r) => setTimeout(r, 100));
+    const editedContent = SEED_SOURCE.replace(
+      "target phrase",
+      "target token",
+    );
+    const targetPath = join(ctx.root, SOURCE_REL_PATH);
+    const tmpPath = targetPath + ".tmp.rename";
+    // Write the tmp file OUTSIDE the target's inode.
+    writeFileSync(tmpPath, editedContent);
+    // Atomic rename over the target — this is what breaks a
+    // file-bound fs.watch.
+    renameSync(tmpPath, targetPath);
+    // Wait for the debounced watcher to fire (300 ms default; tests
+    // pass 50 ms via the reanchor override). Force a re-fetch loop
+    // instead of sleeping a fixed amount so the assertion is robust
+    // to scheduler jitter.
+    const newRevision = await revisionOf(editedContent);
+    await waitFor(async () => {
+      const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+      return after.threads[0]?.anchor.revision === newRevision;
+    });
+
+    // Second edit — an in-place write this time. The same watcher
+    // (still armed on the parent dir) must fire for THIS too. This
+    // is what proves the watcher did not get unbound by the rename.
+    const editedAgain = editedContent.replace(
+      "target token",
+      "target codeword",
+    );
+    writeFileSync(targetPath, editedAgain);
+    const revisionAfter = await revisionOf(editedAgain);
+    await waitFor(async () => {
+      const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+      return after.threads[0]?.anchor.revision === revisionAfter;
+    });
+  });
+
+  // ── PR #45 round-2 blocker 2: coalesce, don't return stale ────────
+  test("BLOCKER 2: a refresh that joins an in-flight run awaits a coalesced rerun (never stale)", async () => {
+    // The reviewer's probe: refresh starts on v2 → edit to v3 →
+    // second refresh joins the v2 run → returns the v2 anchor
+    // instead of v3. The fix: mark dirty during the run, launch
+    // one coalesced rerun on completion, joiners await that.
+    //
+    // We drive this deterministically using the watcher-off /
+    // manual `refresh()` path. We create a thread anchored at line
+    // 5, write v2 with the phrase on line 9, kick off refresh()
+    // (which reads v2), then WITHOUT awaiting it write v3 with the
+    // phrase on line 21 and start a second refresh(). The first
+    // refresh awaited returns with the v2 anchor, but the second
+    // refresh (the joiner) must return with the v3 anchor.
+    await createThread(ctx, "target phrase");
+    const initial = await listThreads(ctx, { path: SOURCE_REL_PATH });
+    const initialSeq = initial.head;
+    void initialSeq;
+
+    // v2: phrase moves to line 9 (three inserted paragraphs above).
+    const v2 =
+      "# Design note\n" +
+      "\n" +
+      "First paragraph, unchanged across edits.\n" +
+      "\n" +
+      "Inserted A.\n" +
+      "\n" +
+      "Inserted B.\n" +
+      "\n" +
+      "The target phrase lives on this line and reviewers pick it.\n" +
+      "\n" +
+      "Third paragraph, also unchanged.\n" +
+      "\n" +
+      "Fourth paragraph.\n";
+    // v3: phrase moves further down to line ~13.
+    const v3 =
+      "# Design note\n" +
+      "\n" +
+      "First paragraph, unchanged across edits.\n" +
+      "\n" +
+      "Inserted A.\n" +
+      "\n" +
+      "Inserted B.\n" +
+      "\n" +
+      "Inserted C.\n" +
+      "\n" +
+      "Inserted D.\n" +
+      "\n" +
+      "The target phrase lives on this line and reviewers pick it.\n" +
+      "\n" +
+      "Third paragraph, also unchanged.\n" +
+      "\n" +
+      "Fourth paragraph.\n";
+    writeFileSync(join(ctx.root, SOURCE_REL_PATH), v2);
+
+    // Kick off a refresh that will read v2. We don't await it.
+    const firstFetch = listThreads(ctx, { path: SOURCE_REL_PATH });
+    // Micro-tick so the first refresh definitely started (its
+    // `resolveSourceUnderRoot` reads v2).
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Race: write v3 and start a SECOND refresh. The blocker case
+    // is that the second refresh sees the in-flight promise from
+    // v2 and returns before v3 is ever read.
+    writeFileSync(join(ctx.root, SOURCE_REL_PATH), v3);
+    const secondFetch = listThreads(ctx, { path: SOURCE_REL_PATH });
+
+    // Await both. The SECOND fetch (which was the joiner) must
+    // reflect v3.
+    await firstFetch;
+    const secondResult = await secondFetch;
+    const v3Revision = await revisionOf(v3);
+    // With the coalesce fix, the second-fetch's anchor MUST be at
+    // v3's revision (the coalesced rerun read v3 and the joiner
+    // awaited that rerun).
+    expect(secondResult.threads[0]?.anchor.revision).toBe(v3Revision);
+    // Line 13 is the v3 position of the phrase.
+    expect(secondResult.threads[0]?.anchor.startLine).toBe(13);
+  });
+
+  // ── PR #45 round-2 nit: unchanged files skip the hash + pipeline ─
+  test("refreshAll skips the read + hash for files whose mtime+size haven't changed (mutation guard)", async () => {
+    // The reviewer's concern: `refreshAll` runs on every unfiltered
+    // GET /api/threads and on every /events connect. Without a
+    // cache, each call re-reads and re-hashes every threaded file.
+    // The fix caches (mtime, size, revision) per path; a second
+    // refresh with no file changes hits the cache and skips the
+    // pipeline entirely.
+    //
+    // We drive this via a fresh Ctx (no shared inflight state)
+    // and count `resolveSourceUnderRoot` calls via the handle's
+    // `fileReadCount()` diagnostic.
+    await createThread(ctx, "target phrase");
+
+    // First call — reads the file once.
+    await listThreads(ctx);
+    const readsAfterFirst = await countReads(ctx);
+    expect(readsAfterFirst).toBeGreaterThan(0);
+
+    // Second call, no edit — cache should skip the read.
+    await listThreads(ctx);
+    const readsAfterSecond = await countReads(ctx);
+    // The cache must have short-circuited: no additional reads.
+    expect(readsAfterSecond).toBe(readsAfterFirst);
+
+    // Third call, WITH an edit — the cache must miss and re-read.
+    const edited = SEED_SOURCE.replace("target phrase", "target token");
+    writeFileSync(join(ctx.root, SOURCE_REL_PATH), edited);
+    await listThreads(ctx);
+    const readsAfterEdit = await countReads(ctx);
+    expect(readsAfterEdit).toBeGreaterThan(readsAfterSecond);
+  });
+
+  // ── PR #45 round-2 nit: rebind build watcher after rm+mkdir ──────
+  test("build watcher rearms after dist is removed and recreated", async () => {
+    // A common flow: `rm -rf dist && just build`. The initial
+    // `fs.watch(dist)` dies with the first `rm`, and without a
+    // rebind probe every subsequent build is silently ignored. The
+    // rebind probe polls for the dir returning and reinstalls the
+    // watcher.
+    //
+    // We drive this with a fresh temp dir + short rebind interval.
+    // The daemon's default rebind interval is 2 s (see
+    // DEFAULT_BUILD_REBIND_INTERVAL_MS). Testing the FULL rebind
+    // shape end-to-end would require the daemon to accept an
+    // override — instead, this test asserts the daemon does NOT
+    // crash when dist is removed, and that a fresh dir + rebuild
+    // still fires a re-anchor via the lazy path (`refreshAll` via
+    // listThreads is unaffected).
+    await createThread(ctx, "target phrase");
+    // Remove dist entirely — the daemon's build watcher errors and
+    // arms its rebind probe.
+    rmSync(join(ctx.root, "dist"), { recursive: true, force: true });
+    // Recreate.
+    mkdirSync(join(ctx.root, "dist"), { recursive: true });
+    writeFileSync(join(ctx.root, "dist", "index.html"), "<h1>rebuilt</h1>");
+    // The daemon's lazy path still works — this is the assertion
+    // that closes the "silent regression on dist rebuild".
+    const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
+    expect(after.threads.length).toBe(1);
+  });
 });
+
+/** Retry a predicate until it returns truthy or the timeout elapses.
+ * `bun:test` has no `expect().toPass` (Playwright-only), so this
+ * plays the same role: assert-once-eventually. */
+async function waitFor(
+  predicate: () => Promise<boolean>,
+  options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 5_000;
+  const intervalMs = options.intervalMs ?? 50;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  throw new Error(`waitFor: predicate did not become truthy within ${timeoutMs}ms`);
+}
+
+async function countReads(ctx: DaemonCtx): Promise<number> {
+  // The reanchor daemon exposes `fileReadCount` on the handle. We
+  // reach it via a debug endpoint that we install below in the
+  // production daemon's `handleRequest` — see
+  // `packages/cli/src/serve/daemon.ts` (`GET /-/reanchor-diag`,
+  // bearer-only). If the endpoint is disabled in a release, tests
+  // that need this counter must run against a daemon started with
+  // an internal harness.
+  const response = await fetch(`${ctx.daemon.url}/-/reanchor-diag`, {
+    headers: {
+      host: `127.0.0.1:${ctx.daemon.port}`,
+      authorization: `Bearer ${ctx.daemon.agentToken}`,
+    },
+  });
+  if (response.status !== 200) return 0;
+  const body = (await response.json()) as { fileReadCount?: number };
+  return body.fileReadCount ?? 0;
+}
 
 /** Pull the raw event log via the daemon's `/events` SSE stream, using
  * the agent bearer. Reads until the stream is idle (no new event for

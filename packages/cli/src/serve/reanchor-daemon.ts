@@ -62,8 +62,8 @@
 // server and any future PR-adapter can display or hide these
 // events independently. See M2 item 5b's design note.
 
-import { statSync, watch, type FSWatcher } from "node:fs";
-import { relative } from "node:path";
+import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
+import { basename as basenameOf, dirname, relative } from "node:path";
 import {
   prepareReanchor,
   reanchorEvent,
@@ -103,6 +103,12 @@ export const DEFAULT_BUILD_DEBOUNCE_MS = 500;
  * watched file per 2 s is trivial. */
 export const DEFAULT_POLL_INTERVAL_MS = 2_000;
 
+/** How often the build-watcher rebind probe runs (`rm -rf dist &&
+ * just build` deletes and recreates the directory the watcher was
+ * bound to; the probe re-installs the watcher). 2 s matches the
+ * poll interval so a common shape for both is exercised together. */
+export const DEFAULT_BUILD_REBIND_INTERVAL_MS = 2_000;
+
 /** Options a caller can override. In production the daemon calls
  * `startReanchorDaemon({ store, bus, repoRoot, distDir, logger })`
  * with the defaults; tests inject clocks and shorter debounces so
@@ -132,19 +138,36 @@ export interface ReanchorDaemonOptions {
  * `stop()` tears down watchers and clears pending debounce timers. */
 export interface ReanchorDaemonHandle {
   /** Re-anchor every open or orphaned thread on `path` against the
-   * current file content on disk. Idempotent; serialised per path
-   * (a second concurrent call joins the first's promise). */
+   * current file content on disk. Serialised per path with a dirty-
+   * flag: a caller that arrives while one refresh is in flight
+   * marks the path dirty and joins a coalesced rerun that starts
+   * after the first finishes, so the awaited promise always reflects
+   * a run that read a source at or newer than the caller's request
+   * time. See PR #45 round-2 blocker 2. */
   refresh(path: string): Promise<void>;
   /** Re-anchor every threaded path. Used by the build watcher when a
    * site rebuild lands, and by callers that read `/api/threads`
-   * without a path filter. */
+   * without a path filter. Uses the per-path
+   * mtime+size+revision cache so an unchanged file skips the
+   * `revisionOf` hash and the pipeline. See PR #45 round-2 nit. */
   refreshAll(): Promise<void>;
   /** Trigger a garbage-collection pass on the snapshot store,
    * deleting rows no live thread references. Fired opportunistically
    * after a refresh. */
   gc(): Promise<void>;
-  /** Number of paths currently under an fs.watch (or poll). Diagnostic. */
+  /** Reconcile the watched-file set with the current threads: install
+   * an fs.watch (or polling watcher) for a threaded path that has
+   * none, and tear down a watcher for a path whose threads all
+   * resolved. Called by the daemon after every `store.append`. */
+  reconcileWatchers(): Promise<void>;
+  /** Number of paths currently under a watcher (real fs.watch or
+   * polling fallback). Diagnostic. */
   watchedPaths(): number;
+  /** Number of times the re-anchor pipeline actually READ a file
+   * (called `resolveSourceUnderRoot`). A skip through the
+   * mtime+size cache does not increment this counter — the counter
+   * is what the "no re-hash on unchanged file" test asserts on. */
+  fileReadCount(): number;
   stop(): Promise<void>;
 }
 
@@ -166,30 +189,97 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
   } = options;
 
   const actor: Author = { kind: "agent", id: REANCHOR_ACTOR_ID };
-  const inflight = new Map<string, Promise<void>>();
+  /** Per-path in-flight state. `run` is the current pipeline
+   * promise; `pending` is a coalesced rerun (created lazily) that
+   * a caller who arrived AFTER the current run started can await,
+   * so a caller never observes stale anchors. `dirty` is set every
+   * time `refresh(path)` is called after `run` began; the completion
+   * path uses it to decide whether to launch a fresh run before
+   * resolving `pending`. */
+  interface InflightState {
+    run: Promise<void>;
+    pending?: { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void };
+    dirty: boolean;
+  }
+  const inflight = new Map<string, InflightState>();
+  /** Per-path read cache (mtime + size + revision) so an unchanged
+   * file is skipped without re-hashing the whole source. `resolveSourceUnderRoot`
+   * still opens the file and runs `revisionOf` when the mtime/size
+   * says the file changed, so a rename-save (which changes both) still
+   * hits the pipeline. */
+  const readCache = new Map<string, { mtimeMs: number; size: number; revision: string; source: string }>();
   const fileWatchers = new Map<string, { close: () => void }>();
   const fileTimers = new Map<string, ReturnType<typeof setTimeout>>();
   let buildTimer: ReturnType<typeof setTimeout> | undefined;
   let buildWatcher: FSWatcher | undefined;
   let stopped = false;
+  let fileReadCount = 0;
 
   const handle: ReanchorDaemonHandle = {
     refresh,
     refreshAll,
     gc: gcOnce,
+    reconcileWatchers,
     watchedPaths: () => fileWatchers.size,
+    fileReadCount: () => fileReadCount,
     stop,
   };
 
+  /** Refresh a path, coalescing concurrent calls into at most one
+   * in-flight run plus one pending rerun. The returned promise
+   * resolves after a run that STARTED at or after the caller's
+   * invocation, so a joiner never observes stale anchors — the
+   * blocker 2 fix. */
   async function refresh(path: string): Promise<void> {
     if (stopped) return;
     const existing = inflight.get(path);
-    if (existing !== undefined) return existing;
-    const run = doRefresh(path).finally(() => {
+    if (existing === undefined) {
+      // Fresh run.
+      const run = doRefresh(path).finally(() => onRunFinished(path));
+      inflight.set(path, { run, dirty: false });
+      return run;
+    }
+    // A run is already in flight. Mark dirty so the completion path
+    // launches a coalesced rerun, then hand back the pending promise
+    // (creating one if this is the first joiner of the current run).
+    existing.dirty = true;
+    if (existing.pending === undefined) {
+      let resolveFn: () => void = () => {};
+      let rejectFn: (error: unknown) => void = () => {};
+      const promise = new Promise<void>((resolve, reject) => {
+        resolveFn = resolve;
+        rejectFn = reject;
+      });
+      existing.pending = { promise, resolve: resolveFn, reject: rejectFn };
+    }
+    return existing.pending.promise;
+  }
+
+  /** Called by every run's `.finally`. If the path was marked dirty
+   * during the run, launch ONE more run and route the pending
+   * promise to its completion. Otherwise the state slot is freed. */
+  function onRunFinished(path: string): void {
+    const state = inflight.get(path);
+    if (state === undefined) return;
+    if (!state.dirty) {
       inflight.delete(path);
-    });
-    inflight.set(path, run);
-    return run;
+      // A pending promise here means we saw a joiner but forgot the
+      // dirty flag — impossible by construction, but defensively
+      // resolve so nothing hangs.
+      state.pending?.resolve();
+      return;
+    }
+    state.dirty = false;
+    const pending = state.pending;
+    state.pending = undefined;
+    const next = doRefresh(path).finally(() => onRunFinished(path));
+    state.run = next;
+    if (pending !== undefined) {
+      // Route the pending joiners' promise to THIS coalesced run's
+      // completion. Any joiners that arrive during `next` get their
+      // own fresh pending slot by the block above.
+      next.then(pending.resolve, pending.reject);
+    }
   }
 
   async function doRefresh(path: string): Promise<void> {
@@ -198,6 +288,30 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // path that snuck onto a thread despite the anchor check (or a
     // symlink that appeared between then and now) is refused here
     // too.
+    //
+    // Fast path: the (mtime, size) tuple already matches the cached
+    // (mtime, size, revision). Skip the read + hash + pipeline
+    // entirely — nothing has changed since the last refresh. This
+    // is what keeps `/api/threads` cheap under the lazy trigger.
+    // A rename-save (write tmp + rename over) changes mtime AND
+    // size, so it still hits the pipeline (blocker 1 fix relies on
+    // this).
+    const rooted = repoRoot + "/" + path;
+    const cached = readCache.get(path);
+    if (cached !== undefined) {
+      try {
+        const stat = statSync(rooted);
+        if (stat.mtimeMs === cached.mtimeMs && stat.size === cached.size) {
+          // No change on disk; the pipeline would emit `anchored` for
+          // every thread (identity short-circuit). Skip.
+          return;
+        }
+      } catch {
+        // Fall through to `resolveSourceUnderRoot`, which will report
+        // the removal + orphan every thread.
+      }
+    }
+    fileReadCount += 1;
     const resolved = await resolveSourceUnderRoot(path, repoRoot);
     if (!resolved.ok) {
       // Refused (missing, over cap, symlink escape): every thread on
@@ -206,6 +320,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       // reveal WHICH failure mode fired (matches
       // `UNIFORM_ANCHOR_REJECTION`'s privacy stance) — an operator
       // reads the daemon's own log for the specific cause.
+      readCache.delete(path);
       logger.warn("reanchor.source.rejected", { path, reason: resolved.reason });
       await orphanAll(
         path,
@@ -214,6 +329,20 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       return;
     }
     const { revision: newRevision, source: newSource } = resolved;
+    // Refresh the read cache. `statSync` here is called AFTER the
+    // read; a write between the two settles at the next refresh (a
+    // rename-save's second event fires the watcher again).
+    try {
+      const stat = statSync(rooted);
+      readCache.set(path, {
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        revision: newRevision,
+        source: newSource,
+      });
+    } catch {
+      readCache.delete(path);
+    }
 
     // Fetch open + orphaned threads on this path. `resolved` threads
     // are not tracked — the human/agent's final word stands.
@@ -426,8 +555,28 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       installPollingWatcher(path, rooted, fire);
       return;
     }
+    // **Blocker 1 fix**: watch the PARENT directory and filter by
+    // basename. `fs.watch(file)` binds to the inode, so vim,
+    // Sublime, VS Code, `git checkout` and every atomic-save (write
+    // tmp + `renameSync` over the target) silently break the
+    // watcher — no more events, no error, and the polling fallback
+    // never arms. Watching the parent and matching the basename
+    // catches BOTH `change` events (in-place writes) and `rename`
+    // events (atomic replace, delete, recreate). The `filename`
+    // argument may be null on some kernels; when it is, we treat
+    // any event as a match and let the refresh's own mtime cache
+    // short-circuit the no-op case.
+    const dir = dirname(rooted);
+    const basename = basenameOf(rooted);
+    // A parent directory that does not exist yet (rare — the file
+    // was just written) fails `fs.watch`. Fall back to polling in
+    // that case; the caller can re-`ensureWatcher` once the dir
+    // exists.
     try {
-      const watcher = watch(rooted, { persistent: false }, fire);
+      const watcher = watch(dir, { persistent: false }, (_eventType, filename) => {
+        if (filename !== null && filename !== basename) return;
+        fire();
+      });
       watcher.on("error", () => {
         // fs.watch failed after start; swap to polling silently. The
         // debounce timer keeps whatever the last `fire()` scheduled.
@@ -523,8 +672,22 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
   }
 
+  /** Install a watcher on `distDir`. Reinstalled after an error or
+   * a `distDir` recreate (`rm -rf dist && just build` is a common
+   * shape). The reinstall is guarded by a polling probe every
+   * `buildRebindIntervalMs` so a deleted-then-recreated dist gets a
+   * fresh watcher instead of dropping build signals forever. See PR
+   * #45 round-2 nit. */
+  let buildRebindTimer: ReturnType<typeof setInterval> | undefined;
   function installBuildWatcher(): void {
-    if (distDir === undefined) return;
+    if (distDir === undefined || stopped) return;
+    if (!existsSync(distDir)) {
+      // dist/ does not exist yet — schedule a probe so we install
+      // the watcher when the first build lands. Fire once now to
+      // pick up a build that finished BEFORE the daemon started.
+      armBuildRebind();
+      return;
+    }
     try {
       // `recursive: true` catches every write under dist/. Astro
       // writes many files during a build; the debounce (500 ms
@@ -547,14 +710,37 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
           // Already closed.
         }
         buildWatcher = undefined;
+        // Watcher died (dist was rm -rf'd, for example). Arm the
+        // rebind probe so we reinstall once dist exists again.
+        armBuildRebind();
       });
+      // Once a watcher is live, we can stop the rebind probe.
+      if (buildRebindTimer !== undefined) {
+        clearInterval(buildRebindTimer);
+        buildRebindTimer = undefined;
+      }
     } catch (error) {
-      // A non-existent dist dir is fine — the daemon may be run
-      // without a site build; the lazy path still works.
+      // A permission error or a race with a concurrent build — arm
+      // the rebind probe so a subsequent attempt lands.
       logger.warn("reanchor.build.watch.install-failed", {
         errorKind: (error as Error).name,
       });
+      armBuildRebind();
     }
+  }
+
+  function armBuildRebind(): void {
+    if (buildRebindTimer !== undefined || stopped || distDir === undefined) return;
+    buildRebindTimer = setInterval(() => {
+      if (stopped || distDir === undefined) return;
+      if (buildWatcher !== undefined) return;
+      if (existsSync(distDir)) {
+        // Directory came back — try to install. `installBuildWatcher`
+        // clears the rebind timer on success.
+        installBuildWatcher();
+      }
+    }, DEFAULT_BUILD_REBIND_INTERVAL_MS);
+    (buildRebindTimer as unknown as { unref?: () => void }).unref?.();
   }
 
   async function stop(): Promise<void> {
@@ -563,6 +749,10 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     for (const timer of fileTimers.values()) clearTimeout(timer);
     fileTimers.clear();
     if (buildTimer !== undefined) clearTimeout(buildTimer);
+    if (buildRebindTimer !== undefined) {
+      clearInterval(buildRebindTimer);
+      buildRebindTimer = undefined;
+    }
     for (const watcher of fileWatchers.values()) watcher.close();
     fileWatchers.clear();
     try {
@@ -581,13 +771,6 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
   void reconcileWatchers().catch((error) =>
     logger.warn("reanchor.reconcile.failed", { errorKind: (error as Error).name }),
   );
-
-  // Expose the reconcile function via a hook: the daemon calls it
-  // after every append (via a monkey-patch below in the wire-up
-  // module) so a NEW thread on a NEW path gets a watcher installed.
-  (handle as unknown as { reconcileWatchers: () => Promise<void> }).reconcileWatchers =
-    reconcileWatchers;
-
   return handle;
 }
 

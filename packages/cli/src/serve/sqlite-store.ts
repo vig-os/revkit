@@ -332,9 +332,9 @@ export class SqliteThreadStore implements ThreadStore {
     return row?.total ?? 0;
   }
 
-  /** All snapshot revisions currently held, sorted. Used by the
-   * GC pass in `reanchor-daemon.ts` to compute the delete set:
-   * `stored − retained`. */
+  /** All snapshot revisions currently held, sorted. Diagnostic — the
+   * GC pass computes its delete set inside a transaction and does
+   * not need this. */
   snapshotRevisions(): string[] {
     const rows = this.#db
       .query<{ revision: string }, []>("SELECT revision FROM snapshots ORDER BY revision ASC")
@@ -342,27 +342,61 @@ export class SqliteThreadStore implements ThreadStore {
     return rows.map((row) => row.revision);
   }
 
-  /** Delete snapshots not in `retain`. Every thread's current anchor
-   * revision must be in `retain`; anything else is garbage from a
-   * superseded rebuild and is reclaimed. Returns the number of rows
-   * deleted so the daemon can log a reclamation size.
+  /** Delete snapshots not in `retain` AND older than the grace
+   * period `graceMs`. Returns the number of rows deleted so the
+   * daemon can log a reclamation size.
    *
-   * The delete runs inside one transaction so a concurrent
-   * `putSnapshot` (a POST /api/threads landing between the SELECT
-   * and the DELETEs) either lands entirely before or entirely after
-   * the sweep — never mid-delete. `retain` is treated as read-only. */
-  gcSnapshots(retain: ReadonlySet<string>): number {
-    const stored = this.snapshotRevisions();
-    const toDelete: string[] = [];
-    for (const revision of stored) {
-      if (!retain.has(revision)) toDelete.push(revision);
-    }
-    if (toDelete.length === 0) return 0;
-    const stmt = this.#db.prepare("DELETE FROM snapshots WHERE revision = ?");
+   * **The race** (PR #45 round-2 nit). `retain` is computed
+   * application-side from the event log (threads are a JS reduction
+   * of events, not a SQL view), so a concurrent `POST /api/threads`
+   * that inserts a fresh snapshot AFTER `retain` was computed but
+   * BEFORE this call runs would otherwise see its snapshot deleted:
+   * the new revision is in the on-disk `snapshots` table but is not
+   * in `retain`. The grace period closes the race: any snapshot
+   * created within `graceMs` of NOW is retained regardless of the
+   * `retain` set, so a fresh POST's snapshot always survives the
+   * next GC round.
+   *
+   * The SELECT + DELETEs run inside ONE `BEGIN IMMEDIATE`
+   * transaction so a `putSnapshot` racing this GC either lands
+   * entirely before or entirely after the sweep — never mid-scan.
+   * `retain` is treated as read-only. */
+  gcSnapshots(retain: ReadonlySet<string>, graceMs: number = DEFAULT_SNAPSHOT_GC_GRACE_MS): number {
+    const cutoffMs = Date.now() - graceMs;
+    // Turn the retain set into a stable, quoted SQL list. sqlite's
+    // parameterised `IN (?, ?, …)` needs one placeholder per value,
+    // which is awkward at scale; the retain set is small (one
+    // revision per open+resolved+orphaned thread — a few hundred at
+    // most on a realistic project), so building the list in JS and
+    // filtering in-memory is fine. We STILL run the SELECT inside
+    // the transaction so the row set is snapshot-consistent with the
+    // DELETE.
+    const selectStmt = this.#db.query<{ revision: string; created_at: string }, []>(
+      "SELECT revision, created_at FROM snapshots",
+    );
+    const deleteStmt = this.#db.prepare("DELETE FROM snapshots WHERE revision = ?");
+    let deleted = 0;
     const txn = this.#db.transaction((): void => {
-      for (const revision of toDelete) stmt.run(revision);
+      const rows = selectStmt.all();
+      for (const row of rows) {
+        if (retain.has(row.revision)) continue;
+        const createdMs = Date.parse(row.created_at);
+        if (Number.isFinite(createdMs) && createdMs > cutoffMs) continue;
+        deleteStmt.run(row.revision);
+        deleted += 1;
+      }
     });
-    txn();
-    return toDelete.length;
+    // `bun:sqlite` transactions default to DEFERRED; call
+    // `.immediate()` so we take the write lock at BEGIN and no
+    // concurrent writer sneaks a fresh row in between our SELECT
+    // and DELETEs.
+    txn.immediate();
+    return deleted;
   }
 }
+
+/** Default grace period for `gcSnapshots`. A snapshot created within
+ * this window is retained regardless of the `retain` set. 30 s is
+ * comfortably wider than the request-plus-refresh round-trip on any
+ * realistic workload. Tests pass `0` to force an immediate sweep. */
+export const DEFAULT_SNAPSHOT_GC_GRACE_MS = 30_000;

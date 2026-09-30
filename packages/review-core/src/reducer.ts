@@ -108,8 +108,12 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       // overrule). `open` is the only status the un-orphaning transition
       // targets.
       const nextStatus = thread.status === "orphaned" ? "open" : thread.status;
+      // When un-orphaning, drop the stale `orphanReason` — the block
+      // came back and the rail must stop displaying "was at L…".
+      const { orphanReason: _prevReason, ...rest } = thread;
+      void _prevReason;
       threads.set(event.threadId, {
-        ...thread,
+        ...rest,
         anchor: event.anchor,
         status: nextStatus,
         updatedAt: event.ts,
@@ -129,6 +133,11 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       threads.set(event.threadId, {
         ...thread,
         status: "orphaned",
+        // Carry the pipeline's own reason string onto the derived
+        // Thread view so the rail's orphan panel renders exactly
+        // what the diff engine said, not a synthesised sentence
+        // (PR #45 round-2 nit).
+        ...(event.reason !== undefined ? { orphanReason: event.reason } : {}),
         updatedAt: event.ts,
       });
       return;

@@ -75,6 +75,14 @@ export const threadSchema = z
     createdAt: isoTimestamp,
     updatedAt: isoTimestamp,
     comments: z.array(commentSchema),
+    /** The reason string from the most recent `thread.orphaned`
+     * event on this thread, if any. Present ONLY when
+     * `status === "orphaned"` and the pipeline supplied a reason;
+     * cleared by a subsequent `thread.reanchored` (which un-orphans
+     * the thread). Read by the rail's orphan panel so the human
+     * sees WHY the anchor was lost — the diff's own account rather
+     * than a synthesised sentence. (PR #45 round-2 nit.) */
+    orphanReason: z.string().min(1).optional(),
   })
   .strict();
 

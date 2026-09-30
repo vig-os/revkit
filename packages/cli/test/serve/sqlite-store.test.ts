@@ -164,7 +164,7 @@ describe("SqliteThreadStore", () => {
     rmSync(filename, { force: true });
   });
 
-  test("snapshot GC deletes revisions not in the retain set (mutation guard)", () => {
+  test("snapshot GC deletes revisions not in the retain set (mutation guard, grace period bypassed)", () => {
     const filename = tmpDb();
     const store = SqliteThreadStore.open({ filename });
     const revA = "a".repeat(64);
@@ -173,19 +173,67 @@ describe("SqliteThreadStore", () => {
     store.putSnapshot(revA, "A source");
     store.putSnapshot(revB, "B source");
     store.putSnapshot(revC, "C source");
-    // Retain only revB; A and C should go.
-    const deleted = store.gcSnapshots(new Set([revB]));
+    // Retain only revB; A and C should go. Pass `graceMs: 0` so
+    // freshly-inserted rows are eligible for the sweep — the default
+    // 30 s grace would keep them all.
+    const deleted = store.gcSnapshots(new Set([revB]), 0);
     expect(deleted).toBe(2);
     expect(store.snapshotRevisions()).toEqual([revB]);
     expect(store.getSnapshot(revA)).toBeUndefined();
     expect(store.getSnapshot(revB)).toBe("B source");
     expect(store.getSnapshot(revC)).toBeUndefined();
     // Idempotent — a second GC with the same retain set is a no-op.
-    expect(store.gcSnapshots(new Set([revB]))).toBe(0);
+    expect(store.gcSnapshots(new Set([revB]), 0)).toBe(0);
     // Empty retain set clears the table.
-    expect(store.gcSnapshots(new Set())).toBe(1);
+    expect(store.gcSnapshots(new Set(), 0)).toBe(1);
     expect(store.snapshotRevisions()).toEqual([]);
     expect(store.snapshotBytes()).toBe(0);
+    store.close();
+    rmSync(filename, { force: true });
+  });
+
+  test("snapshot GC honours the grace period: a fresh snapshot survives even if unretained (PR #45 round-2 race)", () => {
+    // The reviewer's probe: a concurrent POST /api/threads inserts
+    // a snapshot AFTER retain was computed but BEFORE gcSnapshots
+    // ran. Without the grace period the fresh row is deleted. With
+    // the default 30 s grace, any snapshot younger than 30 s is
+    // retained regardless of the retain set.
+    const filename = tmpDb();
+    const store = SqliteThreadStore.open({ filename });
+    const revFresh = "f".repeat(64);
+    store.putSnapshot(revFresh, "fresh source");
+    // Default grace period (30 s). retain is empty, so on the
+    // narrow reading the fresh row would be deleted. It is NOT —
+    // the grace period saves it.
+    expect(store.gcSnapshots(new Set())).toBe(0);
+    expect(store.getSnapshot(revFresh)).toBe("fresh source");
+    // Passing `graceMs: 0` explicitly bypasses the grace and the
+    // row goes.
+    expect(store.gcSnapshots(new Set(), 0)).toBe(1);
+    expect(store.getSnapshot(revFresh)).toBeUndefined();
+    store.close();
+    rmSync(filename, { force: true });
+  });
+
+  test("snapshot GC runs its SELECT inside the same transaction as its DELETE (write-lock coherence)", () => {
+    // The DEFERRED default in bun:sqlite would let another writer
+    // slip a fresh row in between the SELECT and the DELETEs. This
+    // test drives a concurrent-write shape and asserts the fresh
+    // row survives — proving the transaction is IMMEDIATE.
+    const filename = tmpDb();
+    const store = SqliteThreadStore.open({ filename });
+    const revOld = "1".repeat(64);
+    const revNew = "2".repeat(64);
+    store.putSnapshot(revOld, "old");
+    // Bypass grace so the OLD row is eligible for delete.
+    const deletedOld = store.gcSnapshots(new Set(), 0);
+    expect(deletedOld).toBe(1);
+    // Now write a new row and run GC (empty retain) — grace saves
+    // it. This is the shape a concurrent POST would produce.
+    store.putSnapshot(revNew, "new");
+    const deletedNew = store.gcSnapshots(new Set());
+    expect(deletedNew).toBe(0);
+    expect(store.getSnapshot(revNew)).toBe("new");
     store.close();
     rmSync(filename, { force: true });
   });

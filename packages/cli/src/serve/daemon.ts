@@ -551,6 +551,24 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response(body, { status: 200 }), "json", "application/json; charset=utf-8");
     }
 
+    // Bearer-only diagnostic for the re-anchoring daemon. The
+    // reanchor engine's `fileReadCount` is the counter the
+    // "unchanged files skip the hash" test needs; there is no other
+    // public surface that reflects it. Locked to the agent bearer
+    // so a cookie-authenticated browser tab cannot probe internal
+    // state (defence in depth even for a diagnostic).
+    if (method === "GET" && url.pathname === "/-/reanchor-diag") {
+      const bearer = bearerFromHeader(request.headers.get("authorization"));
+      if (bearer === undefined || !auth.isAgent(bearer)) {
+        return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+      }
+      const body = JSON.stringify({
+        fileReadCount: reanchor.fileReadCount(),
+        watchedPaths: reanchor.watchedPaths(),
+      });
+      return withHygiene(new Response(body, { status: 200 }), "json", "application/json; charset=utf-8");
+    }
+
     // Fresh launch-code mint (PR #38 round-2 blocker 3). The startup
     // launch code has a 60 s TTL; an auto-started daemon (spawned
     // by `revkit mcp`) prints it to a stdout the parent ignored, so
@@ -957,12 +975,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Reconcile the re-anchor watchers so a NEW thread on a NEW
     // path gets a watcher installed immediately (fire-and-forget:
     // the daemon does not block the POST response on this).
-    const reanchorInternal = reanchor as unknown as {
-      reconcileWatchers?: () => Promise<void>;
-    };
-    if (reanchorInternal.reconcileWatchers !== undefined) {
-      void reanchorInternal.reconcileWatchers();
-    }
+    void reanchor.reconcileWatchers();
     logger.info("api.append.ok", {
       requestId,
       seq,

@@ -59,6 +59,14 @@ interface RailThread {
   readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: RailAnchor;
   readonly comments: readonly RailComment[];
+  /** The pipeline's own reason string from the last
+   * `thread.orphaned` event, carried onto the Thread view by the
+   * reducer. Read by the orphan panel so the human sees WHY the
+   * anchor was lost — the diff's own account rather than a
+   * synthesised sentence. Absent when the pipeline emitted no
+   * reason, or when the thread is not orphaned. (PR #45 round-2
+   * nit.) */
+  readonly orphanReason?: string;
 }
 interface RailListResponse {
   readonly threads: readonly RailThread[];
@@ -847,13 +855,21 @@ function orphanedThreadsFor(response: RailListResponse | undefined): readonly Ra
   return response.threads.filter((thread) => thread.status === "orphaned");
 }
 
-/** Best-effort human reason for an orphan. The daemon does not
- * ship the reason on the `Thread` view today (the reason lives
- * inside the `thread.orphaned` event), so the rail composes a
- * generic sentence from the anchor's path + line range. A future
- * ADR that extends the Thread view with `lastOrphanReason` would
- * let this render the exact pipeline-reason string. */
+/** Render the orphan panel's reason line. Priority order:
+ *
+ *   1. The pipeline's own reason from the reducer (Thread.
+ *      orphanReason, plumbed through from thread.orphaned's payload
+ *      — PR #45 round-2 fix). This is the diff engine's account of
+ *      WHY the anchor was lost ("block deleted; no move detected."
+ *      or "modified: quote similarity 0.32 < gate 0.4."), which is
+ *      what the human actually needs.
+ *   2. A generic fallback for backwards-compat: an orphan event
+ *      without a reason (from an older daemon) still gets a
+ *      readable line. */
 function orphanReasonFor(thread: RailThread): string {
+  if (thread.orphanReason !== undefined && thread.orphanReason.length > 0) {
+    return thread.orphanReason;
+  }
   return (
     `The quoted text no longer appears at ${thread.anchor.path}:` +
     `L${thread.anchor.startLine}–${thread.anchor.endLine}. ` +
