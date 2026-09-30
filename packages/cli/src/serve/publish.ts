@@ -595,7 +595,16 @@ async function appendAndFanOut(
   const materialised = events.find((e: ReviewEvent) => e.seq === seq);
   if (materialised !== undefined) {
     await deps.ingestDelivery(materialised);
-    void deps.bus.publish(materialised, { audiences });
+    // AWAIT the fanout so the POST /api/publish response cannot
+    // return before every SSE subscriber has enqueued the frame.
+    // A previous `void bus.publish` version let the daemon reply
+    // 201 before the microtask that delivers to the SSE stream
+    // ran; on CI that produced a flaky test where the client
+    // polled `/events` after the 201 landed and missed the
+    // frame. `bus.publish` awaits each subscriber's `deliver`,
+    // which for SSE is a synchronous `controller.enqueue` — so
+    // awaiting here is nearly free but removes the race.
+    await deps.bus.publish(materialised, { audiences });
   }
   return seq;
 }
