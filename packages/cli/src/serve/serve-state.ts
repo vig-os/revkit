@@ -34,12 +34,10 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { randomBytes } from "node:crypto";
 
 /** The wire shape of `.revkit/serve.json`. */
 export interface ServeState {
@@ -119,39 +117,80 @@ export interface WriteRefused {
 
 /** Try to write the state atomically at mode 600. Refuses if a live
  * daemon already owns the file (`already-running`). Replaces a stale
- * file (dead pid) without asking. */
+ * file (dead pid) without asking.
+ *
+ * **Atomicity.** The state file is the lock. Every launch tries to
+ * create it with `O_WRONLY | O_CREAT | O_EXCL` and only proceeds if
+ * that call wins. On EEXIST we read the file: a live-pid owner is
+ * `already-running`; a dead-pid owner is stale, so we unlink and
+ * retry the O_EXCL create ONCE. Two daemons racing on a stale file
+ * see one create win and the other lose (its second O_EXCL comes back
+ * EEXIST), so at most one daemon ever owns the file at a time. There
+ * is no check-then-write race. */
 export function writeServeState(repoRoot: string, state: ServeState): { ok: true } | { ok: false; refused: WriteRefused } {
   const path = serveStatePath(repoRoot);
-  mkdirSync(dirname(path), { recursive: true });
-  const existing = existsSync(path) ? readServeState(repoRoot) : undefined;
-  if (existing !== undefined) {
-    // Never remove a live daemon's file. Stale (dead pid) files are
-    // fine to replace — the file has no owner any more.
-    if (existing.pid !== state.pid && isPidAlive(existing.pid)) {
-      return { ok: false, refused: { kind: "already-running", state: existing } };
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+
+  const tryCreate = (): { ok: true } | { ok: false; code: string } => {
+    try {
+      const fd = openSync(path, "wx", 0o600);
+      try {
+        const payload = JSON.stringify(state, null, 2) + "\n";
+        writeSync(fd, payload);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      // Force 0o600 in case the umask clamped the create mode.
+      chmodSync(path, 0o600);
+      return { ok: true };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "";
+      return { ok: false, code };
     }
+  };
+
+  const firstAttempt = tryCreate();
+  if (firstAttempt.ok) return { ok: true };
+  if (firstAttempt.code !== "EEXIST") {
+    throw new Error(`writeServeState: unexpected error creating ${path}: ${firstAttempt.code}`);
   }
-  const tmpSuffix = randomBytes(6).toString("hex");
-  const tmpPath = `${path}.${tmpSuffix}.tmp`;
-  // O_WRONLY | O_CREAT | O_EXCL, mode 0o600. A race that lands another
-  // process on the same tmpPath is impossible in practice (16 hex
-  // chars = 48 random bits) but O_EXCL still surfaces it as an error
-  // rather than silently truncating.
-  const fd = openSync(tmpPath, "wx", 0o600);
+
+  // File exists: whose is it?
+  const existing = readServeState(repoRoot);
+  if (existing !== undefined && existing.pid !== state.pid && isPidAlive(existing.pid)) {
+    return { ok: false, refused: { kind: "already-running", state: existing } };
+  }
+
+  // Stale (or a leftover from our own crashed prior run). Unlink and
+  // retry the O_EXCL create ONCE — if another racing daemon beats us
+  // to it, we report them as already-running.
   try {
-    const payload = JSON.stringify(state, null, 2) + "\n";
-    writeSync(fd, payload);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    unlinkSync(path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT") throw error;
   }
-  // On some filesystems (older glibc, WSL) the file's mode after
-  // `openSync(..., 0o600)` is the umask-clamped mode. Force 0o600 with
-  // an explicit chmod so the invariant is a property of this code,
-  // not of the calling umask.
-  chmodSync(tmpPath, 0o600);
-  renameSync(tmpPath, path);
-  return { ok: true };
+  const secondAttempt = tryCreate();
+  if (secondAttempt.ok) return { ok: true };
+  if (secondAttempt.code !== "EEXIST") {
+    throw new Error(`writeServeState: unexpected error creating ${path}: ${secondAttempt.code}`);
+  }
+  const raced = readServeState(repoRoot);
+  return {
+    ok: false,
+    refused: {
+      kind: "already-running",
+      state: raced ?? {
+        pid: -1,
+        port: 0,
+        url: "",
+        agentToken: "",
+        startedAt: "",
+        version: "",
+      },
+    },
+  };
 }
 
 /** Remove the state file. Idempotent — a shutdown path calls this even

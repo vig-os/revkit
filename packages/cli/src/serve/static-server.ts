@@ -48,16 +48,13 @@ export function openStaticServer(dir: string): StaticServer {
   const resolve = (pathname: string): ResolveResult => {
     const first = resolveWithinRoot(rootReal, pathname);
     if (!first.ok) return first;
-    // Try in order the resolved file, its `index.html` when it is a
-    // directory, and `<path>.html` when nothing existed. Each
+    // Astro / Starlight emit `<page>/index.html` (directory-with-
+    // index) by default and revkit does not override that, so we
+    // only need the two candidates: the resolved file itself, or its
+    // `index.html` when the resolved path is a directory. Each
     // candidate goes through `resolveWithinRoot` again so the
     // containment check applies at every step.
-    let stat;
-    try {
-      stat = statSync(first.absolutePath);
-    } catch {
-      return tryHtmlExtension(rootReal, pathname);
-    }
+    const stat = statSync(first.absolutePath);
     if (stat.isDirectory()) {
       const indexed = resolveWithinRoot(rootReal, join(pathname, "index.html"));
       if (indexed.ok) {
@@ -92,22 +89,4 @@ function join(a: string, b: string): string {
   if (a.endsWith("/") && b.startsWith("/")) return a + b.slice(1);
   if (!a.endsWith("/") && !b.startsWith("/")) return a + "/" + b;
   return a + b;
-}
-
-/** Try `<pathname>.html` — Astro emits `about.html` and serves it at
- * `/about`. Only called from `resolve` when the primary lookup missed
- * the file. */
-function tryHtmlExtension(rootReal: string, pathname: string): ResolveResult {
-  if (pathname.endsWith("/") || pathname.endsWith(".html")) {
-    return { ok: false, kind: "not-found", message: "not found" };
-  }
-  const candidate = resolveWithinRoot(rootReal, pathname + ".html");
-  if (!candidate.ok) return candidate;
-  try {
-    const stat = statSync(candidate.absolutePath);
-    if (stat.isFile()) return candidate;
-  } catch {
-    // Fall through.
-  }
-  return { ok: false, kind: "not-found", message: "not found" };
 }
