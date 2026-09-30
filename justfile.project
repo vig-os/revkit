@@ -237,12 +237,14 @@ claude-plugin ref="":
 # disposable LOCKED-DOWN test Claude session (no built-in tools, only
 # `mcp__revkit__{threads,reply,resolve}`) in a flock pane, then drives a
 # comment through the rail UI with Playwright and waits for the test agent to
-# reply with `ack <nonce> bash-denied` (the `bash-denied` marker proves the
-# lockdown fired) and resolve. Requires a logged-in Claude (`claude auth`), a
-# running flock server (`flk`), and the nix dev shell. Not part of `just test`
-# or CI. Writes a redacted transcript to `.revkit/dogfood/last.log`, an
-# unredacted daemon log to `.revkit/dogfood/daemon.log` (contains the launch
-# code — treat as sensitive), and, on success, a screenshot to
+# reply with `ack <nonce> :: Error: No such tool available: Bash` (proving the
+# runtime's tool-allowlist refused the Bash call), then resolve. Requires a
+# logged-in Claude (`claude auth`), a running flock server (`flk`), and the
+# nix dev shell. Not part of `just test` or CI. Writes a redacted transcript
+# to `.revkit/dogfood/last.log`, unlinks the daemon.log (unredacted — holds
+# the launch code) at teardown by default; set
+# `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1` to keep a redacted copy. On success
+# writes a screenshot to
 # `.revkit/dogfood/reply-visible.png`. Cleanup runs on any exit path and
 # ends with a self-check for leaked panes or subprocesses (exit 3 on leak).
 # See `.claude/skills/revkit_dogfood/SKILL.md` for the full runbook and the

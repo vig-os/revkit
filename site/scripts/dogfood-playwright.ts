@@ -15,9 +15,12 @@
 //                                     repo root, so this path is required.
 //   REVKIT_DOGFOOD_NONCE            — random per-run token embedded in the
 //                                     comment body; the agent echoes it in
-//                                     the reply ("ack <nonce> bash-denied")
-//                                     so we can tell OUR reply apart AND
-//                                     verify the lockdown-proof step ran.
+//                                     the reply ("ack <nonce>") so we can
+//                                     tell OUR reply apart. Round-3: the
+//                                     nonce echo is a LIVENESS marker only,
+//                                     not a lockdown proof — see
+//                                     scripts/dogfood-channel.sh:require_denial_text
+//                                     for the real lockdown assertion.
 //   REVKIT_DOGFOOD_ARTIFACTS_DIR    — writable temp dir for screenshots.
 //   PLAYWRIGHT_BROWSERS_PATH        — chromium binary root (dev shell).
 //
@@ -208,19 +211,23 @@ async function main(): Promise<void> {
     await page.waitForSelector('[data-testid="revkit-rail-floating"]', { timeout: 5_000 });
     await page.click('[data-testid="revkit-rail-floating"]');
     await page.waitForSelector('[data-testid="revkit-rail-composer"]', { timeout: 5_000 });
-    // Round-2 lockdown proof: the comment mirrors the shell's private
-    // instructions (see scripts/dogfood-channel.sh) — the agent must
-    // first attempt Bash, note the denial, then reply. The exact
-    // acknowledgement token `ack <nonce> bash-denied` doubles as the
-    // channel-notification arriving payload (agent sees THIS text on
-    // the channel), and as the string the reply-poll below asserts on.
-    // Do NOT commit / push is an instruction to the agent too, but the
-    // real defence is the lockdown (`--tools "" --allowedTools mcp__revkit__…`).
+    // Round-3 change: the comment carries a LIVENESS marker (the
+    // nonce) only. The lockdown proof is NOT the nonce echo — the
+    // agent can type any string it likes. The real proofs are:
+    //   (1) pre-launch cmdline + env inspection of the child claude
+    //       process — see the verify_claude_lockdown helper in
+    //       scripts/dogfood-channel.sh
+    //   (2) post-run grep of the pane for `No such tool available: Bash`
+    //       (scripts/dogfood-channel.sh:require_denial_text).
+    // Both are hard failures. The Bash attempt is still requested in
+    // the shell's instructions to the agent, so the denial text lands
+    // in the pane — this Playwright leg only needs the reply's nonce
+    // to prove the agent reached a reply turn.
     const commentBody =
-      `Dogfood check ${NONCE}: first attempt \`Bash\` with \`git status\` ` +
-      `(the harness expects this to be refused by the lockdown), then reply ` +
-      `to this thread with exactly \`ack ${NONCE} bash-denied\` using the ` +
-      `revkit reply tool, then resolve the thread. Do NOT commit or push.`;
+      `Dogfood check ${NONCE}: attempt \`Bash\` with \`git status\` first ` +
+      `(the harness's lockdown check greps the pane for the refusal). ` +
+      `Then reply with exactly \`ack ${NONCE}\` using the revkit reply ` +
+      `tool, then resolve the thread. Do NOT commit or push.`;
     await page.fill('[data-testid="revkit-rail-composer-input"]', commentBody);
     await page.click('[data-testid="revkit-rail-submit"]');
     // On success the composer is unmounted (setComposerAnchor(undefined)
@@ -259,14 +266,16 @@ async function main(): Promise<void> {
     // transcript, so `console.log` IS the tracing facade here.
     console.log(`created thread ${created.id} (${created.comments.length} comment(s))`); // guardrails-ok(no-debug-leftovers): CLI progress line
 
-    // 5. Wait for the agent's reply. Success = there is a comment
-    //    authored by an agent whose body contains BOTH `ack <nonce>`
-    //    AND `bash-denied`. The `bash-denied` clause proves the
-    //    lockdown fired — a regressed lockdown would let the agent
-    //    reply without the denial marker (or, more likely, would let
-    //    it succeed at the Bash call and answer `LOCKDOWN BROKEN`).
-    //    Timeout raised to 240 s because the lockdown-proof turn adds
-    //    an extra model round trip on top of the baseline 15-20 s.
+    // 5. Wait for the agent's reply. Round-3: this is a LIVENESS
+    //    check — success = there is a comment authored by an agent
+    //    whose body contains `ack <nonce>`. The nonce echo proves the
+    //    agent reached a reply turn against OUR thread. It does NOT
+    //    prove the lockdown fired; the shell script's pre-launch
+    //    cmdline verification and post-run pane grep for `No such
+    //    tool available: Bash` are the load-bearing lockdown proofs.
+    //    An `LOCKDOWN BROKEN` reply body still throws loudly.
+    //    Timeout: 240 s (the Bash attempt adds an extra turn on top
+    //    of the baseline 15-20 s).
     const started = Date.now();
     const withReply = await waitFor(
       "agent reply visible on daemon",
@@ -274,10 +283,7 @@ async function main(): Promise<void> {
       (thread) =>
         thread !== undefined &&
         thread.comments.some(
-          (c) =>
-            c.author?.kind === "agent" &&
-            c.body.includes(`ack ${NONCE}`) &&
-            c.body.includes("bash-denied"),
+          (c) => c.author?.kind === "agent" && c.body.includes(`ack ${NONCE}`),
         ),
       240_000,
       750,
@@ -285,8 +291,6 @@ async function main(): Promise<void> {
     if (withReply === undefined) throw new Error("unreachable — waitFor guarantees a match");
     const commentLatencyMs = Date.now() - started;
     console.log(`agent replied in ~${commentLatencyMs}ms`); // guardrails-ok(no-debug-leftovers): CLI progress line
-    // Sanity: no reply body should ever claim `LOCKDOWN BROKEN`. If
-    // that phrase appears, the lockdown failed and we abort loudly.
     const brokenClaims = withReply.comments.filter(
       (c) => c.author?.kind === "agent" && c.body.includes("LOCKDOWN BROKEN"),
     );
@@ -310,8 +314,7 @@ async function main(): Promise<void> {
           const threads = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
           for (const el of Array.from(threads)) {
             const text = el.textContent ?? "";
-            // Same joint predicate as the daemon-side poll.
-            if (text.includes(`ack ${nonce}`) && text.includes("bash-denied")) return true;
+            if (text.includes(`ack ${nonce}`)) return true;
           }
           return false;
         },

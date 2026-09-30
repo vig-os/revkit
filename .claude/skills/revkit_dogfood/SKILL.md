@@ -27,17 +27,35 @@ handing the test agent any tool it doesn't need:
    `capabilities.experimental["claude/channel"]`).
 4. **Agent replies.** The test Claude session calls the `reply` MCP tool,
    then `resolve`. It ALSO attempts `Bash git status` first — a lockdown
-   proof: with the tool set restricted, the attempt is refused and the
-   agent's reply body carries the `bash-denied` marker.
+   proof: with the tool set narrowed by `--tools ""` + `--allowedTools
+   mcp__revkit__…` and permission-mode `dontAsk`, the attempt is refused
+   by the runtime with `Error: No such tool available: Bash`, and the
+   agent pastes that exact text into its reply body.
 5. **Daemon → human.** The reply flows back over SSE and the rail updates
    without a reload.
 
 Anything that breaks the loop — a channel schema drift, an env allowlist
 regression, a rail submit regression, an origin-check tightening — fails
-this script well before it fails a user. A lockdown regression that let the
-agent reach Bash / Edit / GitHub tools also fails: the pane's Bash denial
-disappears from the log, or the reply lacks `bash-denied`, or the agent's
-reply says `LOCKDOWN BROKEN`.
+this script well before it fails a user.
+
+The lockdown itself is verified TWICE per run, both as hard failures:
+
+- **Before any prompt is sent**, the harness reads the child claude's
+  `/proc/<pid>/cmdline` and `/proc/<pid>/environ` and refuses to
+  proceed unless every required flag (`--strict-mcp-config`,
+  `--mcp-config <abs>`, `--permission-mode dontAsk`, `--tools ""`,
+  the three `--allowedTools` names) is exactly right AND every
+  forbidden flag (`--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`,
+  `--dangerously-allow-browser-network-access`, `--bare`) is absent
+  AND the env is the tight allowlist (`PATH`, `HOME`,
+  `CLAUDE_CONFIG_DIR`, `TERM`, `LANG` — nothing else, no
+  `SSH_AUTH_SOCK`, `FLOCK_SOCKET_PATH`, `GH_TOKEN`, etc.).
+- **After the loop**, the harness greps the pane AND the agent's reply
+  body for `Error: No such tool available:.*[Bb]ash`. If neither
+  contains it, the run fails.
+- **`DOGFOOD_SELFTEST_BAD_FLAGS=1`** injects a forbidden flag and
+  asserts the pre-launch check fires before any prompt is sent.
 
 ## When to run it
 
@@ -128,13 +146,24 @@ from a previous run can reach the test agent.
    STATE_DIR (so `.revkit/` lands in STATE_DIR). Captures the bun pid via
    `$!` AFTER `cd` (the previous version captured a subshell pid and the
    real daemon leaked). Verifies the captured pid matches `serve.json.pid`.
-5. Mints a per-run 12-char hex **nonce** — the comment body embeds it and
-   the test agent is told to echo `ack <nonce> bash-denied` in the reply.
+5. Mints a per-run 12-char hex **nonce** — the comment body embeds it as
+   a LIVENESS marker (the reply must include `ack <nonce>`); the real
+   lockdown proof is the runtime's own `No such tool available:` refusal
+   grepped from the pane and the reply body, not the nonce echo.
 6. Runs `flk agent start revkit-dogfood-<nonce> --cwd <STATE_DIR>
-   --no-focus -- env … claude --model haiku --strict-mcp-config
+   --no-focus -- /usr/bin/env -i PATH=… HOME=… CLAUDE_CONFIG_DIR=…
+   TERM=… LANG=… claude --model haiku --strict-mcp-config
    --mcp-config <STATE_DIR>/mcp-config.json
    --dangerously-load-development-channels server:revkit --permission-mode
    dontAsk --tools "" --allowedTools mcp__revkit__…`.
+   6a. **Pre-launch lockdown verification.** Before any prompt is
+       sent, finds the child claude by grepping for the unique
+       `mcp-config.json` path in its argv, then reads
+       `/proc/<pid>/cmdline` and `/proc/<pid>/environ`. Hard-fails
+       unless every required flag is present and exactly right, every
+       forbidden flag is absent, and every forbidden env var is
+       absent. `DOGFOOD_SELFTEST_BAD_FLAGS=1` injects `--tools
+       default` and asserts this step catches it.
 7. Handles first-run interactive prompts by reading pane state and
    inspecting the `❯` cursor: workspace-trust (Down + verify cursor is on
    'Yes, I trust this folder' + Enter) and development-channel consent
@@ -150,23 +179,37 @@ from a previous run can reach the test agent.
      affordance, types the nonce comment, submits.
 10. Polls `GET /api/threads` until three conditions are met in order:
     the thread carries our nonce (created); then the thread has an
-    agent-authored comment whose body matches `ack <nonce> bash-denied`
-    (agent replied AND the Bash attempt was denied); then the thread's
+    agent-authored comment whose body matches `ack <nonce>` (LIVENESS
+    check — the agent reached a reply turn); then the thread's
     `status` is `resolved`. An `LOCKDOWN BROKEN` reply body fails the
-    run loudly.
+    run loudly. The lockdown itself is asserted separately in step 6a
+    (pre-launch) and step 11 (post-run) — the nonce echo is not a
+    security proof.
 11. Verifies the reply also appears in the page WITHOUT a reload (SSE
     round trip), then screenshots the rail.
-12. Teardown: closes the flock pane by ID AND by name (name-based
+12. **Post-run lockdown assertion.** Greps the pane's on-screen text
+    AND the agent's reply body for the runtime's own refusal:
+    `Error: No such tool available:.*[Bb]ash`. If neither surface
+    contains it, the run FAILS — the harness never passes a run where
+    the lockdown couldn't be observed firing live.
+13. Teardown: closes the flock pane by ID AND by name (name-based
     closure covers the `pane_id`-parse-failure path), SIGTERMs the daemon
     with a bounded escalate-to-SIGKILL, then runs a POST-TEARDOWN
     self-check that scans for leaked panes and leaked `revkit serve`
-    subprocesses rooted at OUR STATE_DIR. A leak turns the exit code to 3
-    even when the loop succeeded.
+    subprocesses by both cmdline pattern AND `/proc/<pid>/cwd` (so an
+    MCP-auto-spawned daemon rooted at STATE_DIR is caught even when its
+    argv doesn't name it). A leak turns the exit code to 3 even when the
+    loop succeeded. `daemon.log` (which holds the plaintext launch code)
+    is unlinked by default; set `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1` to
+    keep a redacted copy. `daemon.lock` is only flagged as leaked when
+    a `flock -n` test shows it's actually held.
 
 ## Exit codes
 
-- `0` — the full loop completed, the agent replied `ack <nonce>
-  bash-denied` + resolved, cleanup left nothing behind.
+- `0` — the full loop completed: the pre-launch flag/env check
+  passed, the agent replied `ack <nonce>` + resolved, the post-run
+  `No such tool available:` refusal was recorded in the pane or the
+  reply body, and cleanup left nothing behind.
 - `1` — a step failed. See `.revkit/dogfood/last.log` for the transcript
   (redacted) and `.revkit/dogfood/daemon.log` for the daemon's raw log
   (NOT redacted — contains the launch code, so treat it as sensitive).

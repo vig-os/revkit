@@ -78,10 +78,14 @@ agent receives a `notifications/claude/channel` frame in that session; ask it to
 reply lands on the page without a reload.
 
 Automated end-to-end proof: `just dogfood` runs the same loop headless in a disposable, locked-down flock pane
-(no built-in tools; only `mcp__revkit__{threads,reply,resolve}` allowed; the pane's cwd is an isolated temp state
-dir with its own copy of `site/dist` and `docs/`, so the test agent never sees the worktree's git tree), asserting
-the reply arrives within 240 s and carries a `bash-denied` marker proving the lockdown fired. Requires `flk` and
-a logged-in Claude; not part of `just test` or CI. See
+(no built-in tools; only `mcp__revkit__{threads,reply,resolve}` allowed; `env -i` at pane launch strips
+`SSH_AUTH_SOCK` / `FLOCK_SOCKET_PATH` / `GH_TOKEN` / etc.; the pane's cwd is an isolated temp state dir under
+`$XDG_RUNTIME_DIR` OUTSIDE the git worktree, with its own copy of `site/dist` and `docs/`, so the test agent never
+sees the worktree's git tree). The lockdown is verified TWICE per run as a HARD failure: pre-launch, the harness
+reads the child claude's `/proc/<pid>/cmdline` and `/proc/<pid>/environ` and hard-fails on any missing required flag,
+any forbidden flag, or any leaked env var — before any prompt is sent; post-run, the pane and the agent's reply body
+must contain the runtime's own `Error: No such tool available:.*[Bb]ash` refusal. Requires `flk` and a logged-in
+Claude; not part of `just test` or CI. See
 [`.claude/skills/revkit_dogfood/SKILL.md`](.claude/skills/revkit_dogfood/SKILL.md) for the runbook.
 
 ## License
