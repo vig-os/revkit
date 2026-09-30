@@ -23,6 +23,7 @@ import { spawnGh } from "./gh-runner.ts";
 import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
 import { runServeCommand } from "./serve/cli.ts";
+import { runMcpCommand } from "./mcp/cli.ts";
 import { resolve as resolvePath } from "node:path";
 
 /** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
@@ -38,6 +39,7 @@ Usage:
   revkit check-dist <dist-dir> [--print-hashes]
   revkit escalate "<need>"
   revkit serve [--dir <path>] [--port <n>]
+  revkit mcp [--dir <path>]
 
 Guards (ADR-0005):
   component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure,
@@ -60,7 +62,15 @@ WebSocket) and the launch-code → session-cookie flow. Prints the
 launch URL on stdout; the agent bearer token is written to
 .revkit/serve.json at mode 600. Ctrl-C stops gracefully.
 
-Subcommands (build, mcp, invite, deploy) land in their milestones
+mcp is a stdio MCP server (ADR-0007): declares the 'claude/channel'
+capability, exposes tools 'threads'/'reply'/'resolve' that proxy to
+the daemon, and forwards human comments/replies as
+'notifications/claude/channel' events. Auto-starts 'revkit serve'
+if '.revkit/serve.json' is missing or stale. Run under Claude Code
+with --dangerously-load-development-channels server:revkit until
+the plugin lands on an allowlisted marketplace.
+
+Subcommands (build, invite, deploy) land in their milestones
 (see the roadmap in docs/designs/DESIGN-0001-revkit-architecture.md).
 `;
 
@@ -141,6 +151,16 @@ export async function dispatch(
 
   if (first === "serve") {
     const outcome = await runServeCommand(rest, { cwd: env.cwd, version: VERSION });
+    return {
+      stdout: outcome.stdout,
+      stderr: outcome.stderr,
+      exitCode: outcome.exitCode,
+      ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
+    };
+  }
+
+  if (first === "mcp") {
+    const outcome = await runMcpCommand(rest, { cwd: env.cwd, version: VERSION });
     return {
       stdout: outcome.stdout,
       stderr: outcome.stderr,

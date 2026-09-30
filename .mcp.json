@@ -1,0 +1,9 @@
+{
+  "$comment": "MCP servers registered for revkit's Claude Code sessions. `revkit` is the M2 channel server (ADR-0007): declares the `claude/channel` capability and exposes the `threads` / `reply` / `resolve` tools. The command runs via `bun` from the workspace so no absolute host path leaks into the committed file; the entrypoint is `packages/cli/bin/revkit.js` (workspace-relative). Until the plugin is on an allowlisted marketplace, start Claude Code with `--dangerously-load-development-channels server:revkit` to opt this server in.",
+  "mcpServers": {
+    "revkit": {
+      "command": "bun",
+      "args": ["packages/cli/bin/revkit.js", "mcp"]
+    }
+  }
+}

@@ -48,6 +48,8 @@ import {
   setCookieHeader,
 } from "./auth.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
+import { buildRailBundle } from "../rail/bundle.ts";
+import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
 import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
@@ -445,6 +447,18 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // the handler.
     if (url.pathname === "/api/threads" || url.pathname.startsWith("/api/threads/")) {
       return handleApi(request, url, method, requestId);
+    }
+
+    // Rail bundle — served from memory (built with `Bun.build` on
+    // first request, cached forever). The rail is opt-in by the
+    // page: the daemon's HTMLRewriter appends
+    // `<script type="module" src="/-/rail.js"></script>` to every
+    // static HTML response's `<head>`. Rail assets are public (no
+    // user data), so no cookie or Origin check runs here — same
+    // stance as the static branch below.
+    if (url.pathname === RAIL_JS_PATH || url.pathname === RAIL_CSS_PATH) {
+      if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
+      return handleRailAsset(url, method, requestId);
     }
 
     // Static files. GET / HEAD only. Static output is public — no
@@ -893,7 +907,45 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response(null, { status: 200, headers: { "content-length": String(size) } }), contentType);
     }
     const body = Bun.file(result.absolutePath);
-    return withHygiene(new Response(body, { status: 200 }), contentType);
+    const rawResponse = withHygiene(new Response(body, { status: 200 }), contentType);
+    // Only HTML responses get the rail injected; a JS asset, CSS,
+    // JSON, or image is served untouched. `injectRail` materialises
+    // the body before feeding it to `HTMLRewriter` — a Bun 1.3.13
+    // `Bun.file()` body handed straight to `.transform()` hangs when
+    // `Bun.serve` tries to write it (the socket sits waiting on a
+    // never-flushed stream). Buffering is cheap for HTML: even a
+    // large Astro page is a few hundred KiB.
+    if (contentType.startsWith("text/html")) {
+      return await injectRail(rawResponse);
+    }
+    return rawResponse;
+  }
+
+  /** Serve the rail bundle (`/-/rail.js` and `/-/rail.css`). Built
+   * once with `Bun.build` on first request, then held in memory for
+   * the daemon's lifetime — the bundle is deterministic in the
+   * package's source tree. */
+  async function handleRailAsset(url: URL, method: string, requestId: string): Promise<Response> {
+    let bundle;
+    try {
+      bundle = await buildRailBundle();
+    } catch (error) {
+      logger.error("rail.build.failed", { requestId, errorKind: (error as Error).name });
+      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text/plain; charset=utf-8");
+    }
+    const isJs = url.pathname === RAIL_JS_PATH;
+    const body = isJs ? bundle.js : bundle.css;
+    const contentType = isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";
+    if (method === "HEAD") {
+      return withHygiene(
+        new Response(null, { status: 200, headers: { "content-length": String(body.byteLength) } }),
+        contentType,
+      );
+    }
+    // `body` is a `Uint8Array`; `new Response(body)` widens through
+    // `BodyInit` — a cast keeps TS's stricter DOM types happy without
+    // a runtime copy.
+    return withHygiene(new Response(body as BodyInit, { status: 200 }), contentType);
   }
 
   /** Attach the response-hygiene headers every response carries:
