@@ -72,19 +72,39 @@ function dataSrcValues(html: string): readonly string[] {
   return out;
 }
 
+import { existsSync } from "node:fs";
+import { beforeAll } from "bun:test";
+
+const SITE_DIR = resolve(REPO_ROOT, "site");
+
+/** Ensure `site/dist/` exists — this test compares against a real
+ * `astro build` output. `just e2e` runs `just build` before
+ * Playwright, and a local dev cycle often has a fresh dist sitting
+ * around; on CI the CLI test lane runs BEFORE the e2e lane, so we
+ * build here on demand. Bounded to 3 minutes so a hung build fails
+ * this test rather than starving the whole CLI test lane. */
+async function ensureSiteBuilt(): Promise<void> {
+  if (existsSync(DIST_ADR_HTML)) return;
+  const proc = Bun.spawn(["bun", "run", "build"], {
+    cwd: SITE_DIR,
+    stdout: "inherit",
+    stderr: "inherit",
+  });
+  const code = await proc.exited;
+  if (code !== 0) {
+    throw new Error(`ensureSiteBuilt: 'bun run build' in ${SITE_DIR} exited with ${code}.`);
+  }
+  if (!existsSync(DIST_ADR_HTML)) {
+    throw new Error(`ensureSiteBuilt: build finished but ${DIST_ADR_HTML} still missing.`);
+  }
+}
+
 describe("fast-path ↔ full-build equivalence (ADR-0001 amendment)", () => {
+  beforeAll(async () => {
+    await ensureSiteBuilt();
+  }, 180_000);
   test("data-src stamps match on ADR-0001 (the anchoring surface is preserved)", async () => {
-    let builtHtml: string;
-    try {
-      builtHtml = readFileSync(DIST_ADR_HTML, "utf8");
-    } catch {
-      // The full build must be in place — `just test` or `just
-      // e2e` builds `site/dist/` first. Skip gracefully with a
-      // clear message so CI / local runs know why.
-      throw new Error(
-        `site/dist/adr/0001-.../index.html missing. Run \`nix develop -c bash -c "cd site && bun run build"\` first — the equivalence test compares against the on-disk full build.`,
-      );
-    }
+    const builtHtml = readFileSync(DIST_ADR_HTML, "utf8");
     const fullArticle = extractArticleBody(builtHtml);
     expect(fullArticle).toBeDefined();
     if (fullArticle === undefined) return;
