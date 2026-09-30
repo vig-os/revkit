@@ -47,10 +47,13 @@ frame:
   aligned with a walker that folds the replacement INSERT into the DELETE. The similarity of the OLD quote to the
   aligned new text must clear a moderate gate; a span whose EQUAL preservation is under half is demoted to the
   deleted path (a templated-row shift, not an in-place edit).
-- **Deleted spans** try move detection: **exact** `prefix + exact + suffix` in the new source with substantial
-  context on each side (non-whitespace count OR a line boundary). Exactly one match anchors as `quote-exact` (moved);
-  zero or several **orphan**. There is no fuzzy or bare-quote-copy fallback — a lone match of the bare quote in a
-  different context is refused. Orphaning beats a wrong place.
+- **Deleted spans** try move detection: **exact** `prefix + exact + suffix` in the new source AND in the old source
+  with substantial context on each side (non-whitespace count OR a line boundary). Exactly one occurrence in BOTH
+  the old and the new source anchors as `quote-exact` (moved); zero, several, or an old snapshot that already had
+  the pattern twice (copy-pasted blocks) **orphan**. There is no fuzzy or bare-quote-copy fallback — a lone match of
+  the bare quote in a different context is refused, and a paragraph moved WITHOUT its surrounding context orphans
+  (the safe choice: we cannot prove which copy the anchor was on if two identical blocks lived side by side).
+  Orphaning beats a wrong place.
 
 The event kinds `thread.reanchored` and `thread.orphaned` carry these outcomes; the wire methods are `quote-exact`
 (unchanged / moved) and `fuzzy` (modified). Fuzzy carries the similarity score.

@@ -119,14 +119,6 @@ export const DEFAULT_MIN_QUOTE_SCORE = 0.4;
  */
 export const DEFAULT_MIN_MODIFIED_EQUAL_FRACTION = 0.5;
 
-/**
- * How much the best fuzzy candidate must beat every other candidate
- * in the LOCAL HUNK WINDOW by. Because the window is bounded by the
- * diff structure, a viable runner-up is by definition a near-miss;
- * the margin ensures we do not accept when the diff itself is
- * ambiguous inside the window.
- */
-export const DEFAULT_MIN_MARGIN = 0.1;
 
 /**
  * Characters of slack around a modified hunk when defining the
@@ -158,6 +150,32 @@ export const DEFAULT_DIFF_TIMEOUT_SECONDS = 2.0;
  * micro-benchmarks and forensic diagnostics can tweak the timeout. */
 export interface ReanchorOptions {
   readonly diffTimeoutSeconds?: number;
+}
+
+/**
+ * A prepared context for re-anchoring N threads against one (old,
+ * new) file pair. The char-level diff and the line-start indices
+ * are the expensive shared work; `prepareReanchor` computes them
+ * ONCE, and `reanchorWith(ctx, anchor)` re-runs only the per-anchor
+ * classification and alignment.
+ *
+ * Item 5b (the daemon) prepares once per changed file on rebuild,
+ * then iterates every open thread anchored to that file. Without
+ * the split, a fully-rewritten 1 MB file with N threads costs
+ * `N × Diff_Timeout` (potentially 2 s per anchor); with it, the
+ * amortised per-anchor cost drops to a few ms.
+ *
+ * The context is a plain data object — safe to hand to another
+ * async task while it is used, and cheap to discard.
+ */
+export interface ReanchorContext {
+  readonly oldLF: string;
+  readonly newLF: string;
+  readonly oldRevision: string;
+  readonly newRevision: string;
+  readonly diffs: readonly Diff[];
+  readonly oldLineIndex: readonly number[];
+  readonly newLineIndex: readonly number[];
 }
 
 // ---------- Line-offset index (perf) ----------
@@ -324,13 +342,13 @@ export function alignMatchedText(
   const window = newSource.slice(startOffset, windowEnd);
   const dmp = new DiffMatchPatch();
   const diffs = dmp.diff_main(alignmentTarget, window) as Diff[];
-  // `diff_cleanupSemantic` consolidates the incidental single-char
-  // matches DMP finds by accident (e.g. an "o" shared between "fox"
-  // and "over") which would otherwise send the walker past the real
-  // block boundary and spill into the next paragraph or table row.
-  dmp.diff_cleanupSemantic(diffs);
   // Walk to position oldQuote.length (the boundary between the
-  // block and the trailing context we appended).
+  // block and the trailing context we appended). The trailing
+  // context bounds the diff so the walker does not overrun the
+  // block into a following paragraph, which is what would
+  // otherwise happen when DMP finds an incidental single-char
+  // match past the block. See test `alignMatchedText — does not
+  // spill into a following table row`.
   const endInWindow = walkAlignmentEnd(diffs, oldQuote.length);
   let start = startOffset;
   let end = Math.min(newSource.length, startOffset + endInWindow);
@@ -398,18 +416,28 @@ function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
 // ---------- Move detection (deleted spans) ----------
 
 /**
- * Try to detect a MOVE for a fully-deleted anchor: find `prefix +
- * exact + suffix` verbatim in the new source. Returns the new
- * offset (start of `exact`) or `null` on zero, ambiguous, or
- * insufficient-context cases. Uses a linear `indexOf` loop that
- * stops at the second hit — no O(n·m) scan.
+ * Try to detect a MOVE for a fully-deleted or heavily-modified
+ * anchor: find `prefix + exact + suffix` verbatim in the new source.
+ * Returns the new offset (start of `exact`) or `null` on zero,
+ * ambiguous, or insufficient-context cases.
+ *
+ * Requires the pattern to be unique in BOTH the new AND the old
+ * source. Round-3 review blocker: without the OLD-side uniqueness
+ * check, a copy-pasted block whose original was deleted anchors
+ * onto the surviving copy — the pattern is unique in `newSource`
+ * because there is only one copy left, but it was NOT unique in
+ * `oldSource` and we cannot tell which copy the anchor was on.
  *
  * `sufficientContext` guards against a bare-quote copy: a quote
  * with too little surrounding evidence (short prefix AND short
  * suffix, neither reaching a line boundary) cannot be safely
- * disambiguated and returns `null`.
+ * disambiguated and returns `null` regardless of hit counts.
+ *
+ * Uses linear `indexOf` loops that stop at the second hit — no
+ * O(n·m) scan on either side.
  */
 export function tryMove(
+  oldSource: string,
   newSource: string,
   quote: TextQuote,
   minContext: number = DEFAULT_MIN_MOVE_CONTEXT,
@@ -419,11 +447,26 @@ export function tryMove(
   }
   const pattern = quote.prefix + quote.exact + quote.suffix;
   if (pattern.length === 0) return { start: -1, reason: "empty context pattern" };
+  // OLD-side uniqueness. If the pattern appeared twice in the old
+  // snapshot, the anchor is on ONE of the copies — deletion of one
+  // and preservation of the other in `newSource` looks like a
+  // unique move, but the "correct" destination is undefined.
+  const oldFirst = oldSource.indexOf(pattern);
+  if (oldFirst < 0) {
+    return { start: -1, reason: "prefix+exact+suffix not found in the old snapshot" };
+  }
+  const oldSecond = oldSource.indexOf(pattern, oldFirst + 1);
+  if (oldSecond >= 0) {
+    return {
+      start: -1,
+      reason: "ambiguous move (prefix+exact+suffix was not unique in the old snapshot)",
+    };
+  }
   const first = newSource.indexOf(pattern);
   if (first < 0) return null;
   const second = newSource.indexOf(pattern, first + 1);
   if (second >= 0) {
-    return { start: -1, reason: "ambiguous move (multiple exact-context matches)" };
+    return { start: -1, reason: "ambiguous move (multiple exact-context matches in new)" };
   }
   return { start: first + quote.prefix.length };
 }
@@ -464,16 +507,28 @@ function similarity(a: string, b: string): number {
   return denom === 0 ? 1 : 1 - distance / denom;
 }
 
-// ---------- Boundary-class check (unchanged path) ----------
+// ---------- Boundary + surroundings check (unchanged path) ----------
+
+/** How many bytes of immediate context must match verbatim on each
+ * side of a span for the unchanged path to accept it. Catches the
+ * K3 case (round-3 review): the anchor's exact quote is still there
+ * (the `### Step` header) but the paragraph below was rewritten in
+ * place; without this check the pipeline anchors to the kept header
+ * while the comment's answer sits in the rewritten body. */
+const UNCHANGED_CONTEXT_CHECK_BYTES = 8;
 
 /**
- * Whether the immediate boundaries of the OLD span match the
- * immediate boundaries of the NEW span in "character class" —
- * specifically whether each side is at a line boundary (or file
- * edge) or in the middle of a line. Catches the "substring
- * accident" where the diff aligns the exact quote as EQUAL, but
- * the new location's neighbours reveal the block was actually
- * absorbed into a rewritten sentence.
+ * Whether the immediate surroundings of the OLD span match the
+ * immediate surroundings of the NEW span:
+ *   - character class of the very next byte on each side (line
+ *     boundary vs mid-line);
+ *   - AND the next `UNCHANGED_CONTEXT_CHECK_BYTES` bytes on each
+ *     side match byte-for-byte.
+ *
+ * The class check alone catches the substring accident where the
+ * quote appears embedded in a rewritten sentence. The byte-match
+ * catches K3: the header is kept but the body immediately below
+ * was rewritten in place.
  */
 function boundariesMatch(
   oldSource: string,
@@ -487,14 +542,21 @@ function boundariesMatch(
   const newPre = newStart > 0 ? newSource.charCodeAt(newStart - 1) : -1;
   const oldPost = oldEnd < oldSource.length ? oldSource.charCodeAt(oldEnd) : -1;
   const newPost = newEnd < newSource.length ? newSource.charCodeAt(newEnd) : -1;
-  return sameBoundaryClass(oldPre, newPre) && sameBoundaryClass(oldPost, newPost);
+  if (!sameBoundaryClass(oldPre, newPre)) return false;
+  if (!sameBoundaryClass(oldPost, newPost)) return false;
+  const n = UNCHANGED_CONTEXT_CHECK_BYTES;
+  const oldPreBytes = oldSource.slice(Math.max(0, oldStart - n), oldStart);
+  const newPreBytes = newSource.slice(Math.max(0, newStart - n), newStart);
+  if (oldPreBytes !== newPreBytes) return false;
+  const oldPostBytes = oldSource.slice(oldEnd, Math.min(oldSource.length, oldEnd + n));
+  const newPostBytes = newSource.slice(newEnd, Math.min(newSource.length, newEnd + n));
+  return oldPostBytes === newPostBytes;
 }
 
 function sameBoundaryClass(a: number, b: number): boolean {
   const aBoundary = a === -1 || a === 10 /* \n */;
   const bBoundary = b === -1 || b === 10;
   if (aBoundary !== bBoundary) return false;
-  // Both are line-boundary-class OR both are mid-line: accept.
   return true;
 }
 
@@ -545,15 +607,43 @@ function locateOldSpan(oldLF: string, anchor: Anchor, oldLineIndex: readonly num
  * Re-anchor `anchor` against `newSource`, given `oldSource`. Pure
  * and runtime-neutral; no side effects beyond WebCrypto.
  */
-export async function reanchor(
-  anchor: Anchor,
+/**
+ * Precompute the char-level diff and line-start indices for one
+ * (old, new) source pair. The returned context is passed to
+ * `reanchorWith(ctx, anchor)` for every thread anchored to that
+ * file, so the expensive `diff_main` runs once per rebuild — not
+ * per anchor.
+ */
+export async function prepareReanchor(
   oldSource: string,
   newSource: string,
   options: ReanchorOptions = {},
-): Promise<ReanchorResult> {
+): Promise<ReanchorContext> {
   const oldLF = toLF(oldSource);
   const newLF = toLF(newSource);
+  const oldRevision = await revisionOf(oldLF);
   const newRevision = await revisionOf(newLF);
+  const dmp = new DiffMatchPatch();
+  dmp.Diff_Timeout = options.diffTimeoutSeconds ?? DEFAULT_DIFF_TIMEOUT_SECONDS;
+  const diffs = dmp.diff_main(oldLF, newLF) as Diff[];
+  dmp.diff_cleanupSemantic(diffs);
+  return {
+    oldLF,
+    newLF,
+    oldRevision,
+    newRevision,
+    diffs,
+    oldLineIndex: buildLineStartIndex(oldLF),
+    newLineIndex: buildLineStartIndex(newLF),
+  };
+}
+
+/**
+ * Re-anchor `anchor` against a prepared context. Every step here is
+ * O(anchor.quote.length) or O(diff-length), no O(oldLF) work.
+ */
+export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promise<ReanchorResult> {
+  const { oldLF, newLF, oldRevision, newRevision, diffs, oldLineIndex, newLineIndex } = ctx;
 
   // (0) Identity.
   if (anchor.revision === newRevision) {
@@ -561,7 +651,6 @@ export async function reanchor(
   }
 
   // (1) Snapshot must correspond to the anchor.
-  const oldRevision = await revisionOf(oldLF);
   if (oldRevision !== anchor.revision) {
     return {
       kind: "orphaned",
@@ -570,8 +659,6 @@ export async function reanchor(
     };
   }
 
-  const oldLineIndex = buildLineStartIndex(oldLF);
-  const newLineIndex = buildLineStartIndex(newLF);
   const oldSpan = locateOldSpan(oldLF, anchor, oldLineIndex);
   if (oldSpan === null) {
     return {
@@ -581,12 +668,7 @@ export async function reanchor(
     };
   }
 
-  // (2) One character-level diff serves the whole classification.
   const dmp = new DiffMatchPatch();
-  dmp.Diff_Timeout = options.diffTimeoutSeconds ?? DEFAULT_DIFF_TIMEOUT_SECONDS;
-  const diffs = dmp.diff_main(oldLF, newLF) as Diff[];
-  dmp.diff_cleanupSemantic(diffs);
-
   const cls = classifySpan(diffs, oldSpan.start, oldSpan.end);
 
   // (4a) Unchanged — map through diff_xIndex and verify, INCLUDING
@@ -600,8 +682,8 @@ export async function reanchor(
   // the new location's edges are mid-line inside a rewritten
   // sentence.
   if (cls.kind === "unchanged") {
-    const newStart = dmp.diff_xIndex(diffs, oldSpan.start);
-    const newEnd = dmp.diff_xIndex(diffs, oldSpan.end - 1) + 1;
+    const newStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
+    const newEnd = dmp.diff_xIndex(diffs as Diff[], oldSpan.end - 1) + 1;
     const mapped = newLF.slice(newStart, newEnd);
     if (
       mapped === anchor.quote.exact &&
@@ -620,7 +702,7 @@ export async function reanchor(
     // Boundary mismatch or exact slice mismatch: fall through to
     // move detection. If the block truly moved to a new position
     // with intact context, tryMove will find it; otherwise orphan.
-    const moveResult = tryMove(newLF, anchor.quote);
+    const moveResult = tryMove(oldLF, newLF, anchor.quote);
     if (moveResult !== null && moveResult.start >= 0) {
       const rebuilt = await buildAnchor(
         anchor,
@@ -651,7 +733,7 @@ export async function reanchor(
     spanLen > 0 &&
     cls.equalChars / spanLen < DEFAULT_MIN_MODIFIED_EQUAL_FRACTION
   ) {
-    const moveResult = tryMove(newLF, anchor.quote);
+    const moveResult = tryMove(oldLF, newLF, anchor.quote);
     if (moveResult !== null && moveResult.start >= 0) {
       const rebuilt = await buildAnchor(
         anchor,
@@ -675,7 +757,7 @@ export async function reanchor(
 
   // (4c) Deleted — try move detection. NO fuzzy fallback.
   if (cls.kind === "deleted") {
-    const moveResult = tryMove(newLF, anchor.quote);
+    const moveResult = tryMove(oldLF, newLF, anchor.quote);
     if (moveResult !== null && moveResult.start >= 0) {
       const rebuilt = await buildAnchor(
         anchor,
@@ -697,20 +779,17 @@ export async function reanchor(
     };
   }
 
-  // (4b) Modified — the diff already localizes the block. We use
-  // `diff_xIndex(oldSpan.start)` as the single seed inside the
-  // enclosing hunk window, then `alignMatchedText` walks the old
-  // quote's END onto the new source. The similarity gate decides
-  // whether the block is still "recognisably the same block". A
-  // second candidate from a bitap probe in the same window would
-  // only re-locate on the SAME modified hunk (the window is bounded
-  // by the changed segments); competing "candidates" arise from
-  // probes hitting nearby lines, which are noise, not ambiguity.
-  // If in future we need an ambiguity signal here, it comes from
-  // the char-level diff's own alternatives — not from re-searching
-  // the window.
+  // (4b) Modified — the diff already localizes the block. We seed a
+  // single candidate at `diff_xIndex(oldSpan.start)` inside the
+  // enclosing hunk window and let `alignMatchedText` walk the old
+  // quote's END onto the new source. The demotion above ensures the
+  // span had ≥ 50 % of its chars in EQUAL segments, so the aligned
+  // text is by construction recognisably related to the old quote —
+  // a small similarity check catches the pathological "50 % EQUAL
+  // plus a huge INSERT" edge case that would otherwise leave the
+  // aligned text mostly not the quote.
   const hunkWindow = findHunkWindow(diffs, oldSpan.start, oldSpan.end, newLF.length);
-  const mappedStart = dmp.diff_xIndex(diffs, oldSpan.start);
+  const mappedStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
   const clampedStart = Math.max(hunkWindow.start, Math.min(hunkWindow.end, mappedStart));
   const aligned = alignMatchedText(anchor.quote.exact, newLF, clampedStart, {
     trailingContext: anchor.quote.suffix,
@@ -724,23 +803,6 @@ export async function reanchor(
       score,
     };
   }
-  // Second-opinion: does the NEW aligned text also appear elsewhere
-  // in the hunk window? If yes, we have local ambiguity and must
-  // orphan. Uses `indexOf` (no fuzzy) so this remains cheap.
-  if (aligned.matchedText.length > 0) {
-    const first = newLF.indexOf(aligned.matchedText, hunkWindow.start);
-    if (first >= 0 && first < hunkWindow.end) {
-      const second = newLF.indexOf(aligned.matchedText, first + 1);
-      if (second >= 0 && second < hunkWindow.end && Math.abs(second - aligned.startOffset) > DEFAULT_MIN_MARGIN * newLF.length) {
-        return {
-          kind: "orphaned",
-          revision: newRevision,
-          reason: `modified: aligned text appears twice inside the local hunk window (ambiguous).`,
-          score,
-        };
-      }
-    }
-  }
   const rebuilt = await buildAnchor(
     anchor,
     newLF,
@@ -750,6 +812,23 @@ export async function reanchor(
     newRevision,
   );
   return { kind: "fuzzy", anchor: rebuilt, method: "fuzzy", score };
+}
+
+/**
+ * Re-anchor a single anchor against a fresh `(oldSource, newSource)`
+ * pair. Convenience wrapper over `prepareReanchor` +
+ * `reanchorWith`; batch callers that process many anchors against
+ * the same file should call the two directly to avoid re-computing
+ * the diff.
+ */
+export async function reanchor(
+  anchor: Anchor,
+  oldSource: string,
+  newSource: string,
+  options: ReanchorOptions = {},
+): Promise<ReanchorResult> {
+  const ctx = await prepareReanchor(oldSource, newSource, options);
+  return reanchorWith(ctx, anchor);
 }
 
 /**

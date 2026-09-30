@@ -36,8 +36,10 @@ import {
   findHunkWindow,
   lineToOffset,
   offsetToLine,
+  prepareReanchor,
   reanchor,
   reanchorEvent,
+  reanchorWith,
   revisionOf,
   tryMove,
   type Anchor,
@@ -217,52 +219,71 @@ describe("alignMatchedText — Blocker 2 fix", () => {
 });
 
 describe("tryMove — deleted spans", () => {
-  test("exactly one match with sufficient context: returns the location", () => {
+  test("exactly one match in both old and new with sufficient context: returns the location", () => {
+    const oldSrc = "before context here\n\nthe target phrase\n\nafter context here";
     const newSrc = "before context here\n\nthe target phrase\n\nafter context here";
     const quote = {
       exact: "the target phrase",
       prefix: "before context here\n\n",
       suffix: "\n\nafter context here",
     };
-    const r = tryMove(newSrc, quote);
+    const r = tryMove(oldSrc, newSrc, quote);
     expect(r).not.toBeNull();
     if (r === null) return;
     expect(r.start).toBe(newSrc.indexOf("the target phrase"));
   });
 
   test("insufficient context: refuses even a lone match", () => {
-    // Short bare quote with no context — cannot safely detect a move.
     const quote = { exact: "hi", prefix: "", suffix: "" };
-    const r = tryMove("hi", quote);
+    const r = tryMove("hi", "hi", quote);
     expect(r).not.toBeNull();
     if (r === null) return;
     expect(r.start).toBe(-1);
     expect(r.reason).toContain("insufficient context");
   });
 
-  test("multiple exact-context matches: refuses (ambiguous)", () => {
-    // Same 2×context+quote appears twice.
+  test("multiple exact-context matches in new: refuses (ambiguous new)", () => {
     const block = "prefix line abcdef\n\ntarget phrase content\n\nsuffix line ghijkl";
+    const oldSrc = block;
     const newSrc = block + "\n\n\n" + block;
     const quote = {
       exact: "target phrase content",
       prefix: "prefix line abcdef\n\n",
       suffix: "\n\nsuffix line ghijkl",
     };
-    const r = tryMove(newSrc, quote);
+    const r = tryMove(oldSrc, newSrc, quote);
     expect(r).not.toBeNull();
     if (r === null) return;
     expect(r.start).toBe(-1);
     expect(r.reason).toContain("ambiguous");
   });
 
-  test("no match: returns null", () => {
+  test("multiple exact-context matches in OLD (copy-pasted block): refuses (round-3 blocker fix)", () => {
+    const block = "prefix line abcdef\n\ntarget phrase content\n\nsuffix line ghijkl";
+    // Two copies in old, one copy left in new.
+    const oldSrc = block + "\n\n\n" + block;
+    const newSrc = block;
     const quote = {
-      exact: "nowhere in newSource",
-      prefix: "leading context here for sure",
-      suffix: "trailing context here for sure",
+      exact: "target phrase content",
+      prefix: "prefix line abcdef\n\n",
+      suffix: "\n\nsuffix line ghijkl",
     };
-    expect(tryMove("completely different file content", quote)).toBeNull();
+    const r = tryMove(oldSrc, newSrc, quote);
+    expect(r).not.toBeNull();
+    if (r === null) return;
+    expect(r.start).toBe(-1);
+    expect(r.reason).toContain("not unique in the old snapshot");
+  });
+
+  test("pattern unique in old but absent in new: returns null (block deleted, no move)", () => {
+    const quote = {
+      exact: "the unique block",
+      prefix: "leading context prose\n",
+      suffix: "\ntrailing context prose",
+    };
+    const oldSrc = "leading context prose\nthe unique block\ntrailing context prose\n";
+    const newSrc = "completely different content everywhere else in this file\n";
+    expect(tryMove(oldSrc, newSrc, quote)).toBeNull();
   });
 });
 
@@ -636,6 +657,11 @@ describe("reanchor — coherent-anchor invariant across all non-orphan results",
 // ---------- Performance guards ----------
 
 describe("reanchor — performance", () => {
+  // Bounds tightened after the round-3 rewrite: measured medians on
+  // both fixtures are single-digit milliseconds; 200 ms leaves ~20x
+  // headroom for a busy CI runner.
+  const PERF_LIMIT_MS = 200;
+
   test("< 200 ms on 20k templated `- item N` lines with anchor deleted", async () => {
     const N = 20_000;
     const lines: string[] = [];
@@ -646,7 +672,7 @@ describe("reanchor — performance", () => {
     const t0 = performance.now();
     await reanchor(anchor, oldSrc, newSrc);
     const dt = performance.now() - t0;
-    expect(dt).toBeLessThan(1500);
+    expect(dt).toBeLessThan(PERF_LIMIT_MS);
   }, 30_000);
 
   test("< 200 ms on the pathological 200 k `a` case with quote `aaaaaaaa`", async () => {
@@ -666,9 +692,215 @@ describe("reanchor — performance", () => {
     const t0 = performance.now();
     const result = await reanchor(anchor, oldSrc, newSrc);
     const dt = performance.now() - t0;
-    expect(dt).toBeLessThan(1500);
+    expect(dt).toBeLessThan(PERF_LIMIT_MS);
     void result;
   }, 30_000);
+});
+
+// ---------- Round-3 review: K1 / K3 / J7b (copy-pasted blocks) ----------
+
+describe("reanchor — MUST-orphan: copy-pasted blocks (K1 / K3 / J7b)", () => {
+  const blk =
+    "### Step\n\nPlease read this carefully first.\nRun the installer and restart.\nThen continue with the setup guide.\n\n";
+
+  test("K1: two identical sections; Linux copy deleted → orphaned (does not move to macOS copy)", async () => {
+    const oldSrc = "# Linux\n\n" + blk + "# macOS\n\n" + blk;
+    // Anchor on the Linux copy (first occurrence).
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // Delete the Linux block, keep macOS block.
+    const newSrc = "# Linux\n\n\n# macOS\n\n" + blk;
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("K3: Linux copy rewritten in place while macOS copy is untouched → orphaned", async () => {
+    const oldSrc = "# Linux\n\n" + blk + "# macOS\n\n" + blk;
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // Rewrite the first (Linux) block; the second (macOS) is intact.
+    const newSrc =
+      "# Linux\n\n### Step\n\nUse apt; no reboot.\n\n" + "# macOS\n\n" + blk;
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    // The rewrite is probably the answer to the comment. Orphaning
+    // beats moving onto the macOS copy.
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("J7b: a paragraph plus its copy, quoted phrase heavily rewritten in the first → orphaned", async () => {
+    const oldSrc = [
+      "# Alpha section",
+      "",
+      "The distinctive paragraph we anchor on.",
+      "",
+      "Later in the doc:",
+      "",
+      "# Beta section",
+      "",
+      "The distinctive paragraph we anchor on.",
+      "",
+      "trailer content here",
+    ].join("\n");
+    // Anchor on the first copy.
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // Heavily rewrite the first copy; leave the second copy intact.
+    const newSrc = oldSrc.replace(
+      "The distinctive paragraph we anchor on.\n\nLater in the doc:",
+      "A completely rewritten sentence about something else.\n\nLater in the doc:",
+    );
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+});
+
+// ---------- Prepared-context (diff-once) ----------
+
+describe("prepareReanchor + reanchorWith — one diff for N anchors", () => {
+  test("N anchors on one big (old, new) pair share the diff", async () => {
+    // ~200 KB base to make the diff cost measurable.
+    const base = "line ".repeat(40_000); // 200 000 chars
+    const oldSrc = base + "\nline A\nline B\nline C\n";
+    const newSrc = base + "\nline A\nline B changed\nline C\n";
+    const N = 8;
+    const anchor: Anchor = {
+      path: "x.mdx",
+      startLine: 1,
+      endLine: 1,
+      quote: {
+        exact: "line B",
+        prefix: base.slice(-40) + "\nline A\n",
+        suffix: "\nline C\n",
+      },
+      revision: await revisionOf(oldSrc),
+    };
+
+    // Prepared: one diff, N alignments.
+    const t0 = performance.now();
+    const ctx = await prepareReanchor(oldSrc, newSrc);
+    for (let i = 0; i < N; i += 1) await reanchorWith(ctx, anchor);
+    const dtPrepared = performance.now() - t0;
+
+    // Naive: N diffs, N alignments.
+    const t1 = performance.now();
+    for (let i = 0; i < N; i += 1) await reanchor(anchor, oldSrc, newSrc);
+    const dtNaive = performance.now() - t1;
+
+    // The naive path should be substantially more expensive because
+    // it repeats the diff. Require at least a 2x savings — small
+    // enough not to flake on a busy runner, large enough that the
+    // amortisation is measurable.
+    expect(dtPrepared * 2).toBeLessThan(dtNaive);
+  }, 30_000);
+});
+
+// ---------- Mutation-guarding fixtures with DEFAULTS ----------
+//
+// The reviewer's round-3 concern: several surviving mutations have
+// no default-settings test. Each test below is designed to fail if
+// the named default is dropped or the named stage is removed. All
+// call `reanchor(anchor, old, new)` with no options.
+
+describe("reanchor — mutation guards (default settings)", () => {
+  test("snapshot revision check: wrong old source orphans with a 'revision mismatch' reason", async () => {
+    const oldSrc = "A\n\nB\n\nC\n";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    const wrongSnapshot = "completely different content\n";
+    const newSrc = "A\n\nB modified\n\nC\n";
+    const result = await reanchor(anchor, wrongSnapshot, newSrc);
+    expect(result.kind).toBe("orphaned");
+    if (result.kind !== "orphaned") return;
+    // The snapshot check produces the specific `revision mismatch`
+    // reason with hash prefixes. If the check is removed, the
+    // pipeline runs the diff on the wrong text and orphans with a
+    // different reason (e.g. `old anchor span not found`), so the
+    // exact-substring assertion trips.
+    expect(result.reason).toContain("revision mismatch");
+  });
+
+  test("exact-text check on unchanged spans: INSERT inside the mapped range falls through to orphan", async () => {
+    // Anchor on "abc" (no context — a bare quote). New source
+    // inserts an "X" between the "a" and "bc"; diff sees this as
+    // EQUAL "a", INSERT "X", EQUAL "bcdef", so classifySpan says
+    // UNCHANGED. Without the `mapped === anchor.quote.exact` check
+    // the pipeline would return a `moved` result with a wrong new
+    // range; with the check, we fall through to tryMove which
+    // orphans because the anchor's context is empty.
+    const oldSrc = "abcdef\n";
+    const newSrc = "aXbcdef\n";
+    const anchor: Anchor = {
+      path: "x.mdx",
+      startLine: 1,
+      endLine: 1,
+      quote: { exact: "abc", prefix: "", suffix: "" },
+      revision: await revisionOf(oldSrc),
+    };
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("MIN_MOVE_CONTEXT gate: a short-context anchor refuses a move even to a unique lone copy", async () => {
+    // The `abcfoo12` pattern is unique in BOTH old and new (a shift
+    // to a different line), so old-uniqueness and new-uniqueness
+    // both PASS. The only thing keeping this from anchoring is the
+    // context-length gate — 2 mid-line non-whitespace chars, well
+    // under DEFAULT_MIN_MOVE_CONTEXT = 16. With the gate at 0 the
+    // pipeline would move onto the shifted line.
+    const oldSrc = "abcfoo12 first place\nother content lines\n";
+    const newSrc = "other content lines\ninterstitial paragraph\nabcfoo12 shifted place\n";
+    const anchor: Anchor = {
+      path: "x.mdx",
+      startLine: 1,
+      endLine: 1,
+      quote: { exact: "cfoo", prefix: "ab", suffix: "12" },
+      revision: await revisionOf(oldSrc),
+    };
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("modified-path quote gate: a 50%-preserved-plus-big-INSERT edit orphans", async () => {
+    // Construct a span where EQUAL preservation is ≥ 0.5 (so the
+    // demotion does NOT fire), but the aligned text has a huge
+    // trailing INSERT that pushes similarity below the gate.
+    //
+    // Old span (line 3) is 10 chars "abcdefghij"; the new source
+    // keeps the first 5 chars ("abcde") and replaces the last 5
+    // ("fghij") with a much longer inserted string.
+    const oldSrc = "prelude paragraph\n\nabcdefghij\n\ntrailer\n";
+    const newSrc =
+      "prelude paragraph\n\nabcdeQQQQQQQQQQQQQQQQQQQQ\n\ntrailer\n";
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    // If the modified-path quote gate is removed, the aligned text
+    // "abcdeQQQQQQQQQQQQQQQQQQQQ" would be accepted (its similarity
+    // to "abcdefghij" is well under 0.4).
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("old-uniqueness in tryMove: identical-surroundings copies + first deletion orphans (round-3 blocker)", async () => {
+    // Both copies of the block have the SAME 40-char surroundings, so
+    // the full `prefix + exact + suffix` pattern is IDENTICAL for
+    // both copies. Without the OLD-uniqueness check, the pipeline
+    // would move onto the surviving copy after the first is
+    // deleted.
+    const commonSurroundings =
+      "filler line one to fill the anchor prefix and suffix contexts fully so both copies present the same 40-char pattern to tryMove\n" +
+      "filler line two also filling the context so both copies present the same 40-char pattern to tryMove\n";
+    const commonBlock =
+      commonSurroundings +
+      "the distinct block content that we anchor onto here for the K1 style test\n" +
+      commonSurroundings;
+    // Anchor the first copy's distinct line.
+    const oldSrc = commonBlock + "\ninterstitial content\n\n" + commonBlock + "\nfile tail content\n";
+    // The distinct line is at line 3 of `oldSrc`.
+    const anchor = await anchorForSource("x.mdx", oldSrc, 3, 3);
+    // Delete the FIRST copy of commonBlock.
+    const newSrc = "\ninterstitial content\n\n" + commonBlock + "\nfile tail content\n";
+    const result = await reanchor(anchor, oldSrc, newSrc);
+    expect(result.kind).toBe("orphaned");
+    if (result.kind !== "orphaned") return;
+    // Sanity: the orphan reason names the old-side ambiguity — proof
+    // that the round-3 check is what caught it.
+    expect(result.reason).toContain("not unique in the old snapshot");
+  });
 });
 
 // ---------- reanchorEvent shape ----------
