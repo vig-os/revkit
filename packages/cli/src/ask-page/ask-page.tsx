@@ -375,10 +375,25 @@ function renderScale(spec: ScaleSpec, onAnswer: (a: Answer) => void): JSX.Elemen
           step={1}
           value={index()}
           data-testid="revkit-ask-scale-input"
+          // The DOM value is an INTEGER step index; the reconstructed
+          // scale value goes into `aria-valuetext` so screen readers
+          // announce "3" on a 1..4 scale, not "step 2 of 3". PR #52
+          // round-3 review.
+          aria-valuetext={String(currentValue())}
           onInput={(e: InputEvent) => {
             setIndex(Number.parseInt((e.currentTarget as HTMLInputElement).value, 10));
             setTouched(true);
           }}
+          // PR #52 round-3 review: `input` fires only when the value
+          // CHANGES. If the slider is already at index 0 and the
+          // user presses Home / ArrowLeft, or clicks at the min
+          // end, the value doesn't move and no `input` fires — so
+          // the previous "touched on input only" left submit
+          // disabled forever. Marking touched on keydown /
+          // pointerdown covers both cases; touching does not itself
+          // change the value.
+          onKeyDown={() => setTouched(true)}
+          onPointerDown={() => setTouched(true)}
         />
         <output aria-live="polite" class="revkit-ask__scale-value" data-testid="revkit-ask-scale-value">
           <Show when={touched()} fallback={<span class="revkit-ask__scale-hint">(pick a value)</span>}>

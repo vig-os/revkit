@@ -145,3 +145,14 @@ Further refinements from PR #52 round-2:
   over historical data would strand a user on a fresh boot. New
   appends still run the strict rule; every other rejection kind
   remains fatal on replay.
+  **Cutoff (PR #52 round-3 review).** The reviewer asked whether
+  this leniency should be bounded to events whose schema version
+  predates the tightened check. **Individual `ReviewEvent`s do
+  not carry a `schemaVersion` field on the wire** — only
+  persisted *data files* (asks, threads archive) do, per
+  ADR-0003 / ADR-0021. There is therefore no per-event version
+  to gate on, and inventing a sentinel would be worse than a
+  bounded, explicit lenient replay. We leave the leniency as is;
+  when `CURRENT_SCHEMA_VERSION` bumps and the event log carries
+  a `schemaVersion` header, this replay branch is the natural
+  place to gate on it.

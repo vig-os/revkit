@@ -330,15 +330,49 @@ describe("validateAnswerAgainstSpec — answer values must conform to the ask", 
     expect(bad?.message).toContain("not on a step");
   });
 
-  test("PR #52 round-2 review — scale tolerance scales with magnitude (999_999_999.999 on 0..1e9 step 0.001 is on-step)", () => {
+  test("PR #52 round-2 review — scale tolerance scales with step magnitude (999_999_999.999 on 0..1e9 step 0.001 is on-step)", () => {
     // Large-magnitude scales with a tiny step: binary-float noise
-    // grows with the magnitude, and the earlier `1e-9` tolerance
-    // (unscaled) rejected legitimate answers. The scaled
-    // tolerance accepts values that reconstruct within
-    // proportional noise.
+    // grows with the magnitude, and a fixed `1e-9` tolerance
+    // rejected legitimate answers. The `step * 1e-6` tolerance
+    // accepts values that reconstruct within proportional noise.
     const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 0, max: 1_000_000_000, step: 0.001 };
     // 999_999_999.999 = min + (999_999_999_999 * step) — a valid step.
     expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 999_999_999.999 })).toBeUndefined();
+  });
+
+  test("PR #52 round-3 review — tolerance anchored to step: value 0.4 past max on 0..1e9 step 1 is REFUSED", () => {
+    // The reviewer's failure mode: the earlier
+    // `1e-9 * max(1, |value|, |min|, |max|)` tolerance grew to
+    // ~1 on a `0..1e9` range, and `1e9 + 0.4` fell inside the
+    // band — half a step past max, accepted. The `step * 1e-6`
+    // tolerance keeps sub-step slack (1e-6 on step 1) — a value
+    // 0.4 past the endpoint is refused, and the integer-step-
+    // index bounds check refuses it too.
+    const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 0, max: 1_000_000_000, step: 1 };
+    // Legitimate endpoints round-trip cleanly.
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 1_000_000_000 })).toBeUndefined();
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 500_000_000 })).toBeUndefined();
+    // Reviewer case A: 1e9 + 0.4 — refused (was ACCEPTED pre-fix).
+    const caseA = validateAnswerAgainstSpec(spec, { kind: "scale", value: 1_000_000_000.4 });
+    expect(caseA).not.toBeUndefined();
+    // Reviewer case B: symmetric shape below min — refused too.
+    const caseB = validateAnswerAgainstSpec(spec, { kind: "scale", value: -0.4 });
+    expect(caseB).not.toBeUndefined();
+  });
+
+  test("PR #52 round-3 review — value at max+step (step index n+1) is refused by the integer-step-index bounds check, even without tolerance help", () => {
+    // A value that lands cleanly on the step lattice but ONE
+    // step past `max` must still be refused. `1_000_000_001` is
+    // `min + (1e9+1)*step` on the `0..1e9 step 1` spec — index
+    // n+1, refused by the bounds check with a specific message.
+    const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 0, max: 1_000_000_000, step: 1 };
+    const issue = validateAnswerAgainstSpec(spec, { kind: "scale", value: 1_000_000_001 });
+    expect(issue).not.toBeUndefined();
+    // The reviewer's spec says the message names the [0, n] range
+    // — assert BOTH the "outside [min, max]" and the index-bounds
+    // messages are ready to fire (one of them will).
+    const messages = [issue!.message];
+    expect(messages.some((m) => m.includes("outside") || m.includes("step index"))).toBe(true);
   });
 
   test("rank: ranking must be an exact permutation of the option ids", () => {

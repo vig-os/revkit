@@ -623,39 +623,51 @@ export function validateAnswerAgainstSpec(spec: Ask, answer: AskAnswer): { reado
     case "scale": {
       if (spec.kind !== "scale") return { field: "kind", message: `internal: kind mismatch.` };
       if (!Number.isFinite(answer.value)) return { field: "value", message: `value must be a finite number.` };
-      // PR #52 round-2 review — check via INTEGER step indices,
-      // with a tolerance scaled to the magnitudes involved. The
-      // earlier `(value - min) / step` at fixed `1e-9` tolerance
-      // failed on large-magnitude scales (e.g. 999_999_999.999
-      // on `0..1e9` with step 0.001) because binary-float
-      // representation error grows with the magnitude. The
-      // integer form `i = round((value - min) / step)` +
-      // `reconstructed = min + i*step` isolates the noise to
-      // ONE multiplication + subtraction, and we compare on
-      // the reconstruction (not the ratio).
+      // PR #52 round-3 review — tolerance is anchored to `step`
+      // (so whole values cannot slip through: `1e9 + 0.4` on
+      // `0..1e9 step 1` had a diff of 0.4 that the earlier
+      // magnitude-scaled tolerance of ~1 accepted), with an
+      // additional epsilon-of-magnitude floor for the case
+      // where the reconstruction `min + i*step` itself carries
+      // binary-float noise proportional to the values involved
+      // (e.g. `999_999_999.999` on `0..1e9 step 0.001` —
+      // reconstruction accumulates ~3e-6 of double-precision
+      // noise, far above `step * 1e-6` = 1e-9). The two
+      // components together are still bounded by a small
+      // fraction of `step`, so whole-value drift is still
+      // refused. Separately, the integer-step-index bounds
+      // check below refuses `index < 0` or `index > stepsInSpan`
+      // outright.
       const step = spec.step ?? 1;
       const rawIndex = (answer.value - spec.min) / step;
       const index = Math.round(rawIndex);
       const reconstructed = spec.min + index * step;
-      const tolerance = 1e-9 * Math.max(1, Math.abs(answer.value), Math.abs(spec.min), Math.abs(spec.max));
+      const magnitude = Math.max(Math.abs(spec.min), Math.abs(spec.max), Math.abs(answer.value));
+      const tolerance = Math.max(
+        Math.abs(step) * 1e-6,
+        magnitude * Number.EPSILON * 16,
+        Number.EPSILON * 8,
+      );
       if (Math.abs(answer.value - reconstructed) > tolerance) {
         return { field: "value", message: `value ${answer.value} is not on a step of ${step} from min ${spec.min} (nearest step: ${reconstructed}).` };
       }
-      // Range check ALSO uses the same tolerance so a value that
-      // is on-step but at max reconstructs to slightly above max
-      // via binary-float error and is not falsely refused.
+      // Range check: value must reconstruct into [min, max]. The
+      // integer-step-index bounds check below is the load-bearing
+      // guard; this one names the failure clearly for a value
+      // that landed clean of the step lattice but past the
+      // endpoints.
       if (answer.value < spec.min - tolerance || answer.value > spec.max + tolerance) {
         return { field: "value", message: `value ${answer.value} is outside [${spec.min}, ${spec.max}].` };
       }
-      // Bounds on the index (needed too — if value equals max
-      // within tolerance but index rounded to n+1, the range
-      // check above passed but the step index is out of the
-      // valid [0, n] range for a spec that already survived
-      // the `askSchema` (max - min) / step check).
-      const span = spec.max - spec.min;
-      const stepsInSpan = Math.round(span / step);
+      // Integer-step-index bounds — the definitive check. A
+      // spec that already survived `askSchema` has
+      // `(max - min) / step` as an integer, so `stepsInSpan`
+      // is exact. `index < 0 || index > stepsInSpan` refuses
+      // anything half-a-step past either endpoint that could
+      // otherwise slip through the range check by tolerance.
+      const stepsInSpan = Math.round((spec.max - spec.min) / step);
       if (index < 0 || index > stepsInSpan) {
-        return { field: "value", message: `value ${answer.value} maps to step ${index}, outside [0, ${stepsInSpan}].` };
+        return { field: "value", message: `value ${answer.value} maps to step index ${index}, outside [0, ${stepsInSpan}].` };
       }
       if (answer.note !== undefined && answer.note.length > CAP_NOTE) {
         return { field: "note", message: `note too long (${answer.note.length} > ${CAP_NOTE}).` };

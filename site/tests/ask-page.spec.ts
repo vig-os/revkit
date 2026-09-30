@@ -36,7 +36,44 @@ interface DaemonCtx {
   readonly launchUrl: string;
 }
 
+/** Set of daemon child PIDs the process spawned but has not
+ * yet cleanly torn down. Used by the process-exit / SIGINT /
+ * SIGTERM handlers below to kill leaked daemons if the Playwright
+ * worker itself is interrupted (Ctrl-C, an unhandled rejection,
+ * or a Playwright timeout that ends the process without running
+ * `afterAll`).
+ *
+ * PR #52 round-3 review — an earlier interrupted debug run of
+ * this suite left a daemon rooted in a stray `revkit-debug-*`
+ * temp dir, matching what this spec spawns. The signal handlers
+ * make interrupted runs self-cleaning without depending on the
+ * `daemon-registry.ts` helper (which is a Bun-test in-process
+ * Set and cannot survive a Playwright worker exit). */
+const LIVE_CHILDREN = new Set<import("node:child_process").ChildProcess>();
+let signalHandlersInstalled = false;
+function installSignalHandlersOnce(): void {
+  if (signalHandlersInstalled) return;
+  signalHandlersInstalled = true;
+  const kill = (signal: NodeJS.Signals): void => {
+    for (const c of LIVE_CHILDREN) {
+      try { c.kill(signal); } catch { /* dead */ }
+    }
+  };
+  // Best-effort: SIGTERM on any exit signal the worker receives.
+  // `process.on("exit")` runs synchronously in the last tick, so
+  // SIGTERM here is the last thing the child sees.
+  process.on("exit", () => kill("SIGTERM"));
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.once(sig, () => {
+      kill(sig);
+      // Re-raise so the exit code reflects the signal.
+      process.exit(128 + (sig === "SIGINT" ? 2 : sig === "SIGTERM" ? 15 : 1));
+    });
+  }
+}
+
 async function bootDaemon(): Promise<DaemonCtx> {
+  installSignalHandlersOnce();
   if (!existsSync(DIST)) throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
   const root = mkdtempSync(join(tmpdir(), "revkit-ask-page-"));
   mkdirSync(join(root, ".revkit"), { recursive: true });
@@ -47,6 +84,8 @@ async function bootDaemon(): Promise<DaemonCtx> {
     detached: false,
     env: process.env,
   });
+  LIVE_CHILDREN.add(child);
+  child.once("exit", () => LIVE_CHILDREN.delete(child));
   const stderrChunks: string[] = [];
   const stdoutChunks: string[] = [];
   child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString("utf8")));
@@ -88,7 +127,20 @@ async function bootDaemon(): Promise<DaemonCtx> {
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
   try { ctx.child.kill("SIGTERM"); } catch { /* dead */ }
-  await new Promise((r) => setTimeout(r, 200));
+  // Wait for the child to actually exit (up to 3 s) so a
+  // subsequent teardown-race doesn't leave a zombie the signal
+  // handlers then double-kill on process exit. Falls back to
+  // SIGKILL if SIGTERM is ignored.
+  const exited = await new Promise<boolean>((resolveOuter) => {
+    if (ctx.child.exitCode !== null || ctx.child.killed) return resolveOuter(true);
+    const timer = setTimeout(() => resolveOuter(false), 3000);
+    ctx.child.once("exit", () => { clearTimeout(timer); resolveOuter(true); });
+  });
+  if (!exited) {
+    try { ctx.child.kill("SIGKILL"); } catch { /* dead */ }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  LIVE_CHILDREN.delete(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 
@@ -271,6 +323,63 @@ test.describe("/ask/<id> — six kinds render, answer, and pass axe", () => {
     await expect(page.locator('[data-testid="revkit-ask-root"]')).toHaveAttribute("data-status", "answered", { timeout: 5000 });
     const record = await readAsk(ctx, id);
     expect((record.answer as { value: number }).value).toBe(2);
+  });
+
+  test("PR #52 round-3 review — pressing Home from index 0 marks the slider touched and answers the minimum", async ({ page }) => {
+    // The keyboard already positions the thumb at step 0 (min);
+    // pressing Home at index 0 does NOT fire `input` because the
+    // value doesn't move. Before the fix, the submit button
+    // stayed disabled forever after a single Home press.
+    // `onKeyDown` on the range marks touched regardless.
+    const { id } = await createAsk(ctx, {
+      schemaVersion: 1,
+      kind: "scale",
+      title: "1..4",
+      min: 1,
+      max: 4,
+      step: 1,
+    });
+    await openAskPage(ctx, page, id);
+    const submit = page.locator('[data-testid="revkit-ask-submit"]');
+    await expect(submit).toBeDisabled();
+    const range = page.locator('[data-testid="revkit-ask-scale-input"]');
+    await range.focus();
+    await page.keyboard.press("Home");
+    // Home at index 0 fires NO input event; the touched signal
+    // must come from onKeyDown for submit to enable.
+    await expect(submit).toBeEnabled();
+    await submit.click();
+    await expect(page.locator('[data-testid="revkit-ask-root"]')).toHaveAttribute("data-status", "answered", { timeout: 5000 });
+    const record = await readAsk(ctx, id);
+    // Minimum is 1 on this scale.
+    expect((record.answer as { value: number }).value).toBe(1);
+  });
+
+  test("PR #52 round-3 review — aria-valuetext reflects the reconstructed scale value, not the step index", async ({ page }) => {
+    // The DOM value is an INTEGER step index (0..n); a screen
+    // reader announcing "0 of 3" tells the user nothing. The
+    // `aria-valuetext` attribute carries the reconstructed
+    // scale value (min + i*step) so the announcement is
+    // "3" / "6" / etc.
+    const { id } = await createAsk(ctx, {
+      schemaVersion: 1,
+      kind: "scale",
+      title: "0..9, step 3",
+      min: 0,
+      max: 9,
+      step: 3,
+    });
+    await openAskPage(ctx, page, id);
+    const range = page.locator('[data-testid="revkit-ask-scale-input"]');
+    // At index 0, aria-valuetext must be "0" (min + 0*3).
+    await expect(range).toHaveAttribute("aria-valuetext", "0");
+    await range.focus();
+    await page.keyboard.press("ArrowRight");
+    // At index 1, aria-valuetext is "3".
+    await expect(range).toHaveAttribute("aria-valuetext", "3");
+    await page.keyboard.press("ArrowRight");
+    // At index 2, aria-valuetext is "6".
+    await expect(range).toHaveAttribute("aria-valuetext", "6");
   });
 
   test("PR #52 round-2 review — scale on 0..9 step 3: only 0, 3, 6, 9 are reachable, and submit lands on a valid step", async ({ page }) => {
