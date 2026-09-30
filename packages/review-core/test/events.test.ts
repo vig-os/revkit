@@ -106,6 +106,24 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     commentId: "c-1",
     external: { github: { commentId: 42, reviewId: 7, nodeId: "PRC_x" } },
   },
+  "thread.reanchored": {
+    seq: 10,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "thread.reanchored",
+    threadId: "th-1",
+    anchor: { ...anchor, revision: "d".repeat(64), startLine: 42, endLine: 46 },
+    method: "quote-exact",
+  },
+  "thread.orphaned": {
+    seq: 11,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "thread.orphaned",
+    threadId: "th-1",
+    revision: "e".repeat(64),
+    reason: "block deleted on rebuild",
+  },
 };
 
 describe("reviewEventSchema — happy paths", () => {
@@ -189,6 +207,40 @@ describe("reviewEventSchema — rejections", () => {
 
   test("comment.linked with an empty external object is rejected — needs at least one backend", () => {
     const bad = { ...validPerKind["comment.linked"], external: {} };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("thread.reanchored: method='fuzzy' REQUIRES a numeric score", () => {
+    const bad = { ...validPerKind["thread.reanchored"], method: "fuzzy" as const };
+    // No `score` provided — refused.
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("thread.reanchored: method='quote-exact' MUST NOT carry a score", () => {
+    const bad = { ...validPerKind["thread.reanchored"], method: "quote-exact" as const, score: 0.9 };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("thread.reanchored: method='fuzzy' with a valid score parses", () => {
+    const good = {
+      ...validPerKind["thread.reanchored"],
+      method: "fuzzy" as const,
+      score: 0.87,
+    };
+    expect(reviewEventSchema.safeParse(good).success).toBe(true);
+  });
+
+  test("thread.reanchored: score out of [0,1] is rejected", () => {
+    const bad = {
+      ...validPerKind["thread.reanchored"],
+      method: "fuzzy" as const,
+      score: 1.4,
+    };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("thread.orphaned.revision must be 64-hex (SHA-256 shape)", () => {
+    const bad = { ...validPerKind["thread.orphaned"], revision: "not-a-hash" };
     expect(reviewEventSchema.safeParse(bad).success).toBe(false);
   });
 });

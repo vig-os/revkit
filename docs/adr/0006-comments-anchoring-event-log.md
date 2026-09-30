@@ -29,3 +29,31 @@ Suggested edits (A6) extend comments with patches. Co-editing (A7) will need a s
 - The revision id is the **SHA-256 of the source normalised to LF line endings**.
 - Local threads (`bun:sqlite`) export/import to D1 with the same schema (`revkit threads export|import`), so a local
   review can be published to a hosted PR.
+
+## Amendment (2026-09-30)
+
+The original "diff-map → quote verify → fuzzy → orphan" description let implementers reach for a whole-file fuzzy
+search, which produces false positives on templated content (a deleted bullet lands on its neighbour). The
+re-anchoring engine (`packages/review-core/src/reanchor.ts`, M2 item 5a) implements the same intent under a stricter
+frame:
+
+- **The diff decides where; similarity only decides whether.** A character-level `diff_main(oldLF, newLF)` (with
+  `diff_cleanupSemantic` and `Diff_Timeout` bounded) is the ONLY search. The anchor's old span is classified as
+  **unchanged**, **modified** or **deleted** against the diff.
+- **Unchanged spans** map through `diff_xIndex` and are accepted as `quote-exact` when the mapped text equals the
+  quote AND the character-class of the new boundaries matches the old (line boundary vs mid-line) — the boundary
+  check catches the substring-accident where the exact quote appears embedded in a longer inserted sentence.
+- **Modified spans** are located by `diff_xIndex` inside the enclosing changed-hunk window (± a small slack) and
+  aligned with a walker that folds the replacement INSERT into the DELETE. The similarity of the OLD quote to the
+  aligned new text must clear a moderate gate; a span whose EQUAL preservation is under half is demoted to the
+  deleted path (a templated-row shift, not an in-place edit).
+- **Deleted spans** try move detection: **exact** `prefix + exact + suffix` in the new source AND in the old source
+  with substantial context on each side (non-whitespace count OR a line boundary). Exactly one occurrence in BOTH
+  the old and the new source anchors as `quote-exact` (moved); zero, several, or an old snapshot that already had
+  the pattern twice (copy-pasted blocks) **orphan**. There is no fuzzy or bare-quote-copy fallback — a lone match of
+  the bare quote in a different context is refused, and a paragraph moved WITHOUT its surrounding context orphans
+  (the safe choice: we cannot prove which copy the anchor was on if two identical blocks lived side by side).
+  Orphaning beats a wrong place.
+
+The event kinds `thread.reanchored` and `thread.orphaned` carry these outcomes; the wire methods are `quote-exact`
+(unchanged / moved) and `fuzzy` (modified). Fuzzy carries the similarity score.

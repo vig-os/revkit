@@ -50,3 +50,115 @@ describe("validateNext — leaves state untouched on rejection", () => {
     expect([...state.commentIndex.keys()]).toEqual(before.comments);
   });
 });
+
+// ---------- thread.reanchored / thread.orphaned rules ----------
+
+function reanchored(threadId: string, seq: number): ReviewEvent {
+  return {
+    seq,
+    ts: t,
+    actor,
+    kind: "thread.reanchored",
+    threadId,
+    anchor: { ...anchor, revision: "b".repeat(64), startLine: 42, endLine: 46 },
+    method: "quote-exact",
+  };
+}
+
+function orphaned(threadId: string, seq: number): ReviewEvent {
+  return {
+    seq,
+    ts: t,
+    actor,
+    kind: "thread.orphaned",
+    threadId,
+    revision: "c".repeat(64),
+  };
+}
+
+describe("validateNext — thread.reanchored", () => {
+  test("un-orphans a previously orphaned thread (status returns to open)", () => {
+    const state = emptyLogState();
+    expect(validateNext(state, created("th-1", "c-1", 1)).ok).toBe(true);
+    expect(validateNext(state, orphaned("th-1", 2)).ok).toBe(true);
+    expect(state.threads.get("th-1")?.status).toBe("orphaned");
+    expect(validateNext(state, reanchored("th-1", 3)).ok).toBe(true);
+    expect(state.threads.get("th-1")?.status).toBe("open");
+  });
+
+  test("rejects a reanchor for an unknown thread (unknown-thread)", () => {
+    const state = emptyLogState();
+    const result = validateNext(state, reanchored("th-nowhere", 1));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("unknown-thread");
+  });
+
+  test("refuses a reanchor whose anchor.path differs from the thread's file (cross-file-reanchor)", () => {
+    const state = emptyLogState();
+    validateNext(state, created("th-1", "c-1", 1));
+    const crossFile: ReviewEvent = {
+      seq: 2,
+      ts: t,
+      actor,
+      kind: "thread.reanchored",
+      threadId: "th-1",
+      anchor: {
+        ...anchor,
+        path: "docs/other-file.md",
+        revision: "b".repeat(64),
+        startLine: 3,
+        endLine: 3,
+      },
+      method: "quote-exact",
+    };
+    const result = validateNext(state, crossFile);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("cross-file-reanchor");
+  });
+});
+
+describe("validateNext — thread.orphaned", () => {
+  test("moves an open thread to orphaned", () => {
+    const state = emptyLogState();
+    validateNext(state, created("th-1", "c-1", 1));
+    const result = validateNext(state, orphaned("th-1", 2));
+    expect(result.ok).toBe(true);
+    expect(state.threads.get("th-1")?.status).toBe("orphaned");
+  });
+
+  test("rejects a second orphan on the same thread (already-orphaned)", () => {
+    const state = emptyLogState();
+    validateNext(state, created("th-1", "c-1", 1));
+    validateNext(state, orphaned("th-1", 2));
+    const result = validateNext(state, orphaned("th-1", 3));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("already-orphaned");
+  });
+
+  test("rejects an orphan on a RESOLVED thread (not-open)", () => {
+    const state = emptyLogState();
+    validateNext(state, created("th-1", "c-1", 1));
+    validateNext(state, {
+      seq: 2,
+      ts: t,
+      actor,
+      kind: "thread.resolved",
+      threadId: "th-1",
+    });
+    const result = validateNext(state, orphaned("th-1", 3));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("not-open");
+  });
+
+  test("rejects an orphan for an unknown thread (unknown-thread)", () => {
+    const state = emptyLogState();
+    const result = validateNext(state, orphaned("th-nowhere", 1));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("unknown-thread");
+  });
+});

@@ -28,6 +28,20 @@
 //                      `duplicate-answer`).
 //   comment.linked   — the commentId must exist; a commentId may be
 //                      linked once (a second link is `duplicate-link`).
+//   thread.reanchored — the threadId must exist AND the event's
+//                       `anchor.path` must equal the thread's original
+//                       path (`cross-file-reanchor` otherwise: moving
+//                       a comment across files is not re-anchoring).
+//                       Accepted on any status; the reducer un-orphans
+//                       a re-anchored thread and leaves resolved/open
+//                       otherwise.
+//   thread.orphaned  — the threadId must exist and its status must be
+//                      `open`: a `resolved` thread is not tracked by
+//                      the pipeline (the human/agent's final word),
+//                      and an already-`orphaned` thread would be a
+//                      redundant repeat (`already-orphaned`). Both
+//                      cases carry their own rejection kind so a
+//                      caller can branch without parsing messages.
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -46,8 +60,14 @@ import type { ThreadStatus } from "./thread.ts";
  * and either commit the whole sequence or leave the real state
  * untouched. */
 export interface LogState {
-  /** Per-thread status. Presence in the map means the thread exists. */
-  readonly threads: Map<string, { status: ThreadStatus; readonly commentIds: Set<string> }>;
+  /** Per-thread status and anchor path. Presence in the map means
+   * the thread exists. `path` is captured on `comment.created` from
+   * the anchor and never changes — the validator refuses a
+   * `thread.reanchored` whose anchor points at a different file. */
+  readonly threads: Map<
+    string,
+    { status: ThreadStatus; readonly path: string; readonly commentIds: Set<string> }
+  >;
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
   readonly commentIndex: Map<string, string>;
@@ -81,9 +101,16 @@ export function emptyLogState(): LogState {
  * `InMemoryThreadStore.import` to dry-run an archive without mutating
  * the real state (the atomic-commit contract). */
 export function cloneLogState(state: LogState): LogState {
-  const threads = new Map<string, { status: ThreadStatus; commentIds: Set<string> }>();
+  const threads = new Map<
+    string,
+    { status: ThreadStatus; path: string; commentIds: Set<string> }
+  >();
   for (const [id, entry] of state.threads) {
-    threads.set(id, { status: entry.status, commentIds: new Set(entry.commentIds) });
+    threads.set(id, {
+      status: entry.status,
+      path: entry.path,
+      commentIds: new Set(entry.commentIds),
+    });
   }
   const asks = new Map<string, { kind: AskKind; answered: boolean }>();
   for (const [id, entry] of state.asks) {
@@ -118,7 +145,9 @@ export type AppendRejection =
   | { kind: "duplicate-answer"; askId: string; message: string }
   | { kind: "answer-kind-mismatch"; askId: string; askKind: AskKind; answerKind: AskKind; message: string }
   | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
-  | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string };
+  | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string }
+  | { kind: "already-orphaned"; threadId: string; message: string }
+  | { kind: "cross-file-reanchor"; threadId: string; fromPath: string; toPath: string; message: string };
 
 export type ValidationResult = { ok: true } | { ok: false; rejection: AppendRejection };
 
@@ -148,6 +177,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       }
       state.threads.set(event.threadId, {
         status: "open",
+        path: event.anchor.path,
         commentIds: new Set([event.commentId]),
       });
       state.commentIndex.set(event.commentId, event.threadId);
@@ -272,6 +302,60 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
         };
       }
       ask.answered = true;
+      return { ok: true };
+    }
+    case "thread.reanchored": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      // Refuse a cross-file reanchor: moving a comment onto a
+      // different file is not "re-anchoring the same block", and
+      // silently accepting it would erase the audit trail of where
+      // the comment was originally made. The daemon (item 5b) reads
+      // the source file whose path the anchor names — the re-anchor
+      // pipeline reads and writes the SAME file.
+      if (event.anchor.path !== thread.path) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "cross-file-reanchor",
+            threadId: event.threadId,
+            fromPath: thread.path,
+            toPath: event.anchor.path,
+            message: `thread.reanchored: thread '${event.threadId}' is anchored on '${thread.path}'; refusing a reanchor onto a different file '${event.anchor.path}'.`,
+          },
+        };
+      }
+      // A re-anchor un-orphans a previously-orphaned thread — the
+      // reducer records the anchor change and moves the status back
+      // to open. The validator only needs to track status here (the
+      // anchor lives outside `LogState`).
+      if (thread.status === "orphaned") thread.status = "open";
+      return { ok: true };
+    }
+    case "thread.orphaned": {
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (thread.status === "orphaned") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "already-orphaned",
+            threadId: event.threadId,
+            message: `thread.orphaned: thread '${event.threadId}' is already orphaned — the pipeline is idempotent, so a redundant orphan is refused.`,
+          },
+        };
+      }
+      if (thread.status !== "open") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-open",
+            threadId: event.threadId,
+            message: `thread.orphaned: thread '${event.threadId}' is not open (current status: ${thread.status}) — the pipeline only tracks open threads.`,
+          },
+        };
+      }
+      thread.status = "orphaned";
       return { ok: true };
     }
     case "comment.linked": {

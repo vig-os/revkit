@@ -39,6 +39,21 @@
 //                      (M3 GitHub adapter, ADR-0025). Reserved on v0 so
 //                      M3 lands without a `schemaVersion` bump; the M2
 //                      daemon does not emit it.
+//   thread.reanchored — the re-anchoring pipeline (ADR-0006 Acceptance,
+//                       M2 item 5a) found the thread on a new revision.
+//                       Carries the new anchor (with the new revision),
+//                       the method that produced it ('quote-exact' or
+//                       'fuzzy'), and — for fuzzy — the score. Emitted
+//                       by the daemon on every rebuild for each open
+//                       thread whose anchor survived; identity/unchanged
+//                       results emit nothing.
+//   thread.orphaned  — the pipeline could not find the thread on the
+//                      new revision above the fuzzy-score threshold.
+//                      The thread's status transitions to `orphaned`
+//                      but it is kept, still answerable, never dropped
+//                      (ADR-0006). A subsequent `thread.reanchored`
+//                      un-orphans the thread when a later rebuild finds
+//                      it again.
 import { z } from "zod";
 import { anchorSchema } from "./anchor.ts";
 import { askAnswerSchema, askSchema } from "./asks.ts";
@@ -129,6 +144,39 @@ const commentLinkedPayload = {
   external: externalRefSchema,
 } as const;
 
+/** Methods `thread.reanchored` may carry. `unchanged` is not on the
+ * wire — the pipeline emits no event for an identity re-anchor. The
+ * other two match the pipeline stages (ADR-0006 Acceptance). */
+const reanchorMethods = ["quote-exact", "fuzzy"] as const;
+export const reanchorMethodSchema = z.enum(reanchorMethods);
+export type ReanchorEventMethod = (typeof reanchorMethods)[number];
+
+const threadReanchoredPayload = {
+  kind: z.literal("thread.reanchored"),
+  threadId: z.string().min(1),
+  anchor: anchorSchema,
+  method: reanchorMethodSchema,
+  // Present only when `method === 'fuzzy'`. A `superRefine` on the
+  // variant below enforces both directions — fuzzy requires a score,
+  // and quote-exact refuses one so no silent extra field lands on the log.
+  score: z.number().min(0).max(1).optional(),
+} as const;
+
+const threadOrphanedPayload = {
+  kind: z.literal("thread.orphaned"),
+  threadId: z.string().min(1),
+  // The revision the pipeline ran against — the SHA-256 of the new
+  // source (LF-normalised). Named so an operator can see "this thread
+  // orphaned on THIS content", not just "at this timestamp".
+  revision: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "thread.orphaned.revision must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
+    ),
+  reason: z.string().min(1).optional(),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
@@ -180,6 +228,30 @@ const eventVariants = [
         });
       }
     }),
+  z
+    .object({ ...envelope, ...threadReanchoredPayload })
+    .strict()
+    .superRefine((event, ctx) => {
+      // `score` is meaningful only for a fuzzy re-anchor and required
+      // for it. A quote-exact match has no fuzzy score; a fuzzy match
+      // without one hides the confidence that gates the orphan
+      // decision. Fail either shape at the wire boundary.
+      if (event.method === "fuzzy" && event.score === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["score"],
+          message: "thread.reanchored: method='fuzzy' requires a numeric `score` (0–1).",
+        });
+      }
+      if (event.method !== "fuzzy" && event.score !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["score"],
+          message: `thread.reanchored: method='${event.method}' must not carry a score (score is a fuzzy-only signal).`,
+        });
+      }
+    }),
+  z.object({ ...envelope, ...threadOrphanedPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -207,6 +279,8 @@ export const reviewEventKinds = [
   "ask.created",
   "ask.answered",
   "comment.linked",
+  "thread.reanchored",
+  "thread.orphaned",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**
