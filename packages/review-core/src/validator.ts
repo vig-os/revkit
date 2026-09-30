@@ -23,9 +23,14 @@
 //                      the log (`unknown-comment`).
 //   presence         — no thread state; always accepted.
 //   ask.created      — the askId must be new (`duplicate-ask`).
-//   ask.answered     — the askId must be a prior `ask.created` and not
-//                      already answered (`unknown-ask`,
-//                      `duplicate-answer`).
+//   ask.answered     — the askId must be a prior `ask.created` and still
+//                      pending (`unknown-ask`, `ask-not-pending`); the
+//                      answer's `kind` must match the spec's `kind`
+//                      (`answer-kind-mismatch`).
+//   ask.cancelled    — the askId must be a prior `ask.created` and
+//                      still pending (`unknown-ask`, `ask-not-pending`).
+//   ask.expired      — the askId must be a prior `ask.created` and
+//                      still pending (`unknown-ask`, `ask-not-pending`).
 //   comment.linked   — the commentId must exist; a commentId may be
 //                      linked once (a second link is `duplicate-link`).
 //   thread.reanchored — the threadId must exist AND the event's
@@ -48,7 +53,7 @@
 // hold one long-lived `LogState`; `parseArchive` builds a fresh one and
 // throws it away.
 
-import type { AskKind } from "./asks.ts";
+import type { AskKind, AskStatus } from "./asks.ts";
 import type { ReviewEvent } from "./events.ts";
 import type { ThreadStatus } from "./thread.ts";
 
@@ -80,10 +85,13 @@ export interface LogState {
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
   readonly commentIndex: Map<string, string>;
-  /** askId → { kind, answered? }. `kind` is stored so `ask.answered`
+  /** askId → { kind, status }. `kind` is stored so `ask.answered`
    * can be refused when the answer's discriminant does not match the
-   * ask's kind (a `scale` answer on a `text` ask, and so on). */
-  readonly asks: Map<string, { kind: AskKind; answered: boolean }>;
+   * ask's kind (a `scale` answer on a `text` ask, and so on).
+   * `status` gates all three terminal transitions
+   * (answered / cancelled / expired) — the validator refuses any of
+   * them on an ask that is already terminal. */
+  readonly asks: Map<string, { kind: AskKind; status: AskStatus }>;
   /** commentId → set of already-linked backends, so a second link to
    * the same backend on the same comment can be rejected without
    * silently overwriting the first. */
@@ -127,9 +135,9 @@ export function cloneLogState(state: LogState): LogState {
       commentIds: new Set(entry.commentIds),
     });
   }
-  const asks = new Map<string, { kind: AskKind; answered: boolean }>();
+  const asks = new Map<string, { kind: AskKind; status: AskStatus }>();
   for (const [id, entry] of state.asks) {
-    asks.set(id, { kind: entry.kind, answered: entry.answered });
+    asks.set(id, { kind: entry.kind, status: entry.status });
   }
   const commentLinks = new Map<string, Set<string>>();
   for (const [id, backends] of state.commentLinks) {
@@ -157,7 +165,16 @@ export type AppendRejection =
   | { kind: "unknown-comment"; commentId: string; message: string }
   | { kind: "duplicate-ask"; askId: string; message: string }
   | { kind: "unknown-ask"; askId: string; message: string }
+  /** Kept as a distinct kind so a caller can special-case
+   * "the answer beat a cancel" without parsing the message. Emitted
+   * only when an `ask.answered` targets an already-answered ask. */
   | { kind: "duplicate-answer"; askId: string; message: string }
+  /** `ask.answered`, `ask.cancelled` or `ask.expired` targeting an
+   * ask that is no longer pending (already answered / cancelled /
+   * expired). Carries the current status so a race between two
+   * terminal events (e.g. concurrent cancel + answer) surfaces
+   * which one won. */
+  | { kind: "ask-not-pending"; askId: string; currentStatus: AskStatus; attempted: "answered" | "cancelled" | "expired"; message: string }
   | { kind: "answer-kind-mismatch"; askId: string; askKind: AskKind; answerKind: AskKind; message: string }
   | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
   | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string }
@@ -293,7 +310,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      state.asks.set(event.askId, { kind: event.spec.kind, answered: false });
+      state.asks.set(event.askId, { kind: event.spec.kind, status: "pending" });
       return { ok: true };
     }
     case "ask.answered": {
@@ -308,13 +325,25 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      if (ask.answered) {
+      if (ask.status === "answered") {
         return {
           ok: false,
           rejection: {
             kind: "duplicate-answer",
             askId: event.askId,
             message: `ask.answered: ask '${event.askId}' already has an answer.`,
+          },
+        };
+      }
+      if (ask.status !== "pending") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "ask-not-pending",
+            askId: event.askId,
+            currentStatus: ask.status,
+            attempted: "answered",
+            message: `ask.answered: ask '${event.askId}' is '${ask.status}' — a terminal state cannot be answered.`,
           },
         };
       }
@@ -330,7 +359,36 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      ask.answered = true;
+      ask.status = "answered";
+      return { ok: true };
+    }
+    case "ask.cancelled":
+    case "ask.expired": {
+      const ask = state.asks.get(event.askId);
+      const attempted = event.kind === "ask.cancelled" ? "cancelled" : "expired";
+      if (ask === undefined) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-ask",
+            askId: event.askId,
+            message: `${event.kind}: ask '${event.askId}' does not exist (no prior ask.created).`,
+          },
+        };
+      }
+      if (ask.status !== "pending") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "ask-not-pending",
+            askId: event.askId,
+            currentStatus: ask.status,
+            attempted,
+            message: `${event.kind}: ask '${event.askId}' is '${ask.status}' — a terminal state cannot transition.`,
+          },
+        };
+      }
+      ask.status = attempted === "cancelled" ? "cancelled" : "expired";
       return { ok: true };
     }
     case "thread.reanchored": {

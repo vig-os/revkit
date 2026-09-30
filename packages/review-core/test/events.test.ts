@@ -98,6 +98,21 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     askId: "ask-1",
     answer: { kind: "choice", value: "d1" },
   },
+  "ask.cancelled": {
+    seq: 12,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "ask.cancelled",
+    askId: "ask-1",
+    reason: "superseded",
+  },
+  "ask.expired": {
+    seq: 13,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "ask.expired",
+    askId: "ask-1",
+  },
   "comment.linked": {
     seq: 9,
     ts: t,

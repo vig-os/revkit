@@ -45,6 +45,22 @@ an ADR needs a new ADR (superseding), not a silent deviation.
   command that needs them, never `cat` or echo them.
 - Workflows: no `pull_request_target`; PR builds get no secrets; deploys go through the `production` environment.
 
+## Asks — the `ask` / `await_answer` MCP tools (A1, ADR-0007)
+
+Prefer a rich question page over a chat prompt when the answer benefits from choices, ranking, a scale, a region on
+a plot, or a review decision. The `revkit` MCP server exposes:
+
+- `ask({ spec, id?, ttlMs? })` — creates a question at `/ask/<id>` and returns `{ ask, url }` immediately. `spec`
+  follows `askSchema` (kinds: `choice`, `rank`, `scale`, `text`, `region`, `review`). Question text is untrusted as
+  HTML — the daemon renders it as text.
+- `await_answer({ id, timeout_ms? })` — long-polls up to `timeout_ms` (max 9 s to stay under the MCP tool deadline)
+  and returns the ask record. A `pending` return is NORMAL: call again. When a human answers during the poll the
+  tool wakes on the SSE frame (median ~15 ms in tests, well under the A1 < 1 s bound).
+
+Ask files live at `.revkit/asks/<id>.json` (mode 0600), and the lifecycle is `pending → answered | cancelled |
+expired`. Expiry is lazy — a slow answer POST that raced the deadline lands as `ask-not-pending`, never wins
+silently.
+
 ## Conventions for revkit content (from ADR-0003/0004/0005)
 
 - Prose is MDX; data (vocabulary, plots, questions) is JSON/YAML in side files.

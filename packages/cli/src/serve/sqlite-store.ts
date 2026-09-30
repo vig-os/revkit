@@ -30,9 +30,13 @@ import {
   emptyLogState,
   parseArchive,
   reduce,
+  reduceAsks,
   reviewEventSchema,
+  selectAsks,
   selectThreads,
   validateNext,
+  type AskFilter,
+  type AskRecord,
   type Clock,
   type LogState,
   type ReviewEvent,
@@ -268,6 +272,23 @@ export class SqliteThreadStore implements ThreadStore {
   async thread(id: string): Promise<Thread | undefined> {
     const events = await this.since(0);
     const derived = reduce(events);
+    return derived.get(id);
+  }
+
+  async asks(filter?: AskFilter): Promise<AskRecord[]> {
+    // Mirrors `threads()` — the review-core helper owns the
+    // reduce → sort → filter sequence for both stores. Reading the
+    // whole log is fine at M2 scale (an interactive session
+    // rarely holds more than a handful of asks); a later index
+    // would go on `ask.created` payload → seq if the log ever
+    // grows big enough for it to matter.
+    const events = await this.since(0);
+    return selectAsks(events, filter);
+  }
+
+  async ask(id: string): Promise<AskRecord | undefined> {
+    const events = await this.since(0);
+    const derived = reduceAsks(events);
     return derived.get(id);
   }
 

@@ -65,6 +65,14 @@ export interface HeaderContext {
  * the header builder and `rail/injector.ts` agree on one spelling. */
 export const RAIL_SCRIPT_URL_PATH = "/-/rail.js";
 
+/** Where the `/ask/<id>` page bundle lives. Same shape as the rail:
+ * a compiled Solid bundle served from an exact daemon path so
+ * `script-src` names it verbatim. Kept alongside `RAIL_SCRIPT_URL_PATH`
+ * so a future third bundle adds one line here + one entry per alias
+ * in `buildCspHeader` rather than a copy-paste of the whole loop.
+ * (M2 item 7, story A1.) */
+export const ASK_SCRIPT_URL_PATH = "/-/ask.js";
+
 /** Astro's chunk directory — every static JS asset a page loads via
  * `<script src>` starts with this prefix (`check-dist.ts` enforces the
  * same on the built HTML). */
@@ -187,6 +195,7 @@ export function buildCspHeader(ctx: HeaderContext): string {
   // as a page opened at http://127.0.0.1:<port>/.
   for (const origin of loopbackOrigins(ctx.port, "http")) {
     scriptSources.push(`${origin}${RAIL_SCRIPT_URL_PATH}`);
+    scriptSources.push(`${origin}${ASK_SCRIPT_URL_PATH}`);
     scriptSources.push(`${origin}${ASTRO_SCRIPTS_URL_PREFIX}`);
     scriptSources.push(`${origin}${PAGEFIND_URL_PREFIX}`);
   }
