@@ -13,10 +13,15 @@
 :root {
   --revkit-rail-bg: #ffffff;
   --revkit-rail-fg: #111827;
-  --revkit-rail-muted: #6b7280;
-  --revkit-rail-accent: #2563eb;
+  /* `muted` must clear WCAG 2.2 SC 1.4.3 (4.5:1 on rail background)
+   * for the small author-id / anchor line text. #4b5563 on #ffffff
+   * gives ~7.6:1 (verified via axe). #6b7280 sat right on the
+   * threshold and failed on the .revkit-rail__comment background
+   * (which mixes 4% fg onto white → ~#f4f5f6). */
+  --revkit-rail-muted: #4b5563;
+  --revkit-rail-accent: #1d4ed8;
   --revkit-rail-border: #e5e7eb;
-  --revkit-rail-resolved: #10b981;
+  --revkit-rail-resolved: #047857;
   --revkit-rail-danger: #b91c1c;
   --revkit-rail-focus: #fde68a;
 }
@@ -25,9 +30,11 @@
   :root {
     --revkit-rail-bg: #0b1220;
     --revkit-rail-fg: #f3f4f6;
-    --revkit-rail-muted: #9ca3af;
-    --revkit-rail-accent: #60a5fa;
+    /* Same 4.5:1 requirement, this time on the dark rail bg. */
+    --revkit-rail-muted: #cbd5e1;
+    --revkit-rail-accent: #93c5fd;
     --revkit-rail-border: #1f2937;
+    --revkit-rail-resolved: #34d399;
     --revkit-rail-focus: #78350f;
   }
 }
@@ -205,8 +212,16 @@
   border-radius: 4px;
 }
 
+/*
+ * Resolved threads are visually de-emphasised. Avoid `opacity: 0.75`
+ * — that would dim the text below the WCAG 2.2 SC 1.4.3 4.5:1
+ * threshold on the small-body author line (axe catches it). Use a
+ * distinct border colour + resolved anchor colour instead; keep the
+ * body text at full contrast.
+ */
 .revkit-rail__thread--resolved {
-  opacity: 0.75;
+  border-color: var(--revkit-rail-resolved);
+  background: color-mix(in srgb, var(--revkit-rail-resolved) 6%, transparent);
 }
 
 .revkit-rail__thread--resolved .revkit-rail__thread-anchor {
@@ -262,6 +277,33 @@
   text-align: center;
   padding: 1rem;
   margin: 0;
+}
+
+/*
+ * Floating "Comment" button pinned to the selection's top edge.
+ * Position is set inline (viewport coordinates from
+ * getBoundingClientRect). Keeps the affordance where the eye
+ * already is when the reviewer just selected text (WCAG 2.5.7
+ * pointer target size — 32px min).
+ */
+.revkit-rail__floating {
+  position: fixed;
+  z-index: 2147483001;
+  background: var(--revkit-rail-accent);
+  color: white;
+  border: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  min-height: 32px;
+}
+
+.revkit-rail__floating:hover,
+.revkit-rail__floating:focus-visible {
+  filter: brightness(1.1);
 }
 
 [data-rail-focus="true"] {

@@ -243,6 +243,10 @@ function Rail(): unknown {
     readonly quote: string;
   } | undefined>(undefined);
   const [error, setError] = createSignal<string | undefined>(undefined);
+  // `replyDraftFor` holds the id of the thread whose reply form is
+  // open. Declared here so keyboard handlers set up below can read
+  // it in Escape's dispatch table.
+  const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
 
   // Wire the SSE stream on mount, tear it down on unmount.
   const unsubscribe = subscribeEvents(() => {
@@ -250,17 +254,24 @@ function Rail(): unknown {
   });
   onCleanup(unsubscribe);
 
-  // Selection listener: on `mouseup`, if the user has selected non-empty
-  // text inside a stamped block, offer a "comment" button that opens
-  // the composer.
+  // Selection listener: on `mouseup` (or a keyboard-driven
+  // `selectionchange` when a screen reader / keyboard user extends
+  // a selection with shift+arrow), if the user has selected
+  // non-empty text inside a stamped block, we surface two entry
+  // points to the composer. First, a floating "Comment" button
+  // pinned to the selection's bounding box, so the click
+  // affordance is where the eye is. Second, the `c` keyboard
+  // shortcut and the "comment on selection" button inside the rail
+  // panel (both wired up further down).
   const [selection, setSelection] = createSignal<{
     readonly block: HTMLElement;
     readonly anchor: RailAnchor;
     readonly quote: string;
+    readonly rect: { readonly top: number; readonly left: number; readonly width: number; readonly height: number };
   } | undefined>(undefined);
-  const onMouseUp = (): void => {
+  const readSelection = (): void => {
     const sel = window.getSelection();
-    if (sel === null || sel.isCollapsed) {
+    if (sel === null || sel.isCollapsed || sel.rangeCount === 0) {
       setSelection(undefined);
       return;
     }
@@ -275,6 +286,13 @@ function Rail(): unknown {
       setSelection(undefined);
       return;
     }
+    // Ignore selections that live INSIDE the rail itself — e.g. a
+    // user selecting an old comment's text should not offer to
+    // start a NEW thread from that text.
+    if (block.closest("[data-testid=\"revkit-rail\"]") !== null) {
+      setSelection(undefined);
+      return;
+    }
     const raw = block.getAttribute("data-src");
     if (raw === null) {
       setSelection(undefined);
@@ -286,6 +304,8 @@ function Rail(): unknown {
       return;
     }
     const quoteParts = quoteFromBlock(block, text);
+    const range = sel.getRangeAt(0);
+    const box = range.getBoundingClientRect();
     setSelection({
       block,
       anchor: {
@@ -300,10 +320,17 @@ function Rail(): unknown {
         revision: "0".repeat(64),
       },
       quote: text,
+      rect: { top: box.top, left: box.left, width: box.width, height: box.height },
     });
   };
-  document.addEventListener("mouseup", onMouseUp);
-  onCleanup(() => document.removeEventListener("mouseup", onMouseUp));
+  document.addEventListener("mouseup", readSelection);
+  // `selectionchange` catches keyboard-driven selections (shift+arrow,
+  // shift+home/end) so the floating button appears without the mouse.
+  document.addEventListener("selectionchange", readSelection);
+  onCleanup(() => {
+    document.removeEventListener("mouseup", readSelection);
+    document.removeEventListener("selectionchange", readSelection);
+  });
 
   const openComposer = async (candidate: NonNullable<ReturnType<typeof selection>>): Promise<void> => {
     const revision = await revisionHex(candidate.block.textContent ?? "");
@@ -314,6 +341,43 @@ function Rail(): unknown {
     });
     setSelection(undefined);
   };
+
+  // Keyboard shortcut: `c` when a selection exists opens the
+  // composer. Ignored when the user is typing in a form field (a
+  // shortcut that steals `c` in a textarea would be worse than not
+  // having one). ADR-0017: keyboard-accessible parity with the
+  // "comment on selection" button.
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== "c" || event.metaKey || event.ctrlKey || event.altKey) return;
+    const target = event.target as HTMLElement | null;
+    const tag = target?.tagName?.toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+    const pending = selection();
+    if (pending === undefined) return;
+    event.preventDefault();
+    void openComposer(pending);
+  };
+  document.addEventListener("keydown", onKeyDown);
+  onCleanup(() => document.removeEventListener("keydown", onKeyDown));
+
+  // Escape closes the composer / reply form / dismisses the
+  // selection prompt — the browser's own dismiss gesture.
+  const onEscape = (event: KeyboardEvent): void => {
+    if (event.key !== "Escape") return;
+    if (composerAnchor() !== undefined) {
+      setComposerAnchor(undefined);
+      return;
+    }
+    if (replyDraftFor() !== undefined) {
+      setReplyDraftFor(undefined);
+      return;
+    }
+    if (selection() !== undefined) {
+      setSelection(undefined);
+    }
+  };
+  document.addEventListener("keydown", onEscape);
+  onCleanup(() => document.removeEventListener("keydown", onEscape));
 
   const submitNewThread = async (bodyText: string): Promise<void> => {
     const composed = composerAnchor();
@@ -328,7 +392,6 @@ function Rail(): unknown {
     }
   };
 
-  const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
   const submitReply = async (thread: RailThread, bodyText: string): Promise<void> => {
     setError(undefined);
     const last = thread.comments[thread.comments.length - 1];
@@ -373,6 +436,36 @@ function Rail(): unknown {
       aria-label="review comments"
       data-testid="revkit-rail"
     >
+      <${Show} when=${() => selection() !== undefined && composerAnchor() === undefined}>
+        ${() => {
+          // Floating "Comment" button pinned to the selection's
+          // top-right corner. Uses viewport coordinates from
+          // `getBoundingClientRect()` (position: fixed). Clicking
+          // opens the composer; the `c` keyboard shortcut is the
+          // keyboard-only equivalent.
+          const sel = selection()!;
+          const style =
+            `top: ${Math.max(8, sel.rect.top - 36)}px; ` +
+            `left: ${Math.min(window.innerWidth - 120, sel.rect.left + sel.rect.width - 8)}px;`;
+          return html`
+            <button
+              type="button"
+              class="revkit-rail__floating"
+              data-testid="revkit-rail-floating"
+              style=${style}
+              onMouseDown=${(event: MouseEvent): void => {
+                // `mousedown` fires before the click clears the
+                // selection — otherwise `openComposer(selection())`
+                // sees `undefined` because the click collapsed the
+                // range.
+                event.preventDefault();
+                void openComposer(sel);
+              }}
+              aria-label=${`Comment on \"${sel.quote.slice(0, 40)}\" — shortcut: c`}
+            >Comment</button>
+          `;
+        }}
+      <//>
       <header class="revkit-rail__header">
         <h2 class="revkit-rail__title">Comments</h2>
         <button
@@ -426,6 +519,12 @@ function Rail(): unknown {
                   rows="3"
                   data-testid="revkit-rail-composer-input"
                   aria-label="comment body"
+                  ref=${(el: HTMLTextAreaElement): void => {
+                    // Focus on mount so a reviewer opening the
+                    // composer (via keyboard `c` or the mouse) can
+                    // type immediately (WCAG 2.4.3 focus order).
+                    queueMicrotask(() => el.focus());
+                  }}
                 ></textarea>
               </label>
               <div class="revkit-rail__actions">
