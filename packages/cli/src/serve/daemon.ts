@@ -604,8 +604,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   }
 
   /** Validate a `next=` value for the auth redirect. Returns the
-   * accepted path (leading slash, no query, no fragment) or
-   * undefined if the value is unsafe. Rules:
+   * accepted target (leading slash + optional query; fragments
+   * are dropped by `URL.searchParams.get`, which decodes only the
+   * query, and the query is preserved on the returned target)
+   * or undefined if the value is unsafe. Rules:
    *
    *   - `next` must not be null.
    *   - After percent-decoding (which the URL parser has done for

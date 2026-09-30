@@ -274,3 +274,140 @@ describe("round-3 nit 3 — ensureDaemon applies filteredDaemonEnv", () => {
     }
   });
 });
+
+// Round-4 review: a 401 from the daemon indicates a stale bearer
+// (the daemon died and a new one took the same port, minting a
+// fresh agentToken). Unlike a 400 / 403 / 404, this IS worth a
+// reconnect — the discover path will pick up the new token.
+// Both tests below run against a REAL daemon: creating the
+// channel-server with a bogus initial bearer is the cleanest way
+// to observe the 401 path end-to-end without stubbing the daemon
+// side. The `400` test uses the daemon's own real 4xx path
+// (unknown-thread on a `resolve` call) as the negative control.
+describe("round-4 nit — 401 (stale bearer) triggers reconnect; other 4xx do not", () => {
+  let root: string;
+  let daemon: DaemonHandle;
+
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), "revkit-r4-401-"));
+    mkdirSync(join(root, "dist"), { recursive: true });
+    writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
+    mkdirSync(join(root, "docs", "adr"), { recursive: true });
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\n");
+    daemon = await startDaemon({
+      dir: join(root, "dist"),
+      repoRoot: root,
+      port: 0,
+      sqlitePath: ":memory:",
+      version: "0.0.0-test",
+      localUserId: "local-test",
+      installSignalHandlers: false,
+      logSink: { write: () => {} },
+    });
+  });
+  afterEach(async () => {
+    await daemon.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("MUTATION: a 401 on `review_url` re-runs discover and retries against the fresh bearer", async () => {
+    // `POST /-/launch-code` is bearer-only and returns `401
+    // Unauthorized` before the Origin check runs, which is the
+    // clean end-to-end way to observe the 401 path against a real
+    // daemon (no fetch stubs). The `review_url` MCP tool routes to
+    // that endpoint, so a stale bearer on the initial client
+    // produces a real 401, then `discover` swaps in the real bearer
+    // and the retry succeeds. Mutation partner: revert the
+    // `error.status !== 401` guard on the tool-call catch — the
+    // 401 short-circuits, no reconnect fires, `discoverCalls === 0`,
+    // and the result is an error whose text quotes the raw 401.
+    //
+    // Priming (a `GET /api/threads`) with the stale bearer would
+    // fail against Origin check (403) BEFORE we ever get to the
+    // tool call, so we supply an `initialListing` stub that
+    // returns the empty `{threads, head}` shape — the daemon-side
+    // 401 test happens at the tool call, not at prime.
+    const staleClient = new DaemonClient({ url: daemon.url, agentToken: "stale-bearer" });
+    let discoverCalls = 0;
+    const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+    const channel = await startChannelServer({
+      client: staleClient,
+      url: daemon.url,
+      agentToken: "stale-bearer",
+      transport: serverTx,
+      subscribeEvents: () => ({ close: () => {}, done: Promise.resolve() }),
+      // Stub prime so it does not itself hit /api/threads with the
+      // stale bearer. This test is scoped to the tool-call path.
+      initialListing: { threads: [], head: 0 },
+      discover: () => {
+        discoverCalls++;
+        return Promise.resolve({ url: daemon.url, agentToken: daemon.agentToken });
+      },
+      reconnectToolDeadlineMs: 1_500,
+      reconnectBaseDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      sleep: () => Promise.resolve(),
+    });
+    const mcpClient = new Client({ name: "r4-401", version: "0.0.0" }, { capabilities: {} });
+    await mcpClient.connect(clientTx);
+    try {
+      const result = await mcpClient.callTool({
+        name: "review_url",
+        arguments: {},
+      });
+      // With the reconnect guard in place, the retry succeeds and
+      // returns a launch URL.
+      expect(result.isError).toBeFalsy();
+      const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+      expect(text).toContain("launchUrl");
+      expect(discoverCalls).toBeGreaterThan(0);
+    } finally {
+      await channel.stop();
+      await mcpClient.close();
+    }
+  });
+
+  test("a non-401 4xx (unknown-thread → 404) still short-circuits — no reconnect", async () => {
+    // Sibling negative control: a 4xx that ISN'T 401 must NOT
+    // trigger reconnect (round-3 nit 1 already covers 400 on
+    // `reply`; this locks the same for 404 on `resolve`, since a
+    // future 4xx-tightening must keep the whitelist exact).
+    let discoverCalls = 0;
+    const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+    const channel = await startChannelServer({
+      client: new DaemonClient({ url: daemon.url, agentToken: daemon.agentToken }),
+      url: daemon.url,
+      agentToken: daemon.agentToken,
+      transport: serverTx,
+      subscribeEvents: () => ({ close: () => {}, done: Promise.resolve() }),
+      discover: () => {
+        discoverCalls++;
+        return Promise.resolve({ url: daemon.url, agentToken: daemon.agentToken });
+      },
+      reconnectToolDeadlineMs: 500,
+      reconnectBaseDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      sleep: () => Promise.resolve(),
+    });
+    const mcpClient = new Client({ name: "r4-4xx", version: "0.0.0" }, { capabilities: {} });
+    await mcpClient.connect(clientTx);
+    try {
+      const result = await mcpClient.callTool({
+        name: "resolve",
+        arguments: {
+          // Structurally-valid id shape (idSchema-clean) but points
+          // at no real thread → the daemon returns a 4xx.
+          thread_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+      expect(text).toContain("rejected by daemon");
+      // No reconnect on a plain 4xx.
+      expect(discoverCalls).toBe(0);
+    } finally {
+      await channel.stop();
+      await mcpClient.close();
+    }
+  });
+});

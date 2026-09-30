@@ -6,11 +6,11 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 
 | ID | Story | ADRs | Milestone | Tracking | Status |
 |---|---|---|---|---|---|
-| A1 | Rich question pages instead of chat prompts, answer to agent < 1 s | ADR-0007, ADR-0002, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
-| A2 | Inline comments on any block, persistent, structured to the agent | ADR-0002, ADR-0006, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
-| A3 | Threads with the agent anchored on a block | ADR-0007, ADR-0011, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
+| A1 | Rich question pages instead of chat prompts, answer to agent < 1 s | ADR-0007, ADR-0002, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
+| A2 | Inline comments on any block, persistent, structured to the agent | ADR-0002, ADR-0006, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
+| A3 | Threads with the agent anchored on a block | ADR-0007, ADR-0011, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
 | A4 | Agent publishes a report; page refreshes < 1 s without a full build | ADR-0001, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
-| A5 | Live delivery: mid-turn / while away; live, handover, quiet modes | ADR-0006, ADR-0007, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
+| A5 | Live delivery: mid-turn / while away; live, handover, quiet modes | ADR-0006, ADR-0007, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
 | A6 | Suggested edits on rendered text land in the source | ADR-0006 | M6 | [#11](https://github.com/vig-os/revkit/issues/11) | planned |
 | A7 | Co-editing the source beside the rendered view (later) | ADR-0006, ADR-0023 (deferred) | M7 | [#12](https://github.com/vig-os/revkit/issues/12) | planned |
 | A8 | Comments survive rebuilds; re-anchor, never lost (orphaned) | ADR-0006, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
