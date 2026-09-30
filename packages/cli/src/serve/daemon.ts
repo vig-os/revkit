@@ -23,7 +23,8 @@
 // same function against `port: 0` and a temporary directory.
 
 import { randomUUID } from "node:crypto";
-import { extname } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname, extname } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import {
   type Author,
@@ -179,9 +180,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
   const requestedPort = options.port ?? 0;
 
-  const store = SqliteThreadStore.open({
-    filename: options.sqlitePath ?? `${options.repoRoot}/.revkit/threads.sqlite`,
-  });
+  // Make sure `.revkit/` exists before opening the sqlite file —
+  // `bun:sqlite` creates the file but not the parent directory, and
+  // `writeServeState` (below) also assumes the directory is there.
+  const sqlitePath = options.sqlitePath ?? `${options.repoRoot}/.revkit/threads.sqlite`;
+  if (sqlitePath !== ":memory:") {
+    mkdirSync(dirname(sqlitePath), { recursive: true });
+  }
+  const store = SqliteThreadStore.open({ filename: sqlitePath });
   const staticServer = openStaticServer(options.dir);
   const bus = new EventBus();
 
