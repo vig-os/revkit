@@ -40,7 +40,13 @@ const CHECKOUT_ROOT = resolvePath(import.meta.dirname!, "..", "..", "..", "..");
 let PKG_STORE: string | null = null;
 const cleanupDirs: string[] = [];
 
-beforeAll(() => {
+// `beforeAll` is bounded by a default 5s hook timeout in bun.
+// `nix build .#revkit` on a cold cache takes minutes. Give it 20
+// minutes explicitly (bun's second arg to beforeAll). CI's `Tests`
+// job passes REVKIT_E2E_BUILD=1 which flips this test on; the
+// revkit-flake matrix already builds `.#revkit` in a sibling job so
+// the store path is warm-cached in the same nix daemon.
+beforeAll(async () => {
   if (!E2E) return;
   // Build the package. Captures the store path so the test can
   // invoke `$STORE/bin/revkit` directly.
@@ -49,7 +55,7 @@ beforeAll(() => {
     encoding: "utf8",
   }).trim();
   PKG_STORE = output.split("\n").at(-1)!.trim();
-});
+}, 20 * 60 * 1000);
 
 afterAll(() => {
   for (const d of cleanupDirs) {
