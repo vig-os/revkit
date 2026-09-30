@@ -5,7 +5,7 @@
 // export/import format and the store interface reference a single Zod
 // schema for cross-boundary validation (ADR-0025).
 import { z } from "zod";
-import { anchorSchema } from "./anchor.ts";
+import { anyAnchorSchema } from "./anchor.ts";
 import { authorSchema } from "./author.ts";
 import { isoTimestamp } from "./timestamp.ts";
 
@@ -69,7 +69,7 @@ export type Comment = z.infer<typeof commentSchema>;
 export const threadSchema = z
   .object({
     id: z.string().min(1),
-    anchor: anchorSchema,
+    anchor: anyAnchorSchema,
     status: threadStatusSchema,
     createdSeq: z.number().int().positive(),
     createdAt: isoTimestamp,

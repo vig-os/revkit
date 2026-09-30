@@ -59,7 +59,7 @@ import {
   type PrCommentToAnchorResult,
   type PrFile,
 } from "./anchor-map.ts";
-import type { Anchor } from "./anchor.ts";
+import type { Anchor, AnyAnchor } from "./anchor.ts";
 import type { Author } from "./author.ts";
 import type { ReviewEventInput } from "./events.ts";
 import { newSideLines, parsePatch, type Hunk } from "./patch.ts";
@@ -198,6 +198,13 @@ export interface GhReviewComment {
    * ${GraphQL} — used to fetch the file at that commit so a stable
    * anchor can be built (PR-43 round-3, Blocker 2). */
   readonly originalCommitOid: string | null;
+  /** The diff hunk fragment the comment was made against. Its last
+   * content line (after stripping the ` `/`+`/`-` marker) is the
+   * file's content at `originalLine`; we verify every fetched blob
+   * against this to catch a wrong-base fetch (PR-43 round-5
+   * Blocker). Null on very old comments GitHub didn't record it
+   * for. */
+  readonly diffHunk: string | null;
 }
 
 /** Input for `addPendingReviewThread`. `reviewId` is the GraphQL id
@@ -285,6 +292,8 @@ export type SnapshotUnavailableReason =
   | "no-parent"          // (LEFT-side) `originalCommit^` doesn't exist (root commit)
   | "no-snapshot"        // resolveSnapshot returned nothing for the thread
   | "mixed-sides"        // the range straddles LEFT+RIGHT; one blob can't hold both
+  | "diffhunk-mismatch"  // the fetched blob's originalLine text disagrees with the comment's diffHunk
+  | "no-merge-base"      // the merge-base lookup didn't return an oid (LEFT-side only)
   | "fetch-failed";      // any network / GitHub error
 
 /** Return type for `GitHubAdapter.fetchBlobText`. Directly re-uses
@@ -637,6 +646,7 @@ export class GitHubAdapter {
               createdAt: c.createdAt,
               url: c.url,
               originalCommitOid: c.originalCommit?.oid ?? null,
+              diffHunk: c.diffHunk ?? null,
             });
           }
           hasMore = conn.pageInfo.hasNextPage;
@@ -1028,7 +1038,7 @@ export class GitHubAdapter {
       });
 
       const snapshot = input.resolveSnapshot(thread);
-      let anchor: Anchor | undefined;
+      let anchor: AnyAnchor | undefined;
       let willOrphan = mapResult.kind === "orphan";
       let orphanReason: string | undefined =
         mapResult.kind === "orphan" ? mapResult.reason : undefined;
@@ -1043,34 +1053,22 @@ export class GitHubAdapter {
       let forceOrphan = false;
 
       if (snapshot.kind === "unavailable") {
-        // NO head revision, NO head-relative lines. Use a
-        // deterministic non-file revision (SHA-256 of the FIRST
-        // COMMENT'S body prefixed with a namespace tag) so the
-        // anchor validates, is stable across imports, and cannot
-        // possibly collide with a real file's LF-content hash.
-        // Lines: `originalLine` (the coordinates GitHub recorded
-        // at comment time). The immediate `thread.orphaned`
-        // makes clear these lines are NOT authoritative on head.
-        const endLine = thread.originalLine ?? thread.line ?? 1;
+        // PR-43 round-5 nit: proper state, not a sentinel string.
+        // Emit an UNANCHORED anchor — no revision, no quote — so
+        // the reducer parks the thread in `orphaned` from birth
+        // and downstream code (rail / reanchor engine) never tries
+        // to load a snapshot or render a quote.
+        const endLine = thread.originalLine ?? thread.line;
         const startLine = thread.originalStartLine ?? thread.startLine ?? endLine;
-        const revision = await revisionOf(
-          `<revkit:unanchored-import>\n<thread:${thread.id}>\n${firstComment.body}`,
-        );
         anchor = {
+          kind: "unanchored",
           path: thread.path,
-          startLine,
-          endLine,
-          quote: input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body),
-          revision,
-          // NO `commit` — nothing to pin to.
+          ...(startLine !== null && startLine !== undefined ? { originalStartLine: startLine } : {}),
+          ...(endLine !== null && endLine !== undefined ? { originalEndLine: endLine } : {}),
         };
         willOrphan = true;
         forceOrphan = true;
-        // If GitHub had resolved it, preserve the fact in the
-        // reason string; the terminal event is still `orphaned`.
-        orphanReason = thread.isResolved
-          ? `${snapshot.reason};was-resolved-on-github`
-          : snapshot.reason;
+        orphanReason = snapshot.reason;
       } else if (snapshot.kind === "own-commit") {
         // The authoritative branch: anchor in the coordinates of
         // the thread's own commit, with the quote cut from THAT
@@ -1086,21 +1084,18 @@ export class GitHubAdapter {
         // (same principle as the unavailable branch: no lying
         // about head).
         if (quote.exact.length === 0) {
-          const revision = await revisionOf(
-            `<revkit:unanchored-import>\n<thread:${thread.id}>\n${firstComment.body}`,
-          );
+          // Same unanchored path as the outer `unavailable` branch:
+          // no revision, no quote, thread parks in `orphaned` from
+          // birth.
           anchor = {
+            kind: "unanchored",
             path: thread.path,
-            startLine,
-            endLine,
-            quote: input.quoteFor?.(thread) ?? placeholderQuote(firstComment.body),
-            revision,
+            originalStartLine: startLine,
+            originalEndLine: endLine,
           };
           willOrphan = true;
           forceOrphan = true;
-          orphanReason = thread.isResolved
-            ? "empty-original-quote;was-resolved-on-github"
-            : "empty-original-quote";
+          orphanReason = "empty-original-quote";
         } else {
           const revision = snapshot.revision;
           snapshots.set(revision, snapshot.content);
@@ -1141,6 +1136,19 @@ export class GitHubAdapter {
 
       if (anchor === undefined) continue;
 
+      // Structured import metadata for an unanchored / orphaned
+      // thread whose remote is GitHub. PR-43 round-5 nit: proper
+      // field, not a `;was-resolved-on-github` reason suffix.
+      const externalMetadata =
+        forceOrphan
+          ? {
+              provider: "github" as const,
+              threadId: thread.id,
+              resolved: thread.isResolved,
+              ...(thread.resolvedByLogin !== null ? { resolvedByLogin: thread.resolvedByLogin } : {}),
+            }
+          : undefined;
+
       // --- Emit the events for the thread. ---
       events.push({
         kind: "comment.created",
@@ -1149,6 +1157,7 @@ export class GitHubAdapter {
         commentId: input.commentIdOf(thread, firstComment),
         anchor,
         body: firstComment.body,
+        ...(externalMetadata !== undefined ? { external: externalMetadata } : {}),
       });
       events.push({
         kind: "comment.linked",
@@ -1178,25 +1187,23 @@ export class GitHubAdapter {
         });
       }
 
-      // Terminal transition. Rules (PR-43 round-4):
+      // Terminal transition. Rules (PR-43 round-4 + round-5):
       //   - `forceOrphan` (snapshot unavailable / empty own-commit
-      //     quote): ALWAYS emit `thread.orphaned`, never
-      //     `thread.resolved`. The resolved-on-GitHub fact is
-      //     preserved in the orphan reason. This is what stops a
-      //     resolved+outdated+unavailable thread from freezing at
-      //     head lines forever.
+      //     quote): the anchor is UNANCHORED, and the reducer
+      //     starts the thread in `orphaned` from birth. No
+      //     `thread.orphaned` event is emitted (a subsequent one
+      //     would be `already-orphaned`). The
+      //     `external.resolved` field on `comment.created`
+      //     preserves the remote's resolved state (round-5 nit —
+      //     proper state, not a reason-string suffix).
       //   - Otherwise resolved wins over willOrphan (human
       //     decision > machine classification). Validator refuses
-      //     both from `open`, so only one may fire.
+      //     both terminal transitions from `open`, so only one
+      //     may fire.
       if (forceOrphan) {
         orphaned.push(threadId);
-        events.push({
-          kind: "thread.orphaned",
-          actor: firstAuthor,
-          threadId,
-          revision: anchor.revision,
-          reason: orphanReason,
-        });
+        // No further event — reducer parked it as orphaned via
+        // the unanchored anchor on comment.created.
       } else if (thread.isResolved) {
         const actor: Author =
           thread.resolvedByLogin !== null
@@ -1209,6 +1216,9 @@ export class GitHubAdapter {
           resolution: "resolved on GitHub",
         });
       } else if (willOrphan) {
+        // Non-force orphan (RIGHT/LEFT-mixed on head-side maps).
+        // The anchor is a LINE anchor (has `revision`).
+        if (!("revision" in anchor)) continue;
         orphaned.push(threadId);
         events.push({
           kind: "thread.orphaned",
@@ -1248,14 +1258,23 @@ export class GitHubAdapter {
     readonly headRevisionOf: (path: string) => string | undefined;
     readonly headSourceOf?: (path: string) => string | undefined;
     readonly headCommitOid?: string;
+    /** The PR base's ref (branch name) OR commit OID. Used to
+     * compute the LEFT-side merge-base (`compare/{base}...{originalCommit}`).
+     * PR-43 round-5 Blocker: GitHub's LEFT side is the merge-base,
+     * not `originalCommit^`. Required for LEFT-side thread import;
+     * LEFT threads become `unavailable` when omitted. */
+    readonly pullRequestBaseRef?: string;
     /** Return the OLD path for a currently-renamed file (from
      * `PrFile.previousFilename`), so a LEFT-side thread reads the
-     * parent commit at its original name. */
+     * merge-base commit at its original name. */
     readonly oldPathOf?: (currentPath: string) => string | undefined;
     readonly quoteFor?: (thread: GhReviewThread) => { exact: string; prefix: string; suffix: string };
   }): Promise<ReturnType<typeof GitHubAdapter.mapThreadsToEvents>> {
     // Pre-fetch every thread's snapshot, deduping by (expression).
-    const cache = new Map<string, ThreadSnapshot>();
+    const blobCache = new Map<string, ThreadSnapshot>();
+    // Merge-base cache keyed by originalCommitOid — one lookup per
+    // originating commit no matter how many LEFT threads reference it.
+    const mergeBaseCache = new Map<string, string | null>();
     const snapshotFor = new Map<string, ThreadSnapshot>();
     for (const thread of input.threads) {
       const key = thread.id;
@@ -1296,48 +1315,99 @@ export class GitHubAdapter {
         continue;
       }
 
-      // Build the expression for the blob to fetch. RIGHT-side
-      // uses the form OID+colon+path. LEFT-side uses the parent
-      // form OID+caret+colon+oldPath (parent of the commit the
-      // comment was made against, at the file's OLD name if the
-      // file was renamed in the PR).
-      let expression: string;
-      let referencedOid: string;
-      if (thread.diffSide === "LEFT") {
+      // Candidate list — the base blob we try in order. For RIGHT
+      // side there's exactly one candidate: `<originalOid>:<path>`.
+      // For LEFT side there are up to TWO candidates (PR-43
+      // round-5 Blocker):
+      //   1. merge-base of `pullRequestBaseRef` and `originalOid`
+      //      at `<oldPath>` — GitHub's LEFT side on the full PR
+      //      diff.
+      //   2. `<originalOid>^:<oldPath>` — first parent, correct on
+      //      the single-commit view.
+      // We fetch the first, verify against `diffHunk`, and fall
+      // back to the second only on mismatch. If both mismatch we
+      // record `diffhunk-mismatch` and orphan.
+      const candidates: Array<{ expression: string; referencedOid: string }> = [];
+      const side = thread.diffSide;
+      if (side === "LEFT") {
         const oldPath = input.oldPathOf?.(thread.path) ?? thread.path;
-        expression = `${originalOid}^:${oldPath}`;
-        // For LEFT the recorded `oid` is the parent — resolved
-        // server-side, so we tag the snapshot with the syntactic
-        // form for clarity. The daemon persists snapshot content
-        // by REVISION (a SHA-256), so a human-readable oid here
-        // is diagnostic only.
-        referencedOid = `${originalOid}^`;
+        if (input.pullRequestBaseRef !== undefined) {
+          let mbOid = mergeBaseCache.get(originalOid);
+          if (mbOid === undefined) {
+            try {
+              mbOid = await this.getMergeBase({
+                owner: input.pr.owner,
+                repo: input.pr.repo,
+                base: input.pullRequestBaseRef,
+                head: originalOid,
+              });
+            } catch {
+              mbOid = null;
+            }
+            mergeBaseCache.set(originalOid, mbOid);
+          }
+          if (mbOid !== null) {
+            candidates.push({ expression: `${mbOid}:${oldPath}`, referencedOid: mbOid });
+          }
+        }
+        // Single-commit-view fallback.
+        candidates.push({ expression: `${originalOid}^:${oldPath}`, referencedOid: `${originalOid}^` });
       } else {
-        expression = `${originalOid}:${thread.path}`;
-        referencedOid = originalOid;
+        candidates.push({ expression: `${originalOid}:${thread.path}`, referencedOid: originalOid });
       }
 
-      let snap = cache.get(expression);
-      if (snap === undefined) {
-        try {
-          const result = await this.fetchBlobText({
-            owner: input.pr.owner,
-            repo: input.pr.repo,
-            expression,
-          });
-          if (result.kind === "text") {
-            const rev = await revisionOf(result.text);
-            snap = { kind: "own-commit", content: result.text, oid: referencedOid, revision: rev };
-          } else {
-            snap = { kind: "unavailable", reason: result.kind };
+      let chosen: ThreadSnapshot | undefined;
+      let lastReason: SnapshotUnavailableReason = candidates.length === 0 ? "no-merge-base" : "diffhunk-mismatch";
+      for (const cand of candidates) {
+        const cached = blobCache.get(cand.expression);
+        let snap: ThreadSnapshot;
+        if (cached !== undefined) {
+          snap = cached;
+        } else {
+          try {
+            const result = await this.fetchBlobText({
+              owner: input.pr.owner,
+              repo: input.pr.repo,
+              expression: cand.expression,
+            });
+            if (result.kind === "text") {
+              const rev = await revisionOf(result.text);
+              snap = { kind: "own-commit", content: result.text, oid: cand.referencedOid, revision: rev };
+            } else {
+              snap = { kind: "unavailable", reason: result.kind };
+            }
+          } catch {
+            snap = { kind: "unavailable", reason: "fetch-failed" };
           }
-        } catch {
-          // Any network / GitHub error → typed unavailable reason.
-          snap = { kind: "unavailable", reason: "fetch-failed" };
+          blobCache.set(cand.expression, snap);
         }
-        cache.set(expression, snap);
+        if (snap.kind !== "own-commit") {
+          // The `live` case cannot occur here (fetch only returns
+          // text or unavailable); an unavailable snapshot passes
+          // its reason through.
+          if (snap.kind === "unavailable") lastReason = snap.reason;
+          continue;
+        }
+        // Verify against the comment's diff hunk. `hunk-empty` and
+        // `line-missing` are treated as "cannot verify but the
+        // blob is plausible" — accept the first candidate. If the
+        // hunk verification says `mismatched`, try the next
+        // candidate.
+        const originalLine = thread.originalLine ?? thread.line ?? 0;
+        const verification = verifyContentAgainstDiffHunk({
+          content: snap.content,
+          originalLine,
+          diffHunk: first.diffHunk,
+          side,
+        });
+        if (verification === "matched" || verification === "hunk-empty" || verification === "line-missing") {
+          chosen = snap;
+          break;
+        }
+        lastReason = "diffhunk-mismatch";
       }
-      snapshotFor.set(key, snap);
+
+      snapshotFor.set(key, chosen ?? { kind: "unavailable", reason: lastReason });
     }
     return GitHubAdapter.mapThreadsToEvents({
       threads: input.threads,
@@ -1377,6 +1447,28 @@ export class GitHubAdapter {
     if (object.isTruncated === true) return { kind: "truncated" };
     if (typeof object.text !== "string") return { kind: "no-text" };
     return { kind: "text", text: object.text };
+  }
+
+  /**
+   * Return the merge-base commit SHA of `base` and `head` via REST
+   * `GET /repos/{owner}/{repo}/compare/{base}...{head}`
+   * (`merge_base_commit.sha`). Used by `importThreads` to locate
+   * the correct LEFT-side base for a comment on the full PR diff
+   * (PR-43 round-5 Blocker): GitHub's LEFT side is the merge-base
+   * of the PR base and the review commit — NOT the review commit's
+   * first parent (which is only correct on the single-commit
+   * view). Both `base` and `head` may be branch names or SHAs.
+   */
+  async getMergeBase(input: {
+    readonly owner: string;
+    readonly repo: string;
+    readonly base: string;
+    readonly head: string;
+  }): Promise<string | null> {
+    const url = `${this.baseUrl}/repos/${enc(input.owner)}/${enc(input.repo)}/compare/${enc(input.base)}...${enc(input.head)}`;
+    const res = await this.restWithRetry("GET", url);
+    const body = (await res.json()) as { merge_base_commit?: { sha?: string } };
+    return body.merge_base_commit?.sha ?? null;
   }
 
   // --- Internals --- //
@@ -1578,6 +1670,59 @@ export function composeFileFallbackBody(
  * so downstream consumers see something meaningful. The
  * following `thread.orphaned` event makes the placeholder
  * nature explicit. */
+/**
+ * Verify that `content`'s line `originalLine` matches the LAST
+ * content line of `diffHunk` (after stripping the marker character
+ * for the appropriate side). PR-43 round-5 Blocker: if the fetch
+ * pulled the wrong base blob, the anchor would be self-consistent
+ * but ON THE WRONG TEXT, and the reanchor engine would carry that
+ * wrong text to head. This check catches it before the anchor is
+ * emitted.
+ *
+ * The diff hunk shape: first line is `@@ -a,b +c,d @@` (optionally
+ * followed by trailing context after the second `@@`); subsequent
+ * lines have a `+`, `-` or ` ` marker. The LAST such line whose
+ * side matches ours is the one recorded at `originalLine`:
+ *   - RIGHT side: match the trailing `+` or ` ` line
+ *   - LEFT side:  match the trailing `-` or ` ` line
+ *
+ * `content` is compared LF-normalised so a CRLF blob doesn't
+ * false-fail against an LF diff hunk.
+ *
+ * Returns:
+ *   - `matched` when the cut line equals the hunk's last side-line
+ *   - `mismatched` when both lines exist but differ
+ *   - `hunk-empty` when `diffHunk` is null / empty / has no side-line
+ *   - `line-missing` when `content` doesn't have an `originalLine`
+ */
+export function verifyContentAgainstDiffHunk(input: {
+  readonly content: string;
+  readonly originalLine: number;
+  readonly diffHunk: string | null;
+  readonly side: "LEFT" | "RIGHT";
+}): "matched" | "mismatched" | "hunk-empty" | "line-missing" {
+  if (input.diffHunk === null || input.diffHunk.length === 0) return "hunk-empty";
+  const lfContent = input.content.replace(/\r\n?/g, "\n");
+  const lines = lfContent.split("\n");
+  if (input.originalLine < 1 || input.originalLine > lines.length) return "line-missing";
+  const contentLine = lines[input.originalLine - 1] ?? "";
+  // Walk the diff hunk from the end backwards, finding the last
+  // line whose marker matches our side. Skip the `@@` header itself.
+  const hunkLines = input.diffHunk.split("\n");
+  const sideMarker = input.side === "RIGHT" ? "+" : "-";
+  for (let i = hunkLines.length - 1; i >= 0; i--) {
+    const line = hunkLines[i] ?? "";
+    if (line.startsWith("@@")) break;
+    if (line.length === 0) continue;
+    const marker = line.charAt(0);
+    if (marker === sideMarker || marker === " ") {
+      const stripped = line.slice(1);
+      return stripped === contentLine ? "matched" : "mismatched";
+    }
+  }
+  return "hunk-empty";
+}
+
 function placeholderQuote(commentBody: string): { exact: string; prefix: string; suffix: string } {
   const firstLine = commentBody.split(/\r?\n/).find((line) => line.trim().length > 0) ?? commentBody;
   const trimmed = firstLine.trim().slice(0, 200);
@@ -1616,6 +1761,7 @@ function mapReviewThread(node: ReviewThreadGraphqlNode): GhReviewThread {
       createdAt: c.createdAt,
       url: c.url,
       originalCommitOid: c.originalCommit?.oid ?? null,
+      diffHunk: c.diffHunk ?? null,
     })),
   };
 }
@@ -1742,6 +1888,7 @@ interface ReviewCommentGraphqlNode {
   readonly url: string;
   readonly author: { readonly login: string; readonly __typename: string } | null;
   readonly originalCommit: { readonly oid: string } | null;
+  readonly diffHunk: string | null;
 }
 
 interface PendingReviewCommentGraphqlNode {
@@ -1904,6 +2051,7 @@ const REVIEW_THREADS_QUERY = /* GraphQL */ `
                 url
                 author { login __typename }
                 originalCommit { oid }
+                diffHunk
               }
             }
           }
@@ -1928,6 +2076,7 @@ const THREAD_COMMENTS_QUERY = /* GraphQL */ `
             url
             author { login __typename }
             originalCommit { oid }
+                diffHunk
           }
         }
       }

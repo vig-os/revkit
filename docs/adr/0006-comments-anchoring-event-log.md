@@ -57,3 +57,31 @@ frame:
 
 The event kinds `thread.reanchored` and `thread.orphaned` carry these outcomes; the wire methods are `quote-exact`
 (unchanged / moved) and `fuzzy` (modified). Fuzzy carries the similarity score.
+
+## Amendment (PR-43 round-5): the `unanchored` anchor kind
+
+An imported thread whose source content cannot be fetched (blob deleted / binary / truncated / diffHunk verification
+failed) is a real case the model must represent honestly. The round-4 approach — a placeholder line anchor with a
+`revisionOf("<sentinel>\n...")` value — was a proper-state violation: the placeholder revision matched no file, so
+the re-anchor engine's identity short-circuit could freeze the thread at wrong lines forever.
+
+Round-5 replaces the placeholder with a **new anchor kind: `unanchored`**. Schema (`packages/review-core/src/anchor.ts`):
+
+```ts
+{ kind: "unanchored", path, originalStartLine?, originalEndLine? }
+```
+
+- **No `revision`, no `quote`.** The two fields the re-anchor engine reads are absent — the engine skips unanchored
+  threads entirely. The rail renders the thread under the path, without a quote.
+- **`originalStartLine` / `originalEndLine` are diagnostic only** — the coordinates GitHub recorded at comment time.
+  They do not semantically map to any revision.
+- **The reducer parks the thread in `orphaned` from birth** when `comment.created.anchor.kind === "unanchored"`.
+  The validator refuses subsequent `thread.orphaned` (already orphaned) and `thread.resolved` (not open). This
+  turns the "we don't know where this belongs" state into first-class state, not a sentinel string.
+- **Origin metadata rides on a structured field**: `comment.created.external` and `thread.orphaned.external` carry
+  `{ provider: "github", threadId, resolved: boolean, resolvedByLogin? }`. Downstream (B4 two-way sync — ADR-0025
+  amendment) reads these to reconcile local orphan status with remote resolved status without regex-parsing
+  reason strings.
+
+The existing line-anchor schema is unchanged — line anchors have no `kind` field on the wire. `anyAnchorSchema` is
+the discriminated union used by `comment.created.anchor` and `Thread.anchor`.

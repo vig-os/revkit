@@ -122,3 +122,24 @@ The other milestones renumber only if the owner wants them to; the split above i
 - Fork PRs, or any PR whose tooling files (flake inputs, `package.json` scripts, `astro.config.*`, prek/hook
   configuration, lockfile) differ from the base, are **refused unless the reviewer passes `--trust`**; `--trust`
   binds to the exact head SHA and prints the tooling diff before proceeding.
+
+## Amendment (PR-43 round-5)
+
+- **LEFT-side thread import uses the merge-base**, not `originalCommit^`. GitHub's LEFT side on the full PR diff is
+  the merge-base of the PR base and the commit the comment was made against — verified live-read-only against
+  TypeScript#64381 (`Herebyfile.mjs:1233`) and TypeScript#64408 (`SKILL.md:16`). The adapter resolves the merge-base
+  via REST `GET /repos/{o}/{r}/compare/{baseRef}...{originalCommit}` (`merge_base_commit.sha`), caches it per
+  originalCommitOid, then fetches `<mergeBase>:<oldPath>`. It falls back to `<originalCommit>^:<oldPath>` on
+  diffHunk mismatch (correct in single-commit view), and marks the thread `unavailable, reason: diffhunk-mismatch`
+  when neither matches. Every fetched blob is verified against the comment's `diffHunk` (last stripped side-line
+  must equal the file's `originalLine` content) before it is trusted.
+- **Imported threads whose source content is unavailable** (blob not-found / binary / truncated / diffHunk-mismatch)
+  use the new **unanchored anchor kind** on `comment.created` (see ADR-0006 amendment). The reducer parks the
+  thread in `orphaned` from birth; the rail / re-anchor engine never load a snapshot for it. Resolved-on-GitHub
+  metadata rides on a structured `external: { provider: "github", threadId, resolved, resolvedByLogin? }` field
+  on the same event, so B4 two-way sync can reconcile the LOCAL orphan status with the REMOTE resolved status
+  without regex-parsing prose. When B4 lands (M4), the reconciliation rule is:
+  - GitHub resolves a locally-orphaned thread → the local UI shows "resolved on GitHub (originally imported
+    unanchored)"; the thread stays orphaned on the local anchor axis.
+  - The local reviewer explicitly re-anchors an orphaned imported thread → the LOCAL anchor gets a line-anchored
+    revision; the `external.resolved` bit is preserved as historical metadata.

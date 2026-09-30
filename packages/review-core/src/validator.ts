@@ -175,8 +175,13 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       if (state.commentIndex.has(event.commentId)) {
         return duplicateComment(event.commentId);
       }
+      // PR-43 round-5: an unanchored anchor puts the thread in
+      // `orphaned` from birth. The reducer mirrors this so the two
+      // stay in lock-step.
+      const initialStatus =
+        "kind" in event.anchor && event.anchor.kind === "unanchored" ? "orphaned" : "open";
       state.threads.set(event.threadId, {
-        status: "open",
+        status: initialStatus,
         path: event.anchor.path,
         commentIds: new Set([event.commentId]),
       });

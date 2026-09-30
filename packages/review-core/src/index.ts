@@ -8,7 +8,19 @@
 // `test/browser-build.test.ts` and the src-only tsconfig
 // (`tsconfig.src.json`) that typechecks without bun globals.
 
-export { anchorPathSchema, anchorSchema, textQuoteSchema, type Anchor, type TextQuote } from "./anchor.ts";
+export {
+  anchorPathSchema,
+  anchorSchema,
+  anyAnchorSchema,
+  isLineAnchor,
+  isUnanchoredAnchor,
+  textQuoteSchema,
+  unanchoredAnchorSchema,
+  type Anchor,
+  type AnyAnchor,
+  type TextQuote,
+  type UnanchoredAnchor,
+} from "./anchor.ts";
 export {
   anchorToPrComment,
   anchorToPrCommentWithHunks,

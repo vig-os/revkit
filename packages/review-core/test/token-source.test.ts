@@ -61,26 +61,35 @@ describe("redactTokenInMessage", () => {
     }
   });
 
-  test("does NOT scrub prose collisions where the prefix sits mid-word", () => {
-    // PR-43 round-4: the earlier rule scrubbed `highs_and_lows...`
-    // because `ghs_` + `and_lows...` is a legal token shape. With
-    // the word-boundary check, prose shapes are safe.
-    const long = "and_lows_" + "A".repeat(30);
-    const before = `highs_${long}`;
+  test("does NOT scrub prose collisions where the mid-word tail is shorter than a real token", () => {
+    // PR-43 round-5: `highs_and_lows` (10 chars after `ghs_`) —
+    // under the 36-char in-word threshold. The word-boundary tier
+    // requires `\b`, which doesn't fire between word chars.
+    const before = "highs_and_lows_something_here_short_20";
     const scrubbed = redactTokenInMessage(before, "");
-    // Nothing was redacted.
     expect(scrubbed).toBe(before);
     expect(scrubbed).not.toContain("<redacted:ghtoken>");
   });
 
-  test("does NOT scrub letter- or digit-adjacent joins (aghp_..., 4ghs_...)", () => {
-    // Real tokens don't appear in these shapes; refusing the
-    // scrub is the safer default.
-    for (const preamble of ["a", "z", "9", "4"]) {
-      const s = `${preamble}ghp_${"a".repeat(40)}`;
+  test("scrubs underscore-joined and alnum-joined when tail >= 36 chars (real token length)", () => {
+    // PR-43 round-5 nit: bring back scrubbing for `aghp_<36>` /
+    // `x_ghp_<36>` shapes — real leaked tokens are ≥ 36 chars in
+    // the tail, and a leak that concatenates a variable name with
+    // the token is a real shape.
+    for (const preamble of ["a", "z", "9", "4", "prefix_", "x_"]) {
+      const token = "ghp_" + "a".repeat(36);
+      const s = `${preamble}${token} tail`;
       const scrubbed = redactTokenInMessage(s, "");
-      expect(scrubbed).toBe(s);
+      expect(scrubbed).not.toContain(token);
+      expect(scrubbed).toContain("<redacted:ghtoken>");
     }
+  });
+
+  test("does NOT scrub prose collisions where the mid-word tail is < 36 chars", () => {
+    // `highs_and_lows` has only 10 chars after `ghs_` — the
+    // in-word tier requires ≥ 36, so this stays safe.
+    const s = `highs_and_lows_${"z".repeat(20)}`;
+    expect(redactTokenInMessage(s, "")).toBe(s);
   });
 
   test("does NOT scrub short strings shaped like a prefix (min tail 30)", () => {

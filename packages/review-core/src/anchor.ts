@@ -73,3 +73,57 @@ export const anchorSchema = z
   });
 
 export type Anchor = z.infer<typeof anchorSchema>;
+
+/** An imported thread whose source content we couldn't fetch (blob
+ * deleted / binary / truncated / diffHunk mismatch) is emitted with
+ * an **unanchored** anchor: no `revision`, no `quote`, just the
+ * path and the coordinates GitHub recorded at comment time as
+ * metadata. The reducer treats a thread born with an unanchored
+ * anchor as `orphaned` from birth (validator refuses subsequent
+ * `thread.orphaned` / `thread.resolved` for it — the terminal
+ * state is set on creation), and the reanchor engine / rail skip
+ * it entirely (no content to load, no quote to render). PR-43
+ * round-5 nit: replaces the round-4 "namespaced-hash-of-body"
+ * placeholder — proper state, not a sentinel string. */
+export const unanchoredAnchorSchema = z
+  .object({
+    kind: z.literal("unanchored"),
+    path: anchorPathSchema,
+    /** The 1-indexed line number GitHub recorded at comment time.
+     * Diagnostic only — the anchor doesn't semantically map to a
+     * revision, so this line number cannot be looked up. */
+    originalStartLine: z.number().int().positive().optional(),
+    originalEndLine: z.number().int().positive().optional(),
+  })
+  .strict()
+  .refine(
+    (a) => a.originalEndLine === undefined || a.originalStartLine === undefined || a.originalEndLine >= a.originalStartLine,
+    {
+      message: "unanchored anchor: originalEndLine must be >= originalStartLine when both are set.",
+      path: ["originalEndLine"],
+    },
+  );
+
+export type UnanchoredAnchor = z.infer<typeof unanchoredAnchorSchema>;
+
+/** Union of the two anchor variants. Used by events (`comment.created`)
+ * and by `Thread.anchor` so the reducer / store carry either shape
+ * without lossy narrowing.
+ *
+ * A downstream consumer that needs to read `.startLine` narrows on
+ * the absence of `kind` (line anchors omit it — see `isLineAnchor`)
+ * or on `.kind === "unanchored"` to skip. */
+export const anyAnchorSchema = z.union([anchorSchema, unanchoredAnchorSchema]);
+export type AnyAnchor = z.infer<typeof anyAnchorSchema>;
+
+/** Type guard: an anchor is a line anchor when it doesn't carry
+ * `kind: "unanchored"`. The existing line-anchor schema does not
+ * require a `kind` field, so its instances have `kind === undefined`. */
+export function isLineAnchor(anchor: AnyAnchor): anchor is Anchor {
+  return !("kind" in anchor) || anchor.kind !== "unanchored";
+}
+
+/** Type guard: an anchor is unanchored. */
+export function isUnanchoredAnchor(anchor: AnyAnchor): anchor is UnanchoredAnchor {
+  return "kind" in anchor && anchor.kind === "unanchored";
+}

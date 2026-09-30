@@ -60,23 +60,22 @@ export function redactTokenInMessage(message: string, token: string): string {
     // Replace all occurrences. `split`/`join` avoids a regex escape.
     out = out.split(token).join("<redacted:token>");
   }
-  // GitHub token prefixes plus a plausible tail (letters, digits,
-  // underscore) of at least 30 chars.
+  // Two-tier redaction:
   //
-  // PR-43 round-4 nit: the earlier "match anywhere" rule redacted
-  // `highs_and_lows...` → `hi<redacted:ghtoken>` because `ghs_` +
-  // `and_lows...` is a legal token shape. Require a WORD boundary
-  // before the prefix (`\b`): start of string, or a transition
-  // from a non-word char (space, punctuation, newline) to `g`.
-  // That refuses letter- and digit-adjacent joins (`aghp_...`,
-  // `4ghs_...`) and underscore joins (`foo_ghp_...`) — none of
-  // which are shapes a leaked token actually takes in practice
-  // (leaks appear after `=`, `:`, whitespace, `"`, or at the
-  // start of a line). Combined with the 30-char minimum on the
-  // token body, this eliminates the `highs_and_lows` class of
-  // false positive without weakening the redaction of real
-  // leaks.
+  // 1. Word-boundary + 30-char tail — catches the vast majority of
+  //    leak shapes (`token=ghp_...`, `"ghp_..."`, whitespace-adjacent,
+  //    start-of-line). Refuses letter-/digit-/underscore-adjacent
+  //    prose collisions like `highs_and_lows` because `\b` doesn't
+  //    fire between word chars.
+  //
+  // 2. In-word join + 36-char tail — PR-43 round-5 nit: catches the
+  //    specific `x_ghp_...` or `aghp_...` shapes where a variable
+  //    name runs directly into a token value. Real GitHub tokens
+  //    are `<prefix>_` + 36 chars, so the length gate keeps prose
+  //    collisions (`highs_and_lows` — only 10 chars after `ghs_`)
+  //    safe.
   out = out.replace(/\b(gh[opusr]_|github_pat_)[A-Za-z0-9_]{30,}/g, "<redacted:ghtoken>");
+  out = out.replace(/(gh[opusr]_|github_pat_)[A-Za-z0-9_]{36,}/g, "<redacted:ghtoken>");
   // `Authorization: Bearer <anything up to whitespace or quote>`.
   out = out.replace(/(Authorization:\s*Bearer\s+)[^\s"']+/gi, "$1<redacted>");
   return out;

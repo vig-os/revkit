@@ -15,15 +15,25 @@ import { describe, expect, test } from "bun:test";
 import {
   buildQuoteFromLines,
   GitHubAdapter,
+  isLineAnchor,
   reduce,
   reviewEventSchema,
   retryAfterMs,
   revisionOf,
   shouldRetry,
+  type Anchor,
+  type AnyAnchor,
   type GhReviewThread,
   type ReviewEvent,
   type ThreadSnapshot,
 } from "../src/index.ts";
+
+/** Narrow an `AnyAnchor` to a line anchor or throw. Used across
+ * tests that expect the successful own-commit / live path. */
+function asLineAnchor(anchor: AnyAnchor): Anchor {
+  if (!isLineAnchor(anchor)) throw new Error(`expected a LINE anchor, got: ${JSON.stringify(anchor)}`);
+  return anchor;
+}
 
 /** Stamp events with monotonic seq/ts so the reducer accepts them. */
 function stampEvents(
@@ -78,6 +88,7 @@ function thread(overrides: Partial<GhReviewThread> = {}): GhReviewThread {
         createdAt: "2026-09-30T00:00:00Z",
         url: "https://github.com/vig-os/revkit/pull/8#discussion_r1",
         originalCommitOid: "1".repeat(40),
+        diffHunk: null,
       },
     ],
     ...overrides,
@@ -108,11 +119,11 @@ describe("mapThreadsToEvents — live RIGHT threads", () => {
       ...created,
     });
     if (stamped.kind !== "comment.created") throw new Error("kind");
-    expect(stamped.anchor.revision).toBe(HEAD_REV);
-    expect(stamped.anchor.commit).toBe("9".repeat(40));
+    expect(asLineAnchor(stamped.anchor).revision).toBe(HEAD_REV);
+    expect(asLineAnchor(stamped.anchor).commit).toBe("9".repeat(40));
     // The quote is cut from HEAD content at the requested lines.
     const expected = buildQuoteFromLines(HEAD_SOURCE, 5, 5);
-    expect(stamped.anchor.quote.exact).toBe(expected.exact);
+    expect(asLineAnchor(stamped.anchor).quote.exact).toBe(expected.exact);
     // Head source appears in snapshots.
     expect(snapshots.get(HEAD_REV)).toBe(HEAD_SOURCE);
   });
@@ -151,12 +162,12 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
     if (created.kind !== "comment.created") throw new Error("kind");
     // CRITICAL: the anchor revision is the original commit's — NOT
     // head. This is exactly what Blocker 2 was about.
-    expect(created.anchor.revision).toBe(ORIGINAL_REV);
-    expect(created.anchor.revision).not.toBe(HEAD_REV);
-    expect(created.anchor.commit).toBe("1".repeat(40));
+    expect(asLineAnchor(created.anchor).revision).toBe(ORIGINAL_REV);
+    expect(asLineAnchor(created.anchor).revision).not.toBe(HEAD_REV);
+    expect(asLineAnchor(created.anchor).commit).toBe("1".repeat(40));
     // The quote came from ORIGINAL content.
     const expected = buildQuoteFromLines(ORIGINAL_SOURCE, 3, 3);
-    expect(created.anchor.quote.exact).toBe(expected.exact);
+    expect(asLineAnchor(created.anchor).quote.exact).toBe(expected.exact);
     // Snapshot map contains the original content at its revision.
     expect(snapshots.get(ORIGINAL_REV)).toBe(ORIGINAL_SOURCE);
     // Reduce: the thread is orphaned.
@@ -185,8 +196,8 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
     expect(orphanedThreadIds).toEqual(["T-left"]);
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).toBe(ORIGINAL_REV);
-    expect(created.anchor.commit).toBe("2".repeat(40));
+    expect(asLineAnchor(created.anchor).revision).toBe(ORIGINAL_REV);
+    expect(asLineAnchor(created.anchor).commit).toBe("2".repeat(40));
     // Reduce → orphaned.
     const reduced = reduce(stampEvents(events)).get("T-left");
     expect(reduced?.status).toBe("orphaned");
@@ -217,7 +228,7 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
     // Anchor uses own-commit revision.
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).toBe(ORIGINAL_REV);
+    expect(asLineAnchor(created.anchor).revision).toBe(ORIGINAL_REV);
     // Resolved event present; no orphan event.
     const kinds = events.map((e) => e.kind);
     expect(kinds).toContain("thread.resolved");
@@ -229,12 +240,12 @@ describe("mapThreadsToEvents — outdated / LEFT threads use own-commit anchor",
     // Reduce → resolved, at own-commit anchor.
     const reduced = reduce(stampEvents(events)).get("T-both");
     expect(reduced?.status).toBe("resolved");
-    expect(reduced?.anchor.revision).toBe(ORIGINAL_REV);
+    expect(asLineAnchor(reduced!.anchor).revision).toBe(ORIGINAL_REV);
   });
 });
 
 describe("mapThreadsToEvents — snapshot unavailable", () => {
-  test("unavailable snapshot uses head-revision placeholder + orphans with reason", async () => {
+  test("unavailable snapshot emits an UNANCHORED anchor (kind: 'unanchored', no revision, no quote); reducer parks as orphaned-from-birth", async () => {
     if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
     const t = thread({ isOutdated: true, line: null, originalLine: 3 });
     const { events, orphanedThreadIds } = await GitHubAdapter.mapThreadsToEvents({
@@ -246,18 +257,21 @@ describe("mapThreadsToEvents — snapshot unavailable", () => {
       resolveSnapshot: () => ({ kind: "unavailable", reason: "not-found" }),
     });
     expect(orphanedThreadIds).toEqual(["T-un"]);
-    const orphan = events.find((e) => e.kind === "thread.orphaned");
-    if (orphan?.kind !== "thread.orphaned") throw new Error("kind");
-    expect(orphan.reason).toBe("not-found");
-    // BLOCKER (PR-43 round-4): the anchor MUST NOT carry the head
-    // revision when the snapshot is unavailable — a head revision
-    // pins the thread at head lines that don't actually contain
-    // its content. We use a deterministic non-file revision
-    // (hash of the comment body under a namespace tag) instead.
+    // PR-43 round-5 nit: no thread.orphaned event — the unanchored
+    // anchor makes the reducer start the thread in `orphaned` from
+    // birth.
+    const kinds = events.map((e) => e.kind);
+    expect(kinds).not.toContain("thread.orphaned");
+    // Anchor is unanchored — no revision, no quote, originalStartLine present.
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).not.toBe(HEAD_REV);
-    expect(created.anchor.commit).toBeUndefined();
+    if (!("kind" in created.anchor) || created.anchor.kind !== "unanchored")
+      throw new Error("expected unanchored anchor");
+    expect(created.anchor.originalStartLine).toBe(3);
+    expect(created.anchor.originalEndLine).toBe(3);
+    // Reduce and verify status.
+    const reduced = reduce(stampEvents(events)).get("T-un");
+    expect(reduced?.status).toBe("orphaned");
   });
 });
 
@@ -281,25 +295,31 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
       // Content unavailable (deleted / binary / truncated / not-found).
       resolveSnapshot: () => ({ kind: "unavailable", reason: "not-found" }),
     });
-    // The terminal transition is thread.orphaned, not
-    // thread.resolved — resolved-on-GitHub is preserved in the
-    // reason string but the anchor is not authoritative.
+    // PR-43 round-5: unanchored anchor + structured external
+    // metadata carrying `resolved: true` — no `thread.resolved`
+    // event, no `thread.orphaned` event.
     expect(orphanedThreadIds).toEqual(["RES_OUT_UNAV"]);
     const kinds = events.map((e) => e.kind);
-    expect(kinds).toContain("thread.orphaned");
+    expect(kinds).not.toContain("thread.orphaned");
     expect(kinds).not.toContain("thread.resolved");
-    const orphan = events.find((e) => e.kind === "thread.orphaned")!;
-    if (orphan.kind !== "thread.orphaned") throw new Error("kind");
-    expect(orphan.reason).toContain("not-found");
-    expect(orphan.reason).toContain("was-resolved-on-github");
-    // Anchor: no head revision, no `commit` (nothing to pin to).
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).not.toBe(HEAD_REV);
-    expect(created.anchor.commit).toBeUndefined();
+    if (!("kind" in created.anchor) || created.anchor.kind !== "unanchored")
+      throw new Error("expected unanchored");
+    // Structured external field replaces the ;was-resolved-on-github
+    // reason suffix (round-5 nit).
+    expect(created.external).toEqual({
+      provider: "github",
+      threadId: "PRRT_x",
+      resolved: true,
+      resolvedByLogin: "carol",
+    });
+    // Reduce → thread status is orphaned (from unanchored anchor).
+    const reduced = reduce(stampEvents(events)).get("RES_OUT_UNAV");
+    expect(reduced?.status).toBe("orphaned");
   });
 
-  test("RES_LEFT_UNAV: resolved+LEFT+unavailable also emits thread.orphaned, not resolved", async () => {
+  test("RES_LEFT_UNAV: resolved+LEFT+unavailable emits unanchored anchor; reducer parks orphaned; external.resolved=true", async () => {
     if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
     const t = thread({
       diffSide: "LEFT",
@@ -318,24 +338,48 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
     });
     expect(orphanedThreadIds).toEqual(["RES_LEFT_UNAV"]);
     const kinds = events.map((e) => e.kind);
-    expect(kinds).toContain("thread.orphaned");
+    expect(kinds).not.toContain("thread.orphaned");
     expect(kinds).not.toContain("thread.resolved");
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).not.toBe(HEAD_REV);
-    expect(created.anchor.commit).toBeUndefined();
+    if (!("kind" in created.anchor) || created.anchor.kind !== "unanchored")
+      throw new Error("expected unanchored");
+    expect(created.external?.provider).toBe("github");
+    expect(created.external?.resolved).toBe(true);
+    const reduced = reduce(stampEvents(events)).get("RES_LEFT_UNAV");
+    expect(reduced?.status).toBe("orphaned");
   });
 
-  test("LEFTRES via importThreads: LEFT+resolved fetches parent-of-originalCommit blob (never head; never originalCommit alone)", async () => {
-    // Fake fetch: only allow `<oid>^:<path>` expressions to
-    // succeed. If importThreads tries `<oid>:<path>` for a LEFT
-    // thread, this returns null and the thread becomes
-    // unavailable — the assertion below would fail.
+  test("LEFTRES via importThreads (multi-commit PR): merge-base blob wins over originalCommit^ when they differ AND the file changed", async () => {
+    // PR-43 round-5 Blocker (RED on 25d5608d): GitHub's LEFT side
+    // for a full-PR-diff comment is the MERGE-BASE of the PR base
+    // and originalCommit, NOT `originalCommit^`. This scenario
+    // mirrors the reviewer's live probes (TypeScript#64381 and
+    // #64408): the file changed between `oid^` and merge-base, so
+    // cutting at originalLine on the WRONG blob produces a
+    // self-consistent-but-wrong anchor whose text disagrees with
+    // the comment's diffHunk. Round-4 code fetched `oid^` and
+    // silently accepted it; round-5 fetches merge-base first,
+    // verifies against the diffHunk, and only falls back to `oid^`
+    // on mismatch. Both blobs are served by the fake; the merge-
+    // base blob's line matches the diffHunk, `oid^`'s does not.
+    const mergeBaseSha = "d".repeat(40);
+    const mergeBaseBlob = "line 1\nline 2\nleft-side target\nline 4\n";
+    const parentSha = "9".repeat(40);
+    const parentBlob = "line 1\nline 2\nDIFFERENT parent-line\nline 4\n";
+    const originalCommitSha = "9".repeat(40);
+    const diffHunk = "@@ -1,3 +1,3 @@\n line 1\n line 2\n-left-side target";
+
     const captured: string[] = [];
-    const parentBlobText = "line 1\nline 2\nleft-side target\nline 4\n";
-    let parentRev = "";
     const baseFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      // REST merge-base compare endpoint.
+      if (url.includes("/compare/")) {
+        return new Response(
+          JSON.stringify({ merge_base_commit: { sha: mergeBaseSha } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
       const body = JSON.parse((init as { body: string }).body) as {
         query: string;
         variables: { expression?: string };
@@ -343,26 +387,20 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
       if (/query FetchBlobText/.test(body.query)) {
         const expr = body.variables.expression ?? "";
         captured.push(expr);
-        if (expr.includes("^:")) {
-          return new Response(
-            JSON.stringify({
-              data: {
-                repository: {
-                  object: {
-                    __typename: "Blob",
-                    text: parentBlobText,
-                    isBinary: false,
-                    isTruncated: false,
-                  },
-                },
-              },
-            }),
-            { status: 200, headers: { "content-type": "application/json" } },
-          );
-        }
-        // NOT parent-of-originalCommit → refuse (return null).
+        let text: string | null = null;
+        if (expr.startsWith(`${mergeBaseSha}:`)) text = mergeBaseBlob;
+        else if (expr.startsWith(`${parentSha}^:`)) text = parentBlob;
         return new Response(
-          JSON.stringify({ data: { repository: { object: null } } }),
+          JSON.stringify({
+            data: {
+              repository: {
+                object:
+                  text === null
+                    ? null
+                    : { __typename: "Blob", text, isBinary: false, isTruncated: false },
+              },
+            },
+          }),
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
@@ -375,8 +413,9 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
       fetch: baseFetch as unknown as typeof fetch,
       retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
     });
-    parentRev = await revisionOf(parentBlobText);
     if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const mergeBaseRev = await revisionOf(mergeBaseBlob);
+    const parentRev = await revisionOf(parentBlob);
     const t = thread({
       diffSide: "LEFT",
       startDiffSide: null,
@@ -388,14 +427,8 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
       resolvedByLogin: "carol",
       comments: [
         {
-          databaseId: 1,
-          nodeId: "n1",
-          body: "left comment",
-          authorLogin: "alice",
-          authorType: "User",
-          createdAt: "t1",
-          url: "u1",
-          originalCommitOid: "9".repeat(40),
+          databaseId: 1, nodeId: "n1", body: "left", authorLogin: "alice", authorType: "User",
+          createdAt: "t1", url: "u1", originalCommitOid: originalCommitSha, diffHunk,
         },
       ],
     });
@@ -405,26 +438,240 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
       threadIdOf: () => "LEFTRES",
       commentIdOf: (_t, c) => `C${c.databaseId}`,
       headRevisionOf: () => HEAD_REV,
+      pullRequestBaseRef: "main",
     });
-    // Exactly the parent expression was queried.
-    expect(captured).toEqual([`${"9".repeat(40)}^:docs/x.mdx`]);
-    // Anchor uses the parent blob's revision, NOT head, and NOT
-    // originalCommit's own revision.
+    // The MERGE-BASE expression was tried FIRST. If a bug re-
+    // introduces the round-4 "oid^ only" behaviour, the captured
+    // list starts with the parent expression and the revision
+    // assertion below fails.
+    expect(captured[0]).toBe(`${mergeBaseSha}:docs/x.mdx`);
+    // Since merge-base matched the diffHunk, no fallback fetch:
+    expect(captured).toEqual([`${mergeBaseSha}:docs/x.mdx`]);
+    // Anchor uses merge-base's revision, NOT parent's, NOT head's.
     const created = events[0]!;
     if (created.kind !== "comment.created") throw new Error("kind");
-    expect(created.anchor.revision).toBe(parentRev);
-    expect(created.anchor.revision).not.toBe(HEAD_REV);
-    // For a resolved thread with a KNOWN own-commit anchor, the
-    // pipeline emits thread.resolved (not orphaned).
+    expect(asLineAnchor(created.anchor).revision).toBe(mergeBaseRev);
+    expect(asLineAnchor(created.anchor).revision).not.toBe(parentRev);
+    expect(asLineAnchor(created.anchor).revision).not.toBe(HEAD_REV);
+    // Resolved thread with a KNOWN own-commit anchor → resolved.
     const kinds = events.map((e) => e.kind);
     expect(kinds).toContain("thread.resolved");
     expect(kinds).not.toContain("thread.orphaned");
-    // No event carries head revision.
-    for (const e of events) {
-      if (e.kind === "comment.created") {
-        expect(e.anchor.revision).not.toBe(HEAD_REV);
+  });
+
+  test("LEFT (single-commit-view): when merge-base blob mismatches diffHunk, falls back to originalCommit^", async () => {
+    // Mirror of the single-commit-view case (`oid^ IS right in
+    // single-commit view`). Merge-base blob mismatches; parent
+    // blob matches. Verify the fallback path.
+    const mergeBaseSha = "e".repeat(40);
+    const wrongMergeBaseBlob = "totally\ndifferent\ncontent\n";
+    const originalCommitSha = "7".repeat(40);
+    const parentBlob = "line 1\nline 2\nparent-line target\nline 4\n";
+    const diffHunk = "@@ -1,3 +1,3 @@\n line 1\n line 2\n-parent-line target";
+    const captured: string[] = [];
+    const baseFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/compare/")) {
+        return new Response(
+          JSON.stringify({ merge_base_commit: { sha: mergeBaseSha } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
       }
-    }
+      const body = JSON.parse((init as { body: string }).body) as {
+        query: string; variables: { expression?: string };
+      };
+      if (/query FetchBlobText/.test(body.query)) {
+        const expr = body.variables.expression ?? "";
+        captured.push(expr);
+        const text = expr.startsWith(`${mergeBaseSha}:`)
+          ? wrongMergeBaseBlob
+          : expr.startsWith(`${originalCommitSha}^:`)
+            ? parentBlob
+            : null;
+        return new Response(
+          JSON.stringify({
+            data: {
+              repository: {
+                object: text === null ? null : { __typename: "Blob", text, isBinary: false, isTruncated: false },
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    (baseFetch as { preconnect?: (url: string) => void }).preconnect = () => {};
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: baseFetch as unknown as typeof fetch,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    const parentRev = await revisionOf(parentBlob);
+    if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const t = thread({
+      diffSide: "LEFT",
+      line: 3,
+      originalLine: 3,
+      comments: [
+        {
+          databaseId: 1, nodeId: "n1", body: "left", authorLogin: "alice", authorType: "User",
+          createdAt: "t1", url: "u1", originalCommitOid: originalCommitSha, diffHunk,
+        },
+      ],
+    });
+    const { events } = await adapter.importThreads({
+      pr: { owner: "o", repo: "r", pullNumber: 1 },
+      threads: [t],
+      threadIdOf: () => "LEFT_SINGLE",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => HEAD_REV,
+      pullRequestBaseRef: "main",
+    });
+    // Both expressions tried, in order.
+    expect(captured).toEqual([
+      `${mergeBaseSha}:docs/x.mdx`,
+      `${originalCommitSha}^:docs/x.mdx`,
+    ]);
+    // Anchor uses parent's revision (the fallback that verified).
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    expect(asLineAnchor(created.anchor).revision).toBe(parentRev);
+  });
+
+  test("LEFT: both candidates mismatch diffHunk → unavailable, reason: diffhunk-mismatch (thread orphaned)", async () => {
+    // If neither the merge-base blob nor the `oid^` blob matches
+    // the comment's diffHunk, we do not emit a wrong anchor.
+    const mergeBaseSha = "f".repeat(40);
+    const originalCommitSha = "8".repeat(40);
+    const diffHunk = "@@ -1,1 +1,1 @@\n-expected content";
+    const captured: string[] = [];
+    const baseFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/compare/")) {
+        return new Response(
+          JSON.stringify({ merge_base_commit: { sha: mergeBaseSha } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      const body = JSON.parse((init as { body: string }).body) as {
+        query: string; variables: { expression?: string };
+      };
+      if (/query FetchBlobText/.test(body.query)) {
+        captured.push(body.variables.expression ?? "");
+        return new Response(
+          JSON.stringify({
+            data: {
+              repository: {
+                object: { __typename: "Blob", text: "wrong content\n", isBinary: false, isTruncated: false },
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    (baseFetch as { preconnect?: (url: string) => void }).preconnect = () => {};
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: baseFetch as unknown as typeof fetch,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const t = thread({
+      diffSide: "LEFT",
+      line: 1,
+      originalLine: 1,
+      comments: [
+        {
+          databaseId: 1, nodeId: "n1", body: "left", authorLogin: "alice", authorType: "User",
+          createdAt: "t1", url: "u1", originalCommitOid: originalCommitSha, diffHunk,
+        },
+      ],
+    });
+    const { events } = await adapter.importThreads({
+      pr: { owner: "o", repo: "r", pullNumber: 1 },
+      threads: [t],
+      threadIdOf: () => "LEFT_MISMATCH",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => HEAD_REV,
+      pullRequestBaseRef: "main",
+    });
+    // Both candidates tried.
+    expect(captured.length).toBe(2);
+    // PR-43 round-5: unanchored anchor emitted; the reducer parks
+    // the thread as orphaned from birth. NO thread.orphaned event
+    // is emitted for the unavailable path.
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    if (!("kind" in created.anchor) || created.anchor.kind !== "unanchored")
+      throw new Error("expected unanchored");
+    // Reduce → orphaned.
+    const reduced = reduce(stampEvents(events)).get("LEFT_MISMATCH");
+    expect(reduced?.status).toBe("orphaned");
+  });
+
+  test("LEFT diffHunk verification: RIGHT-side outdated thread also verifies (mismatch → unavailable)", async () => {
+    // RIGHT-side outdated threads also go through diffHunk
+    // verification. If a mutation dropped the RIGHT branch's
+    // verification (e.g. checked only LEFT), this test goes red.
+    const originalCommitSha = "6".repeat(40);
+    const diffHunk = "@@ -1,1 +1,1 @@\n+expected new content";
+    const captured: string[] = [];
+    const baseFetch = async (input: string | URL | Request, init: RequestInit = {}) => {
+      const body = JSON.parse((init as { body: string }).body) as {
+        query: string; variables: { expression?: string };
+      };
+      if (/query FetchBlobText/.test(body.query)) {
+        captured.push(body.variables.expression ?? "");
+        return new Response(
+          JSON.stringify({
+            data: {
+              repository: {
+                object: { __typename: "Blob", text: "different actual content\n", isBinary: false, isTruncated: false },
+              },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("unexpected", { status: 500 });
+    };
+    (baseFetch as { preconnect?: (url: string) => void }).preconnect = () => {};
+    const adapter = new GitHubAdapter({
+      token: { async getToken() { return "test-token-value-long-enough-01234567"; } },
+      fetch: baseFetch as unknown as typeof fetch,
+      retryPolicy: { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0, jitterMs: 0 },
+    });
+    if (HEAD_REV === "") HEAD_REV = await revisionOf(HEAD_SOURCE);
+    const t = thread({
+      isOutdated: true,
+      line: null,
+      originalLine: 1,
+      comments: [
+        {
+          databaseId: 1, nodeId: "n1", body: "r", authorLogin: "alice", authorType: "User",
+          createdAt: "t1", url: "u1", originalCommitOid: originalCommitSha, diffHunk,
+        },
+      ],
+    });
+    const { events } = await adapter.importThreads({
+      pr: { owner: "o", repo: "r", pullNumber: 1 },
+      threads: [t],
+      threadIdOf: () => "R_MISMATCH",
+      commentIdOf: (_t, c) => `C${c.databaseId}`,
+      headRevisionOf: () => HEAD_REV,
+    });
+    // RIGHT-side: only one candidate tried.
+    expect(captured).toEqual([`${originalCommitSha}:docs/x.mdx`]);
+    // Unanchored anchor → reducer parks orphaned; no thread.orphaned event.
+    const created = events[0]!;
+    if (created.kind !== "comment.created") throw new Error("kind");
+    if (!("kind" in created.anchor) || created.anchor.kind !== "unanchored")
+      throw new Error("expected unanchored");
+    const reduced = reduce(stampEvents(events)).get("R_MISMATCH");
+    expect(reduced?.status).toBe("orphaned");
   });
 
   test("importThreads: LEFT rename uses oldPathOf(current) → previousFilename", async () => {
@@ -476,6 +723,7 @@ describe("mapThreadsToEvents — Blocker (PR-43 round-4): resolved+unavailable N
           createdAt: "t1",
           url: "u1",
           originalCommitOid: "5".repeat(40),
+          diffHunk: null,
         },
       ],
     });
@@ -507,7 +755,7 @@ describe("mapThreadsToEvents — mutant killers (own-commit revision, side isola
     if (created.kind !== "comment.created") throw new Error("kind");
     // If a mutation replaces `snapshot.revision` with a different
     // value, this fails.
-    expect(created.anchor.revision).toBe(rev);
+    expect(asLineAnchor(created.anchor).revision).toBe(rev);
     // Snapshot map keyed by that revision.
     expect(snapshots.get(rev)).toBe(content);
   });
@@ -552,6 +800,7 @@ describe("mapThreadsToEvents — mutant killers (own-commit revision, side isola
         {
           databaseId: 1, nodeId: "nR", body: "r", authorLogin: "a", authorType: "User",
           createdAt: "t", url: "u", originalCommitOid: "a".repeat(40),
+          diffHunk: null,
         },
       ],
     });
@@ -564,6 +813,7 @@ describe("mapThreadsToEvents — mutant killers (own-commit revision, side isola
         {
           databaseId: 2, nodeId: "nL", body: "l", authorLogin: "a", authorType: "User",
           createdAt: "t", url: "u", originalCommitOid: "b".repeat(40),
+          diffHunk: null,
         },
       ],
     });
@@ -610,10 +860,12 @@ describe("mapThreadsToEvents — multi-comment threads", () => {
         {
           databaseId: 1, nodeId: "n1", body: "first", authorLogin: "opener",
           authorType: "User", createdAt: "t1", url: "u1", originalCommitOid: "1".repeat(40),
+          diffHunk: null,
         },
         {
           databaseId: 2, nodeId: "n2", body: "reply", authorLogin: "replier",
           authorType: "User", createdAt: "t2", url: "u2", originalCommitOid: "1".repeat(40),
+          diffHunk: null,
         },
       ],
     });
