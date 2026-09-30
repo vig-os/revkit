@@ -1,10 +1,14 @@
-# revkit authoring guards — online lane.
+# revkit authoring guards — online lane and type checks.
 #
 # `just test` in the devkit-managed `ci.yml` runs `revkit check` offline
 # because the `Tests` job exports no gh token. This dedicated workflow
 # runs `revkit check --online` so the ADR-0005 escape-hatch enforcement
 # (issue must be open and labeled `component-request`) is verified in CI,
 # not only locally by `packages/cli/bin/revkit-check-hook.sh`.
+#
+# The `typecheck` job runs `just lint` (astro check + the tsc typechecks of
+# every workspace package): `ci.yml` runs only `just precommit` and
+# `just test`, so type errors in test files could merge green (PR #36).
 #
 # Outside `CI Summary` until vig-os/devkit#1761 lets a consumer fold a
 # custom check in. `pull_request` only — never `pull_request_target`
@@ -55,4 +59,28 @@ jobs:
             set -euo pipefail
             bun install --frozen-lockfile
             bun packages/cli/bin/revkit.js check --online
+          '
+
+  typecheck:
+    name: just lint (typecheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix (upstream CppNix, flakes enabled)
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build dev shell and run just lint
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail
+            bun install --frozen-lockfile
+            just lint
           '
