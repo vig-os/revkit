@@ -15,9 +15,8 @@
 // a content prefix) or a rename that shifts a file across the
 // boundary.
 
-import type { GitRunner } from "../git-runner.ts";
 import { classifyPath, isUnderContentPrefix } from "./content-allowlist.ts";
-import { runSafeGitOrThrow } from "./git-safe.ts";
+import { runSafeGitOrThrow, type SafeGitRunner } from "./git-safe.ts";
 
 /** One classified change between base and head. `kind: "modify"`
  * covers add, modify and delete; the caller only needs to know the
@@ -56,7 +55,7 @@ export interface ToolingDiff {
  * @param headSha commit SHA of the PR head
  */
 export async function computeToolingDiff(
-  runner: GitRunner,
+  runner: SafeGitRunner,
   cwd: string,
   baseSha: string,
   headSha: string,

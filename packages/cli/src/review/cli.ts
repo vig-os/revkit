@@ -57,6 +57,7 @@ import {
   reviewTargetExists,
 } from "./fetch-pr.ts";
 import { computeToolingDiff, formatToolingDiff, type ToolingDiff } from "./tooling-diff.ts";
+import { wrapSafeGitRunner } from "./git-safe.ts";
 import { materializeSafeTree, MaterializeError } from "./materialize.ts";
 import { populateStoreFromPr, type PopulateOutcome } from "./import-threads.ts";
 import { SqliteThreadStore } from "../serve/sqlite-store.ts";
@@ -281,13 +282,20 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     };
   }
 
+  // Wrap the raw `GitRunner` in a `SafeGitRunner` at the boundary
+  // (PR #48 round-3 nit): the review sub-modules take
+  // `SafeGitRunner`, so the type checker refuses any call that
+  // would bypass the hardening. `env.git` is only used to
+  // construct this one instance and never passed downstream.
+  const safeGit = wrapSafeGitRunner(env.git);
+
   // --- Origin/remote gate (PR #48 round-2 blocker 4) ---
   // The PR must belong to the same `owner/repo` as the checkout's
   // `origin` remote. A reviewer who ran `revkit review 42` from a
   // clone of `foo/bar` and got a PR from `evil/other` would
   // otherwise blindly fetch that repo's `refs/pull/42/head`.
   try {
-    const originUrl = await readOriginUrl(env.git, repoRoot);
+    const originUrl = await readOriginUrl(safeGit, repoRoot);
     if (originUrl === undefined) {
       return {
         exitCode: 1,
@@ -330,7 +338,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   // can read from either side.
   try {
     await ensurePrCommits({
-      runner: env.git,
+      runner: safeGit,
       repoCwd: repoRoot,
       pullNumber: pr.pullNumber,
       headSha: summary.headSha,
@@ -348,7 +356,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   // that SHA, refuse. `--trust <sha>` must equal this AS WELL.
   let fetchedHead: string;
   try {
-    fetchedHead = await readFetchedHeadSha(env.git, repoRoot, pr.pullNumber);
+    fetchedHead = await readFetchedHeadSha(safeGit, repoRoot, pr.pullNumber);
   } catch (error) {
     return {
       exitCode: 1,
@@ -380,7 +388,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   // we can PRINT it when --trust is given.
   let diff: ToolingDiff;
   try {
-    diff = await computeToolingDiff(env.git, repoRoot, summary.baseSha, fetchedHead);
+    diff = await computeToolingDiff(safeGit, repoRoot, summary.baseSha, fetchedHead);
   } catch (error) {
     return { exitCode: 1, stdout: "", stderr: `${(error as Error).message}\n` };
   }
@@ -441,12 +449,14 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   }
   try {
     const outcome = await materializeSafeTree({
-      runner: env.git,
+      runner: safeGit,
       cwd: repoRoot,
-      // Tooling source = the merge-base tree, so the "reviewer's
-      // trusted toolchain" reflects the fork point rather than a
-      // base-tip that may have moved.
-      baseSha: diff.mergeBase,
+      // Tooling source = the base TIP (PR #48 round-3 nit). The PR
+      // author chose the parent commit, so building against the
+      // fork point would let them pick which historical config
+      // gets used. The merge-base stays only as the anchor for the
+      // refusal diff above.
+      baseSha: summary.baseSha,
       headSha: fetchedHead,
       targetDir: materializedRoot,
     });

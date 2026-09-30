@@ -92,6 +92,27 @@ revkit review 200 --trust <that sha>
 revkit review 42 --no-serve
 ```
 
+## Security boundary
+
+The remaining boundary is **"no PR code executes"**. `revkit review` enforces this by:
+
+- refusing every PR-controlled tooling change (default) and by rebuilding the whole tooling tree from the
+  reviewer's TRUSTED base tip when `--trust <sha>` is passed;
+- running `revkit check` in **untrusted mode** on the materialised content: no expressions, no non-static
+  attributes, no allow-annotations, no ESM other than the exact `@revkit/components` / `@astrojs/starlight/components`
+  root, and an **allowlist walk** of every vega-lite spec (no `filter`, `calculate`, `test`, `expr`, `signal`,
+  `param`, `datum.` predicates, no `…Expr` key, no synthesising transforms);
+- invoking the reviewer's OWN astro binary by absolute path (never `bun x astro`, no registry fetch, no
+  `bun install`) with a scrubbed env (`HOME` and `TMPDIR` point at a per-build scratch dir; every token
+  variable is dropped);
+- running `revkit check-dist` on the build output before the daemon serves it (ADR-0012 output-gate
+  sanitiser).
+
+Beyond that boundary, an OS-level sandbox for the build (bwrap / nsjail with no network, read-only binds
+of the trusted node_modules, a fresh cgroup for cpu/memory limits) is a plausible follow-up: it would turn
+the "no PR code executes" invariant into a defence-in-depth even if a bug ever let an expression slip through
+`revkit check`. Not filed here — see the PR body for the proposed issue text.
+
 ## Related
 
 - [ADR-0025 — Hybrid review, one core](adr/0025-hybrid-review-one-core.md)
@@ -100,3 +121,5 @@ revkit review 42 --no-serve
   daemon shares the CSP shape)
 - [ADR-0006 — Comments, anchoring, event log](adr/0006-comments-anchoring-event-log.md) (the anchor model
   the imported threads land under)
+- [ADR-0021 — Versioning and release](adr/0021-versioning-release.md) (why static plots refuse vega
+  expressions)

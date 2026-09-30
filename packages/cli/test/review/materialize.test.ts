@@ -21,6 +21,7 @@ import {
   validateSymlinkTarget,
 } from "../../src/review/materialize.ts";
 import { spawnGit } from "../../src/git-runner.ts";
+import { wrapSafeGitRunner } from "../../src/review/git-safe.ts";
 import { makeFixtureRepo } from "./helpers/git-fixture.ts";
 
 const tempDirsToClean: string[] = [];
@@ -104,7 +105,7 @@ describe("materializeSafeTree — content-only PR change builds", async () => {
   test("content bytes come from head, tooling from base", async () => {
     const target = newTargetDir();
     const outcome = await materializeSafeTree({
-      runner: spawnGit,
+      runner: wrapSafeGitRunner(spawnGit),
       cwd: fixture.repoDir,
       baseSha: fixture.baseSha,
       headSha: fixture.headSha,
@@ -151,7 +152,7 @@ describe("materializeSafeTree — refuses PR-added executable / new tooling in c
   test("PR-added executable in a content dir does NOT land in the output", async () => {
     const target = newTargetDir();
     await materializeSafeTree({
-      runner: spawnGit,
+      runner: wrapSafeGitRunner(spawnGit),
       cwd: fixture.repoDir,
       baseSha: fixture.baseSha,
       headSha: fixture.headSha,
@@ -189,7 +190,7 @@ describe("materializeSafeTree — symlink refusal", async () => {
     let thrown: unknown;
     try {
       await materializeSafeTree({
-        runner: spawnGit,
+        runner: wrapSafeGitRunner(spawnGit),
         cwd: fixture.repoDir,
         baseSha: fixture.baseSha,
         headSha: fixture.headSha,
@@ -227,7 +228,7 @@ describe("materializeSafeTree — inside-tree symlink accepted (but written as r
   test("inside-tree symlink lands as a regular file holding the target string", async () => {
     const target = newTargetDir();
     await materializeSafeTree({
-      runner: spawnGit,
+      runner: wrapSafeGitRunner(spawnGit),
       cwd: fixture.repoDir,
       baseSha: fixture.baseSha,
       headSha: fixture.headSha,
@@ -253,7 +254,7 @@ describe("materializeSafeTree — target-exists refusal", async () => {
     let thrown: unknown;
     try {
       await materializeSafeTree({
-        runner: spawnGit,
+        runner: wrapSafeGitRunner(spawnGit),
         cwd: fixture.repoDir,
         baseSha: fixture.baseSha,
         headSha: fixture.headSha,
@@ -281,7 +282,7 @@ describe("materializeSafeTree — total-size cap", async () => {
     let thrown: unknown;
     try {
       await materializeSafeTree({
-        runner: spawnGit,
+        runner: wrapSafeGitRunner(spawnGit),
         cwd: fixture.repoDir,
         baseSha: fixture.baseSha,
         headSha: fixture.headSha,

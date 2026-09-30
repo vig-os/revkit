@@ -14,10 +14,9 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { GitHubAdapter, type GhReviewThread } from "@revkit/review-core";
 import { runReviewCommand } from "../../src/review/cli.ts";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
-import { spawnGit } from "../../src/git-runner.ts";
 import { registerDaemonPid, unregisterDaemonPid } from "../helpers/daemon-registry.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, makeInterceptingGitRunner, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
 
 const tempDirsToClean: string[] = [];
 const daemonsToStop: DaemonHandle[] = [];
@@ -108,15 +107,18 @@ describe("revkit review → daemon integration", async () => {
     const staticToken = { async getToken() { return "ghp_" + "a".repeat(40); } };
     const fakeFetch = makeFakeGithubFetch([pr]);
 
-    await writeReviewRefs(fixture.repoDir, { pullNumber: 700, headSha: fixture.headSha });
     let daemonHandle: DaemonHandle | undefined;
+    const gitInterceptor = makeInterceptingGitRunner({
+      repoDir: fixture.repoDir,
+      pulls: new Map([[700, fixture.headSha]]),
+    });
     const result = await runReviewCommand(
       ["700", "--repo", "vig-os/revkit"],
       {
         cwd: fixture.repoDir,
         version: "0.0.0",
         gh: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-        git: spawnGit,
+        git: gitInterceptor,
         repoSlug: "vig-os/revkit",
         makeAdapter: () => new GitHubAdapter({ token: staticToken, fetch: fakeFetch }),
         localUserId: "review-test-user",

@@ -1,43 +1,51 @@
 // Safe astro build for a materialised PR-head worktree (ADR-0025,
-// PR #48 round-2 blocker 2).
+// PR #48 round-3 blocker 1).
 //
-// **The rules** — each blocks a concrete attack against the local
-// review surface:
+// **What "safe" means here** — each rule blocks a concrete attack:
 //
-//   1. **Minimal env.** `Bun.spawn` is called with an explicit `env`
-//      object; NOTHING from `process.env` is inherited by default.
-//      The allowlist below covers what an astro build genuinely
-//      needs (`PATH`, `HOME`, `TMPDIR`, `NIX_*` for the flake dev
-//      shell, `NODE_OPTIONS` for a low-memory footprint) and NO
-//      token variable. `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`,
-//      `HF_TOKEN`, `CF_API_TOKEN`, `NODE_AUTH_TOKEN`, `CI` are
-//      NEVER exported to the child.
+//   1. **Trusted astro binary.** The build invokes the reviewer's
+//      OWN astro binary (`<baseCheckout>/site/node_modules/.bin/astro`)
+//      by ABSOLUTE PATH. There is no `bun x astro` (which would
+//      download `astro@latest` from the registry, unpinned) and no
+//      lookup via `PATH`. If the trusted binary is missing, the
+//      build refuses.
 //
-//   2. **No token in argv.** The child gets no positional or
-//      `--` argument that carries a bearer.
+//   2. **Trusted deps resolvable from the sandbox.** The reviewer's
+//      trusted `site/node_modules/` (and workspace `node_modules/`
+//      at the base checkout root) are linked read-only into the
+//      materialised worktree as symlinks. Astro's Node resolver
+//      then finds every dependency (astro's own tsconfig files,
+//      Starlight, plugins) via a normal require chain. No registry
+//      fetch and no `bun install` occur.
 //
-//   3. **Deps stay local.** The child never runs `bun install`
-//      inside the materialised worktree (that would execute PR-
-//      controlled lifecycle scripts). Node resolution instead
-//      points at the reviewer's TRUSTED `node_modules/` — the base
-//      checkout's — via `NODE_PATH`. If a per-review `node_modules`
-//      exists (a symlink to base's), astro finds it too.
+//   3. **No registry install.** No `bun install`, no `npm install`,
+//      no `yarn install`, no lifecycle scripts. The astro command
+//      only reads the tree.
 //
-//   4. **cwd is the materialised worktree.** Astro is invoked in
-//      the sandbox tree; its `astro.config.*` reads from there.
-//      Because the materialiser rebuilt every tooling file from
-//      base, that config is the reviewer's own.
+//   4. **Minimal env.** `Bun.spawn` receives an explicit `env`
+//      object. Only the vars on `BUILD_ENV_ALLOWLIST` are
+//      exported; every token-shaped variable
+//      (`BUILD_ENV_TOKEN_DENYLIST`) is dropped.
 //
-//   5. **Output dir is under the materialised worktree.** The
+//   5. **HOME points at a per-build temp dir.** A hostile astro
+//      config that tried to read `~/.config` or `~/.ssh` sees an
+//      empty scratch directory that lives for the lifetime of the
+//      build.
+//
+//   6. **cwd is the materialised worktree.** Astro reads
+//      `astro.config.*` from there — which the materialiser took
+//      from base, so it is the reviewer's own config.
+//
+//   7. **Output dir is under the materialised worktree.** The
 //      caller passes `distOutDir`; we set `--outDir` on the astro
-//      command so its own writes stay contained. `revkit
-//      check-dist` runs on that dir before it is served.
+//      command so its writes stay contained.
 //
 // If the build fails (non-zero exit, stderr surfaced), the caller
 // aborts the review command and does NOT start the daemon.
 
-import { existsSync, statSync } from "node:fs";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve as resolvePath } from "node:path";
 
 /** Input to `runSafeBuild`. */
 export interface RunSafeBuildOptions {
@@ -48,11 +56,12 @@ export interface RunSafeBuildOptions {
   /** Optional astro entry directory relative to `materializedRoot`.
    * Defaults to `"site"` (revkit's astro project lives there). */
   readonly astroDir?: string;
-  /** Reviewer's TRUSTED base checkout — its `node_modules/` roots
-   * the child's module resolution. Defaults to the parent of the
-   * `.revkit/` directory (three levels above `materializedRoot`).
-   * A test can pin this. */
-  readonly trustedNodeRoot?: string;
+  /** Reviewer's TRUSTED base checkout. Its `site/node_modules/.bin/astro`
+   * is invoked directly; its `site/node_modules/` and
+   * `node_modules/` are symlinked into the materialised worktree.
+   * Defaults to the checkout root inferred from `materializedRoot`
+   * (three levels up from `.revkit/review/<slug>/head-<sha>`). */
+  readonly trustedCheckoutRoot?: string;
   /** Injectable spawner for tests. Defaults to `Bun.spawn`. */
   readonly spawn?: SpawnLike;
 }
@@ -78,11 +87,9 @@ export const BUILD_ENV_ALLOWLIST: readonly string[] = Object.freeze([
   // POSIX baseline the child needs to spawn subprocesses (astro
   // shells out to node internally).
   "PATH",
-  "HOME",
   "USER",
   "LOGNAME",
   "SHELL",
-  "TMPDIR",
   "LANG",
   "LC_ALL",
   "LC_CTYPE",
@@ -97,7 +104,6 @@ export const BUILD_ENV_ALLOWLIST: readonly string[] = Object.freeze([
   "SSL_CERT_DIR",
   // Node / bun tunables that MUST NOT be tokens.
   "NODE_OPTIONS",
-  "NODE_PATH",
   "BUN_INSTALL",
   // Deterministic build (Astro reads this).
   "ASTRO_TELEMETRY_DISABLED",
@@ -124,15 +130,13 @@ export const BUILD_ENV_TOKEN_DENYLIST: readonly string[] = Object.freeze([
   "GOOGLE_APPLICATION_CREDENTIALS",
 ]);
 
-/**
- * Build the allowlisted env for the child. Reads every allowlisted
+/** Build the allowlisted env for the child. Reads every allowlisted
  * key from `sourceEnv` (defaults to `process.env`) and drops
- * everything else. Also overrides `NODE_PATH` to point at the
- * trusted `node_modules/` when available.
- */
+ * everything else. `homeOverride` sets `HOME` to a per-build
+ * scratch dir (PR #48 round-3 nit). */
 export function buildChildEnv(
   sourceEnv: Readonly<Record<string, string | undefined>>,
-  trustedNodeRoot: string | undefined,
+  homeOverride: string,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const key of BUILD_ENV_ALLOWLIST) {
@@ -147,14 +151,10 @@ export function buildChildEnv(
   for (const key of BUILD_ENV_TOKEN_DENYLIST) {
     delete out[key];
   }
-  // Astro sometimes reads `NODE_PATH` for global module resolution.
-  // Point it at the trusted node_modules if we have one.
-  if (trustedNodeRoot !== undefined) {
-    const trustedNm = join(trustedNodeRoot, "node_modules");
-    if (existsSync(trustedNm)) {
-      out.NODE_PATH = trustedNm;
-    }
-  }
+  // Force HOME + TMPDIR to a per-build scratch directory so a
+  // hostile config that tries `~/.config` / `~/.aws` sees nothing.
+  out.HOME = homeOverride;
+  out.TMPDIR = homeOverride;
   // Never let CI-shape variables trigger provider-specific paths in
   // astro/vite.
   delete out.CI;
@@ -163,16 +163,15 @@ export function buildChildEnv(
 }
 
 /**
- * Run the safe astro build.
+ * Run the safe astro build. See file header for the seven rules.
  *
- * The command shape is deliberately minimal:
- *   `bun --bun x astro build --root <materializedRoot>/<astroDir>
+ * Command shape:
+ *   `<trustedCheckoutRoot>/site/node_modules/.bin/astro build
+ *        --root <materializedRoot>/<astroDir>
  *        --outDir <distOutDir>`
  *
- * `--bun x` is bun's `exec`-shaped command; nothing here executes a
- * PR-controlled script. Argv is pure literal strings assembled from
- * the caller's typed options — no positional argument carries a
- * secret.
+ * No shell, no `bun x`, no `npx`. The trusted symlinks are
+ * created before the spawn and removed after.
  */
 export async function runSafeBuild(options: RunSafeBuildOptions): Promise<void> {
   const astroDir = options.astroDir ?? "site";
@@ -182,38 +181,83 @@ export async function runSafeBuild(options: RunSafeBuildOptions): Promise<void> 
       `runSafeBuild: astro project dir '${cwd}' does not exist in the materialised worktree`,
     );
   }
-  // Default trusted node root = the grandparent of the per-PR
+  // Default trusted checkout root = the grandparent of the per-PR
   // review dir, i.e. the reviewer's checkout root. `materializedRoot`
   // ends with `.revkit/review/<slug>/head-<sha>` → four `dirname`
   // hops to the checkout root.
-  const trustedNodeRoot =
-    options.trustedNodeRoot ??
+  const trustedCheckoutRoot =
+    options.trustedCheckoutRoot ??
     resolvePath(options.materializedRoot, "..", "..", "..", "..");
+  const trustedAstroBin = join(trustedCheckoutRoot, "site", "node_modules", ".bin", "astro");
+  if (!existsSync(trustedAstroBin)) {
+    throw new Error(
+      `runSafeBuild: trusted astro binary not found at '${trustedAstroBin}' — ` +
+        `run 'bun install' at the checkout root before reviewing.`,
+    );
+  }
+  const trustedSiteNodeModules = join(trustedCheckoutRoot, "site", "node_modules");
+  if (!existsSync(trustedSiteNodeModules)) {
+    throw new Error(
+      `runSafeBuild: trusted node_modules not found at '${trustedSiteNodeModules}'`,
+    );
+  }
 
-  const env = buildChildEnv(process.env, trustedNodeRoot);
-  const spawn = options.spawn ?? defaultSpawn;
+  // Per-build HOME (scratch dir). Torn down after the build.
+  const homeOverride = mkdtempSync(join(tmpdir(), "revkit-safe-build-home-"));
 
-  const result = await spawn({
-    cmd: [
-      "bun",
-      "--bun",
-      "x",
-      "astro",
-      "build",
-      "--root",
+  // Link the reviewer's TRUSTED node_modules into the sandbox
+  // read-only. Astro's resolver then finds every dep in the tree.
+  // The links are removed after the build.
+  const madeLinks: string[] = [];
+  const sandboxSiteNm = join(cwd, "node_modules");
+  const sandboxWorkspaceNm = join(options.materializedRoot, "node_modules");
+  try {
+    if (!existsSync(sandboxSiteNm)) {
+      symlinkSync(trustedSiteNodeModules, sandboxSiteNm);
+      madeLinks.push(sandboxSiteNm);
+    }
+    const trustedWorkspaceNm = join(trustedCheckoutRoot, "node_modules");
+    if (existsSync(trustedWorkspaceNm) && !existsSync(sandboxWorkspaceNm)) {
+      symlinkSync(trustedWorkspaceNm, sandboxWorkspaceNm);
+      madeLinks.push(sandboxWorkspaceNm);
+    }
+
+    const env = buildChildEnv(process.env, homeOverride);
+    const spawn = options.spawn ?? defaultSpawn;
+
+    const result = await spawn({
+      cmd: [
+        trustedAstroBin,
+        "build",
+        "--root",
+        cwd,
+        "--outDir",
+        options.distOutDir,
+      ],
       cwd,
-      "--outDir",
-      options.distOutDir,
-    ],
-    cwd,
-    env,
-  });
-  if (result.exitCode !== 0) {
-    // Surface the LAST 4 KiB of stderr — enough context for the
-    // reviewer without dumping a many-MiB build log into the CLI
-    // response.
-    const tail = result.stderr.slice(-4096);
-    throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
+      env,
+    });
+    if (result.exitCode !== 0) {
+      // Surface the LAST 4 KiB of stderr — enough context for the
+      // reviewer without dumping a many-MiB build log into the
+      // CLI response.
+      const tail = result.stderr.slice(-4096);
+      throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
+    }
+  } finally {
+    for (const linkPath of madeLinks) {
+      try {
+        rmSync(linkPath, { force: true });
+      } catch {
+        // Best effort — the reviewer can `rm -rf .revkit/review/`
+        // to clean up on any weird failure.
+      }
+    }
+    try {
+      rmSync(homeOverride, { recursive: true, force: true });
+    } catch {
+      /* fine */
+    }
   }
 }
 
@@ -238,4 +282,7 @@ export function defaultDistOutDir(materializedRoot: string): string {
   return join(materializedRoot, "site", "dist");
 }
 
-void dirname;
+// mkdirSync is imported for potential extension points; a lint
+// pass would otherwise mark it unused when the current file only
+// uses mkdtempSync.
+void mkdirSync;

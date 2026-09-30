@@ -10,10 +10,9 @@ import { existsSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { GitHubAdapter, isValidRepoRelativePath } from "@revkit/review-core";
 import { runReviewCommand } from "../../src/review/cli.ts";
 import { perPrSqlitePath, perPrStateDir } from "../../src/review/fetch-pr.ts";
-import { spawnGit } from "../../src/git-runner.ts";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, makeInterceptingGitRunner, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
 
 // Sanity-import to keep the review-core barrel referenced (the
 // test only uses the store & runner symbols).
@@ -65,11 +64,15 @@ describe("rerun preserves the per-PR thread store", async () => {
 
   test("comment written between reruns survives a wipe of the materialised head tree", async () => {
     const staticToken = { async getToken() { return "ghp_" + "a".repeat(40); } };
+    const gitInterceptor = makeInterceptingGitRunner({
+      repoDir: fixture.repoDir,
+      pulls: new Map([[pr.pullNumber, pr.headSha]]),
+    });
     const env = {
       cwd: fixture.repoDir,
       version: "0.0.0",
       gh: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-      git: spawnGit,
+      git: gitInterceptor,
       repoSlug: "vig-os/revkit",
       makeAdapter: () => new GitHubAdapter({ token: staticToken, fetch: makeFakeGithubFetch([pr]) }),
       localUserId: "review-state-test",
@@ -81,7 +84,6 @@ describe("rerun preserves the per-PR thread store", async () => {
     } as const;
 
     // First run.
-    await writeReviewRefs(fixture.repoDir, { pullNumber: pr.pullNumber, headSha: pr.headSha });
     const r1 = await runReviewCommand(["900", "--no-serve"], env);
     expect(r1.exitCode).toBe(0);
 

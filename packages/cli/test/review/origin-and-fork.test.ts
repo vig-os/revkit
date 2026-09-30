@@ -10,7 +10,7 @@ import { GitHubAdapter } from "@revkit/review-core";
 import { runReviewCommand } from "../../src/review/cli.ts";
 import { spawnGit } from "../../src/git-runner.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -39,7 +39,6 @@ describe("deleted-fork PR fails closed", async () => {
     },
   });
   dirs.push(fixture.repoDir);
-  await writeReviewRefs(fixture.repoDir, { pullNumber: 800, headSha: fixture.headSha });
 
   const pr: FakePr = {
     owner: "vig-os",
@@ -93,7 +92,6 @@ describe("origin-remote mismatch fails closed", async () => {
     originUrl: "https://github.com/evil/mismatch.git",
   });
   dirs.push(fixture.repoDir);
-  await writeReviewRefs(fixture.repoDir, { pullNumber: 810, headSha: fixture.headSha });
 
   const pr: FakePr = {
     owner: "vig-os",

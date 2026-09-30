@@ -12,6 +12,7 @@
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnGit } from "../../../src/git-runner.ts";
 
 /** A file to write inside the repo. `mode: "exec"` sets the +x bit;
  * `mode: "symlink"` creates a symlink whose target is `target`. */
@@ -171,4 +172,46 @@ export async function writeReviewRefs(
     `refs/revkit/pr-${input.pullNumber}/head`,
     input.headSha,
   ]);
+}
+
+/** A `GitRunner` that intercepts `fetch … +refs/pull/<n>/head:…`
+ * calls and rewrites them as a local `update-ref` — the fixture's
+ * `origin` is not a real GitHub remote, so a real fetch fails.
+ * Every other command is delegated to `spawnGit`. */
+export function makeInterceptingGitRunner(input: {
+  readonly repoDir: string;
+  readonly pulls: ReadonlyMap<number, string>;
+}): (args: readonly string[], cwd: string) => Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return async (args, cwd) => {
+    // The safe wrapper prepends its config overrides + `fetch` at
+    // the end. Look for a fetch refspec of the form
+    // `+refs/pull/<n>/head:refs/revkit/pr-<n>/head`.
+    const fetchIdx = args.indexOf("fetch");
+    if (fetchIdx !== -1) {
+      const refspecArg = args.find((a) => /^\+refs\/pull\/\d+\/head:refs\/revkit\/pr-\d+\/head$/.test(a));
+      if (refspecArg !== undefined) {
+        const match = refspecArg.match(/^\+refs\/pull\/(\d+)\/head:refs\/revkit\/pr-\d+\/head$/);
+        const num = Number.parseInt(match![1] ?? "", 10);
+        const target = input.pulls.get(num);
+        if (target === undefined) {
+          return {
+            stdout: "",
+            stderr: `intercept: no head registered for PR #${num}\n`,
+            exitCode: 1,
+          };
+        }
+        // Rewrite as an `update-ref` — force it, so a stale ref
+        // (from a previous run where head moved) is overwritten.
+        const updateArgs = args
+          .slice(0, fetchIdx)
+          .concat([
+            "update-ref",
+            `refs/revkit/pr-${num}/head`,
+            target,
+          ]);
+        return await spawnGit(updateArgs, cwd);
+      }
+    }
+    return await spawnGit(args, cwd);
+  };
 }

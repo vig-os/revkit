@@ -497,6 +497,29 @@ export function checkComponentRegistryFile(
         });
         continue;
       }
+      // Untrusted-mode subpath refusal (PR #48 round-3 nit): a PR
+      // cannot import `@revkit/components/<any-subpath>`, only the
+      // exact root. Subpaths would let a PR reach a component the
+      // ecosystem hasn't blessed for content — e.g. a debug
+      // Playground component — since a subpath resolution follows
+      // whatever the package exports allow. The trusted lane keeps
+      // subpaths because the reviewer authored the file.
+      const trustLocal = options?.trust ?? "trusted";
+      if (
+        trustLocal === "untrusted" &&
+        binding.specifier !== "@revkit/components" &&
+        binding.specifier !== "@astrojs/starlight/components" &&
+        (binding.specifier.startsWith("@revkit/components/") ||
+          binding.specifier.startsWith("@astrojs/starlight/components/"))
+      ) {
+        diagnostics.push({
+          file,
+          line: binding.line,
+          rule: "component-registry",
+          message: `import from ${JSON.stringify(binding.specifier)} — under untrusted PR review, only the exact root specifiers "@revkit/components" and "@astrojs/starlight/components" are admitted (no subpaths; ADR-0025).`,
+        });
+        continue;
+      }
       // Named export deny-list (round-4): Card / LinkCard from
       // Starlight's component module are refused even though the
       // specifier is allowed.

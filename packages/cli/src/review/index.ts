@@ -47,6 +47,8 @@ export {
   SAFE_GIT_CONFIG_OVERRIDES,
   SAFE_GIT_TOPLEVEL_FLAGS,
   SafeGitError,
+  wrapSafeGitRunner,
+  type SafeGitRunner,
 } from "./git-safe.ts";
 export {
   BlobTooLargeError,

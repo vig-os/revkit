@@ -180,8 +180,10 @@ describe("untrusted mode: vega-lite executable keys refused", () => {
       const out = await runFor(repo, [trustedSpecPath], "trusted");
       // The plot may still fail schema validation (missing data
       // fields) — we only care that the `calculate` string does
-      // not itself surface a diagnostic in trusted mode.
-      expect(out.lines.every((l) => !l.includes("executable"))).toBe(true);
+      // not itself surface a plot-structure diagnostic in trusted
+      // mode. The untrusted rule adds a diagnostic pointing at
+      // "'calculate'"; the trusted run must never mention it.
+      expect(out.lines.every((l) => !l.includes("'calculate'"))).toBe(true);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -195,7 +197,7 @@ describe("untrusted mode: vega-lite executable keys refused", () => {
     try {
       const out = await runFor(repo, [trustedSpecPath], "untrusted");
       expect(out.exitCode).toBe(1);
-      expect(out.lines.some((l) => l.includes("executable"))).toBe(true);
+      expect(out.lines.some((l) => l.includes("'calculate'"))).toBe(true);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

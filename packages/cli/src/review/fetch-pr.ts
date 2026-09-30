@@ -28,12 +28,11 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import type { GitRunner } from "../git-runner.ts";
-import { runSafeGit, runSafeGitOrThrow, SafeGitError } from "./git-safe.ts";
+import { runSafeGit, runSafeGitOrThrow, SafeGitError, type SafeGitRunner } from "./git-safe.ts";
 
 /** Options for `ensurePrCommits`. */
 export interface EnsurePrCommitsOptions {
-  readonly runner: GitRunner;
+  readonly runner: SafeGitRunner;
   /** cwd for the git commands — the reviewer's repo checkout. */
   readonly repoCwd: string;
   /** Which PR number to fetch — the ref is `refs/pull/<n>/head`. */
@@ -53,25 +52,37 @@ export interface EnsurePrCommitsOptions {
   readonly remote?: string;
 }
 
-/** Ensure both `headSha` and `baseSha` are present in the local git
- * object database. Idempotent: if both SHAs are already there (a
- * prior `revkit review` fetched them), no network call is made.
+/** Ensure `refs/revkit/pr-<n>/head` (and `refs/revkit/pr-<n>/base`
+ * when the base SHA is not otherwise reachable) reflect the current
+ * GitHub state, and that both SHAs are present in the local
+ * object DB.
+ *
+ * **PR #48 round-3 blocker 3**: this function used to early-return
+ * when both SHAs were already local, on the assumption that
+ * `refs/revkit/pr-<n>/head` would still be pointing at the head
+ * from the previous fetch. That's wrong on TWO paths:
+ *   1. A same-repo PR: the head SHA is already on
+ *      `refs/heads/<branch>` before we ever fetch, so the early
+ *      return skipped the `+refs/pull/<n>/head` refspec entirely
+ *      and the `refs/revkit/…` ref never got written — the
+ *      subsequent `readFetchedHeadSha` then failed with
+ *      "could not verify fetched head SHA".
+ *   2. A rerun after a head move where a STALE
+ *      `refs/revkit/pr-<n>/head` points at the old head; the
+ *      early-return leaves it pointing at the wrong commit.
+ *
+ * The fix: always fetch (`+refs/pull/<n>/head` force-updates the
+ * ref), even when both SHAs are already local. GitHub only refuses
+ * the fetch on a genuinely missing PR — a shallow clone / rate
+ * limit does not open a bypass. The fetch is fast on already-local
+ * objects (only the tips move).
  */
 export async function ensurePrCommits(options: EnsurePrCommitsOptions): Promise<void> {
   const remote = options.remote ?? "origin";
 
-  // Cheap early check — if both SHAs are already objects, skip the
-  // fetch entirely. A previous `revkit review` on the same PR-and-
-  // sha does not need to hit GitHub again.
-  const [hasHead, hasBase] = await Promise.all([
-    hasCommit(options.runner, options.repoCwd, options.headSha),
-    hasCommit(options.runner, options.repoCwd, options.baseSha),
-  ]);
-  if (hasHead && hasBase) return;
-
-  // The GitHub-mirrored PR head ref. We fetch it into a namespaced
-  // local ref so the reviewer's normal branch layout is untouched.
-  // `+refs/pull/N/head:refs/revkit/pr-N/head` forces update.
+  // Always fetch `refs/pull/<n>/head` into `refs/revkit/pr-<n>/head`
+  // (force-update). The `+` prefix makes git accept a
+  // non-fast-forward move (a rebased or force-pushed PR head).
   const prHeadRefspec = `+refs/pull/${options.pullNumber}/head:refs/revkit/pr-${options.pullNumber}/head`;
   await runSafeGitOrThrow(
     options.runner,
@@ -131,7 +142,7 @@ export async function ensurePrCommits(options: EnsurePrCommitsOptions): Promise<
  * to this call as every other git invocation on the review path
  * (PR #48 round-2 nit).
  */
-export async function hasCommit(runner: GitRunner, cwd: string, sha: string): Promise<boolean> {
+export async function hasCommit(runner: SafeGitRunner, cwd: string, sha: string): Promise<boolean> {
   const result = await runSafeGit(runner, cwd, ["cat-file", "-e", `${sha}^{commit}`]);
   return result.exitCode === 0;
 }
@@ -150,7 +161,7 @@ export async function hasCommit(runner: GitRunner, cwd: string, sha: string): Pr
  * spawn a network call, so this is cheap.
  */
 export async function readFetchedHeadSha(
-  runner: GitRunner,
+  runner: SafeGitRunner,
   cwd: string,
   pullNumber: number,
 ): Promise<string> {
@@ -180,7 +191,7 @@ export async function readFetchedHeadSha(
  * accidentally build a PR from a repo their checkout does not
  * track.
  */
-export async function readOriginUrl(runner: GitRunner, cwd: string): Promise<string | undefined> {
+export async function readOriginUrl(runner: SafeGitRunner, cwd: string): Promise<string | undefined> {
   const result = await runSafeGit(runner, cwd, ["remote", "get-url", "origin"]);
   if (result.exitCode !== 0) return undefined;
   return result.stdout.trim();

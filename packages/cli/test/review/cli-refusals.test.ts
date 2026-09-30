@@ -17,7 +17,7 @@ import { runReviewCommand } from "../../src/review/cli.ts";
 import { spawnGit } from "../../src/git-runner.ts";
 import type { GhRunner } from "../../src/gh-runner.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, makeInterceptingGitRunner, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
 
 const tempDirsToClean: string[] = [];
 afterAll(() => {
@@ -39,23 +39,21 @@ const fakeGh: GhRunner = async () => ({
   exitCode: 0,
 });
 
-/** Wrapper around `runReviewCommand` that first materialises the
- * `refs/revkit/pr-<n>/head` local ref for the given PR — the real
- * CLI writes that ref during `git fetch`, but our fixture has no
- * network and pre-populates the SHAs directly. */
+/** Wrapper around `runReviewCommand` — the fixture's origin is not
+ * a real GitHub, so we use an intercepting `GitRunner` that
+ * rewrites the fetch into a local `update-ref`. This is the
+ * SHIPPING fetch path (always fetch, no early-return), just with
+ * the network hop stubbed. */
 async function runReview(
   fixtureRepo: string,
   args: readonly string[],
   env: Parameters<typeof runReviewCommand>[1],
   prs: readonly FakePr[],
 ): Promise<ReturnType<typeof runReviewCommand>> {
-  for (const pr of prs) {
-    await writeReviewRefs(fixtureRepo, {
-      pullNumber: pr.pullNumber,
-      headSha: pr.headSha,
-    });
-  }
-  return runReviewCommand(args, env);
+  const pulls = new Map<number, string>();
+  for (const pr of prs) pulls.set(pr.pullNumber, pr.headSha);
+  const gitInterceptor = makeInterceptingGitRunner({ repoDir: fixtureRepo, pulls });
+  return runReviewCommand(args, { ...env, git: gitInterceptor });
 }
 
 /** Build a review env pointed at a fixture repo, an adapter that

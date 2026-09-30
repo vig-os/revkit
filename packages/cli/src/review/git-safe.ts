@@ -54,6 +54,41 @@
 
 import type { GitResult, GitRunner } from "../git-runner.ts";
 
+/** A brand token — a value of this type can only be produced inside
+ * `git-safe.ts`. The brand field is a MODULE-LOCAL symbol, so
+ * TypeScript refuses any structural equivalent from another module
+ * (only this file exports the wrapper that sets it). The branding
+ * is nominal, not structural (PR #48 round-3 nit).
+ *
+ * Every review-module function that takes a git runner accepts
+ * `SafeGitRunner`, not the raw `GitRunner`. The type checker then
+ * enforces the "no direct git call" rule that previously depended
+ * on a grep test.
+ */
+const SAFE_GIT_BRAND: unique symbol = Symbol("revkit.safe-git-brand");
+
+/** Nominal-brand type for a git runner that is guaranteed to route
+ * through the hardened wrapper. Only `wrapSafeGitRunner` (below) can
+ * produce a value of this type — external modules cannot forge one
+ * because they don't have access to the module-local
+ * `SAFE_GIT_BRAND` symbol. */
+export interface SafeGitRunner {
+  readonly run: (args: readonly string[], cwd: string) => Promise<GitResult>;
+  readonly [SAFE_GIT_BRAND]: true;
+}
+
+/** Wrap a raw `GitRunner` — the injectable seam every command uses
+ * — into a `SafeGitRunner`. The returned runner prefixes every call
+ * with `SAFE_GIT_TOPLEVEL_FLAGS` and `SAFE_GIT_CONFIG_OVERRIDES` (no
+ * hooks, no submodules, no filter/smudge, no `protocol.file`, no
+ * `protocol.ext`). */
+export function wrapSafeGitRunner(raw: GitRunner): SafeGitRunner {
+  return {
+    run: async (args, cwd) => await raw(buildSafeGitArgs(args), cwd),
+    [SAFE_GIT_BRAND]: true,
+  };
+}
+
 /** The `-c key=value` pairs prefixed onto every safe git invocation.
  * Frozen so a caller cannot mutate the array and silently disable a
  * rule. */
@@ -95,14 +130,21 @@ export function buildSafeGitArgs(subcommandArgs: readonly string[]): readonly st
  * throw a `SafeGitError` carrying the exit code and stderr — the
  * caller decides whether to wrap it in a domain-specific message
  * (e.g. "PR not found on remote") or propagate.
+ *
+ * Accepts either a raw `GitRunner` (legacy in-file helper, kept for
+ * `wrapSafeGitRunner`'s implementation) or a `SafeGitRunner`, so
+ * both call shapes converge on the same output.
  */
 export async function runSafeGit(
-  runner: GitRunner,
+  runner: GitRunner | SafeGitRunner,
   cwd: string,
   subcommandArgs: readonly string[],
 ): Promise<GitResult> {
-  const args = buildSafeGitArgs(subcommandArgs);
-  return await runner(args, cwd);
+  if (typeof runner === "function") {
+    const args = buildSafeGitArgs(subcommandArgs);
+    return await runner(args, cwd);
+  }
+  return await runner.run(subcommandArgs, cwd);
 }
 
 /** Runtime failure surfacing a non-zero git exit through a typed
@@ -120,7 +162,7 @@ export class SafeGitError extends Error {
 
 /** Convenience: throw a `SafeGitError` if the git call failed. */
 export async function runSafeGitOrThrow(
-  runner: GitRunner,
+  runner: GitRunner | SafeGitRunner,
   cwd: string,
   subcommandArgs: readonly string[],
   contextMessage: string,

@@ -12,9 +12,8 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { GitHubAdapter } from "@revkit/review-core";
 import { runReviewCommand } from "../../src/review/cli.ts";
-import { spawnGit } from "../../src/git-runner.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, makeInterceptingGitRunner, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
 
 const dirs: string[] = [];
 afterAll(() => {
@@ -63,14 +62,17 @@ describe("revkit review → check-dist gate", async () => {
   const staticToken = { async getToken() { return "ghp_" + "a".repeat(40); } };
 
   test("refuses a built dist that contains an `onclick=` attribute", async () => {
-    await writeReviewRefs(fixture.repoDir, { pullNumber: pr.pullNumber, headSha: pr.headSha });
+    const gitInterceptor = makeInterceptingGitRunner({
+      repoDir: fixture.repoDir,
+      pulls: new Map([[pr.pullNumber, pr.headSha]]),
+    });
     const result = await runReviewCommand(
       ["950", "--no-serve"],
       {
         cwd: fixture.repoDir,
         version: "0.0.0",
         gh: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-        git: spawnGit,
+        git: gitInterceptor,
         repoSlug: "vig-os/revkit",
         makeAdapter: () => new GitHubAdapter({ token: staticToken, fetch: makeFakeGithubFetch([pr]) }),
         localUserId: "review-checkdist-test",
@@ -93,14 +95,17 @@ describe("revkit review → check-dist gate", async () => {
   });
 
   test("accepts a clean built dist", async () => {
-    await writeReviewRefs(fixture.repoDir, { pullNumber: pr.pullNumber, headSha: pr.headSha });
+    const gitInterceptor = makeInterceptingGitRunner({
+      repoDir: fixture.repoDir,
+      pulls: new Map([[pr.pullNumber, pr.headSha]]),
+    });
     const result = await runReviewCommand(
       ["950", "--no-serve"],
       {
         cwd: fixture.repoDir,
         version: "0.0.0",
         gh: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
-        git: spawnGit,
+        git: gitInterceptor,
         repoSlug: "vig-os/revkit",
         makeAdapter: () => new GitHubAdapter({ token: staticToken, fetch: makeFakeGithubFetch([pr]) }),
         localUserId: "review-checkdist-test-ok",

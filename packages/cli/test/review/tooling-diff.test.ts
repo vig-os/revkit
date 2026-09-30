@@ -4,6 +4,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { computeToolingDiff, formatToolingDiff } from "../../src/review/tooling-diff.ts";
 import { spawnGit } from "../../src/git-runner.ts";
+import { wrapSafeGitRunner } from "../../src/review/git-safe.ts";
 import { makeFixtureRepo } from "./helpers/git-fixture.ts";
 
 const tempDirsToClean: string[] = [];
@@ -38,7 +39,7 @@ describe("computeToolingDiff — content-only PR", async () => {
   tempDirsToClean.push(fixture.repoDir);
 
   test("classifies every change as content — no tooling changes", async () => {
-    const diff = await computeToolingDiff(spawnGit, fixture.repoDir, fixture.baseSha, fixture.headSha);
+    const diff = await computeToolingDiff(wrapSafeGitRunner(spawnGit), fixture.repoDir, fixture.baseSha, fixture.headSha);
     expect(diff.tooling).toHaveLength(0);
     expect(diff.content.length).toBeGreaterThan(0);
     expect(formatToolingDiff(diff)).toBe("");
@@ -65,7 +66,7 @@ describe("computeToolingDiff — tooling changed", async () => {
   tempDirsToClean.push(fixture.repoDir);
 
   test("tooling change surfaces on `.tooling`, content on `.content`", async () => {
-    const diff = await computeToolingDiff(spawnGit, fixture.repoDir, fixture.baseSha, fixture.headSha);
+    const diff = await computeToolingDiff(wrapSafeGitRunner(spawnGit), fixture.repoDir, fixture.baseSha, fixture.headSha);
     expect(diff.tooling).toHaveLength(1);
     expect(diff.tooling[0]?.kind).toBe("modify");
     if (diff.tooling[0]?.kind === "modify") {
@@ -91,7 +92,7 @@ describe("computeToolingDiff — extension-under-content-prefix note", async () 
   tempDirsToClean.push(fixture.repoDir);
 
   test("under-content-prefix + wrong extension is TOOLING with the ext note", async () => {
-    const diff = await computeToolingDiff(spawnGit, fixture.repoDir, fixture.baseSha, fixture.headSha);
+    const diff = await computeToolingDiff(wrapSafeGitRunner(spawnGit), fixture.repoDir, fixture.baseSha, fixture.headSha);
     expect(diff.tooling).toHaveLength(1);
     const change = diff.tooling[0];
     expect(change?.class).toBe("tooling");
@@ -156,7 +157,7 @@ describe("computeToolingDiff — uses merge-base (stale PR is not refused for ba
     const revParse = Bun.spawn(["git", "-C", fixture.repoDir, "rev-parse", "HEAD"], { stdout: "pipe", stderr: "pipe" });
     const newBase = (await new Response(revParse.stdout).text()).trim();
     await revParse.exited;
-    const diff = await computeToolingDiff(spawnGit, fixture.repoDir, newBase, fixture.headSha);
+    const diff = await computeToolingDiff(wrapSafeGitRunner(spawnGit), fixture.repoDir, newBase, fixture.headSha);
     expect(diff.mergeBase).toBe(fixture.baseSha);
     // Only the PR's docs change surfaces — package.json is NOT
     // tooling here even though it differs from the base TIP.

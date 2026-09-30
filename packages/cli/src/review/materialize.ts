@@ -45,9 +45,8 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
-import type { GitRunner } from "../git-runner.ts";
 import { classifyPath } from "./content-allowlist.ts";
-import { runSafeGit, runSafeGitOrThrow, SafeGitError } from "./git-safe.ts";
+import { runSafeGit, runSafeGitOrThrow, SafeGitError, type SafeGitRunner } from "./git-safe.ts";
 
 /** One entry in a git tree, as parsed from `git ls-tree -r -z`. */
 export interface TreeEntry {
@@ -71,7 +70,7 @@ export interface MaterializeOutcome {
 /** Options for `materializeSafeTree`. */
 export interface MaterializeOptions {
   /** git runner (the injectable `GitRunner`). */
-  readonly runner: GitRunner;
+  readonly runner: SafeGitRunner;
   /** cwd for git commands — the reviewer's repo checkout. */
   readonly cwd: string;
   /** base commit SHA (the trusted toolchain source). */
@@ -147,7 +146,7 @@ const DEFAULT_BLOB_BYTES_CAP = 16 * 1024 * 1024;
  * Refuses immediately on any malformed record.
  */
 export async function listTree(
-  runner: GitRunner,
+  runner: SafeGitRunner,
   cwd: string,
   commitSha: string,
 ): Promise<TreeEntry[]> {
@@ -201,7 +200,7 @@ export async function listTree(
  * spawn overhead is fine.
  */
 export async function readBlob(
-  runner: GitRunner,
+  runner: SafeGitRunner,
   cwd: string,
   oid: string,
   maxBlobBytes: number,
