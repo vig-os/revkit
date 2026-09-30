@@ -22,7 +22,7 @@
 // runtime, which JIT-compiled templates via `new Function()` — that
 // widening is gone.
 
-import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 import {
@@ -30,6 +30,7 @@ import {
   formatRelativeTime,
   isThreadUnread,
   latestAgentActivityOf,
+  migrateSeenStorage,
   pruneSeenMap,
   readSeenMap as readSeenMapImpl,
   seenStorageKeyFor,
@@ -345,11 +346,13 @@ async function reopenThread(threadId: string): Promise<void> {
 }
 
 // Local wrappers around the pure helpers in `./unread.ts`. The
-// browser-side seen map is keyed by the daemon's per-start
-// `instanceId`, fetched once on mount via `GET /-/health`. The
-// helpers here fall back to the unversioned key when we haven't
-// received the id yet — that lasts ~1 refetch and the fall-back
-// bucket is empty in a fresh browser, so no leakage.
+// browser-side seen map is keyed by the daemon's persistent
+// `repoId`, fetched once on mount via `GET /-/health`. The
+// wrappers fall back to the unversioned key when we haven't
+// received the id yet; `migrateSeenStorage` folds anything
+// written under the bare key into the resolved bucket the
+// moment `repoId` arrives, so a "click before /-/health returned"
+// mark cannot be lost (issue #60 PR #62 round-3 review).
 let currentSeenKey: string | undefined;
 function readSeenMap(): SeenMap {
   return readSeenMapImpl(undefined, currentSeenKey);
@@ -358,15 +361,33 @@ function writeSeenMap(next: SeenMap): void {
   writeSeenMapImpl(next, undefined, currentSeenKey);
 }
 /** Fetch the daemon's `/-/health` payload and adopt its
- * `instanceId` as the storage key. Called once on mount; a
+ * `repoId` as the storage key. Called once on mount; a
  * failure (rare — daemon is loopback) leaves the unversioned key,
  * so the reviewer's local session still works. */
-async function fetchInstanceId(): Promise<string | undefined> {
+async function fetchRepoId(): Promise<string | undefined> {
   try {
     const response = await fetch("/-/health", { credentials: "same-origin" });
     if (!response.ok) return undefined;
-    const parsed = (await response.json()) as { instanceId?: string };
-    return typeof parsed.instanceId === "string" ? parsed.instanceId : undefined;
+    const parsed = (await response.json()) as { repoId?: string };
+    return typeof parsed.repoId === "string" ? parsed.repoId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+/** Fetch the FULL, unscoped list of thread ids so the prune
+ * pass keeps marks for threads on OTHER pages. Issue #60
+ * PR #62 round-3 review: pruning against the page-scoped
+ * `threads()` wiped seen marks for every other page. */
+async function fetchAllThreadIds(): Promise<readonly string[] | undefined> {
+  try {
+    const response = await fetch(
+      "/api/threads?status=" + encodeURIComponent("open,resolved,orphaned"),
+      { credentials: "same-origin", headers: { accept: "application/json" } },
+    );
+    if (!response.ok) return undefined;
+    const parsed = (await response.json()) as { threads?: ReadonlyArray<{ id?: string }> };
+    if (!Array.isArray(parsed.threads)) return undefined;
+    return parsed.threads.map((t) => t.id).filter((id): id is string => typeof id === "string");
   } catch {
     return undefined;
   }
@@ -642,17 +663,49 @@ function Rail(): JSX.Element {
   // reopen and the re-anchor pipeline (PR #62 review, the L855
   // pre-reopen mark was masking this).
   const [seenMap, setSeenMap] = createSignal<SeenMap>(readSeenMap());
-  // Fetch the daemon's instanceId once; then re-read the seen map
-  // under the correct key and prune it against the current thread
-  // list. A rebuild (new instanceId) sees an empty bucket, so the
-  // reviewer gets the fresh backlog — exactly the reviewer's
-  // expectation on a "did anything change while I was away" load.
+  // On mount:
+  //   1. Fetch `repoId` from `/-/health`. `repoId` is stable across
+  //      daemon restarts on the same repo (issue #60 PR #62
+  //      round-3 review: `instanceId` was per-start so every
+  //      restart wiped the reviewer's ack state and left an
+  //      orphaned key in localStorage).
+  //   2. Migrate: fold any marks under the bare key (from a click
+  //      that landed before `/-/health` responded) into the
+  //      resolved-key bucket, prefer the newer per-thread
+  //      timestamp, and delete every OTHER `revkit.rail.seen.v1*`
+  //      key so stale buckets from previous repos don't linger.
+  //   3. Prune once against the UNSCOPED thread-id list — using
+  //      the page-scoped `threads()` here would wipe marks for
+  //      threads on every OTHER page (the round-3 blocker).
+  //   A `/-/health` failure leaves the bare key in place; the
+  //   session still works, just without the per-repo bucket
+  //   separation.
   void (async (): Promise<void> => {
-    const id = await fetchInstanceId();
+    const id = await fetchRepoId();
     if (id !== undefined) {
-      currentSeenKey = seenStorageKeyFor(id);
+      const targetKey = seenStorageKeyFor(id);
+      // Migrate uses the underlying storage so it can iterate.
+      try {
+        if (typeof globalThis !== "undefined") {
+          const w = globalThis as unknown as { localStorage?: Storage };
+          if (w.localStorage !== undefined) migrateSeenStorage(w.localStorage, targetKey);
+        }
+      } catch {
+        // Storage inaccessible — skip; the pill will re-fire once
+        // if the click's mark was under the bare key.
+      }
+      currentSeenKey = targetKey;
       setSeenMap(readSeenMap());
     }
+    // Prune against the unscoped id list, once. Fresh mounts on
+    // subsequent pages call this again and keep their own marks.
+    const allIds = await fetchAllThreadIds();
+    if (allIds === undefined) return;
+    const current = seenMap();
+    const pruned = pruneSeenMap(current, allIds);
+    if (pruned === current) return;
+    setSeenMap(pruned);
+    writeSeenMap(pruned);
   })();
   const markThreadSeen = (thread: RailThread): void => {
     const current = seenMap();
@@ -682,20 +735,10 @@ function Rail(): JSX.Element {
     setSeenMap(next);
     writeSeenMap(next);
   };
-  // Prune stale seen entries whenever the thread list changes.
-  // A resolved-then-deleted thread would otherwise leak a mark
-  // forever; the browser's localStorage bucket is small (5 MB),
-  // so a long-lived repo would eventually run out.
-  createEffect(() => {
-    const response = threads();
-    if (response === undefined) return;
-    const current = seenMap();
-    const ids = response.threads.map((t) => t.id);
-    const pruned = pruneSeenMap(current, ids);
-    if (pruned === current) return;
-    setSeenMap(pruned);
-    writeSeenMap(pruned);
-  });
+  // Note: the old per-refetch `createEffect` prune (against
+  // `threads()`, page-scoped) was removed here — the round-3
+  // review caught it wiping every OTHER page's marks. The mount
+  // block above prunes once against the UNSCOPED id list.
   // The set of unread thread ids that are ALLOWED to auto-expand.
   // Cap at UNREAD_EXPANDED_LIMIT so a browser opening on a page
   // with 150 unread agent replies does not render 150 expanded

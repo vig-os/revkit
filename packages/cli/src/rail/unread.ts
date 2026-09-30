@@ -36,20 +36,18 @@ export interface UnreadThread {
 export type SeenMap = Readonly<Record<string, string>>;
 
 /** localStorage key prefix for the seen map. The daemon's
- * `/-/health` `instanceId` is appended so a fresh daemon start
- * (a new repo bound to the same loopback port, or a rebuild)
- * gets a fresh bucket instead of inheriting stale marks from a
- * previous review session on the same origin. Bumped only if
- * the SeenMap shape changes. */
+ * `/-/health` `repoId` is appended so the bucket is keyed to THIS
+ * repo, stable across daemon restarts on the same `--port` (issue
+ * #60 PR #62 round-3 review — the per-start `instanceId` keying
+ * wiped seen marks on every restart). `repoId` is a random tag
+ * generated once and stored in `.revkit/repo-id` at mode 0600 —
+ * never derived from the repo path, so `/-/health` cannot leak
+ * filesystem layout. Bumped only if the SeenMap shape changes. */
 export const SEEN_STORAGE_KEY_PREFIX = "revkit.rail.seen.v1";
-export function seenStorageKeyFor(instanceId: string | undefined): string {
-  if (instanceId === undefined || instanceId.length === 0) return SEEN_STORAGE_KEY_PREFIX;
-  return `${SEEN_STORAGE_KEY_PREFIX}.${instanceId}`;
+export function seenStorageKeyFor(repoId: string | undefined): string {
+  if (repoId === undefined || repoId.length === 0) return SEEN_STORAGE_KEY_PREFIX;
+  return `${SEEN_STORAGE_KEY_PREFIX}.${repoId}`;
 }
-// Kept for backward compatibility with earlier callers (the M2
-// unit tests still reference the plain constant). The rail itself
-// always keys through `seenStorageKeyFor`.
-export const SEEN_STORAGE_KEY = SEEN_STORAGE_KEY_PREFIX;
 
 /** True when the thread has any agent activity — an agent-authored
  * comment OR a resolve by an agent. Cheaper predicate for callers
@@ -216,5 +214,81 @@ function tryLocalStorage(): Storage | undefined {
     return w.localStorage;
   } catch {
     return undefined;
+  }
+}
+
+/** A localStorage-shaped surface that can be iterated. Enough of
+ * the DOM Storage interface for `migrateSeenStorage`; kept narrow
+ * so unit tests can pass an in-memory stand-in. */
+export interface IterableStorage {
+  readonly length: number;
+  key(index: number): string | null;
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+/** Called once on mount, after `GET /-/health` returned `repoId`.
+ *
+ *  1. Reads every `revkit.rail.seen.v1*` bucket the browser
+ *     currently holds — the bare key from the "no repoId yet"
+ *     window at the top of mount, plus any leftover key from a
+ *     previous session on the same origin.
+ *  2. Merges them into the target-key bucket, preferring the
+ *     newer per-thread ISO timestamp.
+ *  3. Writes the merged map back under the target key.
+ *  4. Removes every OTHER `revkit.rail.seen.v1*` bucket, so a
+ *     stale key from a previous repo does not linger in the
+ *     origin's local storage forever.
+ *
+ * Every branch is wrapped in try/catch — the reviewer's session
+ * is never fatal on a storage failure; the pill just re-fires
+ * once, then the seen map catches up on the next mark. Issue #60
+ * PR #62 round-3 review: fixes the "early mark race" (a click
+ * before `/-/health` returned lost its mark) AND the "orphaned
+ * bucket" (a rebuild left a growing pile of stale keys). */
+export function migrateSeenStorage(storage: IterableStorage | undefined, targetKey: string): void {
+  if (storage === undefined) return;
+  try {
+    // Snapshot every seen-bucket key currently present.
+    const foundKeys: string[] = [];
+    for (let i = 0; i < storage.length; i += 1) {
+      const k = storage.key(i);
+      if (k === null) continue;
+      if (k === SEEN_STORAGE_KEY_PREFIX || k.startsWith(`${SEEN_STORAGE_KEY_PREFIX}.`)) foundKeys.push(k);
+    }
+    // Merge, preferring the LATER ISO timestamp per thread id.
+    // Read the target key first so any per-thread mark under the
+    // target's current bucket wins ties.
+    const merged: Record<string, string> = {};
+    const readOne = (k: string): void => {
+      const map = readSeenMap(storage, k);
+      for (const [id, ts] of Object.entries(map)) {
+        const cur = merged[id];
+        if (cur === undefined || ts > cur) merged[id] = ts;
+      }
+    };
+    if (foundKeys.includes(targetKey)) readOne(targetKey);
+    for (const k of foundKeys) {
+      if (k === targetKey) continue;
+      readOne(k);
+    }
+    // Write the merged map under the target key.
+    writeSeenMap(merged, storage, targetKey);
+    // Remove every OTHER seen bucket. The bare-key entry is
+    // included here — it was only used during the "before
+    // /-/health responded" window.
+    for (const k of foundKeys) {
+      if (k === targetKey) continue;
+      try {
+        storage.removeItem(k);
+      } catch {
+        // Skip; not fatal.
+      }
+    }
+  } catch {
+    // On any partial failure we keep the pre-migration state.
+    // The pill will re-fire, but the reviewer can still mark it
+    // seen on the next interaction.
   }
 }

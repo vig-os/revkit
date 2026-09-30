@@ -19,12 +19,13 @@ import {
   hasAgentActivity,
   isThreadUnread,
   latestAgentActivityOf,
+  migrateSeenStorage,
   pruneSeenMap,
   readSeenMap,
-  SEEN_STORAGE_KEY,
   SEEN_STORAGE_KEY_PREFIX,
   seenStorageKeyFor,
   writeSeenMap,
+  type IterableStorage,
   type SeenMap,
   type UnreadThread,
 } from "../../src/rail/unread.ts";
@@ -341,7 +342,7 @@ describe("seen-map localStorage helpers (issue #60)", () => {
       setItem: (k: string, v: string): void => { saved = [k, v]; },
     };
     writeSeenMap({ t1: "2026-09-30T12:00:00Z" }, storage);
-    expect(saved?.[0]).toBe(SEEN_STORAGE_KEY);
+    expect(saved?.[0]).toBe(SEEN_STORAGE_KEY_PREFIX);
     expect(saved?.[1]).toBe(JSON.stringify({ t1: "2026-09-30T12:00:00Z" }));
   });
   test("writeSeenMap swallows a throwing storage (never fatal)", () => {
@@ -381,6 +382,102 @@ describe("seen-map localStorage helpers (issue #60)", () => {
     };
     writeSeenMap({ t1: "2026-09-30T12:00:00Z" }, storage, seenStorageKeyFor("inst-42"));
     expect(saved?.[0]).toBe(`${SEEN_STORAGE_KEY_PREFIX}.inst-42`);
+  });
+});
+
+describe("migrateSeenStorage (issue #60 round-3)", () => {
+  /** Minimal in-memory storage that satisfies `IterableStorage`. */
+  function inMemoryStorage(seed: Record<string, string> = {}): IterableStorage & {
+    readonly snapshot: () => Record<string, string>;
+  } {
+    const map = new Map<string, string>(Object.entries(seed));
+    return {
+      get length(): number {
+        return map.size;
+      },
+      key(index: number): string | null {
+        return Array.from(map.keys())[index] ?? null;
+      },
+      getItem(k: string): string | null {
+        return map.get(k) ?? null;
+      },
+      setItem(k: string, v: string): void {
+        map.set(k, v);
+      },
+      removeItem(k: string): void {
+        map.delete(k);
+      },
+      snapshot(): Record<string, string> {
+        return Object.fromEntries(map);
+      },
+    };
+  }
+
+  test("moves the bare-key bucket under the target key on first repoId arrival", () => {
+    // The reviewer marked something seen before /-/health
+    // responded. That mark landed under the bare key. When
+    // repoId arrives, migrate must fold it into the resolved
+    // bucket.
+    const storage = inMemoryStorage({
+      [SEEN_STORAGE_KEY_PREFIX]: JSON.stringify({ t1: "2026-09-30T12:00:00Z" }),
+    });
+    const target = seenStorageKeyFor("repo-abc");
+    migrateSeenStorage(storage, target);
+    const snap = storage.snapshot();
+    // The bare bucket is gone.
+    expect(snap[SEEN_STORAGE_KEY_PREFIX]).toBeUndefined();
+    // The mark is under the target key.
+    expect(JSON.parse(snap[target]!)).toEqual({ t1: "2026-09-30T12:00:00Z" });
+  });
+
+  test("merges two buckets, preferring the newer per-thread timestamp", () => {
+    const target = seenStorageKeyFor("repo-abc");
+    const storage = inMemoryStorage({
+      [SEEN_STORAGE_KEY_PREFIX]: JSON.stringify({ t1: "2026-09-30T12:00:00Z", t2: "2026-09-30T11:00:00Z" }),
+      [target]: JSON.stringify({ t1: "2026-09-30T11:00:00Z", t3: "2026-09-30T10:00:00Z" }),
+    });
+    migrateSeenStorage(storage, target);
+    const snap = storage.snapshot();
+    // Bare bucket removed; target has the merged, newer-per-key map.
+    expect(snap[SEEN_STORAGE_KEY_PREFIX]).toBeUndefined();
+    expect(JSON.parse(snap[target]!)).toEqual({
+      t1: "2026-09-30T12:00:00Z", // newer from bare
+      t2: "2026-09-30T11:00:00Z", // only in bare
+      t3: "2026-09-30T10:00:00Z", // only in target
+    });
+  });
+
+  test("deletes orphaned buckets from previous repos (the round-3 blocker's cleanup)", () => {
+    const target = seenStorageKeyFor("repo-current");
+    const storage = inMemoryStorage({
+      [seenStorageKeyFor("repo-old-1")]: JSON.stringify({ t: "2026-09-29T12:00:00Z" }),
+      [seenStorageKeyFor("repo-old-2")]: JSON.stringify({ t: "2026-09-28T12:00:00Z" }),
+      [target]: JSON.stringify({ t: "2026-09-30T12:00:00Z" }),
+      "not-a-seen-key": "some other localStorage entry",
+    });
+    migrateSeenStorage(storage, target);
+    const snap = storage.snapshot();
+    expect(snap[seenStorageKeyFor("repo-old-1")]).toBeUndefined();
+    expect(snap[seenStorageKeyFor("repo-old-2")]).toBeUndefined();
+    // Target bucket remains (with the folded-in marks).
+    expect(snap[target]).toBeDefined();
+    // Unrelated localStorage entries are left alone.
+    expect(snap["not-a-seen-key"]).toBe("some other localStorage entry");
+  });
+
+  test("no-op when target key is the only bucket present", () => {
+    const target = seenStorageKeyFor("repo-only");
+    const storage = inMemoryStorage({
+      [target]: JSON.stringify({ t1: "2026-09-30T12:00:00Z" }),
+    });
+    migrateSeenStorage(storage, target);
+    expect(storage.snapshot()).toEqual({
+      [target]: JSON.stringify({ t1: "2026-09-30T12:00:00Z" }),
+    });
+  });
+
+  test("undefined storage returns without throwing", () => {
+    expect(() => migrateSeenStorage(undefined, seenStorageKeyFor("r"))).not.toThrow();
   });
 });
 

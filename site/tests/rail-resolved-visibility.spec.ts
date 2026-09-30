@@ -48,19 +48,30 @@ interface DaemonCtx {
   readonly port: number;
 }
 
-async function bootDaemon(): Promise<DaemonCtx> {
+async function bootDaemon(opts: { root?: string; port?: number } = {}): Promise<DaemonCtx> {
   if (!existsSync(DIST)) throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
-  const root = mkdtempSync(join(tmpdir(), "revkit-60-"));
-  mkdirSync(join(root, ".revkit"), { recursive: true });
-  writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
-  const seedRelPath = FIXTURE_REL_PATH;
-  mkdirSync(join(root, dirname(seedRelPath)), { recursive: true });
-  writeFileSync(
-    join(root, seedRelPath),
-    "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
-    "utf8",
-  );
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
+  // Round-3 test hook: an explicit `root` lets the restart spec
+  // point a second daemon at the SAME repo so `.revkit/repo-id`
+  // persists across the restart. `port` fixes the loopback port
+  // so localStorage (keyed by origin) survives too.
+  let root: string;
+  if (opts.root !== undefined) {
+    root = opts.root;
+  } else {
+    root = mkdtempSync(join(tmpdir(), "revkit-60-"));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
+    const seedRelPath = FIXTURE_REL_PATH;
+    mkdirSync(join(root, dirname(seedRelPath)), { recursive: true });
+    writeFileSync(
+      join(root, seedRelPath),
+      "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+      "utf8",
+    );
+  }
+  const args = [REVKIT_BIN, "serve", "--dir", DIST];
+  if (opts.port !== undefined) args.push("--port", String(opts.port));
+  const child = spawn("bun", args, {
     cwd: root,
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
@@ -110,14 +121,22 @@ async function bootDaemon(): Promise<DaemonCtx> {
   return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
 }
 
-async function shutdown(ctx: DaemonCtx): Promise<void> {
+async function shutdown(ctx: DaemonCtx, opts: { keepRoot?: boolean } = {}): Promise<void> {
   try {
     ctx.child.kill("SIGTERM");
   } catch {
     // Already dead.
   }
-  await new Promise((r) => setTimeout(r, 200));
-  rmSync(ctx.root, { recursive: true, force: true });
+  // Wait for the child to actually exit, so `.revkit/daemon.lock`
+  // is released before a follow-on restart tries to acquire it.
+  await new Promise<void>((r) => {
+    ctx.child.on("exit", () => r());
+    // Fallback: 800 ms is well past `SIGTERM → onCleanup → exit`.
+    setTimeout(() => r(), 800);
+  });
+  if (opts.keepRoot !== true) {
+    rmSync(ctx.root, { recursive: true, force: true });
+  }
 }
 
 /** Write the same fixture the round-trip spec uses so we can drive
@@ -136,6 +155,40 @@ function writeFixtureHtml(): { relPath: string; cleanup: () => void } {
        <main>
          <h1 data-src="${FIXTURE_REL_PATH}:1-1">Rail issue #60 fixture</h1>
          <p id="target" data-src="${FIXTURE_REL_PATH}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
+       </main>
+     </body></html>`,
+    "utf8",
+  );
+  return {
+    relPath,
+    cleanup: (): void => {
+      try {
+        rmSync(abs, { force: true });
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+/** A second fixture on a DIFFERENT source path so the multi-page
+ * round-3 spec can navigate to a page whose thread set does NOT
+ * include page A's threads (i.e. the daemon's page-scoped fetch
+ * returns empty). Round-3 review — the prune must NOT wipe page
+ * A's marks when the browser visits page B. */
+function writeSecondFixtureHtml(): { relPath: string; cleanup: () => void } {
+  fixtureCounter += 1;
+  const relPath = `rail-60-fixture-b-${process.pid}-${fixtureCounter}.html`;
+  const abs = join(DIST, relPath);
+  // Anchor at a wholly unrelated source path so a thread here
+  // could never collide with page A's data-src.
+  const otherPath = "docs/adr/0007-daemon-mcp-transport.md";
+  writeFileSync(
+    abs,
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail 60 fixture B</title></head>
+     <body>
+       <main>
+         <p data-src="${otherPath}:1-1">Page B has its own source anchors.</p>
        </main>
      </body></html>`,
     "utf8",
@@ -595,6 +648,139 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
       // The bulk button hides itself when there is nothing left
       // to acknowledge.
       await expect(bulk).toBeHidden();
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
+  test("PR #62 round-3 blocker: seen mark on page A survives a visit to page B and back", async ({ page }) => {
+    // The pre-round-3 prune ran against `threads()` — the
+    // page-scoped list — so visiting page B (which has a
+    // DIFFERENT set of threads) wiped page A's mark, and the pill
+    // sprang back with no new agent activity. The round-3 fix
+    // prunes against the UNSCOPED thread-id list (from
+    // `/api/threads` with no `path` filter).
+    const daemon = await bootDaemon();
+    // Two fixtures on DIFFERENT source paths: the threads on each
+    // page have distinct `data-src` anchors, and `fetchThreads`
+    // asks the daemon for threads on the current page's paths.
+    const pageA = writeFixtureHtml();
+    const pageB = writeSecondFixtureHtml();
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      // ── Page A: create thread + agent reply + acknowledge ──
+      await page.goto(`${daemon.url}/${pageA.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      await page.getByTestId("revkit-rail-composer-input").fill("A: what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      const threadA = list.threads[0]!;
+      const replyRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadA.id)}/replies`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId: threadA.comments[0]!.id, body: "A: ack" }),
+      });
+      expect(replyRes.status).toBe(201);
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible({ timeout: 5000 });
+      await page.getByTestId("revkit-rail-thread").click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      // ── Navigate to page B ──
+      await page.goto(`${daemon.url}/${pageB.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      // Page B has no threads of its own; the daemon has threads
+      // on other paths, but the page-scoped fetch here returns
+      // an empty set.
+      await expect(page.getByTestId("revkit-rail-empty")).toBeVisible();
+      // ── Back to page A ──
+      await page.goto(`${daemon.url}/${pageA.relPath}`);
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // Load-bearing: the seen mark for thread A must have
+      // survived the round-trip to page B. Pre-round-3, the
+      // page-B prune wiped it and the pill fired again.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+    } finally {
+      pageA.cleanup();
+      pageB.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
+  test("PR #62 round-3 blocker: seen mark survives a daemon restart on the same --port", async ({ page }) => {
+    // Round-3: the pre-fix key was the per-start `instanceId`, so
+    // a restart minted a new key and every ack looked unread
+    // again. The fix keys by the persistent `.revkit/repo-id`,
+    // which survives the restart.
+    let daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      await page.getByTestId("revkit-rail-composer-input").fill("restart: what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // Agent replies + acknowledge.
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      const parentId = list.threads[0]!.comments[0]!.id;
+      const threadId = list.threads[0]!.id;
+      const replyRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadId)}/replies`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId, body: "restart: ack" }),
+      });
+      expect(replyRes.status).toBe(201);
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible({ timeout: 5000 });
+      await page.getByTestId("revkit-rail-thread").click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      // ── Restart the daemon on the same repo + same port ──
+      const savedPort = daemon.port;
+      const savedRoot = daemon.root;
+      await shutdown(daemon, { keepRoot: true });
+      daemon = await bootDaemon({ root: savedRoot, port: savedPort });
+      // A restart mints a new launch code — walk the launch URL
+      // again so the browser has a valid session cookie.
+      const nav2 = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav2?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // Load-bearing: the seen mark from before the restart must
+      // still be in effect (keyed by `repoId`, which is
+      // persistent). Pre-round-3, the pill was back.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
     } finally {
       fixture.cleanup();
       await shutdown(daemon);
