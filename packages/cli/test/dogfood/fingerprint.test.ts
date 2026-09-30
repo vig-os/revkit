@@ -30,6 +30,9 @@ And yet another perfectly safe line for the harness.
   });
 
   test("empty source yields no phrases", () => {
+    // The isolation check treats a zero-phrase result as a hard fail
+    // (fail closed). Consumers that want a permissive default must
+    // widen the extraction rules, not rely on an empty output.
     expect(extractFingerprintPhrases("", 6)).toEqual([]);
   });
 

@@ -74,8 +74,6 @@ export interface TeardownState {
   claudeConfigDir: string;
   keepDaemonLog: boolean;
   daemonLogFinalPath: string | undefined;
-  artifactsDir: string | undefined;
-  extraProfileDirs: readonly string[]; // reserved
 }
 
 export interface Teardown {
@@ -220,22 +218,19 @@ export function makeTeardown(opts: {
           // best-effort
         }
       }
-      // 7. Artifacts scratch dir.
-      if (state.artifactsDir !== undefined) {
-        try {
-          if (existsSync(state.artifactsDir)) {
-            rmSync(state.artifactsDir, { recursive: true, force: true });
-          }
-        } catch {
-          // best-effort
-        }
-      }
-      // 8. Self-test decoy — killed LAST so the sweep saw it.
+      // 7. (removed: unused artifacts scratch dir — the Playwright
+      //     driver mkdtemps a per-run dir and copies the screenshot
+      //     out; nothing else references it.)
+      // 8. Self-test decoy — killed LAST so the sweep saw it. The decoy
+      // is spawned via `setsid` into its own process group, so a single
+      // process-group SIGKILL takes the parent bash AND any children
+      // (round-2 PR-#58 review nit: earlier the sleep child orphaned
+      // to PID 1 when only the parent bash was SIGKILL'd).
       if (state.selftestDecoyPid !== undefined) {
         const decoy = state.selftestDecoyPid;
         state.selftestDecoyPid = undefined;
-        safeKill(decoy, "SIGKILL");
-        logger.log(`SELFTEST-TEARDOWN: killed decoy pid ${decoy} (after sweep)`);
+        killProcessGroup(decoy, "SIGKILL");
+        logger.log(`SELFTEST-TEARDOWN: killed decoy pgroup ${decoy} (after sweep)`);
       }
       logger.log("teardown complete");
       return !sweepBad;
@@ -264,6 +259,19 @@ export function installSignalHandlers(teardown: Teardown, logger: Logger): { run
     runOnce();
     process.exit(1);
   });
+  // PR-#58 review nit: async rejections that escape a `try/await`
+  // (an fs.promises call, a Bun.spawn stream reader) previously
+  // bypassed teardown and leaked. Trigger the same one-shot cleanup.
+  process.on("unhandledRejection", (reason) => {
+    try {
+      const msg = reason instanceof Error ? reason.message : String(reason);
+      logger.log(`unhandled rejection: ${msg}`);
+    } catch {
+      // best-effort
+    }
+    runOnce();
+    process.exit(1);
+  });
   return { runOnce };
 }
 
@@ -275,6 +283,22 @@ function safeKill(pid: number, signal: NodeJS.Signals): void {
   } catch {
     // Best-effort.
   }
+}
+
+/** SIGKILL a process group by its leader pid. Requires the process to
+ *  have been spawned via `setsid` (or otherwise made its own pgroup
+ *  leader). Falls back to a plain kill on the pid if the pgroup kill
+ *  fails (e.g. the pid is not a pgroup leader). Best-effort. */
+function killProcessGroup(leaderPid: number, signal: NodeJS.Signals): void {
+  // In POSIX, kill(-pid, signal) targets the process group whose id
+  // equals pid. Node/Bun map that through `process.kill(-pid, sig)`.
+  try {
+    process.kill(-leaderPid, signal);
+    return;
+  } catch {
+    // fall through to the single-pid kill.
+  }
+  safeKill(leaderPid, signal);
 }
 
 function waitDeadFor(pid: number, ms: number): void {

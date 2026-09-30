@@ -135,14 +135,20 @@ self-test lives in shipping code and is exercised BOTH from
 injection of the load-bearing guard).
 
 - **`just dogfood --selftest bad-flags`** injects a forbidden
-  value (`--tools default`) and asserts the pure lockdown
-  verifier aborts before the harness would send any prompt. On
-  successful abort the harness prints `SELFTEST OK` and exits
-  **0**. `--dangerously-skip-permissions` is NEVER injected — no
-  rogue session ever runs. The `DOGFOOD_SELFTEST_WEAKEN_VERIFIER=1`
-  env var substitutes the mutant (`okAlwaysVerifier`) via the
-  shipping self-test's DI hook; that path is the RED evidence
-  and exits **1** with `SELFTEST FAIL`.
+  value (`--tools default`) into a SYNTHETIC cmdline built by
+  the shared argv builder, then runs the SHIPPING pure lockdown
+  verifier against it. On successful abort the harness prints
+  `SELFTEST OK` and exits **0**. This is a CHECKER test — it
+  exercises the verifier in isolation without spawning claude.
+  Full-fidelity `/proc/<pid>/cmdline` and `/proc/<pid>/environ`
+  coverage happens on a real `just dogfood` run, where the same
+  verifier reads the live child's `/proc` after the wrapper
+  finishes exec'ing to `.claude-wrapped`. `--dangerously-skip-permissions`
+  is NEVER injected — no rogue session ever runs. The
+  `DOGFOOD_SELFTEST_WEAKEN_VERIFIER=1` env var substitutes the
+  mutant (`okAlwaysVerifier`) via the shipping self-test's DI
+  hook; that path is the RED evidence and exits **1** with
+  `SELFTEST FAIL`.
 - **`just dogfood --selftest decoy-teardown`** is the regression
   test for the round-6 cleanup bug. It starts a harmless decoy
   (a `/usr/bin/sleep` — detected as standalone, not a nix

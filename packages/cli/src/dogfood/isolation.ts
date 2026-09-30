@@ -55,10 +55,17 @@ export function requireNoOwnerClaudemdInTranscript(opts: {
   const source = readFileSync(ownerFile, "utf8");
   const phrases = extractFingerprintPhrases(source);
   if (phrases.length === 0) {
+    // PR-#58 review nit: an empty fingerprint set used to green the
+    // check by default. That silently disables the transcript leak
+    // detector — a CLAUDE.md that's all headings or all quoted text
+    // would pass this check even when a real leak is present. Fail
+    // closed: the caller must extend `extractFingerprintPhrases` or
+    // relax the hostile-char rule if their CLAUDE.md legitimately has
+    // no extractable phrase.
     opts.logger.log(
-      `isolation proof (CLAUDE.md): could not extract any quote-free short phrases from ${ownerFile}; skipping transcript check`,
+      `ISOLATION FAIL: could not extract any quote-free short phrases from ${ownerFile}; cannot verify no owner-CLAUDE.md leak`,
     );
-    return true;
+    return false;
   }
   const projectDir = projectDirFor(opts.claudeConfigDir, opts.stateDirPath);
   if (!existsSync(projectDir)) {
@@ -67,12 +74,14 @@ export function requireNoOwnerClaudemdInTranscript(opts: {
     );
     return false;
   }
+  // PR-#58 review nit: scan ALL *.jsonl files (previously capped at 5).
+  // A single session can shard into multiple transcript files —
+  // capping the scan means a leak in the 6th shard would slip past.
   const jsonlFiles: string[] = [];
   try {
     for (const name of readdirSync(projectDir)) {
       if (name.endsWith(".jsonl")) {
         jsonlFiles.push(join(projectDir, name));
-        if (jsonlFiles.length >= 5) break;
       }
     }
   } catch {

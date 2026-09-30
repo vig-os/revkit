@@ -190,6 +190,56 @@ async function main(): Promise<void> {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   const page = await context.newPage();
+  // PR-#58 review round-2 diagnostic: capture browser console + SSE
+  // frames so a rail live-update timeout is diagnosable from the log.
+  // Gated on the env var REVKIT_DOGFOOD_TRACE_SSE equal to one, so
+  // the default run stays quiet; the coordinator's investigation flow
+  // (root-cause the rail live failure) enables it.
+  const trace = process.env["REVKIT_DOGFOOD_TRACE_SSE"] === "1";
+  if (trace) {
+    page.on("console", (msg) => {
+      console.log(`[browser ${msg.type()}] ${msg.text()}`); // guardrails-ok(no-debug-leftovers): diagnostic gated on REVKIT_DOGFOOD_TRACE_SSE
+    });
+    page.on("pageerror", (err) => {
+      console.log(`[browser pageerror] ${err.message}`); // guardrails-ok(no-debug-leftovers): diagnostic gated on REVKIT_DOGFOOD_TRACE_SSE
+    });
+    page.on("response", async (resp) => {
+      const u = resp.url();
+      if (u.includes("/events") || u.includes("/api/threads") || u.includes("/api/handover")) {
+        console.log(`[net] ${resp.status()} ${u}`); // guardrails-ok(no-debug-leftovers): diagnostic gated on REVKIT_DOGFOOD_TRACE_SSE
+      }
+    });
+    // Hook the EventSource so every incoming frame is logged.
+    // The `console.log` calls INSIDE the init script run in the
+    // browser; Playwright's page.on("console") forwards them to our
+    // stdout as `[browser log] ...`. Each one is guardrails-ok because
+    // the whole trace path is behind `REVKIT_DOGFOOD_TRACE_SSE=1`.
+    await page.addInitScript(() => {
+      const OriginalES = window.EventSource;
+      class TracedES extends OriginalES {
+        constructor(url: string | URL, init?: EventSourceInit) {
+          super(url, init);
+          const label = String(url);
+          this.addEventListener("open", () => console.log(`[sse open] ${label}`)); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+          this.addEventListener("error", () => console.log(`[sse error] ${label}`)); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+          this.addEventListener("message", (e: MessageEvent) => {
+            const body = typeof e.data === "string" ? e.data.slice(0, 300) : "<non-string>";
+            console.log(`[sse msg default] ${label} ${body}`); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+          });
+          // Common revkit-daemon event names — see packages/cli/src/serve
+          // Log every named event we know about; the SSE spec dispatches
+          // by `event:` name, not the default `message` listener.
+          for (const name of ["comment.appended", "comment.replied", "thread.status", "handover", "presence", "ping"]) {
+            this.addEventListener(name, (e: MessageEvent) => {
+              const body = typeof e.data === "string" ? e.data.slice(0, 300) : "<non-string>";
+              console.log(`[sse msg ${name}] ${label} ${body}`); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+            });
+          }
+        }
+      }
+      window.EventSource = TracedES as unknown as typeof EventSource;
+    });
+  }
   try {
     // 1. Log in via the single-use launch URL. The daemon set-cookies our
     //    session; we redirect to `/`.
@@ -332,7 +382,26 @@ async function main(): Promise<void> {
         NONCE as string,
         { timeout: 30_000 },
       )
-      .catch(() => {
+      .catch(async () => {
+        // PR-#58 review round-2 diagnostic: dump the rail state on
+        // timeout so a regression like "SSE arrived but rail didn't
+        // re-render" is visible in the log.
+        try {
+          const snapshot = await page.evaluate(() => {
+            const threads = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
+            const list: Array<{ id: string | null; text: string }> = [];
+            threads.forEach((el) => {
+              list.push({
+                id: el.getAttribute("data-thread-id"),
+                text: (el.textContent ?? "").slice(0, 500),
+              });
+            });
+            return { count: list.length, threads: list };
+          });
+          console.log(`[rail-snapshot] threads=${snapshot.count} contents=${JSON.stringify(snapshot.threads)}`); // guardrails-ok(no-debug-leftovers): diagnostic on failure path
+        } catch (err) {
+          console.log(`[rail-snapshot] failed: ${(err as Error).message}`); // guardrails-ok(no-debug-leftovers): diagnostic on failure path
+        }
         throw new Error("reply text did not appear in the rail without reload");
       });
 

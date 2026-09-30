@@ -110,11 +110,30 @@ export async function runDecoyTeardownSelftest(
     logger.log("SELFTEST-TEARDOWN: skipping — /usr/bin/sleep does not exist (need a standalone sleep for exec -a).");
     return "SKIP";
   }
-  // Start the decoy: bash spawns sleep with argv[0] rewritten to look
-  // like a revkit serve.
+  // Start the decoy in ITS OWN process group so we can kill the whole
+  // tree without leaving orphan sleep processes when the parent bash
+  // takes SIGKILL. Round-2 PR-#58 review nit: `bash -c "<sleep> 60 ; :"`
+  // orphaned sleep on SIGKILL (the parent bash died, sleep survived and
+  // parented to PID 1). Fix: wrap the whole decoy in `setsid` so it
+  // starts a new session and becomes its own pgroup leader; teardown
+  // sends SIGKILL to the whole pgroup (`kill(-pid, SIGKILL)`), which
+  // takes both bash and sleep atomically.
+  //
+  // Shape of the compound command matters:
+  //   - `bash -c "sleep 60"`  → bash execve's straight to sleep, losing
+  //                             the argv rewrite from the outer exec -a.
+  //   - `bash -c "sleep 60 ; :"` → bash STAYS resident, keeps its
+  //                                argv rewrite, and forks sleep as a
+  //                                child. `pgrep -f 'revkit.js serve'`
+  //                                sees the resident bash.
   const decoyArgv = "bun /nonexistent/packages/cli/bin/revkit.js serve --dir /nonexistent/dist";
   const decoyProc = spawn({
-    cmd: ["bash", "-c", `exec -a ${JSON.stringify(decoyArgv)} bash -c "${sleepPath} 60 ; :"`],
+    cmd: [
+      "setsid",
+      "bash",
+      "-c",
+      `exec -a ${JSON.stringify(decoyArgv)} bash -c "${sleepPath} 60 ; :"`,
+    ],
     stdin: "ignore",
     stdout: "ignore",
     stderr: "ignore",
@@ -170,18 +189,21 @@ export async function runDecoyTeardownSelftest(
       claudeConfigDir: "",
       keepDaemonLog: false,
       daemonLogFinalPath: undefined,
-      artifactsDir: undefined,
-      extraProfileDirs: [],
     },
   });
   const sweepOk = teardown.run();
-  // The decoy is killed at the END of teardown — verify.
+  // The decoy is killed at the END of teardown — verify. Belt-and-braces
+  // kill the whole pgroup in case teardown's pgroup kill lost a race.
   await sleep(200);
   if (isAlive(decoyPid)) {
     try {
-      process.kill(decoyPid, "SIGKILL");
+      process.kill(-decoyPid, "SIGKILL");
     } catch {
-      // best-effort
+      try {
+        process.kill(decoyPid, "SIGKILL");
+      } catch {
+        // best-effort
+      }
     }
   }
   if (sweepOk) {

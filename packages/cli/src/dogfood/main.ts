@@ -25,15 +25,15 @@
 //     decoy-teardown test uses the SHIPPING teardown's DI hook to
 //     substitute a weakened guard for RED evidence.
 
-import { copyFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { makeLogger, type Logger } from "./logger.ts";
+import { makeLogger } from "./logger.ts";
 import { setupStateDir } from "./state.ts";
 import { startDaemon } from "./daemon.ts";
 import { buildClaudeArgv } from "./argv.ts";
-import { makeExpectations, ALLOWED_TOOLS } from "./lockdown.ts";
+import { makeExpectations } from "./lockdown.ts";
 import { strictLockdownGuard, verifyRunning } from "./verify.ts";
 import { agentStart, paneIdByName, paneRead, paneRun } from "./flk.ts";
 import { answerPrompts, waitReadyOrThrow } from "./prompts.ts";
@@ -80,28 +80,19 @@ function parseCliArgs(argv: readonly string[]): CliOptions {
   return { selftest, leakGuard, verifier };
 }
 
-/** Find an executable on PATH; throw with a clear message if missing. */
+/** Find an executable on PATH; throw with a clear message if missing.
+ *  Uses `Bun.which` — the shell-agnostic in-process resolver — instead
+ *  of spawning `command -v` for every check (PR-#58 review nit). */
 function requireBin(name: string): string {
-  const r = spawnSync("command", ["-v", name], { stdio: ["ignore", "pipe", "pipe"] });
-  const out = (r.stdout?.toString?.() ?? "").trim();
-  if (r.status !== 0 || out === "") {
-    // Retry via which — bash's `command -v` isn't always available as an
-    // external.
-    const r2 = spawnSync("which", [name], { stdio: ["ignore", "pipe", "pipe"] });
-    const out2 = (r2.stdout?.toString?.() ?? "").trim();
-    if (r2.status !== 0 || out2 === "") {
-      throw new Error(`missing required binary: ${name}`);
-    }
-    return out2;
-  }
-  return out;
+  const hit = Bun.which(name);
+  if (hit === null) throw new Error(`missing required binary: ${name}`);
+  return hit;
 }
 
 /** Freshness check: rebuild `site/dist` when any source is newer. */
 function shouldRebuild(repoRoot: string): boolean {
   const dist = join(repoRoot, "site/dist/index.html");
   if (!existsSync(dist)) return true;
-  const distMtime = statSync(dist).mtimeMs;
   const roots = [
     join(repoRoot, "site/src"),
     join(repoRoot, "docs"),
@@ -116,8 +107,6 @@ function shouldRebuild(repoRoot: string): boolean {
     });
     if ((r.stdout?.toString?.() ?? "").trim() !== "") return true;
   }
-  // Silence the unused-var lint for now.
-  void distMtime;
   return false;
 }
 
@@ -178,23 +167,26 @@ async function mainImpl(): Promise<number> {
   } else {
     logger.log("site/dist is up to date with sources");
   }
-  const stateDir = setupStateDir({ repoRoot, bunBin });
-  logger.log(`isolated state dir: ${stateDir.path} (outside the git worktree)`);
-  // ── teardown wired up NOW so a crash below doesn't leak ──────────────
+  // ── teardown wired up BEFORE the state dir exists (PR-#58 review nit).
+  //     A crash between `setupStateDir` and `installSignalHandlers`
+  //     would previously leave the state dir on disk. Now the teardown
+  //     state's `stateDirPath` is `undefined` until setupStateDir hands
+  //     us a path — teardown reads it live from the shared reference.
   const teardownState: TeardownState = {
     pane: undefined,
     daemon: undefined,
     playwrightPid: undefined,
     selftestDecoyPid: undefined,
-    stateDirPath: stateDir.path,
+    stateDirPath: undefined,
     claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? `${process.env.HOME ?? ""}/.claude`,
     keepDaemonLog: process.env.REVKIT_DOGFOOD_KEEP_DAEMON_LOG === "1",
     daemonLogFinalPath: undefined,
-    artifactsDir: undefined,
-    extraProfileDirs: [],
   };
   const teardown = makeTeardown({ logger, sweep: strictLeakGuard, state: teardownState });
   installSignalHandlers(teardown, logger);
+  const stateDir = setupStateDir({ repoRoot, bunBin });
+  teardownState.stateDirPath = stateDir.path;
+  logger.log(`isolated state dir: ${stateDir.path} (outside the git worktree)`);
   let rc = 0;
   try {
     // ── daemon ─────────────────────────────────────────────────────────
@@ -328,11 +320,6 @@ async function mainImpl(): Promise<number> {
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
-
-/** Preserve the `basename` import used by inline containment checks in
- *  teardown. Also documents the module's dependency on it for reviewers
- *  scanning imports at a glance. */
-void basename;
 
 mainImpl()
   .then((rc) => process.exit(rc))
