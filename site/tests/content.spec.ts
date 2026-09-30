@@ -136,3 +136,23 @@ test("sidebar groups Design, ADRs and Feature matrix around Start", async ({ pag
     nav.getByRole("link", { name: /ADR-0001: Static-first site stack/ }),
   ).toHaveCount(1);
 });
+
+test("ADR page carries the sidebar's ADR group and Starlight prev/next at desktop and phone", async ({ page }) => {
+  // M1 item 5 (owner decision 2026-09-30, ADR-0001 amendment): navigation is
+  // stock Starlight — the sidebar plus its built-in `pagination` footer.
+  // Assert both surfaces on both viewport widths so a config regression that
+  // silently drops the ADR group, or a Starlight upgrade that changes the
+  // prev/next markup, trips here rather than in review. `toBeAttached` is
+  // enough for the sidebar: on phone width Starlight keeps the same nav
+  // tree in the DOM behind the mobile menu button.
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 375, height: 667 },
+  ]) {
+    await page.setViewportSize(viewport);
+    await page.goto("/adr/0001-static-first-site-stack/");
+    await expect(page.locator("nav").getByText("ADRs", { exact: true }).first()).toBeAttached();
+    await expect(page.locator("a[rel='prev']")).toHaveCount(1);
+    await expect(page.locator("a[rel='next']")).toHaveCount(1);
+  }
+});

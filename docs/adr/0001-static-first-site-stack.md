@@ -19,11 +19,20 @@ loop, JSON-rendered question pages that need no rebuild, full builds in CI. Math
 
 ## Consequences
 
-Starlight's built-ins (Aside, Tabs, Steps, Cards, FileTree, Badge, Expressive Code) seed the component set; the
-train-line nav is a sidebar override. Rust tooling is deferred until revkit owns compiled code.
+Starlight's built-ins (Aside, Tabs, Steps, Cards, FileTree, Badge, Expressive Code) seed the component set;
+navigation stays on Starlight's stock sidebar + prev/next (see the 2026-09-30 amendment below). Rust tooling is
+deferred until revkit owns compiled code.
 
 ## Acceptance (2026-09-29)
 
 - Versions are **exact** in `package.json`/`bun.lock`; Renovate opens bump PRs that CI and the guards must pass. A
   bump needs no ADR change unless it changes behaviour this ADR relies on.
 - Starting set: Astro 7.3, Starlight 0.42, Bun from the flake (1.3).
+
+## Amendment (2026-09-30)
+
+Navigation uses Starlight's **stock sidebar and prev/next**, plus its built-in responsive layout — no custom
+"train-line" component, no sidebar override. Doc sets (ADRs, design docs, feature matrix, and future sets under
+`docs/sets/*`) map to sidebar groups in `site/astro.config.mjs`; Starlight's default pagination gives the
+prev/next chain a train line would otherwise carry. Owner decision (2026-09-30): stay minimal on modification and
+maximal on the impact of having a review tool at all. Status remains **Accepted**.
