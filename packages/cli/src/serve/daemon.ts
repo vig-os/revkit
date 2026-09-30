@@ -83,7 +83,11 @@ import {
   replyRequestSchema,
   resolveRequestSchema,
 } from "./api-schemas.ts";
-import { runPublish, type PublishOverride } from "./publish.ts";
+import { runPublish, spliceArticleBody } from "./publish.ts";
+import { renderDocFragment } from "./publish-render.ts";
+import { extractDocRevision } from "../rehype-stamp-revision.ts";
+import { revisionOf as revisionOfBytes } from "@revkit/review-core";
+import { statSync } from "node:fs";
 import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
 // The inline-script hash allowlist is the SAME committed set that
 // `revkit check-dist` enforces: `dist-check-allowlist.json`'s
@@ -139,6 +143,12 @@ export interface StartDaemonOptions {
   readonly reanchor?: Partial<
     Omit<ReanchorDaemonOptions, "store" | "bus" | "repoRoot" | "distDir" | "logger">
   >;
+  /** `owner/name` for the GitHub repo `revkit escalate` files
+   * component-request issues against and `revkit check --online`
+   * verifies allow-annotations against. Defaults to
+   * `"vig-os/revkit"`; the CLI top-level derives it from
+   * `env.repoSlug`, and tests may pin any string. */
+  readonly repoSlug?: string;
   /** Test-only override for the delivery-mode idle-flush window
    * (`handover` mode, M2 item 6). 0 disables the idle timer; the
    * production default (90 s) lives in `delivery-modes.ts`. */
@@ -377,15 +387,42 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // and never surfaces.
   const systemActor: Author = { kind: "system", id: "revkit-daemon" };
 
-  // Publish overrides (M2 item 9, story A4). Keyed on the SITE
-  // ROUTE the fast-path renderer produced HTML for. `handleStatic`
-  // checks this map before falling back to disk, so a freshly
-  // published document appears in under a second on every open
-  // page. Cleared on daemon stop. See `publish.ts` for the write
-  // side.
-  const publishOverrides = new Map<string, PublishOverride>();
-  const setPublishOverride = (route: string, override: PublishOverride): void => {
-    publishOverrides.set(normalisePublishRoute(route), override);
+  // Fast-path render cache (M2 item 9, story A4, PR-56 blocker 2).
+  //
+  // Content-addressed by source revision (SHA-256 of the LF-normalised
+  // source). `handleStatic` computes `revisionOf(currentSource)`
+  // for a page route, checks whether the on-disk `site/dist/`
+  // HTML was built against the same revision (via the stamp
+  // `rehypeStampRevision` injects), and — when they diverge —
+  // looks up this cache to serve a spliced fresh render.
+  //
+  // The cache never expires by TTL. A restart wipes it — that's
+  // fine, because serving is DERIVED from files: on the first
+  // request after boot for a route whose source has drifted from
+  // dist, the fast path renders again (~30 ms). Nothing is lost.
+  const RENDER_CACHE_MAX = 128;
+  interface RenderCacheEntry {
+    readonly html: string;
+    readonly revision: string;
+    readonly dataSrcCount: number;
+  }
+  const renderCache = new Map<string, RenderCacheEntry>();
+  const cacheGet = (revision: string): RenderCacheEntry | undefined => {
+    const entry = renderCache.get(revision);
+    if (entry === undefined) return undefined;
+    // LRU touch: move to the tail by delete + re-set.
+    renderCache.delete(revision);
+    renderCache.set(revision, entry);
+    return entry;
+  };
+  const cacheSet = (revision: string, entry: RenderCacheEntry): void => {
+    if (renderCache.size >= RENDER_CACHE_MAX) {
+      const oldest = renderCache.keys().next();
+      if (!oldest.done && typeof oldest.value === "string") {
+        renderCache.delete(oldest.value);
+      }
+    }
+    renderCache.set(revision, entry);
   };
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
@@ -1725,38 +1762,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       logger.warn("static.rejected.invalid-encoding", { requestId, path: url.pathname });
       return withHygiene(new Response("Bad Request", { status: 400 }), "text", "text/plain; charset=utf-8");
     }
-    // M2 item 9: check the publish-override map first. Overrides
-    // are keyed on the normalised route (leading + trailing slash),
-    // which matches the path the human's browser requests when
-    // clicking a link into a doc — Astro emits
-    // `<route>/index.html`, and the daemon rewrites `/route` →
-    // `/route/` via the static-server's directory-index handling
-    // for uncovered routes. Doing the lookup HERE, before
-    // `staticServer.resolve`, means an override wins even when the
-    // disk copy is stale (or missing on a fresh checkout).
-    const overrideRoute = normalisePublishRoute(decodedPath);
-    const override = publishOverrides.get(overrideRoute);
-    if (override !== undefined && (request.method === "GET" || request.method === "HEAD")) {
-      const overrideHtml = override.html;
-      if (request.method === "HEAD") {
-        return withHygiene(
-          new Response(null, {
-            status: 200,
-            headers: { "content-length": String(Buffer.byteLength(overrideHtml, "utf8")) },
-          }),
-          "html",
-          "text/html; charset=utf-8",
-        );
-      }
-      const rawResponse = withHygiene(new Response(overrideHtml, { status: 200 }), "html", "text/html; charset=utf-8");
-      // Rail injection runs on the override too — the rail's SSE
-      // listener is what turns a `doc.published` event into the
-      // page-refresh the reviewer sees.
-      return await injectRail(rawResponse, {
-        onOversize: (bodyBytes: number) => {
-          logger.warn("static.rail.skipped-oversize", { requestId, path: decodedPath, bytes: bodyBytes });
-        },
-      });
+    // M2 item 9 (PR-56 blocker 2): derive-from-files serving.
+    //
+    // For a page route whose source file we can identify (an
+    // ADR / design / feature-matrix), read the current source
+    // and compute its revision. If that revision matches what
+    // dist was built against (extracted from the stamp
+    // `rehypeStampRevision` injects), dist is current — fall
+    // through to the static branch. Otherwise render the current
+    // source into the dist shell and serve that. Cached by
+    // revision, so a second request in the same second is
+    // a Map hit. Nothing is stored per-route; a restart just
+    // repeats the derivation on demand.
+    if (request.method === "GET" || request.method === "HEAD") {
+      const overrideRoute = normalisePublishRoute(decodedPath);
+      const fresh = await tryServeFreshForRoute(overrideRoute, request.method, requestId);
+      if (fresh !== undefined) return fresh;
     }
     const result = staticServer.resolve(decodedPath);
     if (!result.ok) {
@@ -1815,6 +1836,103 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       });
     }
     return rawResponse;
+  }
+
+  /** Derive-from-files serving (M2 item 9, PR-56 blocker 2).
+   *
+   * For a page route whose source file is one of the publishable
+   * roots (ADR, design, feature-matrix), compute the current
+   * source's revision. If dist has already been built against
+   * this revision (extracted from the stamp on the dist HTML),
+   * return undefined so the caller serves dist untouched. If
+   * dist is stale (source has moved on), fast-render the current
+   * source into the dist shell, cache by revision, and serve
+   * that. On any error (dist missing, source missing, render
+   * failed), return undefined so the caller falls back to the
+   * static branch. */
+  async function tryServeFreshForRoute(
+    route: string,
+    method: "GET" | "HEAD",
+    requestId: string,
+  ): Promise<Response | undefined> {
+    // 1. Reverse the site route to a source path.
+    const sourcePath = reverseSiteRoute(route);
+    if (sourcePath === undefined) return undefined;
+    // 2. Read the current source. LF-normalise so revisionOf
+    //    matches what the fast-path and full-build hash.
+    let source: string;
+    let sourceRev: string;
+    try {
+      const abs = `${options.repoRoot}/${sourcePath}`;
+      const raw = await Bun.file(abs).text();
+      source = raw.replace(/\r\n?/g, "\n");
+      sourceRev = await revisionOfBytes(source);
+    } catch {
+      return undefined;
+    }
+    // 3. Locate the dist HTML for this route. Path shape is
+    //    `<distDir>/<route sans slashes>/index.html`.
+    const distPath = shellPathForRouteInStaticDir(options.dir, route);
+    if (distPath === undefined) return undefined;
+    let shellHtml: string;
+    try {
+      shellHtml = await Bun.file(distPath).text();
+    } catch {
+      return undefined;
+    }
+    // 4. Extract the dist's stamped revision. When it matches,
+    //    dist is current and serving fresh is unnecessary — let
+    //    the static branch below handle it (cheaper: no rerender,
+    //    no splice, no rail-injection buffer copy).
+    const distRev = extractDocRevision(shellHtml);
+    if (distRev === sourceRev) return undefined;
+    // 5. Cache lookup by SOURCE revision.
+    let entry = cacheGet(sourceRev);
+    if (entry === undefined) {
+      let fragment: string;
+      let dataSrcCount: number;
+      try {
+        const result = await renderDocFragment({
+          repoRoot: options.repoRoot,
+          path: sourcePath,
+          source,
+        });
+        fragment = result.html;
+        dataSrcCount = result.dataSrcCount;
+      } catch (error) {
+        logger.warn("static.fresh-render.failed", {
+          requestId,
+          path: sourcePath,
+          errorKind: (error as Error).name,
+        });
+        return undefined;
+      }
+      const spliced = spliceArticleBody(shellHtml, fragment);
+      if (spliced === undefined) return undefined;
+      entry = { html: spliced, revision: sourceRev, dataSrcCount };
+      cacheSet(sourceRev, entry);
+    }
+    // 6. Serve.
+    if (method === "HEAD") {
+      return withHygiene(
+        new Response(null, {
+          status: 200,
+          headers: { "content-length": String(Buffer.byteLength(entry.html, "utf8")) },
+        }),
+        "html",
+        "text/html; charset=utf-8",
+      );
+    }
+    const rawResponse = withHygiene(
+      new Response(entry.html, { status: 200 }),
+      "html",
+      "text/html; charset=utf-8",
+    );
+    return await injectRail(rawResponse, {
+      onOversize: (bodyBytes: number) => {
+        logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
+      },
+    });
   }
 
   /** Serve the rail bundle (`/-/rail.js` and `/-/rail.css`). Built
@@ -2189,7 +2307,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         presence,
         agentActor,
         systemActor,
-        repoSlug: "vig-os/revkit",
+        repoSlug: options.repoSlug ?? "vig-os/revkit",
         refreshAnchors: async (path: string) => {
           await reanchor.refresh(path);
         },
@@ -2198,7 +2316,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         },
         ingestDelivery: safeIngest,
         distDir: options.dir,
-        setOverride: setPublishOverride,
+        setRenderCache: (revision, html, dataSrcCount) => {
+          cacheSet(revision, { html, revision, dataSrcCount });
+        },
       },
     );
     if (!outcome.ok) {
@@ -2348,7 +2468,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
  * (a `--dir` pointing at some other directory on disk); the caller has
  * asked us to serve that path, so hiding it in a log would be
  * worse than an absolute leak. */
-/** Normalise a URL pathname into the shape publish overrides are
+/** Normalise a URL pathname into the shape publish routes are
  * keyed on: leading slash, trailing slash. `/adr/foo` and
  * `/adr/foo/` and `/adr/foo/index.html` all normalise to
  * `/adr/foo/`. Exported for tests. */
@@ -2361,6 +2481,50 @@ export function normalisePublishRoute(pathname: string): string {
   // canonical spelling.
   return p.replace(/\/+/g, "/");
 }
+
+/** Inverse of `siteRouteForPath` — a repo-relative source path for
+ * a site route, or undefined when the route is not a publishable
+ * doc (a landing page, an asset, an `/ask/<id>`, etc.). Kept as
+ * a single-place static map so both directions round-trip.
+ * `/adr/foo/`     → `docs/adr/foo.md`
+ * `/designs/bar/` → `docs/designs/bar.md`
+ * `/feature-matrix/` → `docs/FEATURE-MATRIX.md`
+ * The routes we recognise here match the writable prefixes
+ * `publish-confine.ts` accepts, so a publish that lands is a
+ * route the derive-from-files path serves. */
+export function reverseSiteRoute(route: string): string | undefined {
+  const normalised = route.replace(/^\/+|\/+$/g, "");
+  if (normalised === "feature-matrix") return "docs/FEATURE-MATRIX.md";
+  const adrMatch = normalised.match(/^adr\/([^/]+)$/);
+  if (adrMatch !== null && adrMatch[1] !== undefined) {
+    return `docs/adr/${adrMatch[1]}.md`;
+  }
+  const designMatch = normalised.match(/^designs\/([^/]+)$/);
+  if (designMatch !== null && designMatch[1] !== undefined) {
+    return `docs/designs/${designMatch[1]}.md`;
+  }
+  return undefined;
+}
+
+/** Locate the dist HTML for a site route relative to a served dir
+ * (`options.dir`). Returns undefined when the file does not exist
+ * — the caller falls back to the ordinary static branch. Kept
+ * separate from `spliceIntoShell` in `publish.ts` because the
+ * write path needs the file's absolute location; the request path
+ * only needs to know whether the file exists. */
+export function shellPathForRouteInStaticDir(distDir: string, route: string): string | undefined {
+  const normalised = route.replace(/^\/+|\/+$/g, "");
+  const candidate = normalised.length === 0
+    ? `${distDir}/index.html`
+    : `${distDir}/${normalised}/index.html`;
+  try {
+    if (statSync(candidate).isFile()) return candidate;
+  } catch {
+    // Not-found → undefined.
+  }
+  return undefined;
+}
+
 
 function repoRelativeDisplay(repoRoot: string, absolute: string): string {
   const rel = relativePath(repoRoot, absolute);

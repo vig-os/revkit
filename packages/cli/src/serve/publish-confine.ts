@@ -151,6 +151,16 @@ export function resolvePublishTarget(
   if (repoRelativePath.includes("\\")) return { ok: false, reason: UNIFORM_PUBLISH_REJECTION };
   if (repoRelativePath.includes("\0")) return { ok: false, reason: UNIFORM_PUBLISH_REJECTION };
 
+  // Refuse uppercase extensions so the site route (case-sensitive
+  // lower-case) and the on-disk filename agree. `foo.MD` and
+  // `foo.md` would otherwise land at two different Astro
+  // collection ids, so the confinement side rejects the
+  // upper-case shape and the caller renames.
+  const ext = extname(repoRelativePath);
+  if (ext.length > 0 && ext !== ext.toLowerCase()) {
+    return { ok: false, reason: UNIFORM_PUBLISH_REJECTION };
+  }
+
   // Match against the allowlist FIRST. The alternative (resolve, then
   // check prefix) would leak "file exists" information via timing.
   let matched: PublishableRoot | undefined;

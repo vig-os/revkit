@@ -18,10 +18,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { readdirSync } from "node:fs";
 import { basename, dirname, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import remarkMath from "remark-math";
-import { rehypeKatexStrict } from "./src/lib/rehype-katex-strict.ts";
-import { rehypeDataSrc } from "../packages/cli/src/rehype-data-src.ts";
-import { rehypeDropRepoDocTitle } from "../packages/cli/src/rehype-drop-repo-doc-title.ts";
+import { buildSharedMarkdownConfig } from "./src/lib/markdown-processor.ts";
 
 // Repo root — this file lives in `site/`, so the repo root is the
 // parent directory. The rehype-data-src plugin rewrites every
@@ -146,25 +143,10 @@ export default defineConfig({
   // src/lib/rehype-katex-strict.ts). `trust: false` (the default) blocks
   // `\href` and `\includegraphics`, so LaTeX cannot smuggle a link or an
   // external asset through math either.
-  markdown: {
-    remarkPlugins: [remarkMath],
-    // `rehypeDataSrc` runs AFTER `rehype-katex-strict`: KaTeX rewrites
-    // math regions to `<span class="katex">` trees WITHOUT position
-    // info, so running the stamper after keeps it from stamping the
-    // math internals with a garbage position. The stamper is a pure
-    // walker (no I/O), so ordering is a semantics choice, not a
-    // performance one.
-    rehypePlugins: [
-      [rehypeKatexStrict, { trust: false }],
-      // Drop the repo-doc's leading `# Title` in hast — Starlight's
-      // layout already renders the title from frontmatter. Done in
-      // hast (not in source) so `rehype-data-src` below stamps every
-      // block with its ORIGINAL source line number; a source-side
-      // strip shifted every anchor by 2 lines (PR #38 blocker 1).
-      [rehypeDropRepoDocTitle, { repoRoot: REPO_ROOT }],
-      [rehypeDataSrc, { repoRoot: REPO_ROOT }],
-    ],
-  },
+  // The remark + rehype list comes from ONE shared module that the
+  // daemon's fast-path publish also imports (M2 item 9, story A4).
+  // A new plugin lands in ONE place; both consumers see it.
+  markdown: buildSharedMarkdownConfig(REPO_ROOT),
   vite: {
     plugins: [tailwindcss()],
   },

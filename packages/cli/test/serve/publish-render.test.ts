@@ -45,18 +45,21 @@ const x = 1;
       path: "docs/adr/x.md",
       source,
     });
-    expect(dataSrcCount).toBeGreaterThan(3); // p + ul + 2 li + pre
+    expect(dataSrcCount).toBeGreaterThan(3); // p + ul + 2 li
     expect(html).toContain(`data-src="docs/adr/x.md:`);
     // The first h1 is dropped by rehype-drop-repo-doc-title, so
     // the paragraph after it is what gets stamped.
     expect(html).not.toMatch(/<h1[^>]*data-src="docs\/adr\/x\.md:1-1"/);
     expect(html).toContain("A paragraph.");
-    // Code block is wrapped in a data-src'd div (see rail's pre
-    // survival note in rehype-data-src.ts).
-    // The `<h1>` is line 1, line 2 blank, so `A paragraph.` is
-    // at line 3, `- one` at 5, `- two` at 6, blank at 7, ``` at 8,
-    // code at 9, closing ``` at 10 — matches the emitted stamps.
-    expect(html).toMatch(/<div[^>]*data-src="docs\/adr\/x\.md:8-10"[^>]*class="revkit-code-anchor"/);
+    // `A paragraph.` is at line 3, `- one` at 5, `- two` at 6.
+    expect(html).toMatch(/<ul[^>]*data-src="docs\/adr\/x\.md:5-6"/);
+    // Code blocks flow through Astro's default shiki highlighter
+    // (which strips source position). The rail anchors on the
+    // surrounding block; the `<pre>` itself carries no data-src
+    // in either the fast path OR a full build (Starlight's
+    // expressive-code wraps it with its own chrome downstream).
+    // Regression: NO orphan `data-src="…:undefined-…"`.
+    expect(html).not.toContain("undefined-undefined");
   });
 
   test("emits KaTeX HTML for inline math and refuses a malformed formula", async () => {

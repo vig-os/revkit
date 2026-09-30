@@ -77,8 +77,7 @@
 // changes that, this is the one call site to update.
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import type { Author, ReviewEvent } from "@revkit/review-core";
 import { revisionOf } from "@revkit/review-core";
 import { runCheck, toCheckFiles } from "../check.ts";
@@ -155,29 +154,18 @@ export interface PublishDependencies {
    * `IngestGapError` recovery path; publish just calls this after
    * every append so the derived state stays in lockstep. */
   readonly ingestDelivery: (event: ReviewEvent) => Promise<void>;
-  /** Serve-dir root — used to locate the pre-existing built HTML
-   * for the fast-path splice. `undefined` when the daemon serves
-   * a directory that isn't a real astro build (a template-smoke
-   * scenario), in which case `renderIntoSite` degrades to "no
-   * override, just the event fanout". */
+  /** Serve-dir root. The orchestrator does not write here — that
+   * belongs to the background full build — but it does render an
+   * article fragment eagerly so a stale dist doesn't reach the
+   * next page-load. Kept in the deps bag so a test may point at
+   * a temporary tree. */
   readonly distDir: string;
-  /** Called with the completed override AFTER the event has been
-   * fanned out. The daemon's static handler holds an override map
-   * keyed on `route`; this callback is what updates it. Passed in
-   * (instead of imported) so the override map's lifecycle stays
-   * with the daemon: the map is cleared on daemon stop. */
-  readonly setOverride: (route: string, override: PublishOverride) => void;
-}
-
-/** One override the daemon holds in memory. `revision` is the source
- * revision the override was rendered from — the static handler uses
- * it to reconcile against disk when a full `astro build` catches
- * up. */
-export interface PublishOverride {
-  readonly html: string;
-  readonly revision: string;
-  readonly renderedAtMs: number;
-  readonly dataSrcCount: number;
+  /** Called with the fresh (`revision`, `html`) pair AFTER the
+   * event has been fanned out. The daemon's static handler holds
+   * a revision-keyed render cache (M2 item 9, PR-56 blocker 2):
+   * this callback populates it so a page-load right after
+   * publish is a cache hit instead of a re-render. */
+  readonly setRenderCache: (revision: string, html: string, dataSrcCount: number) => void;
 }
 
 /** Public entry point. Runs the whole publish pipeline for one
@@ -306,15 +294,10 @@ async function runPublishInner(
         // Not-found is normal on a new-file publish.
       }
       snapshots.push({ absolutePath: entry.absolutePath, existed, ...(previous !== undefined ? { previous } : {}) });
-      // Ensure parent exists (allowlist guarantees it, but a fresh
-      // repo without `docs/adr/` would 404 here — the caller can
-      // publish a new ADR only when the tree already exists, which
-      // matches PUBLISH_ROOTS' scope).
-      const parent = dirname(entry.absolutePath);
-      if (!existsSync(parent)) {
-        mkdirSync(parent, { recursive: true });
-      }
       // Atomic: write to a temporary sibling, rename over the
+      // target. The confinement helper already refused any path
+      // whose parent directory does not exist, so no on-demand
+      // mkdir is needed here.
       // target. `renameSync` on the same filesystem is atomic on
       // Linux/macOS.
       const tmp = `${entry.absolutePath}.tmp-${randomBytes(8).toString("hex")}`;
@@ -434,19 +417,18 @@ async function runPublishInner(
     });
   }
 
-  // 6) Install overrides + emit `doc.published` for every entry.
+  // 6) Populate the daemon's revision-keyed render cache + emit
+  //    `doc.published` for every entry. The cache entry is
+  //    content-addressed by `revision`, so a request for the
+  //    same source at the same revision (before dist catches up)
+  //    is a Map hit; after dist catches up the entry is simply
+  //    unused. (M2 item 9, PR-56 blocker 2.)
   const overrides: { route: string; html: string; dataSrcCount: number }[] = [];
   const seqs: number[] = [];
   const publishedPaths = resolved.map((entry) => entry.input.path);
-  const publishedAtMs = Date.now();
   for (const item of rendered) {
     if (item.override !== undefined) {
-      deps.setOverride(item.override.route, {
-        html: item.override.html,
-        revision: item.entry.revision,
-        renderedAtMs: publishedAtMs,
-        dataSrcCount: item.override.dataSrcCount,
-      });
+      deps.setRenderCache(item.entry.revision, item.override.html, item.override.dataSrcCount);
       overrides.push(item.override);
     }
     const event: import("@revkit/review-core").ReviewEventInput = {

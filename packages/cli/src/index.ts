@@ -28,6 +28,7 @@ import { runOpenCommand } from "./open-cli.ts";
 import { runEventsCommand } from "./events-cli.ts";
 import { runHookCommand } from "./hook-cli.ts";
 import { runModeCommand } from "./mode-cli.ts";
+import { runSkillCommand } from "./skill-cli.ts";
 import { resolve as resolvePath } from "node:path";
 
 /** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
@@ -48,6 +49,7 @@ Usage:
   revkit mode [handover | live | quiet]
   revkit events --follow [--since <n>] [--dir <path>]
   revkit hook user-prompt-submit
+  revkit skill install [--dir <root>] [--force] [--dry-run]
 
 Guards (ADR-0005):
   component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure,
@@ -217,6 +219,11 @@ export async function dispatch(
 
   if (first === "mode") {
     const outcome = await runModeCommand(rest, { cwd: env.cwd });
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
+  }
+
+  if (first === "skill") {
+    const outcome = runSkillCommand(rest, { cwd: env.cwd });
     return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
   }
 

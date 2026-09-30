@@ -242,18 +242,22 @@ during the poll is under 1 second.
    inputs.revkit.url = "github:vig-os/revkit?ref=<tag>";
    ```
 
-2. Copy this directory into `.claude/skills/`:
+   Scaffolding a fresh docs repo also works: `nix flake init -t
+   github:vig-os/revkit` writes a starter tree that already pulls in
+   revkit's packages.
+
+2. Install this skill file with the packaged CLI:
 
    ```sh
    # from your repo root
-   cp -r "$(nix flake prefetch --json github:vig-os/revkit#templates | jq -r '.storePath')/skills/revkit" .claude/skills/revkit
+   revkit skill install
    ```
 
-   Or scaffold from the template (once PR #51 lands `templates.default`):
-
-   ```sh
-   nix flake init -t github:vig-os/revkit
-   ```
+   That writes `.claude/skills/revkit/SKILL.md`. Rerun with `--force`
+   after a revkit upgrade to pick up a newer version — the previous
+   file is saved next to it as `SKILL.md.backup-<timestamp>` first,
+   so a mid-refactor local edit is never silently lost.
+   `--dry-run` prints the target path without writing anything.
 
 3. Start the daemon and the MCP server:
 
@@ -264,6 +268,44 @@ during the poll is under 1 second.
 
 The skill needs no configuration — the MCP server discovers the daemon
 via `.revkit/serve.json` (mode 0600) that the daemon writes on start.
+Claude Code discovers this file the moment the working directory
+contains `.claude/skills/revkit/SKILL.md`.
+
+## Working with revisions
+
+Every published `.md` document carries a source revision — a SHA-256
+of the LF-normalised bytes, exposed as a hidden
+`<span data-revkit-revision="<hex>">` at the top of the article body.
+The daemon reads this stamp at request time and, when the current
+on-disk source has moved on from what dist was built against, renders
+the fresh source into the shell without waiting for a full build.
+
+You do not need to compute the revision yourself — `publish` returns
+it in the response body under `docs[].revision`. Store it if a later
+`ask` or `reply` should reference the exact revision you published;
+the daemon accepts `revision` as an optional field on `reply` for
+threads pinned to a source line.
+
+## What DOESN'T fast-render
+
+- **MDX (`site/src/content/docs/*.mdx`)** — the fast-path renderer
+  refuses `.mdx` because those files import components the shared
+  markdown pipeline cannot resolve on its own. A publish to an MDX
+  path still lands the write and fans out `doc.published`; the human
+  sees the new content once the background full build catches up
+  (typically 3–10 s). The skill's `publish` tool does not accept MDX
+  paths in v1.
+- **Plot spec / data files** — a publish to `plots/<name>/…` writes
+  the file (the collection loader picks it up on the next full
+  build), but there is no fast-path render because a plot is a
+  component. The doc that references the plot re-renders on its own
+  publish; between the two, the doc shows the old plot SVG until the
+  full build catches up.
+
+The skill's channel notifications carry a `path` and a `revision`;
+if `revision` differs from the source's current revision on disk,
+the human is looking at a stale render — call `publish` again with
+the current source to refresh.
 
 ## Failure modes and their signals
 

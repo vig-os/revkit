@@ -3,46 +3,42 @@
 //
 // The daemon takes a repo-relative `.md` path plus the new source
 // bytes and returns the article HTML fragment plus the block-level
-// `data-src` stamps the rail anchors on. The pipeline mirrors
-// `site/astro.config.mjs` exactly for `.md` files:
+// `data-src` stamps the rail anchors on. The pipeline is built
+// FROM THE SAME shared config `site/astro.config.mjs` passes to
+// Astro (`buildSharedMarkdownConfig`), running through Astro's
+// own `createMarkdownProcessor` so every default plugin Astro
+// applies — `remark-gfm` (tables, task lists, footnotes),
+// `remark-smartypants` (typographic punctuation), `rehype-heading-ids`
+// (heading `id="…"` slugs), `rehype-raw`, `rehype-stringify` — lands
+// in the fast render too. A plugin change on either side reaches
+// both; a config drift is impossible by construction.
 //
-//   remark-parse
-//     → remark-math
-//       → remark-rehype
-//         → rehype-katex-strict (trust: false)
-//           → rehype-drop-repo-doc-title (repo docs only)
-//             → rehype-data-src (repoRoot)
-//               → rehype-stringify
+// **Why an Astro processor and not a hand-rolled `unified()` chain**
+// (blocker 1 in the PR-56 review): the earlier version built a bare
+// `remark-parse → remark-rehype` pipe and got `.md` tables wrong
+// (`FEATURE-MATRIX.md` lost 40 of 44 `data-src` anchors because
+// GFM was missing), lost heading ids, and dropped smartypants
+// output. Using Astro's own factory guarantees byte-parity on the
+// article body.
 //
-// Note the ordering: `rehype-data-src` runs AFTER
-// `rehype-drop-repo-doc-title` so a dropped `<h1>` doesn't leave
-// stamped anchors pointing at empty positions; and AFTER
-// `rehype-katex-strict` so KaTeX's own hast subtree does not carry
-// data-src stamps (KaTeX-generated spans have no source position).
+// **What is NOT identical to a full build**: Starlight's
+// expressive-code integration re-renders `<pre>` blocks with its
+// own CSS classes AFTER Astro's markdown pass. The fast path here
+// stops at Astro's default `shiki` syntax highlighter (which
+// emits `<pre>` with a language attribute the rail can still
+// anchor on) — code blocks look different for the ~1 second
+// between publish and the background full build catching up.
+// `renderDocFragment` reports the source blocks it saw so the
+// caller can log the coverage without a second parse pass.
 //
-// The renderer does NOT wrap the fragment in the Starlight page
-// layout — the daemon takes the existing built HTML for the target
-// route as the "shell" and swaps only the inner article body. That
-// keeps the sidebar/nav/CSP-safe scripts unchanged, so a publish
-// that only rewrites content produces a page that byte-matches a
-// full build outside the `<article>` region (proven by
-// `test/serve/publish-equivalence.test.ts`).
-//
-// **Scope (M2)**: `.md` files under `docs/adr/`, `docs/designs/`
-// and `docs/FEATURE-MATRIX.md`. MDX (`site/src/content/docs/*.mdx`)
-// needs the mdx-to-hast pipeline plus starlight expressive-code and
-// is documented as a follow-up in the ADR-0001 amendment shipped
-// with this PR.
+// **Refuse-and-fall-back**: MDX under `site/src/content/docs/` is
+// not accepted by the fast path today. `isRenderablePath` returns
+// false; the caller emits `doc.published` without an override.
 
 import { extname } from "node:path";
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkMath from "remark-math";
-import remarkRehype from "remark-rehype";
-import rehypeStringify from "rehype-stringify";
-import { rehypeDataSrc } from "../rehype-data-src.ts";
-import { rehypeDropRepoDocTitle } from "../rehype-drop-repo-doc-title.ts";
-import { rehypeKatexStrict } from "../../../../site/src/lib/rehype-katex-strict.ts";
+import { pathToFileURL } from "node:url";
+import { createMarkdownProcessor } from "@astrojs/markdown-remark";
+import { buildSharedMarkdownConfig } from "../../../../site/src/lib/markdown-processor.ts";
 
 /** Options accepted by the fast-path renderer. */
 export interface RenderDocOptions {
@@ -70,21 +66,23 @@ export const RENDERABLE_EXTENSIONS: readonly string[] = Object.freeze([".md"]);
 /** Return true when `path` is one the renderer can produce a
  * fragment for. Callers that hit a non-renderable path still emit
  * `doc.published` (the file was written to disk and re-anchoring
- * ran); they just skip the override injection. */
+ * ran); they just skip the override injection. Extension check is
+ * case-INsensitive so `README.MD` normalises to `.md`. */
 export function isRenderablePath(path: string): boolean {
   const ext = extname(path).toLowerCase();
   return RENDERABLE_EXTENSIONS.includes(ext);
 }
 
-/** Run the fast-path pipeline. Same plugins, same order, same
- * options as `site/astro.config.mjs`; the only difference is
- * `remark-rehype` between them (in `astro.config.mjs` this hop is
- * implicit through `@astrojs/markdown-remark`). Returns the HTML
- * fragment that goes INSIDE the site's `<article>` element.
- *
- * `data-src` stamps use POSIX paths (see `rehype-data-src.ts`), so
- * an output produced on Windows CI still names paths the rail can
- * match against on any platform.
+/** Cached processor keyed by repo root. `createMarkdownProcessor`
+ * is not cheap (it loads a handful of unified plugins); a daemon
+ * usually renders many docs against the same root. */
+const processorCache = new Map<string, Promise<Awaited<ReturnType<typeof createMarkdownProcessor>>>>();
+
+/** Run the fast-path pipeline. Delegates to Astro's own
+ * `createMarkdownProcessor` with the shared plugin config, so the
+ * output equals what `astro build` would emit (whitespace-
+ * normalised) on the article body. Returns the HTML fragment that
+ * goes INSIDE the site's `<article>` element.
  *
  * A file outside `RENDERABLE_EXTENSIONS` throws — the caller checks
  * `isRenderablePath` first. This is a Bun runtime primitive on the
@@ -96,31 +94,34 @@ export async function renderDocFragment(options: RenderDocOptions): Promise<Rend
       `renderDocFragment: path '${options.path}' is not a renderable extension (${RENDERABLE_EXTENSIONS.join(", ")}).`,
     );
   }
-  // Count `data-src` stamps by scanning the final HTML — the plugin
-  // itself doesn't expose a counter through the unified pipe, and
-  // rebuilding the pipe with a counter-taking variant would double
-  // the wire.
-  const processor = unified()
-    .use(remarkParse)
-    .use(remarkMath)
-    .use(remarkRehype)
-    .use(rehypeKatexStrict, { trust: false })
-    .use(rehypeDropRepoDocTitle, { repoRoot: options.repoRoot })
-    .use(rehypeDataSrc, { repoRoot: options.repoRoot })
-    .use(rehypeStringify);
-  // `remark-parse` reads `value` from a VFile; we pass `path` too so
-  // the two rehype plugins that key on the file's location
-  // (`rehype-drop-repo-doc-title` and `rehype-data-src`) see the
-  // same repo-relative path Astro would hand them.
-  const vfile = await processor.process({
-    value: options.source,
-    path: `${options.repoRoot}/${options.path}`,
-  });
-  const html = String(vfile);
-  // A cheap counter over the emitted attribute string — no HTML
-  // parse. `data-src="…"` is the exact spelling `rehype-data-src`
-  // emits (single attribute, ASCII bytes only in the attribute
-  // name), so a string count is unambiguous.
+  let processorPromise = processorCache.get(options.repoRoot);
+  if (processorPromise === undefined) {
+    // `syntaxHighlight: false` matches what Starlight's
+    // `astro-expressive-code` integration does in the full build
+    // (it disables shiki and takes over code-block rendering via
+    // its own rehype plugin). Skipping shiki here keeps position
+    // information on the mdast → hast `<pre>` element so
+    // `rehype-data-src` can wrap it in a `<div data-src="…"
+    // class="revkit-code-anchor">` — the same wrapper the full
+    // build ships. Expressive-code's inner chrome is a visual
+    // detail the background rebuild catches up; the anchor
+    // survives publishes.
+    // `createMarkdownProcessor`'s options type refers to a private
+    // `RemarkPlugin` / `RehypePlugin` union that a plain `readonly`
+    // array can't satisfy without a cast; the runtime shape (an
+    // array of `[plugin, options]` tuples) is what the loader
+    // reads. Same shape Astro's `markdown` block accepts in
+    // `astro.config.mjs`.
+    processorPromise = createMarkdownProcessor({
+      ...buildSharedMarkdownConfig(options.repoRoot),
+      syntaxHighlight: false,
+    } as Parameters<typeof createMarkdownProcessor>[0]);
+    processorCache.set(options.repoRoot, processorPromise);
+  }
+  const processor = await processorPromise;
+  const fileUrl = pathToFileURL(`${options.repoRoot}/${options.path}`);
+  const result = await processor.render(options.source, { fileURL: fileUrl });
+  const html = result.code;
   const dataSrcCount = countOccurrences(html, ` data-src="`);
   return { html, dataSrcCount };
 }
@@ -138,4 +139,9 @@ function countOccurrences(haystack: string, needle: string): number {
     count++;
     from = at + needle.length;
   }
+}
+
+/** Reset the internal processor cache. Test-only. */
+export function _resetProcessorCacheForTests(): void {
+  processorCache.clear();
 }

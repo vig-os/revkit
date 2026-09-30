@@ -179,6 +179,21 @@ describe("resolvePublishTarget — rejection cases", () => {
     }
   });
 
+  test("refuses an uppercase `.MD` extension (PR-56 review nit — routes are case-sensitive)", () => {
+    // `siteRouteForPath` matches `\.md$` case-sensitively, so a
+    // publish to `docs/adr/x.MD` would (before this fix) succeed at
+    // the confinement gate but produce no route — the fast-path
+    // renderer then skipped the override, silently. The guard now
+    // rejects at the gate so caller knows to rename.
+    const { root, cleanup } = scaffold();
+    try {
+      const result = resolvePublishTarget(root, "docs/adr/x.MD");
+      expect(result.ok).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   test("refuses a symlink to somewhere outside the root", () => {
     const { root, cleanup } = scaffold();
     try {
