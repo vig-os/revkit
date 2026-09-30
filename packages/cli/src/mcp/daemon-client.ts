@@ -160,13 +160,116 @@ export class DaemonClient {
     return parsed;
   }
 
+  /** `GET /api/delivered` — the derived set of comment ids that
+   * have already reached the agent stream. Used by the catch-up
+   * summary + the UserPromptSubmit hook to hide handover drafts /
+   * quiet-mode comments (round-2 review). */
+  async getDeliveredCommentIds(): Promise<readonly string[]> {
+    const response = await this.#fetch(`${this.#url}/api/delivered`, {
+      method: "GET",
+      headers: this.#authHeaders(),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon GET /api/delivered → ${response.status}`,
+        response.status,
+        text,
+      );
+    }
+    const parsed = (await response.json()) as { deliveredCommentIds?: readonly string[] };
+    return Array.isArray(parsed.deliveredCommentIds) ? parsed.deliveredCommentIds : [];
+  }
+
+  /** `GET /api/delivery-mode` — read the daemon's current delivery
+   * mode plus batched-count and last-updated timestamp. */
+  async getMode(): Promise<{
+    mode: "handover" | "live" | "quiet";
+    batched: number;
+    lastEventMsAgo: number | null;
+    updatedAt: string;
+    idleFlushMs: number;
+  }> {
+    const response = await this.#fetch(`${this.#url}/api/delivery-mode`, {
+      method: "GET",
+      headers: this.#authHeaders(),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon GET /api/delivery-mode → ${response.status}`,
+        response.status,
+        text,
+      );
+    }
+    return (await response.json()) as {
+      mode: "handover" | "live" | "quiet";
+      batched: number;
+      lastEventMsAgo: number | null;
+      updatedAt: string;
+      idleFlushMs: number;
+    };
+  }
+
+  /** `POST /api/delivery-mode` — change the mode. Returns the same
+   * shape as `getMode`. */
+  async setMode(mode: "handover" | "live" | "quiet"): Promise<{
+    mode: "handover" | "live" | "quiet";
+    batched: number;
+    lastEventMsAgo: number | null;
+    updatedAt: string;
+    idleFlushMs: number;
+  }> {
+    const response = await this.#fetch(`${this.#url}/api/delivery-mode`, {
+      method: "POST",
+      headers: this.#authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ mode }),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /api/delivery-mode → ${response.status}`,
+        response.status,
+        text,
+      );
+    }
+    return (await response.json()) as {
+      mode: "handover" | "live" | "quiet";
+      batched: number;
+      lastEventMsAgo: number | null;
+      updatedAt: string;
+      idleFlushMs: number;
+    };
+  }
+
+  /** `POST /api/presence` — emit an agent-authored presence beacon
+   * (state=editing | idle, optional file + line range). The daemon
+   * auto-expires an `editing` beacon after `presenceTtlMs`. */
+  async presence(state: "editing" | "idle", location?: { path?: string; startLine?: number; endLine?: number }): Promise<AppendResponse> {
+    const body: Record<string, unknown> = { state };
+    if (location?.path !== undefined) body.path = location.path;
+    if (location?.startLine !== undefined) body.startLine = location.startLine;
+    if (location?.endLine !== undefined) body.endLine = location.endLine;
+    const response = await this.#fetch(`${this.#url}/api/presence`, {
+      method: "POST",
+      headers: this.#authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /api/presence → ${response.status}`,
+        response.status,
+        text,
+      );
+    }
+    return (await response.json()) as AppendResponse;
+  }
+
   /** `POST /api/asks` — create a new question spec (M2 item 7,
    * story A1). Returns `{ ask, url }` where `url` is the same-origin
    * path the human opens (`/ask/<id>`). The `ttlMs` cap governs
-   * when the daemon emits `ask.expired` lazily.
-   *
-   * Caller is `revkit mcp`'s `ask` tool; the shape mirrors the
-   * daemon's `createAskRequestSchema` on purpose. */
+   * when the daemon emits `ask.expired` lazily. */
   async createAsk(spec: unknown, opts: { id?: string; ttlMs?: number } = {}): Promise<{ ask: unknown; url: string }> {
     const body: Record<string, unknown> = { spec };
     if (opts.id !== undefined) body.id = opts.id;
@@ -191,10 +294,7 @@ export class DaemonClient {
   async getAsk(id: string): Promise<unknown> {
     const response = await this.#fetch(
       `${this.#url}/api/asks/${encodeURIComponent(id)}`,
-      {
-        method: "GET",
-        headers: this.#authHeaders(),
-      },
+      { method: "GET", headers: this.#authHeaders() },
     );
     if (!response.ok) {
       const text = await response.text().catch(() => "");

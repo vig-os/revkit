@@ -1201,9 +1201,11 @@ sleep 3
 INSTRUCTIONS="This is a disposable local test session for revkit's \
 review loop. You are connected to a running revkit daemon via the \
 \`revkit\` MCP server. Please wait for a channel notification from \
-server:revkit — that will be a review comment on a doc page — then: \
-call \`threads\` to find the open thread whose comment body contains \
-the token ${NONCE}; call \`reply\` on that thread with body \
+server:revkit — it may be a per-comment event OR a hand-over frame \
+(the reviewer batches under the default handover mode; either shape \
+signals there is a review thread to read). When it arrives: call \
+\`threads\` to find the open thread whose comment body contains the \
+token ${NONCE}; call \`reply\` on that thread with body \
 \`ack ${NONCE}\` (use the last comment's id as parent_id); then call \
 \`resolve\`. That's it. No file changes, no git, nothing else."
 

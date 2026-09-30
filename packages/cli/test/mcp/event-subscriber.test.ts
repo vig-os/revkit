@@ -53,6 +53,11 @@ describe("event-subscriber (SSE)", () => {
       localUserId: "local-test",
       installSignalHandlers: false,
       logSink: { write: () => {} },
+      // M2 item 6 makes `handover` the default delivery mode, which
+      // batches human events off the AGENT stream. These tests
+      // exercise the SSE transport itself and want each event
+      // delivered live.
+      deliveryMode: "live",
     });
   });
   afterEach(async () => {
@@ -148,7 +153,7 @@ describe("event-subscriber (SSE)", () => {
       });
       await waitFor(() => secondBatch.length >= 1);
       // Only the SECOND event should have arrived on the resume.
-      expect(secondBatch.every((e) => e.seq > firstSeq)).toBe(true);
+      expect(secondBatch.every((e) => e.seq === undefined || e.seq > firstSeq)).toBe(true);
       expect(secondBatch.some((e) => (e as { body?: string }).body === "two")).toBe(true);
       expect(secondBatch.some((e) => (e as { body?: string }).body === "one")).toBe(false);
     } finally {

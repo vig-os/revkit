@@ -54,6 +54,22 @@ export const commentSchema = z
     body: z.string().min(1),
     createdAt: isoTimestamp,
     external: externalRefSchema.optional(),
+    /** M2 item 6 round 2: typed mentions parsed on the daemon at
+     * append time (see `commentMentionSchema` in `./events.ts`).
+     * Optional so pre-round-2 comments still parse. */
+    mentions: z
+      .array(
+        z
+          .object({
+            kind: z.enum(["agent", "agent-now", "gh-user", "team", "role"]),
+            id: z.string(),
+            label: z.string().min(1),
+            name: z.string().min(1).optional(),
+            range: z.tuple([z.number().int().nonnegative(), z.number().int().nonnegative()]),
+          })
+          .strict(),
+      )
+      .optional(),
   })
   .strict();
 
