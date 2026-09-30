@@ -248,6 +248,39 @@ describe("resolvePublishTarget — rejection cases", () => {
       cleanup();
     }
   });
+
+  test("refuses a path whose PARENT DIRECTORY is a symlink to outside the repo (round-2 nit)", () => {
+    // Round-2 nit: an agent should not be able to write into a
+    // real directory reached only through a symlinked parent.
+    // Even if the leaf itself is a plain filename, an attacker
+    // planted symlink at any component of the path is a bypass.
+    const { root, cleanup } = scaffold();
+    try {
+      // Place a symlink at docs/adr/link-parent → /tmp
+      // (a directory OUTSIDE this scratch repo). Any child
+      // `docs/adr/link-parent/*.md` must be refused.
+      symlinkSync("/tmp", join(root, "docs", "adr", "link-parent"));
+      const result = resolvePublishTarget(root, "docs/adr/link-parent/new.md");
+      expect(result.ok).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("refuses a dangling-symlink leaf (round-2 nit)", () => {
+    // A symlink whose target does not exist would otherwise
+    // survive an `existsSync` on the parent, appearing "new-file
+    // publish" but resolving to an off-tree path if a follower
+    // ever chases the link. The confinement helper refuses.
+    const { root, cleanup } = scaffold();
+    try {
+      symlinkSync("/nonexistent/path", join(root, "docs", "adr", "dangling.md"));
+      const result = resolvePublishTarget(root, "docs/adr/dangling.md");
+      expect(result.ok).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 describe("size caps are named as constants", () => {

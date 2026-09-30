@@ -432,4 +432,36 @@ describe("POST /api/publish — refusal cases", () => {
     const after = readFileSync(join(ctx.root, "docs/adr/0999-test.md"), "utf8");
     expect(after).toBe(previous);
   });
+
+  test("returns 413 when the per-file body exceeds 5 MiB (round-2 nit)", async () => {
+    const previous = readFileSync(join(ctx.root, "docs/adr/0999-test.md"), "utf8");
+    // 5 MiB + 1 byte of ASCII → byteLength = 5 MiB + 1.
+    const oversized = `# ADR-0999\n\n${"x".repeat(5 * 1024 * 1024 + 1)}\n`;
+    const response = await publish(ctx.handle, {
+      docs: [{ path: "docs/adr/0999-test.md", content: oversized }],
+    });
+    expect(response.status).toBe(413);
+    // Rollback: no write should have landed for an over-cap batch.
+    const after = readFileSync(join(ctx.root, "docs/adr/0999-test.md"), "utf8");
+    expect(after).toBe(previous);
+  });
+
+  test("concurrent publish requests serialise cleanly (round-2 nit)", async () => {
+    // Two overlapping publishes to the SAME path. The module-scoped
+    // publish mutex must serialise them; both must complete with a
+    // deterministic final state (the LAST publish wins on disk).
+    const bodyA = `# ADR-0999\n\n- Status: Proposed\n- Date: 2026-09-30\n\n## Context\n\nA writes first.\n`;
+    const bodyB = `# ADR-0999\n\n- Status: Proposed\n- Date: 2026-09-30\n\n## Context\n\nB writes second.\n`;
+    const [resA, resB] = await Promise.all([
+      publish(ctx.handle, { docs: [{ path: "docs/adr/0999-test.md", content: bodyA }] }),
+      publish(ctx.handle, { docs: [{ path: "docs/adr/0999-test.md", content: bodyB }] }),
+    ]);
+    // Both requests must succeed (2xx). One of them is the "winner"
+    // that ended up on disk; the other was applied first and then
+    // overwritten. Neither should 500 or hang.
+    expect([resA.status, resB.status].every((s) => s >= 200 && s < 300)).toBe(true);
+    const onDisk = readFileSync(join(ctx.root, "docs/adr/0999-test.md"), "utf8");
+    // Final content is one of the two bodies (both LF-normalised).
+    expect([bodyA, bodyB]).toContain(onDisk);
+  });
 });
