@@ -1,3 +1,4 @@
+/// <reference path="./vendor/diff-match-patch.d.ts" />
 // Re-anchoring engine (ADR-0006 Acceptance). Pure logic:
 //
 //   reanchor(anchor, oldSource, newSource) → ReanchorResult
