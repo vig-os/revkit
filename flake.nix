@@ -62,11 +62,8 @@
       # than a mismatched hash at build time.
       nodeModulesHashes = {
         x86_64-linux = "sha256-raL8WRFsNe5HeX+nlh1PPUSWg9dutXAFPXwIruzIaCw=";
-        # aarch64 hashes captured by the CI matrix on its first run
-        # after this linker switch (see PR #51). Placeholder = fakeHash
-        # so the first build fails loudly with the correct value.
-        aarch64-linux = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        aarch64-darwin = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        aarch64-linux = "sha256-p9H+EIRs6QBKm4iyC6p9EqFdvAbYR6zT0cgMns1W2m8=";
+        aarch64-darwin = "sha256-jhpEBgpR2FIOe/BtL5c+CcqjKcPWi8LAUnYHvlEHBqY=";
       };
 
       # Systems `packages` / `apps` are exposed on. Kept in lockstep with
