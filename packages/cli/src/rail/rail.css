@@ -228,6 +228,142 @@
   color: var(--revkit-rail-resolved);
 }
 
+/*
+ * Unread state (issue #60). A thread whose latest touch was an
+ * agent action since the human last acknowledged it keeps a
+ * left-hand accent stripe AND a text pill — so the reviewer notices
+ * it even when the accent hue reads badly for a colour-blind
+ * viewer. axe: the pill carries text and an aria-hidden glyph, so
+ * screen readers announce "agent replied — unread".
+ */
+.revkit-rail__thread--unread {
+  border-left-width: 3px;
+  border-left-color: var(--revkit-rail-accent);
+}
+
+.revkit-rail__thread-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.revkit-rail__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4;
+  border: 1px solid currentColor;
+}
+
+.revkit-rail__pill--unread {
+  color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 10%, transparent);
+}
+
+.revkit-rail__pill-icon {
+  font-weight: 700;
+}
+
+/* Resolved-summary disclosure row (issue #60). The button is a real
+ * <button aria-expanded>; the caret is a text glyph so no bitmap
+ * font is needed. Full-width click target so a reviewer can hit it
+ * without pixel-hunting on mobile. */
+.revkit-rail__resolved-summary {
+  margin-top: 0.35rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.revkit-rail__resolved-toggle {
+  all: unset;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-resolved);
+  padding: 0.15rem 0.25rem;
+  border-radius: 4px;
+}
+
+.revkit-rail__resolved-toggle:focus-visible {
+  outline: 2px solid var(--revkit-rail-accent);
+  outline-offset: 2px;
+}
+
+.revkit-rail__resolved-caret {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  color: var(--revkit-rail-resolved);
+}
+
+.revkit-rail__resolved-status {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 0.7rem;
+}
+
+.revkit-rail__resolved-meta {
+  color: var(--revkit-rail-muted);
+  font-size: 0.75rem;
+  margin: 0.15rem 0 0 0;
+}
+
+.revkit-rail__resolved-who {
+  color: var(--revkit-rail-fg);
+  font-weight: 500;
+}
+
+.revkit-rail__resolved-excerpt {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-muted);
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+}
+
+.revkit-rail__reopen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.revkit-rail__reopen:hover,
+.revkit-rail__reopen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+.revkit-rail__mark-seen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-muted);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.revkit-rail__header-resolved-count {
+  font-size: 0.75rem;
+  color: var(--revkit-rail-resolved);
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--revkit-rail-resolved);
+  border-radius: 999px;
+  margin-left: auto;
+  margin-right: 0.5rem;
+}
+
 .revkit-rail__comments {
   list-style: none;
   padding: 0;

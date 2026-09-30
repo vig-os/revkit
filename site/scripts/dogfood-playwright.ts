@@ -377,7 +377,19 @@ async function main(): Promise<void> {
     await page.evaluate((nonce: string) => {
       (window as unknown as { __revkitReplySeen?: number }).__revkitReplySeen = undefined;
       const check = (): void => {
-        const nodes = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
+        // Issue #60 lesson: scope the observer to
+        // `revkit-rail-comment[data-author-kind="agent"]` — an
+        // AGENT-authored comment carrying the ack nonce — instead
+        // of the whole thread's text. The old scope-by-thread check
+        // could match the human comment's echo of the nonce and
+        // signal "reply seen" before the agent had actually
+        // replied. Since the fix now keeps the resolved thread
+        // visible with the reply intact, the observer's scope has
+        // to be tight enough to distinguish a stale human comment
+        // from the real agent-authored ack.
+        const nodes = document.querySelectorAll(
+          '[data-testid="revkit-rail-comment"][data-author-kind="agent"]',
+        );
         for (const el of Array.from(nodes)) {
           const text = el.textContent ?? "";
           if (text.includes(`ack ${nonce}`)) {
