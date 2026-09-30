@@ -92,15 +92,24 @@ function snapshotTrustedCaches(): {
   };
 }
 
-/** Build a real git commit on top of `origin/dev` that adds/modifies
+/** Build a real git commit on top of `HEAD` that adds/modifies
  * one or more files. Returns the commit SHA and the base SHA
- * (origin/dev). Uses a scratch index so the reviewer's real working
- * index is untouched. */
+ * (HEAD).
+ *
+ * The base is `HEAD`, NOT `origin/dev`, so the tests run
+ * identically on a shallow CI checkout that has no remote-tracking
+ * refs. In CI's pull_request event `HEAD` is the merge commit
+ * (which combines this branch and dev), so tooling-diff sees only
+ * the fixture's own changes on top of a benign, in-check tree — the
+ * same shape as running locally.
+ *
+ * Uses a scratch index so the reviewer's real working index is
+ * untouched. */
 async function buildAdversarialCommit(input: {
   readonly slug: string;
   readonly changes: ReadonlyArray<{ readonly path: string; readonly content: string; readonly mode?: string }>;
 }): Promise<{ readonly headSha: string; readonly baseSha: string }> {
-  const baseSha = (await spawnGit(["rev-parse", "origin/dev"], CHECKOUT_ROOT)).stdout.trim();
+  const baseSha = (await spawnGit(["rev-parse", "HEAD"], CHECKOUT_ROOT)).stdout.trim();
   // Scratch index in a per-test tempdir — outside `.git/` because
   // this checkout is a git worktree (`.git` is a FILE that
   // redirects to the main repo's `worktrees/<name>/`, so `.git/foo`
