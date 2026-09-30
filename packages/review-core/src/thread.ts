@@ -21,7 +21,17 @@ export const threadStatusSchema = z.enum(threadStatuses);
  * comment is mirrored somewhere off-log — today that means a GitHub PR
  * review comment (M3, ADR-0025). Structured so a second backend (a
  * hosted `@revkit` reference, GitLab down the line) slots in without
- * a `schemaVersion` bump. */
+ * a `schemaVersion` bump.
+ *
+ * M3 part 2b: the `github` block gains `pending` and `reviewNodeId`.
+ * `pending: true` means the comment lives in an unsubmitted PENDING
+ * review; `reviewNodeId` is the GraphQL id of that pending review
+ * so the derived "pending set" (see `review-state.ts::reduceReviewState`)
+ * can link each comment to the review it belongs to. Both fields are
+ * OPTIONAL so a `comment.linked` event for a SUBMITTED comment (older
+ * log, import path) still parses. `pending: false` is representable
+ * for callers who want to be explicit, but derivation treats
+ * `undefined` and `false` alike. */
 export const externalRefSchema = z
   .object({
     github: z
@@ -32,6 +42,20 @@ export const externalRefSchema = z
         commentId: z.number().int().positive(),
         reviewId: z.number().int().positive().optional(),
         nodeId: z.string().min(1).optional(),
+        /** True when this link was created for a PENDING (unsubmitted)
+         * review draft. Falsy / absent for a published review comment.
+         * The daemon writes true on `addPendingReviewThread`, and the
+         * derived review-state view flips comments to submitted /
+         * abandoned via `review.submitted` / `review.abandoned` events
+         * on the containing review (not by mutating the link event —
+         * the log is append-only). M3 part 2b. */
+        pending: z.boolean().optional(),
+        /** GraphQL node id of the pending review this comment belongs
+         * to. Set alongside `pending: true` so submit / abandon can
+         * find every draft that must go along with the review's own
+         * terminal transition. Node ids are opaque strings; only the
+         * min-1 constraint is enforced. M3 part 2b. */
+        reviewNodeId: z.string().min(1).optional(),
       })
       .strict()
       .optional(),

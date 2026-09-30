@@ -46,6 +46,20 @@ export interface LogFields {
    * call. */
   readonly from?: string;
   readonly to?: string;
+  /** M3 part 2b review-mode fields. `reviewNodeId` is the pending
+   * review's GraphQL id (opaque to us); `actorKind` names the
+   * caller class (local / agent / gh-user / system); the four
+   * `*HeadSha` / `*headSha` names carry short-hex commit SHAs
+   * used by the head-move refresh flow. `fileFallback` is a
+   * boolean flag on the mirror log line noting that the anchor
+   * did not fit any hunk. */
+  readonly reviewNodeId?: string;
+  readonly actorKind?: string;
+  readonly expectedHeadSha?: string;
+  readonly actualHeadSha?: string | null;
+  readonly previousHeadSha?: string;
+  readonly currentHeadSha?: string;
+  readonly fileFallback?: boolean;
 }
 
 /** A tiny writer interface so tests can inject a buffer. Node's
@@ -155,6 +169,13 @@ const ALLOWED_KEYS = [
   "artefact",
   "from",
   "to",
+  "reviewNodeId",
+  "actorKind",
+  "expectedHeadSha",
+  "actualHeadSha",
+  "previousHeadSha",
+  "currentHeadSha",
+  "fileFallback",
 ] as const satisfies readonly (keyof LogFields)[];
 
 /** Exported so `test/serve/logger.test.ts` can iterate the allowlist —

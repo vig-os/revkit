@@ -33,6 +33,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import {
   GitHubAdapter,
+  type PrFile,
   type PrRef,
   type PullRequestSummary,
 } from "@revkit/review-core";
@@ -116,6 +117,19 @@ export interface RunReviewEnv {
     readonly sqlitePath: string;
     readonly repoRoot: string;
     readonly localUserId: string;
+    /** M3 part 2b — the daemon's review-mode wiring. When present,
+     * the daemon mirrors human-authored comments onto GitHub as
+     * pending-review drafts and exposes `/api/review/*`.
+     * When absent, the daemon starts in local-only mode (the
+     * legacy shape). */
+    readonly reviewMode?: {
+      readonly adapter: GitHubAdapter;
+      readonly pr: PrRef;
+      readonly summary: PullRequestSummary;
+      readonly viewerLogin: string;
+      readonly files: readonly PrFile[];
+      readonly trustSha?: string;
+    };
   }) => Promise<{ url: string; port: number; launchUrl: string; blockForever: Promise<void>; stop(): Promise<void> }>;
   /** Local user id — required. The daemon's actor-identification
    * boundary needs a stable per-install tag; the caller
@@ -597,8 +611,16 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     displayName: `review-${pr.owner}-${pr.repo}-${pr.pullNumber}`,
   });
   let populate: PopulateOutcome;
+  // Files list (from listPullRequestFiles) — the daemon's review-mode
+  // needs it for anchor-map. Cache what `importThreads` already fetched
+  // by making an explicit call here (dedupe by using the adapter's
+  // per-instance retry policy). The list is small (~< 5 KB per PR
+  // and gated by DEFAULT_MAX_FILES_PAGES). Fetch is cheap on the
+  // reviewer's local rate limit.
+  let prFiles: readonly PrFile[] = [];
   try {
     const threads = await adapter.listReviewThreads(pr);
+    prFiles = await adapter.listPullRequestFiles(pr);
     populate = await populateStoreFromPr({
       pr,
       threads,
@@ -607,6 +629,10 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
       adapter,
       materializedRoot,
       store,
+      // Rename-aware old-path mapping so LEFT-side threads on a
+      // renamed file read the merge-base at their original name.
+      oldPathOf: (currentPath) =>
+        prFiles.find((f) => f.filename === currentPath)?.previousFilename,
     });
   } catch (error) {
     store.close();
@@ -639,12 +665,36 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
 
   const localUserId = env.localUserId;
 
+  // Look up the reviewer's viewer login now — the daemon needs it
+  // for `findOrCreatePendingReview`, and we already hold the
+  // adapter here. Cheap GraphQL call. Deferred until AFTER the
+  // --no-serve short-circuit so a non-serving prepare-only run
+  // (`--no-serve`) never touches GraphQL for a value it won't use.
+  let viewerLogin: string;
+  try {
+    viewerLogin = await adapter.viewerLogin();
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: `${stdoutLines.join("\n")}\n`,
+      stderr: `revkit review: failed to look up viewer login: ${(error as Error).message}\n`,
+    };
+  }
+
   const serveHandle = await env.startServe({
     materializedRoot,
     distDir: distOutDir,
     sqlitePath,
     repoRoot,
     localUserId,
+    reviewMode: {
+      adapter,
+      pr,
+      summary: { ...summary, headSha: fetchedHead },
+      viewerLogin,
+      files: prFiles,
+      ...(parsed.trustSha !== undefined ? { trustSha: parsed.trustSha } : {}),
+    },
   });
   stdoutLines.push(``);
   stdoutLines.push(`revkit serve: listening on ${serveHandle.url}`);

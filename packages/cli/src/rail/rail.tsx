@@ -172,6 +172,124 @@ async function handOverNow(): Promise<void> {
   if (!response.ok) throw new Error(`POST /api/handover failed: ${response.status}`);
 }
 
+// ── Review-mode wire shapes (M3 part 2b) ─────────────────────────
+
+/** Minimal wire type for `GET /api/review/state`. Kept a duck-type
+ * so the browser bundle doesn't pull in review-core. `null` in
+ * `state.openPending` = no open pending review; `stale: true` when
+ * the head moved after opening. `err` in the fetch layer surfaces
+ * a non-review daemon (404 on the route) as a null result — the
+ * rail then hides the review panel entirely. */
+interface RailReviewState {
+  readonly pr: {
+    readonly owner: string;
+    readonly repo: string;
+    readonly number: number;
+    readonly title: string;
+    readonly headSha: string;
+    readonly headRef: string;
+    readonly baseSha: string;
+    readonly baseRef: string;
+    readonly url: string;
+    readonly state: "open" | "closed";
+  };
+  readonly viewerLogin: string;
+  readonly state: {
+    readonly openPending:
+      | {
+          readonly reviewNodeId: string;
+          readonly headSha: string;
+          readonly comments: ReadonlyArray<{
+            readonly commentId: string;
+            readonly threadId: string;
+            readonly path: string;
+            readonly pendingCommentDatabaseId: number;
+            readonly pendingCommentNodeId?: string;
+          }>;
+        }
+      | null;
+    readonly terminal: ReadonlyArray<{ readonly reviewNodeId: string; readonly outcome: unknown }>;
+  };
+  readonly stale: boolean;
+}
+
+/** Fetch review-mode state. Returns null when the daemon is not in
+ * review mode (`/api/review/state` returns 404). Any other error
+ * surfaces on the rail's error line. */
+async function fetchReviewState(): Promise<RailReviewState | null> {
+  const response = await fetch("/api/review/state", {
+    credentials: "same-origin",
+    headers: { accept: "application/json" },
+  });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`GET /api/review/state failed: ${response.status}`);
+  return (await response.json()) as RailReviewState;
+}
+
+async function submitReview(event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES", body: string): Promise<void> {
+  const response = await fetch("/api/review/submit", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body.length > 0 ? { event, body } : { event }),
+  });
+  if (!response.ok) {
+    if (response.status === 409) {
+      throw new Error("This pending review is stale (head moved). Click 'Re-anchor to new head'.");
+    }
+    let msg = `submit failed: ${response.status}`;
+    try {
+      const parsed = (await response.json()) as { error?: string };
+      if (typeof parsed.error === "string") msg = `submit refused: ${parsed.error}`;
+    } catch {
+      /* fine */
+    }
+    throw new Error(msg);
+  }
+}
+
+async function discardPendingReview(reason?: string): Promise<void> {
+  const response = await fetch("/api/review/discard", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(reason !== undefined ? { reason } : {}),
+  });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`discard failed: ${response.status}`);
+  }
+}
+
+async function reanchorPendingReview(): Promise<{
+  reanchored: number;
+  orphaned: number;
+  openedReviewNodeId: string;
+}> {
+  const response = await fetch("/api/review/reanchor", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: "{}",
+  });
+  if (!response.ok) throw new Error(`reanchor failed: ${response.status}`);
+  return (await response.json()) as {
+    reanchored: number;
+    orphaned: number;
+    openedReviewNodeId: string;
+  };
+}
+
+async function refreshReviewPr(): Promise<{ moved: boolean; stale: boolean; currentHeadSha: string }> {
+  const response = await fetch("/api/review/refresh", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: "{}",
+  });
+  if (!response.ok) throw new Error(`refresh failed: ${response.status}`);
+  return (await response.json()) as { moved: boolean; stale: boolean; currentHeadSha: string };
+}
+
 /** Build the SHA-256 hex digest of the LF-normalised body — the
  * `revision` field on the anchor. `revisionOf` in review-core does the
  * same for the server; the rail computes its own locally so a new
@@ -347,7 +465,7 @@ function nearestAnchorAncestor(node: Node | null): HTMLElement | undefined {
  * backoff up to 30 s — a paused laptop can wake into a stale stream
  * and this brings it back quickly without hammering the daemon. */
 function subscribeEvents(
-  onBump: () => void,
+  onBump: (event: RailReviewEvent) => void,
   onModeBump: () => void = () => {},
   onPresence: (event: {
     readonly ts: string;
@@ -391,9 +509,19 @@ function subscribeEvents(
           // Same refetch strategy — cheap, keeps the rail's model of
           // the world identical to the daemon's authoritative state.
           event.kind === "thread.reanchored" ||
-          event.kind === "thread.orphaned"
+          event.kind === "thread.orphaned" ||
+          // M3 part 2b: review-lifecycle + comment-link events
+          // change the pending set. The rail's review panel reads
+          // that via `refetchReview`; the outer bump also refetches
+          // threads (a review.opened / review.submitted doesn't
+          // move threads, but comment.linked can update a
+          // thread's `external.github` field).
+          event.kind === "comment.linked" ||
+          event.kind === "review.opened" ||
+          event.kind === "review.submitted" ||
+          event.kind === "review.abandoned"
         ) {
-          onBump();
+          onBump(event);
         }
         // M2 item 6: any event that could change the batch count
         // re-fetches the mode. A `comment.created` / `comment.replied`
@@ -483,6 +611,12 @@ function cssEscape(value: string): string {
 function Rail(): JSX.Element {
   const [threads, { refetch }] = createResource(fetchThreads);
   const [mode, { refetch: refetchMode }] = createResource(fetchDeliveryMode);
+  // Review-mode state (M3 part 2b). `null` means the daemon is not
+  // in review mode; the rail hides the panel entirely.
+  const [reviewState, { refetch: refetchReview }] = createResource<RailReviewState | null>(fetchReviewState);
+  const [submitEvent, setSubmitEvent] = createSignal<"COMMENT" | "APPROVE" | "REQUEST_CHANGES">("COMMENT");
+  const [submitBody, setSubmitBody] = createSignal<string>("");
+  const [reviewBusy, setReviewBusy] = createSignal<boolean>(false);
   // Presence — latest beacon per agent id. Cleared on `idle`.
   const [presence, setPresence] = createSignal<readonly PresenceBadge[]>([]);
   // Round-3: "flushed by …" indicator. Every handover or mode
@@ -569,8 +703,21 @@ function Rail(): JSX.Element {
   // subscribers are separated so a `presence` event does not force a
   // thread refetch, and a comment event does not force a mode refetch.
   const unsubscribe = subscribeEvents(
-    () => {
+    (event) => {
       void refetch();
+      // Any comment.linked / review.* event affects the derived
+      // review state — kick a refetch so the pending count and
+      // stale banner stay in sync with the log.
+      if (
+        event.kind === "comment.linked" ||
+        event.kind === "review.opened" ||
+        event.kind === "review.submitted" ||
+        event.kind === "review.abandoned" ||
+        event.kind === "thread.reanchored" ||
+        event.kind === "thread.orphaned"
+      ) {
+        void refetchReview();
+      }
     },
     () => {
       void refetchMode();
@@ -873,6 +1020,175 @@ function Rail(): JSX.Element {
           data-testid="revkit-rail-delivery-note"
         >
           <p class="revkit-rail__delivery-note-text">{deliveryNote()!.text}</p>
+        </section>
+      </Show>
+      <Show when={reviewState() !== null && reviewState() !== undefined}>
+        <section
+          class="revkit-rail__review"
+          data-testid="revkit-rail-review"
+          aria-labelledby="revkit-rail-review-heading"
+        >
+          <h3 id="revkit-rail-review-heading" class="revkit-rail__review-heading">
+            Review: #{reviewState()!.pr.number} — {reviewState()!.pr.title}
+          </h3>
+          <p class="revkit-rail__review-meta">
+            <span class="revkit-rail__review-viewer">as {reviewState()!.viewerLogin}</span>
+            {" · "}
+            <span class="revkit-rail__review-head">
+              head <code>{reviewState()!.pr.headSha.slice(0, 12)}</code>
+            </span>
+          </p>
+          <Show when={reviewState()!.stale}>
+            <div
+              class="revkit-rail__review-stale"
+              role="alert"
+              data-testid="revkit-rail-review-stale"
+            >
+              <p class="revkit-rail__review-stale-text">
+                The PR head moved after you opened this pending review — your drafts point at an
+                older commit and cannot be submitted as-is.
+              </p>
+              <button
+                type="button"
+                class="revkit-rail__review-reanchor"
+                data-testid="revkit-rail-review-reanchor"
+                disabled={reviewBusy()}
+                onClick={() => {
+                  void (async () => {
+                    setReviewBusy(true);
+                    setError(undefined);
+                    try {
+                      const result = await reanchorPendingReview();
+                      setError(undefined);
+                      await refetchReview();
+                      await refetch();
+                      // Surface the outcome in the delivery-note
+                      // channel — cheap way to show a transient banner.
+                      if (result.orphaned > 0) {
+                        setError(
+                          `Re-anchored ${result.reanchored} comment${result.reanchored === 1 ? "" : "s"}; ${result.orphaned} orphaned — see the orphan panel below.`,
+                        );
+                      }
+                    } catch (cause) {
+                      setError((cause as Error).message);
+                    } finally {
+                      setReviewBusy(false);
+                    }
+                  })();
+                }}
+              >Re-anchor to new head</button>
+            </div>
+          </Show>
+          <p class="revkit-rail__review-count" data-testid="revkit-rail-review-count">
+            <Show
+              when={reviewState()!.state.openPending !== null && reviewState()!.state.openPending!.comments.length > 0}
+              fallback={<span>No pending review comments yet.</span>}
+            >
+              {reviewState()!.state.openPending!.comments.length} pending comment
+              {reviewState()!.state.openPending!.comments.length === 1 ? "" : "s"} on {" "}
+              <code>{reviewState()!.state.openPending!.headSha.slice(0, 12)}</code>
+            </Show>
+          </p>
+          <Show when={reviewState()!.state.openPending !== null && !reviewState()!.stale}>
+            <form
+              class="revkit-rail__review-submit"
+              data-testid="revkit-rail-review-submit"
+              onSubmit={(evt) => {
+                evt.preventDefault();
+                void (async () => {
+                  setReviewBusy(true);
+                  setError(undefined);
+                  try {
+                    await submitReview(submitEvent(), submitBody());
+                    setSubmitBody("");
+                    await refetchReview();
+                    await refetch();
+                  } catch (cause) {
+                    setError((cause as Error).message);
+                  } finally {
+                    setReviewBusy(false);
+                  }
+                })();
+              }}
+            >
+              <fieldset class="revkit-rail__review-event">
+                <legend class="revkit-rail__review-event-legend">Review event</legend>
+                <For each={["COMMENT", "APPROVE", "REQUEST_CHANGES"] as const}>
+                  {(e) => (
+                    <label class="revkit-rail__review-event-option">
+                      <input
+                        type="radio"
+                        name="revkit-review-event"
+                        value={e}
+                        checked={submitEvent() === e}
+                        onChange={() => setSubmitEvent(e)}
+                      />
+                      <span class="revkit-rail__review-event-label">{e}</span>
+                    </label>
+                  )}
+                </For>
+              </fieldset>
+              <label class="revkit-rail__review-body-label" for="revkit-rail-review-body">
+                Summary (optional)
+              </label>
+              <textarea
+                id="revkit-rail-review-body"
+                class="revkit-rail__review-body"
+                data-testid="revkit-rail-review-body"
+                rows={3}
+                value={submitBody()}
+                onInput={(evt) => setSubmitBody((evt.currentTarget as HTMLTextAreaElement).value)}
+              />
+              <div class="revkit-rail__review-actions">
+                <button
+                  type="submit"
+                  class="revkit-rail__review-submit-button"
+                  data-testid="revkit-rail-review-submit-button"
+                  disabled={reviewBusy()}
+                >{reviewBusy() ? "Submitting…" : `Submit review (${submitEvent()})`}</button>
+                <button
+                  type="button"
+                  class="revkit-rail__review-discard"
+                  data-testid="revkit-rail-review-discard"
+                  disabled={reviewBusy()}
+                  onClick={() => {
+                    void (async () => {
+                      setReviewBusy(true);
+                      setError(undefined);
+                      try {
+                        await discardPendingReview("user-discarded");
+                        await refetchReview();
+                      } catch (cause) {
+                        setError((cause as Error).message);
+                      } finally {
+                        setReviewBusy(false);
+                      }
+                    })();
+                  }}
+                >Discard</button>
+                <button
+                  type="button"
+                  class="revkit-rail__review-refresh"
+                  data-testid="revkit-rail-review-refresh"
+                  disabled={reviewBusy()}
+                  onClick={() => {
+                    void (async () => {
+                      setReviewBusy(true);
+                      setError(undefined);
+                      try {
+                        await refreshReviewPr();
+                        await refetchReview();
+                      } catch (cause) {
+                        setError((cause as Error).message);
+                      } finally {
+                        setReviewBusy(false);
+                      }
+                    })();
+                  }}
+                >Refresh PR</button>
+              </div>
+            </form>
+          </Show>
         </section>
       </Show>
       <Show when={presence().length > 0}>

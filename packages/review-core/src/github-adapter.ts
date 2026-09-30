@@ -920,6 +920,53 @@ export class GitHubAdapter {
     await this.graphql(SUBMIT_REVIEW_MUTATION, variables);
   }
 
+  /** M3 part 2b — reply to an existing review THREAD (published,
+   * not draft; there is no draft-reply GraphQL surface). Returns
+   * the new comment's identifiers so the caller can `comment.
+   * linked` it. Mutation — no auto-retry. */
+  async addReviewThreadReply(input: {
+    readonly threadNodeId: string;
+    readonly body: string;
+  }): Promise<{ nodeId: string; databaseId: number; body: string; url: string }> {
+    const result = await this.graphql<{
+      data: {
+        addPullRequestReviewThreadReply?: {
+          comment?: { id: string; databaseId: number; body: string; url: string } | null;
+        } | null;
+      };
+    }>(ADD_REVIEW_THREAD_REPLY_MUTATION, {
+      pullRequestReviewThreadId: input.threadNodeId,
+      body: input.body,
+    });
+    const comment = result.data.addPullRequestReviewThreadReply?.comment;
+    if (comment === undefined || comment === null) {
+      throw new GitHubApiError({
+        message: `addReviewThreadReply: mutation returned no comment`,
+        status: 0,
+        method: "POST",
+        url: this.graphqlUrl,
+      });
+    }
+    return {
+      nodeId: comment.id,
+      databaseId: comment.databaseId,
+      body: comment.body,
+      url: comment.url,
+    };
+  }
+
+  /** M3 part 2b — resolve a review thread on GitHub. Mutation
+   * — no auto-retry. */
+  async resolveReviewThread(input: { readonly threadNodeId: string }): Promise<void> {
+    await this.graphql(RESOLVE_REVIEW_THREAD_MUTATION, { threadId: input.threadNodeId });
+  }
+
+  /** M3 part 2b — unresolve (reopen) a review thread on GitHub.
+   * Mutation — no auto-retry. */
+  async unresolveReviewThread(input: { readonly threadNodeId: string }): Promise<void> {
+    await this.graphql(UNRESOLVE_REVIEW_THREAD_MUTATION, { threadId: input.threadNodeId });
+  }
+
   /** Look up the authenticated user's login (`viewer { login }`).
    * Used by `findOrCreatePendingReview` and exposed so a caller
    * that already has the login can pass it in and skip the round
@@ -2065,6 +2112,15 @@ export const GITHUB_GRAPHQL_DOCUMENTS = {
   get SubmitReview() {
     return SUBMIT_REVIEW_MUTATION;
   },
+  get AddReviewThreadReply() {
+    return ADD_REVIEW_THREAD_REPLY_MUTATION;
+  },
+  get ResolveReviewThread() {
+    return RESOLVE_REVIEW_THREAD_MUTATION;
+  },
+  get UnresolveReviewThread() {
+    return UNRESOLVE_REVIEW_THREAD_MUTATION;
+  },
 } as const;
 
 const REVIEW_THREADS_QUERY = /* GraphQL */ `
@@ -2276,6 +2332,40 @@ const SUBMIT_REVIEW_MUTATION = /* GraphQL */ `
       body: $body
     }) {
       pullRequestReview { id state }
+    }
+  }
+`;
+
+/** M3 part 2b — reply to an existing review thread. Uses the
+ * `addPullRequestReviewThreadReply` mutation which appends a
+ * comment inline (published, not draft) to a persisted thread.
+ * The mutation returns the new comment's node + database id so
+ * the caller can `comment.linked` it. */
+const ADD_REVIEW_THREAD_REPLY_MUTATION = /* GraphQL */ `
+  mutation AddReviewThreadReply($pullRequestReviewThreadId: ID!, $body: String!) {
+    addPullRequestReviewThreadReply(input: {
+      pullRequestReviewThreadId: $pullRequestReviewThreadId,
+      body: $body
+    }) {
+      comment { id databaseId body url }
+    }
+  }
+`;
+
+/** M3 part 2b — resolve a review thread. */
+const RESOLVE_REVIEW_THREAD_MUTATION = /* GraphQL */ `
+  mutation ResolveReviewThread($threadId: ID!) {
+    resolveReviewThread(input: { threadId: $threadId }) {
+      thread { id isResolved }
+    }
+  }
+`;
+
+/** M3 part 2b — unresolve a review thread. */
+const UNRESOLVE_REVIEW_THREAD_MUTATION = /* GraphQL */ `
+  mutation UnresolveReviewThread($threadId: ID!) {
+    unresolveReviewThread(input: { threadId: $threadId }) {
+      thread { id isResolved }
     }
   }
 `;

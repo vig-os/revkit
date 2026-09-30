@@ -316,6 +316,58 @@ const threadOrphanedPayload = {
     .optional(),
 } as const;
 
+/** Submitted-review event options: COMMENT / APPROVE / REQUEST_CHANGES.
+ * Same enum shape as `GitHubAdapter.ReviewSubmissionEvent`; declared
+ * here so the wire schema does not import the adapter (review-core
+ * runs in Bun AND in a Cloudflare Worker — the adapter imports plain
+ * `fetch` only, but importing it into events.ts would still couple
+ * layers). M3 part 2b. */
+const reviewSubmitEvents = ["COMMENT", "APPROVE", "REQUEST_CHANGES"] as const;
+export const reviewSubmitEventSchema = z.enum(reviewSubmitEvents);
+export type ReviewSubmitEvent = (typeof reviewSubmitEvents)[number];
+
+/** M3 part 2b: a pending review was OPENED. The daemon writes this
+ * before it writes any `comment.linked` event with
+ * `external.github.pending: true`, so a restart can derive the
+ * "currently-open pending review" without reading anything but the
+ * log. `reviewNodeId` is the GraphQL id GitHub assigned; `headSha`
+ * is the commit the review was pinned to (must match the pending
+ * comments' anchor commit). */
+const reviewOpenedPayload = {
+  kind: z.literal("review.opened"),
+  reviewNodeId: z.string().min(1),
+  headSha: z
+    .string()
+    // `originalCommitOid` shape — hex, may be short or long. Use the
+    // same regex the adapter's `github-adapter.ts` uses for oids to
+    // avoid an inconsistent constraint. Deliberately not tightened
+    // to 40 hex: GitHub's own diff-hunk fixtures sometimes carry
+    // short oids and we accept them at import time.
+    .regex(/^[0-9a-fA-F]{7,64}$/, "review.opened.headSha must be a 7..64-char hex string"),
+} as const;
+
+/** M3 part 2b: the pending review was SUBMITTED. Terminal for the
+ * `reviewNodeId`. `event` is the GitHub review event; `body` the
+ * top-level review message. */
+const reviewSubmittedPayload = {
+  kind: z.literal("review.submitted"),
+  reviewNodeId: z.string().min(1),
+  event: reviewSubmitEventSchema,
+  body: z.string().max(65_536).optional(),
+} as const;
+
+/** M3 part 2b: the pending review was ABANDONED (deleted). Used by
+ * the head-move re-anchor flow — the old pending review's draft
+ * comments no longer point at valid lines on the new head, so we
+ * delete it before opening a fresh one. Terminal for the
+ * `reviewNodeId`. `reason` is a short machine-parseable tag
+ * (`head-moved`, `user-discarded`, …). */
+const reviewAbandonedPayload = {
+  kind: z.literal("review.abandoned"),
+  reviewNodeId: z.string().min(1),
+  reason: z.string().min(1).max(256).optional(),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
@@ -369,6 +421,9 @@ const eventVariants = [
       }
     }),
   z.object({ ...envelope, ...threadOrphanedPayload }).strict(),
+  z.object({ ...envelope, ...reviewOpenedPayload }).strict(),
+  z.object({ ...envelope, ...reviewSubmittedPayload }).strict(),
+  z.object({ ...envelope, ...reviewAbandonedPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -400,6 +455,9 @@ export const reviewEventKinds = [
   "comment.linked",
   "thread.reanchored",
   "thread.orphaned",
+  "review.opened",
+  "review.submitted",
+  "review.abandoned",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

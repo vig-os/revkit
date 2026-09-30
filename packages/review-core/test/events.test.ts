@@ -137,6 +137,30 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     revision: "e".repeat(64),
     reason: "block deleted on rebuild",
   },
+  "review.opened": {
+    seq: 12,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "review.opened",
+    reviewNodeId: "PR_review_1",
+    headSha: "0123456789abcdef0123456789abcdef01234567",
+  },
+  "review.submitted": {
+    seq: 13,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "review.submitted",
+    reviewNodeId: "PR_review_1",
+    event: "COMMENT",
+  },
+  "review.abandoned": {
+    seq: 14,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "review.abandoned",
+    reviewNodeId: "PR_review_2",
+    reason: "head-moved",
+  },
 };
 
 describe("reviewEventSchema — happy paths", () => {

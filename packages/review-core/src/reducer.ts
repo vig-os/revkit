@@ -217,7 +217,12 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
     case "ask.answered":
     case "ask.cancelled":
     case "ask.expired":
+    case "review.opened":
+    case "review.submitted":
+    case "review.abandoned":
       // Handled outside the Thread view — see the file header.
+      // Review-lifecycle events project into their own derived
+      // view; see `review-state.ts::reduceReviewState`.
       return;
   }
 }

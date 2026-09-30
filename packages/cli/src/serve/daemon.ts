@@ -30,8 +30,11 @@ import { z } from "zod";
 import {
   askSchema,
   askStatusSchema,
+  isPendingReviewStale,
   isValidId,
+  reduceReviewState,
   revisionOf,
+  reviewSubmitEventSchema,
   threadStatusSchema,
   type Anchor,
   type AskFilter,
@@ -40,9 +43,19 @@ import {
   type HandoverTrigger,
   type ReviewEvent,
   type ReviewEventInput,
+  type ReviewState,
+  type ReviewSubmitEvent,
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
+import {
+  linkCommentAsPendingReviewComment,
+  makeReviewModeHandle,
+  defaultSubmitBody,
+  reanchorPendingReviewAtNewHead,
+  type ReviewModeHandle,
+  type ReviewModeOptions,
+} from "./review-mode.ts";
 import { IngestGapError, openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
 import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
@@ -78,9 +91,11 @@ import {
   cancelAskRequestSchema,
   createAskRequestSchema,
   createThreadRequestSchema,
+  discardReviewRequestSchema,
   reopenRequestSchema,
   replyRequestSchema,
   resolveRequestSchema,
+  submitReviewRequestSchema,
 } from "./api-schemas.ts";
 import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
 // The inline-script hash allowlist is the SAME committed set that
@@ -153,6 +168,22 @@ export interface StartDaemonOptions {
    * matching `presence.idle` at this timeout so a stalled agent
    * does not pin the badge on forever. Default: 30 s. */
   readonly presenceTtlMs?: number;
+  /** M3 part 2b — review-mode wiring. When set, the daemon:
+   *
+   *   - Mirrors every human-authored `POST /api/threads` comment to
+   *     the reviewer's PENDING GitHub review via the adapter
+   *     (`addPendingReviewThread`).
+   *   - Exposes `/api/review/*` endpoints: `state`, `submit`,
+   *     `refresh`, `discard`.
+   *   - Rail bundle renders the submit form + stale banner (the
+   *     rail queries `/api/review/state`; the mode field is
+   *     absent in local-review-off).
+   *
+   * Every write path is human-only: the agent bearer receives 403
+   * on `/api/review/submit`, and comment writes that would end up
+   * in the pending review skip the adapter call when the poster
+   * is the agent. */
+  readonly reviewMode?: ReviewModeOptions;
 }
 
 /** A handle on a running daemon. `stop()` is idempotent and removes
@@ -374,6 +405,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // channel-server's actor-filter then hides as "loopback echo"
   // and never surfaces.
   const systemActor: Author = { kind: "system", id: "revkit-daemon" };
+
+  // M3 part 2b — review-mode handle (undefined outside review mode).
+  // The handle carries the adapter + mutable PR summary; every
+  // pending-review write path reads through it. `refuseAgent`
+  // returns true for an agent-bearer caller so the review write
+  // paths can 403 uniformly.
+  const reviewMode: ReviewModeHandle | undefined =
+    options.reviewMode !== undefined ? makeReviewModeHandle(options.reviewMode) : undefined;
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -804,6 +843,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return handleAsksApi(request, url, method, requestId);
     }
 
+    // Review-mode JSON API (M3 part 2b, ADR-0025). Only meaningful in
+    // review mode; the daemon returns 404 for these paths outside it
+    // so a non-review daemon exposes the same shape as before.
+    if (url.pathname === "/api/review" || url.pathname.startsWith("/api/review/")) {
+      return handleReviewApi(request, url, method, requestId);
+    }
+
     // `/ask/<id>` — the HTML page the human opens. Session cookie
     // required; a caller without one is redirected to `/-/auth` with
     // `next=/ask/<id>` so the launch-code flow lands them back here.
@@ -1111,7 +1157,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           ? { mentions: mentions.map((m) => ({ ...m, range: [m.range[0], m.range[1]] as [number, number] })) }
           : {}),
       };
-      return await appendAndReturn(input, requestId, { threadId, commentId });
+      const createResponse = await appendAndReturn(input, requestId, { threadId, commentId });
+      // M3 part 2b: mirror local human-authored comments to the
+      // reviewer's PENDING GitHub review via the adapter. Agent-
+      // authored comments are excluded (an agent MUST NOT be able
+      // to post reviewer-identity drafts). A non-2xx response from
+      // the local append short-circuits the mirror — nothing to
+      // link. Errors during the mirror surface on
+      // `X-Review-Mirror` so the rail can prompt the reviewer,
+      // but they never fail the create response (the local thread
+      // is already persisted).
+      if (
+        createResponse.status === 201 &&
+        reviewMode !== undefined &&
+        actor.kind === "local"
+      ) {
+        await mirrorPendingReviewComment({
+          reviewMode,
+          localCommentId: commentId,
+          anchor: anchorWithServerRevision,
+          body: parsed.data.body,
+          actor,
+          requestId,
+        });
+      }
+      return createResponse;
     }
 
     // Paths of shape /api/threads/:id/(replies|resolve|reopen)
@@ -1152,7 +1222,28 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             ? { mentions: mentions.map((m) => ({ ...m, range: [m.range[0], m.range[1]] as [number, number] })) }
             : {}),
         };
-        return await appendAndReturn(input, requestId, { threadId, commentId });
+        const replyResponse = await appendAndReturn(input, requestId, { threadId, commentId });
+        // M3 part 2b B4 two-way: if the thread is imported from
+        // GitHub (its opening comment has `external.github`), post
+        // the reply through the adapter as a published thread
+        // reply. Only human-authored replies (agent bearer never
+        // writes as the reviewer). Non-fatal — errors are logged
+        // and the local reply remains valid.
+        if (
+          replyResponse.status === 201 &&
+          reviewMode !== undefined &&
+          actor.kind === "local"
+        ) {
+          await mirrorReplyToGitHubThread({
+            reviewMode,
+            threadId,
+            localCommentId: commentId,
+            body: parsed.data.body,
+            actor,
+            requestId,
+          });
+        }
+        return replyResponse;
       }
       if (kind === "resolve") {
         const parsed = resolveRequestSchema.safeParse(body);
@@ -1163,7 +1254,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           threadId,
           ...(parsed.data.resolution !== undefined ? { resolution: parsed.data.resolution } : {}),
         };
-        return await appendAndReturn(input, requestId, { threadId });
+        const resolveResponse = await appendAndReturn(input, requestId, { threadId });
+        // M3 part 2b B4 two-way: mirror the resolve on GitHub for
+        // imported threads. Human-only.
+        if (
+          resolveResponse.status === 201 &&
+          reviewMode !== undefined &&
+          actor.kind === "local"
+        ) {
+          await mirrorResolveOnGitHubThread({
+            reviewMode,
+            threadId,
+            resolve: true,
+            requestId,
+          });
+        }
+        return resolveResponse;
       }
       if (kind === "reopen") {
         const parsed = reopenRequestSchema.safeParse(body);
@@ -1174,7 +1280,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           threadId,
           ...(parsed.data.reason !== undefined ? { reason: parsed.data.reason } : {}),
         };
-        return await appendAndReturn(input, requestId, { threadId });
+        const reopenResponse = await appendAndReturn(input, requestId, { threadId });
+        if (
+          reopenResponse.status === 201 &&
+          reviewMode !== undefined &&
+          actor.kind === "local"
+        ) {
+          await mirrorResolveOnGitHubThread({
+            reviewMode,
+            threadId,
+            resolve: false,
+            requestId,
+          });
+        }
+        return reopenResponse;
       }
     }
 
@@ -1511,6 +1630,505 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             })
           : presence.idle(actor, parsed.data.path !== undefined ? { path: parsed.data.path } : undefined);
       return jsonResponse({ ok: true, frame });
+    }
+
+    return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+  }
+
+  // ── review-mode helpers (M3 part 2b) ────────────────────────────
+
+  /** Push a local human-authored comment into the reviewer's
+   * PENDING GitHub review via the adapter. Only called from
+   * `POST /api/threads` after the local append succeeded and only
+   * when the actor is a local human (agent-authored comments
+   * NEVER touch the adapter — the human's `gh` identity must not
+   * carry an agent's writes). Failures are logged (structured;
+   * no token / body content); the local thread stays valid. */
+  async function mirrorPendingReviewComment(input: {
+    readonly reviewMode: ReviewModeHandle;
+    readonly localCommentId: string;
+    readonly anchor: Anchor;
+    readonly body: string;
+    readonly actor: Author;
+    readonly requestId: string;
+  }): Promise<void> {
+    // Agents never mirror. This is the security boundary: the
+    // adapter posts under the reviewer's identity; an agent
+    // must not be able to post as the reviewer.
+    if (input.actor.kind !== "local") {
+      logger.warn("review.mirror.refused.actor", {
+        requestId: input.requestId,
+        actorKind: input.actor.kind,
+      });
+      return;
+    }
+    try {
+      const outcome = await linkCommentAsPendingReviewComment({
+        review: input.reviewMode,
+        store,
+        localCommentId: input.localCommentId,
+        anchor: input.anchor,
+        body: input.body,
+        actor: input.actor,
+        appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, input.requestId),
+      });
+      if (outcome.kind === "stale") {
+        logger.warn("review.mirror.stale", {
+          requestId: input.requestId,
+          reviewNodeId: outcome.reviewNodeId,
+          expectedHeadSha: outcome.expectedHeadSha,
+          actualHeadSha: outcome.actualHeadSha,
+        });
+      } else if (outcome.kind === "orphaned") {
+        logger.warn("review.mirror.orphaned", {
+          requestId: input.requestId,
+          reason: outcome.reason,
+        });
+      } else {
+        logger.info("review.mirror.linked", {
+          requestId: input.requestId,
+          reviewNodeId: outcome.reviewNodeId,
+          fileFallback: outcome.reason === "file-fallback",
+        });
+      }
+    } catch (error) {
+      logger.error("review.mirror.error", {
+        requestId: input.requestId,
+        errorKind: (error as Error).name,
+      });
+    }
+  }
+
+  /** M3 part 2b B4 two-way: mirror a local reply to a GitHub-
+   * imported thread. Reads the thread's external.github to get
+   * the thread's GraphQL node id, then calls the adapter's
+   * `addReviewThreadReply`. On success, appends a
+   * `comment.linked` for the local reply comment. On failure,
+   * logs and returns (the local reply is already persisted). */
+  async function mirrorReplyToGitHubThread(input: {
+    readonly reviewMode: ReviewModeHandle;
+    readonly threadId: string;
+    readonly localCommentId: string;
+    readonly body: string;
+    readonly actor: Author;
+    readonly requestId: string;
+  }): Promise<void> {
+    if (input.actor.kind !== "local") return;
+    let thread;
+    try {
+      thread = await store.thread(input.threadId);
+    } catch (error) {
+      logger.warn("review.reply.thread-load-failed", {
+        requestId: input.requestId,
+        threadId: input.threadId,
+        errorKind: (error as Error).name,
+      });
+      return;
+    }
+    if (thread === undefined) return;
+    // Find the opening comment's github external — that's the one
+    // that anchors the thread on GitHub. Its `nodeId` corresponds
+    // to the review-comment on GitHub, not the thread node id we
+    // need for `addPullRequestReviewThreadReply`. The import path
+    // uses the GitHub review-thread id (via `threadIdOf`), so we
+    // recover it from the deterministic id shape:
+    //   gh-<owner>-<repo>-<pr>-<hash>
+    // The daemon stores that mapping on the log as the thread's
+    // own id; to reply to the exact GraphQL thread we'd need the
+    // thread node id which the deterministic hash obscures.
+    //
+    // Rather than reverse the hash (impossible), we look for a
+    // published-comment reply via the review-thread node id
+    // recovered from the openings' external metadata — the
+    // opening comment.linked event carries the `github.nodeId`
+    // which is the REVIEW-COMMENT's node id. GitHub's GraphQL
+    // requires the THREAD node id for `addPullRequestReviewThreadReply`,
+    // so we take a fallback route: post via the REST
+    // `pulls/N/comments/{comment_id}/replies` shape is not
+    // supported by the adapter — the adapter has no REST reply
+    // surface (GraphQL-only). We store the thread's github id
+    // on the `comment.created.external` metadata; recover it.
+    const external = thread.external;
+    if (external === undefined || external.provider !== "github") return;
+    // `external.threadId` is the GitHub review-thread node id
+    // (see `mapThreadsToEvents`).
+    try {
+      const posted = await input.reviewMode.options.adapter.addReviewThreadReply({
+        threadNodeId: external.threadId,
+        body: input.body,
+      });
+      await appendReviewLifecycleEvent(
+        {
+          kind: "comment.linked",
+          actor: input.actor,
+          commentId: input.localCommentId,
+          external: {
+            github: {
+              commentId: posted.databaseId,
+              nodeId: posted.nodeId,
+            },
+          },
+        },
+        input.requestId,
+      );
+      logger.info("review.reply.mirrored", {
+        requestId: input.requestId,
+        threadId: input.threadId,
+      });
+    } catch (error) {
+      if (
+        error instanceof ThreadStoreAppendError &&
+        (error.rejection.kind === "duplicate-link" ||
+          error.rejection.kind === "duplicate-external-id")
+      ) {
+        return;
+      }
+      logger.warn("review.reply.mirror-failed", {
+        requestId: input.requestId,
+        threadId: input.threadId,
+        errorKind: (error as Error).name,
+      });
+    }
+  }
+
+  /** M3 part 2b B4 two-way: mirror a local resolve / reopen to a
+   * GitHub-imported thread. `resolve=true` for resolve, false for
+   * reopen. */
+  async function mirrorResolveOnGitHubThread(input: {
+    readonly reviewMode: ReviewModeHandle;
+    readonly threadId: string;
+    readonly resolve: boolean;
+    readonly requestId: string;
+  }): Promise<void> {
+    let thread;
+    try {
+      thread = await store.thread(input.threadId);
+    } catch (error) {
+      logger.warn("review.resolve.thread-load-failed", {
+        requestId: input.requestId,
+        threadId: input.threadId,
+        errorKind: (error as Error).name,
+      });
+      return;
+    }
+    if (thread === undefined) return;
+    const external = thread.external;
+    if (external === undefined || external.provider !== "github") return;
+    try {
+      if (input.resolve) {
+        await input.reviewMode.options.adapter.resolveReviewThread({ threadNodeId: external.threadId });
+      } else {
+        await input.reviewMode.options.adapter.unresolveReviewThread({ threadNodeId: external.threadId });
+      }
+      logger.info("review.resolve.mirrored", {
+        requestId: input.requestId,
+        threadId: input.threadId,
+      });
+    } catch (error) {
+      logger.warn("review.resolve.mirror-failed", {
+        requestId: input.requestId,
+        threadId: input.threadId,
+        errorKind: (error as Error).name,
+      });
+    }
+  }
+
+  /** Append a review-lifecycle event (`review.opened`, `review.
+   * submitted`, `review.abandoned`, `comment.linked`) through the
+   * daemon's own append path so the delivery cache + fan-out
+   * decisions run uniformly. Returns the persisted event so the
+   * caller can reason about seq / ts. */
+  async function appendReviewLifecycleEvent(
+    input: ReviewEventInput,
+    requestId: string,
+  ): Promise<ReviewEvent | undefined> {
+    let seq: number;
+    try {
+      seq = await store.append(input);
+    } catch (err) {
+      if (err instanceof ThreadStoreAppendError) {
+        logger.warn("review.append.rejected", {
+          requestId,
+          errorKind: err.rejection.kind,
+        });
+        throw err;
+      }
+      throw err;
+    }
+    const events = await store.since(seq - 1);
+    const event = events.find((e) => e.seq === seq);
+    if (event !== undefined) {
+      await safeIngest(event);
+      const audiences = auditFanOutAudiences(event);
+      void bus.publish(event, { audiences });
+    }
+    return event;
+  }
+
+  // ── /api/review branch (M3 part 2b, ADR-0025) ────────────────────
+
+  async function handleReviewApi(request: Request, url: URL, method: string, requestId: string): Promise<Response> {
+    // Same Origin discipline as /api/threads.
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+
+    // 404 outside review mode — the daemon's shape stays stable for
+    // non-review consumers.
+    if (reviewMode === undefined) {
+      return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+    }
+
+    const actor = identifyActor(request);
+    if (actor === undefined) {
+      logger.warn("review.api.rejected.auth", { requestId, path: url.pathname });
+      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    }
+
+    // GET /api/review/state — session cookie OR agent bearer may
+    // read. The state is not sensitive (it's already in the log).
+    if (url.pathname === "/api/review/state" && method === "GET") {
+      const state = await reviewMode.readState(store);
+      const headSha = reviewMode.currentHeadSha();
+      const summary = reviewMode.options.summary;
+      const stale = isPendingReviewStale(state.openPending, headSha);
+      return jsonResponse({
+        pr: {
+          owner: reviewMode.options.pr.owner,
+          repo: reviewMode.options.pr.repo,
+          number: reviewMode.options.pr.pullNumber,
+          title: summary.title,
+          headSha,
+          headRef: summary.headRef,
+          baseSha: summary.baseSha,
+          baseRef: summary.baseRef,
+          url: summary.url,
+          state: summary.state,
+        },
+        viewerLogin: reviewMode.options.viewerLogin,
+        state,
+        stale,
+      });
+    }
+
+    // POST /api/review/submit — session cookie ONLY. Agent bearer
+    // is refused with 403 (an agent must not submit or approve on
+    // the human's behalf).
+    if (url.pathname === "/api/review/submit" && method === "POST") {
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.submit.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(JSON.stringify({ error: "agent-forbidden", reason: "Agent bearer cannot submit a review on the reviewer's behalf." }), { status: 403 }),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      // Guarded by actor.kind for defence-in-depth against a
+      // bug where the bearer check drifts from the actor kind.
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      const parsed = submitReviewRequestSchema.safeParse(bodyRead.value);
+      if (!parsed.success) return badRequest(parsed.error.issues);
+
+      const state = await reviewMode.readState(store);
+      if (state.openPending === null) {
+        return badRequest([{ code: "custom", path: [], message: "no-open-pending-review" }]);
+      }
+      const headSha = reviewMode.currentHeadSha();
+      if (isPendingReviewStale(state.openPending, headSha)) {
+        return withHygiene(
+          new Response(
+            JSON.stringify({
+              error: "stale-pending-review",
+              reviewNodeId: state.openPending.reviewNodeId,
+              expectedHeadSha: headSha,
+              openedHeadSha: state.openPending.headSha,
+            }),
+            { status: 409 },
+          ),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+
+      const submitEvent: ReviewSubmitEvent = parsed.data.event;
+      const submitBody = parsed.data.body ?? defaultSubmitBody(submitEvent, headSha);
+      try {
+        await reviewMode.options.adapter.submitReview({
+          reviewId: state.openPending.reviewNodeId,
+          event: submitEvent,
+          body: submitBody,
+        });
+      } catch (error) {
+        logger.warn("review.submit.adapter-failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "submit-failed" });
+      }
+      // Log the terminal transition. On any local append failure
+      // (concurrent submit, race with abandon) surface the error
+      // — GitHub has already accepted the submit, so the log MUST
+      // record it to stay coherent.
+      try {
+        await appendReviewLifecycleEvent(
+          {
+            kind: "review.submitted",
+            actor,
+            reviewNodeId: state.openPending.reviewNodeId,
+            event: submitEvent,
+            body: submitBody,
+          },
+          requestId,
+        );
+      } catch (error) {
+        logger.error("review.submit.append-failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "submit-log-write-failed" });
+      }
+      return jsonResponse({ ok: true, reviewNodeId: state.openPending.reviewNodeId, event: submitEvent }, 201);
+    }
+
+    // POST /api/review/discard — session cookie ONLY. Deletes the
+    // pending review on GitHub and records the abandon. Also used
+    // internally by the head-move refresh flow (which is human-
+    // driven and gated the same way).
+    if (url.pathname === "/api/review/discard" && method === "POST") {
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.discard.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(JSON.stringify({ error: "agent-forbidden" }), { status: 403 }),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok && bodyRead.kind === "too-large") return payloadTooLarge();
+      const parsed = discardReviewRequestSchema.safeParse(bodyRead.ok ? bodyRead.value ?? {} : {});
+      if (!parsed.success) return badRequest(parsed.error.issues);
+
+      const state = await reviewMode.readState(store);
+      if (state.openPending === null) return jsonResponse({ ok: true, discarded: 0 });
+      try {
+        await reviewMode.options.adapter.deletePendingReview({ reviewId: state.openPending.reviewNodeId });
+      } catch (error) {
+        logger.warn("review.discard.adapter-failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "discard-failed" });
+      }
+      try {
+        await appendReviewLifecycleEvent(
+          {
+            kind: "review.abandoned",
+            actor,
+            reviewNodeId: state.openPending.reviewNodeId,
+            ...(parsed.data.reason !== undefined ? { reason: parsed.data.reason } : {}),
+          },
+          requestId,
+        );
+      } catch (error) {
+        logger.error("review.discard.append-failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "discard-log-write-failed" });
+      }
+      return jsonResponse({ ok: true, discarded: state.openPending.comments.length }, 201);
+    }
+
+    // POST /api/review/reanchor — session cookie ONLY. Re-anchors
+    // every pending comment onto the CURRENT head (fetched via the
+    // adapter) through the ADR-0006 pipeline (map → verify quote
+    // → fuzzy → orphan; never guess), then discards the old
+    // pending review on GitHub and re-posts the surviving comments
+    // to a fresh pending review on the new head. Orphans are
+    // emitted as `thread.orphaned` and never silently dropped.
+    if (url.pathname === "/api/review/reanchor" && method === "POST") {
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.reanchor.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(JSON.stringify({ error: "agent-forbidden" }), { status: 403 }),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      try {
+        // Refresh PR summary + files ALWAYS so the reanchor runs
+        // against the actual current head (the caller may not
+        // have hit `/api/review/refresh` right before this).
+        const nextSummary = await reviewMode.options.adapter.getPullRequest(reviewMode.options.pr);
+        const nextFiles = await reviewMode.options.adapter.listPullRequestFiles(reviewMode.options.pr);
+        reviewMode.refreshSummary(nextSummary, nextFiles);
+        const outcome = await reanchorPendingReviewAtNewHead({
+          review: reviewMode,
+          store,
+          actor,
+          appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+        });
+        return jsonResponse({ ok: true, ...outcome }, 201);
+      } catch (error) {
+        logger.warn("review.reanchor.failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "reanchor-failed" });
+      }
+    }
+
+    // POST /api/review/refresh — session cookie ONLY. Re-reads the
+    // PR summary via the adapter; if the head moved, the abandon is
+    // driven by the client (the rail shows the banner and offers
+    // discard + re-post). The refresh itself is READ-only against
+    // GitHub. Agent bearer refused for the same reason as submit.
+    if (url.pathname === "/api/review/refresh" && method === "POST") {
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.refresh.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(JSON.stringify({ error: "agent-forbidden" }), { status: 403 }),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      try {
+        const nextSummary = await reviewMode.options.adapter.getPullRequest(reviewMode.options.pr);
+        const nextFiles = await reviewMode.options.adapter.listPullRequestFiles(reviewMode.options.pr);
+        const prevHeadSha = reviewMode.currentHeadSha();
+        reviewMode.refreshSummary(nextSummary, nextFiles);
+        const moved = prevHeadSha.toLowerCase() !== nextSummary.headSha.toLowerCase();
+        const state = await reviewMode.readState(store);
+        const stale = isPendingReviewStale(state.openPending, nextSummary.headSha);
+        return jsonResponse({
+          ok: true,
+          moved,
+          previousHeadSha: prevHeadSha,
+          currentHeadSha: nextSummary.headSha,
+          stale,
+          openPendingReviewNodeId: state.openPending?.reviewNodeId ?? null,
+        });
+      } catch (error) {
+        logger.warn("review.refresh.adapter-failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "refresh-failed" });
+      }
     }
 
     return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");

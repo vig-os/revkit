@@ -126,6 +126,7 @@ export {
   reanchorMethodSchema,
   reviewEventKinds,
   reviewEventSchema,
+  reviewSubmitEventSchema,
   type DeliveryMode,
   type HandoverTrigger,
   type PresenceState,
@@ -133,7 +134,16 @@ export {
   type ReviewEvent,
   type ReviewEventInput,
   type ReviewEventKind,
+  type ReviewSubmitEvent,
 } from "./events.ts";
+export {
+  isPendingReviewStale,
+  reduceReviewState,
+  type OpenPendingReview,
+  type PendingReviewComment as DerivedPendingReviewComment,
+  type ReviewState,
+  type TerminalReview,
+} from "./review-state.ts";
 export {
   alignMatchedText,
   buildLineStartIndex,
