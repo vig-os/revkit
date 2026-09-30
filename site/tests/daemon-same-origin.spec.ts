@@ -76,7 +76,7 @@ test.describe("same-origin daemon UI", () => {
       // Step 3 — open EventSource, then POST a comment via the
       // agent bearer, then wait for the frame to land in the ES.
       const receivedPromise = page.evaluate(
-        ([daemonPortInner]: number[]): Promise<string> =>
+        (): Promise<string> =>
           new Promise((resolveInner, rejectInner) => {
             const es = new EventSource("/events");
             const timeout = setTimeout(() => {
@@ -95,11 +95,8 @@ test.describe("same-origin daemon UI", () => {
               // the test failure has context.
               (window as unknown as { __esError?: number }).__esError = es.readyState;
             };
-            // Signal "attached" to Node so it can POST.
-            void daemonPortInner;
             (window as unknown as { __esReady?: boolean }).__esReady = true;
           }),
-        [daemonPort],
       );
       // Give the EventSource a moment to open.
       await page.waitForFunction(() => (window as unknown as { __esReady?: boolean }).__esReady === true);
