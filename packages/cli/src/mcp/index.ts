@@ -18,10 +18,15 @@ export {
 export {
   startChannelServer,
   formatChannelPayload,
+  formatCatchupSummary,
+  escapeContentFragment,
+  META_VALUE_MAX,
   THREADS_TOOL,
   REPLY_TOOL,
   RESOLVE_TOOL,
   type ChannelServerOptions,
   type ChannelServerHandle,
   type ChannelPayload,
+  type DiscoverFn,
+  type DiscoverResult,
 } from "./channel-server.ts";

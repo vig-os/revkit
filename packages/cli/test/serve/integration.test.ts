@@ -99,6 +99,11 @@ async function startCtx(overrides: { launchCodeTtlMs?: number; sqlitePath?: stri
   const outside = join(root, "outside");
   mkdirSync(outside, { recursive: true });
   writeFileSync(join(outside, "secret.txt"), "SECRET");
+  // Seed a source file at the path every test anchor points at, so
+  // the daemon's server-side revision computation (PR #38 review)
+  // can `readFileSync` it and produce a real revision.
+  mkdirSync(join(root, "docs", "adr"), { recursive: true });
+  writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nquestion body\nwhy 30s?\nsecond line\n");
   const logs: string[] = [];
   const sink: LineSink = { write: (line) => logs.push(line) };
   const handle = await startDaemon({

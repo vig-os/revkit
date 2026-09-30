@@ -78,6 +78,17 @@ async function bootDaemon(): Promise<DaemonCtx> {
   const root = mkdtempSync(join(tmpdir(), "revkit-rt-"));
   mkdirSync(join(root, ".revkit"), { recursive: true });
   writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
+  // Seed the anchor's source file — the daemon now computes
+  // `anchor.revision = revisionOf(source)` server-side, and refuses
+  // an anchor whose file doesn't exist in the repo (PR #38 review).
+  const seedRelPath = "docs/adr/0003-content-model-mdx-typed-data.md";
+  mkdirSync(join(root, dirname(seedRelPath)), { recursive: true });
+  // 6 lines so the fixture anchor at line 5 is inside the file.
+  writeFileSync(
+    join(root, seedRelPath),
+    "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    "utf8",
+  );
   const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
     cwd: root,
     stdio: ["ignore", "pipe", "pipe"],
@@ -415,6 +426,59 @@ test.describe("rail round-trip @chromium-only", () => {
       await expect(composer).toBeVisible();
       const composerInput = page.getByTestId("revkit-rail-composer-input");
       await expect(composerInput).toBeFocused();
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
+  test("XSS regression: <img onerror> in a comment body renders as text (no handler fires)", async ({ page }) => {
+    // If the rail were rendering `comment.body` via innerHTML,
+    // posting `<img src=x onerror=window.__xss=true>` would run the
+    // handler when the rail refetched. `solid-js/html` interpolates
+    // `${expr}` as a TEXT node, so the payload appears verbatim
+    // and no image element is created. This asserts the invariant.
+    const daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    const XSS_PAYLOAD = '<img src=x onerror="window.__xss_fired=true">bar';
+    try {
+      // Post the payload via the cookie-authenticated API — the
+      // shortest path to get a comment body through the daemon's
+      // storage and back into the rail's fetch.
+      await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+
+      const seedAnchor = {
+        path: "docs/adr/0003-content-model-mdx-typed-data.md",
+        startLine: 3,
+        endLine: 3,
+        quote: { exact: "line 3", prefix: "", suffix: "" },
+        revision: "c".repeat(64),
+      };
+      await page.evaluate(
+        async ({ a, body }): Promise<void> => {
+          const response = await fetch("/api/threads", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ anchor: a, body }),
+          });
+          if (!response.ok) throw new Error(`create ${response.status}`);
+        },
+        { a: seedAnchor, body: XSS_PAYLOAD },
+      );
+      // Wait for the rail to render the thread.
+      await expect(page.locator(".revkit-rail__comment").first()).toBeVisible({ timeout: 5000 });
+      // The body text contains the raw payload (verbatim, not an
+      // interpreted `<img>`).
+      await expect(page.locator(".revkit-rail__body").first()).toContainText(XSS_PAYLOAD);
+      // No `<img>` was created — solid-js/html interpolated as text.
+      const imgCount = await page.locator(".revkit-rail .revkit-rail__body img").count();
+      expect(imgCount).toBe(0);
+      // The onerror handler did NOT fire.
+      const xssFired = await page.evaluate(() => (window as unknown as { __xss_fired?: boolean }).__xss_fired === true);
+      expect(xssFired).toBe(false);
     } finally {
       fixture.cleanup();
       await shutdown(daemon);

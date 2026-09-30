@@ -28,13 +28,17 @@ import { dirname, extname, relative as relativePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
 import {
+  revisionOf,
   threadStatusSchema,
+  type Anchor,
   type Author,
   type ReviewEvent,
   type ReviewEventInput,
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
+import { readFileSync as readFileSyncNode } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { openStaticServer } from "./static-server.ts";
 import { contentTypeForExtension } from "./mime.ts";
 import {
@@ -608,6 +612,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const parsed = createThreadRequestSchema.safeParse(bodyRead.value);
       if (!parsed.success) return badRequest(parsed.error.issues);
       if (!enforceCommentBodyLimit(parsed.data.body)) return payloadTooLarge();
+      // Anchor authority: the daemon (a) confirms the source file
+      // exists under the repo root (containment prevents an anchor
+      // to `/etc/passwd` or `../outside/file`) and (b) OVERRIDES
+      // the client-supplied `revision` with `revisionOf(source)`.
+      // Re-anchoring (M2 item 5) depends on the revision matching
+      // the actual file bytes at thread creation, so a client
+      // value (rail's textContent hash) would fail the pipeline
+      // silently. PR #38 review.
+      const anchorResolution = await resolveAnchorSource(parsed.data.anchor, options.repoRoot);
+      if (!anchorResolution.ok) {
+        return badRequest([{ code: "custom", path: ["anchor", "path"], message: anchorResolution.reason }]);
+      }
+      const anchorWithServerRevision: Anchor = {
+        ...parsed.data.anchor,
+        revision: anchorResolution.revision,
+      };
       const threadId = parsed.data.threadId ?? randomUUID();
       const commentId = parsed.data.commentId ?? randomUUID();
       const input: ReviewEventInput = {
@@ -615,7 +635,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         actor,
         threadId,
         commentId,
-        anchor: parsed.data.anchor,
+        anchor: anchorWithServerRevision,
         body: parsed.data.body,
       };
       return await appendAndReturn(input, requestId, { threadId, commentId });
@@ -916,7 +936,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // never-flushed stream). Buffering is cheap for HTML: even a
     // large Astro page is a few hundred KiB.
     if (contentType.startsWith("text/html")) {
-      return await injectRail(rawResponse);
+      return await injectRail(rawResponse, {
+        onOversize: (bodyBytes: number) => {
+          logger.warn("static.rail.skipped-oversize", {
+            requestId,
+            path: decodedPath,
+            bytes: bodyBytes,
+          });
+        },
+      });
     }
     return rawResponse;
   }
@@ -1045,4 +1073,35 @@ function payloadTooLarge(): Response {
   });
   response.headers.set("x-content-type-options", "nosniff");
   return response;
+}
+
+/** Resolve an anchor's `path` under the repo root, confirm the file
+ * exists, and return `revisionOf(sourceContents)`. Path shape has
+ * already been validated by `anchorPathSchema` (no `..`, no
+ * backslash, no absolute prefix); this step adds the filesystem
+ * containment + revision computation (PR #38 review). */
+export async function resolveAnchorSource(
+  anchor: Anchor,
+  repoRoot: string,
+): Promise<{ ok: true; revision: string } | { ok: false; reason: string }> {
+  // Belt-and-braces: even though `anchorPathSchema` rejects `..`,
+  // resolve against the repo root and confirm the result stays
+  // inside it. Cheap, and future-proofs the check.
+  const rootAbs = resolvePath(repoRoot);
+  const abs = resolvePath(rootAbs, anchor.path);
+  if (!abs.startsWith(rootAbs + "/") && abs !== rootAbs) {
+    return { ok: false, reason: "anchor.path escapes repository root" };
+  }
+  let contents: string;
+  try {
+    contents = readFileSyncNode(abs, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "EISDIR" || code === "ENOTDIR") {
+      return { ok: false, reason: `anchor.path '${anchor.path}' does not exist in the repository` };
+    }
+    return { ok: false, reason: `anchor.path could not be read (${code ?? "unknown"})` };
+  }
+  const revision = await revisionOf(contents);
+  return { ok: true, revision };
 }

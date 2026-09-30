@@ -77,16 +77,64 @@ async function revisionHex(text: string): Promise<string> {
   return hex.join("");
 }
 
-/** Fetch threads for the current page — anchored to any file we can
- * see on the page. The rail groups them by anchor.path so a doc
- * that renders many files' fragments shows each's threads. */
+/** Fetch review threads for the source paths visible on THIS page.
+ * The rail walks every `[data-src]` on load, collects the distinct
+ * `path` values, and asks the daemon for each — a large repo with
+ * many threads across many files must not stream them all into
+ * every page's rail. If the page has no stamped blocks, we fall
+ * back to a single unfiltered request so a page carrying nothing
+ * more than a `<main>` still surfaces any thread the reviewer has
+ * open elsewhere. */
 async function fetchThreads(): Promise<RailListResponse> {
-  const response = await fetch("/api/threads", {
-    credentials: "same-origin",
-    headers: { accept: "application/json" },
-  });
-  if (!response.ok) throw new Error(`GET /api/threads failed: ${response.status}`);
-  return (await response.json()) as RailListResponse;
+  const paths = collectPagePaths();
+  if (paths.length === 0) {
+    const response = await fetch("/api/threads", {
+      credentials: "same-origin",
+      headers: { accept: "application/json" },
+    });
+    if (!response.ok) throw new Error(`GET /api/threads failed: ${response.status}`);
+    return (await response.json()) as RailListResponse;
+  }
+  const responses = await Promise.all(
+    paths.map((path) =>
+      fetch("/api/threads?path=" + encodeURIComponent(path), {
+        credentials: "same-origin",
+        headers: { accept: "application/json" },
+      }).then(async (r) => {
+        if (!r.ok) throw new Error(`GET /api/threads?path=${path} failed: ${r.status}`);
+        return (await r.json()) as RailListResponse;
+      }),
+    ),
+  );
+  const merged: RailThread[] = [];
+  let head = 0;
+  const seen = new Set<string>();
+  for (const one of responses) {
+    if (one.head > head) head = one.head;
+    for (const t of one.threads) {
+      if (!seen.has(t.id)) {
+        seen.add(t.id);
+        merged.push(t);
+      }
+    }
+  }
+  return { threads: merged, head };
+}
+
+/** Walk `[data-src]` blocks and collect the unique repo-relative
+ * paths they anchor to. `parseDataSrc` validates the format (path
+ * shape + line range); invalid values are dropped silently. */
+function collectPagePaths(): string[] {
+  const stamped = document.querySelectorAll<HTMLElement>("[data-src]");
+  const seen = new Set<string>();
+  for (const el of Array.from(stamped)) {
+    const raw = el.getAttribute("data-src");
+    if (raw === null) continue;
+    const parsed = parseDataSrc(raw);
+    if (parsed === undefined) continue;
+    seen.add(parsed.path);
+  }
+  return [...seen];
 }
 
 /** Body a `POST /api/threads` accepts. Kept in step with the daemon's

@@ -60,6 +60,10 @@ async function boot(): Promise<Ctx> {
   const dist = join(root, "dist");
   mkdirSync(dist, { recursive: true });
   writeFileSync(join(dist, "index.html"), "<!doctype html><h1>ok</h1>");
+  // Seed the anchor's source file so the daemon can compute its
+  // revision server-side (PR #38 review).
+  mkdirSync(join(root, "docs", "adr"), { recursive: true });
+  writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nquestion body\nwhy 30s?\n");
   const daemon = await startDaemon({
     dir: dist,
     repoRoot: root,

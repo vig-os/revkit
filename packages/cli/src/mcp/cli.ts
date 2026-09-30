@@ -9,9 +9,9 @@
 
 import { resolve as resolvePath } from "node:path";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
-import { ensureDaemon } from "./daemon-bootstrap.ts";
+import { ensureDaemon, verifyDaemonInstance } from "./daemon-bootstrap.ts";
 import { DaemonClient } from "./daemon-client.ts";
-import { startChannelServer } from "./channel-server.ts";
+import { startChannelServer, type DiscoverResult } from "./channel-server.ts";
 
 /** Environment `runMcpCommand` needs. Kept explicit so tests can
  * inject a temporary directory. */
@@ -78,13 +78,51 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     url: state.url,
     agentToken: state.agentToken,
   });
+  // Reconnect discovery for the channel server: re-run `ensureDaemon`
+  // (auto-starts if the previous daemon is gone), then compare the
+  // fresh `/-/health` `instanceId` with what `serve.json`
+  // advertised. On a match, we're talking to the same daemon and
+  // just need to reconnect the SSE; on a mismatch, the sqlite was
+  // preserved across restart (seqs continue) so the channel server
+  // caps our resume at the new head.
+  const discover = async (previous: { instanceId?: string } | undefined): Promise<DiscoverResult> => {
+    const boot = await ensureDaemon({
+      repoRoot,
+      ...(parsed.dir !== undefined ? { dir: parsed.dir } : {}),
+    });
+    const next = boot.state;
+    if (next.instanceId !== undefined) {
+      try {
+        // Belt-and-braces: the file might have been read mid-write
+        // by a racing process. `verifyDaemonInstance` confirms via
+        // `/-/health` that the daemon owns the id it advertises.
+        const match = await verifyDaemonInstance(next.url, next.instanceId);
+        if (!match && previous?.instanceId === next.instanceId) {
+          // Same id advertised, different id at /-/health — treat
+          // as fresh daemon (unusual, but well-defined).
+          void 0;
+        }
+      } catch {
+        // If /-/health itself is unreachable, fall back to trusting
+        // serve.json — the next tool call will surface the failure.
+      }
+    }
+    return {
+      url: next.url,
+      agentToken: next.agentToken,
+      ...(next.instanceId !== undefined ? { instanceId: next.instanceId } : {}),
+    };
+  };
+
   let handle;
   try {
     handle = await startChannelServer({
       client,
       url: state.url,
       agentToken: state.agentToken,
+      ...(state.instanceId !== undefined ? { instanceId: state.instanceId } : {}),
       version: env.version,
+      discover,
     });
   } catch (error) {
     return { exitCode: 1, stdout: "", stderr: `revkit mcp: channel server failed to start: ${(error as Error).message}\n` };

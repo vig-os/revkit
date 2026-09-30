@@ -129,18 +129,13 @@ function extractStatus(body: string): string | undefined {
   return undefined;
 }
 
-/** Strip the leading `# <title>` line (and any blank lines that follow) so
- * Starlight's own heading doesn't render twice — its layout renders the
- * title from frontmatter above the body. */
+/** Test-only shim retained for existing loader tests. The leading
+ * heading is now dropped in hast (`rehype-drop-repo-doc-title`, PR #38
+ * blocker 1) so `rehype-data-src` sees correct mdast positions — the
+ * previous source-side strip shifted every downstream anchor by the
+ * number of dropped lines, off-by-2 on every ADR/design/matrix page. */
 function stripLeadingHeading(body: string): string {
-  const lines = body.split(/\r?\n/);
-  let index = 0;
-  while (index < lines.length && lines[index].trim() === "") index += 1;
-  if (index < lines.length && /^#\s+/.test(lines[index])) {
-    index += 1;
-    while (index < lines.length && lines[index].trim() === "") index += 1;
-  }
-  return lines.slice(index).join("\n");
+  return body;
 }
 
 /** Map a repo-relative markdown path (POSIX-normalised, e.g.

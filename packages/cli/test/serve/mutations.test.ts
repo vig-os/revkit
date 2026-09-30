@@ -47,6 +47,10 @@ describe("mutation-killing tests (round-2 review)", () => {
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, "index.html"), "<h1>ok</h1>");
     writeFileSync(join(dist, "unknown.xyz"), "should not be served");
+    // Seed the anchor source (`docs/x.md`) so the daemon can compute
+    // its revision server-side (PR #38 review).
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "docs", "x.md"), "# X\n\nhello\n");
     sqlitePath = join(root, ".revkit", "threads.sqlite");
     logs = [];
     handle = undefined;

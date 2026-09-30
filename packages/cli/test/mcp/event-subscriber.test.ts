@@ -38,6 +38,9 @@ describe("event-subscriber (SSE)", () => {
   let root: string;
   beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), "revkit-sse-"));
+    // Seed the anchor source so `resolveAnchorSource` finds it.
+    mkdirSync(join(root, "docs", "adr"), { recursive: true });
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\n");
     const dist = join(root, "dist");
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, "index.html"), "<h1>ok</h1>");

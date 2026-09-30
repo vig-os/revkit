@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import remarkMath from "remark-math";
 import { rehypeKatexStrict } from "./src/lib/rehype-katex-strict.ts";
 import { rehypeDataSrc } from "../packages/cli/src/rehype-data-src.ts";
+import { rehypeDropRepoDocTitle } from "../packages/cli/src/rehype-drop-repo-doc-title.ts";
 
 // Repo root — this file lives in `site/`, so the repo root is the
 // parent directory. The rehype-data-src plugin rewrites every
@@ -155,6 +156,12 @@ export default defineConfig({
     // performance one.
     rehypePlugins: [
       [rehypeKatexStrict, { trust: false }],
+      // Drop the repo-doc's leading `# Title` in hast — Starlight's
+      // layout already renders the title from frontmatter. Done in
+      // hast (not in source) so `rehype-data-src` below stamps every
+      // block with its ORIGINAL source line number; a source-side
+      // strip shifted every anchor by 2 lines (PR #38 blocker 1).
+      [rehypeDropRepoDocTitle, { repoRoot: REPO_ROOT }],
       [rehypeDataSrc, { repoRoot: REPO_ROOT }],
     ],
   },

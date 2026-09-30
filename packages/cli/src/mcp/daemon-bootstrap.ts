@@ -29,6 +29,7 @@
 // bootstrap only ever reads it.
 
 import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { findRunningDaemon, type ServeState } from "../serve/serve-state.ts";
 import { stripTrailingSlashes } from "./daemon-client.ts";
 
@@ -124,7 +125,10 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   );
 }
 
-/** Default `spawn`: `Bun.spawn` with `detached: true`. */
+/** Default `spawn`: `Bun.spawn` with `detached: true`, running with
+ * a minimal env (`filteredDaemonEnv`) so a hostile agent env cannot
+ * inject `LD_PRELOAD`, `NODE_OPTIONS`, private tokens, etc. into
+ * the daemon. */
 function defaultSpawn(options: {
   cmd: string[];
   cwd: string;
@@ -135,6 +139,7 @@ function defaultSpawn(options: {
     cmd: options.cmd,
     cwd: options.cwd,
     stdio: options.stdio,
+    env: filteredDaemonEnv(),
     // A detached child continues after this process exits — which is
     // the point of `revkit mcp` auto-starting the daemon: an agent
     // session may spin up and tear down the MCP server many times,
@@ -154,12 +159,55 @@ async function defaultSleep(ms: number): Promise<void> {
 
 /** Default `revkit` binary: `bin/revkit.js` shipped with this
  * package. Computed from `import.meta.url` so a workspace or a
- * vendored install both resolve. */
-function defaultRevkitBin(): string {
+ * vendored install both resolve. Uses `fileURLToPath` (not
+ * `URL.pathname`) because the latter percent-encodes spaces and
+ * other filesystem-legal characters — a path like
+ * `/Users/Some Person/repo/…` would come back as
+ * `/Users/Some%20Person/…` and fail `Bun.spawn`. Exported for tests. */
+export function defaultRevkitBin(): string {
   // src/mcp/daemon-bootstrap.ts → ../../bin/revkit.js
   const here = new URL(import.meta.url);
   const packageRoot = new URL("../../", here);
-  return new URL("bin/revkit.js", packageRoot).pathname;
+  return fileURLToPath(new URL("bin/revkit.js", packageRoot));
+}
+
+/** Minimum env vars the spawned daemon needs to run under Bun on
+ * NixOS / macOS. Kept as an allowlist so a hostile agent process
+ * cannot poison the daemon's environment with tokens or LD_PRELOAD
+ * (PR #38 review). Anything the daemon actually needs at runtime
+ * (a token store path, a proxy, a locale override) has to be
+ * added here explicitly — no automatic passthrough.
+ *
+ * - `PATH`: `bun` is on it (the flake dev shell put it there).
+ * - `HOME`: `bun install`, `bun run` look up config there.
+ * - `TMPDIR` (+ `TMP` / `TEMP`): where `mktemp` lands.
+ * - `LANG` / `LC_*`: preserve locale so date formatting is stable.
+ * - `NIX_*`: NixOS wrappers thread the toolchain through these; a
+ *   missing `NIX_LD` on NixOS bricks `bun`.
+ * - `TERM`: harmless; useful if the spawned daemon errors and
+ *   writes a coloured log line before we redirect its stdio. */
+const DAEMON_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+  "HOME",
+  "LANG",
+  "PATH",
+  "TERM",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "USER",
+]);
+const DAEMON_ENV_PREFIX_ALLOWLIST: readonly string[] = ["LC_", "NIX_", "XDG_"];
+
+/** Filter `process.env` down to the allowlist. Exported for tests. */
+export function filteredDaemonEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    if (DAEMON_ENV_ALLOWLIST.has(key) || DAEMON_ENV_PREFIX_ALLOWLIST.some((p) => key.startsWith(p))) {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 // Re-export ServeState so `revkit mcp` callers get one import path.

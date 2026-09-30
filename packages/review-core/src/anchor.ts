@@ -29,13 +29,51 @@ export const textQuoteSchema = z
 
 export type TextQuote = z.infer<typeof textQuoteSchema>;
 
+/** Structural validator for a repo-relative anchor path. Enforced at
+ * the schema level so the daemon, the rail, `revkit mcp` and the
+ * hosted adapter all reject the same invalid values (PR #38 review):
+ *
+ *   - repo-relative (no leading `/`, no drive letter);
+ *   - no `..` segments (containment: an anchor can only point AT the
+ *     repo, not out of it);
+ *   - no control characters, no NUL;
+ *   - reasonable charset (`A–Z a–z 0–9 . - _ / space`);
+ *   - length cap of 512 (browser-safe, avoids pathological allocations).
+ *
+ * A file may legitimately have a space in its name; a colon is not
+ * allowed because `data-src` uses the last colon to split the path
+ * from the line range, so a path with a colon would ambiguate.
+ * Backslashes are refused too — Windows paths are POSIX-normalised
+ * by the rehype plugin before they reach any consumer, so seeing a
+ * backslash means the value was hand-crafted and is not trusted. */
+export const anchorPathSchema = z
+  .string()
+  .min(1)
+  .max(512, "anchor.path exceeds 512 characters — refuse pathological allocations.")
+  .refine((value) => !value.startsWith("/"), {
+    message: "anchor.path must be repo-relative, not absolute (no leading '/').",
+  })
+  .refine((value) => !/[\\]/.test(value), {
+    message: "anchor.path must not contain backslashes — POSIX-normalise before anchoring.",
+  })
+  .refine((value) => !/[:*?<>|"\x00-\x1f]/.test(value), {
+    message: "anchor.path contains a disallowed character (control char, `:`, `*`, `?`, `<`, `>`, `|`, or `\"`).",
+  })
+  .refine(
+    (value) => {
+      const parts = value.split("/");
+      return parts.every((part) => part !== ".." && part !== ".");
+    },
+    { message: "anchor.path must not contain '..' or '.' segments (containment)." },
+  );
+
 /** An anchor: file path plus 1-indexed inclusive line range, the text-quote
  * selector for the range, and the revision it was captured on. Refined so
  * `endLine >= startLine`. Line numbers are 1-based (matching editors and
  * `data-src="<file>#L<n>-L<m>"`). */
 export const anchorSchema = z
   .object({
-    path: z.string().min(1),
+    path: anchorPathSchema,
     startLine: z.number().int().positive(),
     endLine: z.number().int().positive(),
     quote: textQuoteSchema,

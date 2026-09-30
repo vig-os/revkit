@@ -21,7 +21,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDaemon, verifyDaemonInstance } from "../../src/mcp/daemon-bootstrap.ts";
+import {
+  defaultRevkitBin,
+  ensureDaemon,
+  filteredDaemonEnv,
+  verifyDaemonInstance,
+} from "../../src/mcp/daemon-bootstrap.ts";
 import type { ServeState } from "../../src/serve/serve-state.ts";
 
 /** One state fixture — the shape `findRunningDaemon` returns to the
@@ -230,5 +235,75 @@ describe("verifyDaemonInstance", () => {
       new Response(JSON.stringify({ pid: 1 }), { status: 200 }),
     );
     await expect(verifyDaemonInstance("http://127.0.0.1:9999", "abc", fakeFetch)).rejects.toThrow(/instanceId/);
+  });
+});
+
+describe("defaultRevkitBin — spaces in path", () => {
+  test("returns a real filesystem path (not URL percent-encoded)", () => {
+    // The path derived from this test file's import.meta.url has no
+    // space, but we can still verify the CONTRACT: fileURLToPath's
+    // output never contains "%20" for a space in the URL. Assert
+    // the returned path exists as a file and does not contain "%".
+    const bin = defaultRevkitBin();
+    expect(bin).toContain("bin/revkit.js");
+    expect(bin).not.toContain("%");
+  });
+
+  test("MUTATION: URL.pathname would break on a path with a space; fileURLToPath does not", () => {
+    // Independent unit check for the underlying primitive: build a
+    // file:// URL with a space and confirm `fileURLToPath` gives us
+    // the raw path back, while `URL.pathname` percent-encodes it.
+    const url = new URL("file:///Users/Some%20Person/bin/revkit.js");
+    // URL.pathname is percent-encoded (browser convention).
+    expect(url.pathname).toContain("%20");
+    // fileURLToPath decodes.
+    const nodeUrl = require("node:url") as typeof import("node:url");
+    expect(nodeUrl.fileURLToPath(url)).toBe("/Users/Some Person/bin/revkit.js");
+    expect(nodeUrl.fileURLToPath(url)).not.toContain("%");
+  });
+});
+
+describe("filteredDaemonEnv — allowlist", () => {
+  test("keeps PATH, HOME, LANG, TERM, XDG_*, NIX_*, LC_* — drops everything else", () => {
+    const env = filteredDaemonEnv({
+      PATH: "/usr/bin:/bin",
+      HOME: "/tmp/home",
+      LANG: "en_US.UTF-8",
+      LC_ALL: "C",
+      NIX_LD: "/lib64/ld.so",
+      XDG_CACHE_HOME: "/tmp/cache",
+      TERM: "xterm",
+      TMPDIR: "/tmp",
+      // These MUST be dropped.
+      NODE_OPTIONS: "--inspect",
+      LD_PRELOAD: "/malicious/lib.so",
+      REVKIT_AGENT_TOKEN: "secret",
+      SSH_AUTH_SOCK: "/tmp/agent.sock",
+      GITHUB_TOKEN: "ghp_xxx",
+    });
+    expect(env["PATH"]).toBe("/usr/bin:/bin");
+    expect(env["HOME"]).toBe("/tmp/home");
+    expect(env["LANG"]).toBe("en_US.UTF-8");
+    expect(env["LC_ALL"]).toBe("C");
+    expect(env["NIX_LD"]).toBe("/lib64/ld.so");
+    expect(env["XDG_CACHE_HOME"]).toBe("/tmp/cache");
+    expect(env["TERM"]).toBe("xterm");
+    expect(env["TMPDIR"]).toBe("/tmp");
+    // MUTATION: these must NOT leak through — a hostile agent env
+    // could otherwise inject an inspector, a preload, or a token.
+    expect(env["NODE_OPTIONS"]).toBeUndefined();
+    expect(env["LD_PRELOAD"]).toBeUndefined();
+    expect(env["REVKIT_AGENT_TOKEN"]).toBeUndefined();
+    expect(env["SSH_AUTH_SOCK"]).toBeUndefined();
+    expect(env["GITHUB_TOKEN"]).toBeUndefined();
+  });
+
+  test("undefined values are dropped (not passed through as literal 'undefined')", () => {
+    const env = filteredDaemonEnv({
+      PATH: "/usr/bin",
+      HOME: undefined,
+    });
+    expect(env["PATH"]).toBe("/usr/bin");
+    expect("HOME" in env).toBe(false);
   });
 });

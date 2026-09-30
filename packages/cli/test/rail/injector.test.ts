@@ -7,7 +7,7 @@
 // module syntax with the expected side effect (mounts to <body>).
 
 import { describe, expect, test } from "bun:test";
-import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../../src/rail/injector.ts";
+import { injectRail, RAIL_CSS_PATH, RAIL_INJECT_MAX_BYTES, RAIL_JS_PATH } from "../../src/rail/injector.ts";
 import { buildRailBundle, _resetRailBundleForTests } from "../../src/rail/bundle.ts";
 
 describe("rail injector — HTMLRewriter", () => {
@@ -48,6 +48,45 @@ describe("rail injector — HTMLRewriter", () => {
     expect(out).toContain(RAIL_JS_PATH);
     // Tag lands inside <head>, not appended at the end.
     expect(out.indexOf(RAIL_JS_PATH)).toBeLessThan(out.indexOf("</body>"));
+  });
+
+  test("MUTATION: a body over RAIL_INJECT_MAX_BYTES is served WITHOUT the rail (and reports oversize)", async () => {
+    // Just above 8 MiB — the cap. We assemble a fake HTML page big
+    // enough to trip the cap. The response must come back unchanged
+    // (no `/-/rail.js` injected) AND `onOversize` fired with the
+    // body size.
+    const filler = "x".repeat(RAIL_INJECT_MAX_BYTES + 100);
+    const body = `<!doctype html><html><head></head><body>${filler}</body></html>`;
+    let reportedBytes = 0;
+    const out = await injectRail(new Response(body), {
+      onOversize: (bytes) => {
+        reportedBytes = bytes;
+      },
+    });
+    const outText = await out.text();
+    expect(outText.length).toBeGreaterThanOrEqual(body.length);
+    // Rail tags NOT present — the guard bypassed injection.
+    expect(outText).not.toContain(RAIL_JS_PATH);
+    expect(outText).not.toContain(RAIL_CSS_PATH);
+    expect(reportedBytes).toBeGreaterThan(RAIL_INJECT_MAX_BYTES);
+  });
+
+  test("only trusted script src / stylesheet href are injected — nothing user-controllable", async () => {
+    // `injectRail` composes its own tag strings from RAIL_JS_PATH /
+    // RAIL_CSS_PATH constants; nothing from the caller reaches the
+    // template. Sanity: assert the output contains ONLY these two
+    // src/href values as URL attributes and no javascript:/data:
+    // scheme, no inline onhandler, no third-party origin.
+    const html = "<!doctype html><html><head></head><body></body></html>";
+    const out = await (await injectRail(new Response(html))).text();
+    expect(out).toMatch(new RegExp(`src="${RAIL_JS_PATH}"`));
+    expect(out).toMatch(new RegExp(`href="${RAIL_CSS_PATH}"`));
+    // Refused patterns must be absent — this is a bun-side XSS
+    // regression net for the injector itself. The rail's own DOM
+    // escaping is exercised by the Playwright roundtrip.
+    expect(out).not.toMatch(/on[a-z]+=/i);
+    expect(out).not.toMatch(/javascript:/i);
+    expect(out).not.toMatch(/data:/i);
   });
 });
 
