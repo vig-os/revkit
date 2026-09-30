@@ -66,7 +66,16 @@ export interface LogState {
    * `thread.reanchored` whose anchor points at a different file. */
   readonly threads: Map<
     string,
-    { status: ThreadStatus; readonly path: string; readonly commentIds: Set<string> }
+    {
+      status: ThreadStatus;
+      /** Set by `thread.resolved` to the status the thread had
+       * before the resolve (open or orphaned); read by
+       * `thread.reopened` so reopen restores it. Issue #46
+       * item 4. */
+      resumeStatus?: "open" | "orphaned";
+      readonly path: string;
+      readonly commentIds: Set<string>;
+    }
   >;
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
@@ -103,11 +112,17 @@ export function emptyLogState(): LogState {
 export function cloneLogState(state: LogState): LogState {
   const threads = new Map<
     string,
-    { status: ThreadStatus; path: string; commentIds: Set<string> }
+    {
+      status: ThreadStatus;
+      resumeStatus?: "open" | "orphaned";
+      path: string;
+      commentIds: Set<string>;
+    }
   >();
   for (const [id, entry] of state.threads) {
     threads.set(id, {
       status: entry.status,
+      ...(entry.resumeStatus !== undefined ? { resumeStatus: entry.resumeStatus } : {}),
       path: entry.path,
       commentIds: new Set(entry.commentIds),
     });
@@ -175,8 +190,13 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       if (state.commentIndex.has(event.commentId)) {
         return duplicateComment(event.commentId);
       }
+      // PR-43 round-5: an unanchored anchor puts the thread in
+      // `orphaned` from birth. The reducer mirrors this so the two
+      // stay in lock-step.
+      const initialStatus =
+        "kind" in event.anchor && event.anchor.kind === "unanchored" ? "orphaned" : "open";
       state.threads.set(event.threadId, {
-        status: "open",
+        status: initialStatus,
         path: event.anchor.path,
         commentIds: new Set([event.commentId]),
       });
@@ -207,16 +227,22 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
     case "thread.resolved": {
       const thread = state.threads.get(event.threadId);
       if (thread === undefined) return unknownThread(event.threadId, event.kind);
-      if (thread.status !== "open") {
+      // Issue #46 item 4: allow `orphaned → resolved`. A human
+      // reviewer marks an orphaned thread as no-longer-relevant
+      // (or B4 two-way sync mirrors GitHub's resolved bit onto a
+      // local orphaned thread). Record the pre-resolve status
+      // so a subsequent `thread.reopened` restores it.
+      if (thread.status !== "open" && thread.status !== "orphaned") {
         return {
           ok: false,
           rejection: {
             kind: "not-open",
             threadId: event.threadId,
-            message: `thread.resolved: thread '${event.threadId}' is not open (current status: ${thread.status}).`,
+            message: `thread.resolved: thread '${event.threadId}' cannot be resolved from status '${thread.status}' (allowed: open, orphaned).`,
           },
         };
       }
+      thread.resumeStatus = thread.status;
       thread.status = "resolved";
       return { ok: true };
     }
@@ -233,7 +259,10 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
-      thread.status = "open";
+      // Restore the pre-resolve status when known (issue #46 item 4).
+      // Falls back to `open` for logs from before this field existed.
+      thread.status = thread.resumeStatus ?? "open";
+      thread.resumeStatus = undefined;
       return { ok: true };
     }
     case "handover": {
@@ -329,7 +358,16 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       // reducer records the anchor change and moves the status back
       // to open. The validator only needs to track status here (the
       // anchor lives outside `LogState`).
+      //
+      // PR #47 round-1 nit: if the thread is currently `resolved` and
+      // was orphaned BEFORE the resolve (`resumeStatus === "orphaned"`),
+      // the reanchor also flips `resumeStatus` to `open` — the block
+      // has come back, so a subsequent reopen must land on `open`,
+      // not on the stale pre-reanchor `orphaned` state.
       if (thread.status === "orphaned") thread.status = "open";
+      if (thread.status === "resolved" && thread.resumeStatus === "orphaned") {
+        thread.resumeStatus = "open";
+      }
       return { ok: true };
     }
     case "thread.orphaned": {

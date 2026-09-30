@@ -28,11 +28,11 @@ import { revisionOf, type Anchor, type ReviewEventInput } from "@revkit/review-c
 import { EventBus } from "../../src/serve/event-bus.ts";
 import { makeLogger } from "../../src/serve/logger.ts";
 import {
-  isLineAnchorLocal,
   startReanchorDaemon,
   type ReanchorDaemonHandle,
   type ReanchorDaemonOptions,
 } from "../../src/serve/reanchor-daemon.ts";
+import { isLineAnchor, isUnanchoredAnchor } from "@revkit/review-core";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 
 const QUOTE = "The target phrase lives on this line and reviewers pick it.";
@@ -113,7 +113,14 @@ async function threadLine(store: SqliteThreadStore, threadId: string): Promise<n
   const all = await store.threads();
   const t = all.find((x) => x.id === threadId);
   if (t === undefined) throw new Error(`thread ${threadId} not found`);
+  if (!isLineAnchor(t.anchor)) throw new Error(`thread ${threadId} is not line-anchored`);
   return t.anchor.startLine;
+}
+
+/** Test helper: narrow to a line anchor or fail the test. */
+function lineAnchorOrThrow(anchor: import("@revkit/review-core").AnyAnchor): import("@revkit/review-core").Anchor {
+  if (!isLineAnchor(anchor)) throw new Error(`expected a line anchor, got ${JSON.stringify(anchor)}`);
+  return anchor;
 }
 
 beforeEach(() => {
@@ -296,7 +303,9 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     // The reopened thread's anchor.revision is now the new one.
     const all = await env.store.threads();
     const tThread = all.find((x) => x.id === T);
-    expect(tThread?.anchor.revision).toBe(await revisionOf(src2));
+    expect(tThread !== undefined && lineAnchorOrThrow(tThread.anchor).revision).toBe(
+      await revisionOf(src2),
+    );
   });
 
   test("PROBE H sibling — late thread.opened at OLD revision still re-anchors", async () => {
@@ -384,7 +393,7 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     for (let i = 0; i < 30 && !anchoredAtV2; i++) {
       const all = await env.store.threads();
       const t = all.find((x) => x.id === T);
-      if (t?.anchor.revision === v2Rev) {
+      if (t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === v2Rev) {
         anchoredAtV2 = true;
         break;
       }
@@ -422,7 +431,7 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     for (let i = 0; i < 40 && !anchoredAtV3; i++) {
       const all = await env.store.threads();
       const t = all.find((x) => x.id === T);
-      if (t?.anchor.revision === v3Rev) {
+      if (t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === v3Rev) {
         anchoredAtV3 = true;
         break;
       }
@@ -457,7 +466,7 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     for (let i = 0; i < 40 && !anchoredAtV4; i++) {
       const all = await env.store.threads();
       const t = all.find((x) => x.id === T);
-      if (t?.anchor.revision === v4Rev) {
+      if (t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === v4Rev) {
         anchoredAtV4 = true;
         break;
       }
@@ -493,7 +502,7 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     for (let i = 0; i < 40 && !anchoredAtV2; i++) {
       const all = await env.store.threads();
       const t = all.find((x) => x.id === T);
-      if (t?.anchor.revision === v2Rev) {
+      if (t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === v2Rev) {
         anchoredAtV2 = true;
         break;
       }
@@ -512,7 +521,7 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     for (let i = 0; i < 40 && !anchoredAtV3; i++) {
       const all = await env.store.threads();
       const t = all.find((x) => x.id === T);
-      if (t?.anchor.revision === v3Rev) {
+      if (t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === v3Rev) {
         anchoredAtV3 = true;
         break;
       }
@@ -554,42 +563,84 @@ describe("startReanchorDaemon — PR #45 round-4 regressions", () => {
     const all = await env.store.threads();
     const t = all.find((x) => x.id === T);
     expect(t?.status).toBe("open");
-    expect(t?.anchor.startLine).toBe(lineOf(v2));
+    expect(t !== undefined && lineAnchorOrThrow(t.anchor).startLine).toBe(lineOf(v2));
   });
 
-  test("isLineAnchorLocal — skips PR #43 unanchored anchors, accepts line anchors", () => {
-    // Coordinator note 2026-09-30: PR #43 adds an unanchored anchor
-    // shape (`{kind: "unanchored", path, originalStartLine?}`) with
-    // no revision + no quote. The daemon must skip such threads in
-    // every place we would otherwise touch `anchor.revision`. This
-    // test pins the runtime guard shape so a future rebase onto dev
-    // (which brings in review-core's own `isLineAnchor`) has an
-    // anchor of comparison. Full integration test lands in the
-    // rebase — the schema on this branch does not yet accept an
-    // unanchored anchor at append time.
-    // Positive: a line anchor.
-    expect(
-      isLineAnchorLocal({
-        path: "docs/a.md",
-        startLine: 5,
-        endLine: 5,
-        quote: { exact: "x", prefix: "", suffix: "" },
-        revision: "a".repeat(64),
-      }),
-    ).toBe(true);
-    // Negative: an unanchored anchor.
-    expect(
-      isLineAnchorLocal({
+  test("UNANCHORED thread on a watched path is skipped end-to-end (issue #46 + PR #43)", async () => {
+    // Full integration: seed a line-anchored thread T on
+    // `docs/a.md` (so the daemon watches the path), then append a
+    // second thread U with an UNANCHORED anchor (PR #43 shape: no
+    // revision, no quote — the reducer stamps it `orphaned` from
+    // birth). Then drive several refreshes with and without file
+    // edits. Assertions:
+    //
+    //   1. The pipeline NEVER touches U — no `thread.reanchored` or
+    //      `thread.orphaned` events land for U beyond its birth
+    //      event.
+    //   2. U does not appear in the derived-skip check as a reason
+    //      to run the pipeline (an idle refresh over unchanged
+    //      content leaves `pipelineRunCount` at 0).
+    //   3. `isUnanchoredAnchor(U.anchor)` is `true` on the derived
+    //      Thread view.
+    const env = await setup();
+    const f = join(env.root, "docs/a.md");
+    const v1 = mk(0);
+    writeFileSync(f, v1);
+    const T = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa11";
+    await seedThread(env.store, v1, "docs/a.md", T);
+    // Append U with an unanchored anchor. The reducer parks U as
+    // orphaned-from-birth; the daemon must skip it in the derived
+    // check and never run the pipeline for it.
+    const U = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa22";
+    await env.store.append({
+      kind: "comment.created",
+      actor: { kind: "local", id: "u" },
+      threadId: U,
+      commentId: U.replace(/.$/, "c"),
+      anchor: {
         kind: "unanchored",
         path: "docs/a.md",
         originalStartLine: 5,
-      }),
-    ).toBe(false);
-    // Defensive negatives.
-    expect(isLineAnchorLocal(undefined)).toBe(false);
-    expect(isLineAnchorLocal(null)).toBe(false);
-    expect(isLineAnchorLocal({ path: "docs/a.md" })).toBe(false);
-    expect(isLineAnchorLocal({ path: "docs/a.md", revision: 42 })).toBe(false);
+      },
+      body: "imported",
+      // The reducer expects an orphanReason on unanchored births
+      // (issue #46 item 3) so U shows a real explanation in the
+      // orphan panel.
+      orphanReason: "GitHub reported an anchor whose source blob is unavailable.",
+    });
+
+    // Baseline: refresh once to drive the derived-skip check on
+    // both threads. T becomes up-to-date; U stays orphaned +
+    // untouched.
+    await env.rd.refresh("docs/a.md");
+    const headAfterFirst = env.store.head();
+    const pipelineAfterFirst = env.rd.pipelineRunCount();
+
+    // Idle refreshes ×3: no file change, T is up to date, U should
+    // NOT force a pipeline run.
+    for (let i = 0; i < 3; i++) await env.rd.refresh("docs/a.md");
+    expect(env.store.head()).toBe(headAfterFirst);
+    expect(env.rd.pipelineRunCount()).toBe(pipelineAfterFirst);
+
+    // Edit the file so T re-anchors; U must still not attract any
+    // events beyond its birth.
+    const v2 = mk(2);
+    writeFileSync(f, v2);
+    await env.rd.refresh("docs/a.md");
+    const events = await env.store.since(0);
+    const uEvents = events.filter((e) => (e as unknown as { threadId?: string }).threadId === U);
+    // U has ONLY its `comment.created` event — no reanchored, no
+    // orphaned, no anything.
+    expect(uEvents.length).toBe(1);
+    expect(uEvents[0]?.kind).toBe("comment.created");
+
+    // Sanity: U's derived Thread view is orphaned and carries an
+    // unanchored anchor. review-core's guards agree.
+    const all = await env.store.threads();
+    const u = all.find((x) => x.id === U);
+    expect(u?.status).toBe("orphaned");
+    expect(u !== undefined && isUnanchoredAnchor(u.anchor)).toBe(true);
+    expect(u !== undefined && isLineAnchor(u.anchor)).toBe(false);
   });
 
   test("rejected append leaves the orphan check memo untouched so the thread stays eligible for retry", async () => {

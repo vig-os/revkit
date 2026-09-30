@@ -65,6 +65,7 @@
 import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
 import { basename as basenameOf, dirname, relative } from "node:path";
 import {
+  isLineAnchor,
   prepareReanchor,
   reanchorEvent,
   reanchorWith,
@@ -85,29 +86,6 @@ import { REANCHOR_SOURCE_MAX_BYTES, resolveSourceUnderRoot } from "./anchor-sour
  * filter on it without seeing the user's own agent id. */
 export const REANCHOR_ACTOR_ID = "revkit-reanchor";
 
-/** Runtime guard: is this thread's anchor a LINE anchor (has a
- * revision + quote) rather than an UNANCHORED one (PR #43's
- * import shape — no revision, no quote, orphaned from birth)?
- *
- * The re-anchoring pipeline runs on line anchors only: an
- * unanchored thread has nothing for `reanchorWith` to work on,
- * and the reducer treats it as `orphaned` from creation. This
- * daemon must skip it in every place we would otherwise touch
- * `anchor.revision` — the derived-skip check, the snapshot
- * backfill, the orphan memo, and `refreshAll` / `reconcileWatchers`
- * bookkeeping. (Coordinator note, 2026-09-30.)
- *
- * Kept as a local runtime guard so this file compiles both against
- * the pre-#43 review-core (line anchors only; the check reduces
- * to `revision !== undefined`) AND the post-#43 review-core (which
- * exports its own `isLineAnchor`). After the rebase onto dev this
- * helper is a candidate to drop in favour of the shared one. */
-export function isLineAnchorLocal(anchor: unknown): anchor is { path: string; revision: string; startLine: number; endLine: number } {
-  if (anchor === null || typeof anchor !== "object") return false;
-  const a = anchor as Record<string, unknown>;
-  if (a.kind === "unanchored") return false;
-  return typeof a.revision === "string" && typeof a.path === "string";
-}
 
 /** Debounce for the anchored-file watcher. A single edit fires 2–3
  * OS-level events (write, stat, close); 300 ms coalesces them into
@@ -478,8 +456,12 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // Filter out unanchored threads (PR #43) — they have no
     // revision / no quote, the reducer stamps them `orphaned` at
     // creation, and the pipeline has nothing to do with them.
-    // Coordinator note 2026-09-30.
-    const pipelineThreads = threads.filter((thread) => isLineAnchorLocal(thread.anchor));
+    // Coordinator note 2026-09-30. Explicit type-guard callback so
+    // TypeScript narrows `pipelineThreads`'s anchor to `Anchor`.
+    type LineAnchoredThread = Omit<Thread, "anchor"> & { anchor: import("@revkit/review-core").Anchor };
+    const pipelineThreads = threads.filter(
+      (thread): thread is LineAnchoredThread => isLineAnchor(thread.anchor),
+    );
     if (pipelineThreads.length === 0) return;
 
     const allUpToDate = pipelineThreads.every((thread) => {
@@ -490,7 +472,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
 
     // Group by old revision so `prepareReanchor` runs once per (old,
     // new) pair rather than once per thread.
-    const byRevision = new Map<string, Thread[]>();
+    const byRevision = new Map<string, LineAnchoredThread[]>();
     for (const thread of pipelineThreads) {
       const existing = byRevision.get(thread.anchor.revision);
       if (existing !== undefined) existing.push(thread);
@@ -674,7 +656,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     const all = await store.threads();
     const paths = new Set<string>();
     for (const thread of all) {
-      if (!isLineAnchorLocal(thread.anchor)) continue;
+      if (!isLineAnchor(thread.anchor)) continue;
       paths.add(thread.anchor.path);
     }
     await Promise.all([...paths].map((path) => refresh(path)));
@@ -689,7 +671,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     const all = await store.threads();
     const retain = new Set<string>();
     for (const thread of all) {
-      if (!isLineAnchorLocal(thread.anchor)) continue;
+      if (!isLineAnchor(thread.anchor)) continue;
       retain.add(thread.anchor.revision);
     }
     try {
@@ -951,7 +933,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       // orphaned-from-birth and the rail renders them at the
       // file level.
       if (thread.status === "resolved") continue;
-      if (!isLineAnchorLocal(thread.anchor)) {
+      if (!isLineAnchor(thread.anchor)) {
         trackedThreadIds.add(thread.id);
         continue;
       }

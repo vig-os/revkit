@@ -48,14 +48,28 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         body: event.body,
         createdAt: event.ts,
       };
+      // An unanchored anchor represents "imported without a
+      // trustworthy anchor" — the thread starts orphaned so the
+      // reanchor engine / rail skip it (no snapshot to load, no
+      // quote to render). PR-43 round-5.
+      const isUnanchored = "kind" in event.anchor && event.anchor.kind === "unanchored";
+      const initialStatus = isUnanchored ? "orphaned" : "open";
       threads.set(event.threadId, {
         id: event.threadId,
         anchor: event.anchor,
-        status: "open",
+        status: initialStatus,
         createdSeq: event.seq,
         createdAt: event.ts,
         updatedAt: event.ts,
         comments: [firstComment],
+        // Issue #46 item 3: project structured metadata and the
+        // unavailable reason onto the derived Thread view. The
+        // reason is only meaningful when the thread starts
+        // orphaned (unanchored path); dropping it on line-anchor
+        // threads keeps the field's meaning honest (only present
+        // when `status === "orphaned"`).
+        ...(event.external !== undefined ? { external: event.external } : {}),
+        ...(isUnanchored && event.orphanReason !== undefined ? { orphanReason: event.orphanReason } : {}),
       });
       return;
     }
@@ -80,9 +94,16 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
     case "thread.resolved": {
       const thread = threads.get(event.threadId);
       if (thread === undefined) return;
+      // Issue #46 item 4: allow orphaned → resolved (a human
+      // marks an orphaned thread as no-longer-relevant). Record
+      // the previous status in `resumeStatus` so a subsequent
+      // `thread.reopened` restores it (open → open, orphaned →
+      // orphaned) rather than always flipping to open.
+      if (thread.status !== "open" && thread.status !== "orphaned") return;
       threads.set(event.threadId, {
         ...thread,
         status: "resolved",
+        resumeStatus: thread.status,
         updatedAt: event.ts,
       });
       return;
@@ -90,9 +111,17 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
     case "thread.reopened": {
       const thread = threads.get(event.threadId);
       if (thread === undefined) return;
+      if (thread.status !== "resolved") return;
+      // Restore the pre-resolve status. Fall back to `open` when
+      // `resumeStatus` is absent (backfilled from an older log).
+      const nextStatus: "open" | "orphaned" = thread.resumeStatus ?? "open";
+      // Drop `resumeStatus` so a subsequent resolve/reopen cycle
+      // starts fresh.
+      const { resumeStatus: _prev, ...rest } = thread;
+      void _prev;
       threads.set(event.threadId, {
-        ...thread,
-        status: "open",
+        ...rest,
+        status: nextStatus,
         updatedAt: event.ts,
       });
       return;
@@ -109,14 +138,27 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       // targets.
       const nextStatus = thread.status === "orphaned" ? "open" : thread.status;
       // When un-orphaning, drop the stale `orphanReason` — the block
-      // came back and the rail must stop displaying "was at L…".
+      // came back and the rail must stop displaying the old reason.
+      // Field name matches PR #45.
+      //
+      // PR #47 round-1 nit: if the thread is currently `resolved` and
+      // its `resumeStatus` records that it was `orphaned` before the
+      // resolve, the reanchor also updates `resumeStatus` to `open`.
+      // Otherwise a subsequent `thread.reopened` would return to
+      // `orphaned` — a stale answer to the pre-reanchor question — on
+      // a thread whose block has since been found again.
       const { orphanReason: _prevReason, ...rest } = thread;
       void _prevReason;
+      const nextResume =
+        thread.status === "resolved" && thread.resumeStatus === "orphaned"
+          ? ("open" as const)
+          : thread.resumeStatus;
       threads.set(event.threadId, {
         ...rest,
         anchor: event.anchor,
         status: nextStatus,
         updatedAt: event.ts,
+        ...(nextResume !== undefined ? { resumeStatus: nextResume } : {}),
       });
       return;
     }
@@ -135,8 +177,8 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         status: "orphaned",
         // Carry the pipeline's own reason string onto the derived
         // Thread view so the rail's orphan panel renders exactly
-        // what the diff engine said, not a synthesised sentence
-        // (PR #45 round-2 nit).
+        // what the diff engine said, not a synthesised sentence.
+        // Field name matches PR #45.
         ...(event.reason !== undefined ? { orphanReason: event.reason } : {}),
         updatedAt: event.ts,
       });

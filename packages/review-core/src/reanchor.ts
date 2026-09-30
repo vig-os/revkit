@@ -877,7 +877,14 @@ export function reanchorEvent(
 
 // ---------- helpers (module-local) ----------
 
-function toLF(source: string): string {
+/** Normalise `\r\n` and lone `\r` to `\n`. Every helper that
+ * offsets or diffs source content in review-core works on the
+ * LF form, so a producer that hands source to
+ * `buildQuoteFromLines`, `revisionOf`, or the reanchor engine
+ * must pre-normalise (or let those helpers do it). One source
+ * of truth so a CRLF fixture never orphans on a normalisation
+ * mismatch (PR-43 round-4 nit). */
+export function toLF(source: string): string {
   return source.replace(/\r\n?/g, "\n");
 }
 
@@ -887,6 +894,12 @@ function toLF(source: string): string {
  * from the new source; the line range is computed from the offset
  * via the precomputed line-start index.
  */
+/** Minimum prefix/suffix window used by `buildAnchor` — 32 chars
+ * matches the fuzzy engine's fixtures. Exported so producers that
+ * mint fresh anchors (`buildQuoteFromLines`, the local rail's
+ * `data-src` cutter) use the same window. */
+export const DEFAULT_ANCHOR_CONTEXT_CHARS = 32;
+
 async function buildAnchor(
   original: Anchor,
   newSource: string,
@@ -895,7 +908,7 @@ async function buildAnchor(
   matchedText: string,
   newRevision: string,
 ): Promise<Anchor> {
-  const contextLength = Math.max(original.quote.prefix.length, original.quote.suffix.length, 32);
+  const contextLength = Math.max(original.quote.prefix.length, original.quote.suffix.length, DEFAULT_ANCHOR_CONTEXT_CHARS);
   const endOffset = startOffset + matchedText.length;
   const startLine = offsetToLine(newLineIndex, startOffset);
   const endLine = offsetToLine(newLineIndex, Math.max(startOffset, endOffset - 1));

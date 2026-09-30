@@ -12,6 +12,7 @@ import {
   type ReviewEventInput,
   type Anchor,
   exportArchive,
+  isLineAnchor,
 } from "@revkit/review-core";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 
@@ -333,8 +334,10 @@ describe("SqliteThreadStore", () => {
     // (through selectThreads) reflects the new position.
     let listed = await store.threads();
     expect(listed.length).toBe(1);
-    expect(listed[0]?.anchor.startLine).toBe(50);
-    expect(listed[0]?.anchor.endLine).toBe(54);
+    const first = listed[0];
+    if (first === undefined || !isLineAnchor(first.anchor)) throw new Error("expected line anchor");
+    expect(first.anchor.startLine).toBe(50);
+    expect(first.anchor.endLine).toBe(54);
     expect(listed[0]?.status).toBe("open");
     // Orphan it.
     await store.append({
@@ -355,7 +358,11 @@ describe("SqliteThreadStore", () => {
     const restored = await dest.threads();
     expect(restored.length).toBe(1);
     expect(restored[0]?.status).toBe("orphaned");
-    expect(restored[0]?.anchor.startLine).toBe(50);
+    const restoredFirst = restored[0];
+    if (restoredFirst === undefined || !isLineAnchor(restoredFirst.anchor)) {
+      throw new Error("expected line anchor");
+    }
+    expect(restoredFirst.anchor.startLine).toBe(50);
     dest.close();
     rmSync(filename, { force: true });
   });

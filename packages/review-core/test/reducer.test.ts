@@ -168,7 +168,9 @@ describe("reduce — thread.reanchored", () => {
     const threads = reduce([...log.slice(0, 2), orphan, rediscovered]);
     const thread = threads.get("th-1");
     expect(thread?.status).toBe("open");
-    expect(thread?.anchor.startLine).toBe(44);
+    // Narrow: the reanchored anchor is a LINE anchor.
+    if (!thread || !("startLine" in thread.anchor)) throw new Error("expected line anchor");
+    expect(thread.anchor.startLine).toBe(44);
   });
 });
 

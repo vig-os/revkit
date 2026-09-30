@@ -8,7 +8,84 @@
 // `test/browser-build.test.ts` and the src-only tsconfig
 // (`tsconfig.src.json`) that typechecks without bun globals.
 
-export { anchorPathSchema, anchorSchema, textQuoteSchema, type Anchor, type TextQuote } from "./anchor.ts";
+export {
+  anchorPathSchema,
+  anchorSchema,
+  anyAnchorSchema,
+  isLineAnchor,
+  isUnanchoredAnchor,
+  textQuoteSchema,
+  unanchoredAnchorSchema,
+  type Anchor,
+  type AnyAnchor,
+  type TextQuote,
+  type UnanchoredAnchor,
+} from "./anchor.ts";
+export {
+  anchorToPrComment,
+  anchorToPrCommentWithHunks,
+  fileFallbackPreamble,
+  findFile,
+  prCommentToAnchor,
+  type AnchorMapOptions,
+  type AnchorMapResult,
+  type FileFallbackReason,
+  type OrphanReason,
+  type PrCommentSource,
+  type PrCommentTarget,
+  type PrCommentToAnchorResult,
+  type PrFile,
+  type PrFileComment,
+  type PrLineComment,
+} from "./anchor-map.ts";
+export {
+  composeFileFallbackBody,
+  DEFAULT_GITHUB_BASE_URL,
+  DEFAULT_GITHUB_GRAPHQL_URL,
+  DEFAULT_MAX_FILES_PAGES,
+  DEFAULT_RETRY_POLICY,
+  DEFAULT_USER_AGENT,
+  GITHUB_API_VERSION,
+  GitHubAdapter,
+  GitHubApiError,
+  GitHubRateLimitError,
+  githubExternal,
+  nextPageUrl,
+  PrContext,
+  retryAfterMs,
+  shouldRetry,
+  verifyContentAgainstDiffHunk,
+  type AddPendingReviewThreadInput,
+  type FindOrCreatePendingReviewResult,
+  type GhReviewComment,
+  type GhReviewThread,
+  type GitHubAdapterOptions,
+  type PendingReview,
+  type PendingReviewComment,
+  type PrRef,
+  type PullRequestSummary,
+  type RetryPolicy,
+  type ReviewSubmissionEvent,
+  type SubmitReviewInput,
+  type ThreadSnapshot,
+} from "./github-adapter.ts";
+export {
+  newSideLines,
+  oldSideLines,
+  parsePatch,
+  rangeIsOnRightSide,
+  type Hunk,
+  type HunkLine,
+  type HunkLineKind,
+} from "./patch.ts";
+export {
+  buildQuoteFromLines,
+  buildQuoteFromOffsets,
+  DEFAULT_QUOTE_CONTEXT_CHARS,
+  lineStartsOf,
+  type BuildQuoteOptions,
+} from "./quote.ts";
+export { redactTokenInMessage, type TokenSource } from "./token-source.ts";
 export { ID_REGEX, idSchema, isValidId } from "./id.ts";
 export { isValidRepoRelativePath } from "./path.ts";
 export { authorKinds, authorSchema, type Author, type AuthorKind } from "./author.ts";
@@ -36,6 +113,7 @@ export {
   alignMatchedText,
   buildLineStartIndex,
   classifySpan,
+  DEFAULT_ANCHOR_CONTEXT_CHARS,
   DEFAULT_DIFF_TIMEOUT_SECONDS,
   DEFAULT_HUNK_SLACK,
   DEFAULT_MIN_MODIFIED_EQUAL_FRACTION,
@@ -48,6 +126,7 @@ export {
   reanchor,
   reanchorEvent,
   reanchorWith,
+  toLF,
   tryMove,
   type LineRange,
   type ReanchorContext,

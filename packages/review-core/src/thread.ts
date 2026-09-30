@@ -5,7 +5,7 @@
 // export/import format and the store interface reference a single Zod
 // schema for cross-boundary validation (ADR-0025).
 import { z } from "zod";
-import { anchorSchema } from "./anchor.ts";
+import { anyAnchorSchema } from "./anchor.ts";
 import { authorSchema } from "./author.ts";
 import { isoTimestamp } from "./timestamp.ts";
 
@@ -69,20 +69,46 @@ export type Comment = z.infer<typeof commentSchema>;
 export const threadSchema = z
   .object({
     id: z.string().min(1),
-    anchor: anchorSchema,
+    anchor: anyAnchorSchema,
     status: threadStatusSchema,
     createdSeq: z.number().int().positive(),
     createdAt: isoTimestamp,
     updatedAt: isoTimestamp,
     comments: z.array(commentSchema),
     /** The reason string from the most recent `thread.orphaned`
-     * event on this thread, if any. Present ONLY when
-     * `status === "orphaned"` and the pipeline supplied a reason;
-     * cleared by a subsequent `thread.reanchored` (which un-orphans
-     * the thread). Read by the rail's orphan panel so the human
-     * sees WHY the anchor was lost — the diff's own account rather
-     * than a synthesised sentence. (PR #45 round-2 nit.) */
+     * event on this thread, or the reason recorded on
+     * `comment.created` for a thread born unanchored. Present
+     * when the thread was ever orphaned and the pipeline supplied
+     * a reason — including on a `resolved` thread that was
+     * orphaned BEFORE the resolve, so a subsequent
+     * `thread.reopened` restores the reason alongside the
+     * `orphaned` state (issue #46 item 4). Cleared by
+     * `thread.reanchored` (the block came back). Read by the
+     * rail's orphan panel so the human sees WHY the anchor was
+     * lost — the pipeline's own account rather than a synthesised
+     * sentence. Field name matches PR #45 for merge compatibility
+     * (issue #46). */
     orphanReason: z.string().min(1).optional(),
+    /** Structured origin metadata for a thread imported from an
+     * external provider (currently GitHub). Projected from
+     * `comment.created.external` by the reducer so B4 two-way
+     * sync (ADR-0025 amendment) can reconcile local orphan state
+     * with the remote's `resolved` bit without regex-parsing prose.
+     * (Issue #46 item 3.) */
+    external: z
+      .object({
+        provider: z.literal("github"),
+        threadId: z.string().min(1),
+        resolved: z.boolean(),
+        resolvedByLogin: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    /** The status this thread was in BEFORE the most recent
+     * `thread.resolved` event, so `thread.reopened` restores the
+     * correct pre-resolve state (open or orphaned). Set on
+     * resolve, read on reopen. (Issue #46 item 4.) */
+    resumeStatus: z.enum(["open", "orphaned"]).optional(),
   })
   .strict();
 

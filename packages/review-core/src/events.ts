@@ -55,7 +55,7 @@
 //                      un-orphans the thread when a later rebuild finds
 //                      it again.
 import { z } from "zod";
-import { anchorSchema } from "./anchor.ts";
+import { anchorSchema, anyAnchorSchema } from "./anchor.ts";
 import { askAnswerSchema, askSchema } from "./asks.ts";
 import { authorSchema } from "./author.ts";
 import { idSchema } from "./id.ts";
@@ -80,8 +80,35 @@ const commentCreatedPayload = {
   kind: z.literal("comment.created"),
   threadId: idSchema,
   commentId: idSchema,
-  anchor: anchorSchema,
+  /** Line-anchored (`kind` absent) OR unanchored (`kind:
+   * "unanchored"`). The reducer treats an unanchored anchor as
+   * orphaned-from-birth (PR-43 round-5 nit — proper state, not a
+   * sentinel string). */
+  anchor: anyAnchorSchema,
   body: z.string().min(1),
+  /** PR-43 round-5 nit: structured origin metadata for a thread
+   * imported from an external provider (currently GitHub). Set on
+   * the thread's opening `comment.created` so the reducer can
+   * project it onto `Thread` state without regex-parsing prose.
+   * Same shape as the field on `thread.orphaned`. */
+  external: z
+    .object({
+      provider: z.literal("github"),
+      threadId: z.string().min(1),
+      resolved: z.boolean(),
+      resolvedByLogin: z.string().min(1).optional(),
+    })
+    .strict()
+    .optional(),
+  /** Issue #46 item 3: for a thread born unanchored (`anchor.kind ===
+   * "unanchored"`), the reducer projects this onto
+   * `Thread.orphanReason` so the rail's orphan panel shows the
+   * unavailable reason (`diffhunk-mismatch`, `binary`, …) rather
+   * than nothing. Ignored when the anchor is line-anchored — a
+   * line-anchored thread reaches `orphaned` via a `thread.orphaned`
+   * event, whose own `reason` field the reducer projects on that
+   * transition. */
+  orphanReason: z.string().min(1).optional(),
 } as const;
 
 const commentRepliedPayload = {
@@ -175,6 +202,22 @@ const threadOrphanedPayload = {
       "thread.orphaned.revision must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
     ),
   reason: z.string().min(1).optional(),
+  /** PR-43 round-5 nit: structured origin metadata for a thread
+   * that was orphaned during import (e.g. the source blob for its
+   * lines couldn't be fetched, but the thread still exists on
+   * GitHub). Callers use this to render "originally on GitHub,
+   * resolved by …" without regex-parsing the reason string. The
+   * B4 two-way sync (see ADR-0025 amendment) reconciles the
+   * local orphan with the remote resolved state via this field. */
+  external: z
+    .object({
+      provider: z.literal("github"),
+      threadId: z.string().min(1),
+      resolved: z.boolean(),
+      resolvedByLogin: z.string().min(1).optional(),
+    })
+    .strict()
+    .optional(),
 } as const;
 
 /** All event variants — one per `kind`. Each carries the envelope plus

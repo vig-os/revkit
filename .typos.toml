@@ -4,6 +4,14 @@
 # Typos configuration
 # https://github.com/crate-ci/typos
 
+# GraphQL schema fixture recorded from GitHub's public schema
+# (packages/review-core/test/fixtures/github/graphql-schema.graphql).
+# Enum values like `FO`, `PN`, `OL` are GitHub type-code identifiers,
+# not typos. Exclude the whole file so we don't have to enumerate
+# them and re-check on every schema refresh.
+[files]
+extend-exclude = ["packages/review-core/test/fixtures/github/graphql-schema.graphql"]
+
 [default.extend-words]
 # Shell scripting: sed label syntax uses 'ba' (branch to label 'a')
 ba = "ba"
@@ -36,3 +44,9 @@ passt = "passt"
 tatus = "tatus"
 fnd = "fnd"
 mis = "mis"
+# npm package name in the recorded PR-38 file listing under
+# packages/review-core/test/fixtures/github/ (a bun.lock excerpt);
+# `devlop` is the actual published package name, not a typo of
+# `develop`. Kept as an extend-word rather than an exclusion so any
+# prose typo elsewhere in the fixture directory is still caught.
+devlop = "devlop"
