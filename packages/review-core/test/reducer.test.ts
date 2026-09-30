@@ -87,6 +87,21 @@ describe("reduce — create → reply → resolve → reopen", () => {
     expect(threads.get("th-1")?.status).toBe("resolved");
     expect(threads.get("th-1")?.updatedAt).toBe(t(2));
   });
+
+  test("issue #60: thread.resolved projects resolvedBy + resolvedAt onto the derived thread", () => {
+    const threads = reduce(log.slice(0, 3));
+    const thread = threads.get("th-1");
+    expect(thread?.resolvedBy).toEqual(humanActor);
+    expect(thread?.resolvedAt).toBe(t(2));
+  });
+
+  test("issue #60: thread.reopened drops resolvedBy + resolvedAt", () => {
+    const threads = reduce(log);
+    const thread = threads.get("th-1");
+    expect(thread?.status).toBe("open");
+    expect(thread?.resolvedBy).toBeUndefined();
+    expect(thread?.resolvedAt).toBeUndefined();
+  });
 });
 
 describe("reduce — ordering", () => {

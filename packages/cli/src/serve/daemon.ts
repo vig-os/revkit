@@ -71,7 +71,7 @@ import {
 import { buildAskPageBundle } from "../ask-page/bundle.ts";
 import { writeAskFile } from "./asks-file.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
-import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
+import { acquireAndPublish, ensureRevkitDir, readOrMintRepoId, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
 import {
   answerAskRequestSchema,
@@ -509,6 +509,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // confirm the port answers as THIS daemon, and required by
   // `serve.json`'s ownership check on shutdown.
   const instanceId = mintToken();
+  // Persistent per-repo tag, also echoed by `GET /-/health` as
+  // `repoId`. The rail keys its per-viewer "seen" localStorage
+  // bucket by this so a `revkit serve` restart on the same
+  // `--port` does not wipe the reviewer's ack state (issue #60
+  // PR #62 round-3 review). Random on first run — never derived
+  // from the repo path — so an unauthenticated `/-/health` cannot
+  // fingerprint the caller's filesystem layout.
+  const repoId = readOrMintRepoId(options.repoRoot);
   const state: ServeState = {
     pid: process.pid,
     port,
@@ -739,7 +747,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // secret is not needed here because the response identifies
     // the daemon only (no tokens, no data).
     if (method === "GET" && url.pathname === "/-/health") {
-      const body = JSON.stringify({ instanceId, pid: process.pid });
+      // `repoId` is a random tag stable across restarts on the
+      // same repo — the rail keys `revkit.rail.seen.<repoId>`
+      // localStorage by it. `instanceId` is per-start; a client
+      // that wants to detect a daemon replacement still uses it.
+      const body = JSON.stringify({ instanceId, repoId, pid: process.pid });
       return withHygiene(new Response(body, { status: 200 }), "json", "application/json; charset=utf-8");
     }
 
