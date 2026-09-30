@@ -162,6 +162,106 @@ export function buildChildEnv(
   return out;
 }
 
+/** Options for `spawnAstroBuild` — the shared low-level primitive
+ * that both `runSafeBuild` (the review sandbox flow, PR #48) and
+ * `runPackagedBuild` (the M5 part 2 consumer-render flow, issue #57)
+ * call. Keep it MINIMAL: this is a spawn wrapper with the env
+ * hardening; caller decides layout, symlinks and config wrapping. */
+export interface SpawnAstroBuildOptions {
+  /** Absolute path to a trusted `astro` binary. Invoked directly,
+   * NEVER via `bunx` / `npx` / `PATH` lookup — the caller is
+   * responsible for locating a trusted one. */
+  readonly astroBin: string;
+  /** `--root <astroRoot>` — the astro project root. Must exist,
+   * must contain (or be readable through symlinks to) an
+   * `astro.config.mjs`. */
+  readonly astroRoot: string;
+  /** `--outDir <outDir>` — build output. Astro writes here. */
+  readonly outDir: string;
+  /** `--config <relative-to-root>` — optional. When omitted, astro
+   * reads `astro.config.{mjs,ts,js}` from the root. Set when
+   * running through a wrapper config that lives INSIDE the root. */
+  readonly configPathRelativeToRoot?: string;
+  /** cwd for the spawn. Defaults to `astroRoot`. Node's resolver
+   * walks up from here for module resolution. */
+  readonly cwd?: string;
+  /** Per-build HOME (scratch dir). When omitted, `spawnAstroBuild`
+   * mkdtemps one under `os.tmpdir()`. Passed to the child as HOME
+   * and TMPDIR so a hostile config that reads `~/.config` sees
+   * an empty scratch directory. */
+  readonly homeOverride?: string;
+  /** Extra env vars merged into the child's minimal env AFTER the
+   * denylist scrub, so a caller can pass `REVKIT_CONSUMER_ROOT`,
+   * `REVKIT_ASTRO_CACHE_DIR`, `REVKIT_VITE_CACHE_DIR` to steer
+   * the site's config without a wrapper file. Keys on the token
+   * denylist are stripped by design. */
+  readonly extraEnv?: Readonly<Record<string, string>>;
+  /** Injectable spawner. Defaults to `Bun.spawn`. */
+  readonly spawn?: SpawnLike;
+}
+
+/** Low-level: spawn astro build with the trusted-binary + minimal-env
+ * hardening. Both `runSafeBuild` (review) and `runPackagedBuild`
+ * (consumer render) call this — keeping one implementation of the
+ * primitive. Callers own layout / wrapper-config / symlink concerns;
+ * this function ONLY spawns and applies the env allowlist. */
+export async function spawnAstroBuild(options: SpawnAstroBuildOptions): Promise<void> {
+  if (!existsSync(options.astroBin)) {
+    throw new Error(`spawnAstroBuild: astro binary not found at '${options.astroBin}'`);
+  }
+  if (!existsSync(options.astroRoot) || !statSync(options.astroRoot).isDirectory()) {
+    throw new Error(`spawnAstroBuild: --root '${options.astroRoot}' does not exist or is not a directory`);
+  }
+
+  const homeOverride =
+    options.homeOverride ?? mkdtempSync(join(tmpdir(), "revkit-astro-build-home-"));
+  const ownHome = options.homeOverride === undefined;
+  const cwd = options.cwd ?? options.astroRoot;
+
+  try {
+    const baseEnv = buildChildEnv(process.env, homeOverride);
+    // Merge extra env AFTER the denylist scrub so a caller can only
+    // ADD non-token vars — a token-shaped key on `extraEnv` is
+    // stripped by the second denylist pass below (defense in depth).
+    const env: Record<string, string> = { ...baseEnv, ...(options.extraEnv ?? {}) };
+    for (const key of BUILD_ENV_TOKEN_DENYLIST) {
+      delete env[key];
+    }
+    // `HOME` and `TMPDIR` MUST stay pinned to the scratch dir even
+    // if `extraEnv` tries to override them — a caller should never
+    // fight the sandbox.
+    env.HOME = homeOverride;
+    env.TMPDIR = homeOverride;
+
+    const cmd = [
+      options.astroBin,
+      "build",
+      ...(options.configPathRelativeToRoot !== undefined
+        ? ["--config", options.configPathRelativeToRoot]
+        : []),
+      "--root",
+      options.astroRoot,
+      "--outDir",
+      options.outDir,
+    ];
+
+    const spawn = options.spawn ?? defaultSpawn;
+    const result = await spawn({ cmd, cwd, env });
+    if (result.exitCode !== 0) {
+      const tail = result.stderr.slice(-4096);
+      throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
+    }
+  } finally {
+    if (ownHome) {
+      try {
+        rmSync(homeOverride, { recursive: true, force: true });
+      } catch {
+        /* fine */
+      }
+    }
+  }
+}
+
 /**
  * Run the safe astro build. See file header for the seven rules.
  *
@@ -243,20 +343,12 @@ export async function runSafeBuild(options: RunSafeBuildOptions): Promise<void> 
   unlinkStale(join(options.materializedRoot, "node_modules"));
 
   try {
-    const env = buildChildEnv(process.env, homeOverride);
-    const spawn = options.spawn ?? defaultSpawn;
-
-    const result = await spawn({
-      cmd: [
-        trustedAstroBin,
-        "build",
-        "--config",
-        "./astro.config.revkit-review.mjs",
-        "--root",
-        cwd,
-        "--outDir",
-        options.distOutDir,
-      ],
+    await spawnAstroBuild({
+      astroBin: trustedAstroBin,
+      astroRoot: cwd,
+      outDir: options.distOutDir,
+      configPathRelativeToRoot: "./astro.config.revkit-review.mjs",
+      homeOverride,
       // cwd = the sandbox site. Node's resolver walks up:
       //   <materialized>/site/                                 no node_modules
       //   <materialized>/                                      no
@@ -266,12 +358,8 @@ export async function runSafeBuild(options: RunSafeBuildOptions): Promise<void> 
       // So the build reads modules from the reviewer's own
       // TRUSTED site/node_modules — no symlinks, no writes.
       cwd,
-      env,
+      ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
     });
-    if (result.exitCode !== 0) {
-      const tail = result.stderr.slice(-4096);
-      throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
-    }
   } finally {
     for (const scratch of [homeOverride, viteCacheDir]) {
       try {
