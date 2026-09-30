@@ -141,13 +141,16 @@ export function makeTeardown(opts: {
       if (state.daemon !== undefined) {
         const daemonPid = state.daemon.pid;
         if (isAlive(daemonPid)) {
+          const t0 = Date.now();
           logger.log(`killing daemon pid ${daemonPid}`);
           safeKill(daemonPid, "SIGTERM");
           waitDeadFor(daemonPid, 4_000);
           if (isAlive(daemonPid)) {
-            logger.log("daemon didn't stop on SIGTERM — SIGKILLing");
+            logger.log(`daemon didn't stop on SIGTERM in ${Date.now() - t0}ms — SIGKILLing`);
             safeKill(daemonPid, "SIGKILL");
             waitDeadFor(daemonPid, 500);
+          } else {
+            logger.log(`daemon stopped in ${Date.now() - t0}ms on SIGTERM`);
           }
         }
       }
