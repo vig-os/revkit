@@ -35,6 +35,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve as resolvePath } from "node:path";
+import { parseHTML } from "linkedom";
 
 const E2E = process.env.REVKIT_E2E_BUILD === "1";
 const CHECKOUT_ROOT = resolvePath(import.meta.dirname!, "..", "..", "..", "..");
@@ -58,34 +59,40 @@ afterAll(() => {
  * A byte-level diff would flip on every CI run.
  *
  * What matters for "own build unchanged" is that a reviewer sees
- * the same PAGE CONTENT: titles, headings, prose, list items,
- * anchor targets, `data-src` anchors. Everything else is
- * chrome. Canonicalise by extracting the visible-text set +
- * every `data-src` value and the `<title>`, then hash that. */
+ * the same PAGE CONTENT: titles, prose, anchor targets,
+ * `data-src` anchors. Everything else is chrome.
+ *
+ * Uses linkedom (already a dep for check-dist) to parse the HTML
+ * and walk the DOM — a regex-based canonicalise would trip
+ * CodeQL's `js/bad-tag-filter` + `js/incomplete-multi-character-
+ * sanitization` rules, and reasonably so: regex-parsed HTML has
+ * corner cases (`<SCRIPT>`, `<scrip<script>...</script>t>`) that
+ * a proper parser handles. Test-only code, but the check is
+ * enforced repo-wide. */
 function canonicalise(html: string): string {
-  // Extract data-src anchor values (order-preserving).
-  const anchors = Array.from(html.matchAll(/data-src="([^"]+)"/g))
-    .map((m) => m[1])
-    .sort()
-    .join("\n");
-  // Extract <title>.
-  const titleMatch = html.match(/<title>([^<]*)<\/title>/);
-  const title = titleMatch ? titleMatch[1] : "";
-  // Extract every text node between `>` and `<`, drop the ones
-  // that are pure whitespace, and normalise whitespace runs. Skip
-  // the contents of `<script>`, `<style>`, and `<template>` — those
-  // are chrome that changes with the toolchain.
-  const noScript = html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/g, "")
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/g, "")
-    .replace(/<template[^>]*>[\s\S]*?<\/template>/g, "");
+  const { document } = parseHTML(html);
+  const title = document.title ?? "";
+  const anchors = Array.from(document.querySelectorAll("[data-src]"))
+    .map((el) => el.getAttribute("data-src") ?? "")
+    .sort();
+  // Walk the DOM, collect visible text. Skip the contents of
+  // <script>, <style>, <template> — those are chrome that shifts
+  // with the toolchain (asset hashes, minifier output).
+  const CHROME_TAGS: ReadonlySet<string> = new Set(["SCRIPT", "STYLE", "TEMPLATE"]);
   const textFragments: string[] = [];
-  for (const m of noScript.matchAll(/>([^<]+)</g)) {
-    const t = m[1]!.trim();
-    if (t.length === 0) continue;
-    textFragments.push(t.replace(/\s+/g, " "));
-  }
-  return `TITLE:${title}\nANCHORS:\n${anchors}\nTEXT:\n${textFragments.join("\n")}`;
+  const walk = (node: Node): void => {
+    if (node.nodeType === 3 /* TEXT_NODE */) {
+      const t = (node.textContent ?? "").trim();
+      if (t.length > 0) textFragments.push(t.replace(/\s+/g, " "));
+      return;
+    }
+    if (node.nodeType !== 1 /* ELEMENT_NODE */) return;
+    const el = node as Element;
+    if (CHROME_TAGS.has(el.tagName.toUpperCase())) return;
+    for (const child of Array.from(el.childNodes)) walk(child as Node);
+  };
+  walk(document.documentElement as unknown as Node);
+  return `TITLE:${title}\nANCHORS:\n${anchors.join("\n")}\nTEXT:\n${textFragments.join("\n")}`;
 }
 
 /** Walk `root` and return `<rel-path>: sha256(canonicalise(html))`
