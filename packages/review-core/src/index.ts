@@ -9,6 +9,56 @@
 // (`tsconfig.src.json`) that typechecks without bun globals.
 
 export { anchorPathSchema, anchorSchema, textQuoteSchema, type Anchor, type TextQuote } from "./anchor.ts";
+export {
+  anchorToPrComment,
+  fileFallbackPreamble,
+  findFile,
+  prCommentToAnchor,
+  type AnchorMapOptions,
+  type AnchorMapResult,
+  type FileFallbackReason,
+  type OrphanReason,
+  type PrCommentSource,
+  type PrCommentTarget,
+  type PrCommentToAnchorResult,
+  type PrFile,
+  type PrFileComment,
+  type PrLineComment,
+} from "./anchor-map.ts";
+export {
+  composeFileFallbackBody,
+  DEFAULT_GITHUB_BASE_URL,
+  DEFAULT_GITHUB_GRAPHQL_URL,
+  DEFAULT_MAX_FILES_PAGES,
+  DEFAULT_USER_AGENT,
+  GITHUB_API_VERSION,
+  GitHubAdapter,
+  GitHubApiError,
+  githubExternal,
+  nextPageUrl,
+  retryAfterMs,
+  shouldRetry,
+  type AddPendingCommentInput,
+  type GhReviewComment,
+  type GhReviewThread,
+  type GitHubAdapterOptions,
+  type PendingReview,
+  type PendingReviewComment,
+  type PrRef,
+  type PullRequestSummary,
+  type ReviewSubmissionEvent,
+  type SubmitReviewInput,
+} from "./github-adapter.ts";
+export {
+  newSideLines,
+  oldSideLines,
+  parsePatch,
+  rangeIsOnRightSide,
+  type Hunk,
+  type HunkLine,
+  type HunkLineKind,
+} from "./patch.ts";
+export { redactTokenInMessage, type TokenSource } from "./token-source.ts";
 export { ID_REGEX, idSchema, isValidId } from "./id.ts";
 export { isValidRepoRelativePath } from "./path.ts";
 export { authorKinds, authorSchema, type Author, type AuthorKind } from "./author.ts";

@@ -36,3 +36,9 @@ passt = "passt"
 tatus = "tatus"
 fnd = "fnd"
 mis = "mis"
+# npm package name in the recorded PR-38 file listing under
+# packages/review-core/test/fixtures/github/ (a bun.lock excerpt);
+# `devlop` is the actual published package name, not a typo of
+# `develop`. Kept as an extend-word rather than an exclusion so any
+# prose typo elsewhere in the fixture directory is still caught.
+devlop = "devlop"
