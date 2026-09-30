@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused SVG fill unterminated url() (reviewer bypass D) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><rect fill="url(/D.svg#g"/></svg>
+</body>
+</html>

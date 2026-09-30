@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused style unterminated url() (reviewer bypass B) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<div style="background:url(https://evil.example/B.png"></div>
+</body>
+</html>

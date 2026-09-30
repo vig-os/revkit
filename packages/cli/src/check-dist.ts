@@ -25,10 +25,12 @@ import { parseDataSrc } from "./data-src-format.ts";
 import {
   ALLOWED_SVG_ATTRIBUTES,
   ALLOWED_SVG_ELEMENTS,
-  CSS_URL_VALUE_REGEX,
-  isSameDocumentFragmentRef,
   URL_BEARING_SVG_ATTRIBUTES,
 } from "../../../site/src/lib/render-plot.ts";
+import {
+  scanCssForUrlRefs,
+  svgHrefRefusalReason,
+} from "../../../site/src/lib/css-url-scan.ts";
 
 /** Shape of the shipped allowlist. */
 interface ElementEntry {
@@ -129,26 +131,15 @@ const METADATA_LINK_RELS: ReadonlySet<string> = new Set([
   "sitemap",
 ]);
 
-/** CSS token sequences (after unescape) that must NEVER appear in a
- * `style` attribute value or an SVG URL-bearing presentation attribute.
- * `image-set`, `-webkit-image-set` and `src(` can each carry an
- * out-of-origin fetch that a `url(` refusal would miss (round-4
- * review). `url(` is handled separately below because SVG presentation
- * attributes legitimately carry `url(#fragment)`; the shared list here
- * covers every other outbound-shape refusal. */
-const CSS_REFUSED_SUBSTRINGS_NON_URL: readonly string[] = [
-  // Order matters: longer / more-specific tokens first so a value
-  // like `image-set(url(x))` reports as `image-set(` (the outer
-  // resource loader) rather than `url(` (the inner). Both would
-  // refuse — the ordering only picks which one names the finding.
-  "-webkit-image-set(",
-  "image-set(",
-  "expression(",
-  "@import",
-  "src(",
-  "javascript:",
-  "vbscript:",
-];
+// CSS URL handling moved to `scanCssForUrlRefs` (site/src/lib/
+// css-url-scan.ts) — the round-1 substring-plus-unescape pass had
+// three bypass classes closed structurally by a real CSS Syntax
+// Level 3 tokenizer (`css-tree`): unterminated `url(https://…` (no
+// closing `)`), `url(https://…/*)` (fake `*/` end that the pre-pass
+// cssUnescape stripped but CSS wouldn't), and `u\rl(` / `\75 rl(`
+// classified as Function tokens whose name resolves to `url`. See
+// css-url-scan.ts's header for the failure cases the tokenizer
+// closes.
 
 interface Attribute {
   readonly name: string;
@@ -204,43 +195,6 @@ function decodeAndStripUrl(input: string): string {
     try { return String.fromCodePoint(cp); } catch { return ""; }
   });
   return decoded.replace(/[\t\n\r\f\v\u0000-\u001F\u007F ]/g, "");
-}
-
-/** CSS-unescape a style attribute value: strip block comments, then
- * fold `\NN`/`\NNNNNN[ws?]` hex escapes into their code points and
- * `\<char>` into the literal char. Round-4 bypass:
- * `u\rl(https://…)` — the backslash-r escape produces `r`, so the
- * effective CSS is `url(…)`; without unescape the `url(` denylist
- * misses it. */
-export function cssUnescape(input: string): string {
-  const noComments = input.replace(/\/\*[\s\S]*?\*\//g, "");
-  let out = "";
-  let i = 0;
-  while (i < noComments.length) {
-    const ch = noComments[i];
-    if (ch !== "\\") { out += ch; i += 1; continue; }
-    const next = noComments[i + 1];
-    if (next === undefined) { out += "\\"; i += 1; continue; }
-    if (/[0-9a-fA-F]/.test(next)) {
-      let hex = "";
-      let j = i + 1;
-      while (j < noComments.length && hex.length < 6 && /[0-9a-fA-F]/.test(noComments[j] ?? "")) {
-        hex += noComments[j];
-        j += 1;
-      }
-      if (j < noComments.length && /[\t\n\r\f ]/.test(noComments[j] ?? "")) j += 1;
-      const cp = Number.parseInt(hex, 16);
-      if (Number.isFinite(cp) && cp > 0 && cp <= 0x10FFFF) {
-        try { out += String.fromCodePoint(cp); } catch { /* drop */ }
-      }
-      i = j;
-      continue;
-    }
-    if (next === "\n" || next === "\r" || next === "\f") { i += 2; continue; }
-    out += next;
-    i += 2;
-  }
-  return out;
 }
 
 /** URL scheme check on an HTML attribute value. Fetching URL attrs
@@ -400,101 +354,57 @@ function attrValueConstraintFinding(
   return `<${tagName} ${attrName}=${JSON.stringify(value)}> — value(s) [${bad.join(", ")}] not on allowlist [${allowed.join(", ")}].`;
 }
 
-/** Scan a CSS-shaped value (a `style=` attribute or an SVG
- * presentation attribute that can carry `url(…)`) for refused tokens.
- *
- * One scanner covers both callers, so a bypass class only has to be
- * closed once. Steps:
- *
- * 1. Unescape (`cssUnescape`) so `u\\rl(`, `\\75 rl(` and `/* … *\/url(`
- *    collapse to their effective text before we look at them. Round-4
- *    fixture: `background:u\\rl(https://evil…)`.
- * 2. Lowercase so a mixed-case `URL(` or `Url(` matches too.
- * 3. Refuse the non-URL denylist (`@import`, `expression(`,
- *    `image-set(`, `-webkit-image-set(`, `src(`, `javascript:`,
- *    `vbscript:`).
- * 4. Every `url(…)` in the (unescaped, lowercased) value must be a
- *    same-document `#fragment` reference when `allowFragmentUrl` is
- *    true (SVG presentation attrs); when false (`style=`), every
- *    `url(` is refused outright, matching the source sanitiser's
- *    "no CSS in SVG" decision (render-plot.ts).
- *
- * Returns a short descriptor for the first refused token, or null.
- * Callers build the full finding message with element context. */
-function cssValueFinding(value: string, allowFragmentUrl: boolean): string | null {
-  const decoded = cssUnescape(value).toLowerCase();
-  for (const bad of CSS_REFUSED_SUBSTRINGS_NON_URL) {
-    if (decoded.includes(bad)) {
-      return `refused CSS token ${JSON.stringify(bad)} (after unescape)`;
-    }
-  }
-  // Rebuild a fresh regex per call — a global regex remembers its
-  // lastIndex between uses and would skip matches on the second call.
-  const urlRegex = new RegExp(CSS_URL_VALUE_REGEX.source, CSS_URL_VALUE_REGEX.flags);
-  for (const match of decoded.matchAll(urlRegex)) {
-    if (!allowFragmentUrl) {
-      return `refused CSS token "url(" (after unescape)`;
-    }
-    const inner = (match[1] ?? match[2] ?? match[3] ?? "").trim();
-    if (!isSameDocumentFragmentRef(inner)) {
-      return `refused url(${JSON.stringify(inner)}) — only same-document url(#id) refs are allowed (after unescape)`;
-    }
-  }
-  return null;
+/** `style` attribute value check — walks the CSS Level 3 token
+ * stream (`scanCssForUrlRefs`, allowFragmentUrl=false) and refuses
+ * every URL-shaped construct. Matches the source sanitiser's
+ * decision (render-plot.ts) to drop `style=` entirely on SVG; on
+ * ordinary HTML KaTeX/Starlight `style="height:1em"` shapes pass
+ * because they carry no URL-shaped token. */
+function styleAttrFindings(tagName: string, value: string): string[] {
+  return scanCssForUrlRefs(value, { allowFragmentUrl: false })
+    .map((finding) => `style attribute on <${tagName}> — ${finding}.`);
 }
 
-/** `style` attribute value check — CSS-unescape, then look for
- * refused substrings. `style` never allows any `url(…)` (matches the
- * source sanitiser, render-plot.ts, which drops `style` entirely). */
-function styleAttrFinding(tagName: string, value: string): string | null {
-  const inner = cssValueFinding(value, /* allowFragmentUrl */ false);
-  if (inner === null) return null;
-  return `style attribute on <${tagName}> ${inner}.`;
-}
-
-/** SVG presentation attribute value check — same scanner as `style`,
- * but same-document `url(#id)` refs are allowed (Vega emits these for
- * gradient / clip / mask fills). Refuses `url(https://…)`,
- * `url(//…)`, `url(data:…)`, CSS-escaped / mixed-case / whitespace-padded
- * variants, plus the shared non-URL denylist (`@import`,
- * `image-set(`, etc.). Issue #27. */
-function svgPresentationAttrFinding(
+/** SVG presentation attribute value check — same tokenizer as
+ * `style`, but same-document `url(#id)` refs are allowed (Vega
+ * emits `<rect fill="url(#gradient1)"/>` for gradient / clip / mask
+ * fills). Refuses `url(https://…)`, `url(//…)`, `url(data:…)`,
+ * CSS-escaped / mixed-case / whitespace-padded / unterminated
+ * variants, plus the shared non-URL denylist. Issue #27. */
+function svgPresentationAttrFindings(
   tagName: string,
   attrName: string,
   value: string,
-): string | null {
-  const inner = cssValueFinding(value, /* allowFragmentUrl */ true);
-  if (inner === null) return null;
-  return `refused <${tagName} ${attrName}=${JSON.stringify(value)}> — ${inner}.`;
+): string[] {
+  return scanCssForUrlRefs(value, { allowFragmentUrl: true })
+    .map((finding) => `<${tagName} ${attrName}=${JSON.stringify(value)}> — ${finding}.`);
 }
 
-/** SVG `<use href=…>` / `<use xlink:href=…>` — only a same-document
- * `#fragment` reference is allowed. Browsers already refuse a
- * cross-origin `<use href>` fetch, but a same-origin absolute path or a
- * fragment-in-a-remote-svg (`url#frag`) would silently work; allowing
- * only `#fragment` matches the source sanitiser's decision
- * (render-plot.ts, `keepAttribute`). Issue #27.
- *
- * The value is percent-decoded to a fixed point first (parse5 has
- * already entity-decoded the attribute), so `%23frag` (`#frag` URL-
- * encoded) resolves the same as `#frag`. Both `href` and `xlink:href`
- * are checked when present — SVG 2 says `href` wins over `xlink:href`
- * for rendering, but a stale user agent might follow the xlink form,
- * so either one being non-fragment is a refusal. */
-function useHrefFinding(rawValue: string): string | null {
-  let decoded: string;
-  try {
-    decoded = decodeUntilStable(rawValue);
-  } catch (error) {
-    return (error as Error).message;
-  }
-  const trimmed = decoded.trim();
-  if (trimmed.length === 0) return `empty href value`;
-  if (!isSameDocumentFragmentRef(trimmed)) {
-    return `must be a same-document #fragment reference (decoded: ${JSON.stringify(decoded)})`;
-  }
-  return null;
-}
+/** SVG elements that can carry a `href` / `xlink:href` attribute
+ * that fetches / references another SVG element. The reviewer round
+ * flagged that limiting the fragment-only rule to `<use>` alone
+ * leaves `<linearGradient href="https://evil/g.svg#g">` and friends
+ * open. */
+const SVG_HREF_ELEMENTS: ReadonlySet<string> = new Set([
+  "use",
+  "lineargradient",
+  "radialgradient",
+  "pattern",
+  "mask",
+  "filter",
+  "clippath",
+  "marker",
+  "symbol",
+  // <textPath href="#…"> is a legitimate same-doc reference; a
+  // cross-origin fetch here would be the same class of leak.
+  "textpath",
+  // <a href="…"> inside an SVG is a link and is refused entirely by
+  // the SVG element allowlist today (render-plot.ts drops <a>), but
+  // include it here in case a future allowlist change re-admits it.
+  "a",
+  // <animate*> elements are already refused (SMIL is on the refused
+  // list), so no entry needed for them.
+]);
 
 /** `<link>` policy handler. Rule of thumb: if `rel` contains ANY
  * fetching token, href must be same-origin (round-4 review closes the
@@ -648,8 +558,9 @@ export function scanDocument(document: ParseTreeNode, reportPath: string): Check
         }
       }
       if (lower === "style") {
-        const styleFinding = styleAttrFinding(tagName, attrValue);
-        if (styleFinding !== null) findings.push({ file: reportPath, message: styleFinding });
+        for (const msg of styleAttrFindings(tagName, attrValue)) {
+          findings.push({ file: reportPath, message: msg });
+        }
       }
       // `data-src` value format check — every stamped attribute
       // must parse to `<repo-relative path>:<startLine>-<endLine>`
@@ -667,41 +578,41 @@ export function scanDocument(document: ParseTreeNode, reportPath: string): Check
         }
       }
       // Issue #27: SVG presentation attributes that can carry
-      // `url(…)` get the same CSS URL scan the `style` attribute
-      // gets, but same-document `url(#id)` refs are allowed (Vega
-      // uses these for gradient / clip fills). Any `url(https://…)`,
-      // `url(//…)`, `url(data:…)` or escaped variant is refused.
+      // `url(…)` get the same CSS Level 3 token walk the `style`
+      // attribute gets, but same-document `url(#id)` refs are
+      // allowed (Vega uses these for gradient / clip fills). Any
+      // `url(https://…)`, `url(//…)`, `url(data:…)`, escaped or
+      // unterminated variant is refused.
       if (isSvg && URL_BEARING_SVG_ATTRIBUTES.has(lower)) {
-        const svgUrlFinding = svgPresentationAttrFinding(tagName, attrName, attrValue);
-        if (svgUrlFinding !== null) findings.push({ file: reportPath, message: svgUrlFinding });
+        for (const msg of svgPresentationAttrFindings(tagName, attrName, attrValue)) {
+          findings.push({ file: reportPath, message: msg });
+        }
       }
     }
 
     // Per-tag specials.
     if (tagName === "link") linkElementFindings(element, findings, reportPath);
-    // Issue #27: SVG `<use>` — href / xlink:href must be a
-    // same-document `#fragment`. Browsers already refuse cross-origin
-    // `<use>` fetches, but a same-origin absolute path or a
-    // fragment-in-a-remote-svg would silently work; allow only the
-    // fragment shape, matching the source sanitiser (render-plot.ts).
-    if (isSvg && tagName === "use") {
-      // Both attributes are checked when present — either one being
-      // a non-fragment is a refusal, regardless of the SVG 2
-      // href-over-xlink:href precedence. A stale user agent might
-      // follow the xlink form; a maliciously crafted document might
-      // set `href="#ok"` alongside `xlink:href="https://evil…"`.
-      // parse5 splits namespaced attributes into `prefix` + `name`,
-      // so `xlink:href` is `{ prefix: "xlink", name: "href" }` —
-      // rebuild the qualified name for the lookup.
+    // Issue #27: SVG element `href` / `xlink:href` — must be a
+    // same-document `#fragment`. Applied to every SVG element that
+    // can carry a fetch-shaped href (see SVG_HREF_ELEMENTS), not
+    // just `<use>` — `<linearGradient href="https://evil/g.svg#g">`
+    // is the same fetch semantics as `<use href="…">`. Both
+    // attributes are checked when present; SVG 2 says `href` wins
+    // over `xlink:href` for rendering, but a stale user agent might
+    // follow the xlink form; a maliciously crafted document might
+    // set `href="#ok"` alongside `xlink:href="https://evil…"`.
+    // parse5 splits namespaced attributes into `prefix` + `name`,
+    // so `xlink:href` is `{ prefix: "xlink", name: "href" }` —
+    // rebuild the qualified name for the lookup.
+    if (isSvg && SVG_HREF_ELEMENTS.has(tagName)) {
       for (const attr of element.attrs ?? []) {
         const qualified = qualifiedAttrName(attr).toLowerCase();
         if (qualified !== "href" && qualified !== "xlink:href") continue;
-        if (attr.value.length === 0) continue;
-        const message = useHrefFinding(attr.value);
+        const message = svgHrefRefusalReason(attr.value);
         if (message !== null) {
           findings.push({
             file: reportPath,
-            message: `refused <use ${qualified}=${JSON.stringify(attr.value)}> — ${message}.`,
+            message: `refused <${rawTag} ${qualified}=${JSON.stringify(attr.value)}> — ${message}.`,
           });
         }
       }

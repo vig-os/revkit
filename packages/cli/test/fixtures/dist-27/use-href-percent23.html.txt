@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused SVG <use href=%23ok> (browser resolves %23 as relative path, not fragment) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><use href="%23ok"/></svg>
+</body>
+</html>
