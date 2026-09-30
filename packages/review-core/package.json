@@ -10,7 +10,7 @@
   },
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.src.json --noEmit"
   },
   "dependencies": {
     "zod": "4.6.5"

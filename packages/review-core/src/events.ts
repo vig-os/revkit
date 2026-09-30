@@ -5,9 +5,9 @@
 // reduced into the derived `Thread` view (see `reducer.ts`).
 //
 // Envelope shape (§5.3):
-//   `seq`   — server-assigned, strictly monotonically increasing, starting
-//             at 1. Consumers use `since(seq)` for cheap replay after a
-//             reconnect.
+//   `seq`   — server-assigned, STRICTLY INCREASING (gaps allowed, D1-
+//             friendly), starting at 1 for a fresh log. Consumers use
+//             `since(lastSeen)` for cheap replay after a reconnect.
 //   `ts`    — ISO-8601 datetime with offset, assigned by the store on
 //             append.
 //   `actor` — the typed author of the event (ADR-0011).
@@ -15,7 +15,8 @@
 //             object so a wire message is one flat record, not a nested
 //             envelope + payload.
 //
-// The kinds match §5.3 / ADR-0007:
+// The kinds match §5.3 / ADR-0007 plus one M3 hook (`comment.linked`,
+// see ADR-0025):
 //   comment.created  — the first comment of a new thread, carrying the
 //                      dual anchor (ADR-0006). Thread creation is implicit
 //                      (threads are derived from events).
@@ -34,10 +35,16 @@
 //                      /ask/<id> (§5.1, ADR-0007).
 //   ask.answered     — the human answered the question; the answer is
 //                      routed back to the agent through the channel.
+//   comment.linked   — records an external mapping for a local comment
+//                      (M3 GitHub adapter, ADR-0025). Reserved on v0 so
+//                      M3 lands without a `schemaVersion` bump; the M2
+//                      daemon does not emit it.
 import { z } from "zod";
 import { anchorSchema } from "./anchor.ts";
 import { askAnswerSchema, askSchema } from "./asks.ts";
 import { authorSchema } from "./author.ts";
+import { SHA256_HEX_REGEX } from "./revision.ts";
+import { externalRefSchema } from "./thread.ts";
 import { isoTimestamp } from "./timestamp.ts";
 
 /** The envelope every event carries. Split into a plain object so each
@@ -84,7 +91,9 @@ const threadReopenedPayload = {
 const handoverPayload = {
   kind: z.literal("handover"),
   commentIds: z.array(z.string().min(1)).min(1),
-  revision: z.string().regex(/^[0-9a-f]{64}$/),
+  revision: z
+    .string()
+    .regex(SHA256_HEX_REGEX, "handover.revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
   note: z.string().min(1).optional(),
 } as const;
 
@@ -111,6 +120,12 @@ const askAnsweredPayload = {
   kind: z.literal("ask.answered"),
   askId: z.string().min(1),
   answer: askAnswerSchema,
+} as const;
+
+const commentLinkedPayload = {
+  kind: z.literal("comment.linked"),
+  commentId: z.string().min(1),
+  external: externalRefSchema,
 } as const;
 
 /** All event variants — one per `kind`. Each carries the envelope plus
@@ -149,6 +164,21 @@ const eventVariants = [
     }),
   z.object({ ...envelope, ...askCreatedPayload }).strict(),
   z.object({ ...envelope, ...askAnsweredPayload }).strict(),
+  z
+    .object({ ...envelope, ...commentLinkedPayload })
+    .strict()
+    .superRefine((event, ctx) => {
+      // At least one backend must be present so the event does something.
+      // The v0 shape only defines `github`; more backends slot into
+      // `externalRefSchema` without a schemaVersion bump.
+      if (event.external.github === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["external"],
+          message: "comment.linked.external must carry at least one backend (github).",
+        });
+      }
+    }),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -161,7 +191,7 @@ export type ReviewEventKind = ReviewEvent["kind"];
 
 /** Convenience: the set of kinds, iterable for exhaustiveness checks and
  * for tests that want to enumerate them. Kept as a manual const tuple —
- * `.superRefine()` (used by the `presence` variant) wraps the object so
+ * `.superRefine()` (used by two variants) wraps the object so
  * `variant.shape` is not uniformly available across the array. The
  * `satisfies` clause asserts membership without erasing the tuple
  * literal, so adding a new kind above without listing it here fails the
@@ -175,6 +205,7 @@ export const reviewEventKinds = [
   "presence",
   "ask.created",
   "ask.answered",
+  "comment.linked",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

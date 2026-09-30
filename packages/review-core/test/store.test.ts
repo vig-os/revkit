@@ -1,12 +1,14 @@
 // Tests for InMemoryThreadStore — the append path assigns `seq`/`ts`,
-// refuses inconsistent inputs at the boundary, and `since(seq)` returns
-// only later events in order. Uses a canned clock so timestamps are
-// predictable and the test asserts against known values rather than
-// against themselves.
+// refuses inconsistent inputs at the boundary (one rule set, shared with
+// the archive parser), and `since(seq)` returns only later events in
+// order. Uses a canned clock so timestamps are predictable and each test
+// asserts against known values rather than against themselves.
 import { describe, expect, test } from "bun:test";
 import {
   InMemoryThreadStore,
   ThreadStoreAppendError,
+  type AppendRejection,
+  type Ask,
   type ReviewEventInput,
 } from "../src/index.ts";
 
@@ -53,14 +55,43 @@ const reply: ReviewEventInput = {
   body: "raised to 60 s",
 };
 
+const askSpec: Ask = {
+  schemaVersion: 1,
+  kind: "choice",
+  title: "Storage?",
+  options: [
+    { id: "d1", label: "D1" },
+    { id: "kv", label: "KV" },
+  ],
+  allowOther: false,
+  multi: false,
+};
+
+/** Helper: assert an append rejection with a specific `kind`. Fails the
+ * test with a message that says what actually happened, so a regression
+ * points at the wrong rejection instead of a bare `.toThrow()`. */
+async function expectRejection(
+  fn: () => Promise<unknown>,
+  expectedKind: AppendRejection["kind"],
+): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    expect(error).toBeInstanceOf(ThreadStoreAppendError);
+    if (error instanceof ThreadStoreAppendError) {
+      expect(error.rejection.kind).toBe(expectedKind);
+    }
+    return;
+  }
+  throw new Error(`expected rejection '${expectedKind}' but the call resolved`);
+}
+
 describe("append — assignment and validation", () => {
-  test("assigns seq starting at 1 and strictly monotonically increasing", async () => {
+  test("assigns seq starting at 1 and strictly increasing (this impl: contiguous)", async () => {
     const clock = fixedClock();
     const store = new InMemoryThreadStore({ clock: clock.next });
-    const seq1 = await store.append(create);
-    const seq2 = await store.append(reply);
-    expect(seq1).toBe(1);
-    expect(seq2).toBe(2);
+    expect(await store.append(create)).toBe(1);
+    expect(await store.append(reply)).toBe(2);
   });
 
   test("stamps the injected clock's timestamp on the event", async () => {
@@ -71,54 +102,177 @@ describe("append — assignment and validation", () => {
     expect(only?.ts).toBe(clock.instants[0]);
   });
 
-  test("refuses an event that fails Zod validation, with kind=invalid-shape", async () => {
+  test("refuses an event that fails Zod validation (kind=invalid-shape)", async () => {
     const store = new InMemoryThreadStore({ clock: fixedClock().next });
     // Body is required and non-empty; an empty string trips the schema.
-    const bad = { ...create, body: "" } as ReviewEventInput;
-    try {
-      await store.append(bad);
-      throw new Error("append should have thrown for invalid shape");
-    } catch (error) {
-      expect(error).toBeInstanceOf(ThreadStoreAppendError);
-      if (error instanceof ThreadStoreAppendError) {
-        expect(error.rejection.kind).toBe("invalid-shape");
-      }
-    }
+    await expectRejection(() => store.append({ ...create, body: "" } as ReviewEventInput), "invalid-shape");
   });
 });
 
-describe("append — log-shape rules", () => {
+describe("append — log-shape rules (validateNext)", () => {
   test("refuses a second comment.created for the same thread id", async () => {
     const store = new InMemoryThreadStore({ clock: fixedClock().next });
     await store.append(create);
-    try {
-      await store.append(create);
-      throw new Error("append should have refused a duplicate comment.created");
-    } catch (error) {
-      expect(error).toBeInstanceOf(ThreadStoreAppendError);
-      if (error instanceof ThreadStoreAppendError) {
-        expect(error.rejection.kind).toBe("duplicate-thread");
-      }
-    }
+    await expectRejection(() => store.append(create), "duplicate-thread");
   });
 
-  test("refuses comment.replied / thread.resolved / thread.reopened for an unknown thread", async () => {
+  test("refuses comment.replied, thread.resolved and thread.reopened for an unknown thread", async () => {
     const store = new InMemoryThreadStore({ clock: fixedClock().next });
-    for (const input of [
-      reply,
-      { actor: human, kind: "thread.resolved", threadId: "th-1" } satisfies ReviewEventInput,
-      { actor: human, kind: "thread.reopened", threadId: "th-1" } satisfies ReviewEventInput,
-    ]) {
-      try {
-        await store.append(input);
-        throw new Error(`append should have refused ${input.kind} for an unknown thread`);
-      } catch (error) {
-        expect(error).toBeInstanceOf(ThreadStoreAppendError);
-        if (error instanceof ThreadStoreAppendError) {
-          expect(error.rejection.kind).toBe("unknown-thread");
-        }
-      }
-    }
+    await expectRejection(() => store.append(reply), "unknown-thread");
+    await expectRejection(
+      () => store.append({ actor: human, kind: "thread.resolved", threadId: "th-1" }),
+      "unknown-thread",
+    );
+    await expectRejection(
+      () => store.append({ actor: human, kind: "thread.reopened", threadId: "th-1" }),
+      "unknown-thread",
+    );
+  });
+
+  test("refuses comment.replied with an unknown parentId in an existing thread", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await expectRejection(
+      () => store.append({ ...reply, parentId: "c-nowhere" }),
+      "unknown-parent",
+    );
+  });
+
+  test("refuses a duplicate commentId within the same thread", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await expectRejection(
+      () => store.append({ ...reply, commentId: "c-1" }),
+      "duplicate-comment-id",
+    );
+  });
+
+  test("refuses a duplicate commentId across two different threads", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await expectRejection(
+      () =>
+        store.append({
+          ...create,
+          threadId: "th-2",
+          commentId: "c-1",
+        }),
+      "duplicate-comment-id",
+    );
+  });
+
+  test("refuses thread.resolved twice on the same thread (kind=not-open)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await store.append({ actor: human, kind: "thread.resolved", threadId: "th-1" });
+    await expectRejection(
+      () => store.append({ actor: human, kind: "thread.resolved", threadId: "th-1" }),
+      "not-open",
+    );
+  });
+
+  test("refuses thread.reopened on an already-open thread (kind=not-resolved)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await expectRejection(
+      () => store.append({ actor: human, kind: "thread.reopened", threadId: "th-1" }),
+      "not-resolved",
+    );
+  });
+
+  test("refuses handover naming a commentId that is not in the log", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await expectRejection(
+      () =>
+        store.append({
+          actor: human,
+          kind: "handover",
+          commentIds: ["c-nowhere"],
+          revision: "f".repeat(64),
+        }),
+      "unknown-comment",
+    );
+  });
+
+  test("refuses ask.answered for an unknown askId (kind=unknown-ask)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await expectRejection(
+      () =>
+        store.append({
+          actor: human,
+          kind: "ask.answered",
+          askId: "ask-nowhere",
+          answer: { kind: "text", text: "hi" },
+        }),
+      "unknown-ask",
+    );
+  });
+
+  test("refuses ask.answered twice for the same ask (kind=duplicate-answer)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append({ actor: agent, kind: "ask.created", askId: "ask-1", spec: askSpec });
+    await store.append({
+      actor: human,
+      kind: "ask.answered",
+      askId: "ask-1",
+      answer: { kind: "choice", value: "d1" },
+    });
+    await expectRejection(
+      () =>
+        store.append({
+          actor: human,
+          kind: "ask.answered",
+          askId: "ask-1",
+          answer: { kind: "choice", value: "kv" },
+        }),
+      "duplicate-answer",
+    );
+  });
+
+  test("refuses ask.created twice for the same ask (kind=duplicate-ask)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append({ actor: agent, kind: "ask.created", askId: "ask-1", spec: askSpec });
+    await expectRejection(
+      () => store.append({ actor: agent, kind: "ask.created", askId: "ask-1", spec: askSpec }),
+      "duplicate-ask",
+    );
+  });
+
+  test("refuses comment.linked for an unknown commentId (kind=unknown-comment)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await expectRejection(
+      () =>
+        store.append({
+          actor: agent,
+          kind: "comment.linked",
+          commentId: "c-nowhere",
+          external: { github: { commentId: 1 } },
+        }),
+      "unknown-comment",
+    );
+  });
+
+  test("refuses a second comment.linked for the SAME backend on the same comment (duplicate-link)", async () => {
+    const store = new InMemoryThreadStore({ clock: fixedClock().next });
+    await store.append(create);
+    await store.append({
+      actor: agent,
+      kind: "comment.linked",
+      commentId: "c-1",
+      external: { github: { commentId: 1 } },
+    });
+    await expectRejection(
+      () =>
+        store.append({
+          actor: agent,
+          kind: "comment.linked",
+          commentId: "c-1",
+          external: { github: { commentId: 2 } },
+        }),
+      "duplicate-link",
+    );
   });
 });
 
@@ -129,18 +283,30 @@ describe("since — replay ordering", () => {
     await store.append(reply); // seq 2
     await store.append({ actor: human, kind: "thread.resolved", threadId: "th-1" }); // seq 3
 
-    const all = await store.since(0);
-    expect(all.map((e) => e.seq)).toEqual([1, 2, 3]);
-
-    const afterFirst = await store.since(1);
-    expect(afterFirst.map((e) => e.seq)).toEqual([2, 3]);
-
-    const afterAll = await store.since(3);
-    expect(afterAll).toEqual([]);
+    expect((await store.since(0)).map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect((await store.since(1)).map((e) => e.seq)).toEqual([2, 3]);
+    expect(await store.since(3)).toEqual([]);
   });
 });
 
-describe("threads — filter", () => {
+describe("threads — filter and ordering", () => {
+  test("threads are ordered by createdSeq (not by ISO string)", async () => {
+    // Two threads whose `ts` collides at the same second — createdSeq
+    // still tie-breaks deterministically.
+    const stuck: () => string = () => "2026-09-30T12:00:00Z";
+    const store = new InMemoryThreadStore({ clock: stuck });
+    await store.append(create); // seq 1
+    await store.append({
+      ...create,
+      threadId: "th-2",
+      commentId: "c-3",
+      anchor: { ...anchor, path: "docs/adr/0007-agent-bridge-mcp-channel.md" },
+    }); // seq 2
+    const ordered = await store.threads();
+    expect(ordered.map((t) => t.id)).toEqual(["th-1", "th-2"]);
+    expect(ordered[0]?.createdSeq).toBeLessThan(ordered[1]?.createdSeq ?? 0);
+  });
+
   test("`status` narrows the lifecycle set; `path` narrows to one file", async () => {
     const store = new InMemoryThreadStore({ clock: fixedClock().next });
     await store.append(create);

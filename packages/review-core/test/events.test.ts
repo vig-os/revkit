@@ -98,6 +98,14 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     askId: "ask-1",
     answer: { kind: "choice", value: "d1" },
   },
+  "comment.linked": {
+    seq: 9,
+    ts: t,
+    actor: { kind: "agent", id: "revkit-live" },
+    kind: "comment.linked",
+    commentId: "c-1",
+    external: { github: { commentId: 42, reviewId: 7, nodeId: "PRC_x" } },
+  },
 };
 
 describe("reviewEventSchema — happy paths", () => {
@@ -176,6 +184,11 @@ describe("reviewEventSchema — rejections", () => {
       ...validPerKind["ask.answered"],
       answer: { kind: "choice", text: "hi" },
     };
+    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  });
+
+  test("comment.linked with an empty external object is rejected — needs at least one backend", () => {
+    const bad = { ...validPerKind["comment.linked"], external: {} };
     expect(reviewEventSchema.safeParse(bad).success).toBe(false);
   });
 });

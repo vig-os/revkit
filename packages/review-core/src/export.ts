@@ -7,16 +7,20 @@
 //
 // The exported bytes carry `schemaVersion` (ADR-0003 / ADR-0021) so a
 // future breaking change to the shape lands with a migration, not a
-// silent misread.
+// silent misread. `parseArchive` also runs the shared `validateNext`
+// (see `validator.ts`) across the sequence, so an archive whose events
+// individually pass Zod but produce an inconsistent log (a reply to a
+// missing thread, a duplicate commentId, and so on) is refused at the
+// byte boundary — one rule set at the store boundary and the archive
+// boundary.
 import { z } from "zod";
 import { reviewEventSchema, type ReviewEvent } from "./events.ts";
-import { schemaVersionField } from "./schema-version.ts";
-import type { ThreadStore } from "./store.ts";
+import { CURRENT_SCHEMA_VERSION, schemaVersionField } from "./schema-version.ts";
+import { emptyLogState, validateNext } from "./validator.ts";
 
 /** The wire shape of an archive. `events` are ordered by `seq` ascending
- * — the array's iteration order IS the log order — and any two events
- * carry distinct `seq` values. Refinements enforce both; a random
- * out-of-order archive fails at import. */
+ * (strict; gaps allowed) and any two events carry distinct `seq` values.
+ * Refinements enforce both, plus a `validateNext` play-through. */
 export const threadArchiveSchema = z
   .object({
     schemaVersion: schemaVersionField("revkit threads export|import archive"),
@@ -45,35 +49,52 @@ export const threadArchiveSchema = z
       }
       previous = event.seq;
     }
+    // Play the log through the shared transition validator so a
+    // shape-clean archive that references a missing thread / parent /
+    // ask / comment fails at parse — the same rule set the store's
+    // `append` path enforces.
+    const state = emptyLogState();
+    for (const [index, event] of archive.events.entries()) {
+      const result = validateNext(state, event);
+      if (!result.ok) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["events", index],
+          message: `log invariant: ${result.rejection.kind} — ${result.rejection.message}`,
+        });
+        return;
+      }
+    }
   });
 
 export type ThreadArchive = z.infer<typeof threadArchiveSchema>;
 
-/** Export a store's events into an archive object, ready to `JSON.stringify`
- * for the on-disk / on-wire form. `.since(0)` returns every event; the
- * store may inject its own ordering (e.g. an index scan) so we sort again
- * here to make the archive shape independent of a store's iteration
- * order. */
-export async function exportArchive(store: ThreadStore): Promise<ThreadArchive> {
+/** Interface subset: `exportArchive` only needs `since`. Kept narrow so
+ * a caller that wraps a store (say, a filtered view) can still export
+ * without exposing the whole `ThreadStore`. */
+interface SinceSource {
+  since(after: number): Promise<ReviewEvent[]>;
+}
+
+/** Export a store's events into an archive object, ready to
+ * `JSON.stringify` for the on-disk / on-wire form. `.since(0)` returns
+ * every event; the store may inject its own ordering (e.g. an index
+ * scan) so we sort again here to make the archive shape independent of
+ * a store's iteration order. */
+export async function exportArchive(store: SinceSource): Promise<ThreadArchive> {
   const events = await store.since(0);
   const ordered = [...events].sort((a, b) => a.seq - b.seq);
   return threadArchiveSchema.parse({
-    schemaVersion: 1,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     events: ordered,
   });
 }
 
 /** Parse an unknown JSON value as a `ThreadArchive`. Throws with the
- * schema's `path`-annotated issues on any mismatch, so a hosted archive
- * with a foreign field fails at the boundary rather than silently
- * dropping data. */
+ * schema's `path`-annotated issues on any mismatch — including a
+ * `validateNext` violation — so a hosted archive with a foreign field
+ * or a semantically-inconsistent log fails at the boundary rather than
+ * silently dropping data. */
 export function parseArchive(raw: unknown): ThreadArchive {
   return threadArchiveSchema.parse(raw);
-}
-
-/** Re-parse events from an archive into `ReviewEvent[]`. A convenience
- * over `parseArchive(...).events` when the caller only wants to replay
- * the log through a store. */
-export function eventsFromArchive(archive: ThreadArchive): ReviewEvent[] {
-  return archive.events.slice();
 }

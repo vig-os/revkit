@@ -8,10 +8,16 @@
 // in a Cloudflare Worker and in every browser revkit supports (ADR-0018),
 // so this file needs no runtime-specific import (ADR-0025).
 
-/** Hex-encoded SHA-256 length: 32 bytes × 2 hex characters. Named so the
- * regex on the anchor and the length check on the exported bytes agree in
- * one place. */
-const SHA256_HEX_LENGTH = 64;
+/** Regex for a hex-encoded SHA-256 (64 lowercase hex characters). Exported
+ * so every schema that stores a revision id (`anchorSchema`,
+ * `handover.revision`) shares one definition and moves in one place. */
+export const SHA256_HEX_REGEX = /^[0-9a-f]{64}$/;
+
+/** Regex for a full-length git commit SHA (40 lowercase hex characters).
+ * Used by `Anchor.commit`, which is the optional PR-head SHA the M3 local
+ * PR-review surface (ADR-0025) records against a comment so the GitHub
+ * adapter can pin a pending review to the right `commit_id`. */
+export const GIT_SHA_HEX_REGEX = /^[0-9a-f]{40}$/;
 
 /**
  * Content hash of a source string, LF-normalised. Returns 64 lowercase
@@ -26,9 +32,5 @@ export async function revisionOf(source: string): Promise<string> {
   const normalised = source.replace(/\r\n?/g, "\n");
   const bytes = new TextEncoder().encode(normalised);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
-  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-  if (hex.length !== SHA256_HEX_LENGTH) {
-    throw new Error(`revisionOf: expected ${SHA256_HEX_LENGTH} hex chars, got ${hex.length}`);
-  }
-  return hex;
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

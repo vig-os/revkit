@@ -7,15 +7,15 @@
 //   1. Events are applied in ascending `seq`. The caller passes any slice
 //      of the log; `reduce` re-sorts to make it idempotent regardless of
 //      how the caller stored them.
-//   2. A `comment.replied`, `thread.resolved` or `thread.reopened` for a
-//      thread that has not been created yet is ignored. The append path
-//      (see `store.ts`) refuses such an event at the boundary, so a
-//      correctly-produced log never carries one; ignoring on the read
-//      side keeps `reduce` a total function on any event slice (a partial
-//      slice via `since(seq)` may legitimately reference an older,
-//      still-in-scope thread).
+//   2. `comment.replied`, `thread.resolved`, `thread.reopened`,
+//      `comment.linked` and `handover` for a subject that has not been
+//      created yet in the slice are skipped so the reducer stays total
+//      on any slice `since(seq)` might return. The store's `validateNext`
+//      refuses such an event on the append side, so a correctly-produced
+//      log never carries one — the skip is a safety net for a partial
+//      slice, not a silent cover-up.
 //   3. `handover`, `presence`, `ask.created` and `ask.answered` do not
-//      touch thread state; they are surfaced through the event stream and
+//      touch thread state; they are surfaced through the event stream
 //      elsewhere (delivery modes, ask routes). `reduce` leaves them out
 //      of the Thread view rather than shoehorning them into a comment.
 
@@ -24,8 +24,9 @@ import type { Comment, Thread } from "./thread.ts";
 
 /** Reduce an event slice into a threads map keyed by `threadId`. Threads
  * are ordered on the returned map by insertion (i.e. `comment.created`
- * seq); consumers that want a different order should sort on
- * `Thread.updatedAt` or `Thread.createdAt`. */
+ * seq); consumers that want a different order sort on `Thread.createdSeq`
+ * (deterministic; ISO strings tie-break poorly at sub-second
+ * resolution). */
 export function reduce(events: readonly ReviewEvent[]): Map<string, Thread> {
   const ordered = [...events].sort((a, b) => a.seq - b.seq);
   const threads = new Map<string, Thread>();
@@ -38,13 +39,7 @@ export function reduce(events: readonly ReviewEvent[]): Map<string, Thread> {
 function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
   switch (event.kind) {
     case "comment.created": {
-      if (threads.has(event.threadId)) {
-        // A second `comment.created` for the same thread id is a producer
-        // bug (thread creation is implicit and one-shot). Skip so the
-        // reducer stays total on a byzantine slice; the append path
-        // rejects it at the boundary.
-        return;
-      }
+      if (threads.has(event.threadId)) return;
       const firstComment: Comment = {
         id: event.commentId,
         threadId: event.threadId,
@@ -56,6 +51,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         id: event.threadId,
         anchor: event.anchor,
         status: "open",
+        createdSeq: event.seq,
         createdAt: event.ts,
         updatedAt: event.ts,
         comments: [firstComment],
@@ -98,6 +94,28 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         status: "open",
         updatedAt: event.ts,
       });
+      return;
+    }
+    case "comment.linked": {
+      // Find the thread the comment lives in and merge the external ref
+      // onto that comment. Backends are merged (a later `comment.linked`
+      // adding `github` does not clobber an earlier one adding a
+      // hypothetical second backend); the validator refuses a second
+      // `comment.linked` for the SAME backend on the same comment.
+      for (const [threadId, thread] of threads) {
+        const index = thread.comments.findIndex((c) => c.id === event.commentId);
+        if (index === -1) continue;
+        const existing = thread.comments[index];
+        if (existing === undefined) return;
+        const merged: Comment = {
+          ...existing,
+          external: { ...(existing.external ?? {}), ...event.external },
+        };
+        const nextComments = thread.comments.slice();
+        nextComments[index] = merged;
+        threads.set(threadId, { ...thread, updatedAt: event.ts, comments: nextComments });
+        return;
+      }
       return;
     }
     case "handover":

@@ -4,12 +4,14 @@
 // on. When the source moves, the re-anchoring pipeline (M2 item 5) maps
 // the range, verifies the quote, fuzzy-searches on miss, and marks the
 // thread `orphaned` if the quote can no longer be found — never dropped.
+//
+// `commit` is optional and holds the PR-head git SHA the anchor was
+// captured against. The M3 local PR-review surface (ADR-0025) records it
+// so the GitHub adapter can pin a pending review to the right
+// `commit_id`; the M2 local rail leaves it undefined. Reserved on the v0
+// wire so M3 lands without a `schemaVersion` bump.
 import { z } from "zod";
-
-/** Regex for the revision id: SHA-256 as 64 lowercase hex characters (see
- * `revisionOf`). A tighter shape check than "any string" so a `revkit
- * threads import` on a foreign archive fails at the boundary. */
-const SHA256_HEX = /^[0-9a-f]{64}$/;
+import { GIT_SHA_HEX_REGEX, SHA256_HEX_REGEX } from "./revision.ts";
 
 /** Text-quote selector (W3C Web Annotation §4.2.4). `prefix` and `suffix`
  * disambiguate a repeated `exact` inside the same file — the re-anchoring
@@ -37,7 +39,13 @@ export const anchorSchema = z
     startLine: z.number().int().positive(),
     endLine: z.number().int().positive(),
     quote: textQuoteSchema,
-    revision: z.string().regex(SHA256_HEX, "revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
+    revision: z
+      .string()
+      .regex(SHA256_HEX_REGEX, "revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
+    commit: z
+      .string()
+      .regex(GIT_SHA_HEX_REGEX, "commit must be a full-length lowercase 40-char git SHA (ADR-0025 M3 head-pinning).")
+      .optional(),
   })
   .strict()
   .refine((a) => a.endLine >= a.startLine, {

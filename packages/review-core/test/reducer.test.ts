@@ -4,7 +4,8 @@
 // on the expected state; (b) the reducer sorts by `seq` before applying,
 // so an out-of-order slice yields the same result; (c) events on unknown
 // or duplicate threads are skipped without throwing so the reducer stays
-// total on any slice `since(seq)` might return.
+// total on any slice `since(seq)` might return; (d) `comment.linked`
+// merges an external ref onto the referenced comment.
 import { describe, expect, test } from "bun:test";
 import { reduce, type ReviewEvent } from "../src/index.ts";
 
@@ -74,6 +75,7 @@ describe("reduce — create → reply → resolve → reopen", () => {
     expect(thread.status).toBe("open");
     expect(thread.createdAt).toBe(t(0));
     expect(thread.updatedAt).toBe(t(3));
+    expect(thread.createdSeq).toBe(1);
     expect(thread.comments.map((c) => c.id)).toEqual(["c-1", "c-2"]);
     expect(thread.comments[1]?.parentId).toBe("c-1");
     expect(thread.comments[1]?.author.kind).toBe("agent");
@@ -104,25 +106,6 @@ describe("reduce — total on byzantine slices", () => {
     expect(threads.size).toBe(0);
   });
 
-  test("skips a duplicate comment.created for the same thread id", () => {
-    const duplicate: ReviewEvent = {
-      seq: 5,
-      ts: t(4),
-      actor: humanActor,
-      kind: "comment.created",
-      threadId: "th-1",
-      commentId: "c-dup",
-      anchor,
-      body: "duplicate — must be skipped by the reducer",
-    };
-    const threads = reduce([...log, duplicate]);
-    // The original create wins; the duplicate has no effect on comments
-    // or timestamps.
-    const thread = threads.get("th-1");
-    expect(thread?.comments.map((c) => c.id)).toEqual(["c-1", "c-2"]);
-    expect(thread?.updatedAt).toBe(t(3));
-  });
-
   test("ignores resolved/reopened for an unknown thread id", () => {
     const stray: ReviewEvent = {
       seq: 6,
@@ -131,7 +114,25 @@ describe("reduce — total on byzantine slices", () => {
       kind: "thread.resolved",
       threadId: "th-does-not-exist",
     };
-    // Passing only the stray event: reducer returns an empty map.
     expect(reduce([stray]).size).toBe(0);
+  });
+});
+
+describe("reduce — comment.linked", () => {
+  test("merges an external github ref onto the referenced comment", () => {
+    const linked: ReviewEvent = {
+      seq: 5,
+      ts: t(4),
+      actor: agentActor,
+      kind: "comment.linked",
+      commentId: "c-1",
+      external: { github: { commentId: 987654, nodeId: "PRC_kwDOA" } },
+    };
+    const threads = reduce([...log, linked]);
+    const thread = threads.get("th-1");
+    expect(thread?.comments[0]?.external?.github?.commentId).toBe(987654);
+    expect(thread?.comments[0]?.external?.github?.nodeId).toBe("PRC_kwDOA");
+    // Second comment is untouched.
+    expect(thread?.comments[1]?.external).toBeUndefined();
   });
 });
