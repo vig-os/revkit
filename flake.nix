@@ -217,6 +217,39 @@
                   files = adrFiles;
                   pass_filenames = false;
                 };
+                # `revkit check` (M1 item 4, ADR-0005) runs the five
+                # authoring guards. The hook always walks the whole
+                # workspace (`--staged` would be too narrow — links
+                # resolve across files, vocab loads once from
+                # `vocab/terms.yaml`) and the CLI walks itself with the
+                # same excludes, so `pass_filenames = false`. Also
+                # opts in to `--online` when `gh auth status` succeeds
+                # in the dev shell, else falls back to offline with a
+                # visible warning — the workflow at
+                # `.github/workflows/revkit-guards.yml` runs `--online`
+                # unconditionally with `GITHUB_TOKEN`. `.(md|mdx|astro|
+                # tsx|jsx|json|ya?ml|vue|svelte|html|htm)` (case-
+                # insensitive) is the surface no-hand-rolled-ui and
+                # component-registry look at.
+                revkit-check = {
+                  enable = true;
+                  entry = "packages/cli/bin/revkit-check-hook.sh";
+                  language = "system";
+                  files = "(?i)\\.(md|mdx|astro|tsx|jsx|json|ya?ml|vue|svelte|html|htm|[mc]?[jt]sx?)$";
+                  pass_filenames = false;
+                };
+                # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
+                # changes for tokens, keys and cookies. `git --staged`
+                # is the current-generation subcommand (`gitleaks protect`
+                # is deprecated). `--redact` keeps a false-positive on a
+                # public value from being leaked twice; `-v` names the
+                # file each finding came from.
+                gitleaks = {
+                  enable = true;
+                  entry = "gitleaks git --staged --redact -v";
+                  language = "system";
+                  pass_filenames = false;
+                };
               };
 
             # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the

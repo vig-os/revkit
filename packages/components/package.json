@@ -7,7 +7,8 @@
   "license": "Apache-2.0",
   "exports": {
     ".": "./src/index.ts",
-    "./Callout": "./src/Callout.tsx"
+    "./Callout": "./src/Callout.tsx",
+    "./Plot": "./src/Plot.astro"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"

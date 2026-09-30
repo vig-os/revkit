@@ -2,46 +2,74 @@
 // usage errors and unknown-arg errors with the exit codes callers rely on.
 import { describe, expect, test } from "bun:test";
 import { dispatch, ExitCode, HELP, VERSION } from "../src/index.ts";
+import type { DispatchEnv } from "../src/index.ts";
+
+const noopEnv: DispatchEnv = {
+  cwd: "/",
+  gh: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+  repoSlug: "vig-os/revkit",
+};
 
 describe("dispatch", () => {
-  test("--version prints the version and exits 0", () => {
-    const result = dispatch(["--version"]);
+  test("--version prints the version and exits 0", async () => {
+    const result = await dispatch(["--version"], noopEnv);
     expect(result.stdout).toBe(`${VERSION}\n`);
     expect(result.stderr).toBe("");
     expect(result.exitCode).toBe(ExitCode.ok);
   });
 
-  test("-v is a short alias for --version", () => {
-    const result = dispatch(["-v"]);
+  test("-v is a short alias for --version", async () => {
+    const result = await dispatch(["-v"], noopEnv);
     expect(result.stdout).toBe(`${VERSION}\n`);
     expect(result.exitCode).toBe(ExitCode.ok);
   });
 
-  test("--help prints the help text and exits 0", () => {
-    const result = dispatch(["--help"]);
+  test("--help prints the help text and exits 0", async () => {
+    const result = await dispatch(["--help"], noopEnv);
     expect(result.stdout).toBe(HELP);
     expect(result.stderr).toBe("");
     expect(result.exitCode).toBe(ExitCode.ok);
   });
 
-  test("no arguments prints help and exits 0", () => {
-    const result = dispatch([]);
+  test("no arguments prints help and exits 0", async () => {
+    const result = await dispatch([], noopEnv);
     expect(result.stdout).toBe(HELP);
     expect(result.exitCode).toBe(ExitCode.ok);
   });
 
-  test("--version with extra args exits with usage error on stderr", () => {
-    const result = dispatch(["--version", "extra"]);
+  test("--version with extra args exits with usage error on stderr", async () => {
+    const result = await dispatch(["--version", "extra"], noopEnv);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("--version takes no arguments");
     expect(result.exitCode).toBe(ExitCode.usage);
   });
 
-  test("unknown argument exits with usage error and shows help", () => {
-    const result = dispatch(["serve"]);
+  test("unknown argument exits with usage error and shows help", async () => {
+    const result = await dispatch(["serve"], noopEnv);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("unknown argument 'serve'");
     expect(result.stderr).toContain(HELP);
+    expect(result.exitCode).toBe(ExitCode.usage);
+  });
+
+  test("check with an unknown flag exits with usage error", async () => {
+    const result = await dispatch(["check", "--nope"], noopEnv);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("unknown flag '--nope'");
+    expect(result.exitCode).toBe(ExitCode.usage);
+  });
+
+  test("check --staged with positional paths exits with usage error", async () => {
+    const result = await dispatch(["check", "--staged", "docs/adr/0001.md"], noopEnv);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("does not accept positional paths");
+    expect(result.exitCode).toBe(ExitCode.usage);
+  });
+
+  test("escalate with no argument exits with usage error", async () => {
+    const result = await dispatch(["escalate"], noopEnv);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("exactly one non-empty argument");
     expect(result.exitCode).toBe(ExitCode.usage);
   });
 });

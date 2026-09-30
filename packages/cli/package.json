@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "revkit CLI (M1: --version, --help).",
+  "description": "revkit CLI (M1: --version, --help, check, escalate).",
   "license": "Apache-2.0",
   "bin": {
     "revkit": "./bin/revkit.js"
@@ -14,6 +14,18 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@astrojs/internal-helpers": "0.11.0",
+    "@revkit/site": "workspace:*",
+    "@types/mdast": "4.0.4",
+    "linkedom": "0.18.13",
+    "parse5": "7.3.0",
+    "remark-math": "6.0.0",
+    "remark-mdx": "3.1.1",
+    "remark-parse": "11.0.0",
+    "unified": "11.0.5",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@types/bun": "1.4.2",

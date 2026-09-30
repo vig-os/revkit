@@ -20,9 +20,14 @@
 // to fix.
 import { getEntry } from "astro:content";
 import { dirname } from "node:path";
-import { resolveSpecAbsolutePath } from "../content/loaders/plots.ts";
-import { renderPlotToSvg } from "../lib/render-plot.ts";
-import { assertPlotFieldsExist } from "../lib/plot-fields.ts";
+// Site-owned helpers reached via relative path — the .astro file lives in
+// `@revkit/components` (the registered component set) but the plot render
+// pipeline stays with the site because it needs `astro:content` and Vega
+// under the site's own build. Consumers see `import Plot from
+// "@revkit/components/Plot"`.
+import { resolveSpecAbsolutePath } from "../../../site/src/content/loaders/plots.ts";
+import { renderPlotToSvg } from "../../../site/src/lib/render-plot.ts";
+import { assertPlotFieldsExist } from "../../../site/src/lib/plot-fields.ts";
 
 interface Props {
   /** Name of the plot in the `plots` collection — matches the folder name
