@@ -59,7 +59,7 @@ It has three review surfaces on one core (ADR-0025), sharing one content model a
 | C3 | **Links** and **doc sets** are validated: no broken links, no orphans in a set, prev/next consistent |
 | C4 | A plot is **spec + data side files**, never inline data or a hand-rolled chart |
 | C5 | **LaTeX** math renders correctly, with no client JS |
-| C6 | Proper **phone / tablet / desktop** layouts, with a left **"train line"** navigation for doc sets |
+| C6 | Proper **phone / tablet / desktop** layouts, with **stock Starlight sidebar + prev/next** across doc sets (owner decision 2026-09-30, ADR-0001 amendment: no custom "train-line" component) |
 
 **D — distribution, E — performance**
 
@@ -113,7 +113,7 @@ also make GitHub's own diff view useless for the same docs.
 ```text
 docs/                       # MDX prose, one file per page; frontmatter validated by a Zod schema
   adr/0003-storage.mdx
-  sets/onboarding/…         # a "set" = ordered pages → train-line nav, prev/next, orphan check
+  sets/onboarding/…         # a "set" = ordered pages → Starlight sidebar group + prev/next, orphan check
 vocab/terms.yaml            # collection: id, term, definition, aliases
 plots/latency/spec.vl.json  # Vega-Lite spec, data.url → sibling file only
 plots/latency/data.csv
@@ -487,8 +487,9 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 ## 8. Milestones (to be split into issues after review)
 
 1. **M1 — skeleton + guards:** ([#6](https://github.com/vig-os/revkit/issues/6)) Astro/Starlight/Solid/Tailwind
-   scaffold, the content model, `revkit check` (the five guards) as flake hooks, KaTeX, Vega-Lite SSR plots, the
-   train-line sidebar.
+   scaffold, the content model, `revkit check` (the five guards) as flake hooks, KaTeX, Vega-Lite SSR plots, and
+   stock Starlight sidebar + prev/next navigation across the dogfooded doc sets (owner decision 2026-09-30,
+   ADR-0001 amendment: no custom train-line component).
 2. **M2 — local loop:** ([#7](https://github.com/vig-os/revkit/issues/7)) `revkit serve` daemon + `/events` stream,
    anchors + re-anchoring (§5.4), comment rail, threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a
    **channel** with a Monitor-WebSocket fallback, delivery modes + handover, presence, the Claude Code skill.
