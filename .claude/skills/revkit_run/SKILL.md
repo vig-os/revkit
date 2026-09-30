@@ -15,10 +15,11 @@ iteration needs.
 
 ## Starting a run
 
-From the repo root, once per run (the lock makes a second start a no-op, so it is safe on every resume):
+From the repo root. The lock makes a second start a no-op, so this block is safe on every resume. Clearing a
+leftover `STOP`/`DONE` (`rm -f .revkit/run/STOP .revkit/run/DONE`) is the **owner's** step when starting a new run;
+an agent never deletes them.
 
 ```bash
-rm -f .revkit/run/STOP .revkit/run/DONE   # only when the owner starts a new run
 pane=$(flk agent get "$FLOCK_PANE_ID" | jq -er '.result.agent.pane_id // .result.pane_id')
 setsid nohup .claude/skills/revkit_run/watchdog.sh "$pane" \
   "Watchdog: the revkit run looks stalled. Use the revkit_run skill: check running subagents and open PRs (no duplicates), then continue from .revkit/run/HANDOFF.md." \
@@ -32,8 +33,8 @@ Both scripts log to `.revkit/run/run.log`.
 A chunk is one checklist item of the current milestone's tracking issue (e.g. #6 for M1), delivered as one PR into
 `dev`.
 
-1. **Orient:** read `.revkit/run/HANDOFF.md`, then the tracking issue checklist. If `.revkit/run/STOP` exists, stop
-   and report.
+1. **Orient:** read `.revkit/run/HANDOFF.md`, then the tracking issue checklist. If `.revkit/run/STOP` or `.revkit/run/DONE`
+   exists, stop and report.
 2. **Build:** hand the chunk to a background subagent with a self-contained brief: binding context (CLAUDE.md, the
    ADRs and matrix rows it implements), the rules (dev shell, never `prek install`, conventional commits with
    `Refs:`, branch from up-to-date `dev`, exact pins, guardrails clean), the lessons in HANDOFF.md, and "do not
