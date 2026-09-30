@@ -45,9 +45,12 @@ describe("dispatch", () => {
   });
 
   test("unknown argument exits with usage error and shows help", async () => {
-    const result = await dispatch(["serve"], noopEnv);
+    // `serve` shipped in M2 item 2 (this PR), so it is no longer an
+    // unknown argument; use a name that no future milestone will
+    // claim.
+    const result = await dispatch(["notarealcommand"], noopEnv);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("unknown argument 'serve'");
+    expect(result.stderr).toContain("unknown argument 'notarealcommand'");
     expect(result.stderr).toContain(HELP);
     expect(result.exitCode).toBe(ExitCode.usage);
   });

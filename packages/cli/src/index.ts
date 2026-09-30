@@ -22,6 +22,7 @@ import type { GhRunner } from "./gh-runner.ts";
 import { spawnGh } from "./gh-runner.ts";
 import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
+import { runServeCommand } from "./serve/cli.ts";
 import { resolve as resolvePath } from "node:path";
 
 /** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
@@ -36,6 +37,7 @@ Usage:
   revkit check [--staged | <paths...>] [--online]
   revkit check-dist <dist-dir> [--print-hashes]
   revkit escalate "<need>"
+  revkit serve [--dir <path>] [--port <n>]
 
 Guards (ADR-0005):
   component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure,
@@ -51,7 +53,14 @@ data: / vbscript: URLs, off-list <script> hashes, <iframe>/<object>/
 --print-hashes prints every distinct inline-script hash in the dir so
   a maintainer can update dist-check-allowlist.json after an upgrade.
 
-Subcommands (serve, build, mcp, invite, deploy) land in their milestones
+serve boots the local daemon (ADR-0013, ADR-0006/0007): Bun.serve
+bound to 127.0.0.1 on a random free port (--port 0), serving
+'site/dist' by default with a JSON thread API, /events (SSE +
+WebSocket) and the launch-code → session-cookie flow. Prints the
+launch URL on stdout; the agent bearer token is written to
+.revkit/serve.json at mode 600. Ctrl-C stops gracefully.
+
+Subcommands (build, mcp, invite, deploy) land in their milestones
 (see the roadmap in docs/designs/DESIGN-0001-revkit-architecture.md).
 `;
 
@@ -62,11 +71,15 @@ export const ExitCode = {
   usage: 2,
 } as const;
 
-/** Result of dispatching one CLI invocation — the caller decides how to render it. */
+/** Result of dispatching one CLI invocation — the caller decides how to render it.
+ * `blockForever` is set by long-running subcommands (`serve`) — the CLI
+ * top-level awaits it so the process does not exit while the daemon
+ * is up. Absent on one-shot subcommands. */
 export interface CliResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  blockForever?: Promise<void>;
 }
 
 /** Slug of the repo escalate/check target for --online. Overridden in
@@ -124,6 +137,16 @@ export async function dispatch(
 
   if (first === "escalate") {
     return await runEscalateCommand(rest, env);
+  }
+
+  if (first === "serve") {
+    const outcome = await runServeCommand(rest, { cwd: env.cwd, version: VERSION });
+    return {
+      stdout: outcome.stdout,
+      stderr: outcome.stderr,
+      exitCode: outcome.exitCode,
+      ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
+    };
   }
 
   return {

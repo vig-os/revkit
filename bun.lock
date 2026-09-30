@@ -13,6 +13,7 @@
       },
       "dependencies": {
         "@astrojs/internal-helpers": "0.11.0",
+        "@revkit/review-core": "workspace:*",
         "@revkit/site": "workspace:*",
         "@types/mdast": "4.0.4",
         "linkedom": "0.18.13",
@@ -22,6 +23,7 @@
         "remark-parse": "11.0.0",
         "unified": "11.0.5",
         "yaml": "2.9.1",
+        "zod": "4.6.5",
       },
       "devDependencies": {
         "@types/bun": "1.4.2",
