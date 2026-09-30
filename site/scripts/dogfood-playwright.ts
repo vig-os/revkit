@@ -1,6 +1,6 @@
 // Playwright leg of the revkit dogfood loop.
 //
-// Called by scripts/dogfood-channel.sh. Reads the daemon state from the
+// Called by packages/cli/src/dogfood/playwright.ts. Reads the daemon state from the
 // **isolated** state dir the shell created for this run, mints a fresh
 // launch URL through `POST /-/launch-code` (so the URL is single-use),
 // opens the built site in a real chromium page, selects text on a real
@@ -19,7 +19,7 @@
 //                                     tell OUR reply apart. The nonce echo
 //                                     is a LIVENESS marker only, not a
 //                                     lockdown proof — see
-//                                     scripts/dogfood-channel.sh:verify_claude_lockdown
+//                                     packages/cli/src/dogfood/verify.ts:verifyRunning
 //                                     for the real lockdown assertion.
 //   REVKIT_DOGFOOD_ARTIFACTS_DIR    — writable temp dir for screenshots.
 //   PLAYWRIGHT_BROWSERS_PATH        — chromium binary root (dev shell).
@@ -38,7 +38,7 @@
 
 // `@playwright/test` (not the bare `playwright` package) is what ships in
 // the site workspace, so this script runs from `site/` — see how
-// scripts/dogfood-channel.sh invokes it. The `chromium` and `Page` exports
+// packages/cli/src/dogfood/playwright.ts invokes it. The `chromium` and `Page` exports
 // are re-exported through `@playwright/test`, no test-runner state is used.
 import { chromium, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
@@ -190,6 +190,77 @@ async function main(): Promise<void> {
   const browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   const page = await context.newPage();
+  // PR-#58 review round-2 diagnostic: capture browser console + SSE
+  // frames so a rail live-update timeout is diagnosable from the log.
+  // Gated on the env var REVKIT_DOGFOOD_TRACE_SSE equal to one, so
+  // the default run stays quiet; the coordinator's investigation flow
+  // (root-cause the rail live failure) enables it.
+  const trace = process.env["REVKIT_DOGFOOD_TRACE_SSE"] === "1";
+  if (trace) {
+    page.on("console", (msg) => {
+      console.log(`[browser ${msg.type()}] ${msg.text()}`); // guardrails-ok(no-debug-leftovers): diagnostic gated on REVKIT_DOGFOOD_TRACE_SSE
+    });
+    page.on("pageerror", (err) => {
+      console.log(`[browser pageerror] ${err.message}`); // guardrails-ok(no-debug-leftovers): diagnostic gated on REVKIT_DOGFOOD_TRACE_SSE
+    });
+    page.on("response", async (resp) => {
+      const u = resp.url();
+      if (u.includes("/events") || u.includes("/api/threads") || u.includes("/api/handover")) {
+        console.log(`[net] ${resp.status()} ${u}`); // guardrails-ok(no-debug-leftovers): diagnostic gated on REVKIT_DOGFOOD_TRACE_SSE
+      }
+    });
+    // Also start a MutationObserver so we see the rail's DOM changes
+    // to `revkit-rail-thread` in real time — this is how we tell whether
+    // the rail EVER rendered the reply between seq=3 and seq=4.
+    await page.addInitScript(() => {
+      const obs = new MutationObserver(() => {
+        const nodes = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
+        const rows: string[] = [];
+        nodes.forEach((n) => {
+          const text = (n.textContent ?? "").replace(/\s+/g, " ");
+          // Truncate a full-text summary at 240 chars — long enough to
+          // include an "ack <nonce>" reply if one is rendered.
+          rows.push(text.slice(0, 240));
+        });
+        console.log(`[rail-render] threads=${nodes.length} bodies=${JSON.stringify(rows)}`); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+      });
+      const kick = () => {
+        obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+      };
+      if (document.body !== null) kick();
+      else document.addEventListener("DOMContentLoaded", kick);
+    });
+    // Hook the EventSource so every incoming frame is logged.
+    // The `console.log` calls INSIDE the init script run in the
+    // browser; Playwright's page.on("console") forwards them to our
+    // stdout as `[browser log] ...`. Each one is guardrails-ok because
+    // the whole trace path is behind `REVKIT_DOGFOOD_TRACE_SSE=1`.
+    await page.addInitScript(() => {
+      const OriginalES = window.EventSource;
+      class TracedES extends OriginalES {
+        constructor(url: string | URL, init?: EventSourceInit) {
+          super(url, init);
+          const label = String(url);
+          this.addEventListener("open", () => console.log(`[sse open] ${label}`)); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+          this.addEventListener("error", () => console.log(`[sse error] ${label}`)); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+          this.addEventListener("message", (e: MessageEvent) => {
+            const body = typeof e.data === "string" ? e.data.slice(0, 300) : "<non-string>";
+            console.log(`[sse msg default] ${label} ${body}`); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+          });
+          // Common revkit-daemon event names — see packages/cli/src/serve
+          // Log every named event we know about; the SSE spec dispatches
+          // by `event:` name, not the default `message` listener.
+          for (const name of ["comment.appended", "comment.replied", "thread.status", "handover", "presence", "ping"]) {
+            this.addEventListener(name, (e: MessageEvent) => {
+              const body = typeof e.data === "string" ? e.data.slice(0, 300) : "<non-string>";
+              console.log(`[sse msg ${name}] ${label} ${body}`); // guardrails-ok(no-debug-leftovers): trace gated on REVKIT_DOGFOOD_TRACE_SSE
+            });
+          }
+        }
+      }
+      window.EventSource = TracedES as unknown as typeof EventSource;
+    });
+  }
   try {
     // 1. Log in via the single-use launch URL. The daemon set-cookies our
     //    session; we redirect to `/`.
@@ -214,7 +285,7 @@ async function main(): Promise<void> {
     // Round-4 change: the dogfood comment reads like a real reviewer's
     // note. No embedded imperative chain, no coerced tool call. The
     // lockdown is proven by the shell's pre-launch /proc inspection of
-    // the claude process (see scripts/dogfood-channel.sh:verify_claude_lockdown),
+    // the claude process (see packages/cli/src/dogfood/verify.ts:verifyRunning),
     // NOT by anything the model does with this comment. The comment
     // just carries a nonce so the harness can tell OUR test thread
     // apart from any other. If the agent declines the note (a good
@@ -278,70 +349,109 @@ async function main(): Promise<void> {
     if (!flush.ok) throw new Error(`handover flush failed: ${flush.status}`);
     console.log("handover flushed via POST /api/handover"); // guardrails-ok(no-debug-leftovers): CLI progress line
     // stdout is this script's contract — the caller shell
-    // (scripts/dogfood-channel.sh) tees each line into the dogfood
+    // (packages/cli/src/dogfood/main.ts) tees each line into the dogfood
     // transcript, so `console.log` IS the tracing facade here.
     console.log(`created thread ${created.id} (${created.comments.length} comment(s))`); // guardrails-ok(no-debug-leftovers): CLI progress line
 
-    // 5. Wait for the agent's reply. This is a LIVENESS check —
-    //    success = there is a comment authored by an agent whose
-    //    body contains `ack <nonce>`. The nonce echo proves the
-    //    agent reached a reply turn against OUR thread. It does NOT
-    //    prove the lockdown fired; the shell script's pre-launch
-    //    cmdline + environ verification of the real claude process
-    //    is the load-bearing lockdown proof (round 4 dropped the
-    //    forgeable post-run "did the agent write the denial text"
-    //    check). A well-aligned model may correctly decline to
-    //    follow instructions embedded in a channel comment — that
-    //    behaviour is correct per ADR-0007, and this timeout is
-    //    the right way for the harness to notice it.
-    //    Timeout: 180 s baseline for a normal reply turn.
+    // 5-6. LIVENESS: prove the reply reached BOTH the daemon and the
+    // browser without a reload.
+    //
+    // Round-2 review of PR-#58 exposed a flake: with PR-#53's handover
+    // mode the agent bundles its `reply` + `resolve` MCP calls in one
+    // turn, so `comment.replied` and `thread.resolved` events arrive
+    // within ~300-400ms. The rail filters resolved threads out of the
+    // DOM (see `openThreadsFor` in packages/cli/src/rail/rail.tsx),
+    // so the reply is only visible for that brief window. The old
+    // two-phase check ("daemon-poll 750ms → then rail wait") could
+    // spend the whole window inside the daemon poll and miss the
+    // rail's transient reply state entirely. Under-tests flake at
+    // ~30-40%.
+    //
+    // Round-2 fix: attach a `MutationObserver` in the page BEFORE the
+    // agent starts replying that records every render whose DOM
+    // contains `ack <nonce>`. The window is captured passively so
+    // there is no race between "daemon has the reply" and "rail shows
+    // the reply". The daemon-side confirmation is folded into the
+    // same wait via the SSE hook the browser-side script installs
+    // (comment.replied event → observer sets `replySeenAt`).
+    await page.evaluate((nonce: string) => {
+      (window as unknown as { __revkitReplySeen?: number }).__revkitReplySeen = undefined;
+      const check = (): void => {
+        const nodes = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
+        for (const el of Array.from(nodes)) {
+          const text = el.textContent ?? "";
+          if (text.includes(`ack ${nonce}`)) {
+            (window as unknown as { __revkitReplySeen?: number }).__revkitReplySeen = Date.now();
+            return;
+          }
+        }
+      };
+      // Initial check in case the reply is already visible.
+      check();
+      // MutationObserver stays live for the rest of the test. Any DOM
+      // mutation triggers a re-scan; the first hit stores the timestamp.
+      new MutationObserver(() => {
+        if ((window as unknown as { __revkitReplySeen?: number }).__revkitReplySeen === undefined) {
+          check();
+        }
+      }).observe(document.body, { childList: true, subtree: true, characterData: true });
+    }, NONCE as string);
+    // Now wait — either the observer sets __revkitReplySeen OR the
+    // timeout fires with a diagnostic dump.
     const started = Date.now();
-    const withReply = await waitFor(
-      "agent reply visible on daemon",
-      findThreadByNonce,
-      (thread) =>
-        thread !== undefined &&
-        thread.comments.some(
-          (c) => c.author?.kind === "agent" && c.body.includes(`ack ${NONCE}`),
-        ),
-      180_000,
-      750,
-    );
-    if (withReply === undefined) throw new Error("unreachable — waitFor guarantees a match");
-    const commentLatencyMs = Date.now() - started;
-    console.log(`agent replied in ~${commentLatencyMs}ms`); // guardrails-ok(no-debug-leftovers): CLI progress line
-
-    // 6. Also confirm the reply is visible in the PAGE without a reload —
-    //    that's the SSE path (comment.replied → rail refetch). We look for
-    //    a thread with more than one comment.
-    // Playwright's `waitForFunction` overload with `arg` requires the
-    // function to declare its `arg` type as its FIRST parameter — we pass
-    // `nonce` in explicitly to keep the browser side self-contained. Cast
-    // to `unknown` first to satisfy the overload picker across playwright
-    // versions.
     await page
       .waitForFunction(
-        (nonce: string) => {
-          const threads = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
-          for (const el of Array.from(threads)) {
-            const text = el.textContent ?? "";
-            if (text.includes(`ack ${nonce}`)) return true;
-          }
-          return false;
-        },
-        NONCE as string,
-        { timeout: 30_000 },
+        () => (window as unknown as { __revkitReplySeen?: number }).__revkitReplySeen !== undefined,
+        undefined,
+        { timeout: 180_000, polling: 100 },
       )
-      .catch(() => {
+      .catch(async () => {
+        // PR-#58 review round-2 diagnostic: dump the rail state on
+        // timeout so a regression like "SSE arrived but rail didn't
+        // re-render" is visible in the log.
+        try {
+          const snapshot = await page.evaluate(() => {
+            const threads = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
+            const list: Array<{ id: string | null; text: string }> = [];
+            threads.forEach((el) => {
+              list.push({
+                id: el.getAttribute("data-thread-id"),
+                text: (el.textContent ?? "").slice(0, 500),
+              });
+            });
+            return { count: list.length, threads: list };
+          });
+          console.log(`[rail-snapshot] threads=${snapshot.count} contents=${JSON.stringify(snapshot.threads)}`); // guardrails-ok(no-debug-leftovers): diagnostic on failure path
+        } catch (err) {
+          console.log(`[rail-snapshot] failed: ${(err as Error).message}`); // guardrails-ok(no-debug-leftovers): diagnostic on failure path
+        }
         throw new Error("reply text did not appear in the rail without reload");
       });
+    const railSeenAt = (await page.evaluate(() => (window as unknown as { __revkitReplySeen?: number }).__revkitReplySeen)) ?? Date.now();
+    const commentLatencyMs = railSeenAt - started;
+    console.log(`agent replied in ~${commentLatencyMs}ms (rail-observed via MutationObserver)`); // guardrails-ok(no-debug-leftovers): CLI progress line
 
-    // 7. Capture the "reply visible in rail" screenshot as evidence.
+    // 7. Also confirm the daemon has the reply (should be true by
+    //    construction — the rail rendered it — but assert it so a
+    //    regression to the DOM-only "phantom" path shows up.
+    const withReply = await findThreadByNonce();
+    if (
+      withReply === undefined ||
+      !withReply.comments.some((c) => c.author?.kind === "agent" && c.body.includes(`ack ${NONCE}`))
+    ) {
+      throw new Error("rail showed the reply but the daemon does not — inconsistent state");
+    }
+    console.log(`daemon confirms reply on thread ${withReply.id}`); // guardrails-ok(no-debug-leftovers): CLI progress line
+
+    // 8. Capture the "reply visible in rail" screenshot. If resolve has
+    //    already fired the shot may catch the rail after the reply
+    //    cleared from the DOM; the assertion above is the load-bearing
+    //    check, the screenshot is evidence for a PR body.
     const shot = join(ARTIFACTS_DIR!, "reply-visible.png");
     await page.screenshot({ path: shot, fullPage: false });
     console.log(`screenshot saved to ${shot}`); // guardrails-ok(no-debug-leftovers): CLI progress line
 
-    // 8. Wait for the resolve. The agent instructions include a resolve
+    // 9. Wait for the resolve. The agent instructions include a resolve
     //    after the reply. Give it 60s.
     await waitFor(
       "thread resolved",

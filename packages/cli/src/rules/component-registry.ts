@@ -431,6 +431,27 @@ export interface ComponentRegistryFileResult {
   }[];
 }
 
+/** Options for `checkComponentRegistryFile`. `trust: "untrusted"`
+ * disables the allow-annotation escape-hatch — a PR-authored file
+ * cannot silence its own findings, since the annotation has not
+ * been through the hosted `--online` verifier the reviewer can
+ * trust. See ADR-0025 "Untrusted PR content (must be explicit)"
+ * and PR #48 round-2 review. */
+export interface ComponentRegistryFileOptions {
+  readonly trust?: "trusted" | "untrusted";
+  /** Distinct subpaths ADMITTED under untrusted mode. Derived from
+   * `packages/components/package.json`'s `exports` map by the
+   * orchestrator (see `check.ts:readComponentsExports`), so the
+   * allowlist can never drift from what revkit itself ships
+   * (PR #48 round-4 blocker 1a).
+   *
+   * These are FULL specifiers (`"@revkit/components/Plot"`),
+   * not just the tail. When the set is `undefined` (older
+   * caller / unit test), the untrusted-mode subpath refusal
+   * still fires — the root-only import is always accepted. */
+  readonly untrustedAllowedSubpaths?: ReadonlySet<string>;
+}
+
 /** Check one MDX / MD file against the component-registry rule. A
  * parse error surfaces as a `file:line: component-registry: parse …`
  * diagnostic — never a raw micromark / acorn stack — so the CLI's
@@ -441,6 +462,7 @@ export function checkComponentRegistryFile(
   source: string,
   file: string,
   preparsedRoot?: Parent,
+  options?: ComponentRegistryFileOptions,
 ): ComponentRegistryFileResult {
   let root: Parent;
   try {
@@ -485,6 +507,38 @@ export function checkComponentRegistryFile(
           message: `import from ${JSON.stringify(binding.specifier)} — content may only import from ${ALLOWED_IMPORT_SPECIFIERS.map((s) => JSON.stringify(s)).join(" or ")} (ADR-0002, C1).`,
         });
         continue;
+      }
+      // Untrusted-mode subpath refusal (PR #48 round-3 nit,
+      // round-4 blocker 1a). A PR cannot import an arbitrary
+      // subpath — subpath resolution would follow whatever the
+      // package's exports allow. Under untrusted mode we admit
+      // only the exact root `@revkit/components` and
+      // `@astrojs/starlight/components`, plus subpaths that
+      // appear in `packages/components/package.json`'s `exports`
+      // map, passed in by the orchestrator. This means
+      //     `"@revkit/components/Plot"` — the documented import
+      //     used in the site's own MDX — is admitted, but a
+      //     fantasy `"@revkit/components/Playground"` is not.
+      const trustLocal = options?.trust ?? "trusted";
+      if (
+        trustLocal === "untrusted" &&
+        binding.specifier !== "@revkit/components" &&
+        binding.specifier !== "@astrojs/starlight/components" &&
+        (binding.specifier.startsWith("@revkit/components/") ||
+          binding.specifier.startsWith("@astrojs/starlight/components/"))
+      ) {
+        const declared = options?.untrustedAllowedSubpaths;
+        if (declared === undefined || !declared.has(binding.specifier)) {
+          diagnostics.push({
+            file,
+            line: binding.line,
+            rule: "component-registry",
+            message:
+              `import from ${JSON.stringify(binding.specifier)} — under untrusted PR review, the only admitted subpaths ` +
+              `are those declared in the components package's exports map (${declared === undefined ? "<none loaded>" : [...declared].map((s) => JSON.stringify(s)).sort().join(", ")}). ADR-0025.`,
+          });
+          continue;
+        }
       }
       // Named export deny-list (round-4): Card / LinkCard from
       // Starlight's component module are refused even though the
@@ -589,9 +643,15 @@ export function checkComponentRegistryFile(
     // Escape hatch: the previous sibling being an allow-annotation
     // exempts THIS element (exactly one). The annotation is
     // consumed — a second element on the same parent needs its own
-    // annotation.
+    // annotation. **Disabled entirely under `untrusted` trust**
+    // (ADR-0025, PR #48 round-2): a PR author could otherwise smuggle
+    // a build-time RCE past every attribute-expression / expression-
+    // in-content guard by pairing it with a `{/* revkit-allow: #N */}`
+    // annotation. The annotation is only meaningful for content the
+    // reviewer authored (i.e. the trusted lane).
+    const trust = options?.trust ?? "trusted";
     const annotation = prev !== null ? annotationBySibling.get(prev) ?? null : null;
-    if (annotation !== null) {
+    if (trust === "trusted" && annotation !== null) {
       usedAllowAnnotations.push({ annotation, line });
       annotationBySibling.delete(prev as Nodes);
       return;

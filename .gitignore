@@ -77,6 +77,12 @@ result-*
 site/dist/
 site/.astro/
 
+# Per-PR review sandbox (`revkit review`) — the materialised
+# PR-head worktree lives under `site/.revkit-review/<slug>/head-<sha>/`
+# so vite's module resolution finds the trusted `site/node_modules/`
+# by walking up. Disposable; wiped on the next rerun.
+site/.revkit-review/
+
 # KaTeX assets: regenerated on each build by site/scripts/copy-katex-assets.ts
 # from the pinned katex package (ADR-0001 exact-pins). Checking them in would
 # mean two places to update on a KaTeX bump, so the script is the source of

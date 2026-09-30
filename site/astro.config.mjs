@@ -21,9 +21,19 @@ import { fileURLToPath } from "node:url";
 import { buildSharedMarkdownConfig } from "./src/lib/markdown-processor.ts";
 
 // Repo root — this file lives in `site/`, so the repo root is the
-// parent directory. The rehype-data-src plugin rewrites every
+// parent directory. `rehype-data-src` uses it to rewrite every
 // stamped block's `data-src` attribute as a repo-relative path so
 // the rail can anchor comments to source lines (ADR-0006).
+//
+// The Solid `include` glob below is intentionally NOT anchored at
+// REPO_ROOT — during a `revkit review` safe build this config is
+// loaded from the sandbox, where REPO_ROOT resolves to the sandbox
+// root, and Vite still loads `@revkit/components` through the
+// TRUSTED checkout's node_modules symlink (outside the sandbox).
+// An anchored include would miss that real path and Solid would
+// skip transforming Callout / Aside / …. The unanchored include
+// plus a `.revkit-review/` exclude gives us both: the trusted copy
+// is still matched, and the sandbox copy is never transformed.
 const REPO_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
 
 // Slug lists for the ADRs and design docs that live at the repo root (not
@@ -127,7 +137,22 @@ export default defineConfig({
       ],
     }),
     solidJs({
-      include: ["**/packages/components/**", "**/src/islands/**"],
+      // Solid transforms every `.tsx` under `packages/components/`
+      // (the components package) and `site/src/islands/` (the site's
+      // own islands). The `exclude` guard drops any path inside a
+      // `site/.revkit-review/…/` sandbox, so a hostile PR whose
+      // materialised tree happens to sit under that path (see
+      // `fetch-pr.ts:reviewTargetDir`) can never have a smuggled
+      // `.tsx` transformed by the reviewer's Solid pass. The
+      // reviewer's real build reads `@revkit/components` through
+      // node_modules resolution against the TRUSTED checkout, so
+      // the include still matches and Callout / Aside / … keep
+      // being transformed.
+      include: [
+        "**/packages/components/**",
+        "**/site/src/islands/**",
+      ],
+      exclude: ["**/site/.revkit-review/**"],
     }),
   ],
   // Math renders at build via `remark-math` (parses `$…$` / `$$…$$`) plus
