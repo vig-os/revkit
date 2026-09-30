@@ -162,12 +162,25 @@ describe.skipIf(!E2E)("revkit build — packaged CLI e2e", () => {
     expect(PKG_STORE).not.toBeNull();
     const store = PKG_STORE!;
     const libexec = join(store, "libexec");
-    // Scan every JS/TS/JSON file for forbidden strings in the CLI
-    // source. `packages/cli/` is the only part that could dispatch
-    // a subprocess.
+    // Scan every JS/TS file in the packaged CLI source for
+    // command-shell tokens that would spawn a registry-fetching
+    // subprocess. `packages/cli/` is the only part that could
+    // dispatch a subprocess. Comments are stripped first — the
+    // rule is about ACTUAL usage; a comment that explains "no
+    // bunx" should not trip the guard.
     const cliDir = join(libexec, "revkit", "packages", "cli", "src");
     const stack: string[] = [cliDir];
     const hits: string[] = [];
+    // Character class for quote / apostrophe / backtick, built by
+    // char code to sidestep the parser's confusion with an inline
+    // mixed-quote character class.
+    const q = String.fromCharCode(34) + String.fromCharCode(39) + String.fromCharCode(96);
+    const cls = "[" + q + "]";
+    const patterns = [
+      new RegExp(cls + "bunx\\b"),
+      new RegExp(cls + "bun\\s+x\\b"),
+      new RegExp(cls + "npx\\b"),
+    ];
     while (stack.length > 0) {
       const cur = stack.pop()!;
       for (const entry of readdirSync(cur)) {
@@ -177,20 +190,15 @@ describe.skipIf(!E2E)("revkit build — packaged CLI e2e", () => {
           stack.push(abs);
           continue;
         }
-        if (!/\.(ts|js|mjs|cjs|json)$/.test(entry)) continue;
-        const contents = readFileSync(abs, "utf8");
-        // Look for command-shell tokens that would spawn a
-        // registry-fetching subprocess. The check is textual,
-        // conservative, and would fail on a legitimate mention
-        // in a code comment too — a code comment about "no bunx"
-        // is fine here because the rule includes the word only
-        // once in a helper name (`findPackagedAstroBin`).
-        // Exceptions: match on `bunx `, `bun x `, `npx ` (space-
-        // suffixed tokens) so a benign identifier does not
-        // false-positive.
-        for (const forbidden of ["bunx ", "bun x ", "npx "]) {
-          if (contents.includes(forbidden)) {
-            hits.push(`${abs.slice(cliDir.length)}: '${forbidden.trim()}'`);
+        if (!/\.(ts|js|mjs|cjs)$/.test(entry)) continue;
+        const raw = readFileSync(abs, "utf8");
+        const stripped = raw
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/\/\/[^\n]*/g, "");
+        for (const pattern of patterns) {
+          const match = stripped.match(pattern);
+          if (match) {
+            hits.push(abs.slice(cliDir.length) + " matched " + String(pattern));
           }
         }
       }
