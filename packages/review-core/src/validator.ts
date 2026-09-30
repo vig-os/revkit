@@ -21,7 +21,9 @@
 //                      `resolved` (`not-resolved`).
 //   handover         — every commentId in `commentIds` must exist in
 //                      the log (`unknown-comment`).
-//   presence         — no thread state; always accepted.
+//   delivery.mode_changed — no thread state; always accepted.
+//   presence         — REMOVED from durable log in M2 item 6 round 2.
+//                      Now broadcast ephemerally over /events only.
 //   ask.created      — the askId must be new (`duplicate-ask`).
 //   ask.answered     — the askId must be a prior `ask.created` and still
 //                      pending (`unknown-ask`, `ask-not-pending`); the
@@ -317,7 +319,9 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       }
       return { ok: true };
     }
-    case "presence":
+    case "delivery.mode_changed":
+      // Mode changes have no cross-event invariant (the daemon
+      // dedupes no-op changes at emit time). Always accept.
       return { ok: true };
     case "doc.published":
       // No thread state to update: the event records that the agent

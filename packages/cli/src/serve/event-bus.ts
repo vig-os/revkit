@@ -14,7 +14,18 @@
 
 import type { ReviewEvent } from "@revkit/review-core";
 
+/** Which audience this subscriber represents (M2 item 6). The
+ * daemon decides at append time whether an event is agent-eligible
+ * (based on the derived pending set) and passes an audience mask
+ * to `publish`; a subscriber tagged `"agent"` only receives events
+ * whose mask contains `"agent"`, and vice versa for `"rail"`. */
+export type SubscriberAudience = "agent" | "rail";
+
 export interface Subscriber {
+  /** Which stream this subscriber represents. Defaults to `"rail"`
+   * (see-everything) when omitted so pre-M2-item-6 subscribers
+   * keep the previous behaviour. */
+  readonly audience?: SubscriberAudience;
   /** Push an event to the subscriber. Rejects (throws) on delivery
    * failure — the bus drops the subscriber and moves on. */
   deliver(event: ReviewEvent): void | Promise<void>;
@@ -22,6 +33,15 @@ export interface Subscriber {
    * on a delivery failure or on a graceful `unsubscribe`). Idempotent;
    * the subscriber uses it to close its underlying transport. */
   close(): void;
+}
+
+/** Options for `EventBus.publish`. `audiences` is the mask the
+ * daemon computed at append time. Every subscriber whose
+ * `audience` is in the mask receives the event; subscribers with
+ * no `audience` set are treated as `rail` (see-everything). Absent
+ * mask = both audiences. */
+export interface PublishOptions {
+  readonly audiences?: readonly SubscriberAudience[];
 }
 
 export class EventBus {
@@ -50,13 +70,18 @@ export class EventBus {
    * been offered the event — some transports (SSE) do not backpressure,
    * but a WebSocket send returns immediately either way, so this
    * function does not become a bottleneck. */
-  async publish(event: ReviewEvent): Promise<void> {
+  async publish(event: ReviewEvent, options?: PublishOptions): Promise<void> {
     const failures: Subscriber[] = [];
     // Snapshot the subscriber set — a subscriber that unsubscribes
     // itself during delivery must not mutate the iterator we walk.
     const snapshot = [...this.#subscribers];
+    const audiences = options?.audiences;
     for (const subscriber of snapshot) {
       try {
+        if (audiences !== undefined) {
+          const own = subscriber.audience ?? "rail";
+          if (!audiences.includes(own)) continue;
+        }
         await subscriber.deliver(event);
       } catch {
         failures.push(subscriber);

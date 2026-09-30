@@ -113,10 +113,21 @@ export {
 } from "./asks-view.ts";
 export { exportArchive, parseArchive, threadArchiveSchema, type ThreadArchive } from "./export.ts";
 export {
+  DEFAULT_DELIVERY_MODE,
+  currentDeliveryMode,
+  deliveredCommentIds,
+  isPending,
+  pendingCommentIds,
+} from "./delivery.ts";
+export {
+  deliveryModeSchema,
+  handoverTriggerSchema,
   presenceStateSchema,
   reanchorMethodSchema,
   reviewEventKinds,
   reviewEventSchema,
+  type DeliveryMode,
+  type HandoverTrigger,
   type PresenceState,
   type ReanchorEventMethod,
   type ReviewEvent,

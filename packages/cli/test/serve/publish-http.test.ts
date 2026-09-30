@@ -159,12 +159,17 @@ describe("POST /api/publish — happy path", () => {
   });
 
   test("`doc.published` reaches an SSE subscriber", async () => {
-    // Open an event stream first, subscribe with ?since=0, then
-    // publish. The frame should land on this stream.
+    // Open an agent-audience event stream, wait for the SSE
+    // `hello` frame (the first `: keepalive` the daemon flushes on
+    // `start` to prove the subscriber is primed), THEN publish.
+    // Reading the first frame synchronously before the POST is
+    // the race guard: on `start` the daemon primes the resume
+    // slice + attaches the subscriber, so a frame arriving after
+    // the first keepalive is guaranteed to hit us.
     const events: unknown[] = [];
     const eventStream = new Response(
       (
-        await fetch(`${ctx.handle.url}/events?since=0`, {
+        await fetch(`${ctx.handle.url}/events?for=agent&since=0`, {
           headers: {
             authorization: `Bearer ${ctx.handle.agentToken}`,
             accept: "text/event-stream",
@@ -176,9 +181,15 @@ describe("POST /api/publish — happy path", () => {
     const reader = eventStream.body!.getReader();
     const decoder = new TextDecoder();
     let buffered = "";
-    const readOne = async (): Promise<string> => {
-      while (true) {
-        const { value, done } = await reader.read();
+    const readOne = async (deadlineMs: number): Promise<string> => {
+      while (Date.now() < deadlineMs) {
+        const readPromise = reader.read();
+        const timeout = new Promise<undefined>((r) =>
+          setTimeout(() => r(undefined), Math.max(0, deadlineMs - Date.now())),
+        );
+        const winner = await Promise.race([readPromise, timeout]);
+        if (winner === undefined) return "";
+        const { value, done } = winner as ReadableStreamReadResult<Uint8Array>;
         if (done) return "";
         buffered += decoder.decode(value, { stream: true });
         const at = buffered.indexOf("\n\n");
@@ -188,23 +199,25 @@ describe("POST /api/publish — happy path", () => {
           return frame;
         }
       }
+      return "";
     };
-    // Give the SSE `start` a moment to prime; the daemon flushes a
-    // `: keepalive` first.
-    void readOne();
-    await new Promise((r) => setTimeout(r, 50));
+    // 1) Wait for the first SSE frame — the daemon's
+    //    `sseKeepalive()` fires from inside `start()`, so its
+    //    presence proves `bus.subscribe(subscriber)` has run.
+    const helloDeadline = Date.now() + 2_000;
+    const hello = await readOne(helloDeadline);
+    expect(hello.length).toBeGreaterThan(0);
+    // 2) Publish. The event's fan-out lands AFTER our subscriber
+    //    is attached, so no race.
     const newBody = `# ADR-0999: Test\n\n- Status: Accepted\n\n## Context\n\nEvent flow test.\n`;
     const response = await publish(ctx.handle, {
       docs: [{ path: "docs/adr/0999-test.md", content: newBody }],
     });
     expect(response.status).toBe(201);
-    // Read frames for up to 1 s and look for `doc.published`.
-    const deadline = Date.now() + 2_000;
-    while (Date.now() < deadline) {
-      const frame = await Promise.race([
-        readOne(),
-        new Promise<string>((r) => setTimeout(() => r(""), 200)),
-      ]);
+    // 3) Read frames for up to 2 s and look for `doc.published`.
+    const frameDeadline = Date.now() + 2_000;
+    while (Date.now() < frameDeadline) {
+      const frame = await readOne(frameDeadline);
       if (frame === "") continue;
       const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
       if (dataLine === undefined) continue;
@@ -219,7 +232,11 @@ describe("POST /api/publish — happy path", () => {
     reader.cancel();
     const kinds = events.map((e) => (e as { kind?: string }).kind);
     expect(kinds).toContain("doc.published");
-    expect(kinds).toContain("presence"); // editing + idle envelope
+    // Presence beacons are ephemeral (M2 item 6 round 2): the hub
+    // broadcasts a `presence` frame with no `seq`. Both editing
+    // and idle land on this same stream, so we require at least
+    // one to prove the envelope wraps the publish.
+    expect(kinds).toContain("presence");
   });
 });
 

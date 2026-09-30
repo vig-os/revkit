@@ -58,11 +58,23 @@
 //   same rule set as the pre-commit hook — refuses hand-rolled
 //   HTML, off-vocab terms, mis-shaped plots, and so on.
 //
-// **Presence** (ADR-0007 §5.3 last paragraph): the orchestrator
-// emits `presence editing` BEFORE the write and `presence idle`
-// AFTER the fanout so a viewer sees "agent is editing X" for the
-// duration of the publish, matching the acceptance shape of
-// PR #53's delivery-modes work.
+// **Presence** (ADR-0007 §5.3 last paragraph, M2 item 6 round 2):
+// presence beacons are EPHEMERAL — a viewer chip, not a durable
+// log entry. The orchestrator calls the presence hub's
+// `editing(actor, location)` BEFORE the write and `idle(actor)`
+// AFTER the fanout, matching the "agent is editing X" flow #53
+// shipped. Nothing about the publish itself lives on the
+// `PresenceFrame` stream — that stream is per-viewer state, not a
+// history.
+//
+// **Fan-out audiences** (M2 item 6 round 2). `doc.published`
+// concerns BOTH the rail (page reload) and the agent (turn-level
+// "the doc I was iterating on landed"), so the publish emits with
+// audiences=["rail","agent"]. The delivery mode's own filter
+// (`shouldFanOutToAgent`) accepts `doc.published` unconditionally
+// today because publish is initiated by the agent — no
+// human-authored comment gating is relevant. If a future ADR
+// changes that, this is the one call site to update.
 
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -71,7 +83,8 @@ import type { Author, ReviewEvent } from "@revkit/review-core";
 import { revisionOf } from "@revkit/review-core";
 import { runCheck, toCheckFiles } from "../check.ts";
 import { spawnGh } from "../gh-runner.ts";
-import type { EventBus } from "./event-bus.ts";
+import type { EventBus, SubscriberAudience } from "./event-bus.ts";
+import type { PresenceHub } from "./presence-hub.ts";
 import type { SqliteThreadStore } from "./sqlite-store.ts";
 import {
   PUBLISH_FILE_MAX_BYTES,
@@ -128,6 +141,7 @@ export interface PublishDependencies {
   readonly repoRoot: string;
   readonly store: SqliteThreadStore;
   readonly bus: EventBus;
+  readonly presence: PresenceHub;
   readonly agentActor: Author;
   readonly systemActor: Author;
   readonly repoSlug: string;
@@ -136,6 +150,11 @@ export interface PublishDependencies {
    * pass a no-op. */
   readonly refreshAnchors: (path: string) => Promise<void>;
   readonly reconcileWatchers: () => void;
+  /** Fold a freshly-appended event into the delivery adapter's
+   * incremental cache. The daemon's own `safeIngest` handles the
+   * `IngestGapError` recovery path; publish just calls this after
+   * every append so the derived state stays in lockstep. */
+  readonly ingestDelivery: (event: ReviewEvent) => Promise<void>;
   /** Serve-dir root — used to locate the pre-existing built HTML
    * for the fast-path splice. `undefined` when the daemon serves
    * a directory that isn't a real astro build (a template-smoke
@@ -355,21 +374,13 @@ async function runPublishInner(
     };
   }
 
-  // 4) Emit `presence editing` for every doc in the batch so a
-  //    viewer sees the "agent is editing X" beacon while the
-  //    render + fanout runs. Presence is stateless (validator
-  //    accepts unconditionally); a rebuilder wiring an override
-  //    without emitting presence still works, but the ADR-0007
-  //    §5.3 last paragraph makes it a requirement.
-  const nowIso = new Date().toISOString();
+  // 4) Emit `presence editing` for every doc in the batch. Round-2
+  //    (M2 item 6) makes presence EPHEMERAL — no store append; the
+  //    hub broadcasts the frame straight to `/events` subscribers.
+  //    A restart forgets the beacon, which is exactly the right
+  //    lifetime for "agent is editing X RIGHT NOW".
   for (const entry of resolved) {
-    void nowIso;
-    await appendAndPublish(deps, {
-      kind: "presence",
-      actor: deps.agentActor,
-      state: "editing",
-      path: entry.input.path,
-    });
+    deps.presence.editing(deps.agentActor, { path: entry.input.path });
   }
 
   // 5) Fast-path render + shell splice.
@@ -449,7 +460,7 @@ async function runPublishInner(
       // affects it.
       paths: publishedPaths,
     };
-    const seq = await appendAndPublishRaw(deps, event);
+    const seq = await appendAndFanOut(deps, event, ["rail", "agent"] as const);
     seqs.push(seq);
   }
 
@@ -474,14 +485,9 @@ async function runPublishInner(
   deps.reconcileWatchers();
 
   // 8) Emit `presence idle` per doc so the "agent is editing X"
-  //    beacon flips off.
+  //    beacon flips off. Ephemeral broadcast; no store append.
   for (const entry of resolved) {
-    await appendAndPublish(deps, {
-      kind: "presence",
-      actor: deps.agentActor,
-      state: "idle",
-      path: entry.input.path,
-    });
+    deps.presence.idle(deps.agentActor, { path: entry.input.path });
   }
 
   return {
@@ -576,23 +582,21 @@ export function spliceArticleBody(shellHtml: string, fragment: string): string |
 
 // ── event append + fanout ──────────────────────────────────────────
 
-/** Append + publish a stateless event (`presence`). Returns the seq
- * so the caller can log it. */
-async function appendAndPublish(
+/** Append + fold into the delivery-mode cache + fan out to the named
+ * audiences. `doc.published` reaches both `rail` and `agent`. Returns
+ * the assigned `seq`. */
+async function appendAndFanOut(
   deps: PublishDependencies,
   event: import("@revkit/review-core").ReviewEventInput,
-): Promise<number> {
-  return await appendAndPublishRaw(deps, event);
-}
-
-async function appendAndPublishRaw(
-  deps: PublishDependencies,
-  event: import("@revkit/review-core").ReviewEventInput,
+  audiences: readonly SubscriberAudience[],
 ): Promise<number> {
   const seq = await deps.store.append(event);
   const events = await deps.store.since(seq - 1);
   const materialised = events.find((e: ReviewEvent) => e.seq === seq);
-  if (materialised !== undefined) void deps.bus.publish(materialised);
+  if (materialised !== undefined) {
+    await deps.ingestDelivery(materialised);
+    void deps.bus.publish(materialised, { audiences });
+  }
   return seq;
 }
 

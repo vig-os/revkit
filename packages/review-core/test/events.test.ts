@@ -62,15 +62,13 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     commentIds: ["c-1"],
     revision: "d".repeat(64),
   },
-  presence: {
+  "delivery.mode_changed": {
     seq: 6,
     ts: t,
-    actor: { kind: "agent", id: "revkit-live" },
-    kind: "presence",
-    state: "editing",
-    path: "docs/adr/0006-comments-anchoring-event-log.md",
-    startLine: 40,
-    endLine: 60,
+    actor,
+    kind: "delivery.mode_changed",
+    from: "handover",
+    to: "live",
   },
   "ask.created": {
     seq: 7,
@@ -208,14 +206,13 @@ describe("reviewEventSchema — rejections", () => {
     expect(reviewEventSchema.safeParse(emptyBody).success).toBe(false);
   });
 
-  test("presence with only startLine (no endLine) is rejected — half-specified range", () => {
-    const bad = { ...validPerKind.presence } as Record<string, unknown>;
-    delete bad.endLine;
-    expect(reviewEventSchema.safeParse(bad).success).toBe(false);
+  test("delivery.mode_changed accepts from=null (first-write on a fresh log)", () => {
+    const first = { ...validPerKind["delivery.mode_changed"], from: null } as Record<string, unknown>;
+    expect(reviewEventSchema.safeParse(first).success).toBe(true);
   });
 
-  test("presence with endLine < startLine is rejected", () => {
-    const bad = { ...validPerKind.presence, startLine: 50, endLine: 40 };
+  test("delivery.mode_changed rejects garbage `to`", () => {
+    const bad = { ...validPerKind["delivery.mode_changed"], to: "loud" } as Record<string, unknown>;
     expect(reviewEventSchema.safeParse(bad).success).toBe(false);
   });
 

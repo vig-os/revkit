@@ -10,7 +10,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | A2 | Inline comments on any block, persistent, structured to the agent | ADR-0002, ADR-0006, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
 | A3 | Threads with the agent anchored on a block | ADR-0007, ADR-0011, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
 | A4 | Agent publishes a report; page refreshes < 1 s without a full build | ADR-0001, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 item 9) |
-| A5 | Live delivery: mid-turn / while away; live, handover, quiet modes | ADR-0006, ADR-0007, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | in progress |
+| A5 | Live delivery: mid-turn / while away; live, handover, quiet modes | ADR-0006, ADR-0007, ADR-0011, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 item 6: modes + handover + presence + hook + `@agent now`) |
 | A6 | Suggested edits on rendered text land in the source | ADR-0006 | M6 | [#11](https://github.com/vig-os/revkit/issues/11) | planned |
 | A7 | Co-editing the source beside the rendered view (later) | ADR-0006, ADR-0023 (deferred) | M7 | [#12](https://github.com/vig-os/revkit/issues/12) | planned |
 | A8 | Comments survive rebuilds; re-anchor, never lost (orphaned) | ADR-0006, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 item 5a engine + item 5b daemon) |
@@ -28,7 +28,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | C4 | Plots are spec + data side files, never inline | ADR-0004, ADR-0005 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C5 | LaTeX math rendered at build, no client JS | ADR-0001 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 | C6 | Phone / tablet / desktop layouts, stock Starlight sidebar + prev/next (ADR-0001 amendment) | ADR-0001, ADR-0017, ADR-0018, ADR-0019 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
-| D1 | Any repo adopts revkit with one flake input + one line | ADR-0010, ADR-0021 | M5 | [#10](https://github.com/vig-os/revkit/issues/10) | planned |
+| D1 | Any repo adopts revkit with one flake input + one line | ADR-0010, ADR-0021 | M5 | [#10](https://github.com/vig-os/revkit/issues/10), [#57](https://github.com/vig-os/revkit/issues/57) (part 2) | partial (M5 part 1 shipped: `packages.revkit`, `templates.default`, `lib.hooks`; NEEDS `revkit build` + `serve` auto-build to render consumer docs — see [DESIGN-0002 §5](designs/DESIGN-0002-devkit-review-module.md#5-gap-between-m5-part-1-and-full-d1-acceptance) gap, tracked at [#57](https://github.com/vig-os/revkit/issues/57)) |
 | D2 | Per-org hosting with GitHub-org auth | ADR-0008, ADR-0014, ADR-0015, ADR-0020 | M4 | [#9](https://github.com/vig-os/revkit/issues/9) | planned |
 | E1 | Static by default, JS only where interaction needs it | ADR-0001, ADR-0002, ADR-0004 | M1 | [#6](https://github.com/vig-os/revkit/issues/6) | planned |
 
