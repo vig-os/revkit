@@ -249,4 +249,117 @@ describe("reducer: item 4 — orphaned → resolved, and reopen restores previou
     expect(state.threads.get("T1")?.status).toBe("orphaned");
     expect(state.threads.get("T1")?.resumeStatus).toBeUndefined();
   });
+
+  test("thread.reanchored on a RESOLVED thread updates resumeStatus to 'open' (PR #47 round-1 nit)", () => {
+    // Reviewer's probe: orphaned → resolved → reanchored → reopened
+    // should end `open` (the reanchor brought the block back). On
+    // 3edec7d8 the reanchor's status logic only fired on
+    // `status === "orphaned"`, so a reanchor on a resolved-was-
+    // orphaned thread left `resumeStatus = "orphaned"` untouched
+    // and the reopen returned to `orphaned` with a fresh anchor
+    // and no reason — a nonsense state.
+    const NEW_LINE_ANCHOR = {
+      path: "docs/x.mdx",
+      startLine: 7,
+      endLine: 7,
+      quote: { exact: "moved target", prefix: "", suffix: "" },
+      revision: "1".repeat(64),
+    } as const;
+    const events = stamp([
+      // 1. Import unanchored (starts orphaned).
+      {
+        kind: "comment.created",
+        actor: { kind: "gh-user", id: "alice" },
+        threadId: "T1",
+        commentId: "C1",
+        anchor: UNANCHORED,
+        body: "imported",
+        orphanReason: "diffhunk-mismatch",
+      },
+      // 2. Human resolves the orphaned thread.
+      {
+        kind: "thread.resolved",
+        actor: { kind: "gh-user", id: "human" },
+        threadId: "T1",
+        resolution: "not applicable",
+      },
+      // 3. Pipeline re-anchors — the block came back. The
+      //    resumeStatus should flip to `open`, and the stale
+      //    `orphanReason` should be dropped.
+      {
+        kind: "thread.reanchored",
+        actor: { kind: "agent", id: "reanchor" },
+        threadId: "T1",
+        anchor: NEW_LINE_ANCHOR,
+        method: "quote-exact",
+      },
+      // 4. Reopen — must land on `open`, not `orphaned`.
+      {
+        kind: "thread.reopened",
+        actor: { kind: "gh-user", id: "human" },
+        threadId: "T1",
+      },
+    ]);
+    const thread = reduce(events).get("T1");
+    expect(thread?.status).toBe("open");
+    // Reanchor also drops the orphanReason (the block came back).
+    expect(thread?.orphanReason).toBeUndefined();
+    // The new anchor from step 3.
+    const anchor = thread!.anchor;
+    const isUnanchored = "kind" in anchor && anchor.kind === "unanchored";
+    expect(isUnanchored).toBe(false);
+    if (!isUnanchored) {
+      expect((anchor as typeof NEW_LINE_ANCHOR).startLine).toBe(7);
+    }
+  });
+
+  test("validator agrees: reanchor on resolved-was-orphaned updates resumeStatus to 'open'", () => {
+    const state = emptyLogState();
+    const NEW_LINE_ANCHOR = {
+      path: "docs/x.mdx",
+      startLine: 7,
+      endLine: 7,
+      quote: { exact: "moved target", prefix: "", suffix: "" },
+      revision: "1".repeat(64),
+    } as const;
+    const events = stamp([
+      {
+        kind: "comment.created",
+        actor: { kind: "gh-user", id: "alice" },
+        threadId: "T1",
+        commentId: "C1",
+        anchor: UNANCHORED,
+        body: "imported",
+      },
+      {
+        kind: "thread.resolved",
+        actor: { kind: "gh-user", id: "human" },
+        threadId: "T1",
+        resolution: "wontfix",
+      },
+      {
+        kind: "thread.reanchored",
+        actor: { kind: "agent", id: "reanchor" },
+        threadId: "T1",
+        anchor: NEW_LINE_ANCHOR,
+        method: "quote-exact",
+      },
+    ]);
+    for (const ev of events) validateNext(state, ev);
+    // The thread stays `resolved` — the reanchor respects the
+    // human's terminal decision — but its resumeStatus is now `open`.
+    expect(state.threads.get("T1")?.status).toBe("resolved");
+    expect(state.threads.get("T1")?.resumeStatus).toBe("open");
+    // Reopen from `resolved` restores `open`, not `orphaned`.
+    const reopen = reviewEventSchema.parse({
+      seq: 4,
+      ts: "2026-09-30T00:00:03.000Z",
+      kind: "thread.reopened",
+      actor: { kind: "gh-user", id: "human" },
+      threadId: "T1",
+    });
+    const result = validateNext(state, reopen);
+    expect(result.ok).toBe(true);
+    expect(state.threads.get("T1")?.status).toBe("open");
+  });
 });

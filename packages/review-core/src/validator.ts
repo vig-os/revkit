@@ -358,7 +358,16 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       // reducer records the anchor change and moves the status back
       // to open. The validator only needs to track status here (the
       // anchor lives outside `LogState`).
+      //
+      // PR #47 round-1 nit: if the thread is currently `resolved` and
+      // was orphaned BEFORE the resolve (`resumeStatus === "orphaned"`),
+      // the reanchor also flips `resumeStatus` to `open` — the block
+      // has come back, so a subsequent reopen must land on `open`,
+      // not on the stale pre-reanchor `orphaned` state.
       if (thread.status === "orphaned") thread.status = "open";
+      if (thread.status === "resolved" && thread.resumeStatus === "orphaned") {
+        thread.resumeStatus = "open";
+      }
       return { ok: true };
     }
     case "thread.orphaned": {

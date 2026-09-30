@@ -135,6 +135,97 @@ describe("verifyContentAgainstDiffHunk — item 2: hunk-empty is refused, not pa
   });
 });
 
+describe("verifyContentAgainstDiffHunk — item 2 (mutation guard): LEFT walk ignores '+' lines, RIGHT walk ignores '-' lines", () => {
+  test("mixed +/- hunk on LEFT: counting '+' lines instead of '-' would over-count and land on the wrong content line", () => {
+    // Reviewer's PR #47 round-1 nit: a mutation that counted `+`
+    // lines during a LEFT walk (or `-` lines during a RIGHT walk)
+    // would compute the wrong contentLineNo and either misalign
+    // the check silently or land on a `line-missing`. This test
+    // pins the rule: the walk skips lines whose marker is not
+    // ` ` and not the side's marker.
+    //
+    // Base blob (LEFT side): three lines, `alpha` at line 3.
+    const base = "line 1\nline 2\nalpha\n";
+    // Hunk describing that line 3 (alpha) was replaced by
+    // three new lines. The alpha deletion is the ONLY LEFT-side
+    // line; the three additions are RIGHT-only. Original LEFT
+    // line = 3.
+    const hunk =
+      "@@ -1,3 +1,5 @@\n" +
+      " line 1\n" +
+      " line 2\n" +
+      "-alpha\n" +
+      "+alpha replaced 1\n" +
+      "+alpha replaced 2\n" +
+      "+alpha replaced 3\n";
+    // Correct behaviour: walking backwards on LEFT, we skip the
+    // three `+` lines (they don't advance the LEFT content line
+    // counter), match `-alpha` at line 3, then match ` line 2`
+    // at line 2, then ` line 1` at line 1. All match.
+    expect(
+      verifyContentAgainstDiffHunk({
+        content: base,
+        originalLine: 3,
+        diffHunk: hunk,
+        side: "LEFT",
+      }),
+    ).toBe("matched");
+    // A mutation that COUNTED the `+` lines on the LEFT walk
+    // would decrement `contentLineNo` from 3 down through the
+    // `+` lines and try to match `-alpha` at line 0 (or below) —
+    // that would return `mismatched` or `line-missing`, both
+    // different from `matched`. The assertion above pins the
+    // rule without hand-testing the exact wrong outcome.
+  });
+
+  test("mixed +/- hunk on RIGHT: RIGHT walk must skip '-' lines to land at the right RIGHT line", () => {
+    // Symmetric: RIGHT blob at line 5 should match `+gamma` at
+    // hunk position (last +). If a RIGHT walk counted `-` lines,
+    // the RIGHT content-line counter would advance past `alpha`
+    // and land on the wrong line.
+    const head = "keep 1\nkeep 2\nkeep 3\nkeep 4\ngamma\n";
+    const hunk =
+      "@@ -1,5 +1,5 @@\n" +
+      " keep 1\n" +
+      " keep 2\n" +
+      "-was alpha\n" +
+      "-was beta\n" +
+      " keep 3\n" +
+      " keep 4\n" +
+      "+gamma\n";
+    expect(
+      verifyContentAgainstDiffHunk({
+        content: head,
+        originalLine: 5,
+        diffHunk: hunk,
+        side: "RIGHT",
+      }),
+    ).toBe("matched");
+  });
+
+  test("LEFT walk still catches a wrong-context mismatch when '-' lines agree", () => {
+    // If the LEFT walk correctly SKIPS `+` lines but still walks
+    // the ` ` context lines, a wrong context blob is caught.
+    const wrongBase = "line 1\nWRONG CONTEXT\nalpha\n";
+    const hunk =
+      "@@ -1,3 +1,5 @@\n" +
+      " line 1\n" +
+      " line 2\n" +
+      "-alpha\n" +
+      "+alpha replaced 1\n" +
+      "+alpha replaced 2\n" +
+      "+alpha replaced 3\n";
+    expect(
+      verifyContentAgainstDiffHunk({
+        content: wrongBase,
+        originalLine: 3,
+        diffHunk: hunk,
+        side: "LEFT",
+      }),
+    ).toBe("mismatched");
+  });
+});
+
 describe("verifyContentAgainstDiffHunk — line-missing (unchanged behaviour)", () => {
   test("originalLine beyond the blob's line count → line-missing", () => {
     const result = verifyContentAgainstDiffHunk({

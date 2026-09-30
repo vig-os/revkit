@@ -78,12 +78,16 @@ export const threadSchema = z
     /** The reason string from the most recent `thread.orphaned`
      * event on this thread, or the reason recorded on
      * `comment.created` for a thread born unanchored. Present
-     * ONLY when `status === "orphaned"` and a reason was supplied;
-     * cleared by a subsequent `thread.reanchored` (which un-orphans
-     * the thread). Read by the rail's orphan panel so the human
-     * sees WHY the anchor was lost — the pipeline's own account
-     * rather than a synthesised sentence. Field name matches
-     * PR #45 for merge compatibility (issue #46). */
+     * when the thread was ever orphaned and the pipeline supplied
+     * a reason — including on a `resolved` thread that was
+     * orphaned BEFORE the resolve, so a subsequent
+     * `thread.reopened` restores the reason alongside the
+     * `orphaned` state (issue #46 item 4). Cleared by
+     * `thread.reanchored` (the block came back). Read by the
+     * rail's orphan panel so the human sees WHY the anchor was
+     * lost — the pipeline's own account rather than a synthesised
+     * sentence. Field name matches PR #45 for merge compatibility
+     * (issue #46). */
     orphanReason: z.string().min(1).optional(),
     /** Structured origin metadata for a thread imported from an
      * external provider (currently GitHub). Projected from

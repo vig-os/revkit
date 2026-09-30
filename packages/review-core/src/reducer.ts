@@ -140,13 +140,25 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       // When un-orphaning, drop the stale `orphanReason` — the block
       // came back and the rail must stop displaying the old reason.
       // Field name matches PR #45.
+      //
+      // PR #47 round-1 nit: if the thread is currently `resolved` and
+      // its `resumeStatus` records that it was `orphaned` before the
+      // resolve, the reanchor also updates `resumeStatus` to `open`.
+      // Otherwise a subsequent `thread.reopened` would return to
+      // `orphaned` — a stale answer to the pre-reanchor question — on
+      // a thread whose block has since been found again.
       const { orphanReason: _prevReason, ...rest } = thread;
       void _prevReason;
+      const nextResume =
+        thread.status === "resolved" && thread.resumeStatus === "orphaned"
+          ? ("open" as const)
+          : thread.resumeStatus;
       threads.set(event.threadId, {
         ...rest,
         anchor: event.anchor,
         status: nextStatus,
         updatedAt: event.ts,
+        ...(nextResume !== undefined ? { resumeStatus: nextResume } : {}),
       });
       return;
     }
