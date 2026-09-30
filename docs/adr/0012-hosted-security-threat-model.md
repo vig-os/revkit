@@ -49,3 +49,26 @@ previews path-based rather than per-subdomain (ADR-0008).
 
 Blocks M3. Isolation weaker than per-subdomain origins is accepted in exchange for zero certificate cost; revisit if
 third-party (non-org) repos are ever onboarded.
+
+## Amendment (2026-09-30)
+
+Clarifications from the M2 build-out of the CSP on `revkit serve` (issue #22; see also the ADR-0013 amendment on the
+same date for the local daemon's per-directive specifics).
+
+- **Inline-script hash allowlist as a release artefact.** The M2 daemon consumes the same set. The site build emits
+  `dist/.revkit/csp-hashes.json` (version `1`, algorithm `sha256`, a sorted deduped array of hex digests) from the
+  same parse5 walk `revkit check-dist` uses; a hash `check-dist` allows on disk is a hash the daemon serves the
+  CSP for. The Worker (M3/M4) will read the same artefact from the release bundle rather than reprocessing HTML.
+- **`script-src` path scoping.** The M2 daemon lists the exact loopback URLs for its script sources
+  (`http://127.0.0.1:<port>/-/rail.js` and `.../_astro/`). The hosted Worker will use `/_revkit/<version>/` on the
+  revkit-owned origin as this ADR already prescribes; the daemon exception is documented in ADR-0013.
+- **`'unsafe-eval'` scope.** ADR-0012's `script-src` never contains `'unsafe-eval'`. The local daemon (M2) accepts it
+  because the rail bundle uses `solid-js/html`, whose runtime compiles templates via `new Function()`; the hosted
+  Worker (M3/M4) will not ship that runtime and keeps `script-src` free of `'unsafe-eval'`. See ADR-0013 amendment.
+- **`connect-src` and WebSocket.** CSP L3 (Chromium ≥ 96, Firefox ≥ 99) treats `'self'` as covering `ws://` on the
+  same origin; the hosted Worker keeps `'self'` alone. The local daemon adds an explicit `ws://127.0.0.1:<port>` for
+  older WebKit builds.
+- **Response hygiene beyond `nosniff`.** Every response also carries `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, and a `Permissions-Policy`
+  denying camera / microphone / geolocation / payment / USB / WebAuthn / display-capture / … . API JSON, launch-code
+  responses, and the `/-/auth` 302 carry `Cache-Control: no-store`. The M3/M4 Worker will ship the same set.

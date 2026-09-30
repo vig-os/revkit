@@ -24,3 +24,31 @@ try to reach (CSRF / DNS rebinding).
 ## Consequences
 
 Blocks M2.
+
+## Amendment (2026-09-30)
+
+Details of the M2 CSP wiring on `revkit serve` (issue #22, PR follow-up to this ADR):
+
+- **Script path.** The daemon keeps `/-/rail.js` (and `/-/rail.css`) for the rail bundle rather than moving it to
+  ADR-0012's `/_revkit/<version>/` convention. Reason: `/_revkit/<version>/` addresses a hosted origin that co-tenants
+  many preview paths — the version prefix keeps the CSP `script-src` naming the *current* revkit bundle and refuses an
+  older one. The local daemon serves one project at a time from an isolated loopback origin, and the rail bundle is
+  built on demand from the CLI's own source tree; there is no older version to load. `script-src` still names the
+  exact daemon paths — `http://127.0.0.1:<port>/-/rail.js` and `http://127.0.0.1:<port>/_astro/` — so any other script
+  path is refused by the browser as a CSP violation.
+- **`connect-src`.** The header lists both `'self'` and `ws://127.0.0.1:<port>` explicitly. CSP L3 defines `'self'` to
+  cover the same-origin WebSocket scheme (Chromium ≥ 96, Firefox ≥ 99); the explicit `ws://` origin is defence in
+  depth for older WebKit builds that treat `'self'` and `ws://` as distinct schemes.
+- **`script-src 'unsafe-eval'`.** The rail imports `solid-js/html`, whose tagged-template runtime compiles templates
+  into JS functions via `new Function()`. Without `'unsafe-eval'` those templates refuse. The daemon is a
+  single-user loopback origin serving revkit's own bundle, so the widening is accepted here. The M3/M4 hosted worker
+  (ADR-0012) rebuilds the rail with pre-compiled templates and does **not** allow `'unsafe-eval'`.
+- **Response hygiene.** Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+  `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, and a `Permissions-Policy`
+  denying the powerful features (`camera`, `microphone`, `geolocation`, `payment`, `usb`, `publickey-credentials-*`,
+  …). API JSON, `/-/launch-code`, and the `/-/auth` 302 also carry `Cache-Control: no-store`; the SSE stream keeps
+  its own `no-cache, no-transform` (stronger than `no-store` for a long-lived response, blocks buffering middleboxes).
+- **Inline-script hashes.** The site build emits `dist/.revkit/csp-hashes.json` from the same parse5 walk that
+  `revkit check-dist` uses (one source of truth: whatever `check-dist` allowlists, the daemon allows). The daemon
+  loads it at startup and **fails closed** if it is missing — HTML still serves, but `script-src` carries no hashes
+  and Starlight's inline bootstrap refuses. A startup log line names the artefact path and reason.

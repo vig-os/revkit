@@ -65,6 +65,8 @@ import {
   replyRequestSchema,
   resolveRequestSchema,
 } from "./api-schemas.ts";
+import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
+import { loadCspHashes } from "./csp-hashes.ts";
 
 /** Public options accepted by the daemon. */
 export interface StartDaemonOptions {
@@ -184,6 +186,29 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const staticServer = openStaticServer(options.dir);
   const bus = new EventBus();
 
+  // Load the inline-script hash allowlist (ADR-0012, issue #22). The
+  // artefact lives at `<dir>/.revkit/csp-hashes.json` and is emitted
+  // by `site/scripts/emit-csp-hashes.ts` from the same parse5 walk
+  // `revkit check-dist` uses — one source of truth for what a
+  // Starlight build ships as an inline bootstrap. Fail closed: a
+  // missing artefact means we serve HTML without any inline-script
+  // hash allowlisted; the theme-toggle bootstrap in Starlight then
+  // does not run. A startup log line names the artefact path and
+  // reason so the operator sees why. `revkit serve` never widens
+  // the CSP to compensate.
+  const cspLoad = loadCspHashes(options.dir);
+  if (cspLoad.loaded) {
+    logger.info("csp.hashes.loaded", {
+      count: cspLoad.hashes.length,
+      artefact: repoRelativeDisplay(options.repoRoot, cspLoad.artefactPath),
+    });
+  } else {
+    logger.warn("csp.hashes.missing", {
+      artefact: repoRelativeDisplay(options.repoRoot, cspLoad.artefactPath),
+      reason: cspLoad.reason,
+    });
+  }
+
   const agentToken = mintToken();
   const launchCode = mintToken();
   const auth = new AuthState({
@@ -240,7 +265,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           durationMs: duration,
           errorKind: (error as Error).name,
         });
-        return withHygiene(new Response("Internal Server Error", { status: 500 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Internal Server Error", { status: 500 }), "text", "text/plain; charset=utf-8");
       }
     },
     websocket: {
@@ -295,6 +320,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const port: number = server.port;
   const boundUrl = `http://127.0.0.1:${port}`;
   const launchUrl = `${boundUrl}/-/auth?code=${launchCode}`;
+
+  // Header context (ADR-0012 CSP + hygiene). Bound now that we have
+  // the port. The context is IMMUTABLE for the lifetime of the
+  // daemon — every response goes through `applyResponseHeaders` in
+  // `withHygiene`, so a hash change on disk after start is ignored
+  // (fresh daemon, fresh policy). Captured by closure below.
+  const headerCtx: HeaderContext = {
+    port,
+    inlineScriptHashes: cspLoad.loaded ? cspLoad.hashes : [],
+    cspHashesLoaded: cspLoad.loaded,
+  };
 
   // Per-start opaque id, echoed by `GET /-/health` so a client can
   // confirm the port answers as THIS daemon, and required by
@@ -412,7 +448,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const hostHeader = request.headers.get("host");
     if (!isLoopbackHost(hostHeader, port)) {
       logger.warn("request.rejected.host", { requestId, host: hostHeader ?? "" });
-      return withHygiene(new Response("Misdirected Request", { status: 421 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Misdirected Request", { status: 421 }), "text", "text/plain; charset=utf-8");
     }
 
     const method = request.method.toUpperCase();
@@ -432,12 +468,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // the daemon only (no tokens, no data).
     if (method === "GET" && url.pathname === "/-/health") {
       const body = JSON.stringify({ instanceId, pid: process.pid });
-      const response = new Response(body, {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-      response.headers.set("x-content-type-options", "nosniff");
-      return response;
+      return withHygiene(new Response(body, { status: 200 }), "json", "application/json; charset=utf-8");
     }
 
     // Fresh launch-code mint (PR #38 round-2 blocker 3). The startup
@@ -451,7 +482,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const bearer = bearerFromHeader(request.headers.get("authorization"));
       if (bearer === undefined || !auth.isAgent(bearer)) {
         logger.warn("launch-code.rejected.auth", { requestId });
-        return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
       }
       const minted = auth.mintLaunchCode();
       const launchUrl = `${boundUrl}/-/auth?code=${minted.value}`;
@@ -461,12 +492,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         ttlMs: options.launchCodeTtlMs ?? 60_000,
       });
       logger.info("launch-code.minted", { requestId });
-      const response = new Response(body, {
-        status: 200,
-        headers: { "content-type": "application/json; charset=utf-8" },
-      });
-      response.headers.set("x-content-type-options", "nosniff");
-      return response;
+      // `kind: "auth"` adds `Cache-Control: no-store` — a fresh
+      // launch code must never sit in a shared or disk cache
+      // between the agent handing it to the human and the
+      // human's browser exchanging it.
+      return withHygiene(new Response(body, { status: 200 }), "auth", "application/json; charset=utf-8");
     }
 
     // `/events` — SSE by default, WebSocket on upgrade. Origin check
@@ -536,11 +566,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // stole the bearer, which is worth refusing.
       if (origin !== null && !isLoopbackOrigin(origin, port)) {
         logger.warn("request.rejected.origin", { requestId, origin });
-        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
       }
       if (sfs !== null && sfs !== "same-origin" && sfs !== "none") {
         logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs });
-        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
       }
       return undefined;
     }
@@ -548,11 +578,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (origin !== null) {
       if (!isLoopbackOrigin(origin, port)) {
         logger.warn("request.rejected.origin", { requestId, origin });
-        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
       }
       if (sfs !== null && sfs !== "same-origin") {
         logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs });
-        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
       }
       return undefined;
     }
@@ -565,23 +595,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // browser request.
     if (sfs === "same-origin") return undefined;
     logger.warn("request.rejected.origin", { requestId, reason: sfs === null ? "missing" : `sfs=${sfs}` });
-    return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+    return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
   }
 
   function methodNotAllowed(): Response {
-    return withHygiene(new Response("Method Not Allowed", { status: 405 }), "text/plain; charset=utf-8");
+    return withHygiene(new Response("Method Not Allowed", { status: 405 }), "text", "text/plain; charset=utf-8");
   }
 
   function handleAuthExchange(url: URL, requestId: string): Response {
     const code = url.searchParams.get("code") ?? "";
     if (code.length === 0) {
       logger.warn("auth.exchange.missing-code", { requestId });
-      return withHygiene(new Response("Bad Request", { status: 400 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Bad Request", { status: 400 }), "text", "text/plain; charset=utf-8");
     }
     const outcome = auth.exchangeLaunchCode(code);
     if (!outcome.ok) {
       logger.warn("auth.exchange.rejected", { requestId, reason: outcome.reason });
-      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
     }
     logger.info("auth.exchange.ok", { requestId });
     // Deep-link target. The MCP `review_url` tool sets `?next=<path>`
@@ -600,7 +630,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         "set-cookie": setCookieHeader(cookieName(port), outcome.cookie),
       },
     });
-    return withHygiene(response, undefined);
+    // `kind: "auth"` — the Set-Cookie response must not be cached
+    // anywhere (no reverse proxy sits in front of a loopback
+    // daemon, but the same policy on the host-mode Worker is the
+    // point of one-source-of-truth here).
+    return withHygiene(response, "auth", undefined);
   }
 
   /** Validate a `next=` value for the auth redirect. Returns the
@@ -659,7 +693,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const actor = identifyActor(request);
     if (actor === undefined) {
       logger.warn("api.rejected.auth", { requestId, path: url.pathname });
-      return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
     }
 
     // GET /api/threads?path=&status=
@@ -783,7 +817,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
     }
 
-    return withHygiene(new Response("Not Found", { status: 404 }), "text/plain; charset=utf-8");
+    return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
   }
 
   async function appendAndReturn(
@@ -851,7 +885,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (forParam === "agent") {
       if (!hasValidBearer) {
         logger.warn("events.rejected.agent-token", { requestId });
-        return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
       }
     } else {
       // `/events` accepts the session cookie or the agent token. A
@@ -860,7 +894,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const cookieValue = readCookie(request.headers.get("cookie"), cookieName(port));
       if (!auth.hasSession(cookieValue) && !hasValidBearer) {
         logger.warn("events.rejected.no-session", { requestId });
-        return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
       }
     }
 
@@ -885,7 +919,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const data: WebSocketData = { since, requestId };
       const upgraded = srv.upgrade(request, { data });
       if (!upgraded) {
-        return withHygiene(new Response("Upgrade Failed", { status: 426 }), "text/plain; charset=utf-8");
+        return withHygiene(new Response("Upgrade Failed", { status: 426 }), "text", "text/plain; charset=utf-8");
       }
       // Successful upgrade: Bun ignores any response we return.
       return undefined;
@@ -976,11 +1010,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       status: 200,
       headers: {
         "content-type": "text/event-stream; charset=utf-8",
+        // `no-cache, no-transform` is stronger than `no-store` for
+        // an SSE stream: an intermediary that treats `no-store` as
+        // "hold nothing" may buffer the whole response instead of
+        // forwarding frames as they arrive. `applyResponseHeaders`
+        // sees `kind: "sse"` and does not overwrite this value.
         "cache-control": "no-cache, no-transform",
         connection: "keep-alive",
       },
     });
-    return withHygiene(response, undefined);
+    return withHygiene(response, "sse", undefined);
   }
 
   // ── static branch ─────────────────────────────────────────────────
@@ -991,7 +1030,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       decodedPath = decodeURIComponent(url.pathname);
     } catch {
       logger.warn("static.rejected.invalid-encoding", { requestId, path: url.pathname });
-      return withHygiene(new Response("Bad Request", { status: 400 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Bad Request", { status: 400 }), "text", "text/plain; charset=utf-8");
     }
     const result = staticServer.resolve(decodedPath);
     if (!result.ok) {
@@ -1001,20 +1040,27 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // reveals whether a "symlink" or "outside" file exists.
       logger.warn("static.rejected", { requestId, path: decodedPath, errorKind: result.kind });
       const status = result.kind === "invalid" || result.kind === "traversal" ? 400 : 404;
-      return withHygiene(new Response(status === 400 ? "Bad Request" : "Not Found", { status }), "text/plain; charset=utf-8");
+      return withHygiene(new Response(status === 400 ? "Bad Request" : "Not Found", { status }), "text", "text/plain; charset=utf-8");
     }
     const contentType = contentTypeForExtension(extname(result.absolutePath).toLowerCase());
     if (contentType === null) {
       // Unknown extension: refuse rather than sniff.
       logger.warn("static.rejected.mime", { requestId, path: decodedPath });
-      return withHygiene(new Response("Not Found", { status: 404 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
     }
+    // `kind: "html"` gets the full CSP header. Everything else is an
+    // asset (JS chunk, CSS, image, font, JSON side file); browsers
+    // apply the embedding document's CSP to fetched subresources, so
+    // an asset does not need one of its own. The hygiene triplet
+    // (nosniff / no-referrer / cross-origin isolation / permissions
+    // policy) still lands on every response.
+    const staticKind: ResponseKind = contentType.startsWith("text/html") ? "html" : "asset";
     if (request.method === "HEAD") {
       const size = staticServer.size(result.absolutePath);
-      return withHygiene(new Response(null, { status: 200, headers: { "content-length": String(size) } }), contentType);
+      return withHygiene(new Response(null, { status: 200, headers: { "content-length": String(size) } }), staticKind, contentType);
     }
     const body = Bun.file(result.absolutePath);
-    const rawResponse = withHygiene(new Response(body, { status: 200 }), contentType);
+    const rawResponse = withHygiene(new Response(body, { status: 200 }), staticKind, contentType);
     // Only HTML responses get the rail injected; a JS asset, CSS,
     // JSON, or image is served untouched. `injectRail` materialises
     // the body before feeding it to `HTMLRewriter` — a Bun 1.3.13
@@ -1046,7 +1092,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       bundle = await buildRailBundle();
     } catch (error) {
       logger.error("rail.build.failed", { requestId, errorKind: (error as Error).name });
-      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text/plain; charset=utf-8");
+      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text", "text/plain; charset=utf-8");
     }
     const isJs = url.pathname === RAIL_JS_PATH;
     const body = isJs ? bundle.js : bundle.css;
@@ -1054,25 +1100,44 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (method === "HEAD") {
       return withHygiene(
         new Response(null, { status: 200, headers: { "content-length": String(body.byteLength) } }),
+        "asset",
         contentType,
       );
     }
     // `body` is a `Uint8Array`; `new Response(body)` widens through
     // `BodyInit` — a cast keeps TS's stricter DOM types happy without
     // a runtime copy.
-    return withHygiene(new Response(body as BodyInit, { status: 200 }), contentType);
+    return withHygiene(new Response(body as BodyInit, { status: 200 }), "asset", contentType);
   }
 
-  /** Attach the response-hygiene headers every response carries:
-   * `X-Content-Type-Options: nosniff`, and (when the caller passed
-   * one) the explicit Content-Type. The full CSP is M2 item 8 (issue
-   * #22); this baseline ships now. */
-  function withHygiene(response: Response, contentType: string | undefined): Response {
-    response.headers.set("x-content-type-options", "nosniff");
-    if (contentType !== undefined) {
-      response.headers.set("content-type", contentType);
-    }
-    return response;
+  /** Attach the ADR-0012 response-hygiene headers (issue #22): CSP on
+   * HTML, `X-Content-Type-Options: nosniff`, `Referrer-Policy:
+   * no-referrer`, the cross-origin isolation pair, a
+   * `Permissions-Policy` denying the powerful features, and the
+   * per-kind `Cache-Control`. `kind` selects the CSP + Cache-Control
+   * shape (see `headers.ts`); `contentType` sets an explicit
+   * Content-Type when the response body needs one. */
+  function withHygiene(response: Response, kind: ResponseKind, contentType: string | undefined): Response {
+    return applyResponseHeaders(response, kind, contentType, headerCtx);
+  }
+
+  /** JSON body from `/api/*` (writes and reads). `kind: "json"` adds
+   * `Cache-Control: no-store` in addition to the hygiene triplet. */
+  function jsonResponse(body: unknown, status = 200): Response {
+    const response = new Response(JSON.stringify(body), { status });
+    return withHygiene(response, "json", "application/json; charset=utf-8");
+  }
+
+  /** 400 body used by every request-validation path. Always JSON. */
+  function badRequest(issues: unknown): Response {
+    const response = new Response(JSON.stringify({ error: "invalid-body", issues }), { status: 400 });
+    return withHygiene(response, "json", "application/json; charset=utf-8");
+  }
+
+  /** 413 body used by the request-size caps. */
+  function payloadTooLarge(): Response {
+    const response = new Response(JSON.stringify({ error: "payload-too-large" }), { status: 413 });
+    return withHygiene(response, "json", "application/json; charset=utf-8");
   }
 }
 
@@ -1133,33 +1198,6 @@ async function readCappedJsonBody(request: Request): Promise<
  * MAX_COMMENT_BODY_BYTES. */
 function enforceCommentBodyLimit(body: string): boolean {
   return Buffer.byteLength(body, "utf8") <= MAX_COMMENT_BODY_BYTES;
-}
-
-function jsonResponse(body: unknown, status = 200): Response {
-  const response = new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
-  response.headers.set("x-content-type-options", "nosniff");
-  return response;
-}
-
-function badRequest(issues: unknown): Response {
-  const response = new Response(JSON.stringify({ error: "invalid-body", issues }), {
-    status: 400,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
-  response.headers.set("x-content-type-options", "nosniff");
-  return response;
-}
-
-function payloadTooLarge(): Response {
-  const response = new Response(JSON.stringify({ error: "payload-too-large" }), {
-    status: 413,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
-  response.headers.set("x-content-type-options", "nosniff");
-  return response;
 }
 
 /** Cap on a source file the daemon will read to compute a
