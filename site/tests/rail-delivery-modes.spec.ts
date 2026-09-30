@@ -98,11 +98,15 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
 function writeFixture(): { path: string; cleanup: () => void } {
   const rel = "rail-mode-fixture.html";
   const abs = join(DIST, rel);
+  // A minimal accessible fixture: <h1> for axe's page-has-heading-one
+  // rule, one data-src'd paragraph so the rail's selection listener
+  // has something to anchor a comment to.
   writeFileSync(
     abs,
     `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>mode fixture</title></head>
      <body>
        <main>
+         <h1 data-src="${FIXTURE_REL_PATH}:1-1">Delivery mode fixture</h1>
          <p id="target" data-src="${FIXTURE_REL_PATH}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
        </main>
      </body></html>`,

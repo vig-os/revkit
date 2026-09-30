@@ -375,11 +375,17 @@ function subscribeEvents(
         ) {
           onBump();
         }
-        // M2 item 6: `handover` events change the batch count; the
-        // rail's mode-badge re-fetches so the "N drafts" pill goes
-        // to zero. `presence` events surface the "agent is editing …"
-        // chip.
-        if (event.kind === "handover") {
+        // M2 item 6: any event that could change the batch count
+        // re-fetches the mode. A `comment.created` / `comment.replied`
+        // adds to the pending set under `handover`; a `handover`
+        // event drains it. Both need the badge to reflect the new
+        // count without a page reload. `presence` events don't
+        // affect the badge.
+        if (
+          event.kind === "handover" ||
+          event.kind === "comment.created" ||
+          event.kind === "comment.replied"
+        ) {
           onModeBump();
         }
         if (event.kind === "presence") {
