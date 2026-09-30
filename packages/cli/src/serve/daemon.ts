@@ -43,7 +43,6 @@ import {
   cookieName,
   isLoopbackHost,
   isLoopbackOrigin,
-  isSecFetchAcceptable,
   mintToken,
   readCookie,
   setCookieHeader,
@@ -164,7 +163,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // chmod; not fatal.
     }
   }
-  const store = SqliteThreadStore.open({ filename: sqlitePath });
+  const store = SqliteThreadStore.open({
+    filename: sqlitePath,
+    displayName: sqlitePath === ":memory:" ? sqlitePath : repoRelativeDisplay(options.repoRoot, sqlitePath),
+  });
   if (sqlitePath !== ":memory:") {
     // Chmod the sqlite file and its WAL sidecars to 0600. Sidecars
     // may not exist yet — chmod is best-effort per path.
@@ -292,15 +294,46 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const boundUrl = `http://127.0.0.1:${port}`;
   const launchUrl = `${boundUrl}/-/auth?code=${launchCode}`;
 
-  const state: ServeState = {
+  // Per-start instance id, echoed by `GET /-/health` so a probe can
+  // tell whether the port answers as THIS daemon (or a foreign
+  // process that reclaimed the pid + port pair).
+  const instanceId = mintToken();
+  const state: ServeState & { readonly instanceId: string } = {
     pid: process.pid,
     port,
     url: boundUrl,
     agentToken,
     startedAt: new Date().toISOString(),
     version: options.version,
+    instanceId,
   };
-  const writeResult = writeServeState(options.repoRoot, state);
+  const writeResult = await writeServeState(options.repoRoot, state, {
+    probeDaemon: async (existing) => {
+      // Fetch `/-/health` on the existing daemon's URL. If the
+      // response's instanceId matches the file's, we treat it as
+      // ours (should not happen — we would still be running); if it
+      // does not answer, or answers something else, treat as "other"
+      // so the state file is replaced.
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 500);
+        try {
+          const r = await fetch(existing.url + "/-/health", {
+            headers: { host: `127.0.0.1:${existing.port}` },
+            signal: controller.signal,
+          });
+          if (!r.ok) return "other";
+          const body = (await r.json()) as { instanceId?: unknown };
+          if (typeof body.instanceId === "string" && body.instanceId.length > 0) return "revkit";
+          return "other";
+        } finally {
+          clearTimeout(timer);
+        }
+      } catch {
+        return "other";
+      }
+    },
+  });
   if (!writeResult.ok) {
     // Another daemon owns the file — release our own port and refuse.
     server.stop(true);
@@ -402,6 +435,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return handleAuthExchange(url, requestId);
     }
 
+    // Liveness / identity probe used by the next `revkit serve`
+    // start to distinguish a real running daemon from a reused pid.
+    // Returns the daemon's per-start instance id — a bearer-shaped
+    // secret is not needed here because the response identifies
+    // the daemon only (no tokens, no data).
+    if (method === "GET" && url.pathname === "/-/health") {
+      const body = JSON.stringify({ instanceId, pid: process.pid });
+      const response = new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+      response.headers.set("x-content-type-options", "nosniff");
+      return response;
+    }
+
     // `/events` — SSE by default, WebSocket on upgrade. Origin check
     // runs inside the handler after we know which credential the
     // caller presented (a bearer-authenticated non-browser client may
@@ -426,38 +474,67 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   }
 
   /** Enforce the Origin discipline for a cookie-or-bearer authenticated
-   * endpoint (ADR-0013 + the round-1 review fix). Rules:
+   * endpoint (ADR-0013). Rules, in order:
    *
-   * - If the caller carries a valid agent bearer token, an absent
-   *   Origin is accepted (non-browser MCP clients omit it); a present
-   *   Origin must still match the daemon's own origin.
-   * - Otherwise, the caller is presumed to be a browser tab (session
-   *   cookie); Origin must be present AND match the daemon's own
-   *   origin. This blocks a page on `127.0.0.1:<other-port>` from
-   *   riding the browser's cookie jar into a WebSocket / SSE / API
-   *   call, which the browser cookie model would otherwise allow
-   *   (loopback ports do not partition cookies by port).
-   * - `Sec-Fetch-Site` when present must be `same-origin` / `none`;
-   *   absent is accepted (older browsers, non-browser callers).
+   * 1. **Bearer callers** (a valid agent token) — accept. If they also
+   *    send an Origin, it must match the daemon's own (a bearer
+   *    caller sending a foreign Origin is suspicious). Non-browser
+   *    MCP clients typically send neither header, so absent is fine.
+   * 2. **Origin present** — must match the daemon's own loopback
+   *    origin. If it does, `Sec-Fetch-Site` (when set) must be
+   *    `same-origin`; `cross-site` and `same-site` are refused (a
+   *    page on `127.0.0.1:<other-port>` counts as `same-site`).
+   * 3. **Origin absent** — the browser omits Origin on a same-origin
+   *    GET and on `EventSource` (Fetch §3.3.3 keeps Origin off
+   *    `no-cors` same-origin GETs). Accept only when `Sec-Fetch-Site`
+   *    is `same-origin`. Neither header present is a shell caller
+   *    with a stolen cookie — the daemon's own tab always sends
+   *    Sec-Fetch-Site, so this refuses safely. `Sec-Fetch-Site: none`
+   *    (top-level navigation) is refused too: a data endpoint
+   *    typed in the URL bar returns raw JSON, but so would a phish
+   *    disguising the URL — refusing keeps to same-origin discipline.
    *
    * Returns a Response on rejection or undefined on pass. */
   function checkOrigin(request: Request, requestId: string, hasValidBearer: boolean): Response | undefined {
     const origin = request.headers.get("origin");
-    if (origin === null) {
-      if (hasValidBearer) return undefined;
-      logger.warn("request.rejected.origin", { requestId, reason: "missing" });
-      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
-    }
-    if (!isLoopbackOrigin(origin, port)) {
-      logger.warn("request.rejected.origin", { requestId, origin });
-      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
-    }
     const sfs = request.headers.get("sec-fetch-site");
-    if (!isSecFetchAcceptable(sfs)) {
-      logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs ?? "" });
-      return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+
+    if (hasValidBearer) {
+      // Even a bearer caller cannot claim to be a cross-site or
+      // same-site fetch — that shape only comes from a browser that
+      // stole the bearer, which is worth refusing.
+      if (origin !== null && !isLoopbackOrigin(origin, port)) {
+        logger.warn("request.rejected.origin", { requestId, origin });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+      }
+      if (sfs !== null && sfs !== "same-origin" && sfs !== "none") {
+        logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+      }
+      return undefined;
     }
-    return undefined;
+
+    if (origin !== null) {
+      if (!isLoopbackOrigin(origin, port)) {
+        logger.warn("request.rejected.origin", { requestId, origin });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+      }
+      if (sfs !== null && sfs !== "same-origin") {
+        logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
+      }
+      return undefined;
+    }
+
+    // Origin absent — the same-origin browser fetch / EventSource
+    // path. Requires the browser to have set Sec-Fetch-Site
+    // explicitly. Every modern browser (Chromium, Firefox, WebKit)
+    // sets it on `fetch` and `EventSource`; a caller that sends
+    // neither Origin nor Sec-Fetch-Site cannot be a same-origin
+    // browser request.
+    if (sfs === "same-origin") return undefined;
+    logger.warn("request.rejected.origin", { requestId, reason: sfs === null ? "missing" : `sfs=${sfs}` });
+    return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
   }
 
   function methodNotAllowed(): Response {

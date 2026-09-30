@@ -69,6 +69,11 @@ CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 export interface SqliteThreadStoreOptions {
   readonly filename: string;
   readonly clock?: Clock;
+  /** Optional display label the corruption error uses in place of the
+   * absolute filename — the daemon passes a repo-relative path so a
+   * home-directory username does not leak into an operator's log
+   * scrollback (ADR-0020 in spirit). Falls back to `filename`. */
+  readonly displayName?: string;
 }
 
 /** `SqliteThreadStore` — the on-disk `ThreadStore` for the daemon.
@@ -108,7 +113,7 @@ export class SqliteThreadStore implements ThreadStore {
         // the file so the user can archive it and start clean.
         db.close();
         throw new Error(
-          `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.filename}' and start clean, or restore from backup.`,
+          `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.displayName ?? options.filename}' and start clean, or restore from backup.`,
         );
       }
       if (event.seq > head) head = event.seq;

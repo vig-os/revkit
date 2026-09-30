@@ -31,6 +31,7 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -38,6 +39,7 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { randomBytes } from "node:crypto";
 
 /** The wire shape of `.revkit/serve.json`. */
 export interface ServeState {
@@ -47,6 +49,11 @@ export interface ServeState {
   readonly agentToken: string;
   readonly startedAt: string;
   readonly version: string;
+  /** Per-start random id, echoed by `GET /-/health` so a subsequent
+   * launch can tell whether the port answers as THIS daemon or as a
+   * foreign process that happened to reclaim the pid + port. Optional
+   * on the wire so an older `serve.json` still parses. */
+  readonly instanceId?: string;
 }
 
 /** Filename constants. Kept here so a rename lands in one place. */
@@ -58,37 +65,73 @@ export function serveStatePath(repoRoot: string): string {
   return join(repoRoot, SERVE_STATE_DIR, SERVE_STATE_FILE);
 }
 
-/** Try to read the current state file. Returns undefined when it does
- * not exist, throws on a parse error (a truncated file is a bug the
- * caller should see — silently ignoring it lets a broken state file
- * hide a second daemon). */
-export function readServeState(repoRoot: string): ServeState | undefined {
+/** Outcome of `readServeState`. `missing` when the file does not
+ * exist; `unparsable` when the file exists but is malformed
+ * (truncated, empty, missing fields, not JSON). The caller decides
+ * whether to treat unparsable as stale — see `writeServeState`. */
+export type ReadOutcome =
+  | { kind: "ok"; state: ServeState }
+  | { kind: "missing" }
+  | { kind: "unparsable"; reason: string };
+
+/** Try to read the current state file. Returns a typed outcome so a
+ * caller can distinguish "no file" from "file present but broken";
+ * the previous `throw on parse error` behaviour blocked every restart
+ * after a crash that left a truncated file behind, and turned into a
+ * bare `JSON Parse error` on the console. */
+export function readServeStateVerbose(repoRoot: string): ReadOutcome {
   const path = serveStatePath(repoRoot);
-  if (!existsSync(path)) return undefined;
-  const text = readFileSync(path, "utf8");
-  const parsed: unknown = JSON.parse(text);
+  if (!existsSync(path)) return { kind: "missing" };
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    return { kind: "unparsable", reason: `serve-state: could not read ${path}: ${(error as Error).message}` };
+  }
+  if (text.length === 0) {
+    return { kind: "unparsable", reason: `serve-state: ${path} is empty.` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { kind: "unparsable", reason: `serve-state: ${path} is not valid JSON (${(error as Error).message}).` };
+  }
   if (parsed === null || typeof parsed !== "object") {
-    throw new Error(`serve-state: ${path} is not a JSON object.`);
+    return { kind: "unparsable", reason: `serve-state: ${path} is not a JSON object.` };
   }
   const record = parsed as Record<string, unknown>;
   for (const key of ["pid", "port"]) {
     if (typeof record[key] !== "number") {
-      throw new Error(`serve-state: ${path} missing numeric '${key}'.`);
+      return { kind: "unparsable", reason: `serve-state: ${path} missing numeric '${key}'.` };
     }
   }
   for (const key of ["url", "agentToken", "startedAt", "version"]) {
     if (typeof record[key] !== "string") {
-      throw new Error(`serve-state: ${path} missing string '${key}'.`);
+      return { kind: "unparsable", reason: `serve-state: ${path} missing string '${key}'.` };
     }
   }
   return {
-    pid: record.pid as number,
-    port: record.port as number,
-    url: record.url as string,
-    agentToken: record.agentToken as string,
-    startedAt: record.startedAt as string,
-    version: record.version as string,
+    kind: "ok",
+    state: {
+      pid: record.pid as number,
+      port: record.port as number,
+      url: record.url as string,
+      agentToken: record.agentToken as string,
+      startedAt: record.startedAt as string,
+      version: record.version as string,
+      ...(typeof record.instanceId === "string" ? { instanceId: record.instanceId } : {}),
+    },
   };
+}
+
+/** Back-compat wrapper for callers that only want the parsed state and
+ * `undefined` for either "missing" or "unparsable". Preserved so a
+ * test / caller that predates `readServeStateVerbose` still works;
+ * new code should use the verbose form for stale-detection paths. */
+export function readServeState(repoRoot: string): ServeState | undefined {
+  const outcome = readServeStateVerbose(repoRoot);
+  return outcome.kind === "ok" ? outcome.state : undefined;
 }
 
 /** Is the given pid a live process? Uses `kill(pid, 0)` — throws
@@ -115,63 +158,143 @@ export interface WriteRefused {
   readonly state: ServeState;
 }
 
+/** Options for `writeServeState`. `probeDaemon` is an escape hatch a
+ * caller injects to distinguish a reused pid (another program that
+ * happened to reclaim the number, or a live daemon whose port fell
+ * over) from a real live daemon that still owns `serve.json`. Return
+ * `"revkit"` when the port answers as our daemon and `"other"` when
+ * the port answers something else or nothing at all. Default: assume
+ * a live pid IS a live daemon (conservative — refuse the second
+ * start). */
+export interface WriteServeStateOptions {
+  readonly probeDaemon?: (state: ServeState) => Promise<"revkit" | "other">;
+}
+
 /** Try to write the state atomically at mode 600. Refuses if a live
  * daemon already owns the file (`already-running`). Replaces a stale
- * file (dead pid) without asking.
+ * file (dead pid, empty, truncated, unparsable, or a live pid whose
+ * port does not respond as our daemon) without asking.
  *
- * **Atomicity.** The state file is the lock. Every launch tries to
- * create it with `O_WRONLY | O_CREAT | O_EXCL` and only proceeds if
- * that call wins. On EEXIST we read the file: a live-pid owner is
- * `already-running`; a dead-pid owner is stale, so we unlink and
- * retry the O_EXCL create ONCE. Two daemons racing on a stale file
- * see one create win and the other lose (its second O_EXCL comes back
- * EEXIST), so at most one daemon ever owns the file at a time. There
- * is no check-then-write race. */
-export function writeServeState(repoRoot: string, state: ServeState): { ok: true } | { ok: false; refused: WriteRefused } {
+ * **Atomicity via link().** A temp file is created at mode 0600,
+ * fsync'd, then `linkSync` moved to the final name. `link` fails
+ * with EEXIST if the final name already exists, giving the same
+ * mutual exclusion as O_EXCL create, and the temp file is fully
+ * written before it ever appears at the final name. This closes the
+ * round-2 nit: a crash between `openSync(..., "wx")` and `writeSync`
+ * used to leave an empty `serve.json` behind and block every
+ * restart with a bare `JSON Parse error`. With link(), the final
+ * name only ever holds a fully-written record.
+ *
+ * **Stale detection.** An existing file is stale when:
+ *   1. its pid is dead;
+ *   2. its content is empty / truncated / unparsable AND
+ *      `probeDaemon` confirms the recorded port does not answer as
+ *      our daemon (defence against a truncated file left behind by
+ *      a live daemon: refuse rather than steal);
+ *   3. its pid is alive but `probeDaemon` returns `"other"` (a
+ *      reused pid, or a wedged daemon whose HTTP surface is down).
+ * A stale file is unlinked and the link retry succeeds; a live one
+ * refuses the second start. */
+export async function writeServeState(
+  repoRoot: string,
+  state: ServeState,
+  options: WriteServeStateOptions = {},
+): Promise<{ ok: true } | { ok: false; refused: WriteRefused }> {
   const path = serveStatePath(repoRoot);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dirname(path), 0o700);
+  } catch {
+    // Not fatal — a caller-supplied dir may not be chmod-able.
+  }
 
-  const tryCreate = (): { ok: true } | { ok: false; code: string } => {
+  const linkWithTemp = (): { ok: true } | { ok: false; code: string } => {
+    const tmpSuffix = randomBytes(6).toString("hex");
+    const tmpPath = `${path}.${tmpSuffix}.tmp`;
+    let fd: number;
     try {
-      const fd = openSync(path, "wx", 0o600);
-      try {
-        const payload = JSON.stringify(state, null, 2) + "\n";
-        writeSync(fd, payload);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      // Force 0o600 in case the umask clamped the create mode.
-      chmodSync(path, 0o600);
-      return { ok: true };
+      fd = openSync(tmpPath, "wx", 0o600);
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code ?? "";
-      return { ok: false, code };
+      // A duplicate suffix is astronomically unlikely (48 random
+      // bits); still surface it cleanly.
+      return { ok: false, code: (error as NodeJS.ErrnoException).code ?? "TMP_OPEN" };
     }
+    try {
+      const payload = JSON.stringify(state, null, 2) + "\n";
+      writeSync(fd, payload);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    // Force 0o600 in case the umask clamped the create mode.
+    chmodSync(tmpPath, 0o600);
+    try {
+      linkSync(tmpPath, path);
+    } catch (error) {
+      // Clean up the tmp file whether the link succeeded or not.
+      try { unlinkSync(tmpPath); } catch { /* already unlinked */ }
+      return { ok: false, code: (error as NodeJS.ErrnoException).code ?? "LINK" };
+    }
+    // Link succeeded — the tmp file's ID is now at two paths; unlink
+    // the tmp path so we do not leak.
+    try { unlinkSync(tmpPath); } catch { /* fine */ }
+    return { ok: true };
   };
 
-  const firstAttempt = tryCreate();
+  const firstAttempt = linkWithTemp();
   if (firstAttempt.ok) return { ok: true };
   if (firstAttempt.code !== "EEXIST") {
     throw new Error(`writeServeState: unexpected error creating ${path}: ${firstAttempt.code}`);
   }
 
-  // File exists: whose is it?
-  const existing = readServeState(repoRoot);
-  if (existing !== undefined && existing.pid !== state.pid && isPidAlive(existing.pid)) {
-    return { ok: false, refused: { kind: "already-running", state: existing } };
+  // File exists — decide whose.
+  const outcome = readServeStateVerbose(repoRoot);
+  if (outcome.kind === "ok") {
+    const existing = outcome.state;
+    const pidAlive = existing.pid !== state.pid && isPidAlive(existing.pid);
+    if (pidAlive) {
+      // A live pid could be a real daemon or a reclaimed pid. Ask
+      // the probe: does the recorded port answer as ours? If yes,
+      // refuse. If it answers as something else (or not at all),
+      // treat as stale.
+      const probe = options.probeDaemon;
+      if (probe === undefined) return { ok: false, refused: { kind: "already-running", state: existing } };
+      let probeResult: "revkit" | "other";
+      try {
+        probeResult = await probe(existing);
+      } catch {
+        // A probe that throws is inconclusive — treat as live
+        // (conservative refuse).
+        return { ok: false, refused: { kind: "already-running", state: existing } };
+      }
+      if (probeResult === "revkit") {
+        return { ok: false, refused: { kind: "already-running", state: existing } };
+      }
+      // Reused-pid or wedged daemon — treat as stale.
+    }
+    // Stale (dead pid or reused pid). Fall through to the unlink +
+    // retry path below.
+  } else if (outcome.kind === "unparsable") {
+    // A truncated / empty / non-JSON file. If the recorded port on
+    // disk can't be trusted, fall back on "if we cannot read it,
+    // treat as stale". A concurrent live daemon that wrote such a
+    // file did so between open and write of THIS PR's O_EXCL path
+    // — which we replaced with link(); the new path never leaves
+    // that shape. Unparsable → stale.
+    // (`outcome.reason` is included in the removal log the daemon
+    // emits above via writeServeState's return value.)
   }
 
   // Stale (or a leftover from our own crashed prior run). Unlink and
-  // retry the O_EXCL create ONCE — if another racing daemon beats us
-  // to it, we report them as already-running.
+  // retry the link ONCE — if another racing daemon beats us to it,
+  // we report them as already-running.
   try {
     unlinkSync(path);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "ENOENT") throw error;
   }
-  const secondAttempt = tryCreate();
+  const secondAttempt = linkWithTemp();
   if (secondAttempt.ok) return { ok: true };
   if (secondAttempt.code !== "EEXIST") {
     throw new Error(`writeServeState: unexpected error creating ${path}: ${secondAttempt.code}`);

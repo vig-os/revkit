@@ -35,8 +35,8 @@ describe("serve-state", () => {
     rmSync(repoRoot, { recursive: true, force: true });
   });
 
-  test("writes .revkit/serve.json at mode 600", () => {
-    const outcome = writeServeState(repoRoot, sample(process.pid));
+  test("writes .revkit/serve.json at mode 600", async () => {
+    const outcome = await writeServeState(repoRoot, sample(process.pid));
     expect(outcome.ok).toBe(true);
     const path = serveStatePath(repoRoot);
     expect(existsSync(path)).toBe(true);
@@ -45,8 +45,8 @@ describe("serve-state", () => {
     expect(mode).toBe(0o600);
   });
 
-  test("reads the state back", () => {
-    writeServeState(repoRoot, sample(process.pid));
+  test("reads the state back", async () => {
+    await writeServeState(repoRoot, sample(process.pid));
     const read = readServeState(repoRoot);
     expect(read).toBeDefined();
     expect(read?.pid).toBe(process.pid);
@@ -57,10 +57,10 @@ describe("serve-state", () => {
     expect(readServeState(repoRoot)).toBeUndefined();
   });
 
-  test("refuses to overwrite a file owned by a live pid", () => {
+  test("refuses to overwrite a file owned by a live pid", async () => {
     // The current process is always alive.
-    writeServeState(repoRoot, sample(process.pid));
-    const outcome = writeServeState(repoRoot, sample(process.pid + 1_000_000));
+    await writeServeState(repoRoot, sample(process.pid));
+    const outcome = await writeServeState(repoRoot, sample(process.pid + 1_000_000));
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
       expect(outcome.refused.kind).toBe("already-running");
@@ -68,20 +68,20 @@ describe("serve-state", () => {
     }
   });
 
-  test("replaces a file whose pid is dead", () => {
+  test("replaces a file whose pid is dead", async () => {
     // pid 0 is never a valid process id — `isPidAlive` returns false
     // for anything non-positive, which is what a stale file check
     // needs. Pick a large pid we can be reasonably sure is not alive.
     const deadPid = 2_147_483_646;
-    writeServeState(repoRoot, sample(deadPid));
-    const outcome = writeServeState(repoRoot, sample(process.pid));
+    await writeServeState(repoRoot, sample(deadPid));
+    const outcome = await writeServeState(repoRoot, sample(process.pid));
     expect(outcome.ok).toBe(true);
     const read = readServeState(repoRoot);
     expect(read?.pid).toBe(process.pid);
   });
 
-  test("removeServeState is idempotent", () => {
-    writeServeState(repoRoot, sample(process.pid));
+  test("removeServeState is idempotent", async () => {
+    await writeServeState(repoRoot, sample(process.pid));
     removeServeState(repoRoot);
     expect(existsSync(serveStatePath(repoRoot))).toBe(false);
     // Second call: no throw.

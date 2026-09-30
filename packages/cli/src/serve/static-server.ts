@@ -54,7 +54,18 @@ export function openStaticServer(dir: string): StaticServer {
     // `index.html` when the resolved path is a directory. Each
     // candidate goes through `resolveWithinRoot` again so the
     // containment check applies at every step.
-    const stat = statSync(first.absolutePath);
+    //
+    // `statSync` is wrapped in try/catch because a file can be
+    // removed between `resolveWithinRoot`'s `lstat` and the `stat`
+    // here (a `just build` running alongside `revkit serve`, say).
+    // The race is benign — return 404 instead of an uncaught throw
+    // that would surface as a 500.
+    let stat;
+    try {
+      stat = statSync(first.absolutePath);
+    } catch {
+      return { ok: false, kind: "not-found", message: "not found" };
+    }
     if (stat.isDirectory()) {
       const indexed = resolveWithinRoot(rootReal, join(pathname, "index.html"));
       if (indexed.ok) {
