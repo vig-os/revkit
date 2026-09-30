@@ -242,6 +242,40 @@ describe("checkFrontmatter — round-3 structural bypasses", () => {
     expect(findings.some((f) => f.message.includes("TOML"))).toBe(true);
   });
 
+  test("round-4: hero.tagline containing an svg/title/img payload is refused (string-content check)", () => {
+    // Starlight's Hero.astro renders `hero.title` / `hero.tagline`
+    // through `set:html`. Even with a strict key allowlist that
+    // ACCEPTS `hero.tagline`, the string content must not carry
+    // markup. `<` in a frontmatter string refuses.
+    const src = [
+      "---",
+      "title: t",
+      "template: splash",
+      "hero:",
+      "  tagline: '<svg><title><img src=x onerror=alert(61)></title></svg>'",
+      "---",
+      "",
+      "body",
+      "",
+    ].join("\n");
+    const findings = checkFrontmatter(src, "docs/x.md");
+    const finding = findings.find((f) => f.message.includes("contains `<`"));
+    expect(finding).toBeDefined();
+    expect(finding?.rule).toBe("component-registry");
+  });
+
+  test("round-4: hero.title containing `&` is refused (string-content check)", () => {
+    const src = "---\ntitle: t\nhero:\n  title: 'A & B'\n---\n";
+    const findings = checkFrontmatter(src, "docs/x.md");
+    expect(findings.some((f) => f.message.includes("contains `<`"))).toBe(true);
+  });
+
+  test("round-4: revkitStatus containing `<script>` is refused (string-content check)", () => {
+    const src = "---\ntitle: t\nrevkitStatus: '<script>alert(1)</script>'\n---\n";
+    const findings = checkFrontmatter(src, "docs/x.md");
+    expect(findings.some((f) => f.message.includes("contains `<`"))).toBe(true);
+  });
+
   test("indented `---` inside block scalar does not hide a `banner` payload", () => {
     const src = [
       "---",

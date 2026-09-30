@@ -22,6 +22,10 @@
 /** One import binding discovered in an mdxjsEsm block. */
 export interface ImportBinding {
   readonly localName: string;
+  /** For a named import, the ORIGINAL export name (e.g. `LinkCard`
+   * in `import { LinkCard as X } from …`). Same as `localName` when
+   * the two coincide. `null` for default / namespace imports. */
+  readonly importedName: string | null;
   readonly specifier: string;
   readonly line: number;
 }
@@ -141,7 +145,12 @@ export function analyseEsm(estree: unknown, esmLine: number): EsmAnalysis {
         });
         continue;
       }
-      bindings.push({ localName: spec.local.name, specifier, line });
+      // `imported.name` is present on ImportSpecifier only; ES modules
+      // treat default / namespace bindings as having no original name.
+      const importedName = spec.type === "ImportSpecifier"
+        ? spec.imported?.name ?? null
+        : null;
+      bindings.push({ localName: spec.local.name, importedName, specifier, line });
     }
   }
   return { bindings, violations };

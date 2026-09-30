@@ -477,6 +477,35 @@ See [ref].
     expect(result.diagnostics.some((d) => d.message.includes("../evil"))).toBe(true);
   });
 
+  test("round-4: `import { Card } from \"@astrojs/starlight/components\"` is refused (named-export deny-list)", () => {
+    const source = `import { Card } from "@astrojs/starlight/components";
+
+<Card title="x">body</Card>
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    const finding = result.diagnostics.find((d) => d.message.includes("Card"));
+    expect(finding).toBeDefined();
+    expect(finding?.message).toContain("re-admit");
+  });
+
+  test("round-4: rename `import { LinkCard as X }` still refused (deny keys on original export name)", () => {
+    const source = `import { LinkCard as X } from "@astrojs/starlight/components";
+
+<X href="/x">body</X>
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics.some((d) => d.message.includes("LinkCard"))).toBe(true);
+  });
+
+  test("round-4: `import { Aside }` from starlight still allowed (siblings not deny-listed)", () => {
+    const source = `import { Aside } from "@astrojs/starlight/components";
+
+<Aside type="tip">ok</Aside>
+`;
+    const result = checkComponentRegistryFile(source, "site/src/content/docs/x.mdx");
+    expect(result.diagnostics).toEqual([]);
+  });
+
   test("nit 1: unparsable MDX produces a `file:line` diagnostic, not a stack trace", () => {
     // MDX-invalid content: unclosed JSX + stray `<!` — the parser
     // throws; the rule must catch and produce a diagnostic.

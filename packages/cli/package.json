@@ -20,6 +20,7 @@
     "@revkit/site": "workspace:*",
     "@types/mdast": "4.0.4",
     "linkedom": "0.18.13",
+    "parse5": "7.3.0",
     "remark-math": "6.0.0",
     "remark-mdx": "3.1.1",
     "remark-parse": "11.0.0",

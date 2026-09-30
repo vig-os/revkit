@@ -1,17 +1,18 @@
-// Output-gate (`revkit check-dist`) tests. The tool is an ALLOWLIST
-// now (round-3 review), so a payload that survived a denylist —
-// `<noscript>…</noscript>` shielding a `<img onerror>`, or a
-// `<svg><a><animate attributeName=href values=javascript:…>`
-// activation — fails here because neither `noscript` nor `animate`
-// is on the elements allowlist.
+// Output-gate (`revkit check-dist`) tests. Round-4: the tool now
+// walks a **parse5** tree (WHATWG spec-compliant), not linkedom, so
+// browser-parser-differential payloads that survived the linkedom
+// scan — `<svg><title><img onerror=…></title></svg>` — fail here
+// because parse5 correctly parses SVG > title as foreign content
+// and the inner `<img>` becomes a real HTML element (not RCDATA
+// text). Every earlier round's fixtures are still tested.
 import { describe, expect, test } from "bun:test";
-import { parseHTML } from "linkedom";
-import { scanDocument, sha256Hex } from "../src/check-dist.ts";
+import { parse as parse5Parse } from "parse5";
+import { cssUnescape, scanDocument, sha256Hex } from "../src/check-dist.ts";
 import ALLOWLIST from "../src/dist-check-allowlist.json" with { type: "json" };
 
 function scan(html: string) {
-  const { document } = parseHTML(html);
-  return scanDocument(document as unknown as Parameters<typeof scanDocument>[0], "index.html");
+  const doc = parse5Parse(html);
+  return scanDocument(doc as unknown as Parameters<typeof scanDocument>[0], "index.html");
 }
 
 describe("check-dist — clean pages", () => {
@@ -233,6 +234,116 @@ describe("check-dist — <meta http-equiv> policy", () => {
       <meta http-equiv="Content-Security-Policy" content="default-src 'self'">
     </head></html>`;
     expect(scan(html)).toEqual([]);
+  });
+});
+
+describe("check-dist — round-4 parse5 / rel-mix / CSS-unescape / srcset / script-src fixtures", () => {
+  test("h1: <svg><title><img onerror=…></title></svg> is refused (parse5 sees the foreign-content img)", () => {
+    // Linkedom parses <title> inside <svg> as RCDATA text — the
+    // inner <img> never appears in the DOM tree the scanner sees.
+    // parse5 (WHATWG-compliant) treats svg > title as foreign
+    // content, so the <img> is a real HTML element. The tag `img`
+    // is on the elements allowlist but its `onerror` attribute is
+    // not — the finding fires on onerror.
+    const html = `<!doctype html><html><body>
+      <svg><title><img src=x onerror=alert(61)></title></svg>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("onerror"))).toBe(true);
+  });
+
+  test("h2a: style=\"background:u\\rl(https://evil…)\" is refused after CSS unescape", () => {
+    // Backslash-r in CSS = literal r, so `u\rl(` tokenizes as
+    // `url(`. Without CSS unescape the substring check misses it.
+    const html = `<!doctype html><html><body>
+      <span style="background:u\\rl(https://evil.example/x.png)">x</span>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("url("))).toBe(true);
+  });
+
+  test("h2b: <link rel=\"stylesheet canonical\" href=https://evil…> refused (fetching rel wins over metadata rel)", () => {
+    // Metadata token `canonical` alone allows absolute URLs, but
+    // any FETCHING token in the rel list requires same-origin.
+    const html = `<!doctype html><html><head>
+      <link rel="stylesheet canonical" href="https://evil.example/x.css">
+    </head></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("fetching rel token"))).toBe(true);
+  });
+
+  test("mtext / math title mixed-content payload — parse5 catches the inner <img> in MathML too", () => {
+    const html = `<!doctype html><html><body>
+      <math><mtext><img src=x onerror=alert(1)></mtext></math>
+    </body></html>`;
+    const findings = scan(html);
+    // mtext is on the allowlist (KaTeX emits it), but the inner
+    // img's onerror is refused.
+    expect(findings.some((f) => f.message.includes("onerror"))).toBe(true);
+  });
+
+  test("srcset per-candidate URL check: one bad candidate refuses the attribute", () => {
+    const html = `<!doctype html><html><body>
+      <img src="/ok.png" srcset="/one.png 1x, https://evil.example/two.png 2x">
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("srcset candidate"))).toBe(true);
+    expect(findings.some((f) => f.message.includes("evil.example"))).toBe(true);
+  });
+
+  test("script src with `..` traversal is refused (starts with /_astro/ but escapes)", () => {
+    const html = `<!doctype html><html><body>
+      <script src="/_astro/../evil.js"></script>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("path traversal"))).toBe(true);
+  });
+
+  test("CSS unescape: image-set(https://evil…) is refused", () => {
+    const html = `<!doctype html><html><body>
+      <span style="background: image-set(url('https://evil.example/x.png') 1x)">x</span>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("image-set"))).toBe(true);
+  });
+
+  test("CSS unescape: -webkit-image-set(…) refused", () => {
+    const html = `<!doctype html><html><body>
+      <span style="background: -webkit-image-set('x' 1x)">x</span>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("-webkit-image-set"))).toBe(true);
+  });
+
+  test("CSS unescape: hex-escape `\\75 rl(` = url(", () => {
+    // \75 is 'u' in hex; \75 rl( -> url(
+    const html = `<!doctype html><html><body>
+      <span style="background:\\75 rl(https://evil.example/x)">x</span>
+    </body></html>`;
+    const findings = scan(html);
+    expect(findings.some((f) => f.message.includes("url("))).toBe(true);
+  });
+});
+
+describe("cssUnescape", () => {
+  test("backslash-r produces literal r", () => {
+    expect(cssUnescape("u\\rl(")).toBe("url(");
+  });
+
+  test("hex escape with trailing space consumes the space", () => {
+    expect(cssUnescape("\\75 rl(")).toBe("url(");
+  });
+
+  test("hex escape without trailing space", () => {
+    expect(cssUnescape("\\000075rl(")).toBe("url(");
+  });
+
+  test("block comments are stripped before unescape", () => {
+    expect(cssUnescape("/* u */url(")).toBe("url(");
+  });
+
+  test("backslash at end of input passes through as backslash", () => {
+    expect(cssUnescape("abc\\")).toBe("abc\\");
   });
 });
 

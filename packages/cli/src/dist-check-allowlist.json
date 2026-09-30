@@ -132,6 +132,7 @@
     "th": { "attrs": ["scope", "colspan", "rowspan"] },
     "thead": { "attrs": [] },
     "time": { "attrs": ["datetime"] },
+    "title": { "attrs": [] },
     "tr": { "attrs": [] },
     "ul": { "attrs": [] }
   },

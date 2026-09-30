@@ -236,6 +236,38 @@ function walkAllowlist(
   return out;
 }
 
+/** Recursively refuse any string value in the frontmatter tree that
+ * contains `<` or `&`. Round-4 review: Starlight's `Hero.astro`
+ * emits `hero.title` / `hero.tagline` through `set:html`, so a
+ * tagline string like `<svg><title><img src=x onerror=…></title></svg>`
+ * renders as live DOM. The key-shape allowlist already refuses `hero.
+ * actions` and `banner.content`; the string-content check closes
+ * every remaining `set:html` sink at once — content authors write
+ * prose, not markup, so a `<` in a title is a bug anyway. */
+function refuseMarkupInStrings(value: unknown, keyPath: string, file: string, line: number, out: Diagnostic[]): void {
+  if (typeof value === "string") {
+    if (value.includes("<") || value.includes("&")) {
+      out.push(fmDiagnostic(
+        file,
+        line,
+        keyPath,
+        "string value contains `<` or `&` — refused (Starlight can render frontmatter strings as HTML via set:html; ADR-0005 round-4).",
+      ));
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const [i, entry] of value.entries()) {
+      refuseMarkupInStrings(entry, `${keyPath}[${i}]`, file, line, out);
+    }
+    return;
+  }
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    refuseMarkupInStrings(v, `${keyPath}.${k}`, file, line, out);
+  }
+}
+
 /** Check one frontmatter object against the top-level allowlist and
  * every nested allowlist. Called on the parsed YAML root; produces
  * diagnostics anchored at `frontmatterLine` (the line the YAML starts
@@ -269,6 +301,10 @@ export function checkFrontmatterValue(
     }
     findings.push(...checkKey(key, value, file, frontmatterLine));
   }
+  // String-content refusal runs regardless of the key allowlist —
+  // catches the round-4 Hero set:html sink even when the key that
+  // carries the payload (title / tagline / description) is allowed.
+  refuseMarkupInStrings(record, "(root)", file, frontmatterLine, findings);
   return findings;
 }
 

@@ -55,6 +55,33 @@ const ALLOWED_IMPORT_SPECIFIERS: readonly string[] = [
   "@astrojs/starlight/components",
 ];
 
+/** Named exports that are NEVER importable from an allowlisted
+ * specifier — even though the specifier is on the list, these
+ * specific bindings are refused because their runtime rendering has
+ * a source-side sink that revkit's guards cannot close today.
+ *
+ * Round-4 review: `Card` and `LinkCard` from
+ * `@astrojs/starlight/components` render `title` / `description`
+ * via `set:html` and ship inline `<style>` / `<article>` shapes that
+ * fail check-dist. Follow-up issue "re-admit Card/LinkCard with
+ * prop sanitisation" tracks re-admission (M2, `enhancement`). */
+const REFUSED_NAMED_EXPORTS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "@astrojs/starlight/components": new Set(["Card", "CardGrid", "LinkCard"]),
+};
+
+/** Return the refusal message for `(specifier, localName)`, or null
+ * when nothing on the deny list matches. Named-export refusals key on
+ * the LOCAL binding name because `import { LinkCard as X } from …`
+ * still binds `X` to LinkCard's implementation. Callers pass the
+ * ORIGINAL export name (`imported`) as well so a `LinkCard as X`
+ * rename does not slip through. */
+function refusedNamedExportReason(specifier: string, importedName: string): string | null {
+  const denied = REFUSED_NAMED_EXPORTS[specifier];
+  if (!denied) return null;
+  if (!denied.has(importedName)) return null;
+  return `import of ${JSON.stringify(importedName)} from ${JSON.stringify(specifier)} is refused (source-side sink not yet sanitised; see follow-up issue "re-admit Starlight Card/LinkCard with prop sanitisation").`;
+}
+
 /** Return `true` when `specifier` names one of the allowed roots
  * exactly or one of their subpaths (`@revkit/components/Plot`).
  * Relative imports (`./`, `../`) always return `false` — content
@@ -436,6 +463,21 @@ export function checkComponentRegistryFile(
           line: binding.line,
           rule: "component-registry",
           message: `import from ${JSON.stringify(binding.specifier)} — content may only import from ${ALLOWED_IMPORT_SPECIFIERS.map((s) => JSON.stringify(s)).join(" or ")} (ADR-0002, C1).`,
+        });
+        continue;
+      }
+      // Named export deny-list (round-4): Card / LinkCard from
+      // Starlight's component module are refused even though the
+      // specifier is allowed.
+      const refused = binding.importedName !== null
+        ? refusedNamedExportReason(binding.specifier, binding.importedName)
+        : null;
+      if (refused !== null) {
+        diagnostics.push({
+          file,
+          line: binding.line,
+          rule: "component-registry",
+          message: refused,
         });
         continue;
       }

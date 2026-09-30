@@ -10,8 +10,13 @@
 # Default: all files require review from the maintainer
 #*                               @username
 
-# Security-sensitive files require an extra review — a mismatched hash or
-# a newly-added element name in these files defines what the output-gate
-# guard (`revkit check-dist`, ADR-0012) will accept in built HTML.
-# Uncomment and set the reviewer team once one exists (e.g. @vig-os/security).
-#packages/cli/src/dist-check-allowlist.json    @vig-os/security
+# Security-sensitive files require an extra review — a change to any
+# of these edits the guard surface (`revkit check`, `revkit check-dist`,
+# ADR-0005 / ADR-0012). Ownership pins the maintainer as a reviewer so
+# no PR silently widens the allowlist. Change to a security team handle
+# (e.g. @vig-os/security) once one exists.
+packages/cli/src/dist-check-allowlist.json     @gerchowl
+packages/cli/src/rules/frontmatter.ts          @gerchowl
+packages/cli/src/rules/component-registry.ts   @gerchowl
+packages/cli/src/url-scheme.ts                 @gerchowl
+packages/cli/src/check-dist.ts                 @gerchowl

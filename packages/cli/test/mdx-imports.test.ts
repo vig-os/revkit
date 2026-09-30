@@ -17,12 +17,24 @@ function firstEsmEstree(mdxSource: string): unknown {
 }
 
 describe("analyseEsm", () => {
-  test("named import binds its local name and specifier", () => {
+  test("named import binds its local name and specifier (importedName mirrors localName)", () => {
     const estree = firstEsmEstree(`import { Callout } from "@revkit/components";\n\ntext\n`);
     const analysis = analyseEsm(estree, 1);
     expect(analysis.violations).toEqual([]);
     expect(analysis.bindings).toHaveLength(1);
-    expect(analysis.bindings[0]).toEqual({ localName: "Callout", specifier: "@revkit/components", line: 1 });
+    expect(analysis.bindings[0]).toEqual({
+      localName: "Callout",
+      importedName: "Callout",
+      specifier: "@revkit/components",
+      line: 1,
+    });
+  });
+
+  test("renamed named import binds `localName` but tracks the original `importedName`", () => {
+    const estree = firstEsmEstree(`import { LinkCard as X } from "@astrojs/starlight/components";\n\ntext\n`);
+    const analysis = analyseEsm(estree, 1);
+    expect(analysis.bindings[0]?.localName).toBe("X");
+    expect(analysis.bindings[0]?.importedName).toBe("LinkCard");
   });
 
   test("default import binds its local name", () => {
