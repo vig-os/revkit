@@ -90,6 +90,62 @@ transcript). The dogfood comment is a natural reviewer's note (channel content i
 may decline). Requires `flk` and a logged-in Claude; not part of `just test` or CI. See
 [`.claude/skills/revkit_dogfood/SKILL.md`](.claude/skills/revkit_dogfood/SKILL.md) for the runbook.
 
+## Adopt revkit (one line)
+
+revkit ships as a flake ([ADR-0010](docs/adr/0010-distribution-flake-opt-in.md), D1). Any repo picks it up with one
+input and one line in the dev shell — no Astro dependency until you want it.
+
+Scaffold a fresh docs repo from the template:
+
+```bash
+mkdir my-docs && cd my-docs && git init
+nix flake init -t github:vig-os/revkit
+direnv allow                          # or: nix develop
+revkit check                          # ADR-0005 authoring guards
+revkit serve                          # local review daemon on 127.0.0.1
+```
+
+Or wire it into an existing flake:
+
+```nix
+# your flake.nix
+{
+  inputs.revkit.url = "github:vig-os/revkit";
+  outputs = { self, nixpkgs, revkit, ... }: let
+    system = "x86_64-linux";
+    pkgs = nixpkgs.legacyPackages.${system};
+  in {
+    # 1. Put `revkit` on the dev-shell PATH.
+    devShells.${system}.default = pkgs.mkShell {
+      packages = [ revkit.packages.${system}.revkit ];
+    };
+    # 2. (Optional) merge revkit's pre-commit hooks into your devkit hooks.
+    #    See docs/designs/DESIGN-0002-devkit-review-module.md.
+    #      hooks = revkit.lib.hooks.mkHooks {
+    #        revkit = revkit.packages.${system}.revkit;
+    #      } // { /* your own hooks */ };
+  };
+}
+```
+
+The one-line marker for a consumer repo is a `package.json` at the workspace root carrying `"revkit": {}` — the
+CLI walks the tree from that manifest. The template ships one; an existing repo appends it to its own manifest.
+
+Flake outputs (M5 part 1):
+
+| Output | What it is |
+|---|---|
+| `packages.<system>.revkit` | Reproducible Bun-based CLI: `revkit --help`, `revkit check`, `revkit serve` |
+| `packages.<system>.default` | Same drv as `packages.revkit` |
+| `apps.<system>.revkit` | `nix run github:vig-os/revkit -- <args>` |
+| `templates.default` | `nix flake init -t github:vig-os/revkit` — a minimal docs repo |
+| `lib.hooks.mkHooks` | Reusable pre-commit hook definitions (see `nix/hooks.nix`) |
+
+A `review` capability module for vig-os/devkit — `DEVKIT_MODULES="node review"` for the whole opt-in — is
+proposed in [DESIGN-0002](docs/designs/DESIGN-0002-devkit-review-module.md) and tracked at the vig-os/revkit
+elevation ledger [#1](https://github.com/vig-os/revkit/issues/1). This repo does not open the upstream issue on
+its own; the ledger candidate is the design note itself.
+
 ## License
 
 [Apache-2.0](LICENSE)
