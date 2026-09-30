@@ -237,8 +237,9 @@ claude-plugin ref="":
 # disposable LOCKED-DOWN test Claude session (no built-in tools, only
 # `mcp__revkit__{threads,reply,resolve}`) in a flock pane, then drives a
 # comment through the rail UI with Playwright and waits for the test agent to
-# reply with `ack <nonce> :: Error: No such tool available: Bash` (proving the
-# runtime's tool-allowlist refused the Bash call), then resolve. Requires a
+# reply with `ack <nonce>` and resolve. The lockdown is proven pre-launch
+# against the real claude process (/proc/<pid>/cmdline + /proc/<pid>/environ
+# vs a true allowlist), not by any model behaviour. Requires a
 # logged-in Claude (`claude auth`), a running flock server (`flk`), and the
 # nix dev shell. Not part of `just test` or CI. Writes a redacted transcript
 # to `.revkit/dogfood/last.log`, unlinks the daemon.log (unredacted — holds

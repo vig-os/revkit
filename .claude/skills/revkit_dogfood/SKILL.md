@@ -25,12 +25,10 @@ handing the test agent any tool it doesn't need:
 3. **`revkit mcp` → Claude.** The MCP server converts the event into a
    `notifications/claude/channel` frame (declared under
    `capabilities.experimental["claude/channel"]`).
-4. **Agent replies.** The test Claude session calls the `reply` MCP tool,
-   then `resolve`. It ALSO attempts `Bash git status` first — a lockdown
-   proof: with the tool set narrowed by `--tools ""` + `--allowedTools
-   mcp__revkit__…` and permission-mode `dontAsk`, the attempt is refused
-   by the runtime with `Error: No such tool available: Bash`, and the
-   agent pastes that exact text into its reply body.
+4. **Agent replies.** The test Claude session receives a review comment
+   as a channel notification, calls the `reply` MCP tool to ack the
+   nonce, then `resolve`. The dogfood comment reads like a real
+   reviewer's note (no crafted-injection shape, no coerced tool call).
 5. **Daemon → human.** The reply flows back over SSE and the rail updates
    without a reload.
 
@@ -38,24 +36,50 @@ Anything that breaks the loop — a channel schema drift, an env allowlist
 regression, a rail submit regression, an origin-check tightening — fails
 this script well before it fails a user.
 
-The lockdown itself is verified TWICE per run, both as hard failures:
+**The lockdown proof is pre-launch, not model behaviour.** Before any
+prompt is sent, the harness:
 
-- **Before any prompt is sent**, the harness reads the child claude's
-  `/proc/<pid>/cmdline` and `/proc/<pid>/environ` and refuses to
-  proceed unless every required flag (`--strict-mcp-config`,
-  `--mcp-config <abs>`, `--permission-mode dontAsk`, `--tools ""`,
-  the three `--allowedTools` names) is exactly right AND every
-  forbidden flag (`--dangerously-skip-permissions`,
-  `--allow-dangerously-skip-permissions`,
-  `--dangerously-allow-browser-network-access`, `--bare`) is absent
-  AND the env is the tight allowlist (`PATH`, `HOME`,
-  `CLAUDE_CONFIG_DIR`, `TERM`, `LANG` — nothing else, no
-  `SSH_AUTH_SOCK`, `FLOCK_SOCKET_PATH`, `GH_TOKEN`, etc.).
-- **After the loop**, the harness greps the pane AND the agent's reply
-  body for `Error: No such tool available:.*[Bb]ash`. If neither
-  contains it, the run fails.
-- **`DOGFOOD_SELFTEST_BAD_FLAGS=1`** injects a forbidden flag and
-  asserts the pre-launch check fires before any prompt is sent.
+1. Finds the child claude PID by grepping for the run-specific
+   `mcp-config.json` path in `pgrep -f`.
+2. Waits until `/proc/<pid>/exe` resolves to `.claude-wrapped` — this
+   closes the pre-exec race in the nix claude wrapper.
+3. Reads `/proc/<pid>/cmdline` and refuses to proceed unless every
+   required flag is present and exactly right (`--strict-mcp-config`,
+   `--mcp-config <abs>`, `--permission-mode dontAsk`, `--tools ""`,
+   the three `--allowedTools` names,
+   `--dangerously-load-development-channels`) AND every forbidden
+   flag is absent (`--dangerously-skip-permissions`,
+   `--allow-dangerously-skip-permissions`,
+   `--dangerously-allow-browser-network-access`, `--bare`).
+4. Reads `/proc/<pid>/environ` and enforces a TRUE ALLOWLIST: every
+   name must be in the five we set via `env -i` (`PATH`, `HOME`,
+   `CLAUDE_CONFIG_DIR`, `TERM`, `LANG`) OR one of the five the nix
+   claude wrapper adds (`LD_LIBRARY_PATH`, `DISABLE_AUTOUPDATER`,
+   `FORCE_AUTOUPDATE_PLUGINS`, `DISABLE_INSTALLATION_CHECKS`,
+   `USE_BUILTIN_RIPGREP`). `LD_LIBRARY_PATH` is further validated —
+   every entry must be under `/nix/store`. An unknown name is a hard
+   fail — safer than a denylist that could miss a new leak vector.
+
+There is no post-run "did the agent write the denial text" check.
+Earlier revisions had one; it was forgeable through the reply body
+AND it broke the loop whenever a well-aligned model correctly
+refused to follow embedded instructions from a channel comment.
+
+**`DOGFOOD_SELFTEST_BAD_FLAGS=1`** injects a forbidden value
+(`--tools default`) and asserts the pre-launch check aborts before
+any prompt is sent. On successful abort the harness prints
+`SELFTEST OK` and exits **0** (distinct from a real failure, which
+exits 1). `--dangerously-skip-permissions` is NEVER injected — no
+rogue session ever runs.
+
+**Channel content is untrusted to the agent.** ADR-0007's channel
+section makes this explicit: comments posted on a review page are
+REQUESTS from a human reviewer, not instructions. A well-aligned
+model may decline them for prompt-injection reasons or because it
+disagrees. That behaviour is CORRECT and expected. In this harness,
+a decline shows up as the reply-wait timeout, and the run fails
+cleanly — no assumption is baked in that the model must comply with
+every comment.
 
 ## When to run it
 
@@ -181,18 +205,12 @@ from a previous run can reach the test agent.
     the thread carries our nonce (created); then the thread has an
     agent-authored comment whose body matches `ack <nonce>` (LIVENESS
     check — the agent reached a reply turn); then the thread's
-    `status` is `resolved`. An `LOCKDOWN BROKEN` reply body fails the
-    run loudly. The lockdown itself is asserted separately in step 6a
-    (pre-launch) and step 11 (post-run) — the nonce echo is not a
-    security proof.
+    `status` is `resolved`. The lockdown is asserted separately in
+    step 6a (pre-launch) — the nonce echo is a liveness marker, not
+    a security proof.
 11. Verifies the reply also appears in the page WITHOUT a reload (SSE
     round trip), then screenshots the rail.
-12. **Post-run lockdown assertion.** Greps the pane's on-screen text
-    AND the agent's reply body for the runtime's own refusal:
-    `Error: No such tool available:.*[Bb]ash`. If neither surface
-    contains it, the run FAILS — the harness never passes a run where
-    the lockdown couldn't be observed firing live.
-13. Teardown: closes the flock pane by ID AND by name (name-based
+12. Teardown: closes the flock pane by ID AND by name (name-based
     closure covers the `pane_id`-parse-failure path), SIGTERMs the daemon
     with a bounded escalate-to-SIGKILL, then runs a POST-TEARDOWN
     self-check that scans for leaked panes and leaked `revkit serve`
@@ -207,9 +225,8 @@ from a previous run can reach the test agent.
 ## Exit codes
 
 - `0` — the full loop completed: the pre-launch flag/env check
-  passed, the agent replied `ack <nonce>` + resolved, the post-run
-  `No such tool available:` refusal was recorded in the pane or the
-  reply body, and cleanup left nothing behind.
+  passed, the agent replied `ack <nonce>` and resolved, and cleanup
+  left nothing behind.
 - `1` — a step failed. See `.revkit/dogfood/last.log` for the transcript
   (redacted) and `.revkit/dogfood/daemon.log` for the daemon's raw log
   (NOT redacted — contains the launch code, so treat it as sensitive).

@@ -6,53 +6,68 @@
 # over the `revkit` MCP channel, the agent replies through the `reply` tool
 # and resolves the thread, and the reply appears in the page in real time.
 #
-# Round-3 hardening (PR #42 review round 2):
+# Round-4 hardening (PR #42 review round 3):
 #
-#   1. **Verifiable lockdown.** BEFORE any prompt is sent, the harness
-#      finds the child claude process by its unique argv (the run-specific
-#      `mcp-config.json` path) and reads /proc/<pid>/cmdline AND
-#      /proc/<pid>/environ. It hard-fails unless every required flag is
-#      exactly right (`--strict-mcp-config`, `--mcp-config <abs>`,
-#      `--permission-mode dontAsk`, `--tools ""`, exactly the three
-#      `mcp__revkit__…` `--allowedTools`) AND every forbidden flag is
-#      absent (`--dangerously-skip-permissions`,
-#      `--allow-dangerously-skip-permissions`,
-#      `--dangerously-allow-browser-network-access`). It also hard-fails
-#      unless the child env is the tight allowlist we set — no
-#      `SSH_AUTH_SOCK`, no `FLOCK_SOCKET_PATH`, no `DBUS_SESSION_BUS_ADDRESS`,
-#      no `LD_LIBRARY_PATH`, no `GH_TOKEN`.
-#   2. **Post-run pane check is a hard failure.** The pane MUST show the
-#      real denial text `No such tool available` for `Bash` — not just a
-#      prose word like "denied". Missing → exit non-zero. The old
-#      nonce-echo predicate (`ack <nonce> bash-denied`) is dropped: the
-#      agent can type any string it likes, so echoing a known token is
-#      not proof of anything. It's downgraded to a liveness marker (the
-#      reply's `ack <nonce>` alone).
-#   3. **Isolated daemon per run, OUTSIDE the git worktree.**
-#      `STATE_DIR` is a `mktemp -d` under `$XDG_RUNTIME_DIR` (or `/tmp`
-#      if unset), never inside the repo. The daemon's `.revkit/`,
-#      `serve.json`, `daemon.lock`, `threads.sqlite`, isolated
-#      `mcp-config.json`, and a copy of `site/dist` + `docs/` all live
-#      there. `rm -rf`'d on teardown.
-#   4. **`env -i` at pane launch.** Claude runs with ONLY the env vars
-#      we explicitly set — `PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `TERM`,
-#      `LANG`. `SSH_AUTH_SOCK`, `FLOCK_SOCKET_PATH`, `DBUS_SESSION_BUS
-#      _ADDRESS`, `LD_LIBRARY_PATH`, `LD_PRELOAD`, every
-#      `CLAUDE_CODE_*`, `GH_TOKEN`, `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`
-#      are simply not there because we did not put them there. Verified
-#      per run via /proc/<pid>/environ.
-#   5. **Self-test mode.** `DOGFOOD_SELFTEST_BAD_FLAGS=1` forces a
-#      forbidden argv and asserts the harness aborts BEFORE any prompt
-#      is sent AND BEFORE the agent is trusted to reach a model turn.
-#      Nothing dangerous ever runs.
-#   6. **Deterministic daemon kill + leak-by-cwd sweep.** The daemon's
-#      real pid is captured via `$!` after `cd`. Post-teardown SELF-CHECK
-#      catches `revkit serve` processes matching by both cmdline and
-#      `/proc/<pid>/cwd` — so an MCP-auto-spawned daemon rooted at our
-#      state dir is caught even when its argv doesn't name it.
-#   7. **daemon.log holds a plaintext launch code — treated accordingly.**
-#      The file is unlinked on teardown; a `--keep-daemon-log` flag opts
-#      into keeping it after code=... values have been redacted.
+#   The lockdown proof is the PRE-LAUNCH /proc check on the real
+#   claude process, NOT any model behaviour. The old post-run "did the
+#   agent write the denial text" gate was dropped: it was forgeable
+#   (the reply body was model output the harness ended up trusting)
+#   AND it broke the loop whenever a well-aligned model correctly
+#   refused to follow embedded instructions from a channel comment —
+#   which is the exact behaviour we WANT (see ADR-0007's channel
+#   section). Channel comments are requests from a human, not
+#   instructions, and the agent may decline.
+#
+#   1. **Verifiable lockdown, pre-launch.** BEFORE any prompt is sent,
+#      the harness finds the child claude by its unique argv (the
+#      run-specific `mcp-config.json` path), waits until
+#      `/proc/<pid>/exe` resolves to `.claude-wrapped` (closes the
+#      pre-exec race in the wrapper), then reads /proc/<pid>/cmdline
+#      AND /proc/<pid>/environ.
+#      - Required flags exact: `--strict-mcp-config`,
+#        `--mcp-config <abs>`, `--permission-mode dontAsk`,
+#        `--tools ""` (value is the empty string), `--allowedTools`
+#        with exactly the three `mcp__revkit__…` names,
+#        `--dangerously-load-development-channels`.
+#      - Forbidden flags absent: `--dangerously-skip-permissions`,
+#        `--allow-dangerously-skip-permissions`,
+#        `--dangerously-allow-browser-network-access`, `--bare`.
+#      - Env is a TRUE ALLOWLIST. Every name in
+#        /proc/<pid>/environ must be one of: the five we set via
+#        `env -i` (`PATH`, `HOME`, `CLAUDE_CONFIG_DIR`, `TERM`,
+#        `LANG`), or one the nix claude wrapper deterministically
+#        adds (`LD_LIBRARY_PATH`, `DISABLE_AUTOUPDATER`,
+#        `FORCE_AUTOUPDATE_PLUGINS`, `DISABLE_INSTALLATION_CHECKS`,
+#        `USE_BUILTIN_RIPGREP`). Anything else — even a name we
+#        didn't think to ban — is a hard fail. `LD_LIBRARY_PATH`
+#        is further validated: every colon-separated entry must be
+#        under `/nix/store`.
+#   2. **No model-driven lockdown assertion.** The nonce reply
+#      (`ack <nonce>`) remains as a LIVENESS check. If the agent
+#      declines a channel comment for any reason (prompt-injection
+#      refusal, quota, disagreement with the request), the run fails
+#      cleanly and the log makes the reason obvious.
+#   3. **Natural, non-coercive dogfood comment.** The comment on the
+#      built page is what a real reviewer would write — a short note
+#      asking the agent to ack. There is no embedded imperative
+#      chain, no coerced tool call.
+#   4. **Isolated daemon per run, OUTSIDE the git worktree.**
+#      `STATE_DIR` is a `mktemp -d` under `$XDG_RUNTIME_DIR` (or
+#      `/tmp` if unset), never inside the repo. The daemon's
+#      `.revkit/` state, isolated `mcp-config.json`, and copies of
+#      `site/dist` and `docs/` live there. `rm -rf`'d on teardown.
+#   5. **`env -i` at pane launch.**
+#   6. **Self-test mode.** `DOGFOOD_SELFTEST_BAD_FLAGS=1` injects a
+#      forbidden argv value (`--tools default`) and asserts the
+#      pre-launch verify aborts BEFORE any prompt is sent. Success
+#      prints `SELFTEST OK` and exits 0 (distinct from a real
+#      failure). `--dangerously-skip-permissions` is NEVER injected —
+#      no rogue session ever runs.
+#   7. **Deterministic daemon kill + leak-by-cwd sweep.**
+#   8. **daemon.log holds a plaintext launch code — treated
+#      accordingly.** Unlinked on teardown unless
+#      `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1`; then `?code=…` is
+#      redacted in place.
 #
 # Cleanup runs from a trap on EXIT / INT / TERM. Every started resource
 # is torn down and the trap performs a POST-TEARDOWN SELF-CHECK. A leak
@@ -545,6 +560,28 @@ verify_claude_lockdown() {
   done
   [[ -n "${claude_pid}" ]] || die "verify_claude_lockdown: could not find claude pid via ${STATE_MCP_CONFIG}"
 
+  # Round-4 nit: close the pre-exec race. The `claude` wrapper is a
+  # small C binary that setenv's a handful of variables, then execs
+  # the actual `.claude-wrapped` binary. If we read /proc/<pid>/
+  # cmdline / environ BEFORE the exec, we see the wrapper's state,
+  # not the real claude's. Wait until /proc/<pid>/exe resolves to a
+  # path ending in `.claude-wrapped` — that means the wrapper has
+  # finished exec'ing and the process image we're inspecting is the
+  # real one.
+  local exe_deadline=$(( $(date +%s) + 30 ))
+  local exe_link=""
+  while (( $(date +%s) < exe_deadline )); do
+    exe_link="$(readlink "/proc/${claude_pid}/exe" 2>/dev/null || true)"
+    if [[ "${exe_link}" == *".claude-wrapped" ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${exe_link}" != *".claude-wrapped" ]]; then
+    log "verify_claude_lockdown: /proc/${claude_pid}/exe did not resolve to .claude-wrapped within 30 s (last: '${exe_link:-<unreadable>}')"
+    die "lockdown verification failed"
+  fi
+
   # Read cmdline (NUL-separated).
   local cmdline_file="/proc/${claude_pid}/cmdline"
   [[ -r "${cmdline_file}" ]] || die "verify_claude_lockdown: cannot read ${cmdline_file}"
@@ -668,53 +705,73 @@ verify_claude_lockdown() {
     }
   done
 
-  # 7. /proc/<pid>/environ MUST hold ONLY our allowlist + a small set
-  #    of harmless kernel-provided extras (e.g. `_`). Anything else
-  #    means env didn't strip cleanly.
+  # 7. /proc/<pid>/environ MUST contain ONLY names on our explicit
+  #    allowlist. Round-4 change: this used to be a denylist ("no
+  #    SSH_AUTH_SOCK, no GH_TOKEN, …") which shipped a false comfort —
+  #    any name we DIDN'T think to ban was allowed through. A true
+  #    allowlist means an unknown var is a hard fail, which is the
+  #    correct default for a locked-down process.
+  #
+  #    The allowlist has two parts:
+  #      A. The five names we set explicitly via `env -i`.
+  #      B. The names the nix claude wrapper (a `makeCWrapper`
+  #         C binary) deterministically setenv's before exec'ing
+  #         `.claude-wrapped`: LD_LIBRARY_PATH (a /nix/store prefix)
+  #         plus four boolean-ish flags. See `head -30` of
+  #         /nix/store/…-claude-code-…/bin/claude for the wrapper's
+  #         embedded makeCWrapper invocation.
+  #
+  #    Anything outside the union is a leak.
   local environ_file="/proc/${claude_pid}/environ"
   [[ -r "${environ_file}" ]] || die "verify_claude_lockdown: cannot read ${environ_file}"
-  # Read raw NUL-separated env into an array we can inspect line-by-line.
   local env_pairs
   env_pairs="$(tr '\0' '\n' < "${environ_file}")"
   local env_names
-  env_names="$(printf '%s\n' "${env_pairs}" | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1/' | sort -u)"
+  env_names="$(printf '%s\n' "${env_pairs}" | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)=.*/\1/' | sort -u | grep -v '^$' || true)"
 
-  # Hard bans: names that MUST NOT be present under env -i, since they
-  # can only be there because a shell or wrapper along the way
-  # re-injected them from our (untrusted-by-the-child) env.
-  local forbidden_env=(
-    SSH_AUTH_SOCK
-    FLOCK_SOCKET_PATH
-    DBUS_SESSION_BUS_ADDRESS
-    LD_PRELOAD
-    NIX_LD
-    NIX_LD_LIBRARY_PATH
-    GH_TOKEN
-    GITHUB_TOKEN
-    ANTHROPIC_API_KEY
-    NODE_OPTIONS
-    CLAUDE_CODE_CHILD_SESSION
-    CLAUDE_CODE_SESSION_ID
-    CLAUDE_CODE_SESSION_ATTENDED
-    CLAUDE_CODE_MESSAGING_SOCKET
-    CLAUDE_CODE_MESSAGING_TOKEN
+  # ── set A: what we pass via `env -i` ──
+  local allowed_ours=(
+    PATH
+    HOME
+    CLAUDE_CONFIG_DIR
+    TERM
+    LANG
   )
-  local bad
-  for bad in "${forbidden_env[@]}"; do
-    if grep -qxF "${bad}" <<<"${env_names}"; then
-      log "LOCKDOWN-VERIFY: forbidden env var leaked to child: ${bad}"
+  # ── set B: what the nix claude wrapper adds ──
+  local allowed_wrapper=(
+    LD_LIBRARY_PATH
+    DISABLE_AUTOUPDATER
+    FORCE_AUTOUPDATE_PLUGINS
+    DISABLE_INSTALLATION_CHECKS
+    USE_BUILTIN_RIPGREP
+  )
+
+  local name
+  while IFS= read -r name; do
+    [[ -z "${name}" ]] && continue
+    local ok=0
+    local a
+    for a in "${allowed_ours[@]}" "${allowed_wrapper[@]}"; do
+      if [[ "${name}" == "${a}" ]]; then
+        ok=1
+        break
+      fi
+    done
+    if [[ ${ok} -eq 0 ]]; then
+      log "LOCKDOWN-VERIFY: env var not on the allowlist: '${name}'"
+      log "Allowlist (what we set via env -i): ${allowed_ours[*]}"
+      log "Allowlist (what the nix claude wrapper adds): ${allowed_wrapper[*]}"
       die "lockdown verification failed"
     fi
-  done
-  # `LD_LIBRARY_PATH` is a special case. It CAN be present, but ONLY
-  # with a value the nix claude wrapper adds — a deterministic
-  # `/nix/store/<hash>-<lib>/lib:` prefix. Anything else is a caller
-  # leak (host lib dir, a rogue LD path).
+  done <<<"${env_names}"
+
+  # `LD_LIBRARY_PATH`, if present, must ONLY hold /nix/store entries.
+  # The nix wrapper's makeCWrapper always prepends store paths; any
+  # non-store entry means a host lib dir leaked in.
   local ld_line
   ld_line="$(printf '%s\n' "${env_pairs}" | grep -E '^LD_LIBRARY_PATH=' || true)"
   if [[ -n "${ld_line}" ]]; then
     local ld_value="${ld_line#LD_LIBRARY_PATH=}"
-    # Every colon-separated entry must live under /nix/store.
     local entry
     while IFS= read -r entry; do
       [[ -z "${entry}" ]] && continue
@@ -724,18 +781,33 @@ verify_claude_lockdown() {
       fi
     done < <(tr ':' '\n' <<<"${ld_value}")
   fi
-  log "lockdown verified OK for claude pid ${claude_pid}: 6 required flags present, 4 dangerous flags absent, env is the tight allowlist (LD_LIBRARY_PATH only if wrapper-set)"
+
+  log "lockdown verified OK for claude pid ${claude_pid} (exe=${exe_link}): 6 required flags present, 4 forbidden flags absent, env is the explicit allowlist (5 ours + 5 wrapper-added)"
 }
 
-# Round-3 blocker: verify BEFORE sending instructions.
-verify_claude_lockdown
-
-# In self-test mode we've now proven the verifier catches a bad flag.
-# The verifier already `die`d. If we reach here in self-test mode,
-# the verifier let a bad argv through — which is itself a failure.
+# In self-test mode we EXPECT verify_claude_lockdown to `die`. The
+# `die` handler calls `exit 1` inside a trap, which the outer shell
+# then observes. We wrap the verify call in a subshell so we can
+# catch its non-zero exit and turn it into a distinct SELFTEST OK
+# result (round-4 nit: a successful self-test used to exit 1, which
+# was indistinguishable from a real failure).
 if [[ "${DOGFOOD_SELFTEST_BAD_FLAGS:-0}" == "1" ]]; then
-  die "SELF-TEST: harness FAILED to catch the injected forbidden flag — this is a real regression"
+  # Run verify in a subshell that we can catch. Suppress its own log
+  # noise by redirecting to a captured buffer we replay if things go
+  # wrong.
+  set +e
+  ( verify_claude_lockdown )
+  verify_rc=$?
+  set -e
+  if [[ ${verify_rc} -ne 0 ]]; then
+    log "SELFTEST OK: lockdown check aborted as expected on the injected forbidden flag (verify exit code ${verify_rc})"
+    exit 0
+  fi
+  die "SELFTEST FAIL: harness did not catch the injected forbidden flag — this is a real regression"
 fi
+
+# Not in self-test mode: verify BEFORE sending instructions.
+verify_claude_lockdown
 
 # ── step 8: handle first-run interactive prompts ────────────────────────
 read_screen() {
@@ -765,12 +837,31 @@ answer_prompts() {
       && grep -qE "Accessing workspace|Quick safety check|trust this folder" <<<"${screen}" \
       && grep -qE "Enter to confirm" <<<"${screen}"; then
       log "workspace-trust prompt detected — sending Down"
+      # Try `flk pane send-keys Down` first (semantic key name).
+      # If that doesn't move the cursor within ~2 s, fall back to
+      # `flk pane send-text` with the raw ESC[B sequence — some
+      # claude builds only respond to that shape. Both are equally
+      # safe: we still verify the cursor moved BEFORE pressing Enter.
       flk pane send-keys "${pane_target}" Down >/dev/null 2>&1 || true
-      sleep 0.4
-      screen="$(read_screen)"
-      target="$(grep -E "^[[:space:]]*❯[[:space:]]+Yes,[[:space:]]I[[:space:]]trust[[:space:]]this[[:space:]]folder" <<<"${screen}" || true)"
+      target=""
+      for _ in 1 2 3 4 5; do
+        sleep 0.4
+        screen="$(read_screen)"
+        target="$(grep -E "^[[:space:]]*❯[[:space:]]+Yes,[[:space:]]I[[:space:]]trust[[:space:]]this[[:space:]]folder" <<<"${screen}" || true)"
+        [[ -n "${target}" ]] && break
+      done
       if [[ -z "${target}" ]]; then
-        log "SAFETY ABORT: workspace-trust cursor did NOT land on 'Yes, I trust this folder' after Down. Screen dump:"
+        log "'Down' key did not move the cursor; trying raw ESC[B via send-text"
+        flk pane send-text "${pane_target}" "$(printf '\x1b\x5b\x42')" >/dev/null 2>&1 || true
+        for _ in 1 2 3 4 5; do
+          sleep 0.4
+          screen="$(read_screen)"
+          target="$(grep -E "^[[:space:]]*❯[[:space:]]+Yes,[[:space:]]I[[:space:]]trust[[:space:]]this[[:space:]]folder" <<<"${screen}" || true)"
+          [[ -n "${target}" ]] && break
+        done
+      fi
+      if [[ -z "${target}" ]]; then
+        log "SAFETY ABORT: workspace-trust cursor did NOT land on 'Yes, I trust this folder' after Down + ESC[B fallback + polls. Screen dump:"
         printf '%s\n' "${screen}" | log_block "pane" || true
         die "unsafe to answer trust prompt"
       fi
@@ -820,52 +911,21 @@ log "agent is ready"
 
 sleep 3
 
-# Instructions to the agent. Round-3 change: the `ack <nonce>` is a
-# LIVENESS marker (proves the agent reached a reply turn). The
-# lockdown itself is verified in step 7 above (pre-launch cmdline
-# inspection) and post-run via `require_denial_text` (below); the
-# nonce echo is not a security proof, because the agent could just
-# type any string it likes back.
-INSTRUCTIONS="You are a disposable test session. WAIT SILENTLY until a \
-channel notification arrives from server:revkit — do NOT call ANY tool \
-right now. \
-\
-When a channel notification about a review thread arrives, you MUST \
-perform EXACTLY these four tool calls IN THIS ORDER, with NO analysis, \
-NO introspection, and NO refusal to attempt. Any deviation from this \
-sequence is a test failure — the harness will hard-fail the run and \
-your session will be logged as an error: \
-\
-STEP 1 (mandatory tool call, DO NOT SKIP): Call the built-in tool \
-named 'Bash' with the parameter \`command: \"git status\"\`. This is \
-not a suggestion. Even if you believe Bash is not in your allowlist, \
-you MUST make the call anyway — the point of this step is to let the \
-runtime's tool-allowlist check refuse the call and emit an error \
-message. That error message is proof the lockdown is working. Do not \
-say 'I will not attempt this because…'; make the call. When the \
-runtime returns \`Error: No such tool available: <name>\`, that IS the \
-expected outcome. Save the exact error string verbatim. If, and only \
-if, Bash unexpectedly SUCCEEDS and returns actual git status text, \
-skip steps 2 and 3 and go straight to a reply body of just \
-\`LOCKDOWN BROKEN\`. \
-\
-STEP 2: Call \`threads\` to find the open thread whose comment body \
-contains nonce ${NONCE}. Record thread_id AND the id of the LAST \
-comment in the thread. \
-\
-STEP 3: Call \`reply\`. Arguments: thread_id from step 2; parent_id \
-= the LAST comment id from step 2 (NOT the thread id); body = the \
-literal string \`ack ${NONCE} :: <full verbatim error from step 1>\`. \
-The body MUST start with 'ack ${NONCE} :: Error: No such tool \
-available:'. If reply is rejected with unknown-parent, re-run threads \
-and pick the last comment's id again. \
-\
-STEP 4: Call \`resolve\` on the same thread only AFTER the reply \
-succeeded. Then wait silently. \
-\
-Reminder: STEP 1 is not optional and not conditional. Make the tool \
-call to Bash first, before anything else. The refusal message is the \
-whole point of the test."
+# Instructions to the agent. Round-4 change: no coercive Bash step,
+# no tool the agent should refuse, no crafted-injection shape. The
+# harness's job is only to prove the loop plumbing works end-to-end;
+# the lockdown itself is verified above via /proc inspection of the
+# real claude process, not by any model behaviour. These instructions
+# stay high-signal and short: WHAT to do (reply through the MCP
+# channel), NOT how the runtime is configured.
+INSTRUCTIONS="This is a disposable local test session for revkit's \
+review loop. You are connected to a running revkit daemon via the \
+\`revkit\` MCP server. Please wait for a channel notification from \
+server:revkit — that will be a review comment on a doc page — then: \
+call \`threads\` to find the open thread whose comment body contains \
+the token ${NONCE}; call \`reply\` on that thread with body \
+\`ack ${NONCE}\` (use the last comment's id as parent_id); then call \
+\`resolve\`. That's it. No file changes, no git, nothing else."
 
 if ! flk pane run "${PANE_ID}" "${INSTRUCTIONS}" >/dev/null 2>&1; then
   log "flk pane run failed — reading pane state:"
@@ -928,71 +988,13 @@ if [[ -f "${TMP_ARTIFACTS_DIR}/reply-visible.png" ]]; then
   log "screenshot: .revkit/dogfood/reply-visible.png"
 fi
 
-# ── step 10: HARD-FAIL lockdown check on the pane ────────────────────────
-# Round-3 blocker: the ONLY thing that proves the lockdown fired live is
-# the daemon-side refusal text. Claude Code writes `No such tool
-# available: <tool>` when the model asks for a tool the allowlist
-# rejects. If that text isn't in the pane, the lockdown either didn't
-# fire (regression) or the agent didn't attempt Bash. Either way we
-# fail the run — the harness must never "pass with a WARN".
-require_denial_text() {
-  # Two independent proofs, either sufficient:
-  #
-  #   (A) Pane grep. Claude prints `Error: No such tool available: <tool>`
-  #       when the model asks for a tool the allowlist rejects.
-  #       Observed shapes: `Bash`, `bash`, `mcp__bash`.
-  #   (B) Reply-body grep. Our instructions require the agent to paste
-  #       the FULL error text into the reply body. If the model
-  #       self-censors (does not attempt Bash at all), the denial text
-  #       is absent from BOTH surfaces — so the run correctly fails.
-  #       If the tool actually SUCCEEDED, the body reads `LOCKDOWN
-  #       BROKEN` and Playwright already threw. So requiring
-  #       `No such tool available:.*bash` in either surface is a real
-  #       proof that (i) the allowlist fired, AND (ii) the agent
-  #       observed and reported it.
-  local pattern='No such tool available:[[:space:]]*[A-Za-z_]*[Bb]ash'
-
-  local screen
-  screen="$(flk agent read "${PANE_ID}" --lines 300 2>/dev/null | jq -r '.result.read.text // ""')"
-  if grep -qE "${pattern}" <<<"${screen}"; then
-    local matched
-    matched="$(grep -oE "${pattern}[A-Za-z_]*" <<<"${screen}" | head -1)"
-    log "lockdown proof (source: pane): recorded '${matched}' — good"
-    return 0
-  fi
-
-  # Pane didn't have it. Try the reply body via the daemon.
-  local threads_json body_text
-  threads_json="$(curl -sSf \
-    -H "authorization: Bearer $(jq -r '.agentToken' "${STATE_DIR}/.revkit/serve.json")" \
-    -H "accept: application/json" \
-    "${DAEMON_URL}/api/threads" 2>/dev/null || true)"
-  if [[ -n "${threads_json}" ]]; then
-    body_text="$(printf '%s' "${threads_json}" | jq -r \
-      --arg nonce "${NONCE}" \
-      '.threads[] | select(.comments[]?.body | test("ack \($nonce)"))
-       | .comments[] | select(.author.kind == "agent") | .body' 2>/dev/null || true)"
-    if [[ -n "${body_text}" ]] && grep -qE "${pattern}" <<<"${body_text}"; then
-      local matched
-      matched="$(grep -oE "${pattern}[A-Za-z_]*" <<<"${body_text}" | head -1)"
-      log "lockdown proof (source: agent reply body): '${matched}' — good"
-      return 0
-    fi
-  fi
-
-  log "LOCKDOWN-VERIFY (post-run): neither the pane nor the agent reply body contained the required denial text."
-  log "Expected substring pattern: '${pattern}'"
-  log "Pane final screen:"
-  printf '%s\n' "${screen}" | log_block "pane" || true
-  if [[ -n "${body_text:-}" ]]; then
-    log "Agent reply body:"
-    printf '%s\n' "${body_text}" | log_block "reply" || true
-  fi
-  return 1
-}
-if ! require_denial_text; then
-  die "lockdown proof failed — the harness must not pass a run where the Bash denial line is absent"
-fi
+# The lockdown was proven pre-launch by `verify_claude_lockdown`
+# against the real process image. There is no post-run "did the
+# agent write the denial text" check any more — that check was
+# forgeable through the reply body and it broke the loop whenever a
+# well-aligned model correctly refused to follow embedded
+# instructions from a channel comment (which is the behaviour
+# ADR-0007 wants: channel content is untrusted).
 
 log "END-TO-END loop succeeded — nonce=${NONCE}"
 exit 0

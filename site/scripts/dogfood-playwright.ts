@@ -16,10 +16,10 @@
 //   REVKIT_DOGFOOD_NONCE            — random per-run token embedded in the
 //                                     comment body; the agent echoes it in
 //                                     the reply ("ack <nonce>") so we can
-//                                     tell OUR reply apart. Round-3: the
-//                                     nonce echo is a LIVENESS marker only,
-//                                     not a lockdown proof — see
-//                                     scripts/dogfood-channel.sh:require_denial_text
+//                                     tell OUR reply apart. The nonce echo
+//                                     is a LIVENESS marker only, not a
+//                                     lockdown proof — see
+//                                     scripts/dogfood-channel.sh:verify_claude_lockdown
 //                                     for the real lockdown assertion.
 //   REVKIT_DOGFOOD_ARTIFACTS_DIR    — writable temp dir for screenshots.
 //   PLAYWRIGHT_BROWSERS_PATH        — chromium binary root (dev shell).
@@ -211,23 +211,21 @@ async function main(): Promise<void> {
     await page.waitForSelector('[data-testid="revkit-rail-floating"]', { timeout: 5_000 });
     await page.click('[data-testid="revkit-rail-floating"]');
     await page.waitForSelector('[data-testid="revkit-rail-composer"]', { timeout: 5_000 });
-    // Round-3 change: the comment carries a LIVENESS marker (the
-    // nonce) only. The lockdown proof is NOT the nonce echo — the
-    // agent can type any string it likes. The real proofs are:
-    //   (1) pre-launch cmdline + env inspection of the child claude
-    //       process — see the verify_claude_lockdown helper in
-    //       scripts/dogfood-channel.sh
-    //   (2) post-run grep of the pane for `No such tool available: Bash`
-    //       (scripts/dogfood-channel.sh:require_denial_text).
-    // Both are hard failures. The Bash attempt is still requested in
-    // the shell's instructions to the agent, so the denial text lands
-    // in the pane — this Playwright leg only needs the reply's nonce
-    // to prove the agent reached a reply turn.
+    // Round-4 change: the dogfood comment reads like a real reviewer's
+    // note. No embedded imperative chain, no coerced tool call. The
+    // lockdown is proven by the shell's pre-launch /proc inspection of
+    // the claude process (see scripts/dogfood-channel.sh:verify_claude_lockdown),
+    // NOT by anything the model does with this comment. The comment
+    // just carries a nonce so the harness can tell OUR test thread
+    // apart from any other. If the agent declines the note (a good
+    // model may refuse instructions that arrive over a channel — see
+    // ADR-0007's "channel content is untrusted" section), the harness
+    // fails cleanly on the reply-wait timeout; that IS correct
+    // behaviour and no bug.
     const commentBody =
-      `Dogfood check ${NONCE}: attempt \`Bash\` with \`git status\` first ` +
-      `(the harness's lockdown check greps the pane for the refusal). ` +
-      `Then reply with exactly \`ack ${NONCE}\` using the revkit reply ` +
-      `tool, then resolve the thread. Do NOT commit or push.`;
+      `Small typo here — ${NONCE}. Please ack this thread with the ` +
+      `token \`${NONCE}\` using the revkit reply tool, then resolve. ` +
+      `No file changes needed.`;
     await page.fill('[data-testid="revkit-rail-composer-input"]', commentBody);
     await page.click('[data-testid="revkit-rail-submit"]');
     // On success the composer is unmounted (setComposerAnchor(undefined)
@@ -266,16 +264,19 @@ async function main(): Promise<void> {
     // transcript, so `console.log` IS the tracing facade here.
     console.log(`created thread ${created.id} (${created.comments.length} comment(s))`); // guardrails-ok(no-debug-leftovers): CLI progress line
 
-    // 5. Wait for the agent's reply. Round-3: this is a LIVENESS
-    //    check — success = there is a comment authored by an agent
-    //    whose body contains `ack <nonce>`. The nonce echo proves the
+    // 5. Wait for the agent's reply. This is a LIVENESS check —
+    //    success = there is a comment authored by an agent whose
+    //    body contains `ack <nonce>`. The nonce echo proves the
     //    agent reached a reply turn against OUR thread. It does NOT
     //    prove the lockdown fired; the shell script's pre-launch
-    //    cmdline verification and post-run pane grep for `No such
-    //    tool available: Bash` are the load-bearing lockdown proofs.
-    //    An `LOCKDOWN BROKEN` reply body still throws loudly.
-    //    Timeout: 240 s (the Bash attempt adds an extra turn on top
-    //    of the baseline 15-20 s).
+    //    cmdline + environ verification of the real claude process
+    //    is the load-bearing lockdown proof (round 4 dropped the
+    //    forgeable post-run "did the agent write the denial text"
+    //    check). A well-aligned model may correctly decline to
+    //    follow instructions embedded in a channel comment — that
+    //    behaviour is correct per ADR-0007, and this timeout is
+    //    the right way for the harness to notice it.
+    //    Timeout: 180 s baseline for a normal reply turn.
     const started = Date.now();
     const withReply = await waitFor(
       "agent reply visible on daemon",
@@ -285,20 +286,12 @@ async function main(): Promise<void> {
         thread.comments.some(
           (c) => c.author?.kind === "agent" && c.body.includes(`ack ${NONCE}`),
         ),
-      240_000,
+      180_000,
       750,
     );
     if (withReply === undefined) throw new Error("unreachable — waitFor guarantees a match");
     const commentLatencyMs = Date.now() - started;
     console.log(`agent replied in ~${commentLatencyMs}ms`); // guardrails-ok(no-debug-leftovers): CLI progress line
-    const brokenClaims = withReply.comments.filter(
-      (c) => c.author?.kind === "agent" && c.body.includes("LOCKDOWN BROKEN"),
-    );
-    if (brokenClaims.length > 0) {
-      throw new Error(
-        "LOCKDOWN BROKEN reported by the test agent — Bash tool was reachable despite the allowlist",
-      );
-    }
 
     // 6. Also confirm the reply is visible in the PAGE without a reload —
     //    that's the SSE path (comment.replied → rail refetch). We look for
