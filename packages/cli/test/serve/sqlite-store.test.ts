@@ -4,6 +4,7 @@
 // persistence across restart is a real assertion.
 
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -389,5 +390,81 @@ describe("SqliteThreadStore", () => {
     dest.close();
     rmSync(filenameA, { force: true });
     rmSync(filenameB, { force: true });
+  });
+});
+
+// ── PR #52 round-2 review: replay policy for answer-shape-mismatch ─
+
+describe("SqliteThreadStore.open — replay policy for pre-fix ask-answered logs (PR #52 round-2)", () => {
+  test("an ask.answered event whose values fail the current answer-shape rule is ACCEPTED on replay (state = answered, warning to stderr)", () => {
+    // A log written by an earlier commit could carry an answer
+    // that doesn't match the current spec (e.g. `value: "zzz"`
+    // on a choice with no `other:` prefix). The daemon must
+    // start, not fail — new appends stay strict.
+    const filename = join(tmpdir(), `revkit-replay-${Math.random().toString(16).slice(2)}.sqlite`);
+    // Seed the DB by opening it, appending the "old" events with
+    // the current (strict) validator DISABLED via a raw INSERT.
+    // We use two ordinary events to prove the strict path still
+    // works and then plant a single hostile ask.answered.
+    const store = SqliteThreadStore.open({ filename });
+    store.close();
+    const db = new Database(filename);
+    // Directly insert the events. The reviewEventSchema shape
+    // is preserved; only the transition-time rule fails.
+    const seed: readonly unknown[] = [
+      {
+        seq: 1,
+        ts: "2026-09-30T12:00:00Z",
+        actor: { kind: "agent", id: "revkit-live" },
+        kind: "ask.created",
+        askId: "ask-1",
+        spec: {
+          schemaVersion: 1,
+          kind: "choice",
+          title: "Which?",
+          options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+          allowOther: false,
+          multi: false,
+        },
+      },
+      // Hostile answer — `zzz` is not an option id and allowOther is false.
+      {
+        seq: 2,
+        ts: "2026-09-30T12:00:01Z",
+        actor: { kind: "local", id: "human" },
+        kind: "ask.answered",
+        askId: "ask-1",
+        answer: { kind: "choice", value: "zzz" },
+      },
+    ];
+    for (const ev of seed) {
+      const s = ev as { seq: number; ts: string };
+      db.query("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+        .run(s.seq, s.ts, JSON.stringify(ev));
+    }
+    db.close();
+
+    // Capture stderr for the assertion.
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    const capturedStderr: string[] = [];
+    (process.stderr.write as unknown as (chunk: unknown) => boolean) = (chunk: unknown): boolean => {
+      capturedStderr.push(String(chunk));
+      return true;
+    };
+    let reopened: SqliteThreadStore;
+    try {
+      reopened = SqliteThreadStore.open({ filename });
+    } finally {
+      process.stderr.write = originalWrite;
+    }
+    // The daemon started; the ask is projected as `answered`.
+    reopened.ask("ask-1").then((record) => {
+      expect(record?.status).toBe("answered");
+    });
+    reopened.close();
+    // A warning was logged.
+    expect(capturedStderr.join("")).toContain("accepting historical ask.answered");
+    expect(capturedStderr.join("")).toContain("ask-1");
+    rmSync(filename, { force: true });
   });
 });

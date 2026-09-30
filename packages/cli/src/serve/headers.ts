@@ -65,6 +65,20 @@ export interface HeaderContext {
  * the header builder and `rail/injector.ts` agree on one spelling. */
 export const RAIL_SCRIPT_URL_PATH = "/-/rail.js";
 
+/** Where the `/ask/<id>` page bundle lives. Same shape as the rail:
+ * a compiled Solid bundle served from an exact daemon path so
+ * `script-src` names it verbatim. Kept alongside `RAIL_SCRIPT_URL_PATH`
+ * so a future third bundle adds one line here + one entry per alias
+ * in `buildCspHeader` rather than a copy-paste of the whole loop.
+ * (M2 item 7, story A1.)
+ *
+ * PR #52 review — this path is NOT in the base CSP applied to every
+ * HTML response; the daemon adds it only to the `/ask/<id>` response
+ * via `applyResponseHeaders(..., extraScriptPaths)`. That keeps
+ * every other page's `script-src` tighter (a stored HTML that tries
+ * `<script src="/-/ask.js">` is refused by the browser). */
+export const ASK_SCRIPT_URL_PATH = "/-/ask.js";
+
 /** Astro's chunk directory — every static JS asset a page loads via
  * `<script src>` starts with this prefix (`check-dist.ts` enforces the
  * same on the built HTML). */
@@ -178,15 +192,24 @@ function loopbackOrigins(port: number, scheme: "http" | "ws"): readonly string[]
  * - `frame-ancestors 'none'`, `base-uri 'none'`, `object-src 'none'`,
  *   `form-action 'self'` — verbatim from ADR-0012.
  */
-export function buildCspHeader(ctx: HeaderContext): string {
+export function buildCspHeader(ctx: HeaderContext, extraScriptPaths: readonly string[] = []): string {
   const scriptSources: string[] = [];
   // Path-scoped script sources. CSP treats a source with a trailing
   // slash as "any file under this path"; a source WITHOUT a trailing
   // slash matches exactly one URL. Emit one entry per loopback alias
   // so a page opened at http://localhost:<port>/ loads the same set
   // as a page opened at http://127.0.0.1:<port>/.
+  //
+  // `extraScriptPaths` (PR #52 review): route-specific script paths
+  // the caller adds only for that response. Today: the `/ask/<id>`
+  // handler adds `ASK_SCRIPT_URL_PATH` so every other HTML page's
+  // `script-src` stays tight and refuses a stored HTML that tries
+  // to load the ask bundle from a non-ask route.
   for (const origin of loopbackOrigins(ctx.port, "http")) {
     scriptSources.push(`${origin}${RAIL_SCRIPT_URL_PATH}`);
+    for (const path of extraScriptPaths) {
+      scriptSources.push(`${origin}${path}`);
+    }
     scriptSources.push(`${origin}${ASTRO_SCRIPTS_URL_PREFIX}`);
     scriptSources.push(`${origin}${PAGEFIND_URL_PREFIX}`);
   }
@@ -276,6 +299,7 @@ export function applyResponseHeaders(
   kind: ResponseKind,
   contentType: string | undefined,
   ctx: HeaderContext,
+  extraScriptPaths: readonly string[] = [],
 ): Response {
   // Always attach the hygiene triplet: nosniff, no-referrer, and the
   // cross-origin isolation pair. Every response gets them — an HTML
@@ -302,7 +326,7 @@ export function applyResponseHeaders(
   // own `fetch()` denied inside the Worker — see the issue #22
   // review's second blocker.
   if (kind === "html") {
-    response.headers.set("content-security-policy", buildCspHeader(ctx));
+    response.headers.set("content-security-policy", buildCspHeader(ctx, extraScriptPaths));
   } else if (kind === "svg" || kind === "xml") {
     response.headers.set("content-security-policy", buildMinimalCspHeader(kind));
   }

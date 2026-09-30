@@ -213,6 +213,66 @@ const RESOLVE_TOOL = {
   },
 } as const;
 
+const ASK_TOOL = {
+  name: "ask",
+  description:
+    "Raise a rich question page for the human to answer (DESIGN-0001 §5.1, ADR-0007). Returns " +
+    "{ ask, url } immediately, where `url` is a ready-to-open loopback link (a fresh single-use " +
+    "launch URL that lands the human on the ask page via the cookie exchange) — hand that URL to " +
+    "the human. Then call `await_answer` with `ask.id` to wait for the answer. Prefer this to a " +
+    "plain text prompt whenever the answer benefits from choices, ranking, a scale, a region on a " +
+    "plot, or a review decision. The `spec` is a validated question spec — see revkit's askSchema " +
+    "(six kinds: choice, rank, scale, text, region, review). Question text is untrusted as HTML; " +
+    "the daemon renders it as text.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      spec: {
+        type: "object",
+        description: "The question spec (askSchema). Must include `schemaVersion`, `kind` and `title`.",
+      },
+      id: {
+        type: "string",
+        description:
+          "Optional stable id (letters/digits/`_`/`-`, <= 64 chars). Omit to let the daemon assign a random id.",
+      },
+      ttlMs: {
+        type: "integer",
+        description:
+          "Optional cap on how long the ask stays pending before the daemon lazily emits `ask.expired`. Default: no deadline.",
+        minimum: 1,
+      },
+    },
+    required: ["spec"],
+    additionalProperties: false,
+  },
+} as const;
+
+const AWAIT_ANSWER_TOOL = {
+  name: "await_answer",
+  description:
+    "Long-poll for a human answer to a previously-raised ask. Returns as soon as the ask reaches a terminal " +
+    "state (answered / cancelled / expired), or after `timeout_ms` (default 8000 — one MCP tool deadline). " +
+    "**Contract:** a `pending` return is NORMAL — the tool has a bounded deadline, and the agent calls it again. " +
+    "Answer-to-agent latency for a human answer that arrives during the poll is under 1 second (the daemon " +
+    "pushes `ask.answered` over its event stream; the tool wakes on the frame, not on a timer). Requires the " +
+    "ask id from `ask`.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: { type: "string", description: "The ask id returned by `ask`." },
+      timeout_ms: {
+        type: "integer",
+        description: "Max time to wait before returning `{ status: 'pending' }`. Capped at 9000 ms.",
+        minimum: 1,
+        maximum: 9000,
+      },
+    },
+    required: ["id"],
+    additionalProperties: false,
+  },
+} as const;
+
 const REVIEW_URL_TOOL = {
   name: "review_url",
   description:
@@ -486,6 +546,25 @@ const reviewUrlArgsSchema = z
   })
   .strict();
 
+const askArgsSchema = z
+  .object({
+    // Spec structure is validated server-side by `askSchema`; the
+    // MCP-side accepts `unknown` and lets the daemon do the parse.
+    // A local re-parse would duplicate the schema, and the daemon
+    // is the boundary that persists.
+    spec: z.record(z.string(), z.unknown()),
+    id: z.string().min(1).max(64).optional(),
+    ttlMs: z.number().int().positive().max(24 * 60 * 60 * 1000).optional(),
+  })
+  .strict();
+
+const awaitAnswerArgsSchema = z
+  .object({
+    id: z.string().min(1).max(64),
+    timeout_ms: z.number().int().positive().max(9_000).optional(),
+  })
+  .strict();
+
 /** Start the MCP server and wire it to the daemon. Returns a handle
  * whose `stop()` shuts down the transport and the SSE loop. */
 export async function startChannelServer(options: ChannelServerOptions): Promise<ChannelServerHandle> {
@@ -524,8 +603,39 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   // ── tools/list ────────────────────────────────────────────────────
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [THREADS_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL],
+    tools: [THREADS_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, ASK_TOOL, AWAIT_ANSWER_TOOL],
   }));
+
+  // ── ask-answer waiters ────────────────────────────────────────────
+  // `await_answer` registers itself here keyed on askId. When the
+  // subscriber sees a terminal `ask.*` event whose askId is in the
+  // map, it resolves the waiter with the reduced record. A single
+  // ask may accumulate more than one waiter (a distracted agent
+  // calling `await_answer` twice) so we keep a Set per id.
+  interface AskWaiter {
+    resolve(record: unknown): void;
+    reject(err: Error): void;
+  }
+  const askWaiters = new Map<string, Set<AskWaiter>>();
+  const notifyAskTerminal = async (askId: string): Promise<void> => {
+    const set = askWaiters.get(askId);
+    if (set === undefined || set.size === 0) return;
+    let record: unknown;
+    try {
+      record = await currentClient.getAsk(askId);
+    } catch (error) {
+      // On a transient daemon error we let the poll's own deadline
+      // handle it — closing the waiters with an error would surface
+      // to the agent, and a retry-later contract is nicer than a
+      // hard fail.
+      void error;
+      return;
+    }
+    for (const waiter of set) waiter.resolve(record);
+    set.clear();
+    askWaiters.delete(askId);
+  };
+  const TERMINAL_ASK_KINDS = new Set(["ask.answered", "ask.cancelled", "ask.expired"]);
 
   // ── tools/call ────────────────────────────────────────────────────
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -554,6 +664,122 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
         const parsed = reviewUrlArgsSchema.safeParse(args);
         if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
         return await client.mintLaunchUrl(parsed.data.path);
+      }
+      if (toolName === "ask") {
+        const parsed = askArgsSchema.safeParse(args);
+        if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
+        // The rest is passed through; the daemon runs the strict
+        // `askSchema` check and reports issues on 400.
+        const opts: { id?: string; ttlMs?: number } = {};
+        if (parsed.data.id !== undefined) opts.id = parsed.data.id;
+        if (parsed.data.ttlMs !== undefined) opts.ttlMs = parsed.data.ttlMs;
+        const created = await client.createAsk(parsed.data.spec, opts);
+        // PR #52 review: the daemon returns the same-origin path
+        // `/ask/<id>`, but a browser opening that path without a
+        // session cookie gets a 401 (the launch-code flow is what
+        // mints one). Rather than document a footgun for the agent,
+        // mint a fresh single-use launch URL with `next=/ask/<id>`
+        // — the same shape `review_url` returns — so the URL the
+        // MCP tool hands back is ready to open. The launch code
+        // expires in 60s (ADR-0013), which is short enough that a
+        // stale scrollback copy is not reusable.
+        const askIdRaw = (created as { ask?: { id?: unknown } }).ask?.id;
+        const askId = typeof askIdRaw === "string" ? askIdRaw : undefined;
+        let openUrl = (created as { url?: string }).url ?? "";
+        if (askId !== undefined) {
+          try {
+            const minted = await client.mintLaunchUrl(`/ask/${askId}`);
+            openUrl = minted.launchUrl;
+          } catch {
+            // Fall back to the raw same-origin path — the agent
+            // will get a clear 401 from the daemon rather than a
+            // silent failure, and the tool call still surfaces
+            // the `ask` record so `await_answer` works.
+          }
+        }
+        return { ask: (created as { ask?: unknown }).ask, url: openUrl };
+      }
+      if (toolName === "await_answer") {
+        const parsed = awaitAnswerArgsSchema.safeParse(args);
+        if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
+        const timeoutMs = parsed.data.timeout_ms ?? 8_000;
+        // PR #52 review — register the waiter BEFORE the fast-path
+        // `getAsk` fetch, then check the current state. If the fast
+        // path returns terminal, dispose the waiter and return the
+        // record. If the fast path returns pending but the terminal
+        // event landed WHILE the fetch was in flight, the
+        // subscriber has already resolved the waiter, so awaiting
+        // it is instant. If we did the fetch first, that "in
+        // flight" event would be lost forever — the waiter would
+        // be registered too late to receive it.
+        //
+        // The waiter is also armed with the caller's timeout so a
+        // never-arriving terminal event does not hang the tool
+        // past the MCP tool deadline; on timeout we do one more
+        // `getAsk` so the caller can distinguish "still pending"
+        // from "answered while we were in the fetch race".
+        let waiter: AskWaiter | undefined;
+        const wait = new Promise<unknown>((resolveOuter) => {
+          const w: AskWaiter = {
+            resolve: (r) => resolveOuter(r),
+            reject: () => resolveOuter(undefined),
+          };
+          waiter = w;
+          const set = askWaiters.get(parsed.data.id) ?? new Set<AskWaiter>();
+          set.add(w);
+          askWaiters.set(parsed.data.id, set);
+          const timer = setTimeout(() => {
+            const s = askWaiters.get(parsed.data.id);
+            if (s !== undefined) {
+              s.delete(w);
+              if (s.size === 0) askWaiters.delete(parsed.data.id);
+            }
+            resolveOuter(undefined);
+          }, timeoutMs);
+          const wrappedResolve = w.resolve;
+          w.resolve = (r) => {
+            clearTimeout(timer);
+            wrappedResolve(r);
+          };
+        });
+        const disposeWaiter = (): void => {
+          if (waiter === undefined) return;
+          const s = askWaiters.get(parsed.data.id);
+          if (s !== undefined) {
+            s.delete(waiter);
+            if (s.size === 0) askWaiters.delete(parsed.data.id);
+          }
+          // Also nudge the promise so it settles cleanly (undefined).
+          waiter.reject(new Error("disposed"));
+          waiter = undefined;
+        };
+        // Fast path: read the current record. A terminal state that
+        // already landed does not need to wait. PR #52 round-2 review
+        // — if `getAsk` throws, dispose the waiter (and clear its
+        // timer) before re-raising so the tool-call error path does
+        // not leak a timer or an entry in `askWaiters`.
+        let current: unknown;
+        try {
+          current = await client.getAsk(parsed.data.id);
+        } catch (error) {
+          disposeWaiter();
+          throw error;
+        }
+        const status = (current as { status?: string } | undefined)?.status;
+        if (status === "answered" || status === "cancelled" || status === "expired") {
+          disposeWaiter();
+          return { ask: current };
+        }
+        // Long-poll: await the waiter (already primed to fire on
+        // any terminal `ask.*` event that arrived during the fast
+        // path, or that arrives before the timeout).
+        const record: unknown = await wait;
+        if (record !== undefined) return { ask: record };
+        // Timed out — return the current record so the caller can
+        // decide (still pending? cancelled after all?). Contract:
+        // call again if still pending.
+        const latest = await client.getAsk(parsed.data.id);
+        return { ask: latest };
       }
       throw new Error(`unknown tool '${toolName}'`);
     };
@@ -663,6 +889,13 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       since: lastSeenSeq,
       onEvent: async (event: WireEvent) => {
         if (event.seq > lastSeenSeq) lastSeenSeq = event.seq;
+        // Wake `await_answer` waiters on terminal ask events. The
+        // check runs BEFORE the channel-notification path so the
+        // waiter gets its answer even if the notification is
+        // routed to a no-op (agent event, filter miss).
+        if (TERMINAL_ASK_KINDS.has(event.kind) && typeof event.askId === "string") {
+          void notifyAskTerminal(event.askId);
+        }
         const payload = formatChannelPayload(event);
         if (payload === undefined) return;
         await emitNotification(payload);
@@ -779,5 +1012,12 @@ function toolError(issues: unknown): {
 }
 
 // Named exports the CLI + tests reach for.
-export { threadsArgsSchema, replyArgsSchema, resolveArgsSchema, reviewUrlArgsSchema };
-export { THREADS_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL };
+export {
+  askArgsSchema,
+  awaitAnswerArgsSchema,
+  replyArgsSchema,
+  resolveArgsSchema,
+  reviewUrlArgsSchema,
+  threadsArgsSchema,
+};
+export { ASK_TOOL, AWAIT_ANSWER_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, THREADS_TOOL };

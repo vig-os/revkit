@@ -28,10 +28,14 @@ import { dirname, extname, relative as relativePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
 import {
+  askSchema,
+  askStatusSchema,
   isValidId,
   revisionOf,
   threadStatusSchema,
   type Anchor,
+  type AskFilter,
+  type AskRecord,
   type Author,
   type ReviewEvent,
   type ReviewEventInput,
@@ -55,10 +59,20 @@ import {
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
 import { buildRailBundle } from "../rail/bundle.ts";
 import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
+import {
+  ASK_CSS_PATH,
+  ASK_JS_PATH,
+  renderAskPage,
+} from "../ask-page/render.ts";
+import { buildAskPageBundle } from "../ask-page/bundle.ts";
+import { writeAskFile } from "./asks-file.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
 import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
 import {
+  answerAskRequestSchema,
+  cancelAskRequestSchema,
+  createAskRequestSchema,
   createThreadRequestSchema,
   reopenRequestSchema,
   replyRequestSchema,
@@ -259,6 +273,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     ...(options.localUserDisplayName !== undefined ? { displayName: options.localUserDisplayName } : {}),
   };
   const agentActor: Author = { kind: "agent", id: options.agentActorId ?? "agent" };
+  // System actor for daemon-emitted events with no human or agent
+  // origin — the lazy `ask.expired` sweep, in particular. PR #52
+  // review: reusing `agent` there would falsely attribute the
+  // transition to the agent that raised the ask, which the
+  // channel-server's actor-filter then hides as "loopback echo"
+  // and never surfaces.
+  const systemActor: Author = { kind: "system", id: "revkit-daemon" };
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -612,6 +633,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return handleApi(request, url, method, requestId);
     }
 
+    // Ask JSON API (M2 item 7, story A1). Same Origin gate as threads.
+    if (url.pathname === "/api/asks" || url.pathname.startsWith("/api/asks/")) {
+      return handleAsksApi(request, url, method, requestId);
+    }
+
+    // `/ask/<id>` — the HTML page the human opens. Session cookie
+    // required; a caller without one is redirected to `/-/auth` with
+    // `next=/ask/<id>` so the launch-code flow lands them back here.
+    if (url.pathname.startsWith("/ask/")) {
+      if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
+      return handleAskPage(request, url, method, requestId);
+    }
+
     // Rail bundle — served from memory (built with `Bun.build` on
     // first request, cached forever). The rail is opt-in by the
     // page: the daemon's HTMLRewriter appends
@@ -622,6 +656,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (url.pathname === RAIL_JS_PATH || url.pathname === RAIL_CSS_PATH) {
       if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
       return handleRailAsset(url, method, requestId);
+    }
+
+    // Ask page bundle — mirrors the rail asset shape. Public, no
+    // cookie required (the bundle carries no user data; the answer
+    // POST it makes is what the cookie / Origin gate covers).
+    if (url.pathname === ASK_JS_PATH || url.pathname === ASK_CSS_PATH) {
+      if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
+      return handleAskAsset(url, method, requestId);
     }
 
     // Static files. GET / HEAD only. Static output is public — no
@@ -771,6 +813,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Take the pathname component only — drop query / fragment
     // that a URL parser might have kept.
     const pathOnly = next.split("?")[0]!.split("#")[0]!;
+    // Allow known daemon-virtual routes that do not live in the
+    // static dir. Today: `/ask/<idSchema>` (M2 item 7 — the ask
+    // page). The path segment must pass `isValidId` so no scary
+    // characters slip through, and the tail after the id must be
+    // empty (no `/ask/x/y`, no `/ask/x?...` — the query lives in
+    // `next` and is preserved as `next` is what we return). This
+    // is the SOLE list — the reason `safeNextRedirect` is not the
+    // right place to widen to "any daemon route" is that widening
+    // is the door open-redirect protection is built to close.
+    const askMatch = pathOnly.match(/^\/ask\/([^/]+)$/);
+    if (askMatch !== null) {
+      const askId = askMatch[1] ?? "";
+      if (isValidId(askId)) return next;
+      return undefined;
+    }
     // Resolve inside the served dir.
     const resolved = staticServer.resolve(pathOnly);
     if (!resolved.ok) return undefined;
@@ -1254,15 +1311,389 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return withHygiene(new Response(body as BodyInit, { status: 200 }), "asset", contentType);
   }
 
+  /** Serve the `/ask/<id>` page bundle. Same shape as
+   * `handleRailAsset`: build once, cache forever. */
+  async function handleAskAsset(url: URL, method: string, requestId: string): Promise<Response> {
+    let bundle;
+    try {
+      bundle = await buildAskPageBundle();
+    } catch (error) {
+      logger.error("ask.build.failed", { requestId, errorKind: (error as Error).name });
+      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text", "text/plain; charset=utf-8");
+    }
+    const isJs = url.pathname === ASK_JS_PATH;
+    const body = isJs ? bundle.js : bundle.css;
+    const contentType = isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";
+    if (method === "HEAD") {
+      return withHygiene(
+        new Response(null, { status: 200, headers: { "content-length": String(body.byteLength) } }),
+        "asset",
+        contentType,
+      );
+    }
+    return withHygiene(new Response(body as BodyInit, { status: 200 }), "asset", contentType);
+  }
+
+  // ── /ask/<id> HTML page ─────────────────────────────────────────
+
+  /** Parse an id out of `/ask/<id>` (no trailing path). Returns
+   * undefined for any shape that is not a bare id (extra path
+   * segments, missing id, malformed percent-encoding). */
+  function askIdFromPath(pathname: string): string | undefined {
+    if (!pathname.startsWith("/ask/")) return undefined;
+    const rest = pathname.slice("/ask/".length);
+    if (rest.length === 0 || rest.includes("/")) return undefined;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(rest);
+    } catch {
+      return undefined;
+    }
+    return isValidId(decoded) ? decoded : undefined;
+  }
+
+  async function handleAskPage(request: Request, url: URL, method: string, requestId: string): Promise<Response> {
+    void method;
+    // Same-origin discipline for a page navigation is lighter than
+    // for an API POST: a top-level navigation lands with
+    // `Sec-Fetch-Site: none` (URL bar, launch link click, 302 from
+    // `/-/auth`), and a cross-site link would be `cross-site`. We
+    // refuse `cross-site` explicitly and accept `same-origin` /
+    // `same-site` / `none` (or a missing header). The page's own CSP
+    // (`frame-ancestors 'none'`) blocks foreign iframes; a foreign
+    // page's `<a href>` following that lands here as `cross-site`
+    // and is refused below. The bearer path (test client) is
+    // accepted regardless.
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const origin = request.headers.get("origin");
+    const sfs = request.headers.get("sec-fetch-site");
+    if (!hasValidBearer) {
+      if (origin !== null && !isLoopbackOrigin(origin, port)) {
+        logger.warn("ask.page.rejected.origin", { requestId, origin });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      if (sfs === "cross-site") {
+        logger.warn("ask.page.rejected.sec-fetch", { requestId, reason: sfs });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+    }
+
+    // Session cookie required for the human path. A page without a
+    // cookie 302s through the launch-code exchange so a click on
+    // the launch URL lands here directly. `next=` is validated at
+    // redirect time (`safeNextRedirect`).
+    if (!hasValidBearer) {
+      const cookieValue = readCookie(request.headers.get("cookie"), cookieName(port));
+      if (!auth.hasSession(cookieValue)) {
+        // Redirecting to `/-/auth` without a valid code would just
+        // 403; instead, tell the caller which page they wanted so
+        // whichever tool holds their fresh launch URL can append
+        // `?next=/ask/<id>`. The rail's own login flow does the
+        // same — we never mint a code on a cookie-miss because that
+        // would defeat the "codes are single-use, short-lived"
+        // property. Answer as 401 with a helpful hint.
+        logger.warn("ask.page.rejected.no-session", { requestId, path: url.pathname });
+        return withHygiene(new Response("Unauthorized — open the launch URL first.", { status: 401 }), "text", "text/plain; charset=utf-8");
+      }
+    }
+
+    const id = askIdFromPath(url.pathname);
+    if (id === undefined) {
+      return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+    }
+    const record = await loadAskWithLazyExpire(id);
+    if (record === undefined) {
+      return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+    }
+    const html = renderAskPage(record);
+    // `/-/ask.js` is added to `script-src` ONLY on this response —
+    // no other HTML page allowlists the ask bundle path (PR #52
+    // review). See `headers.ts::buildCspHeader`.
+    return withHygiene(
+      new Response(html, { status: 200 }),
+      "html",
+      "text/html; charset=utf-8",
+      [ASK_JS_PATH],
+    );
+  }
+
+  // ── /api/asks branch (M2 item 7, story A1) ──────────────────────
+
+  /** Handle every `/api/asks*` route. Same Origin discipline as
+   * `/api/threads`: the gate runs before auth so a page on another
+   * loopback port cannot smuggle a cookie into a same-site call. */
+  async function handleAsksApi(request: Request, url: URL, method: string, requestId: string): Promise<Response> {
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+
+    const cookieValue = readCookie(request.headers.get("cookie"), cookieName(port));
+    const hasSession = auth.hasSession(cookieValue);
+    if (!hasValidBearer && !hasSession) {
+      logger.warn("api.asks.rejected.auth", { requestId, path: url.pathname });
+      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    }
+
+    // GET /api/asks?status=
+    if (url.pathname === "/api/asks" && method === "GET") {
+      const filter: AskFilter = {};
+      const statusParam = url.searchParams.get("status");
+      if (statusParam !== null) {
+        const parts = statusParam
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        const parsedStatus = z.array(askStatusSchema).min(1).safeParse(parts);
+        if (!parsedStatus.success) {
+          return badRequest([{ code: "custom", path: ["status"], message: "invalid status value(s)" }]);
+        }
+        if (parsedStatus.data.length === 1) filter.status = parsedStatus.data[0];
+        else filter.status = parsedStatus.data;
+      }
+      // Lazy expire pass — sweep pending asks past their deadline.
+      // Cheap: we already reduce the log to answer the read.
+      await sweepExpiredAsks();
+      const asks = await store.asks(filter);
+      return jsonResponse({ asks, head: store.head() });
+    }
+
+    // POST /api/asks (create) — agent bearer only
+    if (url.pathname === "/api/asks" && method === "POST") {
+      if (!hasValidBearer) {
+        logger.warn("api.asks.create.rejected.role", { requestId });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      const parsed = createAskRequestSchema.safeParse(bodyRead.value);
+      if (!parsed.success) return badRequest(parsed.error.issues);
+      const askId = parsed.data.id ?? randomUUID();
+      // Idempotence: refuse a client-supplied id that already
+      // maps to an ask on the log. The `duplicate-ask` rejection
+      // from validateNext would surface as a 400 with a machine-
+      // readable kind; short-circuiting here also skips the disk
+      // write.
+      if ((await store.ask(askId)) !== undefined) {
+        return badRequest([{ code: "custom", path: ["id"], message: "duplicate-ask" }]);
+      }
+      // Compute the wall-clock deadline (ms since epoch). Passed
+      // in on `ask.created` so a re-derived AskRecord carries it
+      // without a schema-version bump later.
+      const nowMs = options.nowMs?.() ?? Date.now();
+      const expiresAtMs = parsed.data.ttlMs !== undefined ? nowMs + parsed.data.ttlMs : undefined;
+      const urlPath = `/ask/${askId}`;
+      // PR #52 review: write the on-disk spec file AFTER the event
+      // is accepted. Under the previous order, a rejected append
+      // (duplicate-ask id collision, or any other 400) still left
+      // the id-file on disk, and that stray then blocked every
+      // future retry with ask-file-write-failed. Now we append
+      // first, and on any outcome other than 201 no disk state
+      // was ever created.
+      const input: ReviewEventInput = {
+        kind: "ask.created",
+        actor: agentActor,
+        askId,
+        spec: parsed.data.spec,
+        url: urlPath,
+        ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+      };
+      const appendResponse = await appendAndReturn(input, requestId, {});
+      if (appendResponse.status !== 201) return appendResponse;
+      // Event accepted — persist the spec file. A failure here (a
+      // full disk, a permission surprise) removes the ask from
+      // the log too, so the id does not become a ghost the
+      // operator has to inspect.
+      try {
+        writeAskFile(options.repoRoot, askId, parsed.data.spec);
+      } catch (error) {
+        logger.error("api.asks.create.file-failed-after-append", {
+          requestId,
+          askId,
+          errorKind: (error as Error).name,
+        });
+        // PR #52 round-2 review — cancel the just-appended ask and
+        // FAN THE EVENT out on `/events` like any other terminal
+        // transition, so `await_answer` waiters and the rail
+        // notice the ask no longer exists. Returns 500 (a
+        // server-side I/O failure — the client's request was
+        // well-formed) rather than a 400 with `path: ["id"]`
+        // (a client shape complaint).
+        try {
+          const cancelSeq = await store.append({
+            kind: "ask.cancelled",
+            actor: systemActor,
+            askId,
+            reason: "file-write-failed",
+          });
+          const cancelEvents = await store.since(cancelSeq - 1);
+          const cancelEvent = cancelEvents.find((e) => e.seq === cancelSeq);
+          if (cancelEvent !== undefined) void bus.publish(cancelEvent);
+        } catch {
+          // Cancel is best-effort — if it also failed, the ask is
+          // still on the log as pending and a subsequent read
+          // will report it. Not silent: the earlier logger.error
+          // has already reported the I/O failure.
+        }
+        return internalServerError({ error: "ask-file-write-failed" });
+      }
+      const record = await store.ask(askId);
+      return jsonResponse({ ask: record, url: urlPath }, 201);
+    }
+
+    // Paths of shape /api/asks/:id[/answer|/cancel]
+    const match = url.pathname.match(/^\/api\/asks\/([^/]+)(?:\/(answer|cancel))?$/);
+    if (match === null) {
+      return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+    }
+    let askId: string;
+    try {
+      askId = decodeURIComponent(match[1] ?? "");
+    } catch {
+      return badRequest([{ code: "custom", path: ["askId"], message: "invalid percent-encoding" }]);
+    }
+    if (!isValidId(askId)) {
+      return badRequest([{ code: "custom", path: ["askId"], message: "identifier fails idSchema" }]);
+    }
+    const action = match[2];
+
+    // GET /api/asks/:id
+    if (action === undefined && method === "GET") {
+      const record = await loadAskWithLazyExpire(askId);
+      if (record === undefined) {
+        return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+      }
+      return jsonResponse({ ask: record });
+    }
+
+    // POST /api/asks/:id/answer — cookie only (the human's role)
+    if (action === "answer" && method === "POST") {
+      if (hasValidBearer && !hasSession) {
+        // A bearer-only caller trying to answer their own question
+        // would defeat the "human answers, agent listens" split.
+        logger.warn("api.asks.answer.rejected.role", { requestId, askId });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      // Answer body size cap (defence in depth on top of the 1 MiB
+      // request cap): a huge coordinate array or a runaway
+      // `rank.ranking` list would fit under the request cap but is
+      // still not a well-formed answer.
+      if (typeof bodyRead.value === "object" && bodyRead.value !== null) {
+        const raw = JSON.stringify(bodyRead.value);
+        if (Buffer.byteLength(raw, "utf8") > MAX_ANSWER_BODY_BYTES) return payloadTooLarge();
+      }
+      const parsed = answerAskRequestSchema.safeParse(bodyRead.value);
+      if (!parsed.success) return badRequest(parsed.error.issues);
+      // Sweep first — an answer POST that raced past an expiry
+      // deadline should see the terminal state, not silently
+      // succeed and then discover it lost the race after commit.
+      await sweepExpiredAsks(askId);
+      const input: ReviewEventInput = {
+        kind: "ask.answered",
+        actor: localActor,
+        askId,
+        answer: parsed.data.answer,
+      };
+      return await appendAndReturn(input, requestId, {});
+    }
+
+    // POST /api/asks/:id/cancel — bearer only (agent's role)
+    if (action === "cancel" && method === "POST") {
+      if (!hasValidBearer) {
+        logger.warn("api.asks.cancel.rejected.role", { requestId, askId });
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      const parsed = cancelAskRequestSchema.safeParse(bodyRead.value === undefined ? {} : bodyRead.value);
+      if (!parsed.success) return badRequest(parsed.error.issues);
+      const input: ReviewEventInput = {
+        kind: "ask.cancelled",
+        actor: agentActor,
+        askId,
+        ...(parsed.data.reason !== undefined ? { reason: parsed.data.reason } : {}),
+      };
+      return await appendAndReturn(input, requestId, {});
+    }
+
+    return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+  }
+
+  /** Load one ask by id, first sweeping it for expiry so a caller
+   * that hits `/api/asks/:id` after the deadline sees the terminal
+   * `expired` state rather than a stale `pending`. Returns
+   * undefined if the ask does not exist. */
+  async function loadAskWithLazyExpire(id: string): Promise<AskRecord | undefined> {
+    await sweepExpiredAsks(id);
+    return await store.ask(id);
+  }
+
+  /** Sweep pending asks past their `expiresAtMs`. If `onlyId` is
+   * given, only that ask is considered — the fast path for a
+   * `GET /api/asks/:id` / an answer POST. Otherwise every pending
+   * ask is checked, e.g. on `GET /api/asks`.
+   *
+   * The append that carries `ask.expired` may lose a race with a
+   * concurrent `ask.answered`: `validateNext` refuses the second
+   * transition with `ask-not-pending`, and we swallow that
+   * rejection silently — the ask reached a terminal state, that
+   * is what we wanted. Any other append error is logged. */
+  async function sweepExpiredAsks(onlyId?: string): Promise<void> {
+    const nowMs = options.nowMs?.() ?? Date.now();
+    const candidates = onlyId !== undefined
+      ? [(await store.ask(onlyId))].filter((a): a is AskRecord => a !== undefined)
+      : await store.asks({ status: "pending" });
+    for (const record of candidates) {
+      if (record.status !== "pending") continue;
+      if (record.expiresAtMs === undefined) continue;
+      if (record.expiresAtMs > nowMs) continue;
+      const input: ReviewEventInput = {
+        kind: "ask.expired",
+        actor: systemActor,
+        askId: record.id,
+      };
+      try {
+        const seq = await store.append(input);
+        const events = await store.since(seq - 1);
+        const event = events.find((e) => e.seq === seq);
+        if (event !== undefined) void bus.publish(event);
+      } catch (error) {
+        if (error instanceof ThreadStoreAppendError && error.rejection.kind === "ask-not-pending") {
+          // Raced against an answer / cancel — the ask reached a
+          // terminal state, sweep is idempotent.
+          continue;
+        }
+        // Anything else is real; log but do not throw so a read
+        // path stays live even if the sweep hiccups.
+        logger.warn("api.asks.expire.failed", {
+          errorKind: (error as Error).name,
+          askId: record.id,
+        });
+      }
+    }
+  }
+
   /** Attach the ADR-0012 response-hygiene headers (issue #22): CSP on
    * HTML, `X-Content-Type-Options: nosniff`, `Referrer-Policy:
    * no-referrer`, the cross-origin isolation pair, a
    * `Permissions-Policy` denying the powerful features, and the
    * per-kind `Cache-Control`. `kind` selects the CSP + Cache-Control
    * shape (see `headers.ts`); `contentType` sets an explicit
-   * Content-Type when the response body needs one. */
-  function withHygiene(response: Response, kind: ResponseKind, contentType: string | undefined): Response {
-    return applyResponseHeaders(response, kind, contentType, headerCtx);
+   * Content-Type when the response body needs one. `extraScriptPaths`
+   * (PR #52 review) — route-specific `script-src` paths added ONLY
+   * to that response's CSP; today the ask-page handler passes
+   * `[ASK_JS_PATH]` so the ask bundle is not allowlisted on any
+   * other HTML page. */
+  function withHygiene(
+    response: Response,
+    kind: ResponseKind,
+    contentType: string | undefined,
+    extraScriptPaths: readonly string[] = [],
+  ): Response {
+    return applyResponseHeaders(response, kind, contentType, headerCtx, extraScriptPaths);
   }
 
   /** JSON body from `/api/*` (writes and reads). `kind: "json"` adds
@@ -1281,6 +1712,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   /** 413 body used by the request-size caps. */
   function payloadTooLarge(): Response {
     const response = new Response(JSON.stringify({ error: "payload-too-large" }), { status: 413 });
+    return withHygiene(response, "json", "application/json; charset=utf-8");
+  }
+
+  /** 500 JSON body used by the ask-create disk-failure path — a
+   * server-side I/O failure, NOT a client shape complaint. Kept
+   * separate from `badRequest` so the error kind never lands
+   * inside a `path: ["id"]` shape a client might parse as
+   * "reject this id and use another one." PR #52 round-2 review. */
+  function internalServerError(body: { readonly error: string }): Response {
+    const response = new Response(JSON.stringify(body), { status: 500 });
     return withHygiene(response, "json", "application/json; charset=utf-8");
   }
 }
@@ -1303,6 +1744,13 @@ function repoRelativeDisplay(repoRoot: string, absolute: string): string {
  * `payload` column. */
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB whole request
 export const MAX_COMMENT_BODY_BYTES = 65_536; // 64 KiB per comment body
+/** Cap on the serialised size of one answer body. The `text` answer
+ * variant already caps its own field at 65,535 chars in the browser
+ * form; the outer 1 MiB request cap catches oversize composites
+ * (a huge `region` coordinate array, a `rank` with a runaway
+ * option list). This is the wire byte cap `/api/asks/:id/answer`
+ * refuses at 413. */
+export const MAX_ANSWER_BODY_BYTES = 262_144; // 256 KiB
 
 /** Read the request body with a cap. Returns `{ ok: true, value }` on
  * success, `{ ok: false, kind: "too-large" | "invalid" }` on rejection.
