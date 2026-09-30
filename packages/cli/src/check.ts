@@ -10,6 +10,7 @@
 // section, and CI diffs against a prior run stay small.
 
 import { extname, join } from "node:path";
+import type { Parent } from "mdast";
 import type { AllowAnnotation } from "./allow-annotation.ts";
 import { verifyAllowAnnotationOnline } from "./allow-annotation.ts";
 import type { Diagnostic } from "./diagnostics.ts";
@@ -17,6 +18,7 @@ import { formatDiagnostic } from "./diagnostics.ts";
 import type { DiscoveredSymlink } from "./file-discovery.ts";
 import { repoRelative } from "./file-discovery.ts";
 import type { GhRunner } from "./gh-runner.ts";
+import { parseSourceFor } from "./mdx-parse.ts";
 import { checkComponentRegistryFile } from "./rules/component-registry.ts";
 import { checkFrontmatter } from "./rules/frontmatter.ts";
 import { checkLinksFile } from "./rules/links.ts";
@@ -145,21 +147,45 @@ export async function runCheck(
     vocab = [];
   }
 
+  // Parse each content file ONCE and hand the mdast root to every
+  // rule that needs it. A per-rule reparse would (a) double the cost
+  // and (b) let the second rule crash on a parse error the first
+  // rule already caught. `null` on a file means the parse failed —
+  // component-registry emits the parse-error diagnostic; other rules
+  // skip the file quietly.
+  interface Loaded {
+    readonly file: (typeof contentFiles)[number];
+    readonly source: string;
+    readonly root: Parent | null;
+  }
+  const loaded: Loaded[] = [];
+  for (const file of contentFiles) {
+    const source = await readFile(file.absolute);
+    let root: Parent | null;
+    try {
+      root = parseSourceFor(file.relative, source);
+    } catch {
+      root = null;
+    }
+    loaded.push({ file, source, root });
+  }
+
   // 1) component-registry — plus allow-annotation harvest.
   const usedAllowAnnotations: {
     readonly file: string;
     readonly line: number;
     readonly annotation: AllowAnnotation;
   }[] = [];
-  const sourceCache = new Map<string, string>();
-  for (const file of contentFiles) {
-    const source = await readFile(file.absolute);
-    sourceCache.set(file.absolute, source);
-    const result = checkComponentRegistryFile(source, file.relative);
+  for (const entry of loaded) {
+    const result = checkComponentRegistryFile(
+      entry.source,
+      entry.file.relative,
+      entry.root ?? undefined,
+    );
     findings.push(...result.diagnostics);
     for (const used of result.usedAllowAnnotations) {
       usedAllowAnnotations.push({
-        file: file.relative,
+        file: entry.file.relative,
         line: used.line,
         annotation: used.annotation,
       });
@@ -167,13 +193,11 @@ export async function runCheck(
   }
 
   // 1b) frontmatter — YAML at the top of `.md`/`.mdx` must satisfy a
-  //     strict key allowlist. Starlight's `docsSchema` accepts `head`,
-  //     `banner.content` and `hero.actions[].link` — all of which the
-  //     Starlight renderer emits as raw HTML / hrefs in the built
-  //     page (bypass #4).
-  for (const file of contentFiles) {
-    const source = sourceCache.get(file.absolute) ?? await readFile(file.absolute);
-    findings.push(...checkFrontmatter(source, file.relative));
+  //     strict key allowlist (`rules/frontmatter.ts` uses Astro's own
+  //     `parseFrontmatter` so the guard sees exactly what the build
+  //     sees, plus BOM / leading-whitespace / `+++` refusals).
+  for (const entry of loaded) {
+    findings.push(...checkFrontmatter(entry.source, entry.file.relative));
   }
 
   // 2) no-hand-rolled-UI — path-only, runs on every UI-shaped input.
@@ -181,19 +205,30 @@ export async function runCheck(
     findings.push(...checkNoHandRolledUiFile(file.relative));
   }
 
-  // 3) vocabulary — Term/id sigils, redefinitions.
-  for (const file of contentFiles) {
-    const source = await readFile(file.absolute);
-    findings.push(...checkVocabularyFile(source, file.relative, vocab));
+  // 3) vocabulary — Term/id sigils, redefinitions. Reuses the shared
+  //    parse (nit 1 in round-3: one parse per file across rules).
+  for (const entry of loaded) {
+    findings.push(...checkVocabularyFile(
+      entry.source,
+      entry.file.relative,
+      vocab,
+      entry.root ?? undefined,
+    ));
   }
 
   // 4) links — relative links + heading anchors. Confined to repoRoot:
   //    a `../../..` traversal that escapes the workspace is flagged.
   const slugCache = new Map<string, Set<string>>();
-  for (const file of contentFiles) {
-    const source = await readFile(file.absolute);
+  for (const entry of loaded) {
     findings.push(
-      ...checkLinksFile(source, file.absolute, file.relative, slugCache, repoRoot),
+      ...checkLinksFile(
+        entry.source,
+        entry.file.absolute,
+        entry.file.relative,
+        slugCache,
+        repoRoot,
+        entry.root ?? undefined,
+      ),
     );
   }
 

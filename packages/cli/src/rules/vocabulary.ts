@@ -83,15 +83,29 @@ function readStringAttr(
   return null;
 }
 
-/** Walk one MDX / MD file for vocabulary findings. */
+/** Walk one MDX / MD file for vocabulary findings. `preparsedRoot`
+ * lets the caller share ONE parse per file across rules (the
+ * orchestrator does this so a `.mdx` with math is not parsed twice
+ * — the second parse would fail with the same message and, worse,
+ * would let a parse error surface as an unhandled throw from the
+ * second rule). */
 export function checkVocabularyFile(
   source: string,
   file: string,
   vocab: readonly LoadedVocabEntry[],
+  preparsedRoot?: Parent,
 ): Diagnostic[] {
   const idIndex = indexById(vocab);
   const termIndex = indexByTermOrAlias(vocab);
-  const root = parseSourceFor(file, source);
+  let root: Parent;
+  try {
+    root = preparsedRoot ?? parseSourceFor(file, source);
+  } catch {
+    // Parse errors are reported by component-registry (which owns the
+    // MDX-shape rule); vocabulary skips the file quietly rather than
+    // double-reporting the same syntax error.
+    return [];
+  }
   const diagnostics: Diagnostic[] = [];
 
   walkMdast(root as unknown as Nodes, (node, ancestors) => {

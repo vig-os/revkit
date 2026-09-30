@@ -78,10 +78,18 @@ function startsWithCI(haystack: string, needle: string): boolean {
   return haystack.slice(0, needle.length).toLowerCase() === needle.toLowerCase();
 }
 
-/** Is `posixRepoRelative` a test file? Test suites are exempt so a UI
- * unit test can live next to its module (case-insensitive match). */
+/** Is `posixRepoRelative` a UI test file? Only `.test.[jt]sx?` counts
+ * — a plain-text `.test.md` still trips branch C so tests can not
+ * hide inside a content directory. */
 function isTestFile(posixRepoRelative: string): boolean {
   return /(^|\/)([^/]+\.)?test\.[jt]sx?$/i.test(posixRepoRelative);
+}
+
+/** Is `posixRepoRelative` ANY test file (`.test.*`)? Broader than the
+ * UI exemption above — used by branch C to catch `docs/foo.test.md`
+ * and friends. */
+function isAnyTestFile(posixRepoRelative: string): boolean {
+  return /(^|\/)[^/]+\.test\.[^/]+$/i.test(posixRepoRelative);
 }
 
 /** Is this file's path under one of the allowed UI prefixes? */
@@ -121,6 +129,19 @@ export function checkNoHandRolledUiFile(posixRepoRelative: string): Diagnostic[]
         message: `code module (${ext}) inside a content directory (${CONTENT_DIR_PREFIXES.find((p) => startsWithCI(posixRepoRelative, p))}) — content is data, not code (ADR-0002, ADR-0003).`,
       });
     }
+  }
+
+  // Branch C: test file under a content dir — content is data, tests
+  // don't belong there. Catches every `*.test.*` (not just the UI
+  // exempt from branch B), so `docs/foo.test.md` fails too
+  // (round-3 nit).
+  if (isAnyTestFile(posixRepoRelative) && isUnderContentDir(posixRepoRelative)) {
+    findings.push({
+      file: posixRepoRelative,
+      line: 0,
+      rule: "no-hand-rolled-ui",
+      message: `test file inside a content directory — move tests out of ${CONTENT_DIR_PREFIXES.find((p) => startsWithCI(posixRepoRelative, p))} (ADR-0003).`,
+    });
   }
 
   return findings;

@@ -106,7 +106,7 @@ function buildRestrictedLoader(specDir: string): VegaLoaderShape {
  * SMIL declarative logic, embed / script / foreign-object escape hatches
  * and unknown-to-us elements all fail closed. Names are lowercased
  * because linkedom's SVG-XML parser normalises tag names. */
-const ALLOWED_ELEMENTS: ReadonlySet<string> = new Set([
+export const ALLOWED_SVG_ELEMENTS: ReadonlySet<string> = new Set([
   "svg",
   "g",
   "defs",
@@ -141,7 +141,7 @@ const ALLOWED_ELEMENTS: ReadonlySet<string> = new Set([
  * element (allowlist, not denylist) — a `<set attributeName="href" …>`
  * dropped through the element allowlist would still lose the attribute
  * anyway. */
-const ALLOWED_ATTRIBUTES: ReadonlySet<string> = new Set([
+export const ALLOWED_SVG_ATTRIBUTES: ReadonlySet<string> = new Set([
   // Structural / accessibility
   "id",
   "class",
@@ -306,7 +306,7 @@ function keepAttribute(name: string, value: string): string | null {
   if (lower === "href" || lower === "xlink:href") {
     return isSameDocumentFragment(value) ? value : null;
   }
-  if (!ALLOWED_ATTRIBUTES.has(lower)) return null;
+  if (!ALLOWED_SVG_ATTRIBUTES.has(lower)) return null;
   // `javascript:` URLs in any surviving attribute value must go too.
   if (/\bjavascript:/i.test(value)) return null;
   if (URL_BEARING_ATTRIBUTES.has(lower)) {
@@ -351,7 +351,7 @@ function sanitizeSvgTree(root: SvgNode): void {
   const children = Array.from(root.children ?? []);
   for (const child of children) {
     const tagName = child.localName?.toLowerCase() ?? "";
-    if (!ALLOWED_ELEMENTS.has(tagName)) {
+    if (!ALLOWED_SVG_ELEMENTS.has(tagName)) {
       child.remove();
       continue;
     }

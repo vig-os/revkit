@@ -388,14 +388,16 @@ export interface ComponentRegistryFileResult {
  * parse error surfaces as a `file:line: component-registry: parse …`
  * diagnostic — never a raw micromark / acorn stack — so the CLI's
  * output stays legible in a pre-commit log (nit 1 in the round-2
- * review). */
+ * review). `preparsedRoot` lets the orchestrator hand a shared parse
+ * to every rule that reads the same file. */
 export function checkComponentRegistryFile(
   source: string,
   file: string,
+  preparsedRoot?: Parent,
 ): ComponentRegistryFileResult {
-  let root;
+  let root: Parent;
   try {
-    root = parseSourceFor(file, source);
+    root = preparsedRoot ?? parseSourceFor(file, source);
   } catch (error) {
     return {
       diagnostics: [parseErrorDiagnostic(error, file)],

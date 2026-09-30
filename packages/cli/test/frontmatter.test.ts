@@ -9,15 +9,64 @@ import {
 } from "../src/rules/frontmatter.ts";
 
 describe("extractFrontmatterBlock", () => {
-  test("returns null when the file has no frontmatter", () => {
-    expect(extractFrontmatterBlock("# hi\n\nbody\n")).toBeNull();
+  test("returns kind=empty when the file has no frontmatter", () => {
+    expect(extractFrontmatterBlock("# hi\n\nbody\n").kind).toBe("empty");
   });
 
-  test("extracts the yaml between the two `---` fences", () => {
+  test("parses the yaml between the two `---` fences via Astro's parser", () => {
     const src = `---\ntitle: t\ndescription: d\n---\n\nbody\n`;
     const block = extractFrontmatterBlock(src);
-    expect(block?.yaml).toContain("title: t");
-    expect(block?.startLine).toBe(2);
+    expect(block.kind).toBe("ok");
+    expect(block.parsed?.title).toBe("t");
+    expect(block.startLine).toBe(2);
+  });
+});
+
+describe("extractFrontmatterBlock — structural refusals (round-3 bypasses)", () => {
+  test("BOM before the fence is refused (Astro accepts it)", () => {
+    const src = "﻿---\ntitle: t\n---\n";
+    const result = extractFrontmatterBlock(src);
+    expect(result.kind).toBe("structural-refusal");
+    expect(result.message).toContain("BOM");
+  });
+
+  test("leading blank line before the fence is refused (Astro accepts it)", () => {
+    const src = "\n---\ntitle: t\n---\n";
+    const result = extractFrontmatterBlock(src);
+    expect(result.kind).toBe("structural-refusal");
+    expect(result.message).toContain("byte 0");
+  });
+
+  test("`+++` TOML fence is refused (Astro parses it)", () => {
+    const src = "+++\ntitle = \"t\"\n+++\n";
+    const result = extractFrontmatterBlock(src);
+    expect(result.kind).toBe("structural-refusal");
+    expect(result.message).toContain("TOML");
+  });
+
+  test("indented `---` inside a YAML block scalar does NOT close early (Astro's rule)", () => {
+    // Previously our line-based extractor closed on the indented
+    // `---` inside the block scalar, hiding the real payload
+    // (banner.content) from the allowlist.
+    const src = [
+      "---",
+      "title: t",
+      "description: >-",
+      "  paragraph with an",
+      "  indented ---",
+      "  fence inside it",
+      "banner:",
+      "  content: \"<script>alert(1)</script>\"",
+      "---",
+      "",
+      "body",
+      "",
+    ].join("\n");
+    const block = extractFrontmatterBlock(src);
+    expect(block.kind).toBe("ok");
+    // The `banner` key survives to the parsed object — proof the
+    // guard sees the same block Astro would render.
+    expect((block.parsed ?? {})).toHaveProperty("banner");
   });
 });
 
@@ -171,5 +220,46 @@ hero:
     const src = `---\ntitle: t\ntemplate: evil\n---\n`;
     const findings = checkFrontmatter(src, "docs/x.md");
     expect(findings.length).toBeGreaterThan(0);
+  });
+});
+
+describe("checkFrontmatter — round-3 structural bypasses", () => {
+  test("BOM + head[]{tag:script} is refused (BOM caught before parse)", () => {
+    const src = "﻿---\nhead:\n  - tag: script\n    content: \"alert(1)\"\n---\n";
+    const findings = checkFrontmatter(src, "docs/x.md");
+    expect(findings.some((f) => f.message.includes("BOM"))).toBe(true);
+  });
+
+  test("leading whitespace + banner is refused (fence placement caught)", () => {
+    const src = "\n---\nbanner:\n  content: \"<script>alert(1)</script>\"\n---\n";
+    const findings = checkFrontmatter(src, "docs/x.md");
+    expect(findings.some((f) => f.message.includes("byte 0"))).toBe(true);
+  });
+
+  test("`+++` TOML block with head is refused (TOML never reaches the allowlist)", () => {
+    const src = "+++\n[[head]]\ntag = \"script\"\ncontent = \"alert(1)\"\n+++\n";
+    const findings = checkFrontmatter(src, "docs/x.md");
+    expect(findings.some((f) => f.message.includes("TOML"))).toBe(true);
+  });
+
+  test("indented `---` inside block scalar does not hide a `banner` payload", () => {
+    const src = [
+      "---",
+      "title: t",
+      "description: >-",
+      "  paragraph with an",
+      "  indented ---",
+      "  fence inside it",
+      "banner:",
+      "  content: \"<script>alert(1)</script>\"",
+      "---",
+      "",
+      "body",
+      "",
+    ].join("\n");
+    const findings = checkFrontmatter(src, "docs/x.md");
+    // The line-based extractor missed this — the new extractor
+    // (Astro's parser) sees `banner` and the allowlist refuses it.
+    expect(findings.some((f) => f.message.includes("banner"))).toBe(true);
   });
 });

@@ -90,8 +90,17 @@ export function checkLinksFile(
   reportPath: string,
   cache: SlugCache = new Map(),
   repoRoot?: string,
+  preparsedRoot?: import("mdast").Parent,
 ): Diagnostic[] {
-  const root = parseSourceFor(absoluteFilePath, source);
+  let root;
+  try {
+    root = preparsedRoot ?? parseSourceFor(absoluteFilePath, source);
+  } catch {
+    // Same rationale as vocabulary: component-registry owns the
+    // parse-error diagnostic; the links rule skips a failed parse
+    // rather than double-reporting.
+    return [];
+  }
   const findings: Diagnostic[] = [];
   const sourceDir = dirname(absoluteFilePath);
 

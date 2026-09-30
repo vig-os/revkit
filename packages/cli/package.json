@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@astrojs/internal-helpers": "0.11.0",
     "@revkit/site": "workspace:*",
     "@types/mdast": "4.0.4",
     "linkedom": "0.18.13",

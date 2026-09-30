@@ -107,8 +107,27 @@ describe("no-hand-rolled-ui — code modules in content directories", () => {
   test(".ts under packages/cli/src is allowed (not a content dir)", () => {
     expect(checkNoHandRolledUiFile("packages/cli/src/index.ts")).toEqual([]);
   });
+});
 
-  test("test file under a content dir is exempt", () => {
-    expect(checkNoHandRolledUiFile("docs/foo.test.ts")).toEqual([]);
+describe("no-hand-rolled-ui — test files inside content dirs (round-3 nit)", () => {
+  test("docs/foo.test.md is flagged (any *.test.* under a content dir)", () => {
+    const diagnostics = checkNoHandRolledUiFile("docs/foo.test.md");
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.message).toContain("test file inside a content directory");
+  });
+
+  test("site/src/content/docs/foo.test.mdx is flagged", () => {
+    const diagnostics = checkNoHandRolledUiFile("site/src/content/docs/foo.test.mdx");
+    expect(diagnostics).toHaveLength(1);
+  });
+
+  test("docs/foo.test.ts is flagged (test file under content dir, even though the code-module branch exempts .test.*)", () => {
+    const diagnostics = checkNoHandRolledUiFile("docs/foo.test.ts");
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.message).toContain("test file inside a content directory");
+  });
+
+  test("packages/cli/test/foo.test.ts is NOT flagged (outside content dir)", () => {
+    expect(checkNoHandRolledUiFile("packages/cli/test/foo.test.ts")).toEqual([]);
   });
 });

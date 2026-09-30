@@ -21,9 +21,28 @@
 // (the loader is a producer of frontmatter; the shape it emits must
 // pass this same allowlist).
 
-import { parse as parseYaml } from "yaml";
+import { parseFrontmatter } from "@astrojs/internal-helpers/frontmatter";
 import type { Diagnostic } from "../diagnostics.ts";
 import { isRefusedUrl } from "../url-scheme.ts";
+
+// Astro's own frontmatter parser (from `@astrojs/internal-helpers`) is
+// what the build uses to pull `frontmatter` off a `.md`/`.mdx` file, so
+// the guard MUST use the same code path or a differential silently
+// re-opens the door (round-3 review: an indented `---` inside a block
+// scalar closed the extractor early; a BOM or leading whitespace moved
+// the fence past the check; `+++` TOML frontmatter bypassed the YAML
+// parse entirely — each rendered raw HTML through Starlight).
+//
+// On top of Astro's parser we ALSO refuse:
+//
+//   - BOM at the very first byte (allowed by Astro, refused here so
+//     the source is byte-for-byte plain UTF-8).
+//   - Any leading whitespace / blank line before the fence (Astro
+//     accepts it; content authoring in revkit is strict — the fence
+//     is byte 0).
+//   - `+++` TOML — revkit content is YAML frontmatter only.
+//
+// After that, the key allowlist below applies to the parsed object.
 
 /** Top-level keys accepted in content frontmatter. Everything else is
  * a violation. Descriptions (for the diagnostic message when a caller
@@ -105,30 +124,65 @@ const TOC_ALLOWED_KEYS: ReadonlySet<string> = new Set([
   "maxHeadingLevel",
 ]);
 
-/** Extract the YAML frontmatter block from a `.md`/`.mdx` source. The
- * block must be delimited by `---` on its own line at the very top of
- * the file (Starlight's requirement), so a `---` inside prose does not
- * count. Returns `null` when the file has no frontmatter, or the raw
- * YAML text + the line number the block ends on (for `file:line`
- * diagnostics inside the frontmatter). */
-export function extractFrontmatterBlock(source: string): {
-  readonly yaml: string;
-  readonly startLine: number;
-  readonly endLine: number;
-} | null {
-  const lines = source.split(/\r?\n/);
-  if (lines[0]?.trim() !== "---") return null;
-  for (let i = 1; i < lines.length; i += 1) {
-    if (lines[i]?.trim() === "---") {
-      const yamlLines = lines.slice(1, i);
-      return {
-        yaml: yamlLines.join("\n"),
-        startLine: 2, // 1-based line the YAML content starts on
-        endLine: i,
-      };
-    }
+/** Extract the frontmatter block by delegating to Astro's own parser,
+ * so the guard sees the same input Starlight will render. Returns
+ * either the parsed object (and its raw text), or a structural
+ * refusal — a BOM at byte 0, leading whitespace before the fence, or
+ * a `+++` TOML fence — before parsing runs. This keeps guard and
+ * build in lockstep and rejects the placements that only Astro
+ * accepts. */
+export interface FrontmatterExtractResult {
+  readonly kind: "empty" | "ok" | "structural-refusal";
+  readonly parsed?: Record<string, unknown>;
+  readonly rawFrontmatter?: string;
+  readonly startLine?: number;
+  readonly message?: string;
+}
+
+/** Byte-0 fence check: the source must start with `---\n` — no BOM,
+ * no leading whitespace / blank lines, no `+++`. Returns a refusal
+ * message when the shape is wrong, `null` when it's fine. */
+function structuralRefusal(source: string): string | null {
+  // Empty file or files with no fence at all: not a frontmatter
+  // violation (the file has no frontmatter to check).
+  if (source.length === 0) return null;
+  const first = source.charCodeAt(0);
+  if (first === 0xFEFF) {
+    return "frontmatter: BOM at byte 0 is refused (Astro accepts it; revkit content must be plain UTF-8).";
+  }
+  // No fence anywhere → treat as "no frontmatter", not a refusal.
+  if (!/^\s*(?:---|\+\+\+)/.test(source)) return null;
+  // `+++` TOML fence at any position (Astro's regex accepts leading
+  // whitespace before it): refuse.
+  if (/^\s*\+\+\+/.test(source)) {
+    return "frontmatter: `+++` TOML fence is refused (revkit content uses YAML frontmatter only).";
+  }
+  // Leading whitespace before a `---` fence: refuse.
+  if (!source.startsWith("---")) {
+    return "frontmatter: fence must be at byte 0 (no leading whitespace or blank lines before `---`).";
   }
   return null;
+}
+
+export function extractFrontmatterBlock(source: string): FrontmatterExtractResult {
+  const refusal = structuralRefusal(source);
+  if (refusal !== null) {
+    return { kind: "structural-refusal", message: refusal };
+  }
+  // At this point the source is well-shaped for Astro: `---` at byte 0
+  // OR no frontmatter fence at all. Run Astro's parser.
+  const { frontmatter, rawFrontmatter } = parseFrontmatter(source);
+  if (rawFrontmatter.length === 0) {
+    return { kind: "empty" };
+  }
+  return {
+    kind: "ok",
+    parsed: frontmatter,
+    rawFrontmatter,
+    // 1-based line the YAML content starts on (line 2, after the
+    // opening `---` on line 1).
+    startLine: 2,
+  };
 }
 
 /** Produce a diagnostic pointing at the frontmatter block for a
@@ -422,18 +476,26 @@ function checkHeroImage(value: unknown, file: string, line: number): Diagnostic[
 
 /** Entry point: check the frontmatter of `source` from `file`. */
 export function checkFrontmatter(source: string, file: string): Diagnostic[] {
-  const block = extractFrontmatterBlock(source);
-  if (block === null) return [];
-  let parsed: unknown;
+  let block: FrontmatterExtractResult;
   try {
-    parsed = parseYaml(block.yaml);
+    block = extractFrontmatterBlock(source);
   } catch (error) {
+    // Astro's parser throws on malformed YAML / TOML.
     return [{
       file,
-      line: block.startLine,
+      line: 1,
       rule: "component-registry",
-      message: `frontmatter: YAML parse error: ${(error as Error).message.split("\n")[0]}`,
+      message: `frontmatter: parse error: ${(error as Error).message.split("\n")[0]}`,
     }];
   }
-  return checkFrontmatterValue(parsed, file, block.startLine);
+  if (block.kind === "empty") return [];
+  if (block.kind === "structural-refusal") {
+    return [{
+      file,
+      line: 1,
+      rule: "component-registry",
+      message: block.message ?? "frontmatter: structural refusal.",
+    }];
+  }
+  return checkFrontmatterValue(block.parsed ?? null, file, block.startLine ?? 2);
 }
