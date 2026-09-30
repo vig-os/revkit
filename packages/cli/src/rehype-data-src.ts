@@ -22,10 +22,10 @@
 // calls), and by the unit tests here in the CLI package (which run the
 // plugin against a fixture tree — no Astro needed).
 
-import { relative, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import type { Root, Element, RootContent, ElementContent, Properties } from "hast";
-import { fileURLToPath } from "node:url";
 import { formatDataSrc } from "./data-src-format.ts";
+import { filePathOf, repoRelativePosix, type VFileLike } from "./rehype-vfile.ts";
 
 // Re-export the browser-safe format helpers so tests + rail bundle
 // share ONE parser (kept in `data-src-format.ts` so the rail can
@@ -85,70 +85,31 @@ export interface DataSrcPluginOptions {
   readonly overwriteExisting?: boolean;
 }
 
-/** A minimal `VFile` view. The unified pipeline hands the plugin a
- * `VFile`-shaped object; we touch only `path` (absolute file path when
- * set) and `history` (some pipelines use the last history entry).
- * `data` is deliberately typed `unknown` — we cast inside `filePathOf`
- * — so this shape stays compatible with unified's `VFile['data']` even
- * as downstream ecosystems (Astro / Starlight) extend it. */
-interface VFileLike {
-  readonly path?: string;
-  readonly history?: readonly string[];
-  readonly data?: unknown;
-}
-
-/** Extract the source file's absolute path from a `VFile`. Returns
- * undefined when the file has no path (a synthetic in-memory tree).
- * Falls back to `file.data.astro.fileURL` when Astro's markdown
- * pipeline hands us a `VFile` with the path in its `data` bag. */
-function filePathOf(file: VFileLike): string | undefined {
-  if (typeof file.path === "string" && file.path.length > 0) return file.path;
-  if (Array.isArray(file.history) && file.history.length > 0) {
-    const last = file.history[file.history.length - 1];
-    if (typeof last === "string" && last.length > 0) return last;
-  }
-  const data = file.data;
-  if (data !== undefined && data !== null && typeof data === "object") {
-    const astro = (data as { readonly astro?: unknown }).astro;
-    if (astro !== undefined && astro !== null && typeof astro === "object") {
-      const astroFileUrl = (astro as { readonly fileURL?: unknown }).fileURL;
-      if (astroFileUrl instanceof URL) return fileURLToPath(astroFileUrl);
-      if (typeof astroFileUrl === "string" && astroFileUrl.length > 0) {
-        try {
-          return fileURLToPath(new URL(astroFileUrl));
-        } catch {
-          return astroFileUrl;
-        }
-      }
-    }
-  }
-  return undefined;
-}
-
-/** Compute the repo-relative path in POSIX form. Returns undefined if
- * the file falls outside `repoRoot` (a `..` prefix indicates escape). */
-export function repoRelativePosix(
-  repoRoot: string,
-  filePath: string,
-): string | undefined {
-  const rel = relative(resolve(repoRoot), resolve(filePath));
-  if (rel.length === 0) return undefined;
-  if (rel.startsWith("..")) return undefined;
-  // Windows delimiter → POSIX forward slash so the string is the same
-  // on every platform.
-  return sep === "/" ? rel : rel.split(sep).join("/");
-}
+// `VFileLike`, `filePathOf`, and `repoRelativePosix` moved to
+// `./rehype-vfile.ts` (shared with `rehype-drop-repo-doc-title`).
+// Re-export the path helper so external callers (tests, tools) keep
+// their import path stable.
+export { repoRelativePosix };
 
 /** Walk a hast tree and stamp block elements. Exported without the
- * unified wrapper so tests can call it against a fixture. */
+ * unified wrapper so tests can call it against a fixture.
+ *
+ * `<pre>` gets special treatment: Starlight's expressive-code
+ * integration REPLACES the plain `<pre>` with a wrapped
+ * `<figure><pre>…</pre>…</figure>`, silently dropping any
+ * attribute (including `data-src`) on the original pre. To
+ * survive that pass, we WRAP the pre in a stamped `<div>` — the
+ * outer div's attributes are preserved through expressive-code's
+ * rewrite, so the rail can still anchor on it (PR #38 round-2
+ * review: code-block anchors). */
 export function stampTree(
   tree: Root | Element,
   options: { repoRelPath: string; overwriteExisting: boolean },
 ): number {
   let stamped = 0;
-  const walk = (node: Root | ElementContent | RootContent): void => {
-    if (node.type === "element") {
-      const element = node;
+  const walk = (parent: { children?: unknown } | Root | ElementContent | RootContent): void => {
+    if ((parent as { type?: string }).type === "element") {
+      const element = parent as Element;
       const tag = element.tagName.toLowerCase();
       const positioned = element.position as Position | undefined;
       if (
@@ -165,17 +126,43 @@ export function stampTree(
             positioned.start.line,
             positioned.end.line,
           );
-          // hast's property naming: `data-src` on the wire is
-          // `dataSrc` in properties. `hast-util-to-html` converts it
-          // back to `data-src` at serialise time.
           properties["dataSrc"] = value;
           element.properties = properties;
           stamped++;
         }
       }
     }
-    if ("children" in node && Array.isArray(node.children)) {
-      for (const child of node.children) walk(child as ElementContent);
+    // Walk children AND rewrite <pre> children in-place with a
+    // stamped <div> wrapper.
+    const container = parent as { children?: ElementContent[] };
+    if (Array.isArray(container.children)) {
+      for (let i = 0; i < container.children.length; i++) {
+        const child = container.children[i]!;
+        walk(child);
+        if (child.type === "element" && child.tagName.toLowerCase() === "pre") {
+          const positioned = child.position as Position | undefined;
+          if (
+            positioned !== undefined &&
+            Number.isInteger(positioned.start.line) &&
+            Number.isInteger(positioned.end.line)
+          ) {
+            const value = formatDataSrc(
+              options.repoRelPath,
+              positioned.start.line,
+              positioned.end.line,
+            );
+            const wrapper: Element = {
+              type: "element",
+              tagName: "div",
+              properties: { dataSrc: value, className: ["revkit-code-anchor"] },
+              children: [child],
+              position: child.position,
+            };
+            container.children[i] = wrapper;
+            stamped++;
+          }
+        }
+      }
     }
   };
   walk(tree);

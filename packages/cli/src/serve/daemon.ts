@@ -28,6 +28,7 @@ import { dirname, extname, relative as relativePath } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
 import {
+  isValidId,
   revisionOf,
   threadStatusSchema,
   type Anchor,
@@ -37,8 +38,9 @@ import {
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
-import { readFileSync as readFileSyncNode } from "node:fs";
+import { readFileSync as readFileSyncNode, realpathSync as realpathSyncNode, statSync as statSyncNode } from "node:fs";
 import { resolve as resolvePath } from "node:path";
+import { resolveWithinRoot as resolveWithinRootStrict } from "./confined-path.ts";
 import { openStaticServer } from "./static-server.ts";
 import { contentTypeForExtension } from "./mime.ts";
 import {
@@ -438,6 +440,35 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return response;
     }
 
+    // Fresh launch-code mint (PR #38 round-2 blocker 3). The startup
+    // launch code has a 60 s TTL; an auto-started daemon (spawned
+    // by `revkit mcp`) prints it to a stdout the parent ignored, so
+    // no human ever sees it. This endpoint lets a caller with the
+    // agent bearer mint a NEW single-use code so it can hand the
+    // human a fresh URL. Bearer-authed only, exact Host check
+    // already applied above, no cookie path.
+    if (method === "POST" && url.pathname === "/-/launch-code") {
+      const bearer = bearerFromHeader(request.headers.get("authorization"));
+      if (bearer === undefined || !auth.isAgent(bearer)) {
+        logger.warn("launch-code.rejected.auth", { requestId });
+        return withHygiene(new Response("Unauthorized", { status: 401 }), "text/plain; charset=utf-8");
+      }
+      const minted = auth.mintLaunchCode();
+      const launchUrl = `${boundUrl}/-/auth?code=${minted.value}`;
+      const body = JSON.stringify({
+        launchCode: minted.value,
+        launchUrl,
+        ttlMs: options.launchCodeTtlMs ?? 60_000,
+      });
+      logger.info("launch-code.minted", { requestId });
+      const response = new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
+      response.headers.set("x-content-type-options", "nosniff");
+      return response;
+    }
+
     // `/events` — SSE by default, WebSocket on upgrade. Origin check
     // runs inside the handler after we know which credential the
     // caller presented (a bearer-authenticated non-browser client may
@@ -652,6 +683,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         threadId = decodeURIComponent(match[1] ?? "");
       } catch {
         return badRequest([{ code: "custom", path: ["threadId"], message: "invalid percent-encoding" }]);
+      }
+      // Structural id check on the URL path (PR #38 review):
+      // review-core's `idSchema` refuses `<`, `>`, `"`, etc.
+      if (!isValidId(threadId)) {
+        return badRequest([{ code: "custom", path: ["threadId"], message: "identifier fails idSchema" }]);
       }
       const kind = match[2];
       const bodyRead = await readCappedJsonBody(request);
@@ -1075,32 +1111,53 @@ function payloadTooLarge(): Response {
   return response;
 }
 
+/** Cap on a source file the daemon will read to compute a
+ * revision. 5 MiB is comfortable for even the largest reasonable
+ * document; a file over the cap gets the same generic
+ * "anchor.path is not a valid anchor target" refusal (below) so
+ * the daemon does not become an oracle for which oversized files
+ * exist in the repo. (PR #38 round-2 review.) */
+const ANCHOR_SOURCE_MAX_BYTES = 5 * 1024 * 1024;
+
 /** Resolve an anchor's `path` under the repo root, confirm the file
- * exists, and return `revisionOf(sourceContents)`. Path shape has
- * already been validated by `anchorPathSchema` (no `..`, no
- * backslash, no absolute prefix); this step adds the filesystem
- * containment + revision computation (PR #38 review). */
+ * exists, and return `revisionOf(sourceContents)`.
+ *
+ * Uses the shared `resolveWithinRoot` confinement helper (realpath +
+ * lstat, refuses symlinks that escape the repo) so a hostile anchor
+ * cannot chase a symlink into `/etc`. Path shape is already checked
+ * by `anchorPathSchema`; this step adds the filesystem containment,
+ * a size cap, and revision computation.
+ *
+ * Every rejection returns the SAME `reason` string ("anchor.path is
+ * not a valid anchor target in the repository") so the response
+ * body cannot be used to distinguish "missing file", "over cap", or
+ * "symlink escape" — a caller either has the file or does not.
+ * (PR #38 round-2 review.) */
 export async function resolveAnchorSource(
   anchor: Anchor,
   repoRoot: string,
 ): Promise<{ ok: true; revision: string } | { ok: false; reason: string }> {
-  // Belt-and-braces: even though `anchorPathSchema` rejects `..`,
-  // resolve against the repo root and confirm the result stays
-  // inside it. Cheap, and future-proofs the check.
-  const rootAbs = resolvePath(repoRoot);
-  const abs = resolvePath(rootAbs, anchor.path);
-  if (!abs.startsWith(rootAbs + "/") && abs !== rootAbs) {
-    return { ok: false, reason: "anchor.path escapes repository root" };
+  const UNIFORM_REJECTION = "anchor.path is not a valid anchor target in the repository";
+  // Use the shared confinement helper: it realpaths the root and
+  // refuses `..`, symlinks that escape, and non-file entries.
+  const rootReal = realpathSyncNode(resolvePath(repoRoot));
+  const resolved = resolveWithinRootStrict(rootReal, "/" + anchor.path);
+  if (!resolved.ok) return { ok: false, reason: UNIFORM_REJECTION };
+  let stat;
+  try {
+    stat = statSyncNode(resolved.absolutePath);
+  } catch {
+    return { ok: false, reason: UNIFORM_REJECTION };
+  }
+  if (!stat.isFile()) return { ok: false, reason: UNIFORM_REJECTION };
+  if (stat.size > ANCHOR_SOURCE_MAX_BYTES) {
+    return { ok: false, reason: UNIFORM_REJECTION };
   }
   let contents: string;
   try {
-    contents = readFileSyncNode(abs, "utf8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "EISDIR" || code === "ENOTDIR") {
-      return { ok: false, reason: `anchor.path '${anchor.path}' does not exist in the repository` };
-    }
-    return { ok: false, reason: `anchor.path could not be read (${code ?? "unknown"})` };
+    contents = readFileSyncNode(resolved.absolutePath, "utf8");
+  } catch {
+    return { ok: false, reason: UNIFORM_REJECTION };
   }
   const revision = await revisionOf(contents);
   return { ok: true, revision };

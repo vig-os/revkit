@@ -105,6 +105,33 @@ export class DaemonClient {
     return (await response.json()) as AppendResponse;
   }
 
+  /** `POST /-/launch-code` — mint a fresh single-use launch URL the
+   * agent can hand a human. Requires the agent bearer; the daemon
+   * ties the URL to the current port and refuses cross-origin
+   * calls. Returns the launch URL + a TTL in ms. */
+  async mintLaunchUrl(pathHint?: string): Promise<{ launchUrl: string; ttlMs: number }> {
+    const response = await this.#fetch(`${this.#url}/-/launch-code`, {
+      method: "POST",
+      headers: this.#authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({}),
+    });
+    if (!response.ok) {
+      throw new Error(`daemon POST /-/launch-code → ${response.status}`);
+    }
+    const parsed = (await response.json()) as { launchUrl: string; ttlMs: number };
+    // Deep-link support: the caller may pass a repo-relative path
+    // hint so the launched page opens that doc. The daemon's
+    // launch flow redirects to `/`; append a `?next=<encoded>`
+    // fragment the rail can read. Passed through unvalidated
+    // client-side (the browser only navigates within loopback).
+    if (pathHint !== undefined && pathHint.length > 0) {
+      const url = new URL(parsed.launchUrl);
+      url.searchParams.set("next", pathHint);
+      return { launchUrl: url.toString(), ttlMs: parsed.ttlMs };
+    }
+    return parsed;
+  }
+
   /** `POST /api/threads/:id/resolve`. */
   async resolve(threadId: string, resolution?: string): Promise<AppendResponse> {
     const body = resolution !== undefined ? { resolution } : {};

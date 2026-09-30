@@ -79,39 +79,51 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     agentToken: state.agentToken,
   });
   // Reconnect discovery for the channel server: re-run `ensureDaemon`
-  // (auto-starts if the previous daemon is gone), then compare the
-  // fresh `/-/health` `instanceId` with what `serve.json`
-  // advertised. On a match, we're talking to the same daemon and
-  // just need to reconnect the SSE; on a mismatch, the sqlite was
-  // preserved across restart (seqs continue) so the channel server
-  // caps our resume at the new head.
-  const discover = async (previous: { instanceId?: string } | undefined): Promise<DiscoverResult> => {
-    const boot = await ensureDaemon({
-      repoRoot,
-      ...(parsed.dir !== undefined ? { dir: parsed.dir } : {}),
-    });
-    const next = boot.state;
-    if (next.instanceId !== undefined) {
-      try {
-        // Belt-and-braces: the file might have been read mid-write
-        // by a racing process. `verifyDaemonInstance` confirms via
-        // `/-/health` that the daemon owns the id it advertises.
-        const match = await verifyDaemonInstance(next.url, next.instanceId);
-        if (!match && previous?.instanceId === next.instanceId) {
-          // Same id advertised, different id at /-/health — treat
-          // as fresh daemon (unusual, but well-defined).
-          void 0;
-        }
-      } catch {
-        // If /-/health itself is unreachable, fall back to trusting
-        // serve.json — the next tool call will surface the failure.
+  // (auto-starts if the previous daemon is gone), then confirm via
+  // `/-/health` that the running daemon really is the one
+  // `serve.json` advertises. On a mismatch we discard the stale
+  // state and re-run `ensureDaemon` once — the second boot returns
+  // the fresh id. On repeated mismatch we surface an error so the
+  // caller's bounded reconnect deadline can fire cleanly rather
+  // than looping.
+  const discover = async (_previous: { instanceId?: string } | undefined): Promise<DiscoverResult> => {
+    let attempts = 0;
+    while (true) {
+      attempts++;
+      const boot = await ensureDaemon({
+        repoRoot,
+        ...(parsed.dir !== undefined ? { dir: parsed.dir } : {}),
+      });
+      const next = boot.state;
+      if (next.instanceId === undefined) {
+        return { url: next.url, agentToken: next.agentToken };
       }
+      let live: boolean;
+      try {
+        live = await verifyDaemonInstance(next.url, next.instanceId);
+      } catch {
+        // /-/health unreachable — daemon may be shutting down. Retry
+        // once, then give up so the tool-call deadline can return
+        // a clean isError.
+        if (attempts >= 2) throw new Error("verifyDaemonInstance: /-/health unreachable");
+        continue;
+      }
+      if (live) {
+        return {
+          url: next.url,
+          agentToken: next.agentToken,
+          instanceId: next.instanceId,
+        };
+      }
+      if (attempts >= 2) {
+        throw new Error(
+          `verifyDaemonInstance: serve.json advertised '${next.instanceId}' but /-/health reported a different id (daemon replaced mid-discover)`,
+        );
+      }
+      // Loop: serve.json was stale by the time we read /-/health.
+      // ensureDaemon on the next iteration will see the fresh
+      // state (or spawn a new one).
     }
-    return {
-      url: next.url,
-      agentToken: next.agentToken,
-      ...(next.instanceId !== undefined ? { instanceId: next.instanceId } : {}),
-    };
   };
 
   let handle;

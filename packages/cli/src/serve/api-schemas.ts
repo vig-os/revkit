@@ -17,14 +17,14 @@
 // wants a specific id (test harness, replay) passes one in.
 
 import { z } from "zod";
-import { anchorSchema } from "@revkit/review-core";
+import { anchorSchema, idSchema } from "@revkit/review-core";
 
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
 export const createThreadRequestSchema = z
   .object({
-    threadId: z.string().min(1).optional(),
-    commentId: z.string().min(1).optional(),
+    threadId: idSchema.optional(),
+    commentId: idSchema.optional(),
     anchor: anchorSchema,
     body: z.string().min(1),
   })
@@ -35,8 +35,8 @@ export type CreateThreadRequest = z.infer<typeof createThreadRequestSchema>;
 /** POST /api/threads/:id/replies. Adds a reply to an existing thread. */
 export const replyRequestSchema = z
   .object({
-    commentId: z.string().min(1).optional(),
-    parentId: z.string().min(1),
+    commentId: idSchema.optional(),
+    parentId: idSchema,
     body: z.string().min(1),
   })
   .strict();

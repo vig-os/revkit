@@ -24,6 +24,7 @@ import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
 import { runServeCommand } from "./serve/cli.ts";
 import { runMcpCommand } from "./mcp/cli.ts";
+import { runOpenCommand } from "./open-cli.ts";
 import { resolve as resolvePath } from "node:path";
 
 /** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
@@ -40,6 +41,7 @@ Usage:
   revkit escalate "<need>"
   revkit serve [--dir <path>] [--port <n>]
   revkit mcp [--dir <path>]
+  revkit open [<path>]
 
 Guards (ADR-0005):
   component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure,
@@ -167,6 +169,11 @@ export async function dispatch(
       exitCode: outcome.exitCode,
       ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
     };
+  }
+
+  if (first === "open") {
+    const outcome = await runOpenCommand(rest, { cwd: env.cwd });
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
   }
 
   return {

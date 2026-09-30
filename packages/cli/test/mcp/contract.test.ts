@@ -174,7 +174,7 @@ describe("revkit mcp — channel + tools contract", () => {
   test("tools/list advertises threads, reply, resolve with expected shape", async () => {
     const listing = await ctx.client.listTools();
     const names = listing.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["reply", "resolve", "threads"]);
+    expect(names).toEqual(["reply", "resolve", "review_url", "threads"]);
     const reply = listing.tools.find((t) => t.name === "reply");
     expect(reply?.inputSchema.required).toEqual(["thread_id", "parent_id", "body"]);
     const threads = listing.tools.find((t) => t.name === "threads");
@@ -300,14 +300,15 @@ describe("revkit mcp — channel + tools contract", () => {
     expect(message.method).toBe("notifications/claude/channel");
     expect(typeof message.params.content).toBe("string");
     expect(message.params.content.length).toBeGreaterThan(0);
-    // Meta must have EXACTLY the three keys documented for M2 item 3.
-    // Our contract fixes the key set; hyphens would be silently
-    // dropped by Claude Code per the docs, so we insist on
-    // underscore identifiers.
+    // Meta MUST carry the four documented keys for M2 item 3
+    // (thread_id, path, lines, author_kind). Our contract fixes the
+    // key set; hyphens would be silently dropped by Claude Code per
+    // the docs, so we insist on underscore identifiers.
     expect(message.params.meta).toEqual({
       thread_id: createdBody.event.threadId,
       path: anchor.path,
       lines: `${anchor.startLine}-${anchor.endLine}`,
+      author_kind: "local",
     });
     // Belt-and-braces: assert every key is an identifier (letters,
     // digits, underscores) — this is what Claude Code accepts.
@@ -409,10 +410,11 @@ describe("revkit mcp — mutation checks", () => {
     } as unknown as WireEvent);
     expect(payload).toBeDefined();
     // Assert keys individually so a rename of one key is visible.
-    expect(Object.keys(payload!.meta).sort()).toEqual(["lines", "path", "thread_id"]);
+    expect(Object.keys(payload!.meta).sort()).toEqual(["author_kind", "lines", "path", "thread_id"]);
     expect(payload!.meta["path"]).toBe("docs/x.md");
     expect(payload!.meta["lines"]).toBe("1-2");
     expect(payload!.meta["thread_id"]).toBe("t1");
+    expect(payload!.meta["author_kind"]).toBe("local");
     expect(payload!.content).toContain("Alex");
   });
 });

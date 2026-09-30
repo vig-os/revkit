@@ -9,6 +9,8 @@
 // (`tsconfig.src.json`) that typechecks without bun globals.
 
 export { anchorPathSchema, anchorSchema, textQuoteSchema, type Anchor, type TextQuote } from "./anchor.ts";
+export { ID_REGEX, idSchema, isValidId } from "./id.ts";
+export { isValidRepoRelativePath } from "./path.ts";
 export { authorKinds, authorSchema, type Author, type AuthorKind } from "./author.ts";
 export {
   askAnswerSchema,

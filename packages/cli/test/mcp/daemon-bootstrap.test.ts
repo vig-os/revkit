@@ -264,33 +264,53 @@ describe("defaultRevkitBin — spaces in path", () => {
 });
 
 describe("filteredDaemonEnv — allowlist", () => {
-  test("keeps PATH, HOME, LANG, TERM, XDG_*, NIX_*, LC_* — drops everything else", () => {
+  test("keeps only the named allowlist entries and LC_/XDG_ prefixes; drops NIX_LD / NODE_OPTIONS / tokens", () => {
     const env = filteredDaemonEnv({
       PATH: "/usr/bin:/bin",
       HOME: "/tmp/home",
       LANG: "en_US.UTF-8",
       LC_ALL: "C",
-      NIX_LD: "/lib64/ld.so",
+      NIX_PROFILES: "/nix/p",
+      NIX_PATH: "channels",
+      NIX_USER_PROFILE_DIR: "/tmp/prof",
       XDG_CACHE_HOME: "/tmp/cache",
       TERM: "xterm",
       TMPDIR: "/tmp",
-      // These MUST be dropped.
+      SSL_CERT_FILE: "/etc/ssl/cert.pem",
+      NIX_SSL_CERT_FILE: "/etc/ssl/cert.pem",
+      HTTPS_PROXY: "https://proxy:3128",
+      http_proxy: "http://proxy:3128",
+      NO_PROXY: "127.0.0.1",
+      // These MUST be dropped by the filter. Nix loader-injection
+      // env, an inspector env, a preloader env, and three
+      // credential-shaped names are all listed here as "hostile
+      // agent env leaked in" simulants.
+      NIX_LD: "/malicious/ld.so",
+      NIX_LD_LIBRARY_PATH: "/malicious/lib",
       NODE_OPTIONS: "--inspect",
       LD_PRELOAD: "/malicious/lib.so",
       REVKIT_AGENT_TOKEN: "secret",
       SSH_AUTH_SOCK: "/tmp/agent.sock",
       GITHUB_TOKEN: "ghp_xxx",
     });
+    // Kept.
     expect(env["PATH"]).toBe("/usr/bin:/bin");
     expect(env["HOME"]).toBe("/tmp/home");
     expect(env["LANG"]).toBe("en_US.UTF-8");
     expect(env["LC_ALL"]).toBe("C");
-    expect(env["NIX_LD"]).toBe("/lib64/ld.so");
+    expect(env["NIX_PROFILES"]).toBe("/nix/p");
+    expect(env["NIX_PATH"]).toBe("channels");
     expect(env["XDG_CACHE_HOME"]).toBe("/tmp/cache");
     expect(env["TERM"]).toBe("xterm");
     expect(env["TMPDIR"]).toBe("/tmp");
-    // MUTATION: these must NOT leak through — a hostile agent env
-    // could otherwise inject an inspector, a preload, or a token.
+    expect(env["SSL_CERT_FILE"]).toBe("/etc/ssl/cert.pem");
+    expect(env["NIX_SSL_CERT_FILE"]).toBe("/etc/ssl/cert.pem");
+    expect(env["HTTPS_PROXY"]).toBe("https://proxy:3128");
+    expect(env["http_proxy"]).toBe("http://proxy:3128");
+    expect(env["NO_PROXY"]).toBe("127.0.0.1");
+    // MUTATION dropped.
+    expect(env["NIX_LD"]).toBeUndefined();
+    expect(env["NIX_LD_LIBRARY_PATH"]).toBeUndefined();
     expect(env["NODE_OPTIONS"]).toBeUndefined();
     expect(env["LD_PRELOAD"]).toBeUndefined();
     expect(env["REVKIT_AGENT_TOKEN"]).toBeUndefined();

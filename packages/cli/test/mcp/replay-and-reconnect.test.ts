@@ -106,7 +106,7 @@ describe("blocker 2 — replay-on-start", () => {
     rmSync(ctx.root, { recursive: true, force: true });
   });
 
-  test("MUTATION: 2 human comments before start → 0 per-comment notifications, 1 summary", async () => {
+  test("MUTATION C: 2 human comments before start → 0 per-comment notifications, 1 summary (real SSE)", async () => {
     // Seed two human comments BEFORE the channel server starts.
     const first = await postHumanComment(ctx.daemon, ctx.cookie, "first comment");
     const second = await postHumanComment(ctx.daemon, ctx.cookie, "second comment");
@@ -114,46 +114,38 @@ describe("blocker 2 — replay-on-start", () => {
 
     const notifications: Array<{ params: { content: string; meta?: Record<string, string> } }> = [];
 
-    // Start the channel server. The prime step reads listThreads
-    // and subscribes from head, so it must NOT replay the two
-    // historical events; instead it emits ONE summary that says
-    // "2 threads waiting".
+    // Start the channel server WITHOUT stubbing `subscribeEvents`.
+    // The REAL `startEventSubscriber` opens `/events?for=agent`
+    // against the real daemon; if `since` were 0 (the old replay
+    // bug), the two historical events would fan out. The correct
+    // path passes `since = head` and no per-comment event fires.
+    // This test kills mutation C directly.
     const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
     const mcpClient = new Client({ name: "replay-test", version: "0.0.0" }, { capabilities: {} });
     mcpClient.setNotificationHandler(channelSchema, async (msg) => {
       notifications.push(msg);
     });
-    // Order matters. `mcpClient.connect(clientTx)` sends an
-    // initialize request and blocks on the response, so the server
-    // (bound to `serverTx`) must be started first. `InMemoryTransport`
-    // buffers messages until both ends are attached, so the summary
-    // notification the prime step emits sits in the queue until the
-    // client connects and drains it.
     const channel = await startChannelServer({
       client: new DaemonClient({ url: ctx.daemon.url, agentToken: ctx.daemon.agentToken }),
       url: ctx.daemon.url,
       agentToken: ctx.daemon.agentToken,
       transport: serverTx,
-      // No SSE loop for this test: an empty subscriber lets us
-      // measure ONLY what the prime step emits. The old code
-      // would still send per-comment events because it subscribed
-      // from seq=0; we assert that path is now dead.
-      subscribeEvents: () => ({ close: () => {}, done: Promise.resolve() }),
+      // NO subscribeEvents override — the real SSE loop runs.
     });
     await mcpClient.connect(clientTx);
     try {
-      // Give the prime notification a beat to traverse the transport.
-      await new Promise((r) => setTimeout(r, 30));
+      // Give the prime notification + a full SSE handshake a beat
+      // to complete.
+      await new Promise((r) => setTimeout(r, 200));
       // Exactly one summary. No per-comment notifications.
       expect(notifications.length).toBe(1);
       const only = notifications[0]!;
       expect(only.params.meta?.["kind"]).toBe("catchup_summary");
       expect(only.params.meta?.["waiting"]).toBe("2");
-      // The summary body names both thread ids.
       expect(only.params.content).toContain(first.threadId);
       expect(only.params.content).toContain(second.threadId);
-      // Per-comment content strings (which the OLD replay path would
-      // have emitted for each) must NOT appear.
+      // MUTATION C's fingerprint: raw per-comment content strings
+      // would show up here if the SSE loop replayed from seq=0.
       expect(only.params.content).not.toContain("first comment");
       expect(only.params.content).not.toContain("second comment");
     } finally {
@@ -195,6 +187,80 @@ describe("blocker 2 — replay-on-start", () => {
     try {
       await new Promise((r) => setTimeout(r, 30));
       expect(notifications.length).toBe(0);
+    } finally {
+      await channel.stop();
+      await mcpClient.close();
+    }
+  });
+});
+
+describe("blocker 2b — tool call reconnect is bounded", () => {
+  let root: string;
+  let daemon: DaemonHandle;
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), "revkit-mcp-toolbound-"));
+    mkdirSync(join(root, "dist"), { recursive: true });
+    writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
+    mkdirSync(join(root, "docs", "adr"), { recursive: true });
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# X\n\nbody\n");
+    daemon = await startDaemon({
+      dir: join(root, "dist"),
+      repoRoot: root,
+      port: 0,
+      sqlitePath: ":memory:",
+      version: "0.0.0-test",
+      localUserId: "local-test",
+      installSignalHandlers: false,
+      logSink: { write: () => {} },
+    });
+  });
+  afterEach(async () => {
+    try { await daemon.stop(); } catch { /* dead */ }
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("MUTATION: an impossible reconnect returns isError with a clear message inside the deadline", async () => {
+    // Kill the daemon and provide a discover that never returns.
+    // With the previous unbounded loop, `threads` would hang
+    // forever. With the deadline, it returns `isError` well before
+    // the test's Bun timeout.
+    const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+    const mcpClient = new Client({ name: "toolbound-test", version: "0.0.0" }, { capabilities: {} });
+    let discoverCalls = 0;
+    const channel = await startChannelServer({
+      client: new DaemonClient({ url: daemon.url, agentToken: daemon.agentToken }),
+      url: daemon.url,
+      agentToken: daemon.agentToken,
+      transport: serverTx,
+      subscribeEvents: () => ({ close: () => {}, done: Promise.resolve() }),
+      // Never resolves — mimics "no daemon reachable".
+      discover: (): Promise<never> => {
+        discoverCalls++;
+        return new Promise((): void => {
+          /* pending forever */
+        });
+      },
+      // Short deadline so the test finishes in bounded time.
+      reconnectToolDeadlineMs: 300,
+      reconnectBaseDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      sleep: (): Promise<void> => Promise.resolve(),
+    });
+    await mcpClient.connect(clientTx);
+    try {
+      // Kill the daemon so the tool call fails on first attempt.
+      await daemon.stop();
+      const start = Date.now();
+      const result = await mcpClient.callTool({ name: "threads", arguments: {} });
+      const elapsed = Date.now() - start;
+      // Under the OLD unbounded reconnect this callTool never
+      // resolves; here it MUST return within a reasonable margin
+      // of the deadline.
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
+      expect(text).toContain("daemon unavailable");
+      expect(elapsed).toBeLessThan(5000); // deadline + reasonable slack
+      expect(discoverCalls).toBeGreaterThan(0);
     } finally {
       await channel.stop();
       await mcpClient.close();

@@ -82,7 +82,7 @@ describe("revkit mcp — real subprocess", () => {
       // tools/list returns our three names.
       const listing = await client.listTools();
       const names = listing.tools.map((t) => t.name).sort();
-      expect(names).toEqual(["reply", "resolve", "threads"]);
+      expect(names).toEqual(["reply", "resolve", "review_url", "threads"]);
       // Sanity: additionalProperties: false on every schema.
       for (const tool of listing.tools) {
         expect(tool.inputSchema.additionalProperties).toBe(false);

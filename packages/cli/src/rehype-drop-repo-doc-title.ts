@@ -19,9 +19,9 @@
 // so site MDX (which needs its own h1 in the rendered body) is
 // untouched.
 
-import { relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import type { Root, RootContent } from "hast";
+import { filePathOf, repoRelativePosix, type VFileLike } from "./rehype-vfile.ts";
 
 /** Options accepted by the plugin. `repoRoot` is required so paths
  * can be compared to the repo's `docs/` directory. */
@@ -33,14 +33,9 @@ export interface DropRepoDocTitleOptions {
   readonly matches?: (repoRelPath: string) => boolean;
 }
 
-/** Minimal VFile shape — see `rehype-data-src.ts` for the same
- * pattern. `data` is `unknown` so downstream extensions (Astro) do
- * not narrow this type. */
-interface VFileLike {
-  readonly path?: string;
-  readonly history?: readonly string[];
-  readonly data?: unknown;
-}
+// `VFileLike`, `filePathOf`, and `repoRelativePosix` come from
+// `./rehype-vfile.ts` — same source of truth as `rehype-data-src.ts`
+// (PR #38 round-2 review: no duplicate copies).
 
 /** Default predicate: `.md` files under `docs/` at the repo root.
  * Matches the source set the repo-docs loader ingests. */
@@ -48,39 +43,6 @@ function defaultMatches(repoRelPath: string): boolean {
   const lower = repoRelPath.toLowerCase();
   if (!lower.endsWith(".md")) return false;
   return lower.startsWith("docs/");
-}
-
-/** Resolve the source file's absolute path from a VFile. */
-function filePathOf(file: VFileLike): string | undefined {
-  if (typeof file.path === "string" && file.path.length > 0) return file.path;
-  if (Array.isArray(file.history) && file.history.length > 0) {
-    const last = file.history[file.history.length - 1];
-    if (typeof last === "string" && last.length > 0) return last;
-  }
-  const data = file.data;
-  if (data !== undefined && data !== null && typeof data === "object") {
-    const astro = (data as { readonly astro?: unknown }).astro;
-    if (astro !== undefined && astro !== null && typeof astro === "object") {
-      const astroFileUrl = (astro as { readonly fileURL?: unknown }).fileURL;
-      if (astroFileUrl instanceof URL) return fileURLToPath(astroFileUrl);
-      if (typeof astroFileUrl === "string" && astroFileUrl.length > 0) {
-        try {
-          return fileURLToPath(new URL(astroFileUrl));
-        } catch {
-          return astroFileUrl;
-        }
-      }
-    }
-  }
-  return undefined;
-}
-
-/** POSIX-normalised path relative to `repoRoot`, or undefined if the
- * file escapes the root. */
-function repoRelativePosix(repoRoot: string, filePath: string): string | undefined {
-  const rel = relative(resolve(repoRoot), resolve(filePath));
-  if (rel.length === 0 || rel.startsWith("..")) return undefined;
-  return sep === "/" ? rel : rel.split(sep).join("/");
 }
 
 /** True if a hast node is a whitespace-only text node (mdast-to-hast

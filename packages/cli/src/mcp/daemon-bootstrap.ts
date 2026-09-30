@@ -172,20 +172,34 @@ export function defaultRevkitBin(): string {
 }
 
 /** Minimum env vars the spawned daemon needs to run under Bun on
- * NixOS / macOS. Kept as an allowlist so a hostile agent process
- * cannot poison the daemon's environment with tokens or LD_PRELOAD
- * (PR #38 review). Anything the daemon actually needs at runtime
- * (a token store path, a proxy, a locale override) has to be
- * added here explicitly — no automatic passthrough.
+ * NixOS / macOS. Kept as an EXPLICIT allowlist (no `NIX_*` prefix
+ * blanket) so a hostile agent process cannot poison the daemon's
+ * environment with tokens, `LD_PRELOAD`, `NIX_LD` /
+ * `NIX_LD_LIBRARY_PATH`, `NODE_OPTIONS`, or other side channels
+ * (PR #38 round-2 review). Anything the daemon needs at runtime
+ * must be listed here by name.
  *
  * - `PATH`: `bun` is on it (the flake dev shell put it there).
  * - `HOME`: `bun install`, `bun run` look up config there.
+ * - `USER`: some tools resolve `$USER/…` in home paths.
  * - `TMPDIR` (+ `TMP` / `TEMP`): where `mktemp` lands.
  * - `LANG` / `LC_*`: preserve locale so date formatting is stable.
- * - `NIX_*`: NixOS wrappers thread the toolchain through these; a
- *   missing `NIX_LD` on NixOS bricks `bun`.
  * - `TERM`: harmless; useful if the spawned daemon errors and
- *   writes a coloured log line before we redirect its stdio. */
+ *   writes a coloured log line before we redirect its stdio.
+ * - `NIX_PROFILES` / `NIX_PATH` / `NIX_USER_PROFILE_DIR`: needed
+ *   for the flake wrappers to find the tool chain on NixOS. These
+ *   are the ONLY three `NIX_*` names the daemon needs; `NIX_LD` /
+ *   `NIX_LD_LIBRARY_PATH` are drop-in code-execution side channels
+ *   and MUST NOT be forwarded. Verified: `bun packages/cli/bin/
+ *   revkit.js serve` starts under the nix shell without `NIX_LD`.
+ * - `SSL_CERT_FILE` / `NIX_SSL_CERT_FILE`: reserved for a future
+ *   outbound-fetch path. The M2 daemon is loopback-only and does
+ *   no `fetch` at rest, but a M3 GitHub adapter that runs inside
+ *   the daemon (ADR-0025) will need cert bundles; allowlist them
+ *   now to avoid a surprise regression.
+ * - `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (lower + upper):
+ *   same rationale — reserved for outbound; a loopback-only daemon
+ *   is unaffected. */
 const DAEMON_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "HOME",
   "LANG",
@@ -195,8 +209,19 @@ const DAEMON_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
   "TMP",
   "TEMP",
   "USER",
+  "NIX_PROFILES",
+  "NIX_PATH",
+  "NIX_USER_PROFILE_DIR",
+  "SSL_CERT_FILE",
+  "NIX_SSL_CERT_FILE",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NO_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "no_proxy",
 ]);
-const DAEMON_ENV_PREFIX_ALLOWLIST: readonly string[] = ["LC_", "NIX_", "XDG_"];
+const DAEMON_ENV_PREFIX_ALLOWLIST: readonly string[] = ["LC_", "XDG_"];
 
 /** Filter `process.env` down to the allowlist. Exported for tests. */
 export function filteredDaemonEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

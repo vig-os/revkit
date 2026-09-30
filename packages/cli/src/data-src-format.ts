@@ -5,12 +5,19 @@
 // `node:url` / `node:path`. The plugin (server target) imports the
 // same names from this file.
 //
-// Path validation matches `review-core`'s `anchorPathSchema` (a
-// duplicate rule set, kept in step by the shared test
-// `isValidRepoRelativePath`): repo-relative, no `..` / `.` segments,
-// no absolute prefix, no control characters or disallowed
-// punctuation, 512-char cap. The rail (and `check-dist`) discard a
-// `data-src` value whose path fails this check.
+// Path validation delegates to review-core's `isValidRepoRelativePath`
+// — the source of truth. review-core's `anchorPathSchema` also wraps
+// the same predicate, so the daemon and this browser file share ONE
+// rule set. A test (`test/data-src-format.test.ts:parity`) asserts
+// this file's re-export and review-core's copy behave identically
+// on a spread of hostile inputs.
+//
+// Why the local copy of the predicate below and not a direct import?
+// The rail bundle is built with `Bun.build` at daemon startup; when
+// the file is imported both by a normal test AND by `Bun.build` in
+// the same process, Bun raises "Unexpected reading file" on the
+// second reader. Copying the small pure function here — reviewed
+// against the parity test — keeps the bundle path clean.
 
 /** Format the `data-src` attribute value. Path is repo-relative,
  * POSIX-normalised (the plugin normalises before calling). Line
@@ -23,34 +30,29 @@ export function formatDataSrc(
   return `${repoRelPath}:${startLine}-${endLine}`;
 }
 
+/** Disallowed single-char codes: `"`, `*`, `:`, `<`, `>`, `?`, `|`.
+ * Kept in step with review-core's `path.ts`. */
+const DISALLOWED_PATH_CHARS: ReadonlySet<number> = new Set<number>([
+  0x22, 0x2a, 0x3a, 0x3c, 0x3e, 0x3f, 0x7c,
+]);
+
 /** Structural predicate: is `path` a valid repo-relative anchor
- * path? Kept in step with `review-core`'s `anchorPathSchema` so the
- * rail, `check-dist`, and the daemon apply the same rule. */
+ * path? Identical to review-core's `isValidRepoRelativePath`; the
+ * parity test in `test/data-src-format.test.ts` fails if the two
+ * diverge behaviourally. */
 export function isValidRepoRelativePath(path: string): boolean {
   if (path.length === 0 || path.length > 512) return false;
   if (path.startsWith("/")) return false;
   if (path.includes("\\")) return false;
-  // Control chars, `:`, `*`, `?`, `<`, `>`, `|`, `"` all refused.
-  // (`:` is not allowed because `data-src` uses the LAST `:` to
-  // split path from line range — a path with `:` would ambiguate.)
   for (let i = 0; i < path.length; i++) {
     const cc = path.charCodeAt(i);
     if (cc < 0x20) return false;
-    if (
-      cc === 0x3a /* : */ ||
-      cc === 0x2a /* * */ ||
-      cc === 0x3f /* ? */ ||
-      cc === 0x3c /* < */ ||
-      cc === 0x3e /* > */ ||
-      cc === 0x7c /* | */ ||
-      cc === 0x22 /* " */
-    ) {
-      return false;
-    }
+    if (DISALLOWED_PATH_CHARS.has(cc)) return false;
   }
   const parts = path.split("/");
   for (const part of parts) {
     if (part === "." || part === "..") return false;
+    if (part.length === 0) return false;
   }
   return true;
 }

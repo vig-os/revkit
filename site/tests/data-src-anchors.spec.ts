@@ -154,6 +154,27 @@ test.describe("data-src anchors point at real source lines @chromium-only", () =
     expect(repoDocChecked).toBeGreaterThan(100);
     expect(mdxChecked).toBeGreaterThan(0);
   });
+
+  test("MUTATION: fenced code blocks carry a data-src wrapper (PR #38 round-2 review)", () => {
+    // DESIGN-0001 has 7 fenced code blocks (mermaid + jsonc +
+    // sh + directory tree). Under the old plugin, expressive-code
+    // replaced our stamped `<pre>` with its wrapper and the
+    // anchor was lost — reviewers could not comment on code
+    // blocks at all. The new stampTree wraps every `<pre>` in a
+    // `<div data-src=… class="revkit-code-anchor">` that
+    // survives expressive-code.
+    const html = readFileSync(join(DIST, "designs", "design-0001-revkit-architecture", "index.html"), "utf8");
+    const wrappers = html.match(/<div data-src="[^"]+" class="revkit-code-anchor">/g) ?? [];
+    expect(wrappers.length).toBeGreaterThanOrEqual(5);
+    // Each wrapper's data-src must parse.
+    for (const wrapper of wrappers) {
+      const m = wrapper.match(/data-src="([^"]+)"/);
+      expect(m).not.toBeNull();
+      const parsed = parseDataSrc(m![1]!);
+      expect(parsed, `bad wrapper anchor: ${wrapper}`).toBeDefined();
+      expect(parsed!.path).toBe("docs/designs/DESIGN-0001-revkit-architecture.md");
+    }
+  });
 });
 
 /** Pick a substring likely to survive both the built-HTML → text

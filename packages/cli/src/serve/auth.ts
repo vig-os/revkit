@@ -100,36 +100,79 @@ export type MsClock = () => number;
 
 const wallMs: MsClock = () => Date.now();
 
+/** One outstanding launch code — the value + when it was minted +
+ * whether it has been spent. `AuthState` keeps a small set of
+ * these so an agent that mints extra codes via `/-/launch-code`
+ * does not race against the startup one. */
+interface OutstandingCode {
+  readonly value: string;
+  readonly createdAtMs: number;
+  used: boolean;
+}
+
 /** State the guards keep across requests. One instance per running
  * daemon; scoped to that daemon's lifetime. */
 export class AuthState {
   readonly #agentToken: string;
-  readonly #launchCode: string;
-  readonly #launchCodeCreatedAtMs: number;
-  #launchCodeUsed = false;
+  readonly #codes: OutstandingCode[] = [];
   readonly #sessions = new Set<string>();
   readonly #clock: MsClock;
   readonly #ttlMs: number;
 
   constructor(options: { readonly agentToken: string; readonly launchCode: string; readonly clock?: MsClock; readonly launchCodeTtlMs?: number }) {
     this.#agentToken = options.agentToken;
-    this.#launchCode = options.launchCode;
     this.#clock = options.clock ?? wallMs;
-    this.#launchCodeCreatedAtMs = this.#clock();
     this.#ttlMs = options.launchCodeTtlMs ?? LAUNCH_CODE_TTL_MS;
+    this.#codes.push({ value: options.launchCode, createdAtMs: this.#clock(), used: false });
+  }
+
+  /** Mint a fresh single-use launch code with the same TTL as the
+   * startup one. Used by the bearer-authenticated
+   * `POST /-/launch-code` endpoint so `revkit mcp`'s `review_url`
+   * tool can hand a human a fresh link even after the startup
+   * code has been consumed. */
+  mintLaunchCode(): { value: string; createdAtMs: number } {
+    const value = mintToken();
+    const record: OutstandingCode = { value, createdAtMs: this.#clock(), used: false };
+    this.#codes.push(record);
+    return { value, createdAtMs: record.createdAtMs };
   }
 
   /** Try to exchange `code` for a fresh session cookie value. Returns
-   * the cookie value on success, or a rejection kind on failure. */
+   * the cookie value on success, or a rejection kind on failure.
+   * Checks EVERY outstanding code (start + freshly-minted) — the
+   * one that matches, if any, is consumed. */
   exchangeLaunchCode(code: string): { ok: true; cookie: string } | { ok: false; reason: "expired" | "used" | "invalid" } {
-    // Check expiry FIRST so a reused expired code is reported as
-    // "expired", which matches the user's mental model (the link
-    // simply timed out).
-    const age = this.#clock() - this.#launchCodeCreatedAtMs;
-    if (age > this.#ttlMs) return { ok: false, reason: "expired" };
-    if (this.#launchCodeUsed) return { ok: false, reason: "used" };
-    if (!safeEqual(code, this.#launchCode)) return { ok: false, reason: "invalid" };
-    this.#launchCodeUsed = true;
+    const now = this.#clock();
+    // Find a matching, non-expired, unused code.
+    let matched: OutstandingCode | undefined;
+    let anyMatch = false;
+    for (const record of this.#codes) {
+      if (safeEqual(code, record.value)) {
+        anyMatch = true;
+        const age = now - record.createdAtMs;
+        if (age > this.#ttlMs) continue;
+        if (record.used) continue;
+        matched = record;
+        break;
+      }
+    }
+    if (matched === undefined) {
+      // Distinguish the three failure modes for the user-visible
+      // message; expired takes precedence over used (a code the
+      // user just tried again after 60s should say "expired").
+      if (!anyMatch) return { ok: false, reason: "invalid" };
+      // Find whichever matched to classify.
+      for (const record of this.#codes) {
+        if (safeEqual(code, record.value)) {
+          const age = now - record.createdAtMs;
+          if (age > this.#ttlMs) return { ok: false, reason: "expired" };
+          if (record.used) return { ok: false, reason: "used" };
+        }
+      }
+      return { ok: false, reason: "invalid" };
+    }
+    matched.used = true;
     const cookie = mintToken();
     this.#sessions.add(cookie);
     return { ok: true, cookie };
@@ -153,10 +196,11 @@ export class AuthState {
     return safeEqual(bearer, this.#agentToken);
   }
 
-  /** For diagnostics — never for logging. Tests use this to assert the
-   * launch code has been consumed. */
+  /** For diagnostics — never for logging. Tests use this to assert
+   * the startup launch code (the first outstanding one) has been
+   * consumed. */
   launchCodeUsed(): boolean {
-    return this.#launchCodeUsed;
+    return this.#codes[0]?.used === true;
   }
 }
 

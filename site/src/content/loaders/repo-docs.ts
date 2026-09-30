@@ -129,14 +129,13 @@ function extractStatus(body: string): string | undefined {
   return undefined;
 }
 
-/** Test-only shim retained for existing loader tests. The leading
- * heading is now dropped in hast (`rehype-drop-repo-doc-title`, PR #38
- * blocker 1) so `rehype-data-src` sees correct mdast positions — the
- * previous source-side strip shifted every downstream anchor by the
- * number of dropped lines, off-by-2 on every ADR/design/matrix page. */
-function stripLeadingHeading(body: string): string {
-  return body;
-}
+// `stripLeadingHeading` was removed after PR #38 round 2. The
+// leading `# Title` is now dropped in hast by
+// `rehype-drop-repo-doc-title` so `rehype-data-src` sees correct
+// mdast positions — a source-side strip shifted every downstream
+// anchor by the number of dropped lines (off-by-2 on every ADR /
+// design / matrix page). The raw markdown body flows through
+// `renderMarkdown` unchanged.
 
 /** Map a repo-relative markdown path (POSIX-normalised, e.g.
  * `docs/adr/0002-solid-islands-component-registry.md`) to the site route
@@ -231,7 +230,7 @@ async function loadSource(
     filePath: source.filePath,
   });
 
-  const body = stripLeadingHeading(raw);
+  const body = raw;
   const rendered = await ctx.renderMarkdown(body, {
     fileURL: pathToFileURL(source.filePath),
   });

@@ -364,6 +364,7 @@ test.describe("rail round-trip @chromium-only", () => {
         thread_id: threadId,
         path: FIXTURE_REL_PATH,
         lines: `${FIXTURE_START_LINE}-${FIXTURE_END_LINE}`,
+        author_kind: "local",
       });
 
       // Step 8 — MCP client calls the `reply` tool. The rail sees

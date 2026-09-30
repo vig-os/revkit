@@ -11,6 +11,7 @@
 // `commit_id`; the M2 local rail leaves it undefined. Reserved on the v0
 // wire so M3 lands without a `schemaVersion` bump.
 import { z } from "zod";
+import { isValidRepoRelativePath } from "./path.ts";
 import { GIT_COMMIT_HEX_REGEX, SHA256_HEX_REGEX } from "./revision.ts";
 
 /** Text-quote selector (W3C Web Annotation §4.2.4). `prefix` and `suffix`
@@ -29,43 +30,20 @@ export const textQuoteSchema = z
 
 export type TextQuote = z.infer<typeof textQuoteSchema>;
 
-/** Structural validator for a repo-relative anchor path. Enforced at
- * the schema level so the daemon, the rail, `revkit mcp` and the
- * hosted adapter all reject the same invalid values (PR #38 review):
+/** Structural validator for a repo-relative anchor path.
  *
- *   - repo-relative (no leading `/`, no drive letter);
- *   - no `..` segments (containment: an anchor can only point AT the
- *     repo, not out of it);
- *   - no control characters, no NUL;
- *   - reasonable charset (`A–Z a–z 0–9 . - _ / space`);
- *   - length cap of 512 (browser-safe, avoids pathological allocations).
- *
- * A file may legitimately have a space in its name; a colon is not
- * allowed because `data-src` uses the last colon to split the path
- * from the line range, so a path with a colon would ambiguate.
- * Backslashes are refused too — Windows paths are POSIX-normalised
- * by the rehype plugin before they reach any consumer, so seeing a
- * backslash means the value was hand-crafted and is not trusted. */
+ * Calls `isValidRepoRelativePath` from `./path.ts` — the SINGLE
+ * source of truth (PR #38 round-2 review) so the daemon, the rail,
+ * `check-dist`, and the GitHub adapter apply the exact same rule.
+ * The predicate encodes the full rule (length, charset, containment,
+ * empty segments); this schema just wraps it in a Zod message. */
 export const anchorPathSchema = z
   .string()
-  .min(1)
-  .max(512, "anchor.path exceeds 512 characters — refuse pathological allocations.")
-  .refine((value) => !value.startsWith("/"), {
-    message: "anchor.path must be repo-relative, not absolute (no leading '/').",
-  })
-  .refine((value) => !/[\\]/.test(value), {
-    message: "anchor.path must not contain backslashes — POSIX-normalise before anchoring.",
-  })
-  .refine((value) => !/[:*?<>|"\x00-\x1f]/.test(value), {
-    message: "anchor.path contains a disallowed character (control char, `:`, `*`, `?`, `<`, `>`, `|`, or `\"`).",
-  })
-  .refine(
-    (value) => {
-      const parts = value.split("/");
-      return parts.every((part) => part !== ".." && part !== ".");
-    },
-    { message: "anchor.path must not contain '..' or '.' segments (containment)." },
-  );
+  .refine(isValidRepoRelativePath, {
+    message:
+      "anchor.path must be repo-relative POSIX, 1..512 chars, no '..'/'.'/'//' segments, " +
+      "no control chars, no `:`/`*`/`?`/`<`/`>`/`|`/`\"`, no leading `/`, no backslash.",
+  });
 
 /** An anchor: file path plus 1-indexed inclusive line range, the text-quote
  * selector for the range, and the revision it was captured on. Refined so
