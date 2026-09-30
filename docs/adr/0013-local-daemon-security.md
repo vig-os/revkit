@@ -74,3 +74,24 @@ Details of the M2 CSP wiring on `revkit serve` (issue #22, PR follow-up to this 
   denying the powerful features (`camera`, `microphone`, `geolocation`, `payment`, `usb`, `publickey-credentials-*`,
   …). API JSON, `/-/launch-code`, and the `/-/auth` 302 also carry `Cache-Control: no-store`; the SSE stream keeps
   its own `no-cache, no-transform` (stronger than `no-store` for a long-lived response, blocks buffering middleboxes).
+
+## Amendment (2026-09-30, issue #44 — localhost canonicalisation)
+
+Both loopback aliases (`127.0.0.1` and `localhost`) point at the daemon and both pass the Host check for
+DNS-rebinding defence. But browsers scope cookies to a HOST, not a port pair: a user who exchanges the launch
+code on `http://127.0.0.1:<port>/-/auth?code=…` gets a session cookie for `127.0.0.1`, and any later navigation
+to `http://localhost:<port>/` has no cookie and every `/api/*` fetch returns 401.
+
+**Decision.** `127.0.0.1` is the CANONICAL origin. Any request whose Host is `localhost:<port>` is 307'd to the
+same path on `127.0.0.1:<port>`. The 307 preserves method + body and carries the query string, so a `localhost`
+launch URL round-trips through the exchange on the canonical origin and the cookie lands where every subsequent
+request expects it. The CSP still names both aliases so an already-loaded page's asset fetches never fail on the
+way in; the browser follows the 307 to 127.0.0.1 and loads there.
+
+WebSocket upgrades do not follow 307s, so a `localhost` upgrade is refused with 421 Misdirected Request rather
+than silently failing. In practice the rail opens `/events` from the page's own origin, which is already
+canonical after the initial navigation redirect.
+
+Alternative rejected: accepting the exact `http://localhost:<port>` origin (and keeping two parallel session
+cookies) would double the auth surface and leave the "user pastes localhost URL after exchanging on 127.0.0.1"
+case still broken. Canonicalisation is one origin, one cookie jar, one mental model.

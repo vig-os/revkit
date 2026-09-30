@@ -484,6 +484,53 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response("Misdirected Request", { status: 421 }), "text", "text/plain; charset=utf-8");
     }
 
+    // Issue #44 fix: canonicalise to `127.0.0.1:<port>`. The daemon
+    // accepts both loopback aliases at the Host check (defence in
+    // depth) but redirects any `localhost:<port>` request to its
+    // `127.0.0.1:<port>` twin so BOTH the launch-code exchange AND
+    // every subsequent request settle on ONE origin.
+    //
+    // Why redirect (chosen over "accept the exact origin" alone):
+    //
+    //   - Browsers scope cookies to a HOST, not to a port pair. If
+    //     the launch happens on 127.0.0.1 and the user later opens
+    //     `http://localhost:<port>/`, the browser has no cookie for
+    //     `localhost` and every `/api/*` fetch from the rail returns
+    //     401 — the reported bug.
+    //   - Two hosts means two session cookies, two code exchanges,
+    //     two mental models. Canonicalising collapses that to one.
+    //   - The redirect is TEMPORARY (307), preserves method + body,
+    //     and carries the query string — so a `localhost` launch URL
+    //     the human typed into a bookmark still round-trips through
+    //     the launch code exchange on 127.0.0.1.
+    //   - CSP still lists both aliases so an already-loaded page's
+    //     asset fetches never fail on the way in; the browser
+    //     follows the 307 to 127.0.0.1 and loads there.
+    //
+    // WebSocket upgrades don't follow redirects; a `localhost` upgrade
+    // would fail. In practice the rail opens `/events` from the
+    // page's own origin (already canonicalised), so this is a paper
+    // hazard. We refuse a `localhost` upgrade with a plain 421 rather
+    // than issue a 307 the client cannot follow.
+    if (hostHeader === `localhost:${port}`) {
+      const upgrade = request.headers.get("upgrade");
+      if (upgrade !== null && upgrade.toLowerCase() === "websocket") {
+        logger.warn("request.rejected.ws-localhost", { requestId });
+        return withHygiene(
+          new Response("Misdirected Request", { status: 421 }),
+          "text",
+          "text/plain; charset=utf-8",
+        );
+      }
+      const location = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
+      const response = new Response(null, {
+        status: 307,
+        headers: { location },
+      });
+      logger.info("request.redirect.localhost-canonical", { requestId, path: url.pathname });
+      return withHygiene(response, "text", undefined);
+    }
+
     const method = request.method.toUpperCase();
 
     // Launch-code exchange. GET only; the redirect strips the code.
