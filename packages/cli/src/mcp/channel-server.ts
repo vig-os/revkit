@@ -49,7 +49,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { DaemonClient } from "./daemon-client.ts";
+import { DaemonClient, DaemonHttpError } from "./daemon-client.ts";
 import {
   startEventSubscriber,
   type EventSubscriberHandle,
@@ -141,6 +141,14 @@ export function escapeContentFragment(value: string): string {
  * notification path is smaller — 4 KiB is comfortable and stops a
  * pathological path or thread id from blowing up the frame. */
 export const META_VALUE_MAX = 4096;
+
+/** Default per-tool-call reconnect deadline. Exported so tests can
+ * assert the constant (mutation M3: 10 s → 10,000 s) and reference
+ * it directly rather than duplicating the number. 10 seconds is a
+ * balance: long enough to cover a hot daemon restart under load,
+ * short enough that a totally-dead daemon does not stall the
+ * agent's turn. */
+export const TOOL_RECONNECT_DEADLINE_MS_DEFAULT = 10_000;
 
 /** MCP tool schemas. */
 const THREADS_TOOL = {
@@ -461,26 +469,44 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       if (error instanceof ToolValidationError) return toolError(error.issues);
-      // A network / auth error mid-call = daemon likely restarted.
-      // Reconnect ONCE with a bounded deadline (PR #38 round-2
-      // blocker 2). Awaiting the background reconnect's exponential
-      // backoff indefinitely would hang the tool call forever; the
-      // tool-call promise here has to resolve.
+      // A 4xx is the daemon telling us the REQUEST is wrong (bad
+      // parent_id, invalid anchor path, unknown thread). Surface it
+      // as the tool's own error — reconnecting would not help and
+      // would mask the real message from the caller (PR #38
+      // round-3 review: reconnect only on transport / 5xx).
+      if (error instanceof DaemonHttpError && error.status >= 400 && error.status < 500) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `revkit mcp: tool '${toolName}' rejected by daemon (${error.status}): ${error.body || error.message}` }],
+        };
+      }
+      // Transport failures (fetch rejected) and 5xx: the daemon
+      // is unavailable or errored server-side; reconnect ONCE
+      // within the bounded deadline. The background subscriber
+      // keeps trying with capped backoff.
       if (options.discover !== undefined && !stopped) {
         try {
           const reconnected = await Promise.race([
             reconnectOnce("tool-call-failed").then(() => true as const),
-            new Promise<false>((r) => setTimeout(() => r(false), options.reconnectToolDeadlineMs ?? 10_000)),
+            new Promise<false>((r) => setTimeout(() => r(false), options.reconnectToolDeadlineMs ?? TOOL_RECONNECT_DEADLINE_MS_DEFAULT)),
           ]);
           if (!reconnected) {
             return {
               isError: true,
-              content: [{ type: "text", text: `revkit mcp: daemon unavailable: reconnect did not complete within the tool-call deadline (${options.reconnectToolDeadlineMs ?? 10_000} ms). Try again once the daemon is back.` }],
+              content: [{ type: "text", text: `revkit mcp: daemon unavailable: reconnect did not complete within the tool-call deadline (${options.reconnectToolDeadlineMs ?? TOOL_RECONNECT_DEADLINE_MS_DEFAULT} ms). Try again once the daemon is back.` }],
             };
           }
           const retry = await invoke(currentClient);
           return { content: [{ type: "text", text: JSON.stringify(retry) }] };
         } catch (retryError) {
+          // The retry may itself hit a 4xx (same request, different
+          // daemon head). Surface as-is.
+          if (retryError instanceof DaemonHttpError && retryError.status >= 400 && retryError.status < 500) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `revkit mcp: tool '${toolName}' rejected by daemon (${retryError.status}): ${retryError.body || retryError.message}` }],
+            };
+          }
           return {
             isError: true,
             content: [{ type: "text", text: `revkit mcp: daemon unavailable: tool '${toolName}' failed after reconnect: ${(retryError as Error).message}` }],

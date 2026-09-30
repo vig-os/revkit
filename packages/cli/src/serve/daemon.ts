@@ -584,14 +584,65 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response("Forbidden", { status: 403 }), "text/plain; charset=utf-8");
     }
     logger.info("auth.exchange.ok", { requestId });
+    // Deep-link target. The MCP `review_url` tool sets `?next=<path>`
+    // so the browser lands on a specific page (an ADR, a design)
+    // after the login redirect. Guard against open-redirect:
+    // accept `next` ONLY if it is a same-origin relative path
+    // (single leading `/`, no `//`, no `\`, no scheme, no control
+    // chars, resolves inside the served dir). Otherwise fall back
+    // to `/`.
+    const nextParam = url.searchParams.get("next");
+    const location = safeNextRedirect(nextParam) ?? "/";
     const response = new Response(null, {
       status: 302,
       headers: {
-        location: "/",
+        location,
         "set-cookie": setCookieHeader(cookieName(port), outcome.cookie),
       },
     });
     return withHygiene(response, undefined);
+  }
+
+  /** Validate a `next=` value for the auth redirect. Returns the
+   * accepted path (leading slash, no query, no fragment) or
+   * undefined if the value is unsafe. Rules:
+   *
+   *   - `next` must not be null.
+   *   - After percent-decoding (which the URL parser has done for
+   *     us since we read via `searchParams.get`), the value must
+   *     start with a SINGLE `/`, must not start with `//` (protocol-
+   *     relative), must not start with `/\` (Windows path or
+   *     escape), must not contain a scheme (`:` before `/`), must
+   *     not contain a backslash or a control character, and its
+   *     resolved absolute path (via `staticServer.resolve`) must
+   *     land under the served dir.
+   *
+   * Test coverage in `test/serve/launch-code.test.ts` (round-3). */
+  function safeNextRedirect(next: string | null): string | undefined {
+    if (next === null) return undefined;
+    if (!next.startsWith("/")) return undefined;
+    if (next.startsWith("//")) return undefined;
+    if (next.startsWith("/\\")) return undefined;
+    if (next.includes("\\")) return undefined;
+    for (let i = 0; i < next.length; i++) {
+      const cc = next.charCodeAt(i);
+      if (cc < 0x20 || cc === 0x7f) return undefined;
+    }
+    // Reject a scheme-shaped prefix that URL parsing may have left
+    // in an already-percent-decoded value. `javascript:` /
+    // `https:` don't start with `/`; a value like
+    // `/x?u=javascript:alert(1)` would still pass here because
+    // we resolve on the pathname only.
+    if (/^\/[a-z][a-z0-9+.-]*:/i.test(next)) return undefined;
+    // Take the pathname component only — drop query / fragment
+    // that a URL parser might have kept.
+    const pathOnly = next.split("?")[0]!.split("#")[0]!;
+    // Resolve inside the served dir.
+    const resolved = staticServer.resolve(pathOnly);
+    if (!resolved.ok) return undefined;
+    // Rebuild the redirect target from the (URL-safe) pathname,
+    // preserving any query the caller included.
+    return next;
   }
 
   // ── API branch ────────────────────────────────────────────────────

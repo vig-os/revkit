@@ -21,12 +21,15 @@ export {
   formatCatchupSummary,
   escapeContentFragment,
   META_VALUE_MAX,
+  TOOL_RECONNECT_DEADLINE_MS_DEFAULT,
   THREADS_TOOL,
   REPLY_TOOL,
   RESOLVE_TOOL,
+  REVIEW_URL_TOOL,
   type ChannelServerOptions,
   type ChannelServerHandle,
   type ChannelPayload,
   type DiscoverFn,
   type DiscoverResult,
 } from "./channel-server.ts";
+export { DaemonHttpError } from "./daemon-client.ts";

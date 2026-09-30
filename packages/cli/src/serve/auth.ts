@@ -110,11 +110,18 @@ interface OutstandingCode {
   used: boolean;
 }
 
+/** Cap on the number of outstanding launch codes. The startup
+ * code + a handful of freshly-minted ones from `POST /-/launch-code`
+ * — 32 covers any realistic session, and evicts the oldest first
+ * so a runaway mint from a compromised bearer can't grow the
+ * array unbounded. */
+export const MAX_OUTSTANDING_LAUNCH_CODES = 32;
+
 /** State the guards keep across requests. One instance per running
  * daemon; scoped to that daemon's lifetime. */
 export class AuthState {
   readonly #agentToken: string;
-  readonly #codes: OutstandingCode[] = [];
+  #codes: OutstandingCode[] = [];
   readonly #sessions = new Set<string>();
   readonly #clock: MsClock;
   readonly #ttlMs: number;
@@ -126,23 +133,63 @@ export class AuthState {
     this.#codes.push({ value: options.launchCode, createdAtMs: this.#clock(), used: false });
   }
 
+  /** Drop expired + used entries from `#codes` (PR #38 round-3
+   * review). Also caps the remaining list at
+   * `MAX_OUTSTANDING_LAUNCH_CODES`, evicting oldest-first. Called
+   * from both `mintLaunchCode` and `exchangeLaunchCode`. Never
+   * touches the STARTUP code entry (index 0) even if it's used,
+   * because `launchCodeUsed()` reports on it. */
+  #prune(): void {
+    const now = this.#clock();
+    // Keep the startup entry (index 0) always. Filter the rest by
+    // "not expired AND not used".
+    const startup = this.#codes[0];
+    const kept: OutstandingCode[] = startup !== undefined ? [startup] : [];
+    for (let i = 1; i < this.#codes.length; i++) {
+      const record = this.#codes[i]!;
+      const age = now - record.createdAtMs;
+      if (age > this.#ttlMs) continue;
+      if (record.used) continue;
+      kept.push(record);
+    }
+    // Cap: evict oldest first (from the middle so the startup
+    // entry stays put).
+    while (kept.length > MAX_OUTSTANDING_LAUNCH_CODES) {
+      kept.splice(1, 1);
+    }
+    this.#codes = kept;
+  }
+
   /** Mint a fresh single-use launch code with the same TTL as the
    * startup one. Used by the bearer-authenticated
    * `POST /-/launch-code` endpoint so `revkit mcp`'s `review_url`
    * tool can hand a human a fresh link even after the startup
-   * code has been consumed. */
+   * code has been consumed. Prunes stale entries on the way in. */
   mintLaunchCode(): { value: string; createdAtMs: number } {
+    this.#prune();
     const value = mintToken();
     const record: OutstandingCode = { value, createdAtMs: this.#clock(), used: false };
     this.#codes.push(record);
+    // If we're at the cap after adding, evict again so the count
+    // stays bounded even under a mint burst.
+    if (this.#codes.length > MAX_OUTSTANDING_LAUNCH_CODES) this.#prune();
     return { value, createdAtMs: record.createdAtMs };
+  }
+
+  /** Number of outstanding codes currently held. Exported for
+   * tests only — nothing else reads it. */
+  outstandingLaunchCodeCount(): number {
+    return this.#codes.length;
   }
 
   /** Try to exchange `code` for a fresh session cookie value. Returns
    * the cookie value on success, or a rejection kind on failure.
-   * Checks EVERY outstanding code (start + freshly-minted) — the
-   * one that matches, if any, is consumed. */
+   * Prunes on entry so a redeemed / expired record is gone before
+   * the scan. */
   exchangeLaunchCode(code: string): { ok: true; cookie: string } | { ok: false; reason: "expired" | "used" | "invalid" } {
+    // Prune BEFORE the scan so an expired/used entry does not
+    // linger and mask "invalid" as "expired" / "used".
+    this.#prune();
     const now = this.#clock();
     // Find a matching, non-expired, unused code.
     let matched: OutstandingCode | undefined;
@@ -159,10 +206,8 @@ export class AuthState {
     }
     if (matched === undefined) {
       // Distinguish the three failure modes for the user-visible
-      // message; expired takes precedence over used (a code the
-      // user just tried again after 60s should say "expired").
+      // message; expired takes precedence over used.
       if (!anyMatch) return { ok: false, reason: "invalid" };
-      // Find whichever matched to classify.
       for (const record of this.#codes) {
         if (safeEqual(code, record.value)) {
           const age = now - record.createdAtMs;
@@ -175,6 +220,8 @@ export class AuthState {
     matched.used = true;
     const cookie = mintToken();
     this.#sessions.add(cookie);
+    // Prune again to drop the record we just marked used.
+    this.#prune();
     return { ok: true, cookie };
   }
 

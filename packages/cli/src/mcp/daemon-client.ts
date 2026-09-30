@@ -10,6 +10,22 @@
 // same-origin envelope). Missing the header is not a bypass: the
 // bearer token IS the credential.
 
+/** Error thrown by DaemonClient methods on a non-OK response. The
+ * caller can inspect `.status` to decide whether to retry
+ * (5xx / transport) or surface the message unchanged (4xx). PR #38
+ * round-3 review: a 4xx from the daemon (bad `parent_id`, invalid
+ * anchor path) must NOT trigger the tool-call reconnect loop. */
+export class DaemonHttpError extends Error {
+  readonly status: number;
+  readonly body: string;
+  constructor(message: string, status: number, body: string) {
+    super(message);
+    this.name = "DaemonHttpError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 /** Configuration for one connected client. `url` is the daemon's
  * loopback origin (`http://127.0.0.1:<port>`); `agentToken` is the
  * bearer token from `.revkit/serve.json`. */
@@ -80,7 +96,8 @@ export class DaemonClient {
       headers: this.#authHeaders(),
     });
     if (!response.ok) {
-      throw new Error(`daemon GET /api/threads → ${response.status}`);
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(`daemon GET /api/threads → ${response.status}`, response.status, text);
     }
     return (await response.json()) as ListThreadsResponse;
   }
@@ -100,15 +117,26 @@ export class DaemonClient {
     );
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw new Error(`daemon POST /api/threads/${threadId}/replies → ${response.status} ${text}`);
+      throw new DaemonHttpError(
+        `daemon POST /api/threads/${threadId}/replies → ${response.status} ${text}`,
+        response.status,
+        text,
+      );
     }
     return (await response.json()) as AppendResponse;
   }
 
-  /** `POST /-/launch-code` — mint a fresh single-use launch URL the
-   * agent can hand a human. Requires the agent bearer; the daemon
-   * ties the URL to the current port and refuses cross-origin
-   * calls. Returns the launch URL + a TTL in ms. */
+  /** `POST /-/launch-code` — mint a fresh single-use launch URL
+   * the agent can hand a human. The agent bearer token IS the
+   * authentication; no Origin / cookie is required and none is
+   * checked. Returns `{launchUrl, ttlMs}`.
+   *
+   * Deep-link: an optional `pathHint` is appended as `?next=` on
+   * the returned URL. The DAEMON validates the value at
+   * redirect-time (`safeNextRedirect` in `daemon.ts`): only a
+   * same-origin single-slash relative path that resolves under
+   * the served dir is honoured; anything else falls back to `/`.
+   * A malformed hint is not the client's problem to filter. */
   async mintLaunchUrl(pathHint?: string): Promise<{ launchUrl: string; ttlMs: number }> {
     const response = await this.#fetch(`${this.#url}/-/launch-code`, {
       method: "POST",
@@ -116,14 +144,14 @@ export class DaemonClient {
       body: JSON.stringify({}),
     });
     if (!response.ok) {
-      throw new Error(`daemon POST /-/launch-code → ${response.status}`);
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /-/launch-code → ${response.status}`,
+        response.status,
+        text,
+      );
     }
     const parsed = (await response.json()) as { launchUrl: string; ttlMs: number };
-    // Deep-link support: the caller may pass a repo-relative path
-    // hint so the launched page opens that doc. The daemon's
-    // launch flow redirects to `/`; append a `?next=<encoded>`
-    // fragment the rail can read. Passed through unvalidated
-    // client-side (the browser only navigates within loopback).
     if (pathHint !== undefined && pathHint.length > 0) {
       const url = new URL(parsed.launchUrl);
       url.searchParams.set("next", pathHint);
@@ -145,7 +173,11 @@ export class DaemonClient {
     );
     if (!response.ok) {
       const text = await response.text().catch(() => "");
-      throw new Error(`daemon POST /api/threads/${threadId}/resolve → ${response.status} ${text}`);
+      throw new DaemonHttpError(
+        `daemon POST /api/threads/${threadId}/resolve → ${response.status} ${text}`,
+        response.status,
+        text,
+      );
     }
     return (await response.json()) as AppendResponse;
   }

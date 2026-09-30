@@ -22,6 +22,7 @@ import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { filteredDaemonEnv } from "../../src/mcp/daemon-bootstrap.ts";
+import { registerDaemonPid, unregisterDaemonPid } from "../helpers/daemon-registry.ts";
 
 const REVKIT_BIN = resolve(__dirname, "..", "..", "bin", "revkit.js");
 
@@ -44,12 +45,16 @@ describe("revkit mcp — real subprocess", () => {
     // the pipe; when the pipe closes and the daemon exits, its
     // lock releases. Give it a beat.
     await new Promise((r) => setTimeout(r, 300));
-    // Try to kill any lingering daemon we spawned. Cheap: read
-    // serve.json's pid.
+    // Register + kill the auto-spawned daemon via its serve.json
+    // pid. Registration lets `daemon-hygiene.test.ts` know THIS
+    // is a test-owned pid; kill drops it before we nuke the dir.
     try {
       const state = JSON.parse(readFileSync(join(root, ".revkit", "serve.json"), "utf8")) as { pid: number };
+      registerDaemonPid(state.pid);
       try { process.kill(state.pid, "SIGTERM"); } catch { /* dead */ }
       await new Promise((r) => setTimeout(r, 100));
+      // Once dead, unregister — hygiene only wants leaks.
+      try { process.kill(state.pid, 0); /* still alive */ } catch { unregisterDaemonPid(state.pid); }
     } catch { /* no serve.json */ }
     try { rmSync(root, { recursive: true, force: true }); } catch { /* eventual */ }
   });

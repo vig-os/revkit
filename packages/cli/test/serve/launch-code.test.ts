@@ -138,6 +138,74 @@ describe("POST /-/launch-code", () => {
     }
   });
 
+  test("deep-link: redirect honours a safe `next` path", async () => {
+    // Seed a static file in the dist tree, mint a launch code with
+    // `next=/deep.html`, and assert the 302 lands there.
+    writeFileSync(join(root, "dist", "deep.html"), "<h1>deep</h1>");
+    const minted = await fetch(daemon.url + "/-/launch-code", {
+      method: "POST",
+      headers: {
+        host: `127.0.0.1:${daemon.port}`,
+        authorization: `Bearer ${daemon.agentToken}`,
+      },
+    });
+    const body = (await minted.json()) as { launchUrl: string };
+    const url = new URL(body.launchUrl);
+    url.searchParams.set("next", "/deep.html");
+    const redemption = await fetch(url, {
+      redirect: "manual",
+      headers: { host: `127.0.0.1:${daemon.port}` },
+    });
+    expect(redemption.status).toBe(302);
+    expect(redemption.headers.get("location")).toBe("/deep.html");
+  });
+
+  test("MUTATION: `next=` is REJECTED for open-redirect-shaped values", async () => {
+    // Every hostile shape must fall back to `/` — no protocol-
+    // relative, no scheme, no backslash, no control chars, no
+    // path escape.
+    const hostileNexts = [
+      "//evil.example",           // protocol-relative
+      "/\\evil.example",          // path escape
+      "%2F%2Fevil",               // percent-encoded //
+      "/%5Cevil",                 // percent-encoded backslash
+      "https://evil.example",     // scheme
+      "javascript:alert(1)",      // scheme
+      "/a\\b",                    // embedded backslash
+      "/x\x00null",               // control char
+      "/../etc/passwd",           // path traversal
+    ];
+    for (const hostile of hostileNexts) {
+      const minted = await fetch(daemon.url + "/-/launch-code", {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+        },
+      });
+      const body = (await minted.json()) as { launchUrl: string };
+      const url = new URL(body.launchUrl);
+      url.searchParams.set("next", hostile);
+      const redemption = await fetch(url, {
+        redirect: "manual",
+        headers: { host: `127.0.0.1:${daemon.port}` },
+      });
+      // If the daemon accepted (2xx/3xx to the code), the location
+      // MUST be `/`. If it refused the code (single-use consumed
+      // earlier), it returns 403 — also acceptable for this test's
+      // point (no open-redirect leaked). Any location OTHER than
+      // `/` means the guard failed.
+      const location = redemption.headers.get("location");
+      if (redemption.status === 302) {
+        expect(location, `hostile next '${hostile}' leaked to location`).toBe("/");
+      } else {
+        // Non-302 is also safe: the guard refused before the
+        // redirect.
+        expect([400, 403]).toContain(redemption.status);
+      }
+    }
+  });
+
   test("startup launch code and a fresh minted code are independent (using one does not spend the other)", async () => {
     // Redeem the startup code — success.
     const startupUse = await fetch(daemon.launchUrl, {
