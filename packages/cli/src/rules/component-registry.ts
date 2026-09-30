@@ -431,6 +431,16 @@ export interface ComponentRegistryFileResult {
   }[];
 }
 
+/** Options for `checkComponentRegistryFile`. `trust: "untrusted"`
+ * disables the allow-annotation escape-hatch — a PR-authored file
+ * cannot silence its own findings, since the annotation has not
+ * been through the hosted `--online` verifier the reviewer can
+ * trust. See ADR-0025 "Untrusted PR content (must be explicit)"
+ * and PR #48 round-2 review. */
+export interface ComponentRegistryFileOptions {
+  readonly trust?: "trusted" | "untrusted";
+}
+
 /** Check one MDX / MD file against the component-registry rule. A
  * parse error surfaces as a `file:line: component-registry: parse …`
  * diagnostic — never a raw micromark / acorn stack — so the CLI's
@@ -441,6 +451,7 @@ export function checkComponentRegistryFile(
   source: string,
   file: string,
   preparsedRoot?: Parent,
+  options?: ComponentRegistryFileOptions,
 ): ComponentRegistryFileResult {
   let root: Parent;
   try {
@@ -589,9 +600,15 @@ export function checkComponentRegistryFile(
     // Escape hatch: the previous sibling being an allow-annotation
     // exempts THIS element (exactly one). The annotation is
     // consumed — a second element on the same parent needs its own
-    // annotation.
+    // annotation. **Disabled entirely under `untrusted` trust**
+    // (ADR-0025, PR #48 round-2): a PR author could otherwise smuggle
+    // a build-time RCE past every attribute-expression / expression-
+    // in-content guard by pairing it with a `{/* revkit-allow: #N */}`
+    // annotation. The annotation is only meaningful for content the
+    // reviewer authored (i.e. the trusted lane).
+    const trust = options?.trust ?? "trusted";
     const annotation = prev !== null ? annotationBySibling.get(prev) ?? null : null;
-    if (annotation !== null) {
+    if (trust === "trusted" && annotation !== null) {
       usedAllowAnnotations.push({ annotation, line });
       annotationBySibling.delete(prev as Nodes);
       return;

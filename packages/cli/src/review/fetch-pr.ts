@@ -29,7 +29,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { GitRunner } from "../git-runner.ts";
-import { runSafeGitOrThrow, SafeGitError } from "./git-safe.ts";
+import { runSafeGit, runSafeGitOrThrow, SafeGitError } from "./git-safe.ts";
 
 /** Options for `ensurePrCommits`. */
 export interface EnsurePrCommitsOptions {
@@ -124,18 +124,137 @@ export async function ensurePrCommits(options: EnsurePrCommitsOptions): Promise<
  * Uses `git cat-file -e <sha>` — exits 0 if present, non-zero if
  * missing. Never emits stdout, so a caller can use the exit code
  * directly.
+ *
+ * Routed through the safe wrapper so the same hardening (no hooks,
+ * no submodule recursion, no filter/smudge driver reads,
+ * `protocol.file.allow=never`, `protocol.ext.allow=never`) applies
+ * to this call as every other git invocation on the review path
+ * (PR #48 round-2 nit).
  */
 export async function hasCommit(runner: GitRunner, cwd: string, sha: string): Promise<boolean> {
-  const result = await runner(
-    ["--no-optional-locks", "cat-file", "-e", `${sha}^{commit}`],
-    cwd,
-  );
+  const result = await runSafeGit(runner, cwd, ["cat-file", "-e", `${sha}^{commit}`]);
   return result.exitCode === 0;
 }
 
-/** Compute the directory the materializer will target for this PR. */
-export function reviewTargetDir(repoRoot: string, pullNumber: number, headSha: string): string {
-  return join(repoRoot, ".revkit", "review", `${pullNumber}-${shortSha(headSha)}`);
+/**
+ * Re-read the `refs/revkit/pr-<n>/head` SHA that `ensurePrCommits`
+ * just wrote. **Closes the TOCTOU window** between `getPullRequest`
+ * (adapter) and `materializeSafeTree` (git object DB): the reviewer
+ * saw commit X on GitHub, fetched it into the local DB, and the
+ * materializer/build must operate on THAT SHA — not on a value that
+ * moved between the adapter call and the fetch (PR #48 round-2
+ * blocker 3).
+ *
+ * Returns the 40-hex SHA the fetched ref resolves to now.
+ * `git rev-parse --verify` refuses ambiguous names and does not
+ * spawn a network call, so this is cheap.
+ */
+export async function readFetchedHeadSha(
+  runner: GitRunner,
+  cwd: string,
+  pullNumber: number,
+): Promise<string> {
+  const ref = `refs/revkit/pr-${pullNumber}/head`;
+  const out = await runSafeGitOrThrow(
+    runner,
+    cwd,
+    ["rev-parse", "--verify", `${ref}^{commit}`],
+    `readFetchedHeadSha: git rev-parse ${ref} failed`,
+  );
+  const trimmed = out.trim();
+  if (!/^[0-9a-f]{40}$/i.test(trimmed)) {
+    throw new SafeGitError(
+      `readFetchedHeadSha: git rev-parse returned an implausible SHA: ${JSON.stringify(trimmed.slice(0, 80))}`,
+      0,
+      "",
+    );
+  }
+  return trimmed.toLowerCase();
+}
+
+/**
+ * Return the `origin` remote's URL, or `undefined` when no `origin`
+ * remote is configured. Used by the CLI's owner/repo verification
+ * step (PR #48 round-2 blocker 4): a PR ref whose owner/repo does
+ * not match the local `origin` is refused, so a reviewer cannot
+ * accidentally build a PR from a repo their checkout does not
+ * track.
+ */
+export async function readOriginUrl(runner: GitRunner, cwd: string): Promise<string | undefined> {
+  const result = await runSafeGit(runner, cwd, ["remote", "get-url", "origin"]);
+  if (result.exitCode !== 0) return undefined;
+  return result.stdout.trim();
+}
+
+/**
+ * Parse a git remote URL into its `{owner, repo}` slug. Handles both
+ * HTTPS (`https://github.com/o/r.git`) and SSH
+ * (`git@github.com:o/r.git`) shapes. Trailing `.git` is stripped.
+ * Returns `undefined` for a non-github or malformed URL.
+ */
+export function parseGithubRemoteUrl(url: string): { readonly owner: string; readonly repo: string } | undefined {
+  const trimmed = url.trim();
+  // SSH: `git@github.com:owner/repo(.git)?`
+  const ssh = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+?)(\.git)?$/);
+  if (ssh !== null) {
+    return { owner: ssh[1] ?? "", repo: ssh[2] ?? "" };
+  }
+  // HTTPS: `https://github.com/owner/repo(.git)?` (also `http://`).
+  try {
+    const u = new URL(trimmed);
+    if (u.hostname !== "github.com" && u.hostname !== "www.github.com") return undefined;
+    const parts = u.pathname.split("/").filter((s) => s.length > 0);
+    if (parts.length < 2) return undefined;
+    const owner = parts[0] ?? "";
+    let repo = parts[1] ?? "";
+    if (repo.endsWith(".git")) repo = repo.slice(0, -4);
+    return { owner, repo };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Per-PR root — keyed by `<owner>-<repo>-<number>` so a rerun on the
+ * same PR reuses its **state** even after the PR head moves.
+ * (PR #48 round-2 blocker 5.) A subdirectory `head-<sha>/` holds the
+ * per-head materialised tree and per-head dist; `state/` holds the
+ * survivable per-PR state (sqlite, snapshots) that MUST live outside
+ * the materialised tree so a rerun that wipes the head dir does not
+ * destroy comments. */
+export function perPrRoot(repoRoot: string, pr: { owner: string; repo: string; pullNumber: number }): string {
+  // Slugs are already validated (see `pr-ref.ts`), but be defensive
+  // — refuse a path segment with a separator.
+  const slug = safeSlug(pr.owner, pr.repo, pr.pullNumber);
+  return join(repoRoot, ".revkit", "review", slug);
+}
+
+/** Absolute path to the materialised worktree for a given head SHA. */
+export function reviewTargetDir(
+  repoRoot: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+  headSha: string,
+): string {
+  return join(perPrRoot(repoRoot, pr), `head-${shortSha(headSha)}`);
+}
+
+/** Absolute path to the survivable per-PR state directory. Contains
+ * `threads.sqlite` and any snapshot bytes the re-anchor pipeline needs
+ * across head moves. This directory is NEVER removed by a rerun; a
+ * `--clean` flag (future) would remove it explicitly. */
+export function perPrStateDir(
+  repoRoot: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+): string {
+  return join(perPrRoot(repoRoot, pr), "state");
+}
+
+/** Absolute path to the sqlite thread store for this PR. Lives under
+ * `state/` so it survives a `rm -rf` of the head tree. */
+export function perPrSqlitePath(
+  repoRoot: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+): string {
+  return join(perPrStateDir(repoRoot, pr), "threads.sqlite");
 }
 
 /** Directory containing all per-PR review worktrees. */
@@ -143,11 +262,30 @@ export function reviewsRoot(repoRoot: string): string {
   return join(repoRoot, ".revkit", "review");
 }
 
-/** True when the review target for a given PR + SHA already exists on
- * disk. Callers use this to skip a fetch/materialize when a previous
- * invocation on the same head SHA already produced the tree. */
-export function reviewTargetExists(repoRoot: string, pullNumber: number, headSha: string): boolean {
-  return existsSync(reviewTargetDir(repoRoot, pullNumber, headSha));
+/** True when the materialised head-<sha> tree already exists. */
+export function reviewTargetExists(
+  repoRoot: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+  headSha: string,
+): boolean {
+  return existsSync(reviewTargetDir(repoRoot, pr, headSha));
+}
+
+/** Build a safe path segment `<owner>-<repo>-<number>` — refuses
+ * anything but ASCII alphanumeric and `._-` so a hostile slug cannot
+ * escape the reviews root. `pr-ref.ts` already validates owner/repo,
+ * but this is the last line of defence between an on-wire value and
+ * a filesystem path. */
+function safeSlug(owner: string, repo: string, num: number): string {
+  const ok = /^[A-Za-z0-9._-]+$/;
+  if (!ok.test(owner) || !ok.test(repo)) {
+    throw new SafeGitError(
+      `perPrRoot: refusing unsafe slug '${owner}/${repo}'`,
+      0,
+      "",
+    );
+  }
+  return `${owner}-${repo}-${num}`;
 }
 
 function shortSha(sha: string): string {

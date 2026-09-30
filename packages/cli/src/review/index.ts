@@ -19,11 +19,27 @@ export {
 export {
   ensurePrCommits,
   hasCommit,
+  parseGithubRemoteUrl,
+  perPrRoot,
+  perPrSqlitePath,
+  perPrStateDir,
+  readFetchedHeadSha,
+  readOriginUrl,
   reviewTargetDir,
   reviewTargetExists,
   reviewsRoot,
   type EnsurePrCommitsOptions,
 } from "./fetch-pr.ts";
+export {
+  buildChildEnv,
+  BUILD_ENV_ALLOWLIST,
+  BUILD_ENV_TOKEN_DENYLIST,
+  defaultDistOutDir,
+  runSafeBuild,
+  type RunSafeBuildOptions,
+  type SpawnLike,
+  type SpawnResult,
+} from "./build.ts";
 export {
   buildSafeGitArgs,
   runSafeGit,
@@ -33,6 +49,7 @@ export {
   SafeGitError,
 } from "./git-safe.ts";
 export {
+  BlobTooLargeError,
   formatRefusal,
   listTree,
   materializeSafeTree,

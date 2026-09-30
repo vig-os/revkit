@@ -9,25 +9,41 @@ Given a PR number or URL, `revkit review`:
 
 1. Resolves the PR through the GitHub adapter using the reviewer's `gh auth token` (in memory only — never
    written to disk, never sent to the browser).
-2. Fetches the PR head and base commits into the local git object DB through a hardened `git` wrapper
+2. Refuses the review if the local `origin` remote's `owner/repo` does not match the PR's
+   `owner/repo`, or if the PR is from a fork whose head repo has been deleted, unless the reviewer passes
+   `--trust <sha>`.
+3. Fetches the PR head and base commits into the local git object DB through a hardened `git` wrapper
    (no hooks, no submodules, no filter/smudge drivers, no `protocol.file`, no `protocol.ext`).
-3. Refuses the review unless every non-content path is unchanged, or the reviewer passed `--trust <sha>` that
-   pins to the exact head SHA. Fork PRs are refused without `--trust` too.
-4. Materializes a safe worktree under `.revkit/review/<pr>-<sha>/`: tooling files (everything not on the
-   [content allowlist](../packages/cli/src/review/content-allowlist.ts)) come from the reviewer's trusted
-   base; content files (docs, vocab, plots, Starlight collections, allowlisted extensions only) come from
-   the PR head. Symlinks that escape the content root, submodules, and other unsupported tree modes are
-   refused. `git checkout` is never invoked, so smudge filters never run.
-5. Runs `revkit check` over the materialized content.
-6. Imports the PR's existing review threads through the adapter into the daemon's thread store (deterministic
-   ids, so a re-run of `revkit review` on the same head is idempotent).
-7. Starts a per-review `revkit serve` daemon pointing at `.revkit/review/<pr>-<sha>/site/dist`. ADR-0013's
-   auth/CSP stays exactly as it is; only the served directory and the sqlite path change.
+4. Re-reads the fetched head SHA and refuses to continue unless it matches what GitHub advertised (TOCTOU
+   close). If `--trust <sha>` was passed, it must equal that exact SHA too — no prefixes.
+5. Computes the tooling diff against the **merge-base** of head and base (not the base tip; stale PRs are not
+   refused for base-side churn). Refuses if any tooling file differs from the merge-base unless
+   `--trust <sha>` is given. Prints the tooling diff either way.
+6. Materializes a safe worktree under `.revkit/review/<owner>-<repo>-<pr>/head-<sha>/`: tooling files
+   (everything not on the [content allowlist](../packages/cli/src/review/content-allowlist.ts)) come from the
+   reviewer's trusted merge-base tree; content files (docs, vocab, plots, Starlight collections, allowlisted
+   extensions only) come from the PR head. Symlinks that escape the content root, submodules, and other
+   unsupported tree modes are refused. Per-blob size checked via `cat-file -s` BEFORE reading; total-size
+   cap enforced. `git checkout` is never invoked, so smudge filters never run.
+7. Runs `revkit check` over the materialized content in **untrusted mode**: allow-annotations are ignored
+   (a PR cannot silence its own findings), and vega-lite executable keys (`expr`/`signal`/`calculate`/
+   `update`/`on`) are refused.
+8. Runs the astro build with a **minimal env** (no `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `NODE_AUTH_TOKEN`,
+   `HF_TOKEN`, `CF_API_TOKEN`, cloud provider keys — see `build.ts:BUILD_ENV_TOKEN_DENYLIST`) inside the
+   materialised worktree. Node module resolution is pinned to the reviewer's TRUSTED `node_modules/` (no
+   `bun install` inside the sandbox, so PR-controlled lifecycle scripts never run).
+9. Runs `revkit check-dist` on the built output before serving it (ADR-0012 output-gate sanitiser).
+10. Imports the PR's existing review threads through the adapter into the daemon's thread store, which lives
+    at `.revkit/review/<owner>-<repo>-<pr>/state/threads.sqlite` — **outside** the materialised head
+    directory, so a rerun that wipes `head-<sha>/` preserves comments.
+11. Starts a per-review `revkit serve` daemon pointing at the built dist. ADR-0013's auth/CSP stays exactly
+    as it is; only the served directory and the sqlite path change.
 
 ## Flags
 
-- `--trust <sha>`: trust that exact head SHA. Required for any fork PR or any PR whose tooling files differ
-  from base. The command prints the tooling diff so the reviewer sees what they are trusting.
+- `--trust <sha>`: trust that exact head SHA. Must be the **full 40-character** commit id (no prefix). Required
+  for any fork PR or any PR whose tooling files differ from the merge-base. The command prints the tooling
+  diff so the reviewer sees what they are trusting.
 - `--no-serve`: prepare the review (materialize + import) without starting the daemon.
 - `--repo <owner/slug>`: override the default repo when passing a bare PR number.
 

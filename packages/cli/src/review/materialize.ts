@@ -47,7 +47,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import type { GitRunner } from "../git-runner.ts";
 import { classifyPath } from "./content-allowlist.ts";
-import { runSafeGitOrThrow, SafeGitError } from "./git-safe.ts";
+import { runSafeGit, runSafeGitOrThrow, SafeGitError } from "./git-safe.ts";
 
 /** One entry in a git tree, as parsed from `git ls-tree -r -z`. */
 export interface TreeEntry {
@@ -85,6 +85,11 @@ export interface MaterializeOptions {
   readonly totalBytesCap?: number;
   /** Optional per-path length cap. Defaults to 4096. */
   readonly pathBytesCap?: number;
+  /** Optional per-blob size cap in bytes. Defaults to 16 MiB —
+   * comfortably above any legitimate MDX / JSON / image content
+   * revkit tracks, well under a memory-eating unit. Refused blobs
+   * abort the materialize (PR #48 round-2 nit on DoS). */
+  readonly blobBytesCap?: number;
 }
 
 /** Reason a materialize refused. Callers switch on the discriminant
@@ -94,6 +99,7 @@ export type MaterializeRefusal =
   | { readonly kind: "unsupported-mode"; readonly path: string; readonly mode: string }
   | { readonly kind: "invalid-path"; readonly path: string; readonly reason: string }
   | { readonly kind: "path-too-long"; readonly path: string; readonly bytes: number; readonly cap: number }
+  | { readonly kind: "blob-too-large"; readonly path: string; readonly bytes: number; readonly cap: number }
   | { readonly kind: "total-too-large"; readonly bytes: number; readonly cap: number }
   | { readonly kind: "target-exists"; readonly path: string }
   | { readonly kind: "git-error"; readonly message: string };
@@ -120,6 +126,8 @@ export function formatRefusal(refusal: MaterializeRefusal): string {
       return `revkit review: refusing invalid path '${refusal.path}': ${refusal.reason}`;
     case "path-too-long":
       return `revkit review: refusing path '${refusal.path}' (${refusal.bytes} bytes > cap ${refusal.cap})`;
+    case "blob-too-large":
+      return `revkit review: refusing blob at '${refusal.path}' (${refusal.bytes} bytes > cap ${refusal.cap})`;
     case "total-too-large":
       return `revkit review: PR head materialize exceeds total-size cap (${refusal.bytes} > ${refusal.cap})`;
     case "target-exists":
@@ -131,6 +139,7 @@ export function formatRefusal(refusal: MaterializeRefusal): string {
 
 const DEFAULT_TOTAL_BYTES_CAP = 512 * 1024 * 1024;
 const DEFAULT_PATH_BYTES_CAP = 4096;
+const DEFAULT_BLOB_BYTES_CAP = 16 * 1024 * 1024;
 
 /**
  * Enumerate a commit's tree. Uses `git ls-tree -r -z` so paths with
@@ -175,32 +184,57 @@ export async function listTree(
 }
 
 /**
- * Read a git blob as bytes. Uses `git cat-file --batch=%(objectsize)`
- * — a single call per blob keeps the interface simple. A hot path
- * that needed thousands of blobs would benefit from `--batch` mode;
- * revkit's content-plus-tooling paths are small (hundreds), so the
- * per-call overhead is fine.
+ * Read a git blob as bytes, going through the hardened wrapper
+ * (PR #48 round-2 nit: `readBlob` must not bypass the safe-git
+ * config).
+ *
+ * Two-phase (PR #48 round-2 nit on DoS):
+ *   1. `cat-file -s <oid>` returns the blob's declared size — cheap,
+ *      no bytes copied. If it exceeds `maxBlobBytes`, refuse without
+ *      reading the payload.
+ *   2. `cat-file blob <oid>` reads the payload; still capped at
+ *      `maxBlobBytes` on the returned buffer as a belt-and-braces
+ *      check against a hostile server / cache that lies about size.
+ *
+ * A single call per blob keeps the interface simple. revkit's
+ * content-plus-tooling paths are small (hundreds), so per-call
+ * spawn overhead is fine.
  */
 export async function readBlob(
   runner: GitRunner,
   cwd: string,
   oid: string,
+  maxBlobBytes: number,
 ): Promise<Buffer> {
-  // `git cat-file blob <oid>` writes the blob bytes to stdout. Our
-  // GitRunner returns stdout as a string — we treat it as
-  // latin1-encoded bytes and re-decode into a Buffer. This preserves
-  // every byte because latin1 is the identity for 0x00..0xff, unlike
-  // utf8 which would replace an invalid sequence.
-  //
-  // Buffer.from(str, 'latin1') has the same length as str.length for
-  // latin1 strings, so a large PNG round-trips byte-for-byte.
-  const result = await runner(
-    // `--batch-check=&&& / --batch` would avoid a spawn per blob,
-    // but a per-file call keeps error paths simple. The safe git
-    // wrapper still runs, so config overrides apply.
-    ["--no-optional-locks", "cat-file", "blob", oid],
-    cwd,
-  );
+  // Phase 1: cheap size check via `cat-file -s`. Never reads the
+  // payload, so a 200 MiB blob does not eat a memory buffer just to
+  // learn it is over the cap.
+  const sizeResult = await runSafeGit(runner, cwd, ["cat-file", "-s", oid]);
+  if (sizeResult.exitCode !== 0) {
+    throw new SafeGitError(
+      `readBlob: git cat-file -s ${oid} failed: ${sizeResult.stderr.trim()}`,
+      sizeResult.exitCode,
+      sizeResult.stderr,
+    );
+  }
+  const declaredSize = Number.parseInt(sizeResult.stdout.trim(), 10);
+  if (!Number.isFinite(declaredSize) || declaredSize < 0) {
+    throw new SafeGitError(
+      `readBlob: git cat-file -s ${oid} returned invalid size: ${JSON.stringify(sizeResult.stdout)}`,
+      0,
+      "",
+    );
+  }
+  if (declaredSize > maxBlobBytes) {
+    throw new BlobTooLargeError(oid, declaredSize, maxBlobBytes);
+  }
+  // Phase 2: read the payload. Our GitRunner returns stdout as a
+  // string — we treat it as latin1-encoded bytes so every byte
+  // round-trips (unlike utf8, which would replace invalid
+  // sequences). Buffer.from(str, 'latin1') has the same length as
+  // str.length for latin1 strings, so a large PNG round-trips
+  // byte-for-byte.
+  const result = await runSafeGit(runner, cwd, ["cat-file", "blob", oid]);
   if (result.exitCode !== 0) {
     throw new SafeGitError(
       `readBlob: git cat-file blob ${oid} failed: ${result.stderr.trim()}`,
@@ -208,7 +242,27 @@ export async function readBlob(
       result.stderr,
     );
   }
-  return Buffer.from(result.stdout, "latin1");
+  const buf = Buffer.from(result.stdout, "latin1");
+  if (buf.length > maxBlobBytes) {
+    throw new BlobTooLargeError(oid, buf.length, maxBlobBytes);
+  }
+  return buf;
+}
+
+/** Thrown when a git blob exceeds the per-blob size cap. Carries the
+ * declared size and cap so callers can surface a specific
+ * diagnostic. */
+export class BlobTooLargeError extends Error {
+  readonly oid: string;
+  readonly size: number;
+  readonly cap: number;
+  constructor(oid: string, size: number, cap: number) {
+    super(`readBlob: blob ${oid} declared size ${size} exceeds cap ${cap}`);
+    this.name = "BlobTooLargeError";
+    this.oid = oid;
+    this.size = size;
+    this.cap = cap;
+  }
 }
 
 /**
@@ -284,6 +338,7 @@ export async function materializeSafeTree(
 ): Promise<MaterializeOutcome> {
   const totalCap = options.totalBytesCap ?? DEFAULT_TOTAL_BYTES_CAP;
   const pathCap = options.pathBytesCap ?? DEFAULT_PATH_BYTES_CAP;
+  const blobCap = options.blobBytesCap ?? DEFAULT_BLOB_BYTES_CAP;
 
   // Refuse an already-existing target so a stale `.revkit/review/<n>-<sha>/`
   // from a previous run does not mask a new refusal.
@@ -350,7 +405,20 @@ export async function materializeSafeTree(
       throw new MaterializeError({ kind: "unsupported-mode", path, mode: source.mode });
     }
 
-    const bytes = await readBlob(options.runner, options.cwd, source.oid);
+    let bytes: Buffer;
+    try {
+      bytes = await readBlob(options.runner, options.cwd, source.oid, blobCap);
+    } catch (err) {
+      if (err instanceof BlobTooLargeError) {
+        throw new MaterializeError({
+          kind: "blob-too-large",
+          path,
+          bytes: err.size,
+          cap: err.cap,
+        });
+      }
+      throw err;
+    }
 
     if (source.mode === "120000") {
       // Symlink blob: contents are the target string.

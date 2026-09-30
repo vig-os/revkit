@@ -29,8 +29,7 @@
 // keeps the command's fast paths (parse/resolve/refuse/materialize/
 // import) covered by tests without needing a full astro build in CI.
 
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join, resolve as resolvePath } from "node:path";
 import {
   GitHubAdapter,
@@ -46,12 +45,23 @@ import { findRepoRootByPackageJson } from "../repo-root.ts";
 import { runCheck, toCheckFiles } from "../check.ts";
 import { walkForCheckables } from "../file-discovery.ts";
 import { parsePrRef } from "./pr-ref.ts";
-import { ensurePrCommits, reviewTargetDir, reviewTargetExists } from "./fetch-pr.ts";
+import {
+  ensurePrCommits,
+  parseGithubRemoteUrl,
+  perPrRoot,
+  perPrSqlitePath,
+  perPrStateDir,
+  readFetchedHeadSha,
+  readOriginUrl,
+  reviewTargetDir,
+  reviewTargetExists,
+} from "./fetch-pr.ts";
 import { computeToolingDiff, formatToolingDiff, type ToolingDiff } from "./tooling-diff.ts";
 import { materializeSafeTree, MaterializeError } from "./materialize.ts";
 import { populateStoreFromPr, type PopulateOutcome } from "./import-threads.ts";
 import { SqliteThreadStore } from "../serve/sqlite-store.ts";
 import { ensureRevkitDir } from "../serve/serve-state.ts";
+import { runSafeBuild } from "./build.ts";
 
 /** Result shape aligned with the dispatcher's `CliResult`. */
 export interface RunReviewResult {
@@ -59,6 +69,19 @@ export interface RunReviewResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly blockForever?: Promise<void>;
+}
+
+/** Injectable seam for the astro build (PR #48 round-2 blocker 2).
+ * The default (`build.ts:runSafeBuild`) runs the reviewer's trusted
+ * astro toolchain against the materialised worktree with a minimal
+ * env (no GITHUB_TOKEN / GH_TOKEN / npm_ tokens; `TMPDIR`, `PATH`
+ * and the nix profile only). Tests inject a stub that fakes a
+ * `site/dist/` without spawning astro. */
+export interface BuildHook {
+  (options: {
+    readonly materializedRoot: string;
+    readonly distOutDir: string;
+  }): Promise<void>;
 }
 
 /** Env `runReviewCommand` needs. Each field has a default that the
@@ -72,21 +95,29 @@ export interface RunReviewEnv {
   /** Injectable adapter factory — tests hand in an adapter whose
    * `fetch` is a fake. Default builds one using `gh auth token`. */
   readonly makeAdapter?: (gh: GhRunner) => GitHubAdapter;
-  /** Injectable build hook. Called AFTER materialize + check +
-   * import; the default is a no-op stub (part 2a does not run the
-   * astro build itself; that is done by a follow-up "revkit build"
-   * on the reviewer's side). Tests inject a hook that fakes a
-   * `dist/`. Returning a rejected promise aborts the command with
-   * that error. */
-  readonly build?: (materializedRoot: string) => Promise<void>;
+  /** Injectable build hook. When absent, the built-in safe build
+   * runs (see `build.ts:runSafeBuild`), and its output lands under
+   * `distOutDir`. */
+  readonly build?: BuildHook;
   /** Injectable serve start. Defaults to importing `startDaemon`
    * and calling it. Tests set this to a no-op. When absent, the
    * command runs the daemon; when present, tests use their stub.
    * A `--no-serve` flag also skips this. */
-  readonly startServe?: (options: { materializedRoot: string; sqlitePath: string; repoRoot: string; localUserId: string }) => Promise<{ url: string; port: number; launchUrl: string; blockForever: Promise<void>; stop(): Promise<void> }>;
-  /** Injectable local user id — falls back to reading/minting
-   * `.revkit/local-user`. */
-  readonly localUserId?: string;
+  readonly startServe?: (options: {
+    readonly materializedRoot: string;
+    readonly distDir: string;
+    readonly sqlitePath: string;
+    readonly repoRoot: string;
+    readonly localUserId: string;
+  }) => Promise<{ url: string; port: number; launchUrl: string; blockForever: Promise<void>; stop(): Promise<void> }>;
+  /** Local user id — required. The daemon's actor-identification
+   * boundary needs a stable per-install tag; the caller
+   * (`packages/cli/src/index.ts:review`) mints or reads it once. */
+  readonly localUserId: string;
+  /** Skip `check-dist` — for tests that need to bypass the ADR-0012
+   * output-gate sanitiser on a hand-rolled fake dist. NEVER set in
+   * production; the CLI dispatcher never sets it. */
+  readonly _skipCheckDist?: boolean;
 }
 
 /** Parsed argv. `serve: true` means we start the daemon at the end. */
@@ -156,28 +187,32 @@ export function parseReviewArgs(args: readonly string[]): ParsedReviewArgs | { r
   };
 }
 
-/** A hex-only string of length 7..64. Loose enough for short SHAs the
- * reviewer might paste from a PR URL, strict enough to refuse
- * obviously invalid input (spaces, quotes). */
+/** Strict 40-hex SHA (PR #48 round-2 blocker 3). A `--trust` value
+ * must be the FULL commit id: a 7-char prefix could collide with a
+ * different commit in a large repo, and every `--trust` shape a
+ * reviewer would type comes from `gh pr view` / a PR URL where the
+ * full SHA is a `git rev-parse` away. */
 export function isPlausibleSha(value: string): boolean {
-  if (value.length < 7 || value.length > 64) return false;
-  return /^[0-9a-fA-F]+$/.test(value);
+  return /^[0-9a-fA-F]{40}$/.test(value);
 }
 
-/** True when the trusted SHA prefix matches the actual head SHA. */
+/** Exact SHA equality (case-insensitive) — no prefix acceptance
+ * (PR #48 round-2 blocker 3). */
 export function trustMatches(trusted: string, actual: string): boolean {
-  if (trusted.length === 0 || actual.length === 0) return false;
-  const t = trusted.toLowerCase();
-  const a = actual.toLowerCase();
-  // Only a genuine prefix match — a 7-char SHA a reviewer pasted
-  // from a URL should trust the same commit.
-  if (t.length > a.length) return false;
-  return a.startsWith(t);
+  if (trusted.length !== 40 || actual.length !== 40) return false;
+  return trusted.toLowerCase() === actual.toLowerCase();
 }
 
-/** Build the default `env` used by the top-level CLI dispatcher. */
-export function defaultReviewEnv(cwd: string, version: string, repoSlug: string): RunReviewEnv {
-  return { cwd, version, gh: spawnGh, git: spawnGit, repoSlug };
+/** Build the default `env` used by the top-level CLI dispatcher.
+ * `localUserId` is required — the CLI dispatcher mints it via
+ * `readOrMintLocalUserId` (see `packages/cli/src/serve/cli.ts`). */
+export function defaultReviewEnv(
+  cwd: string,
+  version: string,
+  repoSlug: string,
+  localUserId: string,
+): RunReviewEnv {
+  return { cwd, version, gh: spawnGh, git: spawnGit, repoSlug, localUserId };
 }
 
 /** Run `revkit review`. See file-level doc. */
@@ -216,15 +251,21 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
 
   const trustSha = parsed.trustSha;
 
-  // Fork check — refuse without `--trust`.
-  const isFork = summary.headRepoFullName !== null && summary.headRepoFullName !== summary.baseRepoFullName;
+  // --- Fork gate (PR #48 round-2 blocker 4) ---
+  // A deleted fork returns `headRepoFullName === null`. Treat that
+  // as a fork — refuse fail-closed rather than fall through to the
+  // baseRepoFullName-match branch as if the head repo was the base.
+  const isFork =
+    summary.headRepoFullName === null ||
+    summary.headRepoFullName !== summary.baseRepoFullName;
   if (isFork && trustSha === undefined) {
+    const headDisplay = summary.headRepoFullName ?? "<deleted fork>";
     return {
       exitCode: 1,
       stdout: "",
       stderr:
         `revkit review: PR #${pr.pullNumber} is from a fork ` +
-        `(${summary.headRepoFullName} → ${summary.baseRepoFullName}). ` +
+        `(${headDisplay} → ${summary.baseRepoFullName}). ` +
         `Refusing without an explicit --trust <sha>. ` +
         `If you have reviewed the PR head at ${summary.headSha} and want to build ` +
         `it locally, pass --trust ${summary.headSha}.\n`,
@@ -237,6 +278,51 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
       stderr:
         `revkit review: --trust ${trustSha} does not match the current PR head ${summary.headSha}. ` +
         `The head may have moved since you last reviewed it; re-review and pass --trust ${summary.headSha}.\n`,
+    };
+  }
+
+  // --- Origin/remote gate (PR #48 round-2 blocker 4) ---
+  // The PR must belong to the same `owner/repo` as the checkout's
+  // `origin` remote. A reviewer who ran `revkit review 42` from a
+  // clone of `foo/bar` and got a PR from `evil/other` would
+  // otherwise blindly fetch that repo's `refs/pull/42/head`.
+  try {
+    const originUrl = await readOriginUrl(env.git, repoRoot);
+    if (originUrl === undefined) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          `revkit review: no 'origin' remote configured in ${repoRoot}. ` +
+          `Set one (e.g. 'git remote add origin git@github.com:${pr.owner}/${pr.repo}.git') and retry.\n`,
+      };
+    }
+    const originSlug = parseGithubRemoteUrl(originUrl);
+    if (originSlug === undefined) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          `revkit review: 'origin' URL ${originUrl} is not a recognised github.com URL — refusing.\n`,
+      };
+    }
+    if (
+      originSlug.owner.toLowerCase() !== pr.owner.toLowerCase() ||
+      originSlug.repo.toLowerCase() !== pr.repo.toLowerCase()
+    ) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          `revkit review: PR ${pr.owner}/${pr.repo}#${pr.pullNumber} does not match the local 'origin' ` +
+          `remote (${originSlug.owner}/${originSlug.repo}). Refusing — clone the right repo and retry.\n`,
+      };
+    }
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `revkit review: origin-remote check failed: ${(error as Error).message}\n`,
     };
   }
 
@@ -255,12 +341,46 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     return { exitCode: 1, stdout: "", stderr: `${(error as Error).message}\n` };
   }
 
-  // Tooling diff — refuse without --trust if any tooling file
-  // changed. Always compute so we can PRINT it when --trust is
-  // given.
+  // --- Post-fetch head-SHA verification (TOCTOU close, PR #48 R2 B3) ---
+  // The adapter told us the head was `summary.headSha`. Re-read the
+  // ref we just fetched — if it drifted between the adapter call
+  // and the fetch, or if the local ref points anywhere other than
+  // that SHA, refuse. `--trust <sha>` must equal this AS WELL.
+  let fetchedHead: string;
+  try {
+    fetchedHead = await readFetchedHeadSha(env.git, repoRoot, pr.pullNumber);
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `revkit review: could not verify fetched head SHA: ${(error as Error).message}\n`,
+    };
+  }
+  if (fetchedHead.toLowerCase() !== summary.headSha.toLowerCase()) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        `revkit review: fetched head SHA ${fetchedHead} does not match the PR head ${summary.headSha} ` +
+        `advertised by GitHub. The head moved between the adapter call and the fetch — refusing (TOCTOU close).\n`,
+    };
+  }
+  if (trustSha !== undefined && !trustMatches(trustSha, fetchedHead)) {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr:
+        `revkit review: --trust ${trustSha} does not match the fetched head ${fetchedHead} — refusing.\n`,
+    };
+  }
+
+  // Tooling diff — computed against the merge-base of head and
+  // base (not the base tip; PR #48 round-2 nit). Refuse without
+  // --trust if any tooling file differs there. Always compute so
+  // we can PRINT it when --trust is given.
   let diff: ToolingDiff;
   try {
-    diff = await computeToolingDiff(env.git, repoRoot, summary.baseSha, summary.headSha);
+    diff = await computeToolingDiff(env.git, repoRoot, summary.baseSha, fetchedHead);
   } catch (error) {
     return { exitCode: 1, stdout: "", stderr: `${(error as Error).message}\n` };
   }
@@ -270,19 +390,20 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
       exitCode: 1,
       stdout: "",
       stderr:
-        `revkit review: PR #${pr.pullNumber} changes tooling files vs base ` +
-        `(${summary.baseSha.slice(0, 12)}..${summary.headSha.slice(0, 12)}). ` +
+        `revkit review: PR #${pr.pullNumber} changes tooling files vs merge-base ` +
+        `(${diff.mergeBase.slice(0, 12)}..${fetchedHead.slice(0, 12)}). ` +
         `Refusing without --trust <sha>.\n\n` +
-        `Tooling files that differ from base:\n${list}\n\n` +
+        `Tooling files that differ from merge-base:\n${list}\n\n` +
         `If these changes are safe, review them and re-run with:\n` +
-        `  revkit review ${pr.pullNumber} --trust ${summary.headSha}\n`,
+        `  revkit review ${pr.pullNumber} --trust ${fetchedHead}\n`,
     };
   }
 
   const stdoutLines: string[] = [];
   stdoutLines.push(`revkit review: ${pr.owner}/${pr.repo}#${pr.pullNumber} — ${summary.title}`);
-  stdoutLines.push(`  head: ${summary.headSha}  (${summary.headRef})`);
+  stdoutLines.push(`  head: ${fetchedHead}  (${summary.headRef})`);
   stdoutLines.push(`  base: ${summary.baseSha}  (${summary.baseRef})`);
+  stdoutLines.push(`  merge-base: ${diff.mergeBase}`);
   if (diff.tooling.length > 0) {
     stdoutLines.push(``);
     stdoutLines.push(`Tooling files taken from BASE (trusted via --trust ${trustSha}):`);
@@ -293,25 +414,40 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     stdoutLines.push(`Content files taken from PR head: ${diff.content.length}`);
   }
 
-  // Materialize.
-  const materializedRoot = reviewTargetDir(repoRoot, pr.pullNumber, summary.headSha);
+  // --- Path layout (PR #48 round-2 blocker 5) ---
+  // Per-PR root is `.revkit/review/<owner>-<repo>-<pr>/`; a rerun
+  // reuses this. The **survivable state** (sqlite) lives at
+  // `<root>/state/threads.sqlite` and is NEVER removed by a rerun.
+  // The materialised head lives at `<root>/head-<sha>/`, and the
+  // built dist at `<root>/head-<sha>/dist/`.
   ensureRevkitDir(repoRoot);
-  // Materialize's target dir must not exist, but its parent
-  // (`.revkit/review/`) must. Create the parent tree at mode 0700
-  // through the shared helper — the per-review dir is created by
-  // the materializer.
-  const reviewsParent = join(repoRoot, ".revkit", "review");
-  mkdirSync(reviewsParent, { recursive: true, mode: 0o700 });
-  // Clean a stale target that a previous crash left behind.
-  if (reviewTargetExists(repoRoot, pr.pullNumber, summary.headSha)) {
+  const prRootDir = perPrRoot(repoRoot, pr);
+  const stateDir = perPrStateDir(repoRoot, pr);
+  const sqlitePath = perPrSqlitePath(repoRoot, pr);
+  mkdirSync(prRootDir, { recursive: true, mode: 0o700 });
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+
+  // Prune stale head-*/ directories under this PR root (keep only
+  // the state/ directory and the current head-<sha>). A rerun on a
+  // moved head must not accumulate old worktrees.
+  pruneStaleHeadDirs(prRootDir, fetchedHead);
+
+  // Materialize.
+  const materializedRoot = reviewTargetDir(repoRoot, pr, fetchedHead);
+  // Clean a stale target for THIS head that a previous crash left
+  // behind.
+  if (reviewTargetExists(repoRoot, pr, fetchedHead)) {
     rmSync(materializedRoot, { recursive: true, force: true });
   }
   try {
     const outcome = await materializeSafeTree({
       runner: env.git,
       cwd: repoRoot,
-      baseSha: summary.baseSha,
-      headSha: summary.headSha,
+      // Tooling source = the merge-base tree, so the "reviewer's
+      // trusted toolchain" reflects the fork point rather than a
+      // base-tip that may have moved.
+      baseSha: diff.mergeBase,
+      headSha: fetchedHead,
       targetDir: materializedRoot,
     });
     stdoutLines.push(``);
@@ -329,9 +465,9 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     return { exitCode: 1, stdout: "", stderr: `revkit review: materialize failed: ${(error as Error).message}\n` };
   }
 
-  // Run `revkit check` over the materialized content ONLY. The
-  // check walks the tree; we point it at the content dirs inside
-  // materializedRoot.
+  // Run `revkit check` over the materialized content, IN UNTRUSTED
+  // MODE (PR #48 round-2 blocker 1). Untrusted mode disables the
+  // allow-annotation escape hatch and refuses executable vega keys.
   const checkResult = await runCheckOnMaterialized(materializedRoot, env);
   if (checkResult.diagnostics.length > 0) {
     return {
@@ -343,32 +479,56 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   }
   stdoutLines.push(`revkit check: PR content passed (${checkResult.filesScanned} files scanned)`);
 
-  // Optional build step (astro build in the materialized worktree).
-  // The default is a no-op — the reviewer runs it separately in 2a,
-  // and 2b will wire it up as the daemon starts.
-  if (env.build !== undefined) {
-    try {
-      await env.build(materializedRoot);
-      stdoutLines.push(`build: ok`);
-    } catch (error) {
+  // --- Safe build (PR #48 round-2 blocker 2) ---
+  // Run astro build on the materialised worktree with a MINIMAL env
+  // (no GITHUB_TOKEN / GH_TOKEN / npm_ tokens). The output lands at
+  // `<materializedRoot>/site/dist`. If the caller injected a build
+  // hook (tests / bench), use that instead. `revkit check-dist`
+  // then sanitises the built HTML before we serve it.
+  const distOutDir = join(materializedRoot, "site", "dist");
+  const buildHook: BuildHook = env.build ?? runSafeBuild;
+  try {
+    await buildHook({ materializedRoot, distOutDir });
+    stdoutLines.push(`build: ok  (${prettyPath(repoRoot, distOutDir)})`);
+  } catch (error) {
+    return {
+      exitCode: 1,
+      stdout: `${stdoutLines.join("\n")}\n`,
+      stderr: `revkit review: build failed: ${(error as Error).message}\n`,
+    };
+  }
+
+  // --- check-dist on the built output before serving (ADR-0012) ---
+  if (env._skipCheckDist !== true) {
+    const { checkDistDirectory } = await import("../check-dist.ts");
+    const distDiags = checkDistDirectory(distOutDir);
+    if (distDiags.length > 0) {
+      const { formatDiagnostic } = await import("../diagnostics.ts");
       return {
         exitCode: 1,
         stdout: `${stdoutLines.join("\n")}\n`,
-        stderr: `revkit review: build failed: ${(error as Error).message}\n`,
+        stderr:
+          `revkit review: 'revkit check-dist' refused the built PR output:\n` +
+          distDiags.map(formatDiagnostic).join("\n") +
+          "\n",
       };
     }
+    stdoutLines.push(`check-dist: PR output passed`);
   }
 
-  // Import existing PR threads.
-  const sqlitePath = join(materializedRoot, ".revkit-threads.sqlite");
-  const store = SqliteThreadStore.open({ filename: sqlitePath, displayName: `review-${pr.pullNumber}` });
+  // Import existing PR threads — sqlite lives OUTSIDE the
+  // materialized tree (see path-layout note above).
+  const store = SqliteThreadStore.open({
+    filename: sqlitePath,
+    displayName: `review-${pr.owner}-${pr.repo}-${pr.pullNumber}`,
+  });
   let populate: PopulateOutcome;
   try {
     const threads = await adapter.listReviewThreads(pr);
     populate = await populateStoreFromPr({
       pr,
       threads,
-      headSha: summary.headSha,
+      headSha: fetchedHead,
       baseRef: summary.baseRef,
       adapter,
       materializedRoot,
@@ -382,14 +542,9 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
       stderr: `revkit review: failed to import PR threads: ${(error as Error).message}\n`,
     };
   } finally {
-    // If startServe will re-open the same sqlite path, close ours so
-    // there is no double-writer. The daemon opens its own store
-    // handle. (If `startServe` is not set, we close now.)
-    if (parsed.serve === false || env.startServe === undefined) {
-      store.close();
-    } else {
-      store.close();
-    }
+    // Close our handle either way — the daemon will re-open the
+    // same sqlite file with its own handle if serving.
+    store.close();
   }
   stdoutLines.push(
     `import: ${populate.appended} new PR thread events, ${populate.skipped} already-present` +
@@ -401,22 +556,18 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     stdoutLines.push(``);
     stdoutLines.push(
       `Prepared review at ${prettyPath(repoRoot, materializedRoot)}.` +
-        (parsed.serve ? "\nSet env.startServe or run 'revkit serve --dir <that path>/site/dist' to serve." : ""),
+        (parsed.serve
+          ? `\nRun 'revkit serve --dir ${prettyPath(repoRoot, distOutDir)}' to serve.`
+          : ""),
     );
     return { exitCode: 0, stdout: `${stdoutLines.join("\n")}\n`, stderr: "" };
   }
 
-  const localUserId =
-    env.localUserId ??
-    // The daemon expects a local user id. If the caller didn't
-    // supply one, mint a per-review id from a CSPRNG so it doesn't
-    // touch the reviewer's own .revkit/local-user, and so the
-    // opaque tag has no predictability the daemon's auth might
-    // ever depend on later.
-    `review-${randomBytes(9).toString("base64url")}`;
+  const localUserId = env.localUserId;
 
   const serveHandle = await env.startServe({
     materializedRoot,
+    distDir: distOutDir,
     sqlitePath,
     repoRoot,
     localUserId,
@@ -446,6 +597,11 @@ async function runCheckOnMaterialized(
     online: false,
     repoSlug: env.repoSlug,
     gh: env.gh,
+    // PR #48 round-2 blocker 1: content from an untrusted PR MUST
+    // NOT get the allow-annotation escape hatch, and must run the
+    // vega-untrusted refusal. This is the seam that carries the
+    // trust posture down through the whole rule pipeline.
+    trust: "untrusted",
   });
   return {
     diagnostics: output.exitCode === 0 ? [] : [...output.lines],
@@ -464,4 +620,30 @@ function prettyPath(repoRoot: string, absolute: string): string {
   const rel = resolvePath(absolute).slice(resolvePath(repoRoot).length);
   const trimmed = rel.startsWith("/") ? rel.slice(1) : rel;
   return trimmed.length > 0 ? trimmed : absolute;
+}
+
+/** Remove any subdirectory of the per-PR root whose name starts
+ * with `head-` and is NOT the current head. Keeps `state/` untouched
+ * so the survivable per-PR sqlite / snapshot store persists across
+ * head moves and reruns (PR #48 round-2 blocker 5). Safe when the
+ * root does not exist yet. */
+function pruneStaleHeadDirs(prRootDir: string, currentHead: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(prRootDir);
+  } catch {
+    return;
+  }
+  const currentDir = `head-${currentHead.slice(0, 12)}`;
+  for (const entry of entries) {
+    if (!entry.startsWith("head-")) continue;
+    if (entry === currentDir) continue;
+    try {
+      rmSync(join(prRootDir, entry), { recursive: true, force: true });
+    } catch {
+      // best effort — a stale dir the user has open (e.g. an
+      // editor viewing a file) is harmless; it will be cleaned on
+      // the next rerun.
+    }
+  }
 }

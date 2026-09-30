@@ -123,13 +123,21 @@ async function applyCommit(repoDir: string, spec: CommitSpec): Promise<string> {
  * `materializeSafeTree` / `computeToolingDiff`.
  *
  * The fixture uses `main` as the base ref and `pr` as the head ref;
- * both are ordinary local branches (no remotes are configured, so
- * `ensurePrCommits` is not exercised — every review test that needs
- * that behaviour stubs the GitRunner instead).
+ * both are ordinary local branches. `origin` is set to a github.com
+ * URL for `vig-os/revkit` by default so the CLI's origin-remote
+ * gate accepts the fixture; a test that needs a different origin
+ * passes `originUrl`.
+ *
+ * `ensurePrCommits` is not exercised — the review tests stub the
+ * GitRunner or skip the fetch by pre-populating refs directly.
  */
 export async function makeFixtureRepo(input: {
   readonly base: CommitSpec;
   readonly head: CommitSpec;
+  /** Origin URL to set on the fixture. Defaults to a
+   * `vig-os/revkit`-shaped github.com URL so the CLI's owner/repo
+   * gate accepts the default PR fixtures. */
+  readonly originUrl?: string;
 }): Promise<FixtureRepo> {
   const repoDir = mkdtempSync(join(tmpdir(), TMP_PREFIX));
   await git(repoDir, ["init", "-q", "--initial-branch=main"]);
@@ -141,5 +149,26 @@ export async function makeFixtureRepo(input: {
   const headSha = await applyCommit(repoDir, input.head);
   // Return to main so `git diff base..head` in tests reads cleanly.
   await git(repoDir, ["checkout", "main"]);
+  const originUrl = input.originUrl ?? "https://github.com/vig-os/revkit.git";
+  await git(repoDir, ["remote", "add", "origin", originUrl]);
   return { repoDir, baseSha, headSha, baseRef: "main", headRef: "pr" };
+}
+
+/**
+ * Pre-populate `refs/revkit/pr-<n>/head` so the CLI's post-fetch
+ * verification (`readFetchedHeadSha`) finds a real SHA without a
+ * network round-trip. Also touches `refs/heads/<baseRef>` (already
+ * present by `makeFixtureRepo`) so the fetch-branch below is a
+ * no-op. Call this after `makeFixtureRepo` and before
+ * `runReviewCommand`.
+ */
+export async function writeReviewRefs(
+  repoDir: string,
+  input: { readonly pullNumber: number; readonly headSha: string },
+): Promise<void> {
+  await git(repoDir, [
+    "update-ref",
+    `refs/revkit/pr-${input.pullNumber}/head`,
+    input.headSha,
+  ]);
 }

@@ -196,29 +196,41 @@ export async function dispatch(
   if (first === "review") {
     const { startDaemon } = await import("./serve/daemon.ts");
     const { readOrMintLocalUserId } = await import("./serve/cli.ts");
-    const { resolve: resolvePath2, join: joinPath } = await import("node:path");
+    // Mint / read the local user id EARLY so runReviewCommand
+    // receives a stable value and there is no dead-code fallback
+    // branch (PR #48 round-2 nit).
+    let localUserId: string;
+    try {
+      const repoRoot = findRepoRootByPackageJson(env.cwd);
+      localUserId = readOrMintLocalUserId(repoRoot);
+    } catch {
+      // No package.json marker means the review command will
+      // itself refuse in the same way `just check` does; use a
+      // stable string here so the fallback is deterministic.
+      localUserId = "local-review";
+    }
     const reviewEnv = {
-      ...defaultReviewEnv(env.cwd, VERSION, env.repoSlug),
+      ...defaultReviewEnv(env.cwd, VERSION, env.repoSlug, localUserId),
       gh: env.gh,
       git: spawnGit,
-      // Wire the daemon start to the materialized worktree's
-      // `site/dist`. The daemon keeps ADR-0013 auth/CSP unchanged
-      // — we only vary the dir it serves and the sqlite it opens.
+      // Wire the daemon start to the built `site/dist` inside the
+      // materialised worktree. The daemon keeps ADR-0013 auth/CSP
+      // unchanged — we only vary the dir it serves and the sqlite
+      // it opens.
       startServe: async ({
-        materializedRoot,
+        distDir,
         sqlitePath,
         repoRoot,
         localUserId,
       }: {
-        materializedRoot: string;
-        sqlitePath: string;
-        repoRoot: string;
-        localUserId: string;
+        readonly materializedRoot: string;
+        readonly distDir: string;
+        readonly sqlitePath: string;
+        readonly repoRoot: string;
+        readonly localUserId: string;
       }) => {
-        const dir = resolvePath2(materializedRoot, "site", "dist");
-        void joinPath;
         const handle = await startDaemon({
-          dir,
+          dir: distDir,
           repoRoot,
           sqlitePath,
           version: VERSION,
@@ -242,14 +254,6 @@ export async function dispatch(
           stop: () => handle.stop(),
         };
       },
-      localUserId: (() => {
-        try {
-          const repoRoot = findRepoRootByPackageJson(env.cwd);
-          return readOrMintLocalUserId(repoRoot);
-        } catch {
-          return "local-review";
-        }
-      })(),
     };
     const outcome = await runReviewCommand(rest, reviewEnv);
     return {

@@ -29,20 +29,30 @@ export type ToolingChange =
   | { readonly kind: "rename"; readonly oldPath: string; readonly newPath: string; readonly class: "content" | "tooling"; readonly extNote?: string };
 
 /** Result of `computeToolingDiff`. `tooling` is the subset of `all`
- * that failed the content-allowlist — the set `--trust` gates. */
+ * that failed the content-allowlist — the set `--trust` gates.
+ * `mergeBase` is the merge-base SHA the diff was computed against
+ * (PR #48 round-2 nit). */
 export interface ToolingDiff {
   readonly all: readonly ToolingChange[];
   readonly tooling: readonly ToolingChange[];
   readonly content: readonly ToolingChange[];
+  readonly mergeBase: string;
 }
 
 /**
- * Enumerate the changed paths between two commits and classify each.
+ * Enumerate the changed paths between the **merge-base of base and
+ * head** and `head`, then classify each. Using the merge-base (not
+ * the base tip) means a stale PR is not refused for changes that
+ * happened on base after the PR forked (PR #48 round-2 nit).
+ *
+ * The three-dot form `A...B` in `git diff` is exactly that:
+ * changes from the merge-base of A and B up to B, ignoring anything
+ * on A that happened after the fork point.
  *
  * @param runner git runner (the injectable `GitRunner`)
  * @param cwd    directory containing the repo whose object DB the
  *               commits are in
- * @param baseSha commit SHA of the PR base
+ * @param baseSha commit SHA of the PR base (a branch tip)
  * @param headSha commit SHA of the PR head
  */
 export async function computeToolingDiff(
@@ -51,6 +61,23 @@ export async function computeToolingDiff(
   baseSha: string,
   headSha: string,
 ): Promise<ToolingDiff> {
+  // Resolve the merge-base explicitly so we can name it in error
+  // messages and so a caller (e.g. materialise, later) can reuse it.
+  // `git merge-base <a> <b>` prints the SHA or exits non-zero if
+  // there is none (disjoint histories); the safe wrapper surfaces
+  // the failure verbatim.
+  const mbStdout = await runSafeGitOrThrow(
+    runner,
+    cwd,
+    ["merge-base", baseSha, headSha],
+    `tooling-diff: git merge-base ${baseSha} ${headSha} failed`,
+  );
+  const mergeBase = mbStdout.trim();
+  if (!/^[0-9a-f]{40}$/i.test(mergeBase)) {
+    throw new Error(
+      `tooling-diff: git merge-base returned implausible SHA ${JSON.stringify(mergeBase.slice(0, 80))}`,
+    );
+  }
   // `git diff --name-status -z` uses NUL as record separator, which
   // handles paths with spaces / newlines. `--find-renames` surfaces
   // rename statuses as `Rnnn\0<old>\0<new>`.
@@ -62,13 +89,11 @@ export async function computeToolingDiff(
       "--name-status",
       "--find-renames",
       "-z",
-      // Feed both SHAs as `--` delimited args so a hostile commit id
-      // that starts with `-` is treated as data. The SHAs are 40-hex
-      // in normal use; belt-and-braces here.
-      baseSha,
+      // Merge-base .. head — see docstring.
+      mergeBase,
       headSha,
     ],
-    `tooling-diff: git diff ${baseSha}..${headSha} failed`,
+    `tooling-diff: git diff ${mergeBase}..${headSha} failed`,
   );
 
   const changes: ToolingChange[] = [];
@@ -120,7 +145,7 @@ export async function computeToolingDiff(
 
   const tooling = changes.filter((c) => c.class === "tooling");
   const content = changes.filter((c) => c.class === "content");
-  return { all: changes, tooling, content };
+  return { all: changes, tooling, content, mergeBase };
 }
 
 /** Human note about why an under-content-prefix path was still

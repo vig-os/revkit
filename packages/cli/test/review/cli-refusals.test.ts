@@ -17,7 +17,7 @@ import { runReviewCommand } from "../../src/review/cli.ts";
 import { spawnGit } from "../../src/git-runner.ts";
 import type { GhRunner } from "../../src/gh-runner.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
 
 const tempDirsToClean: string[] = [];
 afterAll(() => {
@@ -39,6 +39,25 @@ const fakeGh: GhRunner = async () => ({
   exitCode: 0,
 });
 
+/** Wrapper around `runReviewCommand` that first materialises the
+ * `refs/revkit/pr-<n>/head` local ref for the given PR — the real
+ * CLI writes that ref during `git fetch`, but our fixture has no
+ * network and pre-populates the SHAs directly. */
+async function runReview(
+  fixtureRepo: string,
+  args: readonly string[],
+  env: Parameters<typeof runReviewCommand>[1],
+  prs: readonly FakePr[],
+): Promise<ReturnType<typeof runReviewCommand>> {
+  for (const pr of prs) {
+    await writeReviewRefs(fixtureRepo, {
+      pullNumber: pr.pullNumber,
+      headSha: pr.headSha,
+    });
+  }
+  return runReviewCommand(args, env);
+}
+
 /** Build a review env pointed at a fixture repo, an adapter that
  * uses the fake fetch, and no build hook / no serve. */
 function makeEnv(fixtureCwd: string, prs: readonly FakePr[]): Parameters<typeof runReviewCommand>[1] {
@@ -56,6 +75,17 @@ function makeEnv(fixtureCwd: string, prs: readonly FakePr[]): Parameters<typeof 
     git: spawnGit,
     repoSlug: "vig-os/revkit",
     makeAdapter,
+    localUserId: "review-cli-test",
+    // Skip check-dist in the refusal tests — those exercise the
+    // safety gates before the built dist is inspected. The
+    // integration test covers check-dist end-to-end.
+    _skipCheckDist: true,
+    // Stub the safe build so tests do not spawn astro.
+    build: async ({ distOutDir }: { distOutDir: string }) => {
+      const { mkdirSync, writeFileSync } = await import("node:fs");
+      mkdirSync(distOutDir, { recursive: true, mode: 0o700 });
+      writeFileSync(`${distOutDir}/index.html`, "<!doctype html><title>x</title>");
+    },
     // No serve — 2a's cli scope doesn't require the daemon here.
   };
 }
@@ -101,7 +131,7 @@ describe("revkit review — fork refusal", async () => {
 
   test("refused without --trust with a diagnostic that names the fork", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["100", "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["100", "--no-serve"], env, [pr]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("fork");
     expect(result.stderr).toContain("someone-else/revkit");
@@ -110,7 +140,7 @@ describe("revkit review — fork refusal", async () => {
 
   test("accepted with --trust that matches the head SHA", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["100", "--trust", pr.headSha, "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["100", "--trust", pr.headSha, "--no-serve"], env, [pr]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("Materialized");
   });
@@ -119,7 +149,7 @@ describe("revkit review — fork refusal", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
     // Different plausible sha.
     const wrong = "b".repeat(40);
-    const result = await runReviewCommand(["100", "--trust", wrong, "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["100", "--trust", wrong, "--no-serve"], env, [pr]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("--trust");
     expect(result.stderr).toContain("does not match");
@@ -171,16 +201,16 @@ describe("revkit review — tooling diff refusal (same-repo PR)", async () => {
 
   test("refused without --trust and prints the tooling diff", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["200", "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["200", "--no-serve"], env, [pr]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("package.json");
-    expect(result.stderr).toContain("Tooling files that differ from base");
+    expect(result.stderr).toContain("Tooling files that differ from merge-base");
     expect(result.stderr).toContain(`--trust ${pr.headSha}`);
   });
 
   test("--trust with the current head SHA materializes with the BASE package.json", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["200", "--trust", pr.headSha, "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["200", "--trust", pr.headSha, "--no-serve"], env, [pr]);
     expect(result.exitCode).toBe(0);
     // The stdout advertises that tooling came from base.
     expect(result.stdout).toContain("Tooling files taken from BASE");
@@ -252,7 +282,7 @@ describe("revkit review — package.json postinstall canary never runs", async (
 
   test("run with --trust: no canary was ever created and .gitattributes was NOT taken from PR", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["300", "--trust", pr.headSha, "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["300", "--trust", pr.headSha, "--no-serve"], env, [pr]);
     expect(result.exitCode).toBe(0);
     // The canary would appear in the user's home. Assert it did
     // not. (We chose HOME so the assertion doesn't depend on a
@@ -267,7 +297,7 @@ describe("revkit review — package.json postinstall canary never runs", async (
     // package.json (no preinstall), and the .gitattributes must not
     // have been taken from the PR — the PR added it, so it should
     // not appear at all in the materialized tree.
-    const materializedRoot = fixture.repoDir + "/.revkit/review/300-" + pr.headSha.slice(0, 12);
+    const materializedRoot = fixture.repoDir + "/.revkit/review/vig-os-revkit-300/head-" + pr.headSha.slice(0, 12);
     const pkg = readFileSync(join(materializedRoot, "package.json"), "utf8");
     expect(pkg).toBe(BASE_PKG_JSON);
     expect(existsSync(join(materializedRoot, ".gitattributes"))).toBe(false);
@@ -309,7 +339,7 @@ describe("revkit review — content-only PR is accepted without --trust", async 
 
   test("accepted, materialized, check passes, import runs (empty threads)", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["400", "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["400", "--no-serve"], env, [pr]);
     if (result.exitCode !== 0) {
       // Surface the diagnostics so the assertion prints useful info.
       throw new Error(`unexpected non-zero: stderr=${result.stderr} stdout=${result.stdout}`);
@@ -359,7 +389,7 @@ describe("revkit review — symlink escape in PR content is refused", async () =
   };
   test("refused with a symlink-escape diagnostic naming the target", async () => {
     const env = makeEnv(fixture.repoDir, [pr]);
-    const result = await runReviewCommand(["500", "--no-serve"], env);
+    const result = await runReview(fixture.repoDir, ["500", "--no-serve"], env, [pr]);
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toContain("symlink");
     expect(result.stderr).toContain("docs/leak.md");

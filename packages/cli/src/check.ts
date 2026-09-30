@@ -24,6 +24,7 @@ import { checkFrontmatter } from "./rules/frontmatter.ts";
 import { checkLinksFile } from "./rules/links.ts";
 import { checkNoHandRolledUiFile } from "./rules/no-hand-rolled-ui.ts";
 import { checkPlotSpecFile } from "./rules/plot-structure.ts";
+import { checkVegaUntrusted } from "./rules/vega-untrusted.ts";
 import { checkVendoredCode } from "./rules/vendored-code.ts";
 import type { LoadedVocabEntry } from "./rules/vocabulary.ts";
 import { checkVocabularyFile, loadVocab } from "./rules/vocabulary.ts";
@@ -77,12 +78,29 @@ export interface CheckFile {
   readonly relative: string;
 }
 
+/** Trust posture the check runs under (ADR-0025, PR #48 round-2).
+ *
+ * - `trusted`: the default. Content comes from the reviewer's own
+ *   checkout or the local pre-commit path. Allow-annotations honour
+ *   their escape-hatch, since a maintainer authored them.
+ * - `untrusted`: content comes from a PR head that the reviewer has
+ *   NOT authored. The check refuses every allow-annotation from the
+ *   PR (it has not passed a hosted `--online` verification the local
+ *   reviewer can trust), and it applies the vega-lite executable-key
+ *   refusal (no `expr` / `signal` / `calculate` at build time).
+ *   Every other guard (component-registry, no-hand-rolled-ui,
+ *   vocabulary, links, plot-structure, frontmatter, vendored-code)
+ *   still runs. */
+export type Trust = "trusted" | "untrusted";
+
 /** Options carried through the orchestrator. `--online` toggles the
- * gh-api verification of allow annotations. */
+ * gh-api verification of allow annotations. `trust` picks the trust
+ * posture (see `Trust`); defaults to `trusted`. */
 export interface CheckOptions {
   readonly online: boolean;
   readonly repoSlug: string;
   readonly gh: GhRunner;
+  readonly trust?: Trust;
 }
 
 /** The check's public result: rendered lines + the numeric exit code. */
@@ -180,6 +198,7 @@ export async function runCheck(
   }
 
   // 1) component-registry — plus allow-annotation harvest.
+  const trust: Trust = options.trust ?? "trusted";
   const usedAllowAnnotations: {
     readonly file: string;
     readonly line: number;
@@ -190,6 +209,7 @@ export async function runCheck(
       entry.source,
       entry.file.relative,
       entry.root ?? undefined,
+      { trust },
     );
     findings.push(...result.diagnostics);
     for (const used of result.usedAllowAnnotations) {
@@ -244,6 +264,12 @@ export async function runCheck(
   // 5) plot-structure — schema + confined sibling files.
   for (const file of plotFiles) {
     findings.push(...checkPlotSpecFile(file.absolute, file.relative));
+    // Untrusted-mode-only: also refuse executable vega keys
+    // (`expr` / `signal` / `calculate` / `update` / `on`). See
+    // `rules/vega-untrusted.ts` and ADR-0021 / ADR-0025.
+    if (trust === "untrusted") {
+      findings.push(...checkVegaUntrusted(file.absolute, file.relative));
+    }
   }
 
   // 5b) vendored-code (ADR-0022) — one shot per invocation because

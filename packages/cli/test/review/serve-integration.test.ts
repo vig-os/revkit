@@ -17,7 +17,7 @@ import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
 import { spawnGit } from "../../src/git-runner.ts";
 import { registerDaemonPid, unregisterDaemonPid } from "../helpers/daemon-registry.ts";
 import { makeFakeGithubFetch, type FakePr } from "./helpers/fake-github.ts";
-import { makeFixtureRepo, MIN_VOCAB_YAML } from "./helpers/git-fixture.ts";
+import { makeFixtureRepo, MIN_VOCAB_YAML, writeReviewRefs } from "./helpers/git-fixture.ts";
 
 const tempDirsToClean: string[] = [];
 const daemonsToStop: DaemonHandle[] = [];
@@ -108,6 +108,7 @@ describe("revkit review → daemon integration", async () => {
     const staticToken = { async getToken() { return "ghp_" + "a".repeat(40); } };
     const fakeFetch = makeFakeGithubFetch([pr]);
 
+    await writeReviewRefs(fixture.repoDir, { pullNumber: 700, headSha: fixture.headSha });
     let daemonHandle: DaemonHandle | undefined;
     const result = await runReviewCommand(
       ["700", "--repo", "vig-os/revkit"],
@@ -119,17 +120,18 @@ describe("revkit review → daemon integration", async () => {
         repoSlug: "vig-os/revkit",
         makeAdapter: () => new GitHubAdapter({ token: staticToken, fetch: fakeFetch }),
         localUserId: "review-test-user",
-        build: async (root) => {
+        _skipCheckDist: true,
+        build: async ({ distOutDir }) => {
           // Fake a built site: a `site/dist/index.html` the daemon
           // can serve. The daemon doesn't require anything more
           // than an existing dir for `--dir`, but a real page keeps
           // the integration honest.
-          mkdirSync(root + "/site/dist", { recursive: true, mode: 0o700 });
-          writeFileSync(root + "/site/dist/index.html", "<!doctype html><title>PR 700</title>");
+          mkdirSync(distOutDir, { recursive: true, mode: 0o700 });
+          writeFileSync(distOutDir + "/index.html", "<!doctype html><title>PR 700</title>");
         },
-        startServe: async ({ materializedRoot, sqlitePath, repoRoot, localUserId }) => {
+        startServe: async ({ distDir, sqlitePath, repoRoot, localUserId }) => {
           const handle = await startDaemon({
-            dir: materializedRoot + "/site/dist",
+            dir: distDir,
             repoRoot,
             sqlitePath,
             version: "0.0.0",
