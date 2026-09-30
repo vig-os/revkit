@@ -34,38 +34,75 @@ describe("renderAskPage — shell shape", () => {
     expect(html).toContain('"id":"ask-1"');
   });
 
-  test("encodeBootJson escapes `</script` so an agent-supplied title cannot terminate the boot tag", () => {
-    // A hostile title that would break out of a naïve inline
-    // `<script>`.
+  test("encodeBootJson escapes < / > / & so an agent-supplied title cannot terminate the boot tag or open HTML comments", () => {
     const hostile: AskRecord = {
       ...baseRecord,
       spec: {
         schemaVersion: 1,
         kind: "text",
-        title: "</script><script>window.x=1</script>",
+        title: "</script><script>x=1</script> <!-- x --> & <foo>",
         multiline: false,
       } as unknown as AskRecord["spec"],
     };
     const encoded = encodeBootJson(hostile);
-    // The literal `</script` must not appear (case-insensitive).
+    // No literal HTML sequences survive.
     expect(/<\/script/i.test(encoded)).toBe(false);
-    // The escape form does appear.
-    expect(encoded).toContain('<\\/script>');
-  });
-
-  test("encodeBootJson neutralises HTML-comment starter/terminator", () => {
-    const record: AskRecord = {
-      ...baseRecord,
-      spec: {
-        schemaVersion: 1,
-        kind: "text",
-        title: "<!--start end-->",
-        multiline: false,
-      } as unknown as AskRecord["spec"],
-    };
-    const encoded = encodeBootJson(record);
     expect(encoded).not.toContain("<!--");
     expect(encoded).not.toContain("-->");
+    // The < form is what replaces every `<`.
+    expect(encoded).toContain("\\u003c");
+    expect(encoded).toContain("\\u003e");
+    expect(encoded).toContain("\\u0026");
+  });
+
+  test("PR #52 review — encodeBootJson output is VALID JSON and round-trips losslessly on hostile strings", () => {
+    // The earlier encoding used `<\!--` / `--\>` which are NOT
+    // legal JSON escapes; `JSON.parse` rejected them and
+    // `readBoot` silently returned nothing, leaving the page blank
+    // while `await_answer` waited out its TTL. This test locks in
+    // that encode → parse is now an identity map on the record,
+    // regardless of what an agent wrote in the title / prompt.
+    const hostileTitles = [
+      // The bug's own repro: `-->` in prose.
+      "step 1 --> step 2",
+      // Full script-tag close attempt.
+      "</script><script>alert(1)</script>",
+      // Angle brackets + ampersand.
+      "&<foo & bar> — pick one",
+      // HTML comment open + close.
+      "<!-- do not -->",
+      // Nested markup.
+      "<a href=\"javascript:x()\">click</a>",
+      // JS line terminators — valid in JSON strings but not in JS source.
+      "line 1 line 2 line 3",
+      // Unicode + emoji + normal punctuation.
+      "Which of these — is the best? “right”",
+    ];
+    for (const title of hostileTitles) {
+      const record: AskRecord = {
+        ...baseRecord,
+        spec: {
+          schemaVersion: 1,
+          kind: "text",
+          title,
+          multiline: false,
+        } as unknown as AskRecord["spec"],
+      };
+      const encoded = encodeBootJson(record);
+      // 1. Valid JSON — no InvalidEscape.
+      let parsed: unknown;
+      expect(() => {
+        parsed = JSON.parse(encoded);
+      }).not.toThrow();
+      // 2. Identity round-trip — the parse produces the original
+      //    { id, initial } object with the same title verbatim.
+      expect(parsed).toEqual({ id: record.id, initial: record });
+      // 3. The encoded string has no unescaped `</script` /
+      //    `<!--` / `-->` sequence.
+      expect(/<\/script/i.test(encoded)).toBe(false);
+      expect(encoded).not.toContain("<!--");
+      expect(encoded).not.toContain("-->");
+    }
   });
 });
 

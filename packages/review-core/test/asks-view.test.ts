@@ -16,6 +16,7 @@ import {
   InMemoryThreadStore,
   reduceAsks,
   selectAsks,
+  validateAnswerAgainstSpec,
   validateNext,
   type Ask,
   type AskAnswer,
@@ -235,5 +236,101 @@ describe("InMemoryThreadStore.asks / ask — plugged into the review-core store"
     const record = await store.ask("ask-1");
     expect(record?.status).toBe("answered");
     expect(record?.answer).toEqual({ kind: "choice", value: "d1" });
+  });
+});
+
+// ── PR #52 review: answer-shape validation at the append boundary ─
+
+describe("validateAnswerAgainstSpec — answer values must conform to the ask", () => {
+  test("choice: value not in options is refused when allowOther is false", () => {
+    const spec: Ask = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      kind: "choice",
+      title: "Which?",
+      options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+      allowOther: false,
+      multi: false,
+    };
+    const issue = validateAnswerAgainstSpec(spec, { kind: "choice", value: "zzz" });
+    expect(issue).not.toBeUndefined();
+    expect(issue!.field).toBe("value");
+    expect(issue!.message).toContain("not one of the ask's options");
+  });
+
+  test("choice: value not in options is ACCEPTED when allowOther is set and value starts with 'other:'", () => {
+    const spec: Ask = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      kind: "choice",
+      title: "Which?",
+      options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+      allowOther: true,
+      multi: false,
+    };
+    expect(validateAnswerAgainstSpec(spec, { kind: "choice", value: "other:custom answer" })).toBeUndefined();
+    // But a bare token that is not an option id and not other-prefixed is still refused.
+    expect(validateAnswerAgainstSpec(spec, { kind: "choice", value: "zzz" })).not.toBeUndefined();
+  });
+
+  test("choice: array-value on a single-choice spec is refused, and vice versa", () => {
+    const single: Ask = { schemaVersion: 1, kind: "choice", title: "x", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }], allowOther: false, multi: false };
+    const multi: Ask = { ...single, multi: true };
+    const arrOnSingle = validateAnswerAgainstSpec(single, { kind: "choice", value: ["a", "b"] as unknown as string });
+    expect(arrOnSingle?.message).toContain("must be a single option id");
+    const strOnMulti = validateAnswerAgainstSpec(multi, { kind: "choice", value: "a" });
+    expect(strOnMulti?.message).toContain("must be an array of option ids");
+  });
+
+  test("scale: value outside [min,max] is refused; on-step values are accepted", () => {
+    const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 1, max: 5, step: 1 };
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 99999 })?.field).toBe("value");
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 0 })?.field).toBe("value");
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 3 })).toBeUndefined();
+  });
+
+  test("scale: off-step values are refused (step=2, value=3)", () => {
+    const spec: Ask = { schemaVersion: 1, kind: "scale", title: "x", min: 0, max: 10, step: 2 };
+    // Valid on-step values: 0, 2, 4, 6, 8, 10.
+    expect(validateAnswerAgainstSpec(spec, { kind: "scale", value: 6 })).toBeUndefined();
+    const issue = validateAnswerAgainstSpec(spec, { kind: "scale", value: 3 });
+    expect(issue?.field).toBe("value");
+    expect(issue?.message).toContain("not on a step");
+  });
+
+  test("rank: ranking must be an exact permutation of the option ids", () => {
+    const spec: Ask = { schemaVersion: 1, kind: "rank", title: "x", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }, { id: "c", label: "C" }] };
+    expect(validateAnswerAgainstSpec(spec, { kind: "rank", ranking: ["nope"] })?.message).toContain("does not match option count");
+    expect(validateAnswerAgainstSpec(spec, { kind: "rank", ranking: ["a", "b", "nope"] })?.message).toContain("not one of the ask's options");
+    expect(validateAnswerAgainstSpec(spec, { kind: "rank", ranking: ["a", "a", "b"] })?.message).toContain("duplicate");
+    expect(validateAnswerAgainstSpec(spec, { kind: "rank", ranking: ["c", "b", "a"] })).toBeUndefined();
+  });
+
+  test("region: odd-length coordinates array is refused", () => {
+    const spec: Ask = { schemaVersion: 1, kind: "region", title: "x", target: "plots/x.json" };
+    expect(validateAnswerAgainstSpec(spec, { kind: "region", coordinates: [0.5, 0.5, 0.6] })?.message).toContain("even length");
+    expect(validateAnswerAgainstSpec(spec, { kind: "region", coordinates: [0.5, 0.5] })).toBeUndefined();
+  });
+
+  test("integration: validateNext with a malformed answer returns answer-shape-mismatch", async () => {
+    const store = new InMemoryThreadStore({ clock: () => t0 });
+    const spec: Ask = {
+      schemaVersion: 1,
+      kind: "choice",
+      title: "Which?",
+      options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+      allowOther: false,
+      multi: false,
+    };
+    await store.append({ actor: agent, kind: "ask.created", askId: "ask-1", spec });
+    // A `choice` answer with a value that is not an option id must be refused.
+    let caught: unknown;
+    try {
+      await store.append({ actor, kind: "ask.answered", askId: "ask-1", answer: { kind: "choice", value: "zzz" } });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeDefined();
+    const rejection = (caught as { rejection: { kind: string; field: string } }).rejection;
+    expect(rejection.kind).toBe("answer-shape-mismatch");
+    expect(rejection.field).toBe("value");
   });
 });

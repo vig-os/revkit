@@ -183,6 +183,7 @@ export { isoTimestamp } from "./timestamp.ts";
 export {
   cloneLogState,
   emptyLogState,
+  validateAnswerAgainstSpec,
   validateNext,
   type LogState,
   type ValidationResult,

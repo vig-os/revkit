@@ -65,7 +65,7 @@ import {
   renderAskPage,
 } from "../ask-page/render.ts";
 import { buildAskPageBundle } from "../ask-page/bundle.ts";
-import { writeAskFile, removeAskFile } from "./asks-file.ts";
+import { writeAskFile } from "./asks-file.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
 import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
@@ -273,6 +273,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     ...(options.localUserDisplayName !== undefined ? { displayName: options.localUserDisplayName } : {}),
   };
   const agentActor: Author = { kind: "agent", id: options.agentActorId ?? "agent" };
+  // System actor for daemon-emitted events with no human or agent
+  // origin — the lazy `ask.expired` sweep, in particular. PR #52
+  // review: reusing `agent` there would falsely attribute the
+  // transition to the agent that raised the ask, which the
+  // channel-server's actor-filter then hides as "loopback echo"
+  // and never surfaces.
+  const systemActor: Author = { kind: "system", id: "revkit-daemon" };
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -1400,7 +1407,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
     }
     const html = renderAskPage(record);
-    return withHygiene(new Response(html, { status: 200 }), "html", "text/html; charset=utf-8");
+    // `/-/ask.js` is added to `script-src` ONLY on this response —
+    // no other HTML page allowlists the ask bundle path (PR #52
+    // review). See `headers.ts::buildCspHeader`.
+    return withHygiene(
+      new Response(html, { status: 200 }),
+      "html",
+      "text/html; charset=utf-8",
+      [ASK_JS_PATH],
+    );
   }
 
   // ── /api/asks branch (M2 item 7, story A1) ──────────────────────
@@ -1469,18 +1484,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const nowMs = options.nowMs?.() ?? Date.now();
       const expiresAtMs = parsed.data.ttlMs !== undefined ? nowMs + parsed.data.ttlMs : undefined;
       const urlPath = `/ask/${askId}`;
-      // Write the on-disk spec file FIRST so a crash between
-      // `writeAskFile` and `store.append` leaves a spec on disk
-      // the operator can inspect / clean up, rather than an event
-      // pointing at a missing file. If the file already exists
-      // (a re-run without the log — bit unlikely, but defensive)
-      // `writeAskFile` throws EEXIST and we surface it as 400.
-      try {
-        writeAskFile(options.repoRoot, askId, parsed.data.spec);
-      } catch (error) {
-        logger.warn("api.asks.create.file-failed", { requestId, errorKind: (error as Error).name });
-        return badRequest([{ code: "custom", path: ["id"], message: "ask-file-write-failed" }]);
-      }
+      // PR #52 review: write the on-disk spec file AFTER the event
+      // is accepted. Under the previous order, a rejected append
+      // (duplicate-ask id collision, or any other 400) still left
+      // the id-file on disk, and that stray then blocked every
+      // future retry with ask-file-write-failed. Now we append
+      // first, and on any outcome other than 201 no disk state
+      // was ever created.
       const input: ReviewEventInput = {
         kind: "ask.created",
         actor: agentActor,
@@ -1489,23 +1499,40 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         url: urlPath,
         ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
       };
+      const appendResponse = await appendAndReturn(input, requestId, {});
+      if (appendResponse.status !== 201) return appendResponse;
+      // Event accepted — persist the spec file. A failure here (a
+      // full disk, a permission surprise) removes the ask from
+      // the log too, so the id does not become a ghost the
+      // operator has to inspect.
       try {
-        const response = await appendAndReturn(input, requestId, {});
-        // Return the created ask with its url, not the raw event
-        // (matches the shape `ask` MCP tool consumers expect).
-        if (response.status !== 201) return response;
-        const record = await store.ask(askId);
-        return jsonResponse({ ask: record, url: urlPath }, 201);
+        writeAskFile(options.repoRoot, askId, parsed.data.spec);
       } catch (error) {
-        // If the append failed after we wrote the file, clean up
-        // so a retry with a fresh id does not stumble on the stray.
+        logger.error("api.asks.create.file-failed-after-append", {
+          requestId,
+          askId,
+          errorKind: (error as Error).name,
+        });
+        // Best-effort cancel of the just-appended ask so a retry
+        // with a fresh id does not stumble on a half-created one.
+        // (The cancel event may itself fail if the ask was
+        // already terminal-transitioned — swallow, this is a
+        // safety net.)
         try {
-          removeAskFile(options.repoRoot, askId);
+          await store.append({
+            kind: "ask.cancelled",
+            actor: systemActor,
+            askId,
+            reason: "file-write-failed",
+          });
         } catch {
-          // Best-effort — the operator can also remove it by hand.
+          // Cancel is best-effort — the ask is still in the log
+          // as pending. The reader path sees it and can retry.
         }
-        throw error;
+        return badRequest([{ code: "custom", path: ["id"], message: "ask-file-write-failed" }]);
       }
+      const record = await store.ask(askId);
+      return jsonResponse({ ask: record, url: urlPath }, 201);
     }
 
     // Paths of shape /api/asks/:id[/answer|/cancel]
@@ -1618,7 +1645,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       if (record.expiresAtMs > nowMs) continue;
       const input: ReviewEventInput = {
         kind: "ask.expired",
-        actor: agentActor,
+        actor: systemActor,
         askId: record.id,
       };
       try {
@@ -1648,9 +1675,18 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    * `Permissions-Policy` denying the powerful features, and the
    * per-kind `Cache-Control`. `kind` selects the CSP + Cache-Control
    * shape (see `headers.ts`); `contentType` sets an explicit
-   * Content-Type when the response body needs one. */
-  function withHygiene(response: Response, kind: ResponseKind, contentType: string | undefined): Response {
-    return applyResponseHeaders(response, kind, contentType, headerCtx);
+   * Content-Type when the response body needs one. `extraScriptPaths`
+   * (PR #52 review) — route-specific `script-src` paths added ONLY
+   * to that response's CSP; today the ask-page handler passes
+   * `[ASK_JS_PATH]` so the ask bundle is not allowlisted on any
+   * other HTML page. */
+  function withHygiene(
+    response: Response,
+    kind: ResponseKind,
+    contentType: string | undefined,
+    extraScriptPaths: readonly string[] = [],
+  ): Response {
+    return applyResponseHeaders(response, kind, contentType, headerCtx, extraScriptPaths);
   }
 
   /** JSON body from `/api/*` (writes and reads). `kind: "json"` adds

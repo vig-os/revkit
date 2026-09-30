@@ -216,11 +216,14 @@ const RESOLVE_TOOL = {
 const ASK_TOOL = {
   name: "ask",
   description:
-    "Raise a rich question page for the human to answer (DESIGN-0001 §5.1, ADR-0007). Returns { id, url } " +
-    "immediately — call `await_answer` next to wait for the answer. Prefer this to a plain text prompt " +
-    "whenever the answer benefits from choices, ranking, a scale, a region on a plot, or a review decision. " +
-    "The `spec` is a validated question spec — see `revkit`'s `askSchema` for the shape (six kinds: choice, " +
-    "rank, scale, text, region, review). Question text is untrusted-as-HTML; the daemon renders it as text.",
+    "Raise a rich question page for the human to answer (DESIGN-0001 §5.1, ADR-0007). Returns " +
+    "{ ask, url } immediately, where `url` is a ready-to-open loopback link (a fresh single-use " +
+    "launch URL that lands the human on the ask page via the cookie exchange) — hand that URL to " +
+    "the human. Then call `await_answer` with `ask.id` to wait for the answer. Prefer this to a " +
+    "plain text prompt whenever the answer benefits from choices, ranking, a scale, a region on a " +
+    "plot, or a review decision. The `spec` is a validated question spec — see revkit's askSchema " +
+    "(six kinds: choice, rank, scale, text, region, review). Question text is untrusted as HTML; " +
+    "the daemon renders it as text.",
   inputSchema: {
     type: "object",
     properties: {
@@ -670,49 +673,102 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
         const opts: { id?: string; ttlMs?: number } = {};
         if (parsed.data.id !== undefined) opts.id = parsed.data.id;
         if (parsed.data.ttlMs !== undefined) opts.ttlMs = parsed.data.ttlMs;
-        return await client.createAsk(parsed.data.spec, opts);
+        const created = await client.createAsk(parsed.data.spec, opts);
+        // PR #52 review: the daemon returns the same-origin path
+        // `/ask/<id>`, but a browser opening that path without a
+        // session cookie gets a 401 (the launch-code flow is what
+        // mints one). Rather than document a footgun for the agent,
+        // mint a fresh single-use launch URL with `next=/ask/<id>`
+        // — the same shape `review_url` returns — so the URL the
+        // MCP tool hands back is ready to open. The launch code
+        // expires in 60s (ADR-0013), which is short enough that a
+        // stale scrollback copy is not reusable.
+        const askIdRaw = (created as { ask?: { id?: unknown } }).ask?.id;
+        const askId = typeof askIdRaw === "string" ? askIdRaw : undefined;
+        let openUrl = (created as { url?: string }).url ?? "";
+        if (askId !== undefined) {
+          try {
+            const minted = await client.mintLaunchUrl(`/ask/${askId}`);
+            openUrl = minted.launchUrl;
+          } catch {
+            // Fall back to the raw same-origin path — the agent
+            // will get a clear 401 from the daemon rather than a
+            // silent failure, and the tool call still surfaces
+            // the `ask` record so `await_answer` works.
+          }
+        }
+        return { ask: (created as { ask?: unknown }).ask, url: openUrl };
       }
       if (toolName === "await_answer") {
         const parsed = awaitAnswerArgsSchema.safeParse(args);
         if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
         const timeoutMs = parsed.data.timeout_ms ?? 8_000;
-        // Fast path: read the current record first — a terminal
-        // state that already landed does not need to wait.
-        const current = await client.getAsk(parsed.data.id);
-        const status = (current as { status?: string } | undefined)?.status;
-        if (status === "answered" || status === "cancelled" || status === "expired") {
-          return { ask: current };
-        }
-        // Long-poll: register a waiter and race it against the
-        // caller's timeout. The subscriber's `onEvent` resolves the
-        // waiter on the next terminal `ask.*` frame for this id.
-        const record: unknown = await new Promise<unknown>((resolveOuter) => {
-          const waiter: AskWaiter = {
+        // PR #52 review — register the waiter BEFORE the fast-path
+        // `getAsk` fetch, then check the current state. If the fast
+        // path returns terminal, dispose the waiter and return the
+        // record. If the fast path returns pending but the terminal
+        // event landed WHILE the fetch was in flight, the
+        // subscriber has already resolved the waiter, so awaiting
+        // it is instant. If we did the fetch first, that "in
+        // flight" event would be lost forever — the waiter would
+        // be registered too late to receive it.
+        //
+        // The waiter is also armed with the caller's timeout so a
+        // never-arriving terminal event does not hang the tool
+        // past the MCP tool deadline; on timeout we do one more
+        // `getAsk` so the caller can distinguish "still pending"
+        // from "answered while we were in the fetch race".
+        let waiter: AskWaiter | undefined;
+        const wait = new Promise<unknown>((resolveOuter) => {
+          const w: AskWaiter = {
             resolve: (r) => resolveOuter(r),
             reject: () => resolveOuter(undefined),
           };
+          waiter = w;
           const set = askWaiters.get(parsed.data.id) ?? new Set<AskWaiter>();
-          set.add(waiter);
+          set.add(w);
           askWaiters.set(parsed.data.id, set);
           const timer = setTimeout(() => {
             const s = askWaiters.get(parsed.data.id);
             if (s !== undefined) {
-              s.delete(waiter);
+              s.delete(w);
               if (s.size === 0) askWaiters.delete(parsed.data.id);
             }
             resolveOuter(undefined);
           }, timeoutMs);
-          // Wrap resolve to clear the timer whenever it fires.
-          const wrappedResolve = waiter.resolve;
-          waiter.resolve = (r) => {
+          const wrappedResolve = w.resolve;
+          w.resolve = (r) => {
             clearTimeout(timer);
             wrappedResolve(r);
           };
         });
+        const disposeWaiter = (): void => {
+          if (waiter === undefined) return;
+          const s = askWaiters.get(parsed.data.id);
+          if (s !== undefined) {
+            s.delete(waiter);
+            if (s.size === 0) askWaiters.delete(parsed.data.id);
+          }
+          // Also nudge the promise so it settles cleanly (undefined).
+          waiter.reject(new Error("disposed"));
+          waiter = undefined;
+        };
+        // Fast path: read the current record. A terminal state that
+        // already landed does not need to wait.
+        const current = await client.getAsk(parsed.data.id);
+        const status = (current as { status?: string } | undefined)?.status;
+        if (status === "answered" || status === "cancelled" || status === "expired") {
+          disposeWaiter();
+          return { ask: current };
+        }
+        // Long-poll: await the waiter (already primed to fire on
+        // any terminal `ask.*` event that arrived during the fast
+        // path, or that arrives before the timeout).
+        const record: unknown = await wait;
         if (record !== undefined) return { ask: record };
-        // Timed out: return the current record so the caller can
-        // decide (still pending? cancelled after all?). The
-        // contract is "call again if still pending".
+        // Timed out — return the current record so the caller can
+        // decide (still pending? cancelled after all?). Contract:
+        // call again if still pending.
         const latest = await client.getAsk(parsed.data.id);
         return { ask: latest };
       }

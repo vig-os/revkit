@@ -370,10 +370,26 @@ describe("GET /ask/<id> — page shell", () => {
     const csp = response.headers.get("content-security-policy")!;
     expect(csp).toContain("default-src 'none'");
     expect(csp).not.toContain("'unsafe-eval'");
+    // PR #52 review — /-/ask.js is in the ask-page CSP…
+    for (const origin of [`http://127.0.0.1:${ctx.handle.port}`, `http://localhost:${ctx.handle.port}`]) {
+      expect(csp).toContain(`${origin}/-/ask.js`);
+    }
     // The bundle script lands under /-/ask.js.
     expect(html).toContain('src="/-/ask.js"');
     // The boot JSON contains the ask id.
     expect(html).toContain(`"id":"${id}"`);
+  });
+
+  test("PR #52 review — /-/ask.js is NOT in the CSP on non-ask HTML pages (scoped script-src)", async () => {
+    const ctx = ctxRef!;
+    const response = await fetch(`${ctx.handle.url}/`, {
+      headers: loopbackHeaders(ctx.handle.port),
+    });
+    expect(response.status).toBe(200);
+    const csp = response.headers.get("content-security-policy")!;
+    expect(csp).not.toContain("/-/ask.js");
+    // Rail is still allowlisted everywhere — that's the difference.
+    expect(csp).toContain("/-/rail.js");
   });
 
   test("no cookie → 401 (the launch-code flow is what mints one)", async () => {

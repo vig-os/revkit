@@ -97,7 +97,21 @@ const askVariants = [
 ] as const;
 
 /** Discriminated union on `kind` so an invalid kind fails with a message
- * that lists the allowed set; cross-field refinements ride on top. */
+ * that lists the allowed set. The `superRefine` below adds two
+ * cross-field checks the discriminant cannot see:
+ *
+ *   - `choice`/`rank`: option ids are UNIQUE across `options[]`
+ *     (duplicates would let the daemon route an answer to two
+ *     rows in one call). Reports the offending index in the path.
+ *   - `scale`: `min < max` (equal or flipped is not a scale).
+ *
+ * ANSWER-side validation (that a `choice.value` is an option id,
+ * a `rank.ranking` is a permutation of the option ids, a
+ * `scale.value` is in [min, max] on a step) lives with the event
+ * log in `validator.ts::validateAnswerAgainstSpec`, run at
+ * `ask.answered` append-time; PR #52 review pointed out that
+ * doing it only here would leave a client-side bypass writing a
+ * malformed answer to the log. */
 export const askSchema = z.discriminatedUnion("kind", askVariants).superRefine((ask, ctx) => {
   if (ask.kind === "choice" || ask.kind === "rank") {
     const seen = new Map<string, number>();

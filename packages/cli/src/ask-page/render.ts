@@ -34,32 +34,42 @@ import type { AskRecord } from "@revkit/review-core";
 export const ASK_JS_PATH = "/-/ask.js";
 export const ASK_CSS_PATH = "/-/ask.css";
 
-/** Serialise `record` for inlining. The one JSON sequence that could
- * break out of the surrounding `<script>` is `</script` — inside a
- * JSON body the `/` is not special, so JSON.stringify leaves it as
- * a literal slash. We escape it here so the string cannot terminate
- * the block. `<!` / `-->` are HTML-comment starters that some HTML
- * parsers accept inside a `<script>` when preceded by `<!--`; we
- * neutralise them defensively. */
+/** Serialise `record` for inlining. Every character that could take
+ * on HTML meaning inside a surrounding `<script>` block is encoded
+ * as its standard JSON `\uXXXX` escape — which is VALID JSON, so
+ * `JSON.parse` in the client succeeds regardless of what the agent
+ * wrote in `spec.title` / `spec.prompt` / option labels. Concretely:
+ *
+ *   - `<` becomes `\u003c` (blocks `</script>` and `<!--`)
+ *   - `>` becomes `\u003e` (blocks `-->` and stray `>` after `<` at close)
+ *   - `&` becomes `\u0026` (blocks HTML entity escapes an old parser
+ *                          might expand inside a script data block)
+ *   - U+2028 becomes `\u2028` (line separator: valid JSON, illegal in
+ *                              a JavaScript source string — protects
+ *                              a caller that later evaluates the payload)
+ *   - U+2029 becomes `\u2029` (paragraph separator, same reason)
+ *
+ * Rationale for choosing this ruleset over the earlier
+ * `<\/script` / `<\!--` / `--\>` shape (PR #52 review): `<\!--` and
+ * `--\>` are NOT legal JSON escapes — `JSON.parse` rejected them,
+ * and `readBoot` swallowed the error and left the page blank
+ * whenever an agent wrote text containing `-->` (e.g.
+ * `step 1 --> step 2`). The `\uXXXX` escapes are all valid JSON,
+ * so `JSON.parse(encodeBootJson(record))` round-trips losslessly on
+ * every input, tested by `test/ask-page/render.test.ts` on a
+ * hostile-string fuzz list. */
 export function encodeBootJson(record: AskRecord): string {
   const raw = JSON.stringify({ id: record.id, initial: record });
-  // Guardrails ok: these regex replacements pattern-match specific
-  // HTML sequences before embedding a JSON payload. Parsing is not
-  // an option here — the input is JSON as text, and the target is
-  // an HTML sequence at any position inside the string.
+  // Every replace() below matches a single BMP code point with a
+  // global flag — linear on input length, no backtracking hazard.
   return raw
-    .replace(/<\/(script)/gi, "<\\/$1") // guardrails-ok: HTML sequence guard, not parseable structure
-    .replace(/<!--/g, "<\\!--") // guardrails-ok: HTML comment starter
-    .replace(/--(>|!>)/g, "--\\$1") // guardrails-ok: HTML comment terminator
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
     .replace(new RegExp("\u2028", "g"), "\\u2028")
     .replace(new RegExp("\u2029", "g"), "\\u2029");
 }
 
-/** Render the HTML skeleton for the `/ask/<id>` page. `title` is
- * fixed to `"revkit — question"`; the record's own title lands
- * inside the island (which escapes it via Solid's text-node path).
- * Kept string-only so the daemon can wrap it with the same
- * hygiene headers it puts on every static HTML response. */
 export function renderAskPage(record: AskRecord): string {
   const boot = encodeBootJson(record);
   return [

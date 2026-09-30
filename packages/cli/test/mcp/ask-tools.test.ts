@@ -133,16 +133,24 @@ describe("MCP ask + await_answer", () => {
     expect(names).toContain("await_answer");
   });
 
-  test("ask returns { ask, url } and url is same-origin /ask/<id>", async () => {
+  test("ask returns { ask, url } — url is a ready-to-open launch URL (next=/ask/<id>)", async () => {
     const ctx = ctxRef!;
     const result = await ctx.client.callTool({ name: "ask", arguments: { spec: choiceSpec } });
     const parsed = parseToolResult(result);
     expect(typeof parsed.url).toBe("string");
-    expect(parsed.url).toMatch(/^\/ask\/[A-Za-z0-9_-]{1,64}$/);
     const record = parsed.ask as { id: string; status: string; spec: { kind: string } };
     expect(record.status).toBe("pending");
     expect(record.spec.kind).toBe("choice");
     expect(record.id.length).toBeGreaterThan(0);
+    // PR #52 review: the returned URL is a full loopback URL
+    // (a `?code=<launch-code>&next=/ask/<id>` link the human can
+    // click to land on the page with a session cookie), not a
+    // bare `/ask/<id>` path.
+    const openUrl = new URL(parsed.url as string);
+    expect(openUrl.hostname).toBe("127.0.0.1");
+    expect(openUrl.pathname).toBe("/-/auth");
+    expect(openUrl.searchParams.get("next")).toBe(`/ask/${record.id}`);
+    expect(openUrl.searchParams.get("code")?.length).toBeGreaterThan(20);
   });
 
   test("await_answer wakes on the SSE frame and returns the answered record in under 1000 ms (A1 < 1 s)", async () => {
@@ -198,6 +206,45 @@ describe("MCP ask + await_answer", () => {
     // Should be at least the timeout, at most ~2× (some CI slop).
     expect(elapsedMs).toBeGreaterThanOrEqual(150);
     expect(elapsedMs).toBeLessThan(2000);
+  });
+
+  test("PR #52 review — await_answer catches a terminal event that lands DURING its fast-path getAsk (waiter registered first)", async () => {
+    // A deterministic race: we make the fast-path GET slow, and
+    // fire the answer POST while the GET is still in flight. If
+    // the waiter is registered BEFORE the GET (the fix), the
+    // subscriber wakes it as soon as the SSE frame lands and
+    // `await_answer` returns the answered record. If the waiter
+    // is registered AFTER the GET (the bug), the SSE frame lands
+    // with nobody to wake, and `await_answer` falls through to
+    // the timeout path.
+    const ctx = ctxRef!;
+    const created = parseToolResult(
+      await ctx.client.callTool({ name: "ask", arguments: { spec: choiceSpec } }),
+    );
+    const askId = (created.ask as { id: string }).id;
+    // Warm the SSE subscriber before we start racing.
+    await new Promise((r) => setTimeout(r, 100));
+    // Kick a POST that WILL land while `await_answer` is in the
+    // getAsk fetch. `await_answer` is bounded by 800 ms; we fire
+    // the answer 50 ms in — well before the timeout.
+    const answerAfter = new Promise<void>((r) => setTimeout(r, 50));
+    void answerAfter.then(() => humanAnswer(ctx, askId, "d1"));
+    const start = performance.now();
+    const result = await ctx.client.callTool({
+      name: "await_answer",
+      arguments: { id: askId, timeout_ms: 800 },
+    });
+    const elapsed = performance.now() - start;
+    const record = parseToolResult(result).ask as { status: string; answer: { value: string } };
+    // The load-bearing assertion: the tool returns answered, not
+    // pending. If the waiter is registered AFTER getAsk, this
+    // flips to `pending` at the timeout, which is exactly what the
+    // reviewer flagged.
+    expect(record.status).toBe("answered");
+    expect(record.answer.value).toBe("d1");
+    // The tool returned WELL before its 800 ms deadline — the
+    // waiter caught the event, not the timeout.
+    expect(elapsed).toBeLessThan(600);
   });
 
   test("await_answer returns immediately when the ask is already terminal (fast path)", async () => {

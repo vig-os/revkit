@@ -132,11 +132,9 @@ describe("buildCspHeader — directive shape", () => {
       "default-src 'none'; " +
       "script-src " +
         "http://127.0.0.1:4321/-/rail.js " +
-        "http://127.0.0.1:4321/-/ask.js " +
         "http://127.0.0.1:4321/_astro/ " +
         "http://127.0.0.1:4321/pagefind/ " +
         "http://localhost:4321/-/rail.js " +
-        "http://localhost:4321/-/ask.js " +
         "http://localhost:4321/_astro/ " +
         "http://localhost:4321/pagefind/ " +
         "'wasm-unsafe-eval' " +

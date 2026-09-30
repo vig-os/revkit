@@ -110,16 +110,32 @@ interface Boot {
   readonly initial: AskRecord;
 }
 
-function readBoot(): Boot | undefined {
+/** Read the boot JSON. On a missing tag, a parse error or a shape
+ * mismatch, return an `{error, reason}` outcome — the mount will
+ * render a VISIBLE error state and log via `console.error`, so a
+ * regression in `encodeBootJson` (or an agent that wrote a
+ * pathological title) does not silently leave the page blank while
+ * `await_answer` waits out its TTL. PR #52 review. */
+type BootOutcome = { ok: true; boot: Boot } | { ok: false; reason: string };
+function readBoot(): BootOutcome {
   const el = document.getElementById("revkit-ask-boot");
-  if (el === null) return undefined;
+  if (el === null) return { ok: false, reason: "revkit-ask: bootstrap script tag not found (id=revkit-ask-boot)." };
+  const text = el.textContent ?? "";
+  if (text.length === 0) return { ok: false, reason: "revkit-ask: bootstrap script tag is empty." };
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(el.textContent ?? "") as Boot;
-    if (typeof parsed?.id !== "string" || parsed.initial === undefined) return undefined;
-    return parsed;
-  } catch {
-    return undefined;
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, reason: `revkit-ask: bootstrap JSON did not parse — ${(e as Error).message}` };
   }
+  if (parsed === null || typeof parsed !== "object") {
+    return { ok: false, reason: "revkit-ask: bootstrap payload is not a JSON object." };
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.id !== "string" || record.initial === undefined) {
+    return { ok: false, reason: "revkit-ask: bootstrap payload is missing required fields (id, initial)." };
+  }
+  return { ok: true, boot: record as unknown as Boot };
 }
 
 /** Fetch the latest AskRecord over the cookie-authenticated JSON API.
@@ -680,10 +696,38 @@ function AskPage(props: { boot: Boot }): JSX.Element {
 // ── Bootstrap ─────────────────────────────────────────────────────
 
 function mountAskPage(): void {
-  const bootRecord = readBoot();
+  const outcome = readBoot();
   const mount = document.getElementById("revkit-ask-mount");
-  if (bootRecord === undefined || mount === null) return;
-  render(() => <AskPage boot={bootRecord} />, mount);
+  if (mount === null) {
+    // eslint-disable-next-line no-console
+    console.error("revkit-ask: could not find mount element (id=revkit-ask-mount).");
+    return;
+  }
+  if (!outcome.ok) {
+    // eslint-disable-next-line no-console
+    console.error(outcome.reason);
+    // A visible error state so a human sees the page is broken
+    // (never blank), and Playwright / the reviewer can assert
+    // `[data-testid=revkit-ask-error]` when checking the failure
+    // path. The reason is composed from `readBoot`'s own strings —
+    // no user-supplied text lands here as HTML.
+    const reasonText = document.createTextNode(outcome.reason);
+    const errorBox = document.createElement("div");
+    errorBox.className = "revkit-ask revkit-ask--error";
+    errorBox.setAttribute("data-testid", "revkit-ask-error");
+    errorBox.setAttribute("role", "alert");
+    const heading = document.createElement("h1");
+    heading.className = "revkit-ask__title";
+    heading.appendChild(document.createTextNode("Could not load this question."));
+    const message = document.createElement("p");
+    message.className = "revkit-ask__error";
+    message.appendChild(reasonText);
+    errorBox.appendChild(heading);
+    errorBox.appendChild(message);
+    mount.replaceChildren(errorBox);
+    return;
+  }
+  render(() => <AskPage boot={outcome.boot} />, mount);
 }
 
 if (document.readyState === "loading") {
