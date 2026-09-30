@@ -11,7 +11,7 @@ revkit ships as a flake today ([ADR-0010](../adr/0010-distribution-flake-opt-in.
 `lib.hooks`, `templates.default`. The next step in the [DESIGN-0001 §7](DESIGN-0001-revkit-architecture.md) plan is a
 vig-os/devkit **`review` capability module**, so a devkit consumer opts in with `DEVKIT_MODULES="node review"` (or
 `review` alone) instead of hand-wiring the flake input in every repo. This document is the proposal to
-[vig-os/devkit#1](https://github.com/vig-os/revkit/issues/1) — the elevation ledger — for that module. It is NOT a
+[vig-os/revkit#1](https://github.com/vig-os/revkit/issues/1) — the elevation ledger — for that module. It is NOT a
 plan to write code in this repo (D1 the acceptance criterion works today; this closes the loop for large-N
 adoption).
 
@@ -128,9 +128,41 @@ DEVKIT_MODULES="node review"
 
 There is no compatibility break: the hand-wired form continues to work. The module is sugar.
 
-## 5. Open questions for the devkit maintainers
+## 5. Gap between M5 part 1 and full D1 acceptance
 
-Filed here for the outward-facing issue to reference; not blocking on M5:
+M5 part 1 ships the flake plumbing but NOT a way for a consumer to render their own docs. The template's third
+command (`revkit serve`) currently binds and serves whatever tree is passed to `--dir`, but there is no
+`revkit build` that renders arbitrary consumer docs through the packaged Astro/Starlight site. That gap is
+called out explicitly on the [FEATURE-MATRIX](../FEATURE-MATRIX.md) D1 row and blocks the row from flipping to
+`shipped`.
+
+What is missing (M5 part 2):
+
+- **`revkit build [--dir <root>]`** — renders the consumer's `docs/` (plus `vocab/`, `plots/`) with revkit's
+  PACKAGED site. Uses the packaged `node_modules/.bin/astro` by ABSOLUTE PATH (no `bunx`, no PATH lookup),
+  reuses the safety machinery from `packages/cli/src/review/build.ts` shipped by PR #48 (env allowlist, token
+  denylist, per-build `HOME`, vite `cacheDir` outside the sandbox). Output at
+  `<consumer>/.revkit/dist/`.
+- **Site becomes root-configurable.** `site/astro.config.mjs`, `site/src/content.config.ts` and the
+  `repoDocsLoader` / `plotsLoader` / vocab-file loader currently read from a hardcoded `REPO_ROOT` two
+  parents up from `site/`. They need to accept a `REVKIT_CONSUMER_ROOT` env var so the packaged site can
+  render an external tree. Sidebar generation switches from the ADR/design-specific
+  `slugsFromRepoDir("adr")` / `slugsFromRepoDir("designs")` to Starlight's autogenerate when no ADR tree
+  exists — behaviour still to design.
+- **`revkit serve` auto-build.** When `--dir` is missing and `<root>/.revkit/dist/` does not exist, `serve`
+  runs `revkit build` first (or prints the exact command). Today it refuses on a missing dir.
+- **Template smoke asserts real content.** `scripts/template-smoke.sh` currently accepts a `404` from
+  `GET /` as proof-of-life; once `revkit build` exists, the smoke asserts the built page's title AND the
+  rail's `<script src="/-/rail.js">` tag (injected by the daemon).
+- **Coordinate with PR #48.** `runSafeBuild` in `packages/cli/src/review/build.ts` already handles trusted-
+  toolchain-by-absolute-path, an env allowlist and a per-build `HOME`. M5 part 2 either extracts a shared
+  primitive both `revkit review` and `revkit build` call, or `revkit build` reuses PR #48's module directly.
+  A single build implementation is the target — not two.
+
+## 6. Open questions for the devkit maintainers
+
+Filed here for the outward-facing issue to reference; not blocking on M5 part 1 (M5 part 2, the gap in §5,
+is blocking on the D1 row flipping to `shipped`):
 
 1. **Where does the pin live?** Right now this doc assumes devkit ships a pinned `inputs.revkit` in its own
    flake. An alternative is per-consumer pins in `.vig-os` (`REVKIT_VERSION=`). devkit's other modules pin

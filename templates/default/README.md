@@ -6,13 +6,18 @@ A minimal revkit docs repo. Scaffolded by:
 nix flake init -t github:vig-os/revkit
 ```
 
-## Three commands
+## Two commands (M5 part 1)
 
 ```bash
 direnv allow       # or: nix develop
-revkit check       # run the ADR-0005 authoring guards
-revkit serve       # boot the local review daemon on 127.0.0.1
+revkit check       # run the ADR-0005 authoring guards on this tree
+nix build          # runs `revkit check` inside a docs derivation
 ```
+
+`revkit serve` (the local review daemon that mounts the rail on rendered pages) is **M5 part 2** — see
+[revkit's DESIGN-0002 §5](https://github.com/vig-os/revkit/blob/main/docs/designs/DESIGN-0002-devkit-review-module.md#5-gap-between-m5-part-1-and-full-d1-acceptance).
+It needs a `revkit build` step (not yet shipped) that renders this `docs/` tree through revkit's packaged
+Astro/Starlight site. Until then the daemon works but has no rendered content to serve.
 
 See [revkit][revkit] for the architecture (DESIGN-0001, ADR-0001…0025).
 

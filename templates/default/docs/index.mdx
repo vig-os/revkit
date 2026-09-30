@@ -26,13 +26,16 @@ This is a docs repository that consumes the revkit flake:
   reviewer opens it in a browser and comments on any block. Comments
   flow back to the authoring agent through the M2 MCP channel.
 
-## Three commands
+## Two commands (M5 part 1)
 
 ```bash
 direnv allow       # or: nix develop
 revkit check       # run the authoring guards
-revkit serve       # start the local review daemon
+nix build          # runs revkit check under a docs derivation
 ```
+
+`revkit serve` (the local review daemon that mounts the rail on rendered pages)
+is M5 part 2 — needs a `revkit build` step (not yet shipped).
 
 <Callout kind="note">
   See the [revkit repo][revkit] for the full architecture (DESIGN-0001,

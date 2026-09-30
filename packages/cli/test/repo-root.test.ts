@@ -62,6 +62,28 @@ describe("findRepoRootByPackageJson", () => {
     expect(findRepoRootByPackageJson(root)).toBe(root);
   });
 
+  test("innermost marker wins: a nested 'revkit' key beats an outer 'name: revkit'", () => {
+    // A consumer repo that was cloned INSIDE the revkit repo during
+    // development (a stress-test the flake template's smoke may run)
+    // must bind to the CONSUMER root, not the outer revkit repo.
+    // The nearest marker on the walk-up path is the one that wins.
+    const outer = scratch("nested-outer");
+    writeFileSync(join(outer, "package.json"), JSON.stringify({ name: "revkit" }));
+    const inner = join(outer, "consumers", "acme-docs");
+    mkdirSync(inner, { recursive: true });
+    writeFileSync(
+      join(inner, "package.json"),
+      JSON.stringify({ name: "acme-docs", revkit: {} }),
+    );
+    const innerDocs = join(inner, "docs");
+    mkdirSync(innerDocs);
+
+    // From the inner docs dir, the walk stops at `inner` even though
+    // an outer manifest would also match — findRepoRootByPackageJson
+    // must not walk past the first hit.
+    expect(findRepoRootByPackageJson(innerDocs)).toBe(inner);
+  });
+
   test("REFUSES 'revkit: false' — explicit opt-out is not a root", () => {
     // Guards against a downstream node_modules manifest with a
     // meaningful-looking key from silently binding.

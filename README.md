@@ -92,8 +92,13 @@ may decline). Requires `flk` and a logged-in Claude; not part of `just test` or 
 
 ## Adopt revkit (one line)
 
-revkit ships as a flake ([ADR-0010](docs/adr/0010-distribution-flake-opt-in.md), D1). Any repo picks it up with one
-input and one line in the dev shell — no Astro dependency until you want it.
+revkit ships as a flake ([ADR-0010](docs/adr/0010-distribution-flake-opt-in.md), D1). This is **M5 part 1**: the
+flake plumbing (packages, template, hooks) that a consumer picks up in one input. It does NOT yet include
+`revkit build` — the step that renders a consumer's `docs/` through revkit's packaged Astro/Starlight site.
+Until M5 part 2 lands, an external consumer can lint their docs (`revkit check`) and consume revkit as a Nix
+input, but the packaged site does not render consumer docs. See
+[DESIGN-0002 §5](docs/designs/DESIGN-0002-devkit-review-module.md#5-gap-between-m5-part-1-and-full-d1-acceptance)
+for the exact gap and the follow-up plan.
 
 Scaffold a fresh docs repo from the template:
 
@@ -102,7 +107,8 @@ mkdir my-docs && cd my-docs && git init
 nix flake init -t github:vig-os/revkit
 direnv allow                          # or: nix develop
 revkit check                          # ADR-0005 authoring guards
-revkit serve                          # local review daemon on 127.0.0.1
+nix build                             # runs revkit check under a docs derivation
+# revkit serve                        # M5 part 2 — needs `revkit build` first
 ```
 
 Or wire it into an existing flake:
@@ -140,6 +146,12 @@ Flake outputs (M5 part 1):
 | `apps.<system>.revkit` | `nix run github:vig-os/revkit -- <args>` |
 | `templates.default` | `nix flake init -t github:vig-os/revkit` — a minimal docs repo |
 | `lib.hooks.mkHooks` | Reusable pre-commit hook definitions (see `nix/hooks.nix`) |
+
+**Supported systems.** `packages.<system>` is exposed only for the systems CI verifies with a captured deps
+hash: `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`. `x86_64-darwin` is NOT supported today — GitHub-hosted
+`macos-*` runners are arm64 only, so verifying that system would need a self-hosted runner. A `nix build`
+target on an unsupported system fails at eval with an "attribute missing" error rather than at build time with
+a mismatched hash.
 
 A `review` capability module for vig-os/devkit — `DEVKIT_MODULES="node review"` for the whole opt-in — is
 proposed in [DESIGN-0002](docs/designs/DESIGN-0002-devkit-review-module.md) and tracked at the vig-os/revkit
