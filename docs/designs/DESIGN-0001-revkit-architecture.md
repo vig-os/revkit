@@ -12,12 +12,15 @@ reports, questions) from an **opinionated, guarded component set**; a human read
 answers questions through richer UIs than chat. Those comments flow back to the agent, locally or as a real GitHub PR
 review with file-and-line anchors.
 
-It has two modes, which share one content model and one anchor model:
+It has three review surfaces on one core (ADR-0025), sharing one content model and one anchor model:
 
 - **Local loop.** A single user on their own machine with an agent. The requirement is speed: sub-second from agent
   write to rendered page, and from human answer to agent input.
-- **Hosted PR review.** CI builds a preview per PR and posts the link. Reviewers comment on the rendered doc, and the
-  comments become PR review comments on the source lines.
+- **Local PR review** (`revkit review <pr>`). The reviewer opens a PR on `127.0.0.1` against their own `gh`
+  identity — the same rendered doc as the hosted preview, but with no GitHub App, no Cloudflare and no repo secrets.
+  Comments become PR review comments on the source lines the same way.
+- **Hosted PR review.** CI builds a preview per PR and posts the link. Reviewers comment on the rendered doc, and
+  the comments become PR review comments on the source lines. Adds shareable links and guest reviewers.
 
 ## 1. User stories
 
@@ -38,6 +41,7 @@ It has two modes, which share one content model and one anchor model:
 
 | # | Story |
 |---|---|
+| B0 | As a reviewer, I run **`revkit review <pr>`** on my laptop and review the PR as **myself** through my own `gh` credentials — no App, no Cloudflare, no repo secrets |
 | B1 | As an author, when a PR touches docs, CI builds a preview and **posts the link** on the PR, pinging the requested reviewers |
 | B2 | As a GitHub reviewer, I sign in with GitHub and comment on the rendered doc; each comment becomes a **PR review comment on the exact file + line**, as me |
 | B3 | As a reviewer, I **submit the review** (comment / approve / request changes) from the page |
@@ -312,6 +316,13 @@ Rules:
 
 ### 5.6 PR review round-trip (B1–B6)
 
+Since ADR-0025 there are **two review surfaces on one core** (`@revkit/review-core`): a local surface that runs on
+the reviewer's own machine against their `gh` identity, with no App and no Cloudflare, and the hosted surface
+below. Both use the same thread model (ADR-0006), the same block-anchor → path/line mapping, and the same
+`subject_type: file` fallback for blocks outside diff hunks.
+
+**Hosted surface (Cloudflare, GitHub App):**
+
 ```mermaid
 sequenceDiagram
   participant A as Author/Agent
@@ -331,6 +342,27 @@ sequenceDiagram
   A->>GH: agent reads the review (devkit pr_solve / revkit threads --pr n), fixes, pushes, replies
 ```
 
+**Local surface (`revkit review <pr>`, ADR-0025):**
+
+```mermaid
+sequenceDiagram
+  participant R as Reviewer
+  participant D as revkit serve (loopback)
+  participant W as .revkit/ PR worktree
+  participant GH as GitHub API
+  participant Ag as Agent (local, via channel)
+  R->>D: revkit review <pr-number|url>
+  D->>GH: resolve PR head SHA; refuse if fork/tooling changed w/o --trust
+  D->>W: fetch PR head; build with base-branch (trusted) revkit toolchain, PR content only
+  D->>GH: load existing review threads (as reviewer, gh auth token) → map to blocks
+  D-->>R: serves rendered PR on 127.0.0.1:<port> (ADR-0013 launch code + cookie)
+  R->>D: comment on block
+  D->>GH: add to reviewer's pending review (path, line/start_line, side=RIGHT) as the reviewer
+  D-->>Ag: same thread pushed via the M2 channel
+  R->>D: submit (COMMENT / APPROVE / REQUEST_CHANGES)
+  D->>GH: submit pending review pinned to commit_id
+```
+
 Details:
 
 - Line mapping works because MDX source lines are the anchors. A comment on a block that spans lines outside the diff
@@ -338,15 +370,33 @@ Details:
   (`subject_type: file`) carrying the quote.
 - A guest reviewer (invite link) has no GitHub identity. Their comments go through the App's bot identity as
   "**Jane Doe** (guest) commented:", and their "approve" is recorded in revkit but **cannot count as a GitHub
-  approval**. That's a GitHub rule, and the page shows it.
+  approval**. That's a GitHub rule, and the page shows it. Guests are a hosted-only surface.
+- **Local `TokenSource`.** The daemon reads `gh auth token` at use time, holds it in process memory, never sends it
+  to the browser and never writes it to disk or logs (ADR-0013, ADR-0014). This is the reviewer's own identity, so
+  scopes match whatever they already granted `gh`.
+- **PR-head build safety.** The build uses the reviewer's trusted revkit toolchain and config from the base branch
+  (or the installed revkit) and takes only content — `docs/`, `vocab/`, `plots/`, data files, MDX — from the PR
+  head. Package scripts, `astro.config.*`, flake changes and lockfile changes from the PR are not run and not
+  sourced; `revkit check` runs on the PR content before build (ADR-0005). Fork PRs, or any PR whose tooling files
+  differ from base, are refused unless the reviewer passes `--trust` for that specific head SHA.
+- **Head moves.** A pending review is pinned to `commit_id`. If the head moves before submit, the page says so and
+  re-anchors pending comments through the ADR-0006 pipeline (map → verify quote → fuzzy → orphan, never guess).
+  GitHub itself marks submitted comments outdated when they no longer resolve.
+- **Bridge.** `revkit threads export|import` moves threads between the local sqlite store and the hosted D1 store
+  (ADR-0006), so a local review can be published to the hosted preview or a hosted review continued locally.
 
 ## 6. Hosting and auth
+
+The local PR review surface (§5.6, ADR-0025) needs no hosting at all: `revkit review <pr>` runs on loopback against
+the reviewer's own `gh auth token`, with no App and no Cloudflare. The hosting below is the **hosted surface**, for
+shareable links and guest reviewers.
 
 - **One Cloudflare Worker per org** (§6.1). Previews at `review.exoma.org/<repo>/pr-<n>/` (path-based, ADR-0008), with
   the Worker in front of every
   request.
 - **GitHub users:** GitHub App OAuth (user-to-server). The session is valid if the user has read access to the repo,
-  checked via the API and cached.
+  checked via the API and cached. (The App is the *hosted* `TokenSource`; local uses `gh` — ADR-0009 as amended by
+  ADR-0025.)
 - **Security** of the hosted origin, fork previews and secrets: ADR-0012, ADR-0014.
 - **Invite links (v1).** `revkit invite --repo X --pr 12 --name "Jane Doe" --email … --expires 14d`:
   - mints a random token, stored **hashed** in D1 and scoped to the repo, optionally one PR, and an expiry;
@@ -442,11 +492,18 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
 2. **M2 — local loop:** ([#7](https://github.com/vig-os/revkit/issues/7)) `revkit serve` daemon + `/events` stream,
    anchors + re-anchoring (§5.4), comment rail, threads, MCP (`ask`/`await_answer`/`threads`/`reply`/`resolve`) as a
    **channel** with a Monitor-WebSocket fallback, delivery modes + handover, presence, the Claude Code skill.
-3. **M3 — PR review:** ([#8](https://github.com/vig-os/revkit/issues/8)) CI preview deploy + PR comment, GitHub App,
-   two-way threads, submit review.
-4. **M4 — hosting, deploy + guests:** ([#9](https://github.com/vig-os/revkit/issues/9)) `revkit deploy` (§6.1, one
-   Worker per org), invite links; then Authentik (#4). The Worker and `deploy init` land **before** M3's preview
-   deploys, which need them.
+3. **M3 — Local PR review:** ([#8](https://github.com/vig-os/revkit/issues/8)) `revkit review <pr>` on loopback
+   using the reviewer's own `gh` identity (no App, no Cloudflare, no repo secrets). The `@revkit/review-core`
+   package (anchor → path/line mapping, file-level fallback, GitHub adapter over plain `fetch` REST/GraphQL that
+   runs in Bun and in a Worker), the safe PR-head build (trusted toolchain from base, content-only from PR,
+   fork/tooling-change refusal unless `--trust`), existing-thread import, pending review + submit
+   (COMMENT/APPROVE/REQUEST_CHANGES), head-move re-anchoring; the agent sees the same threads through the M2
+   channel. Re-cut from the old M3 by ADR-0025 — dogfoodable on revkit's own PRs the day it lands.
+4. **M4 — Hosting, previews + guests:** ([#9](https://github.com/vig-os/revkit/issues/9)) `revkit deploy` (§6.1, one
+   Worker per org), CI preview deploy + PR comment with the link, GitHub App as the hosted `TokenSource`, hosted
+   threads in D1 with `revkit threads export|import` bridging local ↔ hosted, invite links; then Authentik (#4).
+   The whole human-gated hosted train — org-owner approvals, Cloudflare OAuth, App manifest confirm, org-config PR
+   for the upload secret — lives here.
 5. **M5 — distribution:** ([#10](https://github.com/vig-os/revkit/issues/10)) flake outputs, template, devkit module
    proposal.
 6. **M6 — suggested edits:** ([#11](https://github.com/vig-os/revkit/issues/11)) patch-carrying comments, accept →

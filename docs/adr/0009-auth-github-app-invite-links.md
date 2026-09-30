@@ -4,6 +4,8 @@
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: B2, B3, B5
+- Amended by: [ADR-0025](0025-hybrid-review-one-core.md) — the GitHub App is the **hosted** surface's `TokenSource`;
+  the local `revkit review` surface uses the reviewer's own `gh auth token` and needs no App.
 
 ## Context
 
