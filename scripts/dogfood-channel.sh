@@ -159,6 +159,13 @@ TMP_ARTIFACTS_DIR=""
 DAEMON_LOG=""
 PLAYWRIGHT_JOB_PID=""
 SELFTEST_DECOY_PID=""
+# Round-6-nit idempotency guard: cleanup is registered on EXIT, INT
+# and TERM. A SIGINT can trigger the trap once, and the interrupted
+# script then exits, firing the trap AGAIN. The second run would try
+# to close a pane that's already closed, unlink files already gone,
+# and log confusing "SELF-CHECK failed" lines against a partial run.
+# The guard makes cleanup a one-shot.
+CLEANUP_RAN=0
 
 # Return 0 when `path` is currently held with an advisory flock (either
 # LOCK_EX or LOCK_SH). `flock -n` acquires the lock non-blocking; success
@@ -273,6 +280,15 @@ daemons_rooted_at_state() {
 # ^ invoked indirectly through `trap` below; shellcheck can't see that.
 cleanup() {
   local rc=$?
+  # Round-6-nit idempotency guard: bash runs the EXIT trap after
+  # SIGINT/SIGTERM traps as well, so a `^C` can drive cleanup twice.
+  # A second pass would confuse the SELF-CHECK ("still HELD" against
+  # a lock file we already unlinked, phantom "leaked pane" reports).
+  # Return early on the second entry — the first pass wins.
+  if [[ "${CLEANUP_RAN}" == "1" ]]; then
+    return 0
+  fi
+  CLEANUP_RAN=1
   # Round-6 blocker: `set -e` was tearing this function apart. Any
   # helper whose last statement was a false `[[ … ]] && …` returned
   # 1 and killed the trap partway through — leaving state dirs,
@@ -304,13 +320,10 @@ cleanup() {
   fi
   close_pane_if_any
   kill_daemon_if_ours
-  # Kill any self-test decoy this run started. Belongs in cleanup so
-  # even a mid-run abort doesn't leave the decoy running.
-  if [[ -n "${SELFTEST_DECOY_PID}" ]]; then
-    kill -9 "${SELFTEST_DECOY_PID}" 2>/dev/null || true
-    log "SELFTEST-TEARDOWN: killed decoy pid ${SELFTEST_DECOY_PID}"
-    SELFTEST_DECOY_PID=""
-  fi
+  # NOTE: the self-test decoy is killed AT THE END of cleanup, AFTER
+  # the sweep runs. Killing it here would leave `daemons_rooted_at_state`
+  # with nothing to scan — the whole regression test would be vacuous.
+  # See the DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY block below.
   # POST-TEARDOWN SELF-CHECK — a leak turns the exit code non-zero
   # regardless of the loop's own result.
   local sweep_bad=0
@@ -401,6 +414,15 @@ cleanup() {
   if [[ -n "${TMP_ARTIFACTS_DIR}" && -d "${TMP_ARTIFACTS_DIR}" ]]; then
     rm -rf "${TMP_ARTIFACTS_DIR}" 2>/dev/null || true
   fi
+  # Kill any self-test decoy AT THE END, AFTER the sweep has had a
+  # chance to observe it via pgrep + /proc/<pid>/cwd. If we killed
+  # earlier (round-6 self-test v1) the sweep saw nothing and the
+  # regression test was vacuous.
+  if [[ -n "${SELFTEST_DECOY_PID}" ]]; then
+    kill -9 "${SELFTEST_DECOY_PID}" 2>/dev/null || true
+    log "SELFTEST-TEARDOWN: killed decoy pid ${SELFTEST_DECOY_PID} (after sweep)"
+    SELFTEST_DECOY_PID=""
+  fi
   log "teardown complete"
   if [[ ${sweep_bad} -ne 0 && ${rc} -eq 0 ]]; then
     log "SELF-CHECK failed — reporting non-zero exit"
@@ -452,22 +474,86 @@ log "worktree: ${REPO_ROOT}"
 if [[ "${DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY:-0}" == "1" ]]; then
   # Some minimal state so cleanup has something to look at.
   STATE_DIR="$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/revkit-dogfood-selftest-XXXXXX")"
+
   # Start a decoy whose argv matches the pgrep pattern in
   # daemons_rooted_at_state (`revkit\.js serve`) but whose cwd is NOT
-  # STATE_DIR (so the pattern-match hits, the cwd filter misses, and
-  # the loop body's `[[ … ]]` is false on that iteration — exactly the
-  # RED case). We rewrite argv[0] with `exec -a` and run `/usr/bin/sleep`
-  # so no file changes and nothing harmful ever runs.
-  bash -c 'exec -a "bun /nonexistent/packages/cli/bin/revkit.js serve --dir /nonexistent/dist" /usr/bin/sleep 60' >/dev/null 2>&1 &
+  # STATE_DIR (pattern-match hits, cwd filter misses; the round-5
+  # loop body's `[[ … ]] && printf` returns 1 on that iteration and
+  # under `set -e` kills cleanup — that's the RED case). Two
+  # subtleties matter here (round-7 nit from the reviewer):
+  #
+  #   1. nix coreutils `sleep` is a MULTI-CALL binary: it inspects
+  #      argv[0] and dies with "unknown program 'bun'" the moment we
+  #      rewrite it via `exec -a`. `/usr/bin/sleep` on this host is
+  #      a standalone ELF (verified `file /usr/bin/sleep`), so the
+  #      exec -a is safe. If `/usr/bin/sleep` isn't a standalone
+  #      binary we bail before ever trusting the decoy — a self-test
+  #      that starts nothing but claims success is worse than no
+  #      test at all.
+  #   2. `bash -c 'sleep 30'` gets optimised into an execve straight
+  #      to `sleep`, so argv[0] rewrite via the outer bash's exec -a
+  #      is lost. We use a compound command (`sleep 60 ; :`) to
+  #      force bash to stay in the process image, so its argv
+  #      (which exec -a rewrote) survives — visible in
+  #      /proc/<pid>/cmdline.
+  #
+  # The self-test verifies BOTH (`kill -0` before proceeding, and a
+  # /proc/cmdline sanity check).
+
+  # Prefer /usr/bin/sleep if it is a proper standalone binary
+  # (i.e. not a nix multi-call wrapper). We detect the multi-call
+  # shape by running it with a bogus argv[0] and seeing whether it
+  # emits "unknown program" — a real sleep just fails on the bad
+  # duration argument.
+  selftest_sleep_bin=""
+  if [[ -x "/usr/bin/sleep" ]]; then
+    if ! bash -c 'exec -a decoy_probe /usr/bin/sleep 0' 2>&1 | grep -qE "unknown program|multi-call"; then
+      selftest_sleep_bin="/usr/bin/sleep"
+    fi
+  fi
+  if [[ -z "${selftest_sleep_bin}" ]]; then
+    log "SELFTEST-TEARDOWN: skipping — no standalone sleep binary usable with 'exec -a' (nix coreutils multi-call would die on the argv rewrite)."
+    log "SELFTEST-TEARDOWN: on a NixOS host without /usr/bin/sleep, install coreutils-standalone or run on a Linux distro that ships it."
+    exit 0
+  fi
+
+  # Start the decoy. The compound `; :` forces bash to stay in the
+  # image (single-command mode would execve to sleep and lose
+  # argv). Redirect stdio to /dev/null so a possible SIGPIPE on
+  # our own log doesn't kick the decoy.
+  bash -c "exec -a \"bun /nonexistent/packages/cli/bin/revkit.js serve --dir /nonexistent/dist\" bash -c \"${selftest_sleep_bin} 60 ; :\"" \
+    >/dev/null 2>&1 &
   SELFTEST_DECOY_PID=$!
   disown "${SELFTEST_DECOY_PID}" 2>/dev/null || true
-  # Give the decoy a beat to be visible via pgrep.
   sleep 0.5
-  log "SELFTEST-TEARDOWN: started decoy pid ${SELFTEST_DECOY_PID} (matches pgrep 'revkit.js serve'; cwd unrelated to STATE_DIR)"
+
+  # Verify the decoy actually came up (round-7 nit: "verify the
+  # decoy is alive before cleanup runs"). If exec-a failed, or the
+  # sleep died on argv, we would silently pass an empty test.
+  if ! kill -0 "${SELFTEST_DECOY_PID}" 2>/dev/null; then
+    log "SELFTEST-TEARDOWN: decoy pid ${SELFTEST_DECOY_PID} died at startup — cannot run the regression test"
+    SELFTEST_DECOY_PID=""
+    exit 2
+  fi
+  # Confirm the decoy is visible with the intended cmdline shape.
+  decoy_cmdline="$(tr '\0' ' ' < "/proc/${SELFTEST_DECOY_PID}/cmdline" 2>/dev/null || true)"
+  if [[ "${decoy_cmdline}" != *"revkit.js serve"* ]]; then
+    log "SELFTEST-TEARDOWN: decoy pid ${SELFTEST_DECOY_PID} did not preserve 'revkit.js serve' in cmdline (was: '${decoy_cmdline}')"
+    kill -9 "${SELFTEST_DECOY_PID}" 2>/dev/null || true
+    SELFTEST_DECOY_PID=""
+    exit 2
+  fi
+  # Also confirm pgrep picks it up (the same tool the sweep uses).
+  if ! pgrep -f 'revkit\.js serve' | grep -qxF "${SELFTEST_DECOY_PID}"; then
+    log "SELFTEST-TEARDOWN: decoy pid ${SELFTEST_DECOY_PID} not visible via pgrep -f 'revkit\.js serve'"
+    kill -9 "${SELFTEST_DECOY_PID}" 2>/dev/null || true
+    SELFTEST_DECOY_PID=""
+    exit 2
+  fi
+
+  log "SELFTEST-TEARDOWN: decoy alive (pid ${SELFTEST_DECOY_PID}, sleep=${selftest_sleep_bin}, cwd=${PWD}, matches pgrep 'revkit.js serve')"
   log "SELFTEST-TEARDOWN: triggering exit — the EXIT trap must run all of cleanup and reach 'teardown complete'"
-  # exit 0 → trap → cleanup. If cleanup completes fully, the log ends
-  # with "teardown complete". If the round-6 bug is present, the log
-  # stops mid-cleanup and the assertion outside sees no such line.
+  log "SELFTEST-TEARDOWN: on 6b90ac9 (round-5 shape of cleanup + daemons_rooted_at_state), 'teardown complete' will NOT appear"
   exit 0
 fi
 

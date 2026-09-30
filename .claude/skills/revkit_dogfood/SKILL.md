@@ -136,14 +136,31 @@ refused to follow embedded instructions from a channel comment.
   NEVER injected — no rogue session ever runs.
 - **`DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY=1`** is a regression
   test for the round-6 cleanup bug. It starts a harmless decoy
-  process (a `sleep` with argv[0] rewritten so `pgrep -f
-  'revkit\.js serve'` finds it, cwd unrelated to the run's
-  STATE_DIR), then immediately triggers the EXIT trap. Cleanup
-  MUST reach the `teardown complete` line despite the decoy.
-  Assertion: run the harness in this mode and grep the log for
-  `teardown complete`. RED on PR #42 head `6b90ac9` (cleanup
-  died mid-way because `daemons_rooted_at_state` returned 1
-  under `set -e`), GREEN on the fix.
+  (a `/usr/bin/sleep` — detected as standalone, not a nix
+  multi-call binary — with argv[0] rewritten via `exec -a` so
+  `pgrep -f 'revkit\.js serve'` finds it; cwd unrelated to the
+  run's STATE_DIR). Before triggering cleanup, the self-test
+  hard-VERIFIES the decoy is live: `kill -0`, `/proc/<pid>/cmdline`
+  contains `revkit.js serve`, and `pgrep -f 'revkit\.js serve'`
+  lists the pid — if any of those fail, the self-test exits 2
+  with a diagnostic (never silently green). The decoy is killed
+  at the END of `cleanup()`, AFTER the SELF-CHECK sweep — killing
+  it earlier (round-6 v1) left the sweep with nothing to observe
+  and made the test vacuous. Assertion contract:
+
+  ```bash
+  DOGFOOD_SELFTEST_TEARDOWN_WITH_DECOY=1 bash scripts/dogfood-channel.sh > /tmp/log
+  rc=$?
+  # BOTH must hold:
+  [[ $rc -eq 0 ]] && grep -qE '^\[dogfood\] teardown complete$' /tmp/log
+  ```
+
+  Substring matches are not sufficient — the self-test's own
+  announcement line contains the phrase "teardown complete" in
+  prose. The assertion must anchor on the exact log line
+  `^[dogfood] teardown complete$`. Verified: RED on 6b90ac9's
+  cleanup + `daemons_rooted_at_state` shape (`set -e`, `[[ … ]]
+  && printf` tail), GREEN on the fix.
 
 **Channel content is untrusted to the agent — harness policy.**
 ADR-0007 states the principle: comments are REQUESTS from a human,
