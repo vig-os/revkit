@@ -135,42 +135,6 @@ class WebSocketSubscriber implements Subscriber {
   }
 }
 
-/** A `Subscriber` backed by an SSE-shaped `ReadableStream`. Owns the
- * writer so it can push frames and keepalives. */
-class SseSubscriber implements Subscriber {
-  #closed = false;
-  constructor(
-    private readonly controller: ReadableStreamDefaultController<Uint8Array>,
-    private readonly encoder: TextEncoder,
-  ) {}
-  deliver(event: ReviewEvent): void {
-    if (this.#closed) return;
-    try {
-      this.controller.enqueue(this.encoder.encode(sseFrame(event)));
-    } catch {
-      this.#closed = true;
-      throw new Error("sse-enqueue-failed");
-    }
-  }
-  writeKeepalive(): void {
-    if (this.#closed) return;
-    try {
-      this.controller.enqueue(this.encoder.encode(sseKeepalive()));
-    } catch {
-      this.#closed = true;
-    }
-  }
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    try {
-      this.controller.close();
-    } catch {
-      // Already closed.
-    }
-  }
-}
-
 /** How often to send an SSE keepalive comment. Kept short so a paused
  * tab wakes quickly; long enough not to spam the log. */
 const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
