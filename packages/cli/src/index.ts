@@ -27,6 +27,9 @@ import { runMcpCommand } from "./mcp/cli.ts";
 import { runOpenCommand } from "./open-cli.ts";
 import { runReviewCommand, defaultReviewEnv } from "./review/cli.ts";
 import { spawnGit } from "./git-runner.ts";
+import { runEventsCommand } from "./events-cli.ts";
+import { runHookCommand } from "./hook-cli.ts";
+import { runModeCommand } from "./mode-cli.ts";
 import { resolve as resolvePath } from "node:path";
 
 /** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
@@ -45,6 +48,9 @@ Usage:
   revkit mcp [--dir <path>]
   revkit open [<path>]
   revkit review <pr-number|url> [--trust <sha>] [--no-serve] [--repo <slug>]
+  revkit mode [handover | live | quiet]
+  revkit events --follow [--since <n>] [--dir <path>]
+  revkit hook user-prompt-submit
 
 Guards (ADR-0005):
   component-registry, no-hand-rolled-ui, vocabulary, links, plot-structure,
@@ -88,6 +94,24 @@ the daemon, and forwards human comments/replies as
 if '.revkit/serve.json' is missing or stale. Run under Claude Code
 with --dangerously-load-development-channels server:revkit until
 the plugin lands on an allowlisted marketplace.
+
+mode reads or writes the daemon's delivery mode (ADR-0007 §5.3):
+  handover (default) — batch human comments, deliver on hand-over
+  live               — push every comment as it lands
+  quiet              — nothing pushed; agent pulls via MCP tools
+An @agent now marker in a comment body overrides handover / quiet
+for that one comment and flushes the pending batch immediately.
+
+events --follow prints one JSON line per daemon event on stdout,
+authenticated with the agent bearer token from .revkit/serve.json.
+Intended for Claude Code's Monitor tool as a fallback when the
+channel path is not available. Reconnects with exponential backoff.
+
+hook user-prompt-submit is the UserPromptSubmit hook: on every
+prompt it prints pending review items as additionalContext. Fast
+(soft ~400 ms deadline), silent on empty / missing daemon / any
+error, escapes every reviewer-authored field. Wire into your
+project's .claude/settings.json — never the user's global config.
 
 Subcommands (build, invite, deploy) land in their milestones
 (see the roadmap in docs/designs/DESIGN-0001-revkit-architecture.md).
@@ -262,6 +286,26 @@ export async function dispatch(
       exitCode: outcome.exitCode,
       ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
     };
+  }
+
+  if (first === "events") {
+    const outcome = await runEventsCommand(rest, { cwd: env.cwd });
+    return {
+      stdout: outcome.stdout,
+      stderr: outcome.stderr,
+      exitCode: outcome.exitCode,
+      ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
+    };
+  }
+
+  if (first === "hook") {
+    const outcome = await runHookCommand(rest, { cwd: env.cwd });
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
+  }
+
+  if (first === "mode") {
+    const outcome = await runModeCommand(rest, { cwd: env.cwd });
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
   }
 
   return {

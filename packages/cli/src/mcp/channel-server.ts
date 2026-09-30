@@ -213,6 +213,41 @@ const RESOLVE_TOOL = {
   },
 } as const;
 
+const MODE_TOOL = {
+  name: "mode",
+  description:
+    "Read revkit's current delivery mode (ADR-0007 §5.3). Modes: `handover` (default; the " +
+    "reviewer's comments are batched and delivered on hand-over), `live` (each comment pushes " +
+    "as it lands), `quiet` (nothing is pushed; the agent pulls via `threads`). Round 2: the " +
+    "mode is the REVIEWER's choice and the agent cannot change it — a `set` call is refused " +
+    "at the daemon (ADR-0007 amendment: agent authority over the mode is denied so a " +
+    "prompt-injected agent cannot silence inbound review).",
+  inputSchema: {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  },
+} as const;
+
+const PRESENCE_TOOL = {
+  name: "presence",
+  description:
+    "Emit a presence beacon (ADR-0007 §5.3) so the reviewer's rail shows 'agent is editing …'. " +
+    "State: `editing` (with optional path + line range) or `idle`. The daemon auto-expires " +
+    "an `editing` beacon after ~30 s, so a long tool call needs periodic refreshes.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      state: { type: "string", enum: ["editing", "idle"] },
+      path: { type: "string", description: "Repo-relative path being edited." },
+      startLine: { type: "integer", minimum: 1 },
+      endLine: { type: "integer", minimum: 1 },
+    },
+    required: ["state"],
+    additionalProperties: false,
+  },
+} as const;
+
 const ASK_TOOL = {
   name: "ask",
   description:
@@ -296,6 +331,12 @@ interface WireComment {
   readonly author?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   readonly body: string;
 }
+
+/** Optional set of "delivered to agent" comment ids the caller may
+ * supply — the daemon derives this from the log; when absent the
+ * catch-up falls back to the pre-round-2 heuristic ("human last
+ * commenter") but with a clear note that it may over-count. */
+export type DeliveredSet = ReadonlySet<string>;
 /** A minimal duck type for the wire thread the daemon exposes.
  * Issue #46 item 5: an anchor may be `line` (start/end present)
  * OR `unanchored` (start/end absent, `kind: "unanchored"` set).
@@ -344,6 +385,7 @@ function renderAnchorRange(anchor: {
  * `<channel>` tag even in the worst case. */
 export function formatCatchupSummary(
   threads: readonly WireThread[],
+  delivered?: DeliveredSet,
 ): ChannelPayload | undefined {
   const waiting = threads.filter((thread) => {
     // Issue #46 item 5: `resolved` and `orphaned` threads never
@@ -352,7 +394,16 @@ export function formatCatchupSummary(
     if (thread.status !== "open") return false;
     const last = thread.comments[thread.comments.length - 1];
     if (last === undefined) return false;
-    return last.author?.kind !== "agent";
+    if (last.author?.kind === "agent") return false;
+    // Round-3: the catch-up summary is a PUSH-side surface. It
+    // filters to DELIVERED threads only so the channel does not
+    // interrupt the agent about drafts the reviewer has not yet
+    // handed over. This is a DELIVERY-TIMING contract, not
+    // confidentiality — the `threads` MCP tool intentionally
+    // returns handover drafts too (see ADR-0007 round-3
+    // amendment).
+    if (delivered !== undefined && !delivered.has(last.id)) return false;
+    return true;
   });
   if (waiting.length === 0) return undefined;
   const sample = waiting.slice(0, 10);
@@ -409,6 +460,15 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     // reopen the thread with a diagnostic.
     "thread.reanchored",
     "thread.orphaned",
+    // M2 item 6: `handover` promotes a batch of buffered comments
+    // to the agent stream. One frame carrying the commentIds tells
+    // the agent to call `threads` — a coherent hand-off, not a
+    // burst of per-comment notifications.
+    "handover",
+    // M2 item 6: presence beacons ("agent is editing …") — the
+    // rail renders them, and other agent sessions can see peer
+    // activity. Emitted on `editing` and on the daemon's auto-idle.
+    "presence",
   ]);
   if (!relevantKinds.has(kind)) return undefined;
   const actor = event.actor as { readonly kind?: string; readonly id?: string; readonly displayName?: string } | undefined;
@@ -424,7 +484,17 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     (kind === "thread.reanchored" || kind === "thread.orphaned") &&
     actor.kind === "agent" &&
     actor.id === "revkit-reanchor";
-  if (!isReanchorSystemEvent && actor.kind === "agent") return undefined;
+  // Presence and handover are agent-facing signals from a `local`
+  // author (the reviewer or the daemon itself). Presence beacons
+  // come from ANOTHER agent session, not the recipient — an agent
+  // hearing about its own presence is echo and gets skipped.
+  if (kind === "presence" && actor.kind === "agent") {
+    // Best-effort: skip echoes only when we can tell the id apart.
+    // In the M2 daemon the recipient is `agent`; an M3 named session
+    // would filter by its own name. Absent that, pass through.
+    if (actor.id === "agent") return undefined;
+  }
+  if (!isReanchorSystemEvent && actor.kind === "agent" && kind !== "handover" && kind !== "presence") return undefined;
   const threadId = typeof event.threadId === "string" ? event.threadId : undefined;
   const anchor = event.anchor as
     | { readonly path?: string; readonly startLine?: number; readonly endLine?: number }
@@ -511,6 +581,58 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
         `The thread is kept and remains repliable / resolvable.`;
       break;
     }
+    case "handover": {
+      // M2 item 6: promote a batched hand-over to the agent as ONE
+      // frame with the count + comment ids + a call-to-action.
+      // The commentIds pass through review-core's `idSchema` at
+      // append-time, so a body cannot forge a channel tag even if
+      // it reached this point; escape defensively regardless.
+      const rawIds = (event as unknown as { commentIds?: unknown }).commentIds;
+      const ids = Array.isArray(rawIds) ? (rawIds as unknown[]).filter((v): v is string => typeof v === "string") : [];
+      const rawNote = (event as unknown as { note?: unknown }).note;
+      const safeNote = typeof rawNote === "string" ? escapeContentFragment(rawNote) : "";
+      put("kind", "handover");
+      put("count", String(ids.length));
+      const idList = ids.slice(0, 10).map((id) => escapeContentFragment(id)).join(", ");
+      const more = ids.length > 10 ? ` (+${ids.length - 10} more)` : "";
+      content =
+        `Hand-over from ${safeActor}: ${ids.length} comment${ids.length === 1 ? "" : "s"} to review. ` +
+        (safeNote.length > 0 ? `${safeNote} ` : "") +
+        `Call the \`threads\` tool for details. Comment ids: ${idList}${more}.`;
+      break;
+    }
+    case "presence": {
+      // M2 item 6: presence broadcast. Skipped early when the
+      // author is this session's own agent; here we render other
+      // agent sessions' beacons for peer visibility.
+      //
+      // Presence events carry `path` / `startLine` / `endLine`
+      // at the TOP level (see `packages/review-core/src/events.ts`
+      // presencePayload), not on an `anchor` sub-object as
+      // comment / thread events do. Read them from the event
+      // directly rather than the outer `anchor` capture.
+      const rawState = (event as unknown as { state?: unknown }).state;
+      const stateStr = rawState === "editing" ? "editing" : rawState === "idle" ? "idle" : "unknown";
+      const pathValue = typeof (event as { path?: unknown }).path === "string"
+        ? ((event as { path?: string }).path as string)
+        : undefined;
+      const startValue = (event as { startLine?: unknown }).startLine;
+      const endValue = (event as { endLine?: unknown }).endLine;
+      const startNum = typeof startValue === "number" ? startValue : undefined;
+      const endNum = typeof endValue === "number" ? endValue : undefined;
+      const safeWhere =
+        pathValue !== undefined
+          ? startNum !== undefined && endNum !== undefined
+            ? `${escapeContentFragment(pathValue)}:${startNum}-${endNum}`
+            : escapeContentFragment(pathValue)
+          : "";
+      put("kind", "presence");
+      put("state", stateStr);
+      content = safeWhere.length > 0
+        ? `Presence: ${safeActor} is ${stateStr} on ${safeWhere}.`
+        : `Presence: ${safeActor} is ${stateStr}.`;
+      break;
+    }
     default:
       return undefined;
   }
@@ -545,6 +667,34 @@ const reviewUrlArgsSchema = z
     path: z.string().min(1).max(1024).optional(),
   })
   .strict();
+
+const modeArgsSchema = z.object({}).strict();
+
+const presenceArgsSchema = z
+  .object({
+    state: z.enum(["editing", "idle"]),
+    path: z.string().min(1).max(2048).optional(),
+    startLine: z.number().int().positive().optional(),
+    endLine: z.number().int().positive().optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    const startSet = value.startLine !== undefined;
+    const endSet = value.endLine !== undefined;
+    if (startSet !== endSet) {
+      ctx.addIssue({
+        code: "custom",
+        path: [startSet ? "endLine" : "startLine"],
+        message: "presence: startLine and endLine must be set together.",
+      });
+    } else if (startSet && (value.endLine ?? 0) < (value.startLine ?? 0)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["endLine"],
+        message: "presence: endLine must be >= startLine.",
+      });
+    }
+  });
 
 const askArgsSchema = z
   .object({
@@ -603,7 +753,16 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   // ── tools/list ────────────────────────────────────────────────────
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [THREADS_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, ASK_TOOL, AWAIT_ANSWER_TOOL],
+    tools: [
+      THREADS_TOOL,
+      REPLY_TOOL,
+      RESOLVE_TOOL,
+      REVIEW_URL_TOOL,
+      MODE_TOOL,
+      PRESENCE_TOOL,
+      ASK_TOOL,
+      AWAIT_ANSWER_TOOL,
+    ],
   }));
 
   // ── ask-answer waiters ────────────────────────────────────────────
@@ -664,6 +823,21 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
         const parsed = reviewUrlArgsSchema.safeParse(args);
         if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
         return await client.mintLaunchUrl(parsed.data.path);
+      }
+      if (toolName === "mode") {
+        const parsed = modeArgsSchema.safeParse(args);
+        if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
+        void parsed;
+        return await client.getMode();
+      }
+      if (toolName === "presence") {
+        const parsed = presenceArgsSchema.safeParse(args);
+        if (!parsed.success) throw new ToolValidationError(parsed.error.issues);
+        const location: { path?: string; startLine?: number; endLine?: number } = {};
+        if (parsed.data.path !== undefined) location.path = parsed.data.path;
+        if (parsed.data.startLine !== undefined) location.startLine = parsed.data.startLine;
+        if (parsed.data.endLine !== undefined) location.endLine = parsed.data.endLine;
+        return await client.presence(parsed.data.state, location);
       }
       if (toolName === "ask") {
         const parsed = askArgsSchema.safeParse(args);
@@ -870,7 +1044,27 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       ? { threads: options.initialListing.threads, head: options.initialListing.head }
       : await currentClient.listThreads();
     lastSeenSeq = listing.head ?? 0;
-    const summary = formatCatchupSummary(listing.threads as readonly WireThread[]);
+    // Round-2: the catch-up summary must ONLY list threads that
+    // are delivered to the agent. The `deliveredCommentIds` set
+    // is derived on the daemon and returned from `/api/delivered`.
+    //
+    // Round-3 fail-closed: if the daemon errors on that endpoint
+    // (an older daemon before the round-2 refactor OR a network
+    // hiccup), the catch-up must SUPPRESS everything rather than
+    // fall back to the pre-round-2 shape — an older-shape summary
+    // would leak handover drafts into the channel on the very
+    // first frame the agent sees. The `hook` command already
+    // fails silent on the same error; the catch-up now matches.
+    let delivered: DeliveredSet;
+    try {
+      delivered = new Set(await currentClient.getDeliveredCommentIds());
+    } catch {
+      // Fail closed: no summary emitted this connect. The agent
+      // can still call `threads` to pull if it needs to.
+      attachSubscriber();
+      return;
+    }
+    const summary = formatCatchupSummary(listing.threads as readonly WireThread[], delivered);
     if (summary !== undefined) {
       await emitNotification(summary);
     }
@@ -888,7 +1082,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       agentToken: currentToken,
       since: lastSeenSeq,
       onEvent: async (event: WireEvent) => {
-        if (event.seq > lastSeenSeq) lastSeenSeq = event.seq;
+        // Round-2: ephemeral frames (presence) carry no `seq` and
+        // must not advance the resume point.
+        if (typeof event.seq === "number" && event.seq > lastSeenSeq) lastSeenSeq = event.seq;
         // Wake `await_answer` waiters on terminal ask events. The
         // check runs BEFORE the channel-notification path so the
         // waiter gets its answer even if the notification is
@@ -1015,9 +1211,20 @@ function toolError(issues: unknown): {
 export {
   askArgsSchema,
   awaitAnswerArgsSchema,
+  modeArgsSchema,
+  presenceArgsSchema,
   replyArgsSchema,
   resolveArgsSchema,
   reviewUrlArgsSchema,
   threadsArgsSchema,
 };
-export { ASK_TOOL, AWAIT_ANSWER_TOOL, REPLY_TOOL, RESOLVE_TOOL, REVIEW_URL_TOOL, THREADS_TOOL };
+export {
+  ASK_TOOL,
+  AWAIT_ANSWER_TOOL,
+  MODE_TOOL,
+  PRESENCE_TOOL,
+  REPLY_TOOL,
+  RESOLVE_TOOL,
+  REVIEW_URL_TOOL,
+  THREADS_TOOL,
+};

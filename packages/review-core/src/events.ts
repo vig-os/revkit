@@ -84,6 +84,28 @@ const envelope = {
  * downstream consumers (the rail, the GitHub adapter) can type against
  * exactly the first-comment payload without picking the whole event
  * apart. */
+/** Typed mention (ADR-0011). The daemon parses comment bodies at
+ * append time with the real Markdown parser (`micromark`), extracts
+ * mentions from prose (code spans / fenced blocks / HTML comments
+ * are excluded), and writes the typed list onto the event. The
+ * rail renders chips from this field — never re-parses the body.
+ * A subsequent `comment.linked` etc. never mutates this. */
+const commentMentionSchema = z
+  .object({
+    kind: z.enum(["agent", "agent-now", "gh-user", "team", "role"]),
+    /** `<login>` for gh-user; `<org>/<team>` for team; `agent` /
+     * `agent:<name>` / `claude` for agent; `author`/`reviewers`/`owners`
+     * for role; empty string for `agent-now` (the marker itself). */
+    id: z.string(),
+    /** The label rendered inside the chip (`@agent`, `@login`, …). */
+    label: z.string().min(1),
+    /** For `@agent:<name>` only. */
+    name: z.string().min(1).optional(),
+    /** [start, end) offset in the original comment body. */
+    range: z.tuple([z.number().int().nonnegative(), z.number().int().nonnegative()]),
+  })
+  .strict();
+
 const commentCreatedPayload = {
   kind: z.literal("comment.created"),
   threadId: idSchema,
@@ -94,6 +116,10 @@ const commentCreatedPayload = {
    * sentinel string). */
   anchor: anyAnchorSchema,
   body: z.string().min(1),
+  /** Typed mentions parsed from the body at append time (ADR-0011,
+   * M2 item 6 review round 2). Written by the daemon; the rail
+   * reads it to render chips WITHOUT bundling a parser. */
+  mentions: z.array(commentMentionSchema).optional(),
   /** PR-43 round-5 nit: structured origin metadata for a thread
    * imported from an external provider (currently GitHub). Set on
    * the thread's opening `comment.created` so the reducer can
@@ -125,6 +151,8 @@ const commentRepliedPayload = {
   commentId: idSchema,
   parentId: idSchema,
   body: z.string().min(1),
+  /** Typed mentions — same shape as on `comment.created`. */
+  mentions: z.array(commentMentionSchema).optional(),
 } as const;
 
 const threadResolvedPayload = {
@@ -139,6 +167,28 @@ const threadReopenedPayload = {
   reason: z.string().min(1).optional(),
 } as const;
 
+/** Trigger for a `handover` delivery event (M2 item 6 review round 2).
+ * Every delivery to the agent stream is recorded on the log as a
+ * `handover` event with one of these triggers, so the "pending" set
+ * is a pure function of the log — no in-memory state to drift.
+ *
+ *   - `live` — the comment arrived under `live` mode and was pushed
+ *     immediately. commentIds carries the single id.
+ *   - `agent-now` — the comment body carried the `@agent now`
+ *     marker; the batch was flushed alongside. commentIds carries
+ *     every id delivered in the frame (the marker's own comment
+ *     plus any prior batched drafts).
+ *   - `handover` — reviewer's explicit hand-over (`POST /api/handover`
+ *     or the rail's Hand-over button). commentIds carries the whole
+ *     pending batch at the time of the flush.
+ *   - `mode-change-flush` — handover→live transition flushed the
+ *     pending batch first, so a mid-flight batch does not disappear
+ *     when the reviewer flips modes. Handover→quiet does NOT flush
+ *     (documented decision, ADR-0007 amendment). */
+const handoverTriggers = ["live", "agent-now", "handover", "mode-change-flush"] as const;
+export const handoverTriggerSchema = z.enum(handoverTriggers);
+export type HandoverTrigger = (typeof handoverTriggers)[number];
+
 const handoverPayload = {
   kind: z.literal("handover"),
   commentIds: z.array(idSchema).min(1),
@@ -146,19 +196,37 @@ const handoverPayload = {
     .string()
     .regex(SHA256_HEX_REGEX, "handover.revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
   note: z.string().min(1).optional(),
+  /** The reason this delivery event fired. Optional on the wire so
+   * an older log (pre-round-2) still parses; the daemon writes it
+   * on every new delivery. Missing = pre-round-2 handover, treated
+   * as `handover` trigger for derivation purposes. */
+  trigger: handoverTriggerSchema.optional(),
 } as const;
 
+/** M2 item 6 review round 2: mode changes ARE log events, not just
+ * a file on disk. This lets rehydration derive the "current mode"
+ * (and every comment's arrival mode) from the log alone. */
+const deliveryModes = ["handover", "live", "quiet"] as const;
+export const deliveryModeSchema = z.enum(deliveryModes);
+export type DeliveryMode = (typeof deliveryModes)[number];
+
+const deliveryModeChangedPayload = {
+  kind: z.literal("delivery.mode_changed"),
+  /** Previous mode. `null` for the very first mode-set on a fresh
+   * daemon (there was no prior mode to record). */
+  from: deliveryModeSchema.nullable(),
+  to: deliveryModeSchema,
+} as const;
+
+/** Presence state is EPHEMERAL (M2 item 6 review round 2). It is
+ * broadcast over the /events stream but never persisted to the
+ * durable log — a presence beacon vanishes on a daemon restart,
+ * which matches its meaning ("agent is editing NOW"). Kept here as
+ * a shared type + Zod enum so the daemon's broadcast validator +
+ * the rail's subscriber use the same shape. */
 const presenceStates = ["editing", "idle"] as const;
 export const presenceStateSchema = z.enum(presenceStates);
 export type PresenceState = (typeof presenceStates)[number];
-
-const presencePayload = {
-  kind: z.literal("presence"),
-  state: presenceStateSchema,
-  path: z.string().min(1).optional(),
-  startLine: z.number().int().positive().optional(),
-  endLine: z.number().int().positive().optional(),
-} as const;
 
 const askCreatedPayload = {
   kind: z.literal("ask.created"),
@@ -257,31 +325,7 @@ const eventVariants = [
   z.object({ ...envelope, ...threadResolvedPayload }).strict(),
   z.object({ ...envelope, ...threadReopenedPayload }).strict(),
   z.object({ ...envelope, ...handoverPayload }).strict(),
-  z
-    .object({ ...envelope, ...presencePayload })
-    .strict()
-    .superRefine((event, ctx) => {
-      // Line range is optional on presence, but if either bound is set the
-      // other must be too and end >= start. Prevents a half-specified
-      // "editing L10" event that a consumer can't render.
-      const startSet = event.startLine !== undefined;
-      const endSet = event.endLine !== undefined;
-      if (startSet !== endSet) {
-        ctx.addIssue({
-          code: "custom",
-          path: [startSet ? "endLine" : "startLine"],
-          message: "presence: startLine and endLine must be set together.",
-        });
-        return;
-      }
-      if (startSet && endSet && (event.endLine ?? 0) < (event.startLine ?? 0)) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["endLine"],
-          message: "presence: endLine must be >= startLine.",
-        });
-      }
-    }),
+  z.object({ ...envelope, ...deliveryModeChangedPayload }).strict(),
   z.object({ ...envelope, ...askCreatedPayload }).strict(),
   z.object({ ...envelope, ...askAnsweredPayload }).strict(),
   z.object({ ...envelope, ...askCancelledPayload }).strict(),
@@ -348,7 +392,7 @@ export const reviewEventKinds = [
   "thread.resolved",
   "thread.reopened",
   "handover",
-  "presence",
+  "delivery.mode_changed",
   "ask.created",
   "ask.answered",
   "ask.cancelled",

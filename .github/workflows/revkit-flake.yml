@@ -1,0 +1,118 @@
+# revkit flake outputs — cross-system build + template smoke (D1,
+# ADR-0010, M5).
+#
+# Verifies the M5 part 1 acceptance on every PR touching the flake or
+# the CLI:
+#   1. `nix build .#revkit` produces a reproducible CLI store path on
+#      every supported system (x86_64-linux, aarch64-linux,
+#      aarch64-darwin). Bun installs platform-native binaries
+#      (esbuild-<os>-<arch>, sharp, rolldown, lightningcss, …), so
+#      the FOD deps hash differs per system — one hash for all
+#      systems would fail everywhere but where it was captured. This
+#      matrix runs on GitHub-hosted runners for each supported
+#      system; a hash mismatch surfaces the correct hash to paste
+#      back into `flake.nix`'s `nodeModulesHashes` attrset.
+#   2. `scripts/template-smoke.sh` scaffolds `templates.default` into
+#      a temp dir, runs `nix build` and `revkit check` in it, and
+#      verifies `--help` / `--version` from the packaged wrapper
+#      outside the checkout. Runs on Linux only — Nix flake init +
+#      the smoke's shell tooling assume a Linux/macOS shell layer
+#      that matches the runners' defaults.
+#
+# ADR-0014 secret discipline:
+#   - `pull_request` only, NEVER `pull_request_target`.
+#   - `contents: read` is the only permission.
+#   - No environment secrets are used or exposed.
+#
+# `x86_64-darwin` is NOT verified today: GitHub-hosted `macos-*`
+# runners are arm64 only, so `flake.nix`'s `packages.revkit` refuses
+# to expose that system (see the `nodeModulesHashes` attrset).
+name: revkit-flake
+
+"on":
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: revkit-flake-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: nix build .#revkit
+    strategy:
+      # Fail-fast off so a hash mismatch on one system doesn't hide
+      # mismatches on the other two (a single push captures all three
+      # hashes at once).
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64-linux — the default hosted runner for Ubuntu.
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          # aarch64-linux — arm64 Ubuntu, GitHub-hosted (free on
+          # public repos as of 2025).
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          # aarch64-darwin — macOS-14+/15 default is arm64.
+          - runner: macos-latest
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix (upstream CppNix, flakes enabled)
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build revkit package for ${{ matrix.system }}
+        # `.#revkit` and `.#default` should be the same drv; the second
+        # build is a store-hit and cheap. `--print-out-paths` is the
+        # evidence we want in the log.
+        run: |
+          set -euxo pipefail
+          nix build .#revkit --no-link --print-out-paths
+          nix build .#default --no-link --print-out-paths
+
+      - name: Smoke — --version and --help outside the repo
+        # Runs from a scratch dir so a relative-import bug in the
+        # wrapper would surface. Both must succeed with exit 0.
+        run: |
+          set -euxo pipefail
+          store=$(nix build .#revkit --no-link --print-out-paths)
+          mkdir -p /tmp/revkit-smoke
+          cd /tmp/revkit-smoke
+          "$store/bin/revkit" --version
+          "$store/bin/revkit" --help | head -5
+
+  template-smoke:
+    name: templates.default end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix (upstream CppNix, flakes enabled)
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Run template smoke
+        # Scaffolds the template into a temp dir, uses --override-input
+        # to point at THIS checkout, runs revkit check, nix build, and
+        # the wrapper's --help/--version. scripts/template-smoke.sh
+        # traps EXIT so no daemon leaks on failure.
+        run: bash scripts/template-smoke.sh "${GITHUB_WORKSPACE}"

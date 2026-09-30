@@ -40,6 +40,12 @@ export interface LogFields {
   readonly bytes?: number;
   readonly count?: number;
   readonly artefact?: string;
+  /** Delivery-mode transition (M2 item 6). `from` and `to` are the
+   * previous and next `DeliveryMode` values; kept as strings on the
+   * log field so a rename of the enum does not touch every logger
+   * call. */
+  readonly from?: string;
+  readonly to?: string;
 }
 
 /** A tiny writer interface so tests can inject a buffer. Node's
@@ -147,6 +153,8 @@ const ALLOWED_KEYS = [
   "bytes",
   "count",
   "artefact",
+  "from",
+  "to",
 ] as const satisfies readonly (keyof LogFields)[];
 
 /** Exported so `test/serve/logger.test.ts` can iterate the allowlist —

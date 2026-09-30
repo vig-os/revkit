@@ -393,3 +393,137 @@
   color: var(--revkit-rail-muted);
   font-size: 0.8rem;
 }
+
+/* ------------------------------------------------------------------
+ * Delivery mode + presence + mention chips (M2 item 6, ADR-0007/0011).
+ *
+ * Kept flat: one section per concern, uses the same tokens the rest
+ * of the rail defines (--revkit-rail-fg / -muted / -accent). No
+ * :hover-only cues (touch target); no colour-only cues (contrast
+ * threshold + border on the selected radio, per WCAG 2.2 AA).
+ * ------------------------------------------------------------------ */
+
+.revkit-rail__mode {
+  padding: 0.35rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 15%, transparent);
+}
+
+.revkit-rail__mode-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.revkit-rail__mode-legend {
+  font-size: 0.8rem;
+  color: var(--revkit-rail-muted);
+  margin-right: 0.35rem;
+}
+
+.revkit-rail__mode-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 20%, transparent);
+  border-radius: 0.35rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.revkit-rail__mode-option[data-selected="true"] {
+  border-color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 8%, transparent);
+}
+.revkit-rail__mode-option input[type="radio"] {
+  /* The radio's native affordance is preserved for screen readers,
+   * but the outer border is what the sighted reviewer relies on. */
+  margin: 0;
+}
+
+.revkit-rail__mode-batched {
+  margin-top: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.revkit-rail__mode-badge {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  background: color-mix(in srgb, var(--revkit-rail-accent) 15%, transparent);
+  color: var(--revkit-rail-fg);
+  font-size: 0.75rem;
+  border-radius: 0.35rem;
+}
+
+.revkit-rail__mode-handover {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.35rem;
+  background: var(--revkit-rail-accent);
+  color: var(--revkit-rail-bg);
+  cursor: pointer;
+}
+
+.revkit-rail__presence {
+  padding: 0.25rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 12%, transparent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 5%, transparent);
+}
+
+.revkit-rail__presence-line {
+  margin: 0.1rem 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.revkit-rail__presence-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--revkit-rail-accent);
+  /* Pulsing dot; respects prefers-reduced-motion so the badge does
+   * not oscillate for a vestibular-sensitive reviewer. */
+  animation: revkit-rail-presence-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .revkit-rail__presence-dot { animation: none; }
+}
+@keyframes revkit-rail-presence-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+
+.revkit-rail__mention {
+  display: inline;
+  padding: 0 0.25rem;
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--revkit-rail-accent) 12%, transparent);
+  color: var(--revkit-rail-fg);
+  font-weight: 500;
+}
+.revkit-rail__mention--agent-now {
+  background: color-mix(in srgb, var(--revkit-rail-accent) 30%, transparent);
+  outline: 1px solid var(--revkit-rail-accent);
+}
+
+.revkit-rail__delivery-note {
+  padding: 0.35rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 12%, transparent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 6%, transparent);
+  border-left: 3px solid var(--revkit-rail-accent);
+}
+
+.revkit-rail__delivery-note-text {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
