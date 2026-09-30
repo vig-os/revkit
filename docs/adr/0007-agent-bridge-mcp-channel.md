@@ -173,13 +173,18 @@ memory and after a restart. Round 2 fixes this **by construction**:
   This amendment retracts those claims.
 
 - **What handover IS.** A UX contract: while the reviewer is drafting,
-  the channel stays quiet — no per-comment notification, no
+  the PUSH surface stays quiet — no per-comment notification, no
   additionalContext preamble on the next prompt. On explicit
   hand-over the drafts land in a single coherent frame. That contract
-  is enforced on the PUSH surface only (`/events?for=agent`, the
-  channel notifications, the `UserPromptSubmit` hook, the catch-up
-  summary). PULL surfaces — `threads` MCP tool, `GET /api/threads`,
-  `revkit events --follow` — return whatever the log carries.
+  is enforced on every PUSH surface: `/events?for=agent` (the SSE /
+  WS stream the channel client and `revkit events --follow` both
+  subscribe to, gated by the delivery mode), the channel
+  notifications, the `UserPromptSubmit` hook, and the catch-up
+  summary. PULL surfaces — the `threads` MCP tool and
+  `GET /api/threads` — return whatever the log carries. Note:
+  `revkit events --follow` is a PUSH client (it reads
+  `/events?for=agent`) and is therefore ALSO gated — it is not a
+  pull path around the mode.
 
 - **Visibility for the reviewer.** When the agent (or any local
   caller) hits `POST /api/handover` or `POST /api/delivery-mode`, the
@@ -194,8 +199,8 @@ memory and after a restart. Round 2 fixes this **by construction**:
   needs a separate credential path: a reviewer-only bearer stored
   outside the agent's uid (a keyring, a hardware-bound key, an OS
   keychain), plus a partition on the daemon's HTTP surface (reader
-  vs. reviewer). That is out of scope for M2 item 6. Tracked as a
-  planned follow-up.
+  vs. reviewer). That is out of scope for M2 item 6. Tracked as
+  [vig-os/revkit#55](https://github.com/vig-os/revkit/issues/55).
 
 ## Amendment (2026-09-30) — M2 item 6: delivery modes, presence, `@agent`, hook
 
@@ -235,8 +240,11 @@ The decisions the design left open:
   **30 seconds** (per-agent-id timer, refreshed on the next `editing` from the same agent). A long tool call must
   refresh periodically or the badge clears on its own.
 
-- **Monitor-WebSocket fallback = `revkit events --follow`.** A one-shot CLI subcommand that opens
+- **Monitor-WebSocket fallback = `revkit events --follow`.** A CLI subcommand that opens
   `/events?for=agent` with the agent bearer token from `serve.json` and writes one JSON line per event to stdout.
+  This is a PUSH client, not a pull path — `/events?for=agent` is the same delivery-mode-gated stream the channel
+  client subscribes to (round-3 amendment), so a comment batched under `handover` mode is invisible on
+  `events --follow` too until the reviewer hands over (or the comment carries `@agent now`).
   `JSON.stringify` is the escape (every user-supplied field is safe on a single line), so a body containing `\n`
   or `</channel>` cannot break the line-per-frame contract Monitor depends on. Reconnect uses the shared
   exponential backoff (500 ms → 30 s).

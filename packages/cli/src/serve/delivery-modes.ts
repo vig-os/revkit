@@ -29,6 +29,20 @@ import {
 export { DEFAULT_DELIVERY_MODE };
 export type { DeliveryMode };
 
+/** Thrown by `DeliveryAdapter.ingest` when an event's `seq` is
+ * greater than `lastSeq + 1` — i.e. events arrived out of order or
+ * with a gap. The daemon never sees this (each `store.append`
+ * returns strictly monotonic seqs); a caller that does must
+ * recover via `rebuildFromLog(events)` with the current full log
+ * slice. Idempotent duplicates (`seq <= lastSeq`) are silently
+ * skipped and never raise. */
+export class IngestGapError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IngestGapError";
+  }
+}
+
 /** The typed enum values (kept as a tuple for CLI --help / tests). */
 export const deliveryModes = ["handover", "live", "quiet"] as const satisfies readonly DeliveryMode[];
 
@@ -123,9 +137,26 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
 
   // ── incremental cache ─────────────────────────────────────
   //
-  // We track, per human comment id: arrival mode + delivered flag.
-  // Mode is the current delivery mode. `lastMs` and `updatedAtMs`
-  // support the status snapshot.
+  // The cache tracks, per human comment id: arrival mode + delivered
+  // flag. Mode is the current delivery mode.
+  //
+  // Round-4 safety: the arrival mode a comment's entry carries is the
+  // mode AT ITS OWN SEQ — set at the time we fold that comment.
+  // That means `ingest` is not order-invariant: an event folded
+  // BEFORE its preceding `delivery.mode_changed` would record the
+  // wrong arrival mode. We enforce order by tracking `lastSeq`:
+  //
+  //   - `event.seq <= lastSeq` — duplicate; silently skip.
+  //   - `event.seq === lastSeq + 1` — normal fold.
+  //   - `event.seq  >  lastSeq + 1` — GAP. The caller must call
+  //     `rebuildFromLog` with the full slice. `ingest` throws
+  //     `IngestGapError` so a bug (or a hostile duplicate that
+  //     re-orders events on the wire) surfaces loudly instead of
+  //     silently corrupting the cache.
+  //
+  // In the daemon this never fires — every `store.append` returns
+  // a strictly increasing seq and we ingest exactly that event.
+  // The check is defense in depth AND the property-test hook.
   interface CommentEntry {
     arrivalMode: DeliveryMode;
     delivered: boolean;
@@ -134,15 +165,17 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
   let mode: DeliveryMode = DEFAULT_DELIVERY_MODE;
   let lastMs: number | null = null;
   let updatedAtMs: number | undefined;
+  let lastSeq = 0;
 
   const reset = (): void => {
     entries.clear();
     mode = DEFAULT_DELIVERY_MODE;
     lastMs = null;
     updatedAtMs = undefined;
+    lastSeq = 0;
   };
 
-  const ingest: DeliveryAdapter["ingest"] = (event) => {
+  const applyEvent = (event: ReviewEvent): void => {
     switch (event.kind) {
       case "delivery.mode_changed": {
         mode = event.to;
@@ -155,10 +188,6 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
         if (event.actor.kind === "agent") break;
         entries.set(event.commentId, {
           arrivalMode: mode,
-          // Live arrivals are delivered as soon as they land; the
-          // handover(trigger=live) bookkeeping event also comes
-          // through this ingest path, so this is consistent even
-          // if the log is replayed in either order.
           delivered: mode === "live",
         });
         const parsed = Date.parse(event.ts);
@@ -175,10 +204,30 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
     }
   };
 
+  const ingest: DeliveryAdapter["ingest"] = (event) => {
+    if (event.seq <= lastSeq) return; // duplicate — idempotent no-op
+    if (event.seq > lastSeq + 1) {
+      throw new IngestGapError(
+        `ingest gap: got seq=${event.seq}, expected ${lastSeq + 1}. ` +
+          `Caller must rebuildFromLog(events) with the full log slice.`,
+      );
+    }
+    applyEvent(event);
+    lastSeq = event.seq;
+  };
+
   const rebuildFromLog: DeliveryAdapter["rebuildFromLog"] = (events) => {
     reset();
     const sorted = [...events].sort((a, b) => a.seq - b.seq);
-    for (const event of sorted) ingest(event);
+    for (const event of sorted) {
+      // rebuildFromLog is authoritative: skip strict duplicates
+      // but do not throw on gaps (a `since(0)` slice can be sparse
+      // in a D1-backed store per ADR-0006, which allows non-
+      // contiguous seqs). Advance lastSeq to the max seq we see.
+      if (event.seq <= lastSeq) continue;
+      applyEvent(event);
+      lastSeq = event.seq;
+    }
   };
 
   const currentMode: DeliveryAdapter["currentMode"] = () => mode;

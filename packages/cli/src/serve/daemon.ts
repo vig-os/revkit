@@ -43,7 +43,7 @@ import {
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
-import { openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
+import { IngestGapError, openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
 import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
 import { openStaticServer } from "./static-server.ts";
@@ -603,7 +603,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // Fold the boot event into the cache.
         const written = await store.since(seq - 1);
         const event = written.find((e) => e.seq === seq);
-        if (event !== undefined) delivery.ingest(event);
+        if (event !== undefined) await safeIngest(event);
       } catch (error) {
         logger.warn("delivery.boot-mode.failed", {
           errorKind: (error as Error).name,
@@ -1208,7 +1208,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (event !== undefined) {
       // Round-3: fold this event into the derived cache FIRST so
       // subsequent audit / snapshot / etc. read the fresh state.
-      delivery.ingest(event);
+      // Round-4: recovery on a seq gap (external sqlite writer,
+      // etc.) rebuilds the cache from the full log.
+      await safeIngest(event);
       // Round-2 ATOMICITY: the delivery event (if any) is appended
       // FIRST, so the fan-out decision at publish time reads a log
       // that already reflects the delivery. Otherwise a
@@ -1269,6 +1271,27 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return rail;
   }
 
+  /** Round-4: fold `event` into the delivery cache; on
+   * `IngestGapError` (an external sqlite writer inserted a row
+   * outside the daemon's append path, or seqs skipped for any
+   * reason), recover by rebuilding the cache from the full log
+   * before re-ingesting. Any other error is re-thrown. */
+  async function safeIngest(event: ReviewEvent): Promise<void> {
+    try {
+      delivery.ingest(event);
+    } catch (error) {
+      if (error instanceof IngestGapError) {
+        logger.warn("delivery.ingest.gap", {
+          seq: event.seq,
+          errorKind: "IngestGapError",
+        });
+        delivery.rebuildFromLog(await store.since(0));
+      } else {
+        throw error;
+      }
+    }
+  }
+
   /** Append a `handover` delivery event covering `ids` under the
    * given `trigger`. The revision is the SHA-256 of a synthetic
    * "delivered:<ISO ts>" string — the log's own reference for the
@@ -1302,7 +1325,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       if (event !== undefined) {
         // Fold into the cache BEFORE fan-out, so shouldFanOutToAgent
         // reads the fresh state.
-        delivery.ingest(event);
+        await safeIngest(event);
         const audiences = auditFanOutAudiences(event);
         void bus.publish(event, { audiences });
       }
@@ -1415,8 +1438,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       if (before === "handover" && mode === "live") {
         await flushPendingHandover("mode-change-flush");
       }
+      let modeSeq: number;
       try {
-        await store.append({
+        modeSeq = await store.append({
           kind: "delivery.mode_changed",
           actor,
           from: before,
@@ -1429,12 +1453,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         throw error;
       }
       // Fan out the mode-change (rail-only per audit rules).
-      // Round-3: read the just-written event by seq and fold it
-      // into the cache before publishing.
-      const eventsAfter = await store.since(0);
-      const modeEvent = eventsAfter[eventsAfter.length - 1];
+      // Round-4: fetch exactly the row we just wrote by seq
+      // (`since(modeSeq - 1)`) instead of the last row of a full
+      // scan. A concurrent write between the append and the read
+      // could otherwise fold the WRONG event into the cache.
+      const written = await store.since(modeSeq - 1);
+      const modeEvent = written.find((e) => e.seq === modeSeq);
       if (modeEvent !== undefined) {
-        delivery.ingest(modeEvent);
+        await safeIngest(modeEvent);
         const audiences = auditFanOutAudiences(modeEvent);
         void bus.publish(modeEvent, { audiences });
       }
