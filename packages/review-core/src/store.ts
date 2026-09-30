@@ -163,9 +163,7 @@ export class InMemoryThreadStore implements ThreadStore {
   }
 
   async threads(filter?: ThreadFilter): Promise<Thread[]> {
-    const derived = reduce(this.#events);
-    const list = [...derived.values()].sort((a, b) => a.createdSeq - b.createdSeq);
-    return list.filter((thread) => matches(thread, filter));
+    return selectThreads(this.#events, filter);
   }
 
   async thread(id: string): Promise<Thread | undefined> {
@@ -174,7 +172,30 @@ export class InMemoryThreadStore implements ThreadStore {
   }
 }
 
-function matches(thread: Thread, filter: ThreadFilter | undefined): boolean {
+/** Reduce `events` and return the resulting threads, ordered by
+ * `createdSeq` ascending and filtered by `filter`. One implementation
+ * owns the reduce → sort → filter sequence; both `InMemoryThreadStore`
+ * and the daemon's `SqliteThreadStore` call it, so a filter rule added
+ * here (an author kind, a mention target, a `since` filter later)
+ * shows up on both stores without a copy-paste.
+ *
+ * The ordering (`createdSeq` ascending) matches the `Thread.createdSeq`
+ * doc line in `thread.ts`: deterministic, and stable across replays,
+ * because seq is the wire-level monotone the store assigns, not a
+ * clock-sensitive ISO string. */
+export function selectThreads(
+  events: readonly ReviewEvent[],
+  filter?: ThreadFilter,
+): Thread[] {
+  const derived = reduce(events);
+  const list = [...derived.values()].sort((a, b) => a.createdSeq - b.createdSeq);
+  return list.filter((thread) => matchesFilter(thread, filter));
+}
+
+/** Predicate for `ThreadFilter`. Exported so a caller with its own
+ * pre-reduced thread set (a UI cache, an export tool) can apply the
+ * same rules the store applies. */
+export function matchesFilter(thread: Thread, filter: ThreadFilter | undefined): boolean {
   if (filter === undefined) return true;
   if (filter.path !== undefined && thread.anchor.path !== filter.path) return false;
   if (filter.status !== undefined) {

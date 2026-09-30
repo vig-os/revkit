@@ -31,6 +31,7 @@ import {
   parseArchive,
   reduce,
   reviewEventSchema,
+  selectThreads,
   validateNext,
   type Clock,
   type LogState,
@@ -39,7 +40,6 @@ import {
   type Thread,
   type ThreadArchive,
   type ThreadFilter,
-  type ThreadStatus,
   type ThreadStore,
 } from "@revkit/review-core";
 import { ThreadStoreAppendError, ThreadStoreImportError } from "@revkit/review-core";
@@ -122,23 +122,63 @@ export class SqliteThreadStore implements ThreadStore {
   }
 
   async append(input: ReviewEventInput): Promise<number> {
-    const seq = this.#head + 1;
+    // Take the next seq inside a `BEGIN IMMEDIATE` transaction so a
+    // concurrent writer (a second `revkit serve`, a repair script)
+    // that appended between two of our writes does not collide on
+    // the PRIMARY KEY. We rehydrate any events we did not see, replay
+    // them through the in-memory validator, and only then insert.
+    //
+    // If the log state has drifted such that the caller's event no
+    // longer validates against the reconciled state (a duplicate
+    // commentId came in from the other side), we surface the same
+    // `ThreadStoreAppendError` the append path always raises and roll
+    // the transaction back — the log is unchanged.
     const ts = this.#clock();
-    const candidate = { ...input, seq, ts } as ReviewEvent;
-    const parsed = reviewEventSchema.safeParse(candidate);
-    if (!parsed.success) {
-      throw new ThreadStoreAppendError({
-        kind: "invalid-shape",
-        message: `append: event failed validation: ${JSON.stringify(parsed.error.issues)}`,
-      });
-    }
-    const event = parsed.data;
-    const result = validateNext(this.#logState, event);
-    if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
-    this.#db
-      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-      .run(seq, ts, JSON.stringify(event));
-    this.#head = seq;
+    const insertStmt = this.#db.prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)");
+    const catchUpStmt = this.#db.query<{ payload: string }, [number]>(
+      "SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC",
+    );
+    const maxSeqStmt = this.#db.query<{ seq: number | null }, []>("SELECT MAX(seq) AS seq FROM events");
+
+    // Bun's `db.transaction(fn)("immediate")` runs `fn` inside a
+    // BEGIN IMMEDIATE. Errors thrown inside roll it back.
+    const txn = this.#db.transaction((): { seq: number; event: ReviewEvent } => {
+      // Catch up on any events another writer appended.
+      const catchUp = catchUpStmt.all(this.#head);
+      for (const row of catchUp) {
+        const foreign = reviewEventSchema.parse(JSON.parse(row.payload));
+        const result = validateNext(this.#logState, foreign);
+        if (!result.ok) {
+          throw new ThreadStoreAppendError({
+            kind: "invalid-shape",
+            message: `append: on-disk event seq=${foreign.seq} broke the local log state (${result.rejection.kind}: ${result.rejection.message}).`,
+          });
+        }
+        if (foreign.seq > this.#head) this.#head = foreign.seq;
+      }
+      // Belt-and-braces: some external writer may have written to a
+      // seq greater than we ever knew about (a corrupted repair)
+      // — trust MAX(seq).
+      const currentHead = maxSeqStmt.get()?.seq ?? 0;
+      if (currentHead > this.#head) this.#head = currentHead;
+
+      const seq = this.#head + 1;
+      const candidate = { ...input, seq, ts } as ReviewEvent;
+      const parsed = reviewEventSchema.safeParse(candidate);
+      if (!parsed.success) {
+        throw new ThreadStoreAppendError({
+          kind: "invalid-shape",
+          message: `append: event failed validation: ${JSON.stringify(parsed.error.issues)}`,
+        });
+      }
+      const event = parsed.data;
+      const result = validateNext(this.#logState, event);
+      if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
+      insertStmt.run(seq, ts, JSON.stringify(event));
+      this.#head = seq;
+      return { seq, event };
+    });
+    const { seq } = txn.immediate();
     return seq;
   }
 
@@ -188,10 +228,11 @@ export class SqliteThreadStore implements ThreadStore {
   }
 
   async threads(filter?: ThreadFilter): Promise<Thread[]> {
+    // review-core owns the reduce → sort → filter sequence in
+    // `selectThreads` so a new filter rule shows up on this store and
+    // on `InMemoryThreadStore` at once, without a copy-paste.
     const events = await this.since(0);
-    const derived = reduce(events);
-    const list = [...derived.values()].sort((a, b) => a.createdSeq - b.createdSeq);
-    return list.filter((thread) => matches(thread, filter));
+    return selectThreads(events, filter);
   }
 
   async thread(id: string): Promise<Thread | undefined> {
@@ -206,16 +247,4 @@ export class SqliteThreadStore implements ThreadStore {
   head(): number {
     return this.#head;
   }
-}
-
-function matches(thread: Thread, filter: ThreadFilter | undefined): boolean {
-  if (filter === undefined) return true;
-  if (filter.path !== undefined && thread.anchor.path !== filter.path) return false;
-  if (filter.status !== undefined) {
-    const allowed: readonly ThreadStatus[] = Array.isArray(filter.status)
-      ? filter.status
-      : [filter.status];
-    if (!allowed.includes(thread.status)) return false;
-  }
-  return true;
 }
