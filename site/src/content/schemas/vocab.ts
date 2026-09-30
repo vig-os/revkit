@@ -2,7 +2,7 @@
 // (DESIGN-0001 §3, C2). `<Term id>` references and the vocabulary guard
 // (ADR-0005) both look up entries here by `id`.
 import { z } from "astro/zod";
-import { schemaVersionField } from "./shared.ts";
+import { schemaVersionField } from "@revkit/review-core";
 
 /** One vocabulary entry: an id used by `<Term id>`, the term as prose, its
  * definition, and any aliases whose bold definition in prose (`**X** is/means

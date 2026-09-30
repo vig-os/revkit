@@ -1,13 +1,20 @@
 // Ask (question spec) schema — the JSON the agent writes and the daemon
 // serves at /ask/<id> (DESIGN-0001 §5.1, ADR-0007). Runtime asks live under
-// `.revkit/asks/<id>.json` (gitignored, ADR-0007 acceptance); the collection
-// exists so promoted specs (`revkit ask --keep` → `docs/decisions/`, later)
-// still validate at build time.
+// `.revkit/asks/<id>.json` (gitignored, ADR-0007 acceptance); the site's
+// `asks` content collection exists so a promoted spec (`revkit ask --keep`
+// → `docs/decisions/`, wired up in M2 item 7) still validates at build
+// time.
 //
 // The id is the filename, not a body field — this matches ADR-0007's shape
 // (the daemon assigns ids) and keeps the source of truth in one place.
-import { z } from "astro/zod";
-import { schemaVersionField } from "./shared.ts";
+//
+// Moved from `site/src/content/schemas/asks.ts` into review-core because
+// the `ask.created` / `ask.answered` events need the same shape at the
+// process boundary; keeping one copy avoids the schema drifting between
+// the site collection and the event log (ADR-0025: one core, three
+// surfaces).
+import { z } from "zod";
+import { schemaVersionField } from "./schema-version.ts";
 
 /** The kinds a question spec may take (DESIGN-0001 §5.1). Kept as a const
  * array so the loader, the guard and tests all iterate the same list. */
@@ -117,3 +124,54 @@ export const askSchema = z.discriminatedUnion("kind", askVariants).superRefine((
 });
 
 export type Ask = z.infer<typeof askSchema>;
+
+/** The answer payload carried by `ask.answered`. Kind-aligned with `Ask`
+ * so a router can dispatch on `kind` without re-parsing the original spec.
+ * A `multi: true` choice answers with an array of option ids; a single
+ * choice answers with one. `region` returns a point (`[x, y]`) or a brush
+ * (an even-length coordinate list). `review` mirrors GitHub's three review
+ * decisions so the hosted surface can pass it through. */
+export const askAnswerSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("choice"),
+      value: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
+      note: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("rank"),
+      ranking: z.array(z.string().min(1)).min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("scale"),
+      value: z.number(),
+      note: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("text"),
+      text: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("region"),
+      coordinates: z.array(z.number()).min(2),
+      note: z.string().min(1).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("review"),
+      decision: z.enum(["approve", "request-changes", "comment"]),
+      note: z.string().min(1).optional(),
+    })
+    .strict(),
+]);
+
+export type AskAnswer = z.infer<typeof askAnswerSchema>;

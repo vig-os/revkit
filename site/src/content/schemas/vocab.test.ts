@@ -3,7 +3,7 @@
 // (ADR-0005) later relies on: unique ids, non-empty terms/definitions, and
 // aliases as an optional array of strings.
 import { describe, expect, test } from "bun:test";
-import { CURRENT_SCHEMA_VERSION } from "./shared.ts";
+import { CURRENT_SCHEMA_VERSION } from "@revkit/review-core";
 import { vocabFileSchema } from "./vocab.ts";
 
 const validFile = {

@@ -1,0 +1,22 @@
+{
+  "name": "@revkit/review-core",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared review core — threads, events, dual anchors, revision (ADR-0006, ADR-0025).",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.9.3"
+  }
+}
