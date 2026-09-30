@@ -9,6 +9,7 @@
 // deterministic — a reviewer scrolling to a rule always sees the same
 // section, and CI diffs against a prior run stay small.
 
+import { readFileSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { Parent } from "mdast";
 import type { AllowAnnotation } from "./allow-annotation.ts";
@@ -199,6 +200,14 @@ export async function runCheck(
 
   // 1) component-registry — plus allow-annotation harvest.
   const trust: Trust = options.trust ?? "trusted";
+  // Under untrusted mode, feed the rule the set of DECLARED
+  // component subpaths — derived from
+  // `packages/components/package.json`'s exports map — so
+  // `@revkit/components/Plot` (the documented import used in the
+  // site's own MDX) passes while a fantasy subpath is refused
+  // (PR #48 round-4 blocker 1a).
+  const untrustedAllowedSubpaths =
+    trust === "untrusted" ? readComponentsExports(repoRoot) : undefined;
   const usedAllowAnnotations: {
     readonly file: string;
     readonly line: number;
@@ -209,7 +218,7 @@ export async function runCheck(
       entry.source,
       entry.file.relative,
       entry.root ?? undefined,
-      { trust },
+      { trust, ...(untrustedAllowedSubpaths !== undefined ? { untrustedAllowedSubpaths } : {}) },
     );
     findings.push(...result.diagnostics);
     for (const used of result.usedAllowAnnotations) {
@@ -346,3 +355,46 @@ export const CHECK_RULES: readonly string[] = [
   "plot-structure",
   "vendored-code",
 ];
+
+/** Read `packages/components/package.json`'s `exports` map and
+ * return the SET of full subpath specifiers (like
+ * `"@revkit/components/Plot"`). Under untrusted PR review, only
+ * these subpaths are admitted — a fantasy `.../Playground` is
+ * refused. Falls back to an empty set (which admits only the exact
+ * root specifiers) when the file is missing or malformed; the check
+ * still refuses subpaths in that case rather than opening the gate.
+ * (PR #48 round-4 blocker 1a.) */
+export function readComponentsExports(repoRoot: string): ReadonlySet<string> {
+  const out = new Set<string>();
+  const pkgPath = join(repoRoot, "packages", "components", "package.json");
+  let raw: string;
+  try {
+    raw = readFileSync(pkgPath, "utf8");
+  } catch {
+    return out;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return out;
+  }
+  if (parsed === null || typeof parsed !== "object") return out;
+  const pkgName = (parsed as { name?: unknown }).name;
+  const exportsMap = (parsed as { exports?: unknown }).exports;
+  if (typeof pkgName !== "string" || pkgName.length === 0) return out;
+  if (exportsMap === null || typeof exportsMap !== "object") return out;
+  for (const key of Object.keys(exportsMap as Record<string, unknown>)) {
+    // `"."` is the root, admitted separately. Every other key
+    // starts with `"./"` — turn it into the FULL specifier.
+    if (key === ".") continue;
+    if (!key.startsWith("./")) continue;
+    // Refuse wildcards for now: a `./features/*` key would let
+    // any subpath resolve, which is exactly what untrusted mode
+    // means to close. If revkit ever adds a wildcard export, the
+    // allowlist gate needs a targeted widening + a fresh review.
+    if (key.includes("*")) continue;
+    out.add(`${pkgName}${key.slice(1)}`);
+  }
+  return out;
+}

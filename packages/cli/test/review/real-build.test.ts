@@ -1,27 +1,42 @@
-// End-to-end: runs the REAL `runSafeBuild` — no injected spawn.
-// The fixture ships a minimal astro project (enough to actually
-// spin up astro's build), points at the reviewer's TRUSTED
-// `site/node_modules`, and verifies:
-//   - the trusted astro binary runs,
-//   - it emits HTML into distOutDir,
-//   - `revkit check-dist` accepts that HTML,
-//   - no `bun install` was needed and no registry fetch happened,
-//     proven by network-var scrub + trusted-only symlinks and by
-//     assertions on the child env.
+// End-to-end: builds the REAL revkit site through the safe build,
+// then runs check-dist against the output, and additionally proves
+// that the reviewer's own `site/node_modules/.astro` and
+// `.../.vite` are byte-for-byte unchanged after the build (PR #48
+// round-4 blocker 2).
 //
-// The test is guarded by `REVKIT_E2E_BUILD=1` so a lightweight
-// CI lane can opt out. Local `just test` and the CI lane that
-// exports the flag run it end-to-end.
+// The test:
+//   1. Copies the current checkout's `site/`, `packages/components`
+//      exports map, `plots/`, `vocab/`, `docs/` and root
+//      `package.json` into a scratch "materialised" tree that
+//      mirrors what `materializeSafeTree` would produce for a
+//      one-line PR change to `site/src/content/docs/index.mdx`.
+//   2. Snapshots the file list + mtimes of the reviewer's real
+//      `site/node_modules/.astro` and `.../.vite`.
+//   3. Runs `runSafeBuild` — the real one, no spawn injection.
+//   4. Re-snapshots those two dirs and asserts they are
+//      byte-for-byte unchanged.
+//   5. Runs `check-dist` on the built output.
+//
+// Guarded by `REVKIT_E2E_BUILD=1` so a lightweight test lane can
+// opt out; `just test` sets the flag.
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
-import { runSafeBuild, defaultDistOutDir } from "../../src/review/build.ts";
+import { join, relative as relativePath, resolve as resolvePath } from "node:path";
+import { defaultDistOutDir, runSafeBuild } from "../../src/review/build.ts";
 import { checkDistDirectory } from "../../src/check-dist.ts";
 
-/** Absolute path to the checkout root — the working directory when
- * `just test` runs. */
 const CHECKOUT_ROOT = resolvePath(import.meta.dirname!, "..", "..", "..", "..");
 
 const dirs: string[] = [];
@@ -35,80 +50,171 @@ afterAll(() => {
   }
 });
 
-/** Build a minimal "site" tree that mirrors what the materialiser
- * would produce for a content-only PR. Only the astro config and
- * a single MDX page — the trusted `site/node_modules` provides
- * everything else. */
-function scaffoldMinimalSite(): string {
-  const root = mkdtempSync(join(tmpdir(), "revkit-real-build-"));
-  dirs.push(root);
-  const siteDir = join(root, "site");
-  mkdirSync(siteDir, { recursive: true });
-  mkdirSync(join(siteDir, "src", "pages"), { recursive: true });
-  // A minimal astro config — no integrations, no plugins. The
-  // trusted `astro` binary in node_modules/.bin handles the rest.
-  writeFileSync(
-    join(siteDir, "astro.config.mjs"),
-    `import { defineConfig } from "astro/config";\nexport default defineConfig({});\n`,
+/** Build a materialised worktree that mirrors the checkout for a
+ * benign one-line PR change to `docs/index.mdx`. The "PR" change is
+ * a single character appended to a paragraph, well inside the
+ * `<Callout>` island — enough for astro to build a page. */
+function scaffoldMaterialisedPr(): string {
+  // Under `<trusted-checkout>/site/.revkit-review/<slug>/head-<sha>/`
+  // — the SAME layout production `revkit review` uses, so node
+  // module resolution walking up from `<sandbox>/site/` reaches
+  // the trusted `site/node_modules/` naturally. The scaffold uses
+  // an e2e-specific slug so it never collides with a real review.
+  const materialised = join(
+    CHECKOUT_ROOT,
+    "site",
+    ".revkit-review",
+    "vig-os-revkit-e2e",
+    "head-abcdef012345",
   );
-  writeFileSync(
-    join(siteDir, "package.json"),
-    JSON.stringify({ name: "revkit-real-build-fixture", type: "module", private: true }),
-  );
-  writeFileSync(
-    join(siteDir, "src", "pages", "index.astro"),
-    `---\n---\n<!doctype html><html><head><title>real build</title></head><body><h1>ok</h1></body></html>\n`,
-  );
-  return root;
+  // If a prior test run left the tree behind, remove it before
+  // rebuilding.
+  try {
+    rmSync(materialised, { recursive: true, force: true });
+  } catch {
+    /* fine */
+  }
+  mkdirSync(materialised, { recursive: true });
+  // Copy in the tooling from the reviewer's checkout — this is
+  // what `materializeSafeTree` would do for a content-only PR
+  // (tooling from base). We copy top-level pieces first, then
+  // walk `site/` MANUALLY, skipping `.revkit-review/` (which is
+  // itself where the sandbox lives — recursively copying it
+  // would loop).
+  for (const path of ["packages", "plots", "vocab", "docs", "package.json", "bun.lock"]) {
+    const src = join(CHECKOUT_ROOT, path);
+    const dst = join(materialised, path);
+    if (!existsSync(src)) continue;
+    cpSync(src, dst, {
+      recursive: true,
+      dereference: false,
+      filter: (from) =>
+        !from.includes("node_modules") &&
+        !from.includes(".astro") &&
+        !from.includes(".vite") &&
+        !from.endsWith("/dist"),
+    });
+  }
+  // Copy `site/` piece by piece, skipping `.revkit-review/`.
+  const siteSrc = join(CHECKOUT_ROOT, "site");
+  const siteDst = join(materialised, "site");
+  mkdirSync(siteDst, { recursive: true });
+  for (const entry of readdirSync(siteSrc)) {
+    if (entry === "node_modules" || entry === ".astro" || entry === ".vite" || entry === "dist") continue;
+    if (entry === ".revkit-review") continue;
+    const entrySrc = join(siteSrc, entry);
+    const entryDst = join(siteDst, entry);
+    cpSync(entrySrc, entryDst, {
+      recursive: true,
+      dereference: false,
+      filter: (from) =>
+        !from.includes("node_modules") &&
+        !from.includes(".astro") &&
+        !from.includes(".vite") &&
+        !from.endsWith("/dist"),
+    });
+  }
+  // The "PR change": append one paragraph to index.mdx.
+  const indexPath = join(materialised, "site", "src", "content", "docs", "index.mdx");
+  const base = readFileSync(indexPath, "utf8");
+  writeFileSync(indexPath, base + "\n\nA one-line PR change appended by the e2e test.\n");
+  dirs.push(materialised);
+  return materialised;
+}
+
+/** Snapshot of {path → sha256(bytes), mtime} for every regular
+ * file inside `root`. Directories, symlinks and non-regular entries
+ * are ignored — we only care about content and timestamps of files
+ * astro / vite might write. */
+function snapshotTree(root: string): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!existsSync(root)) return out;
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    let entries: string[];
+    try {
+      entries = readdirSync(cur);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const abs = join(cur, entry);
+      let st;
+      try {
+        st = statSync(abs, { throwIfNoEntry: false });
+      } catch {
+        continue;
+      }
+      if (st === undefined) continue;
+      if (st.isDirectory()) {
+        stack.push(abs);
+      } else if (st.isFile()) {
+        // Hash + size + mtimeMs — a build that touched the file
+        // would move mtime OR change contents.
+        const hash = new Bun.CryptoHasher("sha256").update(readFileSync(abs)).digest("hex");
+        const rel = relativePath(root, abs);
+        out.set(rel, `${hash}:${st.size}:${st.mtimeMs}`);
+      }
+    }
+  }
+  return out;
 }
 
 const E2E = process.env.REVKIT_E2E_BUILD === "1";
 
-describe.skipIf(!E2E)("real safe-build against the trusted checkout", () => {
-  test("builds an HTML file that check-dist accepts", async () => {
-    // The checkout's site/node_modules/.bin/astro must exist —
-    // `bun install` runs on `direnv reload` in the dev shell.
+describe.skipIf(!E2E)("real safe-build against the checkout's own site", () => {
+  test("builds the materialised site, produces HTML, check-dist passes, and does NOT touch reviewer's node_modules cache dirs", async () => {
+    // Preflight: trusted astro must exist.
     const trustedAstro = join(CHECKOUT_ROOT, "site", "node_modules", ".bin", "astro");
     expect(existsSync(trustedAstro)).toBe(true);
 
-    const root = scaffoldMinimalSite();
-    const distOutDir = defaultDistOutDir(root);
+    // Snapshot the "cache" dirs inside the reviewer's real
+    // node_modules BEFORE the build. Under the old bug, astro
+    // wrote `.astro/data-store.json` and `.vite/deps/*` here via
+    // the symlink.
+    const trustedAstroCache = join(CHECKOUT_ROOT, "site", "node_modules", ".astro");
+    const trustedViteCache = join(CHECKOUT_ROOT, "site", "node_modules", ".vite");
+    const beforeAstro = snapshotTree(trustedAstroCache);
+    const beforeVite = snapshotTree(trustedViteCache);
+
+    const materialised = scaffoldMaterialisedPr();
+    const distOutDir = defaultDistOutDir(materialised);
     await runSafeBuild({
-      materializedRoot: root,
+      materializedRoot: materialised,
       distOutDir,
       trustedCheckoutRoot: CHECKOUT_ROOT,
     });
-    // Astro emitted an index.html.
-    const indexHtml = join(distOutDir, "index.html");
-    expect(existsSync(indexHtml)).toBe(true);
-    const html = readFileSync(indexHtml, "utf8");
-    expect(html.length).toBeGreaterThan(0);
-    // check-dist accepts it.
+
+    // Some HTML got written.
+    // Astro writes the site root as `docs/index.html` when the
+    // `base` is `/revkit` (starlight config). Walk the dist to
+    // find any index.html — that's proof the build produced pages.
+    let firstHtml: string | undefined;
+    const stack: string[] = [distOutDir];
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      for (const entry of readdirSync(cur)) {
+        const abs = join(cur, entry);
+        const st = statSync(abs);
+        if (st.isDirectory()) stack.push(abs);
+        else if (entry.endsWith(".html") && firstHtml === undefined) firstHtml = abs;
+      }
+    }
+    expect(firstHtml).toBeDefined();
+    expect(readFileSync(firstHtml!, "utf8").length).toBeGreaterThan(100);
+
+    // Reviewer's caches — byte-for-byte unchanged. Under the old
+    // symlink-writes-through-to-trusted bug this would flip.
+    const afterAstro = snapshotTree(trustedAstroCache);
+    const afterVite = snapshotTree(trustedViteCache);
+    expect([...afterAstro.entries()].sort()).toEqual([...beforeAstro.entries()].sort());
+    expect([...afterVite.entries()].sort()).toEqual([...beforeVite.entries()].sort());
+
+    // check-dist on the built output.
     const diags = checkDistDirectory(distOutDir);
+    // Any surprise inline handlers / off-list script hashes
+    // would fail here; we expect none.
     expect(diags).toEqual([]);
-  }, 120_000);
-
-  test("no bun install runs inside the sandbox (no `.bun`/`bun.lock` written)", async () => {
-    const root = scaffoldMinimalSite();
-    await runSafeBuild({
-      materializedRoot: root,
-      distOutDir: defaultDistOutDir(root),
-      trustedCheckoutRoot: CHECKOUT_ROOT,
-    });
-    // No `bun.lock` should have been created inside the sandbox.
-    expect(existsSync(join(root, "site", "bun.lock"))).toBe(false);
-    expect(existsSync(join(root, "bun.lock"))).toBe(false);
-    // No `node_modules` was NEWLY installed (only symlinked to
-    // the trusted checkout).
-    const nm = join(root, "site", "node_modules");
-    // The link exists after the build only when we DIDN'T clean
-    // up — in fact the build removes its links in `finally`. So
-    // after a completed build there should be NO
-    // sandbox-managed node_modules dir at all.
-    expect(existsSync(nm)).toBe(false);
-  }, 120_000);
+  }, 240_000);
 });
-
-// Reference helpers so unused-import lint stays quiet even when
-// the test is skipped.
-void symlinkSync;

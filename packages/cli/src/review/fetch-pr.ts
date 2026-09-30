@@ -239,13 +239,63 @@ export function perPrRoot(repoRoot: string, pr: { owner: string; repo: string; p
   return join(repoRoot, ".revkit", "review", slug);
 }
 
-/** Absolute path to the materialised worktree for a given head SHA. */
+/** Absolute path to the materialised worktree for a given head SHA.
+ *
+ * **PR #48 round-4 blocker 2** — the materialised worktree lives
+ * INSIDE the reviewer's trusted `site/` at
+ * `<repoRoot>/site/.revkit-review/<slug>/head-<sha>/`. This has
+ * three consequences we want:
+ *
+ *   1. Astro's default `.astro/` cache lands at
+ *      `<materialised>/.astro/`, and vite's `node_modules/.vite/`
+ *      lands under `<materialised>/node_modules/` — both entirely
+ *      inside the sandbox, never inside the reviewer's real
+ *      `site/node_modules/`.
+ *   2. Node's module resolution walking up from `<materialised>/site/`
+ *      finds `<repoRoot>/site/node_modules/` (four `..`s up). No
+ *      symlink into the trusted checkout is needed.
+ *   3. Astro's content-collection paths, stored as
+ *      `path.relative(config.root, contentFile)`, resolve
+ *      correctly at load time.
+ *
+ * `<repoRoot>/site/.revkit-review/` is gitignored (added by the
+ * cli).
+ *
+ * The per-PR **state** dir (`state/threads.sqlite`) still lives
+ * under `<repoRoot>/.revkit/review/<slug>/state/` (see
+ * `perPrStateDir`) so a rerun finds it. */
 export function reviewTargetDir(
   repoRoot: string,
   pr: { owner: string; repo: string; pullNumber: number },
   headSha: string,
 ): string {
-  return join(perPrRoot(repoRoot, pr), `head-${shortSha(headSha)}`);
+  return join(sandboxParent(repoRoot, pr), `head-${shortSha(headSha)}`);
+}
+
+/** Sandbox parent dir for the materialised worktree — public so
+ * the CLI can prune stale `head-<sha>/` siblings there without
+ * touching the state/ dir under `<repoRoot>/.revkit/review/<slug>/`. */
+export function perPrScratchRoot(pr: { owner: string; repo: string; pullNumber: number }): string {
+  // Callers pass repoRoot too via the full-path helpers; keep
+  // this signature callable without repoRoot for legacy paths.
+  return join(".", ".revkit-review", safeSlug(pr.owner, pr.repo, pr.pullNumber));
+}
+
+function sandboxParent(
+  repoRoot: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+): string {
+  const slug = safeSlug(pr.owner, pr.repo, pr.pullNumber);
+  return join(repoRoot, "site", ".revkit-review", slug);
+}
+
+/** Absolute path to the sandbox parent for pruning stale
+ * `head-<sha>/` siblings — the CLI passes `repoRoot`. */
+export function perPrSandboxParent(
+  repoRoot: string,
+  pr: { owner: string; repo: string; pullNumber: number },
+): string {
+  return sandboxParent(repoRoot, pr);
 }
 
 /** Absolute path to the survivable per-PR state directory. Contains

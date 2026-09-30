@@ -19,15 +19,23 @@ Given a PR number or URL, `revkit review`:
 5. Computes the tooling diff against the **merge-base** of head and base (not the base tip; stale PRs are not
    refused for base-side churn). Refuses if any tooling file differs from the merge-base unless
    `--trust <sha>` is given. Prints the tooling diff either way.
-6. Materializes a safe worktree under `.revkit/review/<owner>-<repo>-<pr>/head-<sha>/`: tooling files
+6. Materializes a safe worktree under `site/.revkit-review/<owner>-<repo>-<pr>/head-<sha>/`: tooling files
    (everything not on the [content allowlist](../packages/cli/src/review/content-allowlist.ts)) come from the
-   reviewer's trusted merge-base tree; content files (docs, vocab, plots, Starlight collections, allowlisted
-   extensions only) come from the PR head. Symlinks that escape the content root, submodules, and other
-   unsupported tree modes are refused. Per-blob size checked via `cat-file -s` BEFORE reading; total-size
-   cap enforced. `git checkout` is never invoked, so smudge filters never run.
-7. Runs `revkit check` over the materialized content in **untrusted mode**: allow-annotations are ignored
-   (a PR cannot silence its own findings), and vega-lite executable keys (`expr`/`signal`/`calculate`/
-   `update`/`on`) are refused.
+   reviewer's trusted base tip; content files (docs, vocab, plots, Starlight collections, allowlisted
+   extensions only) come from the PR head. The sandbox lives inside `site/` so Node's module resolution
+   walking up from `<sandbox>/site/` finds the trusted `site/node_modules/` — no symlinks, no writes to the
+   reviewer's `node_modules/`. Symlinks that escape the content root, submodules, and other unsupported tree
+   modes are refused. Per-blob size checked via `cat-file -s` BEFORE reading; total-size cap enforced.
+   `git checkout` is never invoked, so smudge filters never run. Per-PR **state** (sqlite thread store) lives
+   at `.revkit/review/<slug>/state/threads.sqlite` and survives a wipe of `head-<sha>/`.
+7. Runs `revkit check` twice on the materialized tree: once in trusted mode over the whole tree (catches
+   every regression a merge would), and once in **untrusted mode** over ONLY the files the PR changed
+   relative to the merge-base. Untrusted mode disables the allow-annotation escape hatch, allows only the
+   `@revkit/components` and `@astrojs/starlight/components` root imports plus the specific subpaths that
+   `packages/components/package.json`'s `exports` map declares, and applies an **allowlist walk** of every
+   vega-lite spec — refusing every executable key (`filter`, `calculate`, `test`, `expr`, `signal`, `param`,
+   `datum.` predicates, any `…Expr` key), inline `data.values`, and any unknown top-level / channel /
+   config key.
 8. Runs the astro build with a **minimal env** (no `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `NODE_AUTH_TOKEN`,
    `HF_TOKEN`, `CF_API_TOKEN`, cloud provider keys — see `build.ts:BUILD_ENV_TOKEN_DENYLIST`) inside the
    materialised worktree. Node module resolution is pinned to the reviewer's TRUSTED `node_modules/` (no

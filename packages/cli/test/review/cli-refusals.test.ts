@@ -295,7 +295,7 @@ describe("revkit review — package.json postinstall canary never runs", async (
     // package.json (no preinstall), and the .gitattributes must not
     // have been taken from the PR — the PR added it, so it should
     // not appear at all in the materialized tree.
-    const materializedRoot = fixture.repoDir + "/.revkit/review/vig-os-revkit-300/head-" + pr.headSha.slice(0, 12);
+    const materializedRoot = fixture.repoDir + "/site/.revkit-review/vig-os-revkit-300/head-" + pr.headSha.slice(0, 12);
     const pkg = readFileSync(join(materializedRoot, "package.json"), "utf8");
     expect(pkg).toBe(BASE_PKG_JSON);
     expect(existsSync(join(materializedRoot, ".gitattributes"))).toBe(false);

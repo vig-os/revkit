@@ -49,6 +49,7 @@ import {
   ensurePrCommits,
   parseGithubRemoteUrl,
   perPrRoot,
+  perPrSandboxParent,
   perPrSqlitePath,
   perPrStateDir,
   readFetchedHeadSha,
@@ -57,7 +58,7 @@ import {
   reviewTargetExists,
 } from "./fetch-pr.ts";
 import { computeToolingDiff, formatToolingDiff, type ToolingDiff } from "./tooling-diff.ts";
-import { wrapSafeGitRunner } from "./git-safe.ts";
+import { assertSafeGitRunner, wrapSafeGitRunner } from "./git-safe.ts";
 import { materializeSafeTree, MaterializeError } from "./materialize.ts";
 import { populateStoreFromPr, type PopulateOutcome } from "./import-threads.ts";
 import { SqliteThreadStore } from "../serve/sqlite-store.ts";
@@ -82,6 +83,11 @@ export interface BuildHook {
   (options: {
     readonly materializedRoot: string;
     readonly distOutDir: string;
+    /** Reviewer's TRUSTED checkout root — the CLI resolves this
+     * from the workspace `package.json` marker and passes it to
+     * the hook. `runSafeBuild` uses it to locate the trusted
+     * astro binary + node_modules. */
+    readonly trustedCheckoutRoot: string;
   }): Promise<void>;
 }
 
@@ -288,6 +294,12 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   // would bypass the hardening. `env.git` is only used to
   // construct this one instance and never passed downstream.
   const safeGit = wrapSafeGitRunner(env.git);
+  // Runtime brand check — refuses a value cast through `any`.
+  // Compile-time nominal branding blocks accidental structural
+  // fakes; this second layer covers `runner as unknown as
+  // SafeGitRunner` from outside `git-safe.ts` (PR #48 round-4
+  // nit).
+  assertSafeGitRunner(safeGit, "revkit review");
 
   // --- Origin/remote gate (PR #48 round-2 blocker 4) ---
   // The PR must belong to the same `owner/repo` as the checkout's
@@ -426,19 +438,23 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   // Per-PR root is `.revkit/review/<owner>-<repo>-<pr>/`; a rerun
   // reuses this. The **survivable state** (sqlite) lives at
   // `<root>/state/threads.sqlite` and is NEVER removed by a rerun.
-  // The materialised head lives at `<root>/head-<sha>/`, and the
-  // built dist at `<root>/head-<sha>/dist/`.
+  // The survivable per-PR **state** dir (sqlite + snapshots) lives
+  // under `<repoRoot>/.revkit/review/<slug>/state/`. The
+  // materialised HEAD-<sha> tree lives OUTSIDE the checkout in
+  // a per-PR scratch (PR #48 round-4 blocker 2, see
+  // `fetch-pr.ts:reviewTargetDir`).
   ensureRevkitDir(repoRoot);
   const prRootDir = perPrRoot(repoRoot, pr);
   const stateDir = perPrStateDir(repoRoot, pr);
+  const sandboxParent = perPrSandboxParent(repoRoot, pr);
   const sqlitePath = perPrSqlitePath(repoRoot, pr);
   mkdirSync(prRootDir, { recursive: true, mode: 0o700 });
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  mkdirSync(sandboxParent, { recursive: true, mode: 0o700 });
 
-  // Prune stale head-*/ directories under this PR root (keep only
-  // the state/ directory and the current head-<sha>). A rerun on a
-  // moved head must not accumulate old worktrees.
-  pruneStaleHeadDirs(prRootDir, fetchedHead);
+  // Prune stale head-*/ directories under THIS PR's sandbox
+  // parent (keep only the current head-<sha>).
+  pruneStaleHeadDirs(sandboxParent, fetchedHead);
 
   // Materialize.
   const materializedRoot = reviewTargetDir(repoRoot, pr, fetchedHead);
@@ -475,19 +491,60 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     return { exitCode: 1, stdout: "", stderr: `revkit review: materialize failed: ${(error as Error).message}\n` };
   }
 
-  // Run `revkit check` over the materialized content, IN UNTRUSTED
-  // MODE (PR #48 round-2 blocker 1). Untrusted mode disables the
-  // allow-annotation escape hatch and refuses executable vega keys.
-  const checkResult = await runCheckOnMaterialized(materializedRoot, env);
-  if (checkResult.diagnostics.length > 0) {
+  // Compute the set of CONTENT paths the PR changed (relative to
+  // the merge-base). We ran `computeToolingDiff` above; its
+  // `content` array names each added/modified content path (renames
+  // report the new name too). Unchanged content files are
+  // byte-identical to the trusted merge-base tree and don't need
+  // the untrusted-mode gate — running it over them would flag
+  // legitimate authored content (revkit's own MDX imports from
+  // `@revkit/components/Plot`, its own vega specs, its own
+  // allow-annotations) and refuse every PR (PR #48 round-4
+  // blocker 1b).
+  const changedContentPaths = new Set<string>();
+  for (const change of diff.content) {
+    if (change.kind === "modify") {
+      changedContentPaths.add(change.path);
+    } else {
+      changedContentPaths.add(change.newPath);
+    }
+  }
+
+  // Two checks, both must pass with zero findings:
+  //   (1) TRUSTED-mode check over the whole materialised tree —
+  //       catches every regression a merge would; behaves exactly
+  //       like `just check` on the base + PR union.
+  //   (2) UNTRUSTED-mode check over only the paths the PR CHANGED
+  //       — the security guards (no allow-annotation escape,
+  //       no expressions, vega allowlist, subpath-import
+  //       allowlist).
+  const trustedRun = await runCheckOnMaterialized(materializedRoot, env, {
+    trust: "trusted",
+  });
+  if (trustedRun.diagnostics.length > 0) {
     return {
       exitCode: 1,
       stdout: `${stdoutLines.join("\n")}\n`,
       stderr:
-        `revkit review: 'revkit check' failed on the PR content:\n${checkResult.diagnostics.join("\n")}\n`,
+        `revkit review: 'revkit check' (trusted, full tree) failed on the PR content:\n${trustedRun.diagnostics.join("\n")}\n`,
     };
   }
-  stdoutLines.push(`revkit check: PR content passed (${checkResult.filesScanned} files scanned)`);
+  const untrustedRun = await runCheckOnMaterialized(materializedRoot, env, {
+    trust: "untrusted",
+    onlyPaths: changedContentPaths,
+  });
+  if (untrustedRun.diagnostics.length > 0) {
+    return {
+      exitCode: 1,
+      stdout: `${stdoutLines.join("\n")}\n`,
+      stderr:
+        `revkit review: 'revkit check' (untrusted, changed content only) failed on the PR content:\n${untrustedRun.diagnostics.join("\n")}\n`,
+    };
+  }
+  stdoutLines.push(
+    `revkit check: PR content passed ` +
+      `(${trustedRun.filesScanned} trusted, ${untrustedRun.filesScanned} untrusted)`,
+  );
 
   // --- Safe build (PR #48 round-2 blocker 2) ---
   // Run astro build on the materialised worktree with a MINIMAL env
@@ -498,7 +555,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   const distOutDir = join(materializedRoot, "site", "dist");
   const buildHook: BuildHook = env.build ?? runSafeBuild;
   try {
-    await buildHook({ materializedRoot, distOutDir });
+    await buildHook({ materializedRoot, distOutDir, trustedCheckoutRoot: repoRoot });
     stdoutLines.push(`build: ok  (${prettyPath(repoRoot, distOutDir)})`);
   } catch (error) {
     return {
@@ -595,23 +652,28 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
 }
 
 /** Run `revkit check` over the CONTENT subtree of the materialized
- * worktree. Reuses the existing walk + rule pipeline so a PR that
- * would fail `check` on merge fails it in the review too. */
+ * worktree. `trust` picks the posture; `onlyPaths` (when passed)
+ * restricts the check to POSIX repo-relative paths in that set —
+ * used by the untrusted-mode pass to run only on files the PR
+ * changed (PR #48 round-4 blocker 1b). */
 async function runCheckOnMaterialized(
   materializedRoot: string,
   env: RunReviewEnv,
+  options: {
+    readonly trust: "trusted" | "untrusted";
+    readonly onlyPaths?: ReadonlySet<string>;
+  },
 ): Promise<{ diagnostics: string[]; filesScanned: number }> {
   const discovery = walkForCheckables(materializedRoot);
-  const files = toCheckFiles(discovery.files, materializedRoot);
+  let files = toCheckFiles(discovery.files, materializedRoot);
+  if (options.onlyPaths !== undefined) {
+    files = files.filter((f) => options.onlyPaths!.has(f.relative));
+  }
   const output = await runCheck(materializedRoot, files, discovery.symlinks, {
     online: false,
     repoSlug: env.repoSlug,
     gh: env.gh,
-    // PR #48 round-2 blocker 1: content from an untrusted PR MUST
-    // NOT get the allow-annotation escape hatch, and must run the
-    // vega-untrusted refusal. This is the seam that carries the
-    // trust posture down through the whole rule pipeline.
-    trust: "untrusted",
+    trust: options.trust,
   });
   return {
     diagnostics: output.exitCode === 0 ? [] : [...output.lines],

@@ -43,7 +43,7 @@
 // If the build fails (non-zero exit, stderr surfaced), the caller
 // aborts the review command and does NOT start the daemon.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 
@@ -181,47 +181,68 @@ export async function runSafeBuild(options: RunSafeBuildOptions): Promise<void> 
       `runSafeBuild: astro project dir '${cwd}' does not exist in the materialised worktree`,
     );
   }
-  // Default trusted checkout root = the grandparent of the per-PR
-  // review dir, i.e. the reviewer's checkout root. `materializedRoot`
-  // ends with `.revkit/review/<slug>/head-<sha>` → four `dirname`
-  // hops to the checkout root.
+  // Default trusted checkout root = the checkout ROOT. When the
+  // sandbox lives at `<checkout>/site/.revkit-review/<slug>/head-<sha>/`
+  // (see `fetch-pr.ts:reviewTargetDir`), that's four parents up
+  // from `<materialized>`.
   const trustedCheckoutRoot =
     options.trustedCheckoutRoot ??
     resolvePath(options.materializedRoot, "..", "..", "..", "..");
-  const trustedAstroBin = join(trustedCheckoutRoot, "site", "node_modules", ".bin", "astro");
+  const trustedSiteDir = join(trustedCheckoutRoot, "site");
+  const trustedAstroBin = join(trustedSiteDir, "node_modules", ".bin", "astro");
   if (!existsSync(trustedAstroBin)) {
     throw new Error(
       `runSafeBuild: trusted astro binary not found at '${trustedAstroBin}' — ` +
         `run 'bun install' at the checkout root before reviewing.`,
     );
   }
-  const trustedSiteNodeModules = join(trustedCheckoutRoot, "site", "node_modules");
-  if (!existsSync(trustedSiteNodeModules)) {
+  if (!existsSync(join(trustedSiteDir, "node_modules"))) {
     throw new Error(
-      `runSafeBuild: trusted node_modules not found at '${trustedSiteNodeModules}'`,
+      `runSafeBuild: trusted node_modules not found at '${join(trustedSiteDir, "node_modules")}'`,
     );
   }
 
   // Per-build HOME (scratch dir). Torn down after the build.
   const homeOverride = mkdtempSync(join(tmpdir(), "revkit-safe-build-home-"));
 
-  // Link the reviewer's TRUSTED node_modules into the sandbox
-  // read-only. Astro's resolver then finds every dep in the tree.
-  // The links are removed after the build.
-  const madeLinks: string[] = [];
-  const sandboxSiteNm = join(cwd, "node_modules");
-  const sandboxWorkspaceNm = join(options.materializedRoot, "node_modules");
-  try {
-    if (!existsSync(sandboxSiteNm)) {
-      symlinkSync(trustedSiteNodeModules, sandboxSiteNm);
-      madeLinks.push(sandboxSiteNm);
-    }
-    const trustedWorkspaceNm = join(trustedCheckoutRoot, "node_modules");
-    if (existsSync(trustedWorkspaceNm) && !existsSync(sandboxWorkspaceNm)) {
-      symlinkSync(trustedWorkspaceNm, sandboxWorkspaceNm);
-      madeLinks.push(sandboxWorkspaceNm);
-    }
+  // Vite's default cacheDir is `<root>/node_modules/.vite/`. In
+  // our layout that's `<materialized>/site/node_modules/.vite/` —
+  // inside the sandbox, but the sandbox has NO node_modules of
+  // its own. If we don't override, vite creates a
+  // `<materialized>/site/node_modules/` directory that contains
+  // only `.vite/`, and the astro build's node-modules resolver
+  // then STOPS at that dir (finding no packages inside) instead
+  // of walking up to the trusted site's node_modules. Redirect
+  // vite's cacheDir to a scratch path to keep the sandbox's
+  // node_modules FALSE (so astro's resolver walks up as intended).
+  const viteCacheDir = mkdtempSync(join(tmpdir(), "revkit-safe-build-vite-cache-"));
 
+  // Wrapper astro config lives INSIDE the sandbox site (astro 7
+  // requires `--config` to sit inside `--root`). The wrapper is a
+  // small ESM file that imports the sandbox's own astro.config.mjs
+  // (which the materialiser took from base — TRUSTED tooling) and
+  // adds only the `vite.cacheDir` override.
+  const wrapperConfigPath = join(cwd, "astro.config.revkit-review.mjs");
+  writeFileSync(
+    wrapperConfigPath,
+    `import base from "./astro.config.mjs";\n` +
+      `const viteCacheDir = ${JSON.stringify(viteCacheDir)};\n` +
+      `export default {\n` +
+      `  ...base,\n` +
+      `  vite: {\n` +
+      `    ...(base && base.vite ? base.vite : {}),\n` +
+      `    cacheDir: viteCacheDir,\n` +
+      `  },\n` +
+      `};\n`,
+  );
+
+  // Detect + remove stale symlinks from a SIGKILLed prior run
+  // (PR #48 round-4 nit). Legacy layouts may have left links at
+  // `<sandbox>/site/node_modules` or `<sandbox>/node_modules`.
+  unlinkStale(join(cwd, "node_modules"));
+  unlinkStale(join(options.materializedRoot, "node_modules"));
+
+  try {
     const env = buildChildEnv(process.env, homeOverride);
     const spawn = options.spawn ?? defaultSpawn;
 
@@ -229,35 +250,65 @@ export async function runSafeBuild(options: RunSafeBuildOptions): Promise<void> 
       cmd: [
         trustedAstroBin,
         "build",
+        "--config",
+        "./astro.config.revkit-review.mjs",
         "--root",
         cwd,
         "--outDir",
         options.distOutDir,
       ],
+      // cwd = the sandbox site. Node's resolver walks up:
+      //   <materialized>/site/                                 no node_modules
+      //   <materialized>/                                      no
+      //   <trusted>/site/.revkit-review/<slug>/                no
+      //   <trusted>/site/.revkit-review/                       no
+      //   <trusted>/site/                                      YES (trusted)
+      // So the build reads modules from the reviewer's own
+      // TRUSTED site/node_modules — no symlinks, no writes.
       cwd,
       env,
     });
     if (result.exitCode !== 0) {
-      // Surface the LAST 4 KiB of stderr — enough context for the
-      // reviewer without dumping a many-MiB build log into the
-      // CLI response.
       const tail = result.stderr.slice(-4096);
       throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
     }
   } finally {
-    for (const linkPath of madeLinks) {
+    for (const scratch of [homeOverride, viteCacheDir]) {
       try {
-        rmSync(linkPath, { force: true });
+        rmSync(scratch, { recursive: true, force: true });
       } catch {
-        // Best effort — the reviewer can `rm -rf .revkit/review/`
-        // to clean up on any weird failure.
+        /* fine */
       }
     }
     try {
-      rmSync(homeOverride, { recursive: true, force: true });
+      rmSync(wrapperConfigPath, { force: true });
     } catch {
       /* fine */
     }
+  }
+}
+
+/** Delete `target` when it is a symlink, using `lstat` so the link
+ * is never followed. Any regular file or directory at `target` is
+ * left alone — a caller may have real content there. A SIGKILLed
+ * prior run may leave a symlink pointing at the reviewer's real
+ * `node_modules`; without this cleanup, the `symlinkSync` below
+ * would fail with EEXIST and the build would refuse. (PR #48
+ * round-4 nit.) */
+export function unlinkStale(target: string): void {
+  let lst;
+  try {
+    lst = lstatSync(target);
+  } catch {
+    return;
+  }
+  if (!lst.isSymbolicLink()) return;
+  try {
+    rmSync(target, { force: true });
+  } catch {
+    /* best-effort — a permission error would fall through to the
+     * subsequent symlinkSync which would then throw a clearer
+     * error. */
   }
 }
 

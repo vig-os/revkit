@@ -46,7 +46,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { classifyPath } from "./content-allowlist.ts";
-import { runSafeGit, runSafeGitOrThrow, SafeGitError, type SafeGitRunner } from "./git-safe.ts";
+import { buildSafeGitArgs, runSafeGit, runSafeGitOrThrow, SafeGitError, type SafeGitRunner } from "./git-safe.ts";
 
 /** One entry in a git tree, as parsed from `git ls-tree -r -z`. */
 export interface TreeEntry {
@@ -183,21 +183,23 @@ export async function listTree(
 }
 
 /**
- * Read a git blob as bytes, going through the hardened wrapper
- * (PR #48 round-2 nit: `readBlob` must not bypass the safe-git
- * config).
+ * Read a git blob as raw bytes.
+ *
+ * The shared `GitRunner` returns `stdout` as a UTF-8-decoded
+ * `string`, which corrupts every non-latin1 byte — an em-dash in
+ * an .mjs source becomes 0x14 (PR #48 round-4 bug). For blob
+ * reads we bypass the string decode and stream the raw bytes
+ * from `Bun.spawn` directly, still going through the SAFE git
+ * argv (the SafeGitRunner brand is a compile-time signal we're
+ * on the sanctioned code path; the actual argv prefix is
+ * assembled here explicitly).
  *
  * Two-phase (PR #48 round-2 nit on DoS):
- *   1. `cat-file -s <oid>` returns the blob's declared size — cheap,
- *      no bytes copied. If it exceeds `maxBlobBytes`, refuse without
- *      reading the payload.
- *   2. `cat-file blob <oid>` reads the payload; still capped at
- *      `maxBlobBytes` on the returned buffer as a belt-and-braces
- *      check against a hostile server / cache that lies about size.
- *
- * A single call per blob keeps the interface simple. revkit's
- * content-plus-tooling paths are small (hundreds), so per-call
- * spawn overhead is fine.
+ *   1. `cat-file -s <oid>` returns the blob's declared size —
+ *      cheap, no bytes copied. If it exceeds `maxBlobBytes`,
+ *      refuse without reading the payload.
+ *   2. `cat-file blob <oid>` reads the raw bytes; capped again
+ *      as belt-and-braces.
  */
 export async function readBlob(
   runner: SafeGitRunner,
@@ -205,9 +207,7 @@ export async function readBlob(
   oid: string,
   maxBlobBytes: number,
 ): Promise<Buffer> {
-  // Phase 1: cheap size check via `cat-file -s`. Never reads the
-  // payload, so a 200 MiB blob does not eat a memory buffer just to
-  // learn it is over the cap.
+  // Phase 1: size check via the string runner (size is ASCII).
   const sizeResult = await runSafeGit(runner, cwd, ["cat-file", "-s", oid]);
   if (sizeResult.exitCode !== 0) {
     throw new SafeGitError(
@@ -227,21 +227,28 @@ export async function readBlob(
   if (declaredSize > maxBlobBytes) {
     throw new BlobTooLargeError(oid, declaredSize, maxBlobBytes);
   }
-  // Phase 2: read the payload. Our GitRunner returns stdout as a
-  // string — we treat it as latin1-encoded bytes so every byte
-  // round-trips (unlike utf8, which would replace invalid
-  // sequences). Buffer.from(str, 'latin1') has the same length as
-  // str.length for latin1 strings, so a large PNG round-trips
-  // byte-for-byte.
-  const result = await runSafeGit(runner, cwd, ["cat-file", "blob", oid]);
-  if (result.exitCode !== 0) {
+  // Phase 2: raw-byte read. Directly `Bun.spawn` git with the
+  // safe argv prefix; stream stdout via `arrayBuffer()` so no
+  // UTF-8 decoding step happens.
+  const safeArgs = buildSafeGitArgs(["cat-file", "blob", oid]);
+  const proc = Bun.spawn(["git", ...safeArgs], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdoutBuf, stderrText, exitCode] = await Promise.all([
+    new Response(proc.stdout).arrayBuffer(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) {
     throw new SafeGitError(
-      `readBlob: git cat-file blob ${oid} failed: ${result.stderr.trim()}`,
-      result.exitCode,
-      result.stderr,
+      `readBlob: git cat-file blob ${oid} failed: ${stderrText.trim()}`,
+      exitCode,
+      stderrText,
     );
   }
-  const buf = Buffer.from(result.stdout, "latin1");
+  const buf = Buffer.from(stdoutBuf);
   if (buf.length > maxBlobBytes) {
     throw new BlobTooLargeError(oid, buf.length, maxBlobBytes);
   }

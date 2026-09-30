@@ -439,6 +439,17 @@ export interface ComponentRegistryFileResult {
  * and PR #48 round-2 review. */
 export interface ComponentRegistryFileOptions {
   readonly trust?: "trusted" | "untrusted";
+  /** Distinct subpaths ADMITTED under untrusted mode. Derived from
+   * `packages/components/package.json`'s `exports` map by the
+   * orchestrator (see `check.ts:readComponentsExports`), so the
+   * allowlist can never drift from what revkit itself ships
+   * (PR #48 round-4 blocker 1a).
+   *
+   * These are FULL specifiers (`"@revkit/components/Plot"`),
+   * not just the tail. When the set is `undefined` (older
+   * caller / unit test), the untrusted-mode subpath refusal
+   * still fires — the root-only import is always accepted. */
+  readonly untrustedAllowedSubpaths?: ReadonlySet<string>;
 }
 
 /** Check one MDX / MD file against the component-registry rule. A
@@ -497,13 +508,17 @@ export function checkComponentRegistryFile(
         });
         continue;
       }
-      // Untrusted-mode subpath refusal (PR #48 round-3 nit): a PR
-      // cannot import `@revkit/components/<any-subpath>`, only the
-      // exact root. Subpaths would let a PR reach a component the
-      // ecosystem hasn't blessed for content — e.g. a debug
-      // Playground component — since a subpath resolution follows
-      // whatever the package exports allow. The trusted lane keeps
-      // subpaths because the reviewer authored the file.
+      // Untrusted-mode subpath refusal (PR #48 round-3 nit,
+      // round-4 blocker 1a). A PR cannot import an arbitrary
+      // subpath — subpath resolution would follow whatever the
+      // package's exports allow. Under untrusted mode we admit
+      // only the exact root `@revkit/components` and
+      // `@astrojs/starlight/components`, plus subpaths that
+      // appear in `packages/components/package.json`'s `exports`
+      // map, passed in by the orchestrator. This means
+      //     `"@revkit/components/Plot"` — the documented import
+      //     used in the site's own MDX — is admitted, but a
+      //     fantasy `"@revkit/components/Playground"` is not.
       const trustLocal = options?.trust ?? "trusted";
       if (
         trustLocal === "untrusted" &&
@@ -512,13 +527,18 @@ export function checkComponentRegistryFile(
         (binding.specifier.startsWith("@revkit/components/") ||
           binding.specifier.startsWith("@astrojs/starlight/components/"))
       ) {
-        diagnostics.push({
-          file,
-          line: binding.line,
-          rule: "component-registry",
-          message: `import from ${JSON.stringify(binding.specifier)} — under untrusted PR review, only the exact root specifiers "@revkit/components" and "@astrojs/starlight/components" are admitted (no subpaths; ADR-0025).`,
-        });
-        continue;
+        const declared = options?.untrustedAllowedSubpaths;
+        if (declared === undefined || !declared.has(binding.specifier)) {
+          diagnostics.push({
+            file,
+            line: binding.line,
+            rule: "component-registry",
+            message:
+              `import from ${JSON.stringify(binding.specifier)} — under untrusted PR review, the only admitted subpaths ` +
+              `are those declared in the components package's exports map (${declared === undefined ? "<none loaded>" : [...declared].map((s) => JSON.stringify(s)).sort().join(", ")}). ADR-0025.`,
+          });
+          continue;
+        }
       }
       // Named export deny-list (round-4): Card / LinkCard from
       // Starlight's component module are refused even though the

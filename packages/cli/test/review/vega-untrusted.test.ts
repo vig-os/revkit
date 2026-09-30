@@ -262,16 +262,19 @@ describe("checkVegaUntrusted — accepts a minimal static chart", () => {
 });
 
 describe("checkVegaUntrusted — data caps", () => {
-  test("inline data.values above MAX_INLINE_DATA_ROWS refused", () => {
-    const values = Array.from({ length: MAX_INLINE_DATA_ROWS + 1 }, (_, i) => ({ a: i }));
+  test("inline data.values is refused OUTRIGHT (PR #48 round-4 nit)", () => {
+    // The trusted plots schema and CLAUDE.md forbid inline
+    // data; untrusted mode refuses it independent of size.
+    // Documentation constant kept for reference.
+    void MAX_INLINE_DATA_ROWS;
     const { specPath, cleanup } = writeSpec({
-      data: { values },
+      data: { values: [{ a: 1 }] },
       mark: "bar",
       encoding: { x: { field: "a", type: "quantitative" } },
     });
     try {
       const diags = checkVegaUntrusted(specPath, "plots/x/spec.vl.json");
-      expect(diags.some((d) => d.message.includes(`(cap ${MAX_INLINE_DATA_ROWS})`))).toBe(true);
+      expect(diags.some((d) => d.message.includes("inline data (data.values) is refused"))).toBe(true);
     } finally {
       cleanup();
     }

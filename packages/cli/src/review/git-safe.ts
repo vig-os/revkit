@@ -126,6 +126,28 @@ export function buildSafeGitArgs(subcommandArgs: readonly string[]): readonly st
 }
 
 /**
+ * Runtime brand check (PR #48 round-4 nit). Compile-time nominal
+ * branding stops accidental structural equivalents, but a cast
+ * through `any` can still forge a shape. This function verifies
+ * the brand symbol is present and set to `true` at call time —
+ * an object cast via `foo as unknown as SafeGitRunner` from outside
+ * this module cannot forge the module-local `SAFE_GIT_BRAND`.
+ */
+export function assertSafeGitRunner(candidate: unknown, callerLabel: string): void {
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    (candidate as { [k: symbol]: unknown })[SAFE_GIT_BRAND] !== true ||
+    typeof (candidate as { run?: unknown }).run !== "function"
+  ) {
+    throw new Error(
+      `${callerLabel}: git runner is not a SafeGitRunner ` +
+        `(refusing forged cast; the runner must come from wrapSafeGitRunner).`,
+    );
+  }
+}
+
+/**
  * Invoke `git` in `cwd` through `runner` with the safe prefix. Errors
  * throw a `SafeGitError` carrying the exit code and stderr — the
  * caller decides whether to wrap it in a domain-specific message
@@ -144,6 +166,8 @@ export async function runSafeGit(
     const args = buildSafeGitArgs(subcommandArgs);
     return await runner(args, cwd);
   }
+  // Runtime brand check on the wrapper object shape.
+  assertSafeGitRunner(runner, "runSafeGit");
   return await runner.run(subcommandArgs, cwd);
 }
 

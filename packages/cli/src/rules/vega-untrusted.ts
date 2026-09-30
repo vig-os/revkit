@@ -65,11 +65,18 @@ import type { Diagnostic } from "../diagnostics.ts";
 
 /** Per-file data-size cap, in bytes. */
 export const MAX_DATA_FILE_BYTES = 512 * 1024;
-/** Per-inline data-values array cap, in rows. */
+/** Cap on inline data rows — kept only as a documentation constant.
+ * Inline `data.values` is refused outright in untrusted mode
+ * (PR #48 round-4 nit). */
 export const MAX_INLINE_DATA_ROWS = 5_000;
 
 /** Top-level keys the walker admits. Anything else refused. */
 const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
+  // revkit's own required key on every plot spec (see
+  // site/src/content/schemas/plots.ts): a positive integer with
+  // no expression payload — refused-by-shape any string that
+  // slipped in.
+  "schemaVersion",
   "$schema",
   "title",
   "description",
@@ -226,7 +233,9 @@ const LEGEND_KEYS: ReadonlySet<string> = new Set([
   "gradientThickness",
 ]);
 
-/** Mark object keys. */
+/** Mark object keys. Includes the corner-radius variants revkit's
+ * own plots use (`cornerRadiusEnd`, etc.). Any `…Expr` sibling of
+ * a listed key is still refused by the `isExprKey` check. */
 const MARK_OBJECT_KEYS: ReadonlySet<string> = new Set([
   "type",
   "color",
@@ -248,6 +257,11 @@ const MARK_OBJECT_KEYS: ReadonlySet<string> = new Set([
   "baseline",
   "angle",
   "cornerRadius",
+  "cornerRadiusEnd",
+  "cornerRadiusTopLeft",
+  "cornerRadiusTopRight",
+  "cornerRadiusBottomLeft",
+  "cornerRadiusBottomRight",
   "dx",
   "dy",
   "filled",
@@ -257,6 +271,11 @@ const MARK_OBJECT_KEYS: ReadonlySet<string> = new Set([
   "fontWeight",
   "clip",
   "invalid",
+  "radius",
+  "radius2",
+  "innerRadius",
+  "outerRadius",
+  "padAngle",
 ]);
 
 /** Bin object keys. */
@@ -505,9 +524,17 @@ function walkData(value: unknown, path: string, ctx: WalkCtx): void {
     return;
   }
   const obj = value as Record<string, unknown>;
-  const allowedDataKeys = new Set(["url", "name", "values", "format"]);
+  // `data.values` is refused OUTRIGHT (PR #48 round-4 nit) — the
+  // trusted plots schema (site/src/content/schemas/plots.ts) and
+  // CLAUDE.md already forbid inline data. Every PR data source
+  // must be a sibling file via `data.url`.
+  const allowedDataKeys = new Set(["url", "name", "format"]);
   for (const [k, v] of Object.entries(obj)) {
     if (refuseExpressionKey(k, `${path}.${k}`, ctx)) continue;
+    if (k === "values") {
+      push(ctx, `${path}.values`, `inline data (data.values) is refused — use a sibling data.url file (ADR-0004, C4)`);
+      continue;
+    }
     if (!allowedDataKeys.has(k)) {
       push(ctx, `${path}.${k}`, `unknown data key '${k}'`);
       continue;
@@ -521,24 +548,6 @@ function walkData(value: unknown, path: string, ctx: WalkCtx): void {
     } else if (k === "name") {
       if (typeof v !== "string") {
         push(ctx, `${path}.name`, `data.name must be a string`);
-      }
-    } else if (k === "values") {
-      if (!Array.isArray(v)) {
-        push(ctx, `${path}.values`, `data.values must be an array`);
-        continue;
-      }
-      if (v.length > MAX_INLINE_DATA_ROWS) {
-        push(ctx, `${path}.values`, `inline data has ${v.length} rows (cap ${MAX_INLINE_DATA_ROWS})`);
-      }
-      for (let i = 0; i < v.length; i++) {
-        const row = v[i];
-        if (row === null || typeof row !== "object") {
-          push(ctx, `${path}.values[${i}]`, `row must be an object`);
-          continue;
-        }
-        for (const [rk, rv] of Object.entries(row as Record<string, unknown>)) {
-          checkPrimitive(rv, `${path}.values[${i}].${rk}`, ctx);
-        }
       }
     } else {
       // `format` — restricted set of literal keys.
@@ -610,6 +619,16 @@ function walkEncoding(value: unknown, path: string, ctx: WalkCtx): void {
     if (refuseExpressionKey(channel, `${path}.${channel}`, ctx)) continue;
     if (!ENCODING_CHANNELS.has(channel)) {
       push(ctx, `${path}.${channel}`, `unknown encoding channel '${channel}'`);
+      continue;
+    }
+    // `tooltip` (and `detail`) accept the ARRAY form
+    // `[ {field, type, title}, … ]` — a common shape in revkit's
+    // own plots. Every element is walked as a channel def; any
+    // expression string still gets refused by the leaf check.
+    if (Array.isArray(def)) {
+      for (let i = 0; i < def.length; i++) {
+        walkChannelDef(def[i], `${path}.${channel}[${i}]`, ctx);
+      }
       continue;
     }
     walkChannelDef(def, `${path}.${channel}`, ctx);
@@ -733,15 +752,77 @@ function walkContainerArray(value: unknown, path: string, ctx: WalkCtx): void {
   }
 }
 
+/** Allowlisted top-level keys inside `config`. Anything else (e.g.
+ * vega's `events` / `bind` machinery) is refused (PR #48 round-4
+ * nit). Every sub-key value must still be a primitive or a shallow
+ * object of primitives, and any expression-shaped string is caught
+ * by the leaf check. */
+const CONFIG_KEYS: ReadonlySet<string> = new Set([
+  // Theming baselines.
+  "background",
+  "padding",
+  "autosize",
+  "font",
+  "customFormatTypes",
+  "numberFormat",
+  "timeFormat",
+  // Axis / legend / scale-wide defaults.
+  "axis",
+  "axisX",
+  "axisY",
+  "axisTop",
+  "axisBottom",
+  "axisLeft",
+  "axisRight",
+  "axisBand",
+  "axisDiscrete",
+  "axisQuantitative",
+  "axisTemporal",
+  "legend",
+  "title",
+  "header",
+  "headerRow",
+  "headerColumn",
+  "headerFacet",
+  "range",
+  "scale",
+  "projection",
+  "concat",
+  "facet",
+  "view",
+  // Mark-family defaults.
+  "mark",
+  "arc",
+  "area",
+  "bar",
+  "boxplot",
+  "circle",
+  "errorband",
+  "errorbar",
+  "geoshape",
+  "image",
+  "line",
+  "point",
+  "rect",
+  "rule",
+  "square",
+  "text",
+  "tick",
+  "trail",
+  "style",
+]);
+
 function walkConfig(value: unknown, path: string, ctx: WalkCtx): void {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     push(ctx, path, `config must be an object`);
     return;
   }
-  // config sub-keys are all shallow objects of literals. Recursive
-  // primitive check catches expression-shaped strings anywhere.
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
     if (refuseExpressionKey(k, `${path}.${k}`, ctx)) continue;
+    if (!CONFIG_KEYS.has(k)) {
+      push(ctx, `${path}.${k}`, `unknown config key '${k}'`);
+      continue;
+    }
     if (v === null || typeof v !== "object" || Array.isArray(v)) {
       checkPrimitive(v, `${path}.${k}`, ctx);
       continue;
