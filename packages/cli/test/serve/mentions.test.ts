@@ -119,6 +119,75 @@ describe("extractMentions — misfires prevented (round-2 blockers)", () => {
     const scan = extractMentions("Reach me at foo@bar for that.");
     expect(scan.mentions).toEqual([]);
   });
+
+  // ── Round-3 blockers on the mention parser ──────────────────
+
+  test("ROUND 3: `<CODE>` (case-insensitive tag name) suppresses mentions", () => {
+    // Round-2 pre-mask used `body.slice(i, i+5).toLowerCase()` but
+    // only matched the literal casings the loop tried; a case-shift
+    // could still slip through. Round-3 drops the mask and matches
+    // tag names case-insensitively via `classifyHtml`.
+    const scan = extractMentions("prose <CODE>@agent now</CODE> after");
+    expect(scan.mentions).toEqual([]);
+  });
+
+  test("ROUND 3: `<codebase>` is NOT treated as `<code>` (prefix-match fixed)", () => {
+    // Round-2 mask fired on any `<code…>`, including `<codebase>`,
+    // and swallowed the whole rest of the paragraph. Round-3
+    // matches tag NAME exactly (word-anchored).
+    const scan = extractMentions("see <codebase>x</codebase> and @octo");
+    // remark-parse still emits `<codebase>` as an html node the
+    // walker skips, but `@octo` in the surrounding prose fires.
+    expect(scan.mentions.map((m) => m.id)).toEqual(["octo"]);
+  });
+
+  test("ROUND 3: `<preview>` is NOT treated as `<pre>` (prefix-match fixed)", () => {
+    const scan = extractMentions("see <preview>x</preview> and @octo");
+    expect(scan.mentions.map((m) => m.id)).toEqual(["octo"]);
+  });
+
+  test("ROUND 3: an unclosed `<code>` does not swallow the entire rest of the body", () => {
+    // Round-2 mask had a fallback: unterminated `<code>` masked
+    // everything to end-of-body. That deleted legitimate later
+    // mentions. Round-3 uses AST siblings — an unmatched `<code>`
+    // open tag leaves the code-depth pinned at 1 for the rest of
+    // that paragraph but the next paragraph is a fresh container
+    // and clears it. Even the misclassification is bounded (one
+    // paragraph, not the whole body).
+    const body =
+      "para one has <code>a and @agent should not fire here\n\n" +
+      "para two: @octo should still fire";
+    const scan = extractMentions(body);
+    expect(scan.mentions.map((m) => m.id)).toEqual(["octo"]);
+  });
+
+  test("ROUND 3: an unclosed HTML comment does not swallow later mentions across paragraphs", () => {
+    // Round-2 mask ate everything up to EOF on an unterminated
+    // `<!--`. Round-3 relies on remark's own tokenisation — an
+    // unterminated `<!--` in one paragraph is bounded by
+    // paragraph structure; the mentions in the next paragraph
+    // fire normally.
+    const body = "para one: <!-- @agent now not closed here\n\npara two: @octo";
+    const scan = extractMentions(body);
+    // At MINIMUM `@octo` in the second paragraph fires — the
+    // mention parser must not delete every later mention just
+    // because a comment was unclosed.
+    const ids = scan.mentions.map((m) => m.id);
+    expect(ids).toContain("octo");
+  });
+
+  test("ROUND 3: nested `<code><code>@agent</code></code>` — text is suppressed", () => {
+    // The sibling stack tracks depth, so nested tags close
+    // correctly.
+    const scan = extractMentions("<code><code>@agent</code></code>");
+    expect(scan.mentions).toEqual([]);
+  });
+
+  test("ROUND 3: `<code>@agent</code> @octo` — text OUTSIDE the tag pair still fires", () => {
+    const scan = extractMentions("<code>@agent</code> @octo");
+    // Only @octo fires — @agent is between the sibling code tags.
+    expect(scan.mentions.map((m) => m.id)).toEqual(["octo"]);
+  });
 });
 
 describe("extractMentions — bounds + shapes", () => {

@@ -1,28 +1,28 @@
-// Delivery-mode adapter (M2 item 6 review round 2).
+// Delivery-mode adapter (M2 item 6 review round 3).
 //
-// The state is fully DERIVED from the event log — see
-// `@revkit/review-core`'s `pendingCommentIds` and
-// `currentDeliveryMode`. This module is a thin daemon-side wrapper
-// that:
+// The state is fully DERIVED from the event log — the pure
+// functions live in `@revkit/review-core`. The daemon-side adapter
+// keeps a **materialised incremental cache** of the derived answers
+// so `/api/delivery-mode`, `/api/pending`, `/api/delivered`, the
+// audit / fan-out gate and the idle-timer reconcile do NOT re-read
+// the full log on every request (round-3 nit: the daemon had 15
+// `store.since(0)` calls per typical request path — folding new
+// events as they land drops that to zero).
 //
-//   1. Caches the derived answer for cheap `/api/delivery-mode`
-//      reads (rebuilt on every `store.append`, so the cache is
-//      always the SAME function of the log).
-//   2. Owns the idle-flush timer's callback surface — the actual
-//      "should we flush now?" decision comes from the log's
-//      pending set.
+// Correctness contract: the cache is a materialisation of the
+// same pure function the tests hammer. `ingest(event)` folds one
+// event into the cache; `rebuildFromLog(events)` throws the cache
+// away and rebuilds from the full slice. The daemon calls
+// `rebuildFromLog` at boot (paying one full read) and `ingest`
+// after every `store.append`.
 //
 // Persistence: NONE. Mode changes are `delivery.mode_changed`
 // events on the durable log; a restart re-derives everything.
-// `.revkit/delivery.json` was removed (round-2 blocker fix).
 
 import type { DeliveryMode, ReviewEvent } from "@revkit/review-core";
 import {
   DEFAULT_DELIVERY_MODE,
-  currentDeliveryMode,
-  deliveredCommentIds,
   deliveryModeSchema,
-  pendingCommentIds,
 } from "@revkit/review-core";
 
 /** Re-exported so daemon imports need only the one module. */
@@ -73,29 +73,40 @@ export interface OpenOptions {
   readonly clearTimer?: (handle: { unref?: () => void }) => void;
 }
 
-/** The daemon-facing adapter. All state accessors read the LOG
- * (via `snapshot(events)`) — the adapter itself only tracks the
- * timer handle. */
+/** The daemon-facing adapter. Round-3: the adapter maintains an
+ * incremental cache of the derived state. */
 export interface DeliveryAdapter {
-  /** Derive the current status from a log slice. Cheap; the daemon
-   * calls this on every `GET /api/delivery-mode`. */
-  snapshot(events: readonly ReviewEvent[]): DeliveryModeStatus;
-  /** Whether THIS event should fan out to the AGENT stream, given
-   * the log up to and including this event's `seq`. */
-  shouldFanOutToAgent(event: ReviewEvent, allEvents: readonly ReviewEvent[]): boolean;
-  /** Re-arm (or cancel) the idle-flush timer. Reads the current
-   * pending set from the log; if it is non-empty AND
-   * `idleFlushMs > 0`, arms the timer to fire `onFire`. Idempotent
-   * (a second call reschedules from now). Call this after every
-   * `store.append` and after restart. */
-  reconcileIdleTimer(events: readonly ReviewEvent[], onFire: () => void): void;
+  /** One-shot rebuild from the FULL log. Called by the daemon at
+   * boot; a later `ingest(event)` folds one event into the cache. */
+  rebuildFromLog(events: readonly ReviewEvent[]): void;
+  /** Fold one event into the cache. Called after every
+   * `store.append`. */
+  ingest(event: ReviewEvent): void;
+  /** Current derived mode. */
+  currentMode(): DeliveryMode;
+  /** Set of comment ids currently pending (handover-arrival, not
+   * yet covered by any handover event). */
+  pendingCommentIds(): ReadonlySet<string>;
+  /** Set of comment ids delivered to the agent so far. */
+  deliveredCommentIds(): ReadonlySet<string>;
+  /** Status snapshot. Read-through cache; no full-log scan. */
+  snapshot(): DeliveryModeStatus;
+  /** Whether THIS event should fan out to the AGENT stream. Reads
+   * only the cache and the event itself. */
+  shouldFanOutToAgent(event: ReviewEvent): boolean;
+  /** Re-arm (or cancel) the idle-flush timer. Reads the cache;
+   * if `pending` is non-empty AND `idleFlushMs > 0`, arms the
+   * timer to fire `onFire`. Idempotent. */
+  reconcileIdleTimer(onFire: () => void): void;
   /** Test hook: is the idle timer currently armed? */
   isIdleTimerArmed(): boolean;
   /** Teardown: cancel the timer. */
   stop(): void;
 }
 
-/** Open the adapter. Holds no durable state — the log is truth. */
+/** Open the adapter. Round-3: the adapter maintains an
+ * incremental cache — the log is still truth, but the daemon
+ * does not re-scan it on every request. */
 export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter {
   const clock = options.nowMs ?? Date.now;
   const idleFlushMs = options.idleFlushMs ?? DEFAULT_IDLE_FLUSH_MS;
@@ -110,6 +121,84 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
 
   let idleHandle: { unref?: () => void } | undefined;
 
+  // ── incremental cache ─────────────────────────────────────
+  //
+  // We track, per human comment id: arrival mode + delivered flag.
+  // Mode is the current delivery mode. `lastMs` and `updatedAtMs`
+  // support the status snapshot.
+  interface CommentEntry {
+    arrivalMode: DeliveryMode;
+    delivered: boolean;
+  }
+  const entries = new Map<string, CommentEntry>();
+  let mode: DeliveryMode = DEFAULT_DELIVERY_MODE;
+  let lastMs: number | null = null;
+  let updatedAtMs: number | undefined;
+
+  const reset = (): void => {
+    entries.clear();
+    mode = DEFAULT_DELIVERY_MODE;
+    lastMs = null;
+    updatedAtMs = undefined;
+  };
+
+  const ingest: DeliveryAdapter["ingest"] = (event) => {
+    switch (event.kind) {
+      case "delivery.mode_changed": {
+        mode = event.to;
+        const parsed = Date.parse(event.ts);
+        if (Number.isFinite(parsed)) updatedAtMs = parsed;
+        break;
+      }
+      case "comment.created":
+      case "comment.replied": {
+        if (event.actor.kind === "agent") break;
+        entries.set(event.commentId, {
+          arrivalMode: mode,
+          // Live arrivals are delivered as soon as they land; the
+          // handover(trigger=live) bookkeeping event also comes
+          // through this ingest path, so this is consistent even
+          // if the log is replayed in either order.
+          delivered: mode === "live",
+        });
+        const parsed = Date.parse(event.ts);
+        if (Number.isFinite(parsed)) lastMs = parsed;
+        break;
+      }
+      case "handover": {
+        for (const id of event.commentIds) {
+          const entry = entries.get(id);
+          if (entry !== undefined) entry.delivered = true;
+        }
+        break;
+      }
+    }
+  };
+
+  const rebuildFromLog: DeliveryAdapter["rebuildFromLog"] = (events) => {
+    reset();
+    const sorted = [...events].sort((a, b) => a.seq - b.seq);
+    for (const event of sorted) ingest(event);
+  };
+
+  const currentMode: DeliveryAdapter["currentMode"] = () => mode;
+
+  const pendingSet = (): Set<string> => {
+    const out = new Set<string>();
+    for (const [id, e] of entries) {
+      if (e.arrivalMode === "handover" && !e.delivered) out.add(id);
+    }
+    return out;
+  };
+  const deliveredSet = (): Set<string> => {
+    const out = new Set<string>();
+    for (const [id, e] of entries) if (e.delivered) out.add(id);
+    return out;
+  };
+
+  const pendingCommentIdsFn: DeliveryAdapter["pendingCommentIds"] = () => pendingSet();
+  const deliveredCommentIdsFn: DeliveryAdapter["deliveredCommentIds"] = () => deliveredSet();
+
   const cancelTimer = (): void => {
     if (idleHandle !== undefined) {
       clearTimer(idleHandle);
@@ -117,74 +206,33 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
     }
   };
 
-  const snapshot: DeliveryAdapter["snapshot"] = (events) => {
-    const mode = currentDeliveryMode(events);
-    const pending = pendingCommentIds(events);
-    // Last human comment timestamp — the freshest human comment
-    // event, whether or not it's still pending. Used only for the
-    // rail's "last comment N s ago" badge.
-    let lastMs: number | null = null;
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i]!;
-      if (event.kind !== "comment.created" && event.kind !== "comment.replied") continue;
-      if (event.actor.kind === "agent") continue;
-      const parsed = Date.parse(event.ts);
-      if (Number.isFinite(parsed)) {
-        lastMs = parsed;
-        break;
-      }
-    }
-    // Last mode-change ts.
-    let updatedAt: string | undefined;
-    for (let i = events.length - 1; i >= 0; i--) {
-      const event = events[i]!;
-      if (event.kind === "delivery.mode_changed") {
-        updatedAt = event.ts;
-        break;
-      }
-    }
-    return {
-      mode,
-      batched: pending.size,
-      lastEventMsAgo: lastMs === null ? null : Math.max(0, clock() - lastMs),
-      updatedAt: updatedAt ?? new Date(0).toISOString(),
-      idleFlushMs,
-    };
-  };
+  const snapshot: DeliveryAdapter["snapshot"] = () => ({
+    mode,
+    batched: pendingSet().size,
+    lastEventMsAgo: lastMs === null ? null : Math.max(0, clock() - lastMs),
+    updatedAt: updatedAtMs === undefined ? new Date(0).toISOString() : new Date(updatedAtMs).toISOString(),
+    idleFlushMs,
+  });
 
-  const shouldFanOutToAgent: DeliveryAdapter["shouldFanOutToAgent"] = (event, allEvents) => {
-    // Non-comment events fan out unchanged. Handover events with
-    // trigger `live` are BOOKKEEPING — the agent already saw the
-    // covered `comment.created`, so a live handover frame is
-    // suppressed. Every other trigger (`handover`, `agent-now`,
-    // `mode-change-flush`) IS the agent's frame and fans out —
-    // agent-now informs the agent that a prior BATCH was flushed
-    // alongside the marker comment.
+  const shouldFanOutToAgent: DeliveryAdapter["shouldFanOutToAgent"] = (event) => {
     if (event.kind === "handover") {
       const trigger = event.trigger ?? "handover";
       return trigger !== "live";
     }
-    // `delivery.mode_changed` is rail-only; the agent gets no
-    // notification when the reviewer flips a switch.
     if (event.kind === "delivery.mode_changed") return false;
-    // Human comments: fan out iff delivered under the derived
-    // rules. Delivered comment ids include live arrivals and
-    // handover-covered ids.
     if (event.kind === "comment.created" || event.kind === "comment.replied") {
       if (event.actor.kind === "agent") return true;
-      const delivered = deliveredCommentIds(allEvents);
-      return delivered.has(event.commentId);
+      const entry = entries.get(event.commentId);
+      return entry?.delivered === true;
     }
     return true;
   };
 
-  const reconcileIdleTimer: DeliveryAdapter["reconcileIdleTimer"] = (events, onFire) => {
+  const reconcileIdleTimer: DeliveryAdapter["reconcileIdleTimer"] = (onFire) => {
     cancelTimer();
     if (idleFlushMs <= 0) return;
-    const mode = currentDeliveryMode(events);
     if (mode !== "handover") return;
-    const pending = pendingCommentIds(events);
-    if (pending.size === 0) return;
+    if (pendingSet().size === 0) return;
     idleHandle = setTimer(() => {
       idleHandle = undefined;
       onFire();
@@ -197,5 +245,16 @@ export function openDeliveryAdapter(options: OpenOptions = {}): DeliveryAdapter 
     cancelTimer();
   };
 
-  return { snapshot, shouldFanOutToAgent, reconcileIdleTimer, isIdleTimerArmed, stop };
+  return {
+    rebuildFromLog,
+    ingest,
+    currentMode,
+    pendingCommentIds: pendingCommentIdsFn,
+    deliveredCommentIds: deliveredCommentIdsFn,
+    snapshot,
+    shouldFanOutToAgent,
+    reconcileIdleTimer,
+    isIdleTimerArmed,
+    stop,
+  };
 }

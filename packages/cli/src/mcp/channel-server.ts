@@ -335,11 +335,13 @@ export function formatCatchupSummary(
     const last = thread.comments[thread.comments.length - 1];
     if (last === undefined) return false;
     if (last.author?.kind === "agent") return false;
-    // Round-2: filter to DELIVERED threads only. A handover-batched
-    // draft is the reviewer's WIP (like a GitHub pending review)
-    // and MUST NOT leak into the catch-up summary until it is
-    // handed over. Absent `delivered` = pre-round-2 caller; fall
-    // back to the old shape but the caller should upgrade.
+    // Round-3: the catch-up summary is a PUSH-side surface. It
+    // filters to DELIVERED threads only so the channel does not
+    // interrupt the agent about drafts the reviewer has not yet
+    // handed over. This is a DELIVERY-TIMING contract, not
+    // confidentiality — the `threads` MCP tool intentionally
+    // returns handover drafts too (see ADR-0007 round-3
+    // amendment).
     if (delivered !== undefined && !delivered.has(last.id)) return false;
     return true;
   });
@@ -808,15 +810,24 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       : await currentClient.listThreads();
     lastSeenSeq = listing.head ?? 0;
     // Round-2: the catch-up summary must ONLY list threads that
-    // are delivered to the agent. A handover-batched draft is
-    // hidden until the reviewer hands over — pull the derived
-    // set from the daemon. A failure here (older daemon) falls
-    // back to the pre-round-2 shape.
-    let delivered: DeliveredSet | undefined;
+    // are delivered to the agent. The `deliveredCommentIds` set
+    // is derived on the daemon and returned from `/api/delivered`.
+    //
+    // Round-3 fail-closed: if the daemon errors on that endpoint
+    // (an older daemon before the round-2 refactor OR a network
+    // hiccup), the catch-up must SUPPRESS everything rather than
+    // fall back to the pre-round-2 shape — an older-shape summary
+    // would leak handover drafts into the channel on the very
+    // first frame the agent sees. The `hook` command already
+    // fails silent on the same error; the catch-up now matches.
+    let delivered: DeliveredSet;
     try {
       delivered = new Set(await currentClient.getDeliveredCommentIds());
     } catch {
-      delivered = undefined;
+      // Fail closed: no summary emitted this connect. The agent
+      // can still call `threads` to pull if it needs to.
+      attachSubscriber();
+      return;
     }
     const summary = formatCatchupSummary(listing.threads as readonly WireThread[], delivered);
     if (summary !== undefined) {

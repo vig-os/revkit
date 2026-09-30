@@ -96,7 +96,11 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
 }
 
 function writeFixture(): { path: string; cleanup: () => void } {
-  const rel = "rail-mode-fixture.html";
+  // Round-3: per-process unique fixture path so a parallel spec run
+  // (were fullyParallel to reach us) can't collide with a shared
+  // `site/dist/rail-mode-fixture.html` write.
+  const unique = process.pid.toString(36) + "-" + Date.now().toString(36);
+  const rel = `rail-mode-fixture-${unique}.html`;
   const abs = join(DIST, rel);
   // A minimal accessible fixture: <h1> for axe's page-has-heading-one
   // rule, one data-src'd paragraph so the rail's selection listener
@@ -138,6 +142,17 @@ async function selectSubstring(page: Page, needle: string): Promise<void> {
   }, needle);
 }
 
+// Round-3: force serial mode. `fullyParallel: true` at the config
+// level was splitting these tests across workers; each worker's
+// `beforeAll` boots a daemon AND writes to a SHARED fixture path
+// under `site/dist/`. Two workers colliding on that write (or one
+// worker's afterAll deleting the fixture while another is still
+// reading it) caused the axe test to intermittently time out
+// waiting for the rail to load a fixture that no longer existed.
+// Serial mode means one worker runs the whole file — the daemon
+// and fixture are boot-once, tear-down-once.
+test.describe.configure({ mode: "serial" });
+
 test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   let ctx: DaemonCtx;
   let fixture: { path: string; cleanup: () => void };
@@ -150,8 +165,27 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
     if (ctx !== undefined) await shutdown(ctx);
   });
 
+  /** Round-3: each test uses a FRESH launch URL because the code
+   * is single-use and Playwright creates a new browser context per
+   * test (no cookie carries over). Every test opens the daemon by
+   * minting a new code via `POST /-/launch-code` with the agent
+   * bearer, then navigates to the returned URL. */
+  const freshLaunchUrl = async (): Promise<string> => {
+    const response = await fetch(`${ctx.url}/-/launch-code`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ctx.agentToken}`,
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+    if (!response.ok) throw new Error(`launch mint: ${response.status}`);
+    const parsed = (await response.json()) as { launchUrl: string };
+    return parsed.launchUrl;
+  };
+
   test("mode switch renders and flipping to `live` reaches the daemon", async ({ page }) => {
-    await page.goto(ctx.launchUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
     await page.goto(`${ctx.url}/${fixture.path}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="revkit-rail"]');
     // Mode fieldset is present with all three options.
@@ -180,7 +214,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   });
 
   test("`@agent now` in a comment renders as an agent-now chip", async ({ page }) => {
-    await page.goto(ctx.launchUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
     // Force mode to live so posting a comment does not stay batched (the
     // rail's mention rendering is independent of mode, but the flow
     // through-the-daemon assertion is simpler when the comment shows up).
@@ -213,7 +247,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   test("handover flushes on 'Hand over' click (batched → 0)", async ({ page }) => {
     // Ensure mode is handover for this test — the previous test left it
     // in `live`, so reset explicitly.
-    await page.goto(ctx.launchUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
     await page.evaluate(async () => {
       await fetch("/api/delivery-mode", {
         method: "POST",
@@ -243,7 +277,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   });
 
   test("axe reports no violations with the mode UI + a mention chip on the page", async ({ page }) => {
-    await page.goto(ctx.launchUrl, { waitUntil: "domcontentloaded" });
+    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
     await page.goto(`${ctx.url}/${fixture.path}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="revkit-rail"]');
     // Round-2 fix: wait for the delivery-mode UI to be READY before

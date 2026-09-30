@@ -149,14 +149,53 @@ memory and after a restart. Round 2 fixes this **by construction**:
   writes it once. A test fixture spawning the REAL bin
   (`test/hook-cli.test.ts:BLOCKER 3`) is the regression net.
 
-- **Agent authority over the mode.** The MCP `mode` tool is **read-only**
-  from the agent surface: the tool's inputSchema declares no `set`
-  property, so a prompt-injected agent has NO way to flip modes through
-  the channel. The HTTP endpoint `POST /api/delivery-mode` still accepts
-  the reviewer's cookie AND the agent bearer, because the bearer is
-  filesystem-gated on `.revkit/serve.json` (mode 600) — a prompt-injected
-  agent without local filesystem read cannot obtain it. The security
-  envelope is "local filesystem access", not "identity of the bearer".
+- **Agent authority — MCP surface.** The MCP `mode` tool is
+  **read-only**: its inputSchema declares no `set` property. There is
+  no MCP `flush` / `handover` tool. So a prompt-injected agent that
+  can only reach the MCP surface has no way to flip the mode or drain
+  drafts through the channel.
+
+- **What handover IS NOT.** Handover mode controls when comments are
+  PUSHED to the agent's channel — it is a DELIVERY-TIMING control, not
+  a confidentiality guarantee. A same-user agent that can run `Bash`
+  (or read `.revkit/serve.json`, mode 600, at its own uid) can:
+  - `POST /api/delivery-mode {"mode":"live"}` and trigger the batch
+    flush,
+  - `POST /api/handover` and get `flushed: N`,
+  - `GET /api/threads` and read every draft's body,
+  - call the `threads` MCP tool and get the same shape.
+
+  Round-2 originally claimed the bearer was "filesystem-gated" and
+  drafts "never leak / are private WIP". Both are false at the local
+  M2 daemon: the bearer sits in a file the agent's shell can read,
+  and the `threads` MCP tool intentionally returns every open thread
+  including handover drafts (the pull side of ADR-0007's design).
+  This amendment retracts those claims.
+
+- **What handover IS.** A UX contract: while the reviewer is drafting,
+  the channel stays quiet — no per-comment notification, no
+  additionalContext preamble on the next prompt. On explicit
+  hand-over the drafts land in a single coherent frame. That contract
+  is enforced on the PUSH surface only (`/events?for=agent`, the
+  channel notifications, the `UserPromptSubmit` hook, the catch-up
+  summary). PULL surfaces — `threads` MCP tool, `GET /api/threads`,
+  `revkit events --follow` — return whatever the log carries.
+
+- **Visibility for the reviewer.** When the agent (or any local
+  caller) hits `POST /api/handover` or `POST /api/delivery-mode`, the
+  daemon appends a `handover` (or `delivery.mode_changed`) event that
+  carries the ACTOR who triggered it. The rail shows a small "flushed
+  by …" indicator so the human sees an agent-initiated flush is
+  distinguishable from their own click. `handover` fan-out on
+  audience `["agent","rail"]` covers this.
+
+- **Open question (a follow-up ADR).** A real draft-privacy
+  guarantee — "the agent CANNOT read my drafts until I say so" —
+  needs a separate credential path: a reviewer-only bearer stored
+  outside the agent's uid (a keyring, a hardware-bound key, an OS
+  keychain), plus a partition on the daemon's HTTP surface (reader
+  vs. reviewer). That is out of scope for M2 item 6. Tracked as a
+  planned follow-up.
 
 ## Amendment (2026-09-30) — M2 item 6: delivery modes, presence, `@agent`, hook
 

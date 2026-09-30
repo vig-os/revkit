@@ -31,9 +31,6 @@ import {
   isValidId,
   revisionOf,
   threadStatusSchema,
-  currentDeliveryMode,
-  deliveredCommentIds,
-  pendingCommentIds,
   type Anchor,
   type Author,
   type HandoverTrigger,
@@ -415,9 +412,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // resume slice either — the pending set is still owed a
           // single `handover` promotion when the reviewer hands over.
           const audience = data.audience;
-          const allEvents = await store.since(0);
           const primeFilter = (event: ReviewEvent): boolean =>
-            audience === "rail" ? true : delivery.shouldFanOutToAgent(event, allEvents);
+            audience === "rail" ? true : delivery.shouldFanOutToAgent(event);
           for (const event of primer) {
             if (!primeFilter(event)) continue;
             ws.send(JSON.stringify(event));
@@ -562,26 +558,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
   }
 
-  // Boot-time hydration (round-2). If the caller supplied an
-  // `initialMode` AND the log has no `delivery.mode_changed` yet,
-  // write one so the log records that boot-time choice. Also
-  // re-arm the idle timer if the derived batch is non-empty (a
-  // reviewer left comments in `handover` mode; the daemon
-  // restarted; the drafts must still auto-flush on the SAME
-  // schedule).
+  // Boot-time hydration (round-3). Load the full log ONCE and
+  // rebuild the delivery cache from it. Every subsequent append
+  // folds a single event into the cache via `delivery.ingest`.
+  // If the caller supplied an `initialMode` AND the log has no
+  // `delivery.mode_changed` yet, write one so the log records the
+  // boot-time choice. Then re-arm the idle timer if the derived
+  // batch is non-empty — a reviewer left comments in `handover`
+  // mode; the daemon restarted; the drafts must still auto-flush
+  // on the SAME schedule.
   const bootstrapEvents0 = await store.since(0);
-  const bootMode = currentDeliveryMode(bootstrapEvents0);
-  if (options.deliveryMode !== undefined && options.deliveryMode !== bootMode) {
-    // No prior mode change AND caller wants a different start.
+  delivery.rebuildFromLog(bootstrapEvents0);
+  if (options.deliveryMode !== undefined && options.deliveryMode !== delivery.currentMode()) {
     const hasChange = bootstrapEvents0.some((e) => e.kind === "delivery.mode_changed");
     if (!hasChange) {
       try {
-        await store.append({
+        const seq = await store.append({
           kind: "delivery.mode_changed",
           actor: localActor,
           from: null,
           to: options.deliveryMode,
         });
+        // Fold the boot event into the cache.
+        const written = await store.since(seq - 1);
+        const event = written.find((e) => e.seq === seq);
+        if (event !== undefined) delivery.ingest(event);
       } catch (error) {
         logger.warn("delivery.boot-mode.failed", {
           errorKind: (error as Error).name,
@@ -589,8 +590,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
     }
   }
-  const bootstrapEvents1 = await store.since(0);
-  delivery.reconcileIdleTimer(bootstrapEvents1, () => {
+  delivery.reconcileIdleTimer(() => {
     void flushPendingHandover("idle");
   });
 
@@ -1149,6 +1149,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const events = await store.since(seq - 1);
     const event = events.find((e) => e.seq === seq);
     if (event !== undefined) {
+      // Round-3: fold this event into the derived cache FIRST so
+      // subsequent audit / snapshot / etc. read the fresh state.
+      delivery.ingest(event);
       // Round-2 ATOMICITY: the delivery event (if any) is appended
       // FIRST, so the fan-out decision at publish time reads a log
       // that already reflects the delivery. Otherwise a
@@ -1163,12 +1166,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         if (event.actor.kind !== "agent") {
           const body = (event as { body?: string }).body ?? "";
           const scan = extractMentions(body);
-          const modeSnapshot = currentDeliveryMode(await store.since(0));
+          const modeSnapshot = delivery.currentMode();
           if (modeSnapshot === "live") {
             await appendDeliveryEvent([event.commentId], "live", requestId);
           } else if (scan.hasAgentNow) {
             // @agent now flushes the pending batch alongside.
-            const pending = pendingCommentIds(await store.since(0));
+            const pending = delivery.pendingCommentIds();
             const ids = new Set<string>(pending);
             ids.add(event.commentId);
             await appendDeliveryEvent([...ids], "agent-now", requestId);
@@ -1178,13 +1181,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         }
       }
       // NOW publish the original event with a fan-out decision
-      // computed against the updated log.
-      const allEvents = await store.since(0);
-      const audiences = auditFanOutAudiences(event, allEvents);
+      // read from the cache.
+      const audiences = auditFanOutAudiences(event);
       void bus.publish(event, { audiences });
-      // Re-arm the idle timer based on the updated log (includes
+      // Re-arm the idle timer based on the updated cache (includes
       // any delivery event we just appended).
-      delivery.reconcileIdleTimer(allEvents, () => {
+      delivery.reconcileIdleTimer(() => {
         void flushPendingHandover("idle");
       });
     }
@@ -1201,16 +1203,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return jsonResponse({ seq, event }, 201);
   }
 
-  /** Decide which audiences receive THIS event. Called after append
-   * with the full log so pending / delivered ids are current. Rail
-   * always sees everything; agent visibility follows the derived
-   * rules in `@revkit/review-core`. */
-  function auditFanOutAudiences(
-    event: ReviewEvent,
-    allEvents: readonly ReviewEvent[],
-  ): readonly ("agent" | "rail")[] {
+  /** Decide which audiences receive THIS event. Reads the derived
+   * cache (round-3). Rail always sees everything; agent visibility
+   * follows the derived rules in the adapter. */
+  function auditFanOutAudiences(event: ReviewEvent): readonly ("agent" | "rail")[] {
     const rail: ("agent" | "rail")[] = ["rail"];
-    if (delivery.shouldFanOutToAgent(event, allEvents)) rail.push("agent");
+    if (delivery.shouldFanOutToAgent(event)) rail.push("agent");
     return rail;
   }
 
@@ -1245,8 +1243,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const events = await store.since(seq - 1);
       const event = events.find((e) => e.seq === seq);
       if (event !== undefined) {
-        const allEvents = await store.since(0);
-        const audiences = auditFanOutAudiences(event, allEvents);
+        // Fold into the cache BEFORE fan-out, so shouldFanOutToAgent
+        // reads the fresh state.
+        delivery.ingest(event);
+        const audiences = auditFanOutAudiences(event);
         void bus.publish(event, { audiences });
       }
       logger.info("delivery.appended", { seq, count: ids.length, from: trigger });
@@ -1267,8 +1267,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    * pending. Returns the emitted event or undefined when nothing
    * was pending. */
   async function flushPendingHandover(trigger: "handover" | "mode-change-flush" | "idle"): Promise<ReviewEvent | undefined> {
-    const allEvents = await store.since(0);
-    const pending = pendingCommentIds(allEvents);
+    const pending = delivery.pendingCommentIds();
     if (pending.size === 0) return undefined;
     // Map "idle" reason onto the schema's `handover` trigger — idle
     // is the reviewer implicitly handing over (they walked away).
@@ -1305,26 +1304,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
 
     if (url.pathname === "/api/delivery-mode" && method === "GET") {
-      const events = await store.since(0);
-      return jsonResponse(delivery.snapshot(events));
+      // Round-3: cache read; no full-log scan.
+      return jsonResponse(delivery.snapshot());
     }
 
     if (url.pathname === "/api/delivered" && method === "GET") {
-      // Round-2: expose the derived "delivered to agent" set so the
-      // hook + catch-up summary can filter to threads whose last
-      // comment has actually reached the agent (never leak handover
-      // drafts or quiet-mode comments).
-      const events = await store.since(0);
-      const ids = deliveredCommentIds(events);
+      // Round-2: exposes the derived "delivered to agent" set so
+      // the hook + catch-up summary filter to threads whose last
+      // comment has actually reached the agent. Round-3 reads
+      // the incremental cache.
+      const ids = delivery.deliveredCommentIds();
       return jsonResponse({ deliveredCommentIds: [...ids] });
     }
 
     if (url.pathname === "/api/pending" && method === "GET") {
-      // Round-2: pending is a pure function of the log. Exposed so
-      // the rail's mode-badge and the channel client's catch-up
-      // summary both derive from the same source.
-      const events = await store.since(0);
-      const ids = pendingCommentIds(events);
+      const ids = delivery.pendingCommentIds();
       return jsonResponse({ pendingCommentIds: [...ids] });
     }
 
@@ -1352,10 +1346,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       if (mode === undefined) {
         return badRequest([{ code: "custom", path: ["mode"], message: "unknown mode" }]);
       }
-      const before = currentDeliveryMode(await store.since(0));
+      const before = delivery.currentMode();
       if (mode === before) {
         // No-op — do not emit a duplicate mode_changed event.
-        return jsonResponse(delivery.snapshot(await store.since(0)));
+        return jsonResponse(delivery.snapshot());
       }
       // A handover→live transition flushes the pending batch first
       // (documented, ADR-0007). handover→quiet does NOT flush: the
@@ -1378,17 +1372,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         throw error;
       }
       // Fan out the mode-change (rail-only per audit rules).
+      // Round-3: read the just-written event by seq and fold it
+      // into the cache before publishing.
       const eventsAfter = await store.since(0);
       const modeEvent = eventsAfter[eventsAfter.length - 1];
       if (modeEvent !== undefined) {
-        const audiences = auditFanOutAudiences(modeEvent, eventsAfter);
+        delivery.ingest(modeEvent);
+        const audiences = auditFanOutAudiences(modeEvent);
         void bus.publish(modeEvent, { audiences });
       }
-      delivery.reconcileIdleTimer(eventsAfter, () => {
+      delivery.reconcileIdleTimer(() => {
         void flushPendingHandover("idle");
       });
       logger.info("delivery.mode.changed", { requestId, from: before, to: mode });
-      return jsonResponse(delivery.snapshot(eventsAfter));
+      return jsonResponse(delivery.snapshot());
     }
 
     if (url.pathname === "/api/handover" && method === "POST") {
@@ -1552,11 +1549,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // changed while the daemon was down is re-anchored here.
           await reanchor.refreshAll();
           const primer = await store.since(since);
-          const allEventsForPrime = audience === "agent" ? await store.since(0) : [];
           for (const event of primer) {
             if (
               audience === "agent" &&
-              !delivery.shouldFanOutToAgent(event, allEventsForPrime)
+              !delivery.shouldFanOutToAgent(event)
             ) {
               continue;
             }

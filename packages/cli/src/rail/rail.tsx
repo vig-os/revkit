@@ -357,6 +357,15 @@ function subscribeEvents(
     readonly endLine?: number;
     readonly actor?: { readonly id?: string; readonly displayName?: string };
   }) => void = () => {},
+  onDeliveryEvent: (event: {
+    readonly kind: string;
+    readonly ts: string;
+    readonly trigger?: string;
+    readonly commentIds?: readonly string[];
+    readonly from?: string | null;
+    readonly to?: string;
+    readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
+  }) => void = () => {},
 ): () => void {
   let closed = false;
   let source: EventSource | undefined;
@@ -398,6 +407,22 @@ function subscribeEvents(
           event.kind === "comment.replied"
         ) {
           onModeBump();
+        }
+        // Round-3: expose handover + mode-change events to the rail
+        // so the human sees a "flushed by …" indicator when the
+        // agent (or another local caller) triggers a flush or
+        // mode change. Delivery-timing is not confidentiality —
+        // the human needs to SEE this happen.
+        if (event.kind === "handover" || event.kind === "delivery.mode_changed") {
+          onDeliveryEvent(event as unknown as {
+            readonly kind: string;
+            readonly ts: string;
+            readonly trigger?: string;
+            readonly commentIds?: readonly string[];
+            readonly from?: string | null;
+            readonly to?: string;
+            readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
+          });
         }
         if (event.kind === "presence") {
           onPresence(event as unknown as {
@@ -460,6 +485,45 @@ function Rail(): JSX.Element {
   const [mode, { refetch: refetchMode }] = createResource(fetchDeliveryMode);
   // Presence — latest beacon per agent id. Cleared on `idle`.
   const [presence, setPresence] = createSignal<readonly PresenceBadge[]>([]);
+  // Round-3: "flushed by …" indicator. Every handover or mode
+  // change carries the actor who triggered it. The rail shows a
+  // short line (auto-clearing after 10 s) so the human sees when
+  // the agent-side has taken an action on the delivery pipeline.
+  const [deliveryNote, setDeliveryNote] = createSignal<{
+    readonly text: string;
+    readonly kind: "handover" | "mode-change";
+  } | undefined>(undefined);
+  let deliveryNoteTimer: ReturnType<typeof setTimeout> | undefined;
+  const applyDeliveryEvent = (event: {
+    readonly kind: string;
+    readonly trigger?: string;
+    readonly commentIds?: readonly string[];
+    readonly from?: string | null;
+    readonly to?: string;
+    readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
+  }): void => {
+    const actor = event.actor;
+    const who = actor?.displayName ?? actor?.id ?? actor?.kind ?? "someone";
+    if (event.kind === "handover") {
+      const count = event.commentIds?.length ?? 0;
+      const trigger = event.trigger ?? "handover";
+      // Skip bookkeeping frames — a live-trigger handover is not a
+      // "flush", it's just the log record for a live push.
+      if (trigger === "live") return;
+      const label = trigger === "agent-now" ? "@agent now" : trigger === "mode-change-flush" ? "mode change" : "hand-over";
+      setDeliveryNote({
+        text: `${who} flushed ${count} comment${count === 1 ? "" : "s"} (${label}).`,
+        kind: "handover",
+      });
+    } else if (event.kind === "delivery.mode_changed") {
+      setDeliveryNote({
+        text: `${who} changed mode: ${event.from ?? "(none)"} → ${event.to ?? "?"}.`,
+        kind: "mode-change",
+      });
+    }
+    if (deliveryNoteTimer !== undefined) clearTimeout(deliveryNoteTimer);
+    deliveryNoteTimer = setTimeout(() => setDeliveryNote(undefined), 10_000);
+  };
   const applyPresenceEvent = (event: {
     readonly ts: string;
     readonly state?: string;
@@ -512,6 +576,7 @@ function Rail(): JSX.Element {
       void refetchMode();
     },
     (event) => applyPresenceEvent(event),
+    (event) => applyDeliveryEvent(event),
   );
   onCleanup(unsubscribe);
 
@@ -800,6 +865,16 @@ function Rail(): JSX.Element {
           </div>
         </Show>
       </section>
+      <Show when={deliveryNote() !== undefined}>
+        <section
+          class={`revkit-rail__delivery-note revkit-rail__delivery-note--${deliveryNote()!.kind}`}
+          role="status"
+          aria-live="polite"
+          data-testid="revkit-rail-delivery-note"
+        >
+          <p class="revkit-rail__delivery-note-text">{deliveryNote()!.text}</p>
+        </section>
+      </Show>
       <Show when={presence().length > 0}>
         <section
           class="revkit-rail__presence"

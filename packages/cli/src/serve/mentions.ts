@@ -1,29 +1,35 @@
-// Typed mention extraction — daemon-side (M2 item 6 review round 2).
+// Typed mention extraction — daemon-side (M2 item 6 review round 3).
 //
 // The reviewer's comment body is Markdown. Mentions are only valid
 // in PROSE — never inside code spans, fenced code blocks, HTML
 // comments, indented code blocks, or inline `<code>…</code>` HTML.
 // We parse the body with `remark-parse` (a real CommonMark parser
-// already in the CLI's deps for MDX handling) and walk the AST to
-// pick text nodes only where prose applies. The regex step over
-// text nodes is bounded and structure-aware — never touches raw
-// backtick or backslash bytes in code.
+// already in the CLI's deps for MDX handling) and walk the AST,
+// tracking the state "am I inside a `<code>` or `<pre>` HTML pair"
+// via sibling `html` open/close nodes. Text between the two open
+// and close tags is skipped. Every other AST kind (code, inlineCode,
+// html, indented code blocks, HTML comments, images, thematicBreak,
+// yaml, math, mdx*) is skipped by the walker.
 //
-// Runs on the DAEMON at `POST /api/threads` and reply time; the
-// parsed `Mention[]` rides on the `comment.created` /
-// `comment.replied` event, so the rail renders chips WITHOUT
-// bundling a parser (removes Zod's `new Function` feature probe
-// hazard AND keeps a single source of truth for what counts as a
-// mention).
+// Round 3 change: the round-2 pre-mask pass has been removed. It
+// missed several cases (case-sensitive tag match, prefix matches
+// like `<codebase>`, unclosed backticks in a masked span, unclosed
+// `<!--`, indented-code contamination from replacement spaces).
+// The round-3 walker relies on the AST for structure — the Markdown
+// parser already handles indented code blocks, fenced code, inline
+// code, and HTML comments. The only thing left to do is sibling
+// tracking for inline `<code>...</code>` HTML tag pairs, which is
+// exactly what `htmlStackDepth` below does.
 //
 // Escape support:
 //   - A backslash before `@` (`\@agent`) suppresses the mention.
 //     CommonMark treats `\@` as a literal `@`; `remark-parse` emits
 //     the text node's `value` with the backslash already consumed,
-//     so we detect the escape by comparing the RAW slice from the
-//     original body against the text-node value.
+//     so we detect the escape by walking `value` and the source in
+//     lock-step (`alignValueToSource`) and checking the raw byte
+//     before each `@`.
 //   - Any `@` inside a code / html node is out of scope because
-//     we do not walk those AST subtrees.
+//     the walker does not enter those AST subtrees.
 //
 // Bounded: we cap the number of mentions emitted per body at
 // `MAX_MENTIONS_PER_BODY` so a pathologically long comment cannot
@@ -67,27 +73,15 @@ const AGENT_ALIASES = new Set<string>(["agent", "claude"]);
 export const MAX_MENTIONS_PER_BODY = 64;
 
 /** Parse a comment body and return every actor mention plus routing
- * bits. Uses `remark-parse` to walk the Markdown AST, and a
- * bounded regex scan on prose TEXT nodes only. */
+ * bits. Uses `remark-parse` to walk the Markdown AST, and a bounded
+ * regex scan on prose TEXT nodes only. */
 export function extractMentions(body: string): MentionScan {
   if (body.length === 0) return { mentions: [], hasAgentNow: false, addressesAgent: false };
-  // Pre-pass (round-2 nit): remark-parse treats inline HTML `<code>`
-  // and comment tags as `html` nodes but keeps the text between them
-  // as a normal `text` sibling — so a naive AST walk still fires on
-  // `<code>@agent</code>`. Mask those two shapes (and `<pre>` for
-  // symmetry) with spaces BEFORE parsing so the masked region is
-  // text-node whitespace and never matches an identifier. Offsets
-  // stay 1:1 because we only substitute spaces.
-  const masked = maskInlineHtmlCode(body);
-  const tree = unified().use(remarkParse).parse(masked) as Root;
+  const tree = unified().use(remarkParse).parse(body) as Root;
   const mentions: Mention[] = [];
   let hasAgentNow = false;
   let addressesAgent = false;
-  // The AST offsets align with `masked`. The masked buffer has
-  // the same length as the original body — only inline-HTML
-  // `<code>` and comment content became spaces. Pass `masked` as
-  // the source for offset math and the escape-check.
-  walk(tree, masked, (mention) => {
+  walk(tree, body, (mention) => {
     if (mention.kind === "agent-now") hasAgentNow = true;
     if (mention.kind === "agent" || mention.kind === "agent-now") addressesAgent = true;
     mentions.push(mention);
@@ -96,25 +90,18 @@ export function extractMentions(body: string): MentionScan {
   return { mentions, hasAgentNow, addressesAgent };
 }
 
-/** Whether the body carries `@agent now` in prose. Convenience
- * wrapper. Runs the full parser but never keeps state — a caller
- * that also needs the chip list should call `extractMentions`
- * once and read `.hasAgentNow`. */
+/** Whether the body carries `@agent now` in prose. */
 export function hasAgentNow(body: string): boolean {
   return extractMentions(body).hasAgentNow;
 }
 
 /** True when the body addresses `@agent` / `@claude` /
- * `@agent:<name>` at all. Used by the daemon for a future routing
- * bit (chip highlight even without `now`). */
+ * `@agent:<name>` at all. */
 export function addressesAgent(body: string): boolean {
   return extractMentions(body).addressesAgent;
 }
 
-/** Trigger derived from the mention scan. Used by the daemon's
- * `handleAppendComment` to pick the delivery-event trigger:
- * `agent-now` when the body carries the marker, else undefined
- * (let the caller pick the trigger). Exported for tests. */
+/** Trigger derived from the mention scan. */
 export function triggerFromMentions(scan: MentionScan): HandoverTrigger | undefined {
   return scan.hasAgentNow ? "agent-now" : undefined;
 }
@@ -131,10 +118,7 @@ interface MdastNode {
   readonly children?: readonly MdastNode[];
 }
 
-/** Node kinds where mentions live. Every other AST kind (code,
- * inlineCode, html — CommonMark's inline HTML including comments
- * and `<code>` tags — and structural containers) is skipped or
- * walked recursively without extracting from it. */
+/** Node kinds where mentions live. */
 const PROSE_TEXT_KINDS = new Set<string>(["text"]);
 /** Container kinds we recurse INTO. */
 const CONTAINER_KINDS = new Set<string>([
@@ -157,52 +141,114 @@ const CONTAINER_KINDS = new Set<string>([
   "table",
 ]);
 
+/** State the walker threads through nested containers so a nested
+ * `<code>` opens the same suppression as a top-level one. */
+interface WalkState {
+  /** Depth of the "we are inside an inline `<code>` or `<pre>`
+   * HTML block" stack. Text nodes are suppressed while > 0. */
+  codeDepth: number;
+}
+
+/** Block-level containers within which inline `<code>` / `<pre>`
+ * sibling tracking resets. An unclosed `<code>` at the end of one
+ * paragraph MUST NOT swallow mentions in the next paragraph. */
+const INLINE_SCOPE_RESETS = new Set<string>([
+  "paragraph",
+  "heading",
+  "tableCell",
+  "footnoteDefinition",
+]);
+
 function walk(node: MdastNode, source: string, emit: (mention: Mention) => boolean): boolean {
-  if (PROSE_TEXT_KINDS.has(node.type)) {
-    return extractFromTextNode(node as Text, source, emit);
-  }
-  if (CONTAINER_KINDS.has(node.type) && node.children !== undefined) {
-    for (const child of node.children) {
-      if (!walk(child, source, emit)) return false;
+  return walkChildren(node, source, emit, { codeDepth: 0 });
+}
+
+/** Walk one container's children, tracking `<code>`/`<pre>` open-close
+ * pairs across siblings so text between them is suppressed. The
+ * `codeDepth` state resets at every INLINE_SCOPE_RESETS boundary —
+ * an unclosed `<code>` in one paragraph does not leak into the
+ * next. */
+function walkChildren(node: MdastNode, source: string, emit: (mention: Mention) => boolean, state: WalkState): boolean {
+  if (!CONTAINER_KINDS.has(node.type)) return true;
+  const children = node.children;
+  if (children === undefined) return true;
+  for (const child of children) {
+    if (child.type === "html") {
+      const raw = child.value ?? "";
+      const kind = classifyHtml(raw);
+      if (kind === "code-open" || kind === "pre-open") state.codeDepth++;
+      else if (kind === "code-close" || kind === "pre-close") state.codeDepth = Math.max(0, state.codeDepth - 1);
+      continue;
     }
+    if (PROSE_TEXT_KINDS.has(child.type)) {
+      if (state.codeDepth > 0) continue;
+      if (!extractFromTextNode(child as Text, source, emit)) return false;
+      continue;
+    }
+    if (CONTAINER_KINDS.has(child.type)) {
+      // Round-3 fix: inline-scope resets. A new paragraph starts
+      // with codeDepth=0 regardless of what a previous paragraph
+      // left dangling.
+      const nested: WalkState = INLINE_SCOPE_RESETS.has(child.type) ? { codeDepth: 0 } : state;
+      if (!walkChildren(child, source, emit, nested)) return false;
+      continue;
+    }
+    // code (fenced OR indented) / inlineCode / image / imageReference /
+    // thematicBreak / yaml / toml / math / mdx* / definition-target
+    // — all skipped: content is not prose.
   }
-  // Any other kind (code, inlineCode, html, thematicBreak, image,
-  // imageReference, yaml, toml, math, mdxFlowExpression, …) is
-  // skipped — mentions in those contexts are literal text, not
-  // routing tokens.
   return true;
 }
 
-/** Extract mentions from ONE text node. The node's `value` is the
- * Markdown parser's cooked text (backslash-escapes already
- * consumed); `position.start.offset` and `position.end.offset`
- * give the byte offsets into the ORIGINAL body. We map matches on
- * `value` back to the original body via those offsets AND we check
- * the raw body slice for a leading `\` before `@` so `\@agent`
- * suppresses the mention. */
+/** Classify an inline `html` node's raw value. Only recognises the
+ * tag NAMES `code` and `pre` — matches are case-insensitive AND
+ * word-anchored, so `<CODE>` fires but `<codebase>` and `<preview>`
+ * do NOT. Anything else (comments, other tags, HTML-shaped junk)
+ * returns "other" and is skipped without affecting the code depth. */
+export function classifyHtml(raw: string):
+  | "code-open"
+  | "code-close"
+  | "pre-open"
+  | "pre-close"
+  | "other" {
+  // `raw` is a snippet like `<code>`, `<code class="x">`, `</code>`,
+  // `<!-- … -->`, `<span>` etc. Match tag NAME exactly with a
+  // one-char boundary on the trailing side ( `>`, `/`, space, tab,
+  // newline).
+  const openTag = /^<\s*([A-Za-z][A-Za-z0-9]*)(?=[\s/>])/;
+  const closeTag = /^<\s*\/\s*([A-Za-z][A-Za-z0-9]*)\s*>/;
+  const closeMatch = closeTag.exec(raw);
+  if (closeMatch !== null) {
+    const name = closeMatch[1]!.toLowerCase();
+    if (name === "code") return "code-close";
+    if (name === "pre") return "pre-close";
+    return "other";
+  }
+  const openMatch = openTag.exec(raw);
+  if (openMatch !== null) {
+    const name = openMatch[1]!.toLowerCase();
+    if (name === "code") return "code-open";
+    if (name === "pre") return "pre-open";
+    return "other";
+  }
+  return "other";
+}
+
+/** Extract mentions from ONE text node. See file header for how
+ * offsets are mapped back to the original body. */
 function extractFromTextNode(node: Text, source: string, emit: (mention: Mention) => boolean): boolean {
   const value = node.value;
   const startOffset = node.position?.start?.offset;
   if (startOffset === undefined) return true;
-  // The mapping "value index → source index" is not always 1:1
-  // when backslash-escapes are present. `remark-parse` collapses
-  // `\@` in the source to `@` in the value. To recover an exact
-  // range in the ORIGINAL body, we walk source[startOffset..] and
-  // value in lock-step, tracking the raw offset for each value
-  // index. A backslash-escape steps two source chars for one
-  // value char; that alignment plus the raw-char inspection is
-  // enough to reject `\@agent`.
   const sourceStart = startOffset;
   const sourceEnd = node.position?.end?.offset ?? sourceStart + value.length;
   const valueToSource = alignValueToSource(value, source, sourceStart, sourceEnd);
-  // Scan `value` for `@`-starting identifier runs and classify each.
   let i = 0;
   while (i < value.length) {
     if (value.charCodeAt(i) !== 0x40 /* @ */) {
       i++;
       continue;
     }
-    // Pre-boundary check on VALUE (letters / digits / _ before @ ⇒ not a mention).
     if (i > 0) {
       const prev = value.charCodeAt(i - 1);
       if (
@@ -215,16 +261,12 @@ function extractFromTextNode(node: Text, source: string, emit: (mention: Mention
         continue;
       }
     }
-    // Escape check on SOURCE: the raw char just before the `@`
-    // in the original body. When the mapping shows a backslash
-    // was consumed (source char just BEFORE the `@`'s source
-    // position is `\`), suppress the mention.
+    // Escape check on SOURCE.
     const at = valueToSource[i];
     if (at !== undefined && at > 0 && source.charCodeAt(at - 1) === 0x5c /* \ */) {
       i++;
       continue;
     }
-    // First identifier token.
     const idStart = i + 1;
     if (idStart >= value.length || !isFirstIdChar(value.charCodeAt(idStart))) {
       i++;
@@ -232,7 +274,6 @@ function extractFromTextNode(node: Text, source: string, emit: (mention: Mention
     }
     let j = idStart + 1;
     while (j < value.length && isIdChar(value.charCodeAt(j))) j++;
-    // Trim trailing `-`.
     let end = j;
     while (end > idStart + 1 && value.charCodeAt(end - 1) === 0x2d) end--;
     const firstToken = value.slice(idStart, end);
@@ -240,7 +281,6 @@ function extractFromTextNode(node: Text, source: string, emit: (mention: Mention
       i = j;
       continue;
     }
-    // Optional `:<name>`.
     let cursor = end;
     let agentName: string | undefined;
     if (
@@ -261,7 +301,6 @@ function extractFromTextNode(node: Text, source: string, emit: (mention: Mention
         }
       }
     }
-    // Optional `/<team>`.
     let teamPart: string | undefined;
     if (
       agentName === undefined &&
@@ -283,11 +322,9 @@ function extractFromTextNode(node: Text, source: string, emit: (mention: Mention
         }
       }
     }
-    // Map value range [i, cursor) → source range.
     const valueStart = i;
     const rangeStart = valueToSource[valueStart] ?? sourceStart + valueStart;
     const rangeEnd = valueToSource[cursor - 1] !== undefined ? (valueToSource[cursor - 1] as number) + 1 : sourceStart + cursor;
-    // Classify.
     let mention: Mention;
     if (agentName !== undefined) {
       mention = { kind: "agent", id: `agent:${agentName}`, label: `@agent:${agentName}`, name: agentName, range: [rangeStart, rangeEnd] };
@@ -300,7 +337,6 @@ function extractFromTextNode(node: Text, source: string, emit: (mention: Mention
     } else {
       mention = { kind: "gh-user", id: firstToken, label: `@${firstToken}`, range: [rangeStart, rangeEnd] };
     }
-    // Check for adjacent ` now`.
     if (mention.kind === "agent") {
       const nowEndInValue = readAgentNow(value, cursor);
       if (nowEndInValue !== undefined) {
@@ -339,12 +375,6 @@ function alignValueToSource(
     const vc = value.charCodeAt(val);
     if (sc === 0x5c /* \ */ && src + 1 < sourceEnd) {
       const nextSc = source.charCodeAt(src + 1);
-      // `\<ASCII punctuation>` → the punctuation lands in value.
-      // CommonMark's escape set is a fixed table; we approximate
-      // with ASCII punctuation, which covers every case the
-      // mention parser cares about (`\@`, `\_`, `\*`, `\` before
-      // any punct). If nextSc equals vc, the escape consumed one
-      // source char; otherwise fall through to a normal step.
       if (nextSc === vc) {
         map[val] = src + 1;
         val++;
@@ -358,9 +388,6 @@ function alignValueToSource(
       src++;
       continue;
     }
-    // Mismatch — e.g. entity decoding or line-ending normalisation
-    // rewrites CRLF → LF, or an entity was decoded. Advance both
-    // conservatively; the map entry falls back to undefined.
     val++;
     src++;
   }
@@ -386,78 +413,6 @@ function isFirstIdChar(cc: number): boolean {
     (cc >= 0x41 && cc <= 0x5a) ||
     (cc >= 0x61 && cc <= 0x7a)
   );
-}
-
-/** Replace `<code>…</code>`, `<pre>…</pre>` and `<!-- … -->`
- * regions with spaces of the same length. Preserves offsets so
- * downstream AST positions still map to the original body. Case-
- * insensitive tag match; every other HTML tag is left alone (remark
- * emits it as an `html` node the walker already skips). */
-function maskInlineHtmlCode(body: string): string {
-  const out = body.split("");
-  const len = body.length;
-  const mask = (start: number, end: number): void => {
-    for (let i = start; i < end; i++) out[i] = " ";
-  };
-  let i = 0;
-  while (i < len) {
-    // HTML comment `<!-- … -->`.
-    if (body.startsWith("<!--", i)) {
-      const close = body.indexOf("-->", i + 4);
-      if (close === -1) {
-        mask(i, len);
-        i = len;
-      } else {
-        mask(i, close + 3);
-        i = close + 3;
-      }
-      continue;
-    }
-    // Case-insensitive `<code…>` or `<pre…>` opening tag.
-    const lower4 = body.slice(i, i + 5).toLowerCase();
-    if (lower4 === "<code") {
-      const gt = body.indexOf(">", i);
-      if (gt === -1) {
-        mask(i, len);
-        i = len;
-        continue;
-      }
-      // Find matching `</code>` (case-insensitive).
-      const close = indexOfCaseInsensitive(body, "</code>", gt + 1);
-      if (close === -1) {
-        mask(i, len);
-        i = len;
-      } else {
-        mask(i, close + "</code>".length);
-        i = close + "</code>".length;
-      }
-      continue;
-    }
-    if (body.slice(i, i + 4).toLowerCase() === "<pre") {
-      const gt = body.indexOf(">", i);
-      if (gt === -1) {
-        mask(i, len);
-        i = len;
-        continue;
-      }
-      const close = indexOfCaseInsensitive(body, "</pre>", gt + 1);
-      if (close === -1) {
-        mask(i, len);
-        i = len;
-      } else {
-        mask(i, close + "</pre>".length);
-        i = close + "</pre>".length;
-      }
-      continue;
-    }
-    i++;
-  }
-  return out.join("");
-}
-
-function indexOfCaseInsensitive(haystack: string, needle: string, from: number): number {
-  const lower = haystack.toLowerCase();
-  return lower.indexOf(needle.toLowerCase(), from);
 }
 
 /** Detect an adjacent ` now` (with a case-insensitive `now` and a

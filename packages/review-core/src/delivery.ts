@@ -39,11 +39,12 @@
 //     they are pull-only.
 //
 // The hook + the catch-up summary use `deliveredCommentIds ∩ open
-// threads with a human last commenter` to decide what to surface.
-// Handover drafts NEVER leak into the hook (they are the
-// reviewer's private WIP, like a GitHub pending review) — that
-// promise is enforced BY CONSTRUCTION here, not case-by-case at
-// each caller.
+// threads with a human last commenter` to decide what to PUSH. This
+// controls when comments are pushed to the agent — it is NOT a
+// confidentiality guarantee. A same-user agent with `Bash` (or a
+// bearer read of `.revkit/serve.json`) can call the `threads` MCP
+// tool or `GET /api/threads` and see any draft. See ADR-0007
+// (round-3 amendment) for the draft-privacy open question.
 //
 // Runtime-neutral: no `node:*` / `bun:*` imports.
 
