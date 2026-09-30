@@ -142,6 +142,13 @@ let
     (src + "/packages/components")
     (src + "/site/package.json")
     (src + "/site/src")
+    # The consumer skill file `revkit skill install` copies. Kept at
+    # `templates/skills/revkit/SKILL.md` (a static asset in the
+    # source tree); the CLI resolves it via `import.meta.url` — see
+    # `packages/cli/src/skill-cli.ts::packagedSkillPath`. Without
+    # this include the packaged `bin/revkit` fails on `skill install`
+    # with "packaged SKILL.md not found".
+    (src + "/templates/skills")
   ];
   runtimeExcludes = lib.fileset.unions [
     (lib.fileset.maybeMissing (src + "/packages/cli/node_modules"))
