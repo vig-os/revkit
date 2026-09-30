@@ -2,37 +2,45 @@
 //
 // The MCP server is a **client** of the daemon (DESIGN-0001 §5.3,
 // ADR-0007). It does not own state; it reads `.revkit/serve.json`
-// and proxies to the daemon's HTTP surface. Two states matter at
-// startup:
+// and proxies to the daemon's HTTP surface.
 //
-// 1. **Daemon already running.** `serve.json` exists, the recorded
-//    pid is alive and reachable at `url`. We use its `agentToken`
-//    directly.
+// Discovery is done through the daemon-lock the daemon holds
+// (`packages/cli/src/serve/serve-state.ts:findRunningDaemon`, PR #36):
+// the OS-held `flock(2)` on `.revkit/daemon.lock` is the ground
+// truth. `serve.json` is advertisement only, trusted only while the
+// lock is held. This file is a THIN wrapper over `findRunningDaemon`
+// that adds the "auto-start if nothing is running" and the
+// "reconnect to the daemon we just spawned" paths.
 //
-// 2. **No daemon.** No `serve.json`, or the recorded pid is dead.
-//    We spawn `revkit serve` detached, wait up to a short deadline
-//    for `serve.json` to appear and the daemon to answer a probe on
-//    `url/-/auth`, then read the token. Failure surfaces as an
-//    error — we never fall back to a half-connected client.
+// Two paths at startup:
+//
+// 1. **Daemon already running.** `findRunningDaemon` returns the
+//    current `ServeState`. We use its `agentToken` directly.
+//
+// 2. **No daemon.** `findRunningDaemon` returns undefined (lock is
+//    free, or `.revkit/daemon.lock` doesn't exist yet). We spawn
+//    `revkit serve` detached, then poll `findRunningDaemon` until
+//    it returns a `ServeState`. The new daemon takes the lock, and
+//    the caller reconnects on the next poll.
 //
 // The spawn uses `Bun.spawn` with `stdio: ['ignore', 'ignore',
 // 'ignore']` and `detached: true` so the daemon outlives this
 // process. The daemon writes its own state file (mode 600) and the
 // bootstrap only ever reads it.
 
-import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import { readServeState, serveStatePath, isPidAlive, type ServeState } from "../serve/serve-state.ts";
+import { findRunningDaemon, type ServeState } from "../serve/serve-state.ts";
 
 /** Options for `ensureDaemon`. */
 export interface BootstrapOptions {
   /** Absolute path to the repo root. */
   readonly repoRoot: string;
-  /** How long to wait, in ms, for a freshly spawned daemon's
-   * `serve.json` to appear. Defaults to 10 s — the daemon binds a
-   * random port + reads sqlite; a slow disk can take a beat. */
+  /** How long to wait, in ms, for a freshly spawned daemon to take
+   * the lock and publish `serve.json`. Defaults to 10 s — the daemon
+   * binds a random port + opens sqlite; a slow disk can take a beat. */
   readonly waitMs?: number;
-  /** Between polls of `serve.json`, this long in ms. Defaults to 50. */
+  /** Between `findRunningDaemon` polls, this long in ms. Defaults to
+   * 50. */
   readonly pollIntervalMs?: number;
   /** Directory (relative to repoRoot) the daemon should serve. Passed
    * to `revkit serve --dir`. Defaults to `site/dist`. */
@@ -49,6 +57,11 @@ export interface BootstrapOptions {
     stdio: ["ignore", "ignore", "ignore"];
     detached: boolean;
   }) => { pid: number };
+  /** Test hook: swap out `findRunningDaemon`. Defaults to the
+   * shared implementation in `serve-state.ts`. Lets a test drive the
+   * discover / spawn / re-discover cycle without touching a real
+   * lock file. */
+  readonly findRunningDaemon?: (repoRoot: string) => ServeState | undefined;
   /** Test hook: injected clock (ms epoch). */
   readonly nowMs?: () => number;
   /** Test hook: sleep (ms → Promise). */
@@ -63,8 +76,8 @@ export interface Bootstrapped {
 }
 
 /** Ensure a daemon is running for `repoRoot` and return its state.
- * Reads an existing live `serve.json`, or spawns a new daemon and
- * waits for it. Throws on timeout or on a broken state file. */
+ * Uses `findRunningDaemon` (the lock is the ground truth), spawning
+ * `revkit serve` when nothing owns the lock. Throws on timeout. */
 export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrapped> {
   const repoRoot = resolvePath(options.repoRoot);
   const waitMs = options.waitMs ?? 10_000;
@@ -72,10 +85,11 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   const spawn = options.spawn ?? defaultSpawn;
   const clock = options.nowMs ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
+  const discover = options.findRunningDaemon ?? findRunningDaemon;
 
-  // Case 1: a live daemon owns `serve.json`.
-  const existing = readServeStateSafe(repoRoot);
-  if (existing !== undefined && isPidAlive(existing.pid)) {
+  // Case 1: a live daemon owns the lock.
+  const existing = discover(repoRoot);
+  if (existing !== undefined) {
     return { state: existing, spawned: false };
   }
 
@@ -92,36 +106,24 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
     detached: true,
   });
 
-  // Poll `serve.json` until it appears with a live pid.
+  // Poll `findRunningDaemon` until the new daemon claims the lock
+  // and publishes its state. The lock discipline (PR #36) guarantees
+  // no false positive: `findRunningDaemon` returns a state only when
+  // the lock is currently held.
   const deadline = clock() + waitMs;
   while (clock() < deadline) {
     await sleep(pollIntervalMs);
-    const state = readServeStateSafe(repoRoot);
-    if (state !== undefined && isPidAlive(state.pid)) {
+    const state = discover(repoRoot);
+    if (state !== undefined) {
       return { state, spawned: true };
     }
   }
   throw new Error(
-    `revkit mcp: spawned daemon did not write '.revkit/serve.json' within ${waitMs} ms`,
+    `revkit mcp: spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
   );
 }
 
-/** Read `serve.json`, or `undefined` if it doesn't exist / is
- * malformed. A malformed file is treated the same as a missing one so
- * a stale write from a crashed daemon can be superseded by a fresh
- * spawn. `readServeState` throws on parse errors; we swallow that
- * here specifically because the caller's intent is "recover", not
- * "diagnose". */
-function readServeStateSafe(repoRoot: string): ServeState | undefined {
-  try {
-    return readServeState(repoRoot);
-  } catch {
-    return undefined;
-  }
-}
-
-/** Default `spawn`: `Bun.spawn`. Cast to the caller's shape so the
- * types stay minimal. */
+/** Default `spawn`: `Bun.spawn` with `detached: true`. */
 function defaultSpawn(options: {
   cmd: string[];
   cwd: string;
@@ -162,13 +164,35 @@ function defaultRevkitBin(): string {
 // Re-export ServeState so `revkit mcp` callers get one import path.
 export type { ServeState } from "../serve/serve-state.ts";
 
-// Exposed so the CLI can also read `serve.json` directly (e.g. print
-// diagnostic output on non-fatal errors) without duplicating the
-// error-swallow guard. The default `readServeState` throws on
-// parse errors; use this from anywhere that would rather recover.
-export { readServeStateSafe };
-
-// `existsSync`, `statSync`, `readFileSync` are re-exported so the
-// bootstrap tests can spot-check `serve.json` mode/contents without
-// duplicating node imports.
-export { existsSync, statSync, readFileSync };
+/** Fetch a running daemon's `/-/health` `{instanceId, pid}` and
+ * compare `instanceId` with `advertised.instanceId` to confirm the
+ * daemon we reconnect to is the same one `serve.json` advertises.
+ *
+ * A reconnect from a long-lived MCP session finds `serve.json`
+ * pointing at a URL. Between reading `serve.json` and using its
+ * bearer, the original daemon might have died and been replaced by
+ * a new one (different `instanceId`) — in which case the bearer we
+ * read is stale. This helper lets the caller detect that: fetch
+ * `/-/health`, compare `instanceId`. A mismatch means "reconnect".
+ *
+ * Returns `true` on match, `false` on mismatch (fresh daemon
+ * detected — re-run `ensureDaemon`), and throws on transport
+ * failure (`fetch` rejected — nobody home). */
+export async function verifyDaemonInstance(
+  url: string,
+  advertisedInstanceId: string,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<boolean> {
+  const response = await fetchImpl(`${url.replace(/\/+$/, "")}/-/health`, {
+    method: "GET",
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(`verifyDaemonInstance: /-/health returned ${response.status}`);
+  }
+  const body = (await response.json()) as { instanceId?: unknown };
+  if (typeof body.instanceId !== "string") {
+    throw new Error(`verifyDaemonInstance: /-/health missing instanceId`);
+  }
+  return body.instanceId === advertisedInstanceId;
+}

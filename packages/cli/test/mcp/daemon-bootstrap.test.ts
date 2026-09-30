@@ -1,21 +1,45 @@
 // Unit tests for the daemon-bootstrap module.
 //
-// The bootstrap has two paths:
-//  1. `serve.json` exists and the pid is alive → attach.
-//  2. Otherwise spawn `revkit serve` and poll until `serve.json`
-//     appears.
+// The bootstrap is now a THIN wrapper over `findRunningDaemon`
+// (PR #36 lock discipline): find → attach, or spawn → poll until
+// findRunningDaemon returns.
 //
-// We drive each path with a fake `spawn` and a fake clock/sleep, so
-// the test is deterministic. The full end-to-end auto-start against a
-// real subprocess is exercised implicitly by the Playwright round-trip
-// (which spawns `revkit serve` for real).
+// Coverage: a live daemon is REUSED and not duplicated (the
+// "duplicate daemons" bug the coordinator wants proved dead); a
+// killed daemon is RE-SPAWNED (the "stale lock" bug); the spawn
+// command is bun revkit.js serve with --dir when given, cwd equal
+// to repoRoot, detached true; a spawned daemon that never takes
+// the lock times out.
+//
+// The `findRunningDaemon` hook is injected so the test drives the
+// discover / spawn / re-discover cycle without touching a real
+// flock. The full-stack "real daemon subprocess + real lock" path
+// is exercised by the Playwright roundtrip, which spawns
+// `revkit serve` for real.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureDaemon } from "../../src/mcp/daemon-bootstrap.ts";
-import { writeServeState, type ServeState } from "../../src/serve/serve-state.ts";
+import { ensureDaemon, verifyDaemonInstance } from "../../src/mcp/daemon-bootstrap.ts";
+import type { ServeState } from "../../src/serve/serve-state.ts";
+
+/** One state fixture — the shape `findRunningDaemon` returns to the
+ * bootstrap. `instanceId` is optional on the wire; every fixture
+ * here sets one so the mutation tests for verifyDaemonInstance
+ * have something to compare. */
+function fixtureState(overrides: Partial<ServeState> = {}): ServeState {
+  return {
+    pid: process.pid,
+    port: 12345,
+    url: "http://127.0.0.1:12345",
+    agentToken: "token-" + "x".repeat(40),
+    startedAt: new Date().toISOString(),
+    version: "0.0.0-test",
+    instanceId: "instance-" + "y".repeat(20),
+    ...overrides,
+  };
+}
 
 describe("daemon-bootstrap", () => {
   let root: string;
@@ -27,20 +51,12 @@ describe("daemon-bootstrap", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("attaches to a live serve.json (no spawn)", async () => {
-    const state: ServeState = {
-      pid: process.pid, // this process is alive by definition
-      port: 12345,
-      url: "http://127.0.0.1:12345",
-      agentToken: "test-token-" + "x".repeat(40),
-      startedAt: new Date().toISOString(),
-      version: "0.0.0-test",
-    };
-    const writeResult = await writeServeState(root, state);
-    expect(writeResult.ok).toBe(true);
+  test("attaches to a live daemon (no spawn) — the reuse path", async () => {
+    const state = fixtureState();
     let spawned = false;
     const result = await ensureDaemon({
       repoRoot: root,
+      findRunningDaemon: () => state,
       spawn: () => {
         spawned = true;
         return { pid: -1 };
@@ -48,77 +64,109 @@ describe("daemon-bootstrap", () => {
     });
     expect(spawned).toBe(false);
     expect(result.spawned).toBe(false);
-    expect(result.state.pid).toBe(process.pid);
-    expect(result.state.agentToken).toBe(state.agentToken);
+    expect(result.state).toBe(state);
   });
 
-  test("spawns when no serve.json AND waits for it to appear", async () => {
-    let spawnedWith: { cmd: string[]; cwd: string } | undefined;
-    const state: ServeState = {
-      pid: process.pid,
-      port: 22222,
-      url: "http://127.0.0.1:22222",
-      agentToken: "spawn-token-" + "y".repeat(40),
-      startedAt: new Date().toISOString(),
-      version: "0.0.0-test",
+  test("MUTATION: two back-to-back ensureDaemon calls reuse the same daemon", async () => {
+    // The coordinator's "live daemon reused, not duplicated" gate.
+    // Given `findRunningDaemon` reports the same state on both
+    // calls, ensureDaemon must NOT spawn on either.
+    const state = fixtureState();
+    let spawnCount = 0;
+    const spawn = (): { pid: number } => {
+      spawnCount++;
+      return { pid: 999 };
     };
-    // Simulate the spawn writing serve.json a couple of "polls" later.
-    let pollsBeforeWrite = 3;
-    const fakeSleep = async (): Promise<void> => {
-      if (pollsBeforeWrite === 0) {
-        // Write the state as the "daemon" would.
-        await writeServeState(root, state);
-      }
-      pollsBeforeWrite--;
-    };
-    const result = await ensureDaemon({
+    const one = await ensureDaemon({
       repoRoot: root,
-      spawn: (opts) => {
-        spawnedWith = { cmd: opts.cmd, cwd: opts.cwd };
-        return { pid: 999 };
-      },
-      sleep: fakeSleep,
-      waitMs: 60_000, // deterministic — clock is not injected
-      pollIntervalMs: 5,
+      findRunningDaemon: () => state,
+      spawn,
     });
-    expect(result.spawned).toBe(true);
-    expect(result.state.agentToken).toBe(state.agentToken);
-    expect(spawnedWith?.cmd[0]).toBe("bun");
-    expect(spawnedWith?.cmd[spawnedWith.cmd.length - 1]).toBe("serve");
-    expect(spawnedWith?.cwd).toBe(root);
+    const two = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => state,
+      spawn,
+    });
+    expect(spawnCount).toBe(0);
+    expect(one.state).toBe(state);
+    expect(two.state).toBe(state);
+    expect(one.spawned).toBe(false);
+    expect(two.spawned).toBe(false);
   });
 
-  test("propagates --dir to the spawned daemon", async () => {
+  test("MUTATION: a killed daemon is re-spawned on the next call", async () => {
+    // Simulate: first call attaches; between calls the daemon
+    // exits (findRunningDaemon flips to undefined). The next call
+    // must spawn a new one and reconnect to it.
+    const first = fixtureState();
+    const second = fixtureState({ instanceId: "instance-" + "z".repeat(20), agentToken: "fresh-token" });
+    let call = 0;
+    let spawned = 0;
+    const spawn = (): { pid: number } => {
+      spawned++;
+      return { pid: 42 };
+    };
+    // 1st call: daemon is alive.
+    const attach = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => first,
+      spawn,
+    });
+    expect(attach.spawned).toBe(false);
+    // 2nd call: daemon has died. `findRunningDaemon` returns
+    // undefined until the spawned poll picks up the fresh daemon.
+    call = 0;
+    const revived = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => {
+        call++;
+        if (call === 1) return undefined; // initial probe
+        if (call === 2) return undefined; // 1st poll
+        return second; // fresh daemon claimed the lock
+      },
+      spawn,
+      sleep: async () => {}, // no real delay
+      pollIntervalMs: 5,
+      waitMs: 60_000,
+    });
+    expect(spawned).toBe(1);
+    expect(revived.spawned).toBe(true);
+    expect(revived.state.instanceId).toBe(second.instanceId);
+    expect(revived.state.agentToken).toBe("fresh-token");
+  });
+
+  test("spawn command: `bun <revkit.js> serve` with --dir when given", async () => {
     let spawnedCmd: string[] | undefined;
-    const state: ServeState = {
-      pid: process.pid,
-      port: 33333,
-      url: "http://127.0.0.1:33333",
-      agentToken: "d-token-" + "z".repeat(40),
-      startedAt: new Date().toISOString(),
-      version: "0.0.0-test",
-    };
-    let polls = 2;
-    const fakeSleep = async (): Promise<void> => {
-      if (polls === 0) await writeServeState(root, state);
-      polls--;
-    };
+    let spawnedCwd: string | undefined;
+    let spawnedDetached: boolean | undefined;
+    const state = fixtureState({ instanceId: "fresh" });
+    let call = 0;
     await ensureDaemon({
       repoRoot: root,
       dir: "custom/dist",
+      findRunningDaemon: () => {
+        call++;
+        return call === 1 ? undefined : state;
+      },
       spawn: (opts) => {
         spawnedCmd = opts.cmd;
+        spawnedCwd = opts.cwd;
+        spawnedDetached = opts.detached;
         return { pid: 999 };
       },
-      sleep: fakeSleep,
-      waitMs: 60_000,
+      sleep: async () => {},
       pollIntervalMs: 5,
+      waitMs: 60_000,
     });
-    expect(spawnedCmd).toContain("--dir");
-    expect(spawnedCmd).toContain("custom/dist");
+    expect(spawnedCmd?.[0]).toBe("bun");
+    expect(spawnedCmd?.includes("serve")).toBe(true);
+    expect(spawnedCmd?.includes("--dir")).toBe(true);
+    expect(spawnedCmd?.includes("custom/dist")).toBe(true);
+    expect(spawnedCwd).toBe(root);
+    expect(spawnedDetached).toBe(true);
   });
 
-  test("times out when the spawned daemon never writes serve.json", async () => {
+  test("times out when the spawned daemon never takes the lock", async () => {
     let now = 0;
     const clock = (): number => now;
     const sleep = async (ms: number): Promise<void> => {
@@ -128,6 +176,7 @@ describe("daemon-bootstrap", () => {
     try {
       await ensureDaemon({
         repoRoot: root,
+        findRunningDaemon: () => undefined, // never appears
         spawn: () => ({ pid: 999 }),
         sleep,
         nowMs: clock,
@@ -136,56 +185,50 @@ describe("daemon-bootstrap", () => {
       });
     } catch (error) {
       threw = true;
-      expect((error as Error).message).toContain("did not write");
+      expect((error as Error).message).toContain("did not take");
+      expect((error as Error).message).toContain("daemon.lock");
     }
     expect(threw).toBe(true);
   });
+});
 
-  test("replaces a stale serve.json (dead pid)", async () => {
-    // Pid 1 exists on Linux (init), so use a very high pid nobody
-    // has. `isPidAlive` returns false for a pid that raises ESRCH.
-    // 0x7fffffff is the max signed 32-bit — outside any realistic
-    // range.
-    const stalePid = 0x7fffffff;
-    // writeServeState refuses to overwrite a live-pid state, so we
-    // seed the stale file by writing directly.
-    const path = join(root, ".revkit", "serve.json");
-    writeFileSync(
-      path,
-      JSON.stringify({
-        pid: stalePid,
-        port: 44444,
-        url: "http://127.0.0.1:44444",
-        agentToken: "stale-token",
-        startedAt: new Date().toISOString(),
-        version: "0.0.0-test",
-      }),
-      { mode: 0o600 },
+describe("verifyDaemonInstance", () => {
+  /** A minimal fetch stub. `verifyDaemonInstance` only needs
+   * `(url, init?) => Promise<Response>`, so a plain function
+   * satisfies the runtime; the double cast (`unknown` then
+   * `typeof fetch`) skips the WHATWG-fetch shape's extra members
+   * (`preconnect`, `preload`) which the caller does not touch. */
+  const stubFetch = (impl: (url: string) => Promise<Response>): typeof fetch =>
+    ((async (url: string): Promise<Response> => impl(url)) as unknown) as typeof fetch;
+
+  test("returns true when /-/health's instanceId matches the advertisement", async () => {
+    const fakeFetch = stubFetch(async () =>
+      new Response(JSON.stringify({ instanceId: "abc", pid: 1 }), { status: 200 }),
     );
-    chmodSync(path, 0o600);
-    const freshState: ServeState = {
-      pid: process.pid,
-      port: 44445,
-      url: "http://127.0.0.1:44445",
-      agentToken: "fresh-token-" + "w".repeat(40),
-      startedAt: new Date().toISOString(),
-      version: "0.0.0-test",
-    };
-    let polls = 1;
-    const sleep = async (): Promise<void> => {
-      if (polls === 0) await writeServeState(root, freshState);
-      polls--;
-    };
-    const result = await ensureDaemon({
-      repoRoot: root,
-      spawn: () => ({ pid: 999 }),
-      sleep,
-      pollIntervalMs: 5,
-      waitMs: 60_000,
-    });
-    // Bootstrap saw the stale file, called spawn, then attached to
-    // the fresh state.
-    expect(result.spawned).toBe(true);
-    expect(result.state.agentToken).toBe(freshState.agentToken);
+    const ok = await verifyDaemonInstance("http://127.0.0.1:9999", "abc", fakeFetch);
+    expect(ok).toBe(true);
+  });
+
+  test("MUTATION: a new daemon at the same URL is caught by an instanceId mismatch", async () => {
+    // The reconnect path — `serve.json` said `abc`, but /-/health
+    // reports `xyz`. The daemon we thought we were talking to has
+    // been replaced. The caller must re-run ensureDaemon.
+    const fakeFetch = stubFetch(async () =>
+      new Response(JSON.stringify({ instanceId: "xyz", pid: 2 }), { status: 200 }),
+    );
+    const ok = await verifyDaemonInstance("http://127.0.0.1:9999", "abc", fakeFetch);
+    expect(ok).toBe(false);
+  });
+
+  test("throws on a 5xx (daemon crash mid-check) so the caller re-runs discovery", async () => {
+    const fakeFetch = stubFetch(async () => new Response("boom", { status: 500 }));
+    await expect(verifyDaemonInstance("http://127.0.0.1:9999", "abc", fakeFetch)).rejects.toThrow(/500/);
+  });
+
+  test("throws when /-/health response lacks instanceId (malformed)", async () => {
+    const fakeFetch = stubFetch(async () =>
+      new Response(JSON.stringify({ pid: 1 }), { status: 200 }),
+    );
+    await expect(verifyDaemonInstance("http://127.0.0.1:9999", "abc", fakeFetch)).rejects.toThrow(/instanceId/);
   });
 });

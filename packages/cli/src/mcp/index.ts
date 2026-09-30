@@ -2,7 +2,12 @@
 // glue lives in `cli.ts`; the individual concerns live in their own
 // files so a test can pick just what it needs.
 export { runMcpCommand, parseMcpArgs, type RunMcpEnv, type RunResult } from "./cli.ts";
-export { ensureDaemon, type Bootstrapped, type BootstrapOptions } from "./daemon-bootstrap.ts";
+export {
+  ensureDaemon,
+  verifyDaemonInstance,
+  type Bootstrapped,
+  type BootstrapOptions,
+} from "./daemon-bootstrap.ts";
 export { DaemonClient, type DaemonClientOptions } from "./daemon-client.ts";
 export {
   startEventSubscriber,
