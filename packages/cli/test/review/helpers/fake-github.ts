@@ -308,6 +308,40 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
             },
           });
         }
+        case "ViewerReviews": {
+          // Round-2 BLOCK-fix 1: return the viewer's reviews on
+          // this PR across ALL states. The fake carries any
+          // submitted reviews as `submits` (via SubmitReview) —
+          // reconstruct their state from the recorded event and
+          // include the current pending, if any.
+          if (pending === undefined) {
+            return jsonResponse({ data: { node: { __typename: "PullRequest", reviews: { nodes: [] } } } });
+          }
+          const stateFromEvent = (e: "COMMENT" | "APPROVE" | "REQUEST_CHANGES"): string => {
+            if (e === "APPROVE") return "APPROVED";
+            if (e === "REQUEST_CHANGES") return "CHANGES_REQUESTED";
+            return "COMMENTED";
+          };
+          const nodes: Array<Record<string, unknown>> = pending.submits.map((s, i) => ({
+            id: s.reviewNodeId,
+            databaseId: 100 + i,
+            state: stateFromEvent(s.event),
+            submittedAt: new Date().toISOString(),
+            commit: { oid: pending.commitOid ?? "0".repeat(40) },
+          }));
+          if (pending.reviewNodeId !== null) {
+            nodes.push({
+              id: pending.reviewNodeId,
+              databaseId: 1,
+              state: "PENDING",
+              submittedAt: null,
+              commit: { oid: pending.commitOid },
+            });
+          }
+          return jsonResponse({
+            data: { node: { __typename: "PullRequest", reviews: { nodes } } },
+          });
+        }
         case "ReviewComments": {
           // Serve back the drafts on the review named by `id`.
           if (pending === undefined || pending.reviewNodeId !== vars.id) {

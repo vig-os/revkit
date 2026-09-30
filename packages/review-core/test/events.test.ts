@@ -40,6 +40,15 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     parentId: "c-1",
     body: "raised to 60 s",
   },
+  "comment.edited": {
+    seq: 3,
+    ts: t,
+    actor,
+    kind: "comment.edited",
+    commentId: "c-1",
+    body: "why 30 s? (edited)",
+    remoteUpdatedAt: "2026-09-30T21:00:00Z",
+  },
   "thread.resolved": {
     seq: 3,
     ts: t,

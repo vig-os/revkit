@@ -290,6 +290,22 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       state.commentIndex.set(event.commentId, event.threadId);
       return { ok: true };
     }
+    case "comment.edited": {
+      // Round-2 BLOCK-fix 3: `commentId` must be a known local
+      // comment. `remoteUpdatedAt` idempotency is left to the
+      // emitter (the daemon's refresh path).
+      if (!state.commentIndex.has(event.commentId)) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "unknown-comment",
+            commentId: event.commentId,
+            message: `comment.edited: comment '${event.commentId}' is not in the log.`,
+          },
+        };
+      }
+      return { ok: true };
+    }
     case "thread.resolved": {
       const thread = state.threads.get(event.threadId);
       if (thread === undefined) return unknownThread(event.threadId, event.kind);

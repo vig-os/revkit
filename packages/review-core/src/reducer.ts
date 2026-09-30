@@ -96,6 +96,27 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       });
       return;
     }
+    case "comment.edited": {
+      // Round-2 BLOCK-fix 3: update the referenced comment's body.
+      // We walk every thread to find it — a `commentId` is unique
+      // across the log by construction. `remoteUpdatedAt` is
+      // treated as an idempotency marker at the emitter, so the
+      // reducer trusts what it's handed.
+      for (const [tid, thread] of threads) {
+        const idx = thread.comments.findIndex((c) => c.id === event.commentId);
+        if (idx < 0) continue;
+        const nextComments = thread.comments.slice();
+        const existing = nextComments[idx]!;
+        nextComments[idx] = { ...existing, body: event.body };
+        threads.set(tid, {
+          ...thread,
+          comments: nextComments,
+          updatedAt: event.ts,
+        });
+        return;
+      }
+      return;
+    }
     case "thread.resolved": {
       const thread = threads.get(event.threadId);
       if (thread === undefined) return;

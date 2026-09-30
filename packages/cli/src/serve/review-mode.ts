@@ -40,6 +40,7 @@ import {
   type ReviewSubmitEvent,
   type SyncFingerprint,
   type ThreadStore,
+  type ViewerReviewSummary,
   ThreadStoreAppendError,
   anchorToPrComment,
   fileFallbackPreamble,
@@ -185,6 +186,24 @@ export function defaultSubmitBody(event: ReviewSubmitEvent, headSha: string): st
   return `${label} submitted from revkit local review at ${headSha.slice(0, 12)}.`;
 }
 
+/** Map GitHub's review state enum onto our `review.submitted.event`
+ * type. Terminal-but-non-COMMENT states (APPROVED / CHANGES_REQUESTED)
+ * carry the event through; DISMISSED is treated as a COMMENT
+ * (dismissed reviews are also terminal). */
+function ghStateToReviewEvent(state: ViewerReviewSummary["state"]): ReviewSubmitEvent {
+  switch (state) {
+    case "APPROVED":
+      return "APPROVE";
+    case "CHANGES_REQUESTED":
+      return "REQUEST_CHANGES";
+    case "COMMENTED":
+    case "DISMISSED":
+    case "PENDING":
+    default:
+      return "COMMENT";
+  }
+}
+
 /** Full reconciler outcome. */
 export interface ReconcileOutcome {
   /** Local commentIds we just marked synced. */
@@ -200,6 +219,12 @@ export interface ReconcileOutcome {
   /** True when reconcile discovered the review had been deleted
    * from under us (abandon). */
   readonly healedAbandon: boolean;
+  /** Round-2 BLOCK-fix 1: true when reconcile discovered the
+   * log's pending review was deleted from GitHub — the reconciler
+   * appends `review.abandoned` with reason `deleted-on-github`
+   * and DOES NOT auto-create a replacement. The rail surfaces
+   * this and asks the human to confirm before re-posting. */
+  readonly deletedRemotely?: boolean;
 }
 
 /** Reconciler input. `store` needs the snapshot API for the
@@ -257,73 +282,116 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
   let reviewNodeId: string | null = state.openPending?.reviewNodeId ?? null;
   let healedSubmit = false;
   let healedAbandon = false;
+  let deletedRemotely = false;
 
-  // If the log records an open pending review, check it exists on
-  // GitHub. If not, it was submitted or deleted elsewhere — heal.
+  // Round-2 BLOCK-fix 1: if the log records an open pending
+  // review, DO NOT ask findOrCreatePendingReview (which would
+  // CREATE a new one and lose the fact that GitHub already
+  // accepted our submit). Instead read the viewer's reviews on
+  // this PR across ALL states. Compare the log's recorded
+  // reviewNodeId against GitHub:
+  //   - MATCHES a PENDING review → good, still open.
+  //   - MATCHES a SUBMITTED review (state != PENDING with a
+  //     submittedAt) → GitHub accepted the submit and the log
+  //     lost the terminal event; append `review.submitted`
+  //     with the actual event/commit, then stop. NEVER auto-
+  //     create a replacement.
+  //   - NOT PRESENT (deleted on GitHub, likely by another
+  //     viewer client) → append `review.abandoned` with
+  //     `deleted-on-github` and STOP. The daemon will surface
+  //     "your pending review was deleted on GitHub — re-post N
+  //     drafts?" and the human confirms before a new one opens.
   if (state.openPending !== null) {
-    // A single GraphQL query returns the viewer's current pending
-    // review + commit oid. Compare with what the log has.
-    let live;
+    let viewerReviews: readonly ViewerReviewSummary[];
     try {
-      live = await review.options.adapter.findOrCreatePendingReview({
+      viewerReviews = await review.options.adapter.listViewerReviewsOnPr({
         pullRequestNodeId: review.options.summary.nodeId,
-        commitOid: state.openPending.headSha,
         viewerLogin: review.options.viewerLogin,
       });
     } catch (err) {
-      // Network hiccup — bail; the caller will retry.
       throw err;
     }
-    if (live.kind === "reused") {
-      // Good — the log's open pending review still exists.
-      reviewNodeId = live.review.id;
-    } else if (live.kind === "created") {
-      // The log thought a pending review existed but GitHub had
-      // none — mark the old one abandoned locally and adopt the
-      // new one. Then walk the intents (which point at the OLD
-      // reviewNodeId) — they still need to sync on the NEW review.
-      if (state.openPending.reviewNodeId !== live.review.id) {
-        try {
-          await appendAndPublish({
-            kind: "review.abandoned",
-            actor,
-            reviewNodeId: state.openPending.reviewNodeId,
-            reason: "reconciler-healed-missing",
-          });
-          healedAbandon = true;
-        } catch (err) {
-          // Already terminal / racing — fine.
-          void err;
-        }
+    const recorded = viewerReviews.find((r) => r.id === state.openPending!.reviewNodeId);
+    if (recorded === undefined) {
+      // Deleted on GitHub — mark it terminal locally, refuse to
+      // create anything without a human's confirmation.
+      try {
         await appendAndPublish({
-          kind: "review.opened",
+          kind: "review.abandoned",
           actor,
-          reviewNodeId: live.review.id,
-          headSha: state.openPending.headSha,
+          reviewNodeId: state.openPending.reviewNodeId,
+          reason: "deleted-on-github",
         });
-        reviewNodeId = live.review.id;
-        state = await review.readState(store);
+      } catch (err) {
+        void err; // already terminal — fine.
       }
+      deletedRemotely = true;
+      reviewNodeId = null;
+      state = await review.readState(store);
+    } else if (recorded.state === "PENDING") {
+      reviewNodeId = recorded.id;
     } else {
-      // stale: the pending review is pinned to a different commit
-      // than we asked for. That means the head moved and we asked
-      // via `state.openPending.headSha`. Not our reconciler's job
-      // to fix — the reanchor flow does that. Return the stale
-      // shape via state.stale flag.
-      reviewNodeId = live.review.id;
+      // Submitted-on-github. Heal by appending review.submitted
+      // with the ACTUAL event GitHub recorded. NEVER open a new
+      // pending review in the same reconcile — a retried submit
+      // must be refused, not double-fired.
+      const ghEvent = ghStateToReviewEvent(recorded.state);
+      try {
+        await appendAndPublish({
+          kind: "review.submitted",
+          actor,
+          reviewNodeId: recorded.id,
+          event: ghEvent,
+        });
+        healedSubmit = true;
+      } catch (err) {
+        void err; // already terminal — fine.
+      }
+      reviewNodeId = null;
+      state = await review.readState(store);
     }
   }
 
-  if (!hasIntent) {
-    return { newlySynced: [], newlyFailed: [], reviewNodeId, healedSubmit, healedAbandon };
+  // Round-2 BLOCK-fix 1 + 2: after a submit-heal or a delete-
+  // remotely heal, refuse to auto-recreate a pending review
+  // inside this reconcile. The rail surfaces the situation and
+  // the human confirms via a new intent. The bearer path also
+  // refuses to open a fresh pending review — only replay of
+  // existing intents is allowed.
+  if (!hasIntent || deletedRemotely || healedSubmit) {
+    return { newlySynced: [], newlyFailed: [], reviewNodeId, healedSubmit, healedAbandon, deletedRemotely };
   }
 
   // 2. If we still don't have a reviewNodeId (no local open pending)
   //    and we DO have intents, open a pending review on GitHub and
-  //    record `review.opened`. Idempotent by construction —
-  //    findOrCreatePendingReview reuses an existing viewer pending
-  //    review if one already exists.
+  //    record `review.opened`.
+  //
+  // Round-2 BLOCK-fix 2: opening a pending review is itself a
+  // HUMAN intent. An agent-bearer reconcile MUST NOT create one —
+  // reconcile from the agent bearer is a STRICT REPLAY of already-
+  // recorded intents. When there's no pending review, the bearer
+  // reconciler returns the failed-count and lets the human retry.
   if (reviewNodeId === null) {
+    if (actor.kind !== "local") {
+      // Agent bearer without an existing pending review: refuse
+      // to open one. Every unsynced intent stays unsynced, and
+      // the rail's retry surface handles the recovery under the
+      // human's identity.
+      const newlyFailed: Array<{ commentId: string; reason: string }> = [];
+      for (const commentId of state.unsyncedCommentIds) {
+        const st = state.commentSync.get(commentId);
+        if (st === undefined) continue;
+        newlyFailed.push({ commentId, reason: "bearer-refused-to-open-review" });
+      }
+      return {
+        newlySynced: [],
+        newlyFailed,
+        reviewNodeId: null,
+        healedSubmit,
+        healedAbandon,
+        deletedRemotely,
+      };
+    }
     let live;
     try {
       live = await review.options.adapter.findOrCreatePendingReview({
@@ -446,6 +514,26 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
         actor,
         commentId,
         reason: "body-not-in-log",
+      });
+      continue;
+    }
+    // Round-2 BLOCK-fix 2 (body drift): compare the CURRENT
+    // thread body's hash against the fingerprint's bodyHash. If
+    // they don't match, an editor changed the body after the
+    // intent was recorded. Refuse the retry — the human must
+    // re-request the intent (via a new POST) so a fresh
+    // sync_requested carries the current body's hash. The old
+    // reconciler would have posted the CURRENT body under the
+    // OLD intent, letting an edit ship without a fresh trip
+    // through the log.
+    const currentBodyHash = await revisionOf(submittedBody);
+    if (fingerprint.bodyHash !== currentBodyHash) {
+      newlyFailed.push({ commentId, reason: "body-drift" });
+      await appendAndPublish({
+        kind: "comment.sync_failed",
+        actor,
+        commentId,
+        reason: "body-drift",
       });
       continue;
     }
@@ -779,6 +867,21 @@ export async function reanchorPendingReviewAtNewHead(input: {
     const body = thread.comments[0]?.body ?? "";
     const mapping = mapAnchorForPending(p.newAnchor, review.options.files, body);
     if (mapping.kind === "orphan") {
+      // Round-2 nit: an orphan mapping AFTER a reanchor must
+      // emit `thread.orphaned` so the rail's orphan panel picks
+      // it up. Previously we only counted it — no event landed
+      // on the log.
+      try {
+        await appendAndPublish({
+          kind: "thread.orphaned",
+          actor,
+          threadId: p.threadId,
+          revision: p.newAnchor.revision,
+          reason: `reanchor-mapping-orphan:${mapping.reason}`,
+        });
+      } catch {
+        /* already orphaned — fine */
+      }
       orphaned++;
       repositions.push({
         localCommentId: p.commentId,

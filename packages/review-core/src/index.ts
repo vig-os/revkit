@@ -62,6 +62,7 @@ export {
   type GitHubAdapterOptions,
   type PendingReview,
   type PendingReviewComment,
+  type ViewerReviewSummary,
   type PrRef,
   type PullRequestSummary,
   type RetryPolicy,

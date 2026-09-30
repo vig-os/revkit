@@ -1789,7 +1789,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    * the thread's GraphQL node id, then calls the adapter's
    * `addReviewThreadReply`. On success, appends a
    * `comment.linked` for the local reply comment. On failure,
-   * logs and returns (the local reply is already persisted). */
+   * appends `comment.sync_failed` so the rail surfaces a
+   * retryable "not on GitHub" state (round-2 nit — the local
+   * reply is already persisted, but silently swallowing the
+   * mirror failure hid the drift). */
   async function mirrorReplyToGitHubThread(input: {
     readonly reviewMode: ReviewModeHandle;
     readonly threadId: string;
@@ -1811,28 +1814,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return;
     }
     if (thread === undefined) return;
-    // Find the opening comment's github external — that's the one
-    // that anchors the thread on GitHub. Its `nodeId` corresponds
-    // to the review-comment on GitHub, not the thread node id we
-    // need for `addPullRequestReviewThreadReply`. The import path
-    // uses the GitHub review-thread id (via `threadIdOf`), so we
-    // recover it from the deterministic id shape:
-    //   gh-<owner>-<repo>-<pr>-<hash>
-    // The daemon stores that mapping on the log as the thread's
-    // own id; to reply to the exact GraphQL thread we'd need the
-    // thread node id which the deterministic hash obscures.
-    //
-    // Rather than reverse the hash (impossible), we look for a
-    // published-comment reply via the review-thread node id
-    // recovered from the openings' external metadata — the
-    // opening comment.linked event carries the `github.nodeId`
-    // which is the REVIEW-COMMENT's node id. GitHub's GraphQL
-    // requires the THREAD node id for `addPullRequestReviewThreadReply`,
-    // so we take a fallback route: post via the REST
-    // `pulls/N/comments/{comment_id}/replies` shape is not
-    // supported by the adapter — the adapter has no REST reply
-    // surface (GraphQL-only). We store the thread's github id
-    // on the `comment.created.external` metadata; recover it.
+    // Round-2 nit: the reply uses the imported thread's GraphQL
+    // node id (recorded on `Thread.external.threadId`) and posts
+    // through `addPullRequestReviewThreadReply` — pinned to the
+    // viewer's pending review when one exists (ADR-0025 (b)).
+    // Every imported thread now carries `external.provider =
+    // "github"` (round-2 BLOCK-fix 4), so the mirror fires for
+    // anchored imports too, not only for unanchored ones.
     const external = thread.external;
     if (external === undefined || external.provider !== "github") return;
     // `external.threadId` is the GitHub review-thread node id
@@ -1857,6 +1845,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             github: {
               commentId: posted.databaseId,
               nodeId: posted.nodeId,
+              ...(pendingReviewId !== undefined ? { pending: true, reviewNodeId: pendingReviewId } : {}),
             },
           },
         },
@@ -1879,6 +1868,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         threadId: input.threadId,
         errorKind: (error as Error).name,
       });
+      // Round-2 nit: emit `comment.sync_failed` so the rail sees a
+      // retryable "not on GitHub" state, instead of only a log
+      // line. The local reply is already persisted; failing the
+      // mirror silently was the drift the coordinator flagged.
+      try {
+        await appendReviewLifecycleEvent(
+          {
+            kind: "comment.sync_failed",
+            actor: input.actor,
+            commentId: input.localCommentId,
+            reason: `reply-mirror-failed:${(error as Error).name}`,
+          },
+          input.requestId,
+        );
+      } catch {
+        /* already-failed / already-linked — fine */
+      }
     }
   }
 

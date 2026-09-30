@@ -155,6 +155,24 @@ const commentRepliedPayload = {
   mentions: z.array(commentMentionSchema).optional(),
 } as const;
 
+/** Round-2 BLOCK-fix 3 (B4 pull update): a remote comment's body
+ * changed. Emitted only on refresh, when the local log's last
+ * body for `commentId` differs from the remote's current body.
+ * The reducer projects it on `Comment.body`; the rail's SSE
+ * refetches the thread when this arrives. Idempotency: on
+ * refresh, only emitted when the remote's `updatedAt` moved past
+ * the local's last-seen. */
+const commentEditedPayload = {
+  kind: z.literal("comment.edited"),
+  commentId: idSchema,
+  body: z.string().min(1),
+  /** ISO-8601 timestamp of the remote edit — the caller's own
+   * clock for a local edit. Used as a monotonic idempotency
+   * marker on refresh: the reducer skips an edit whose
+   * `remoteUpdatedAt` is not newer than the last seen. */
+  remoteUpdatedAt: z.string().min(1).optional(),
+} as const;
+
 const threadResolvedPayload = {
   kind: z.literal("thread.resolved"),
   threadId: idSchema,
@@ -424,6 +442,7 @@ const commentSyncFailedPayload = {
 const eventVariants = [
   z.object({ ...envelope, ...commentCreatedPayload }).strict(),
   z.object({ ...envelope, ...commentRepliedPayload }).strict(),
+  z.object({ ...envelope, ...commentEditedPayload }).strict(),
   z.object({ ...envelope, ...threadResolvedPayload }).strict(),
   z.object({ ...envelope, ...threadReopenedPayload }).strict(),
   z.object({ ...envelope, ...handoverPayload }).strict(),
@@ -496,6 +515,7 @@ export type ReviewEventKind = ReviewEvent["kind"];
 export const reviewEventKinds = [
   "comment.created",
   "comment.replied",
+  "comment.edited",
   "thread.resolved",
   "thread.reopened",
   "handover",

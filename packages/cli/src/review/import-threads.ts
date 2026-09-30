@@ -42,6 +42,17 @@ export interface PopulateOutcome {
   /** Distinct thread ids that were touched (appended or already
    * present). */
   readonly threadIds: readonly string[];
+  /** Round-2 BLOCK-fix 3: per-thread update summary from the
+   * refresh diff — new remote replies, resolve/unresolve
+   * transitions, remote edits. Zero when the store is being
+   * populated for the first time (no updates against an empty
+   * log). */
+  readonly updates?: {
+    readonly newReplies: number;
+    readonly resolved: number;
+    readonly reopened: number;
+    readonly edited: number;
+  };
 }
 
 /** Options for `populateStoreFromPr`. */
@@ -199,10 +210,128 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
     }
   }
 
+  // Round-2 BLOCK-fix 3 (B4 pull update): diff each remote
+  // thread against its local counterpart and emit typed events
+  // for what changed since the last refresh. The initial pass
+  // above appended new threads / new comments the reducer had
+  // never seen (idempotent by deterministic id). This second
+  // pass covers three cases: a new remote reply on an already-
+  // imported thread, the remote thread's isResolved flipping
+  // either way (resolve or unresolve, mirrored as thread.resolved
+  // or thread.reopened under a gh-user actor), and a remote body
+  // that changed (comment.edited).
+  // Every emit is idempotent: an event that would repeat what
+  // the reducer already saw is refused with a duplicate kind and
+  // silently absorbed.
+  const updates = { newReplies: 0, resolved: 0, reopened: 0, edited: 0 };
+  for (const remoteThread of options.threads) {
+    const localTid = threadIdOf(options.pr, remoteThread);
+    const localThread = await options.store.thread(localTid);
+    if (localThread === undefined) continue; // just imported; nothing to update.
+
+    // ── Resolve state diff ──
+    const remoteResolved = remoteThread.isResolved;
+    const localResolved = localThread.status === "resolved";
+    if (remoteResolved && !localResolved) {
+      // orphaned → resolved is allowed (ADR-0025 amendment). The
+      // reducer projects `resumeStatus` so a later reopen restores
+      // orphaned rather than open.
+      const actor = remoteThread.resolvedByLogin !== null
+        ? { kind: "gh-user" as const, id: remoteThread.resolvedByLogin, displayName: remoteThread.resolvedByLogin }
+        : { kind: "gh-user" as const, id: "github", displayName: "GitHub" };
+      try {
+        await options.store.append({
+          kind: "thread.resolved",
+          actor,
+          threadId: localTid,
+          resolution: "resolved on GitHub",
+        });
+        updates.resolved++;
+      } catch (err) {
+        if (!(err instanceof ThreadStoreAppendError)) throw err;
+        // Already resolved / refused — fine.
+      }
+    } else if (!remoteResolved && localResolved) {
+      // Round-2 BLOCK-fix 3 (probe R6): the remote UN-resolved a
+      // thread. Mirror as `thread.reopened` under a gh-user actor.
+      const actor = { kind: "gh-user" as const, id: "github", displayName: "GitHub" };
+      try {
+        await options.store.append({
+          kind: "thread.reopened",
+          actor,
+          threadId: localTid,
+          reason: "reopened on GitHub",
+        });
+        updates.reopened++;
+      } catch (err) {
+        if (!(err instanceof ThreadStoreAppendError)) throw err;
+      }
+    }
+
+    // ── Comment-level diff (new replies + body edits) ──
+    // Build a map from local comment.body by commentId so we can
+    // detect edits + missing replies.
+    const localById = new Map(localThread.comments.map((c) => [c.id, c]));
+    for (let i = 0; i < remoteThread.comments.length; i++) {
+      const remoteComment = remoteThread.comments[i];
+      if (remoteComment === undefined) continue;
+      const localCid = commentIdOf(remoteThread, remoteComment);
+      const local = localById.get(localCid);
+      if (local === undefined) {
+        // A new remote reply we hadn't seen. The first comment
+        // (i === 0) is always the opener — already appended by the
+        // first-pass import when it was new. Every subsequent
+        // comment is a reply.
+        if (i === 0) continue;
+        const prevRemote = remoteThread.comments[i - 1];
+        if (prevRemote === undefined) continue;
+        const parentId = commentIdOf(remoteThread, prevRemote);
+        const author = remoteComment.authorLogin !== null
+          ? { kind: "gh-user" as const, id: remoteComment.authorLogin, displayName: remoteComment.authorLogin }
+          : { kind: "gh-user" as const, id: "github", displayName: "GitHub" };
+        try {
+          await options.store.append({
+            kind: "comment.replied",
+            actor: author,
+            threadId: localTid,
+            commentId: localCid,
+            parentId,
+            body: remoteComment.body,
+          });
+          updates.newReplies++;
+        } catch (err) {
+          if (!(err instanceof ThreadStoreAppendError)) throw err;
+        }
+        continue;
+      }
+      // Existing local — emit a body edit when the remote's
+      // body no longer matches the local one. The event is
+      // idempotent at the emitter side (remote-updated-at
+      // marker); here we compare bodies as strings.
+      if (local.body !== remoteComment.body) {
+        const author = remoteComment.authorLogin !== null
+          ? { kind: "gh-user" as const, id: remoteComment.authorLogin, displayName: remoteComment.authorLogin }
+          : { kind: "gh-user" as const, id: "github", displayName: "GitHub" };
+        try {
+          await options.store.append({
+            kind: "comment.edited",
+            actor: author,
+            commentId: localCid,
+            body: remoteComment.body,
+          });
+          updates.edited++;
+        } catch (err) {
+          if (!(err instanceof ThreadStoreAppendError)) throw err;
+        }
+      }
+    }
+  }
+
   return {
     appended,
     skipped,
     refused,
     threadIds: [...touched],
+    updates,
   };
 }

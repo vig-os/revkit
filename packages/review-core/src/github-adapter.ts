@@ -261,6 +261,16 @@ export interface PendingReview {
   readonly state: "PENDING" | "COMMENTED" | "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED";
 }
 
+/** Round-2 BLOCK-fix 1: one entry in `listViewerReviewsOnPr`.
+ * `state` is GitHub's enum; PENDING has `submittedAt: null`. */
+export interface ViewerReviewSummary {
+  readonly id: string;
+  readonly databaseId: number;
+  readonly state: "PENDING" | "COMMENTED" | "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED";
+  readonly commitSha: string | null;
+  readonly submittedAt: string | null;
+}
+
 export type ReviewSubmissionEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
 
 /** Snapshot for a thread — one of three shapes (see
@@ -780,6 +790,55 @@ export class GitHubAdapter {
     };
   }
 
+  /** Round-2 BLOCK-fix 1: list the viewer's reviews on the PR
+   * across ALL states. The reconciler uses this to distinguish
+   * "our recorded pending review was SUBMITTED on GitHub" (in
+   * which case we heal by appending `review.submitted`) from
+   * "our recorded pending review is gone from GitHub" (in which
+   * case we mark it deleted-remotely and NEVER auto-create a
+   * replacement).
+   *
+   * The old crash-heal path called `findOrCreatePendingReview`
+   * which CREATED a new pending review when none was found —
+   * producing a duplicate APPROVE when GitHub had accepted the
+   * submit and our log had lost the terminal event.
+   *
+   * Ordered by `submittedAt` ascending; PENDING entries have
+   * `submittedAt: null` and appear last (GitHub's ordering) but
+   * callers should treat this as an unordered set. */
+  async listViewerReviewsOnPr(input: {
+    readonly pullRequestNodeId: string;
+    readonly viewerLogin?: string;
+  }): Promise<readonly ViewerReviewSummary[]> {
+    const login = input.viewerLogin ?? (await this.viewerLogin());
+    const resp = await this.graphqlWithRetry<{
+      data: {
+        node: {
+          __typename?: string;
+          reviews?: {
+            nodes: Array<{
+              id: string;
+              databaseId?: number | null;
+              state: string;
+              submittedAt?: string | null;
+              commit?: { oid: string } | null;
+            }>;
+          } | null;
+        } | null;
+      };
+    }>(VIEWER_REVIEWS_QUERY, { id: input.pullRequestNodeId, author: login });
+    const node = resp.data.node;
+    if (node === undefined || node === null || node.__typename !== "PullRequest") return [];
+    const nodes = node.reviews?.nodes ?? [];
+    return nodes.map((n) => ({
+      id: n.id,
+      databaseId: n.databaseId ?? 0,
+      state: n.state as ViewerReviewSummary["state"],
+      commitSha: n.commit?.oid ?? null,
+      submittedAt: n.submittedAt ?? null,
+    }));
+  }
+
   /** Add one draft thread to the pending review. Line- or file-
    * subject; multi-line ranges supported (single side only —
    * `startSide` defaults to `side`, and per the schema both must be
@@ -1187,18 +1246,20 @@ export class GitHubAdapter {
 
       if (anchor === undefined) continue;
 
-      // Structured import metadata for an unanchored / orphaned
-      // thread whose remote is GitHub. PR-43 round-5 nit: proper
-      // field, not a `;was-resolved-on-github` reason suffix.
-      const externalMetadata =
-        forceOrphan
-          ? {
-              provider: "github" as const,
-              threadId: thread.id,
-              resolved: thread.isResolved,
-              ...(thread.resolvedByLogin !== null ? { resolvedByLogin: thread.resolvedByLogin } : {}),
-            }
-          : undefined;
+      // Round-2 BLOCK-fix 4: structured import metadata for EVERY
+      // imported thread whose remote is GitHub — not just the
+      // unanchored / orphaned ones. The daemon's B4 mirror path
+      // (reply / resolve / reopen) refuses to hit the adapter
+      // unless `external.provider === "github"`, so a plain
+      // anchored import used to be a dead end for two-way sync.
+      // The `resolved` field is the round-1 PR-43 nit — proper
+      // state, not a reason-string suffix.
+      const externalMetadata = {
+        provider: "github" as const,
+        threadId: thread.id,
+        resolved: thread.isResolved,
+        ...(thread.resolvedByLogin !== null ? { resolvedByLogin: thread.resolvedByLogin } : {}),
+      };
       // Issue #46 item 3: for a forced-orphan thread (unanchored
       // anchor), no `thread.orphaned` event will follow, so carry
       // the pipeline's reason ON `comment.created`. The reducer
@@ -1215,7 +1276,7 @@ export class GitHubAdapter {
         commentId: input.commentIdOf(thread, firstComment),
         anchor,
         body: firstComment.body,
-        ...(externalMetadata !== undefined ? { external: externalMetadata } : {}),
+        external: externalMetadata,
         ...(forcedOrphanReason !== undefined ? { orphanReason: forcedOrphanReason } : {}),
       });
       events.push({
@@ -2098,6 +2159,9 @@ export const GITHUB_GRAPHQL_DOCUMENTS = {
   get ViewerPendingReview() {
     return VIEWER_PENDING_REVIEW_QUERY;
   },
+  get ViewerReviews() {
+    return VIEWER_REVIEWS_QUERY;
+  },
   get AddReview() {
     return ADD_REVIEW_MUTATION;
   },
@@ -2243,6 +2307,30 @@ const VIEWER_PENDING_REVIEW_QUERY = /* GraphQL */ `
             id
             databaseId
             state
+            commit { oid }
+          }
+        }
+      }
+    }
+  }
+`;
+
+// Round-2 BLOCK-fix 1 (double-APPROVE): list the viewer's reviews
+// on this PR across ALL states so the reconciler can tell whether a
+// LOG-known review was submitted or deleted on GitHub. Bounded page
+// size — a single reviewer rarely has more than a handful of
+// reviews on one PR, and we filter by author.
+const VIEWER_REVIEWS_QUERY = /* GraphQL */ `
+  query ViewerReviews($id: ID!, $author: String!) {
+    node(id: $id) {
+      __typename
+      ... on PullRequest {
+        reviews(first: 50, author: $author) {
+          nodes {
+            id
+            databaseId
+            state
+            submittedAt
             commit { oid }
           }
         }
