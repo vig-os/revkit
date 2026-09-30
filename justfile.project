@@ -233,15 +233,20 @@ claude-plugin ref="":
     echo "devkit plugin @${ref} installed (local scope): /devkit:status, /devkit:upgrade, ..."
 
 # End-to-end dogfood of the M2 agent channel loop (ADR-0007, issue #7). Builds
-# the site, starts `revkit serve`, spawns a disposable test Claude session in a
-# flock pane with `--dangerously-load-development-channels server:revkit`, then
-# drives a comment through the rail UI with Playwright and waits for the test
-# agent to reply and resolve. Requires a logged-in Claude (`claude auth`), a
+# the site, starts an ISOLATED `revkit serve` in a temp state dir, spawns a
+# disposable LOCKED-DOWN test Claude session (no built-in tools, only
+# `mcp__revkit__{threads,reply,resolve}`) in a flock pane, then drives a
+# comment through the rail UI with Playwright and waits for the test agent to
+# reply with `ack <nonce> bash-denied` (the `bash-denied` marker proves the
+# lockdown fired) and resolve. Requires a logged-in Claude (`claude auth`), a
 # running flock server (`flk`), and the nix dev shell. Not part of `just test`
-# or CI. Writes a redacted transcript to `.revkit/dogfood/last.log` and, on
-# success, a screenshot to `.revkit/dogfood/reply-visible.png`. See
-# `.claude/skills/revkit_dogfood/SKILL.md` for the full runbook and the failure
-# playbook.
+# or CI. Writes a redacted transcript to `.revkit/dogfood/last.log`, an
+# unredacted daemon log to `.revkit/dogfood/daemon.log` (contains the launch
+# code — treat as sensitive), and, on success, a screenshot to
+# `.revkit/dogfood/reply-visible.png`. Cleanup runs on any exit path and
+# ends with a self-check for leaked panes or subprocesses (exit 3 on leak).
+# See `.claude/skills/revkit_dogfood/SKILL.md` for the full runbook and the
+# failure playbook.
 [group('agent')]
 dogfood:
     scripts/dogfood-channel.sh

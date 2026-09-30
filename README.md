@@ -77,8 +77,11 @@ Post a comment on any block from the rendered page (select text, click the float
 agent receives a `notifications/claude/channel` frame in that session; ask it to reply with the `reply` tool. The
 reply lands on the page without a reload.
 
-Automated end-to-end proof: `just dogfood` runs the same loop headless in a disposable flock pane, asserting the
-reply arrives within 180 s. Requires `flk` and a logged-in Claude; not part of `just test` or CI. See
+Automated end-to-end proof: `just dogfood` runs the same loop headless in a disposable, locked-down flock pane
+(no built-in tools; only `mcp__revkit__{threads,reply,resolve}` allowed; the pane's cwd is an isolated temp state
+dir with its own copy of `site/dist` and `docs/`, so the test agent never sees the worktree's git tree), asserting
+the reply arrives within 240 s and carries a `bash-denied` marker proving the lockdown fired. Requires `flk` and
+a logged-in Claude; not part of `just test` or CI. See
 [`.claude/skills/revkit_dogfood/SKILL.md`](.claude/skills/revkit_dogfood/SKILL.md) for the runbook.
 
 ## License

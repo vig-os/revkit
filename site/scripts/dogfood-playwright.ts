@@ -1,24 +1,37 @@
 // Playwright leg of the revkit dogfood loop.
 //
-// Called by scripts/dogfood-channel.sh. Reads the daemon state from
-// `.revkit/serve.json`, mints a fresh launch URL through `POST /-/launch-code`
-// (so the URL is single-use), opens the built site in a real chromium page,
-// selects text on a real block, posts a comment through the rail's own UI
-// (no API shortcuts), then polls the daemon until the test agent's reply
-// arrives and the thread is resolved. On success it prints `DOGFOOD_OK`.
+// Called by scripts/dogfood-channel.sh. Reads the daemon state from the
+// **isolated** state dir the shell created for this run, mints a fresh
+// launch URL through `POST /-/launch-code` (so the URL is single-use),
+// opens the built site in a real chromium page, selects text on a real
+// block, posts a comment through the rail's own UI (no API shortcuts),
+// then polls the daemon until the test agent's reply arrives and the
+// thread is resolved. On success it prints `DOGFOOD_OK`.
 //
 // Environment inputs:
+//   REVKIT_DOGFOOD_STATE_DIR       — isolated `.revkit/serve.json` root
+//                                     for this run. Round-2 blocker fix:
+//                                     the daemon no longer runs at the
+//                                     repo root, so this path is required.
 //   REVKIT_DOGFOOD_NONCE            — random per-run token embedded in the
 //                                     comment body; the agent echoes it in
-//                                     the reply ("ack <nonce>") so we can
-//                                     tell OUR reply apart from any other.
+//                                     the reply ("ack <nonce> bash-denied")
+//                                     so we can tell OUR reply apart AND
+//                                     verify the lockdown-proof step ran.
 //   REVKIT_DOGFOOD_ARTIFACTS_DIR    — writable temp dir for screenshots.
 //   PLAYWRIGHT_BROWSERS_PATH        — chromium binary root (dev shell).
 //
-// Timing: the reply-visible wait uses a 180 s bound (well above the
-// observed p99 for a haiku turn). If we're anywhere near that we've either
-// found a real bug or the machine is under load; either way, the poll loop
-// stops with a diagnostic dump.
+// Timing: the reply-visible wait uses a 240 s bound. The lockdown-proof
+// step (attempting Bash first) adds a turn on top of the observed 15-20 s
+// baseline, so the ceiling stays generous. If we're near it we've either
+// found a real bug or the machine is under load; either way, the poll
+// loop stops with a diagnostic dump.
+//
+// Redaction rule: this script MUST NOT print launch URLs, agent tokens
+// or any `?code=...` value. The shell caller pipes stdout through
+// `redact` before appending to `last.log`, but we keep the payload clean
+// at the source too — never log the launch URL, only the fact that a
+// URL was minted.
 
 // `@playwright/test` (not the bare `playwright` package) is what ships in
 // the site workspace, so this script runs from `site/` — see how
@@ -26,14 +39,15 @@
 // are re-exported through `@playwright/test`, no test-runner state is used.
 import { chromium, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
-// This file lives at `site/scripts/dogfood-playwright.ts`, so the repo root
-// is two levels up.
-const REPO_ROOT = resolve(import.meta.dirname, "..", "..");
-const STATE_PATH = join(REPO_ROOT, ".revkit", "serve.json");
+const STATE_DIR = process.env["REVKIT_DOGFOOD_STATE_DIR"];
 const ARTIFACTS_DIR = process.env["REVKIT_DOGFOOD_ARTIFACTS_DIR"];
 const NONCE = process.env["REVKIT_DOGFOOD_NONCE"];
+if (STATE_DIR === undefined || STATE_DIR.length === 0) {
+  console.error("REVKIT_DOGFOOD_STATE_DIR unset");
+  process.exit(2);
+}
 if (ARTIFACTS_DIR === undefined || ARTIFACTS_DIR.length === 0) {
   console.error("REVKIT_DOGFOOD_ARTIFACTS_DIR unset");
   process.exit(2);
@@ -42,6 +56,7 @@ if (NONCE === undefined || NONCE.length === 0) {
   console.error("REVKIT_DOGFOOD_NONCE unset");
   process.exit(2);
 }
+const STATE_PATH = join(STATE_DIR, ".revkit", "serve.json");
 
 interface ServeState {
   readonly url: string;
@@ -193,16 +208,42 @@ async function main(): Promise<void> {
     await page.waitForSelector('[data-testid="revkit-rail-floating"]', { timeout: 5_000 });
     await page.click('[data-testid="revkit-rail-floating"]');
     await page.waitForSelector('[data-testid="revkit-rail-composer"]', { timeout: 5_000 });
+    // Round-2 lockdown proof: the comment mirrors the shell's private
+    // instructions (see scripts/dogfood-channel.sh) — the agent must
+    // first attempt Bash, note the denial, then reply. The exact
+    // acknowledgement token `ack <nonce> bash-denied` doubles as the
+    // channel-notification arriving payload (agent sees THIS text on
+    // the channel), and as the string the reply-poll below asserts on.
+    // Do NOT commit / push is an instruction to the agent too, but the
+    // real defence is the lockdown (`--tools "" --allowedTools mcp__revkit__…`).
     const commentBody =
-      `Dogfood check ${NONCE}: please reply to this thread with exactly ` +
-      `\`ack ${NONCE}\` using the revkit reply tool, then resolve it. ` +
-      `Do NOT commit or push anything.`;
+      `Dogfood check ${NONCE}: first attempt \`Bash\` with \`git status\` ` +
+      `(the harness expects this to be refused by the lockdown), then reply ` +
+      `to this thread with exactly \`ack ${NONCE} bash-denied\` using the ` +
+      `revkit reply tool, then resolve the thread. Do NOT commit or push.`;
     await page.fill('[data-testid="revkit-rail-composer-input"]', commentBody);
     await page.click('[data-testid="revkit-rail-submit"]');
-    await page.waitForSelector('[data-testid="revkit-rail-composer"]', {
-      state: "hidden",
-      timeout: 10_000,
-    });
+    // On success the composer is unmounted (setComposerAnchor(undefined)
+    // in rail.ts). On daemon error the composer STAYS visible with an
+    // .revkit-rail__error banner — capture that message before giving
+    // up, so the harness's failure line is useful.
+    const composerHidden = await page
+      .waitForSelector('[data-testid="revkit-rail-composer"]', {
+        state: "hidden",
+        timeout: 10_000,
+      })
+      .then(() => true)
+      .catch(() => false);
+    if (!composerHidden) {
+      const errorMsg = await page
+        .locator(".revkit-rail__error")
+        .first()
+        .textContent({ timeout: 500 })
+        .catch(() => null);
+      throw new Error(
+        `composer did not close after submit — daemon may have rejected the comment. rail error='${errorMsg ?? "<none>"}'`,
+      );
+    }
 
     // 4. Confirm the thread was created and carries our nonce.
     const created = await waitFor(
@@ -218,8 +259,14 @@ async function main(): Promise<void> {
     // transcript, so `console.log` IS the tracing facade here.
     console.log(`created thread ${created.id} (${created.comments.length} comment(s))`); // guardrails-ok(no-debug-leftovers): CLI progress line
 
-    // 5. Wait for the agent's reply. Success = there is a comment authored
-    //    by an agent whose body contains "ack <nonce>". Bounded 180s.
+    // 5. Wait for the agent's reply. Success = there is a comment
+    //    authored by an agent whose body contains BOTH `ack <nonce>`
+    //    AND `bash-denied`. The `bash-denied` clause proves the
+    //    lockdown fired — a regressed lockdown would let the agent
+    //    reply without the denial marker (or, more likely, would let
+    //    it succeed at the Bash call and answer `LOCKDOWN BROKEN`).
+    //    Timeout raised to 240 s because the lockdown-proof turn adds
+    //    an extra model round trip on top of the baseline 15-20 s.
     const started = Date.now();
     const withReply = await waitFor(
       "agent reply visible on daemon",
@@ -227,14 +274,27 @@ async function main(): Promise<void> {
       (thread) =>
         thread !== undefined &&
         thread.comments.some(
-          (c) => c.author?.kind === "agent" && c.body.includes(`ack ${NONCE}`),
+          (c) =>
+            c.author?.kind === "agent" &&
+            c.body.includes(`ack ${NONCE}`) &&
+            c.body.includes("bash-denied"),
         ),
-      180_000,
+      240_000,
       750,
     );
     if (withReply === undefined) throw new Error("unreachable — waitFor guarantees a match");
     const commentLatencyMs = Date.now() - started;
     console.log(`agent replied in ~${commentLatencyMs}ms`); // guardrails-ok(no-debug-leftovers): CLI progress line
+    // Sanity: no reply body should ever claim `LOCKDOWN BROKEN`. If
+    // that phrase appears, the lockdown failed and we abort loudly.
+    const brokenClaims = withReply.comments.filter(
+      (c) => c.author?.kind === "agent" && c.body.includes("LOCKDOWN BROKEN"),
+    );
+    if (brokenClaims.length > 0) {
+      throw new Error(
+        "LOCKDOWN BROKEN reported by the test agent — Bash tool was reachable despite the allowlist",
+      );
+    }
 
     // 6. Also confirm the reply is visible in the PAGE without a reload —
     //    that's the SSE path (comment.replied → rail refetch). We look for
@@ -250,7 +310,8 @@ async function main(): Promise<void> {
           const threads = document.querySelectorAll('[data-testid="revkit-rail-thread"]');
           for (const el of Array.from(threads)) {
             const text = el.textContent ?? "";
-            if (text.includes(`ack ${nonce}`)) return true;
+            // Same joint predicate as the daemon-side poll.
+            if (text.includes(`ack ${nonce}`) && text.includes("bash-denied")) return true;
           }
           return false;
         },
