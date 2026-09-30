@@ -53,6 +53,11 @@ describe("event-subscriber (SSE)", () => {
       localUserId: "local-test",
       installSignalHandlers: false,
       logSink: { write: () => {} },
+      // M2 item 6 makes `handover` the default delivery mode, which
+      // batches human events off the AGENT stream. These tests
+      // exercise the SSE transport itself and want each event
+      // delivered live.
+      deliveryMode: "live",
     });
   });
   afterEach(async () => {

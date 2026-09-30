@@ -90,6 +90,13 @@ export { ID_REGEX, idSchema, isValidId } from "./id.ts";
 export { isValidRepoRelativePath } from "./path.ts";
 export { authorKinds, authorSchema, type Author, type AuthorKind } from "./author.ts";
 export {
+  addressesAgent,
+  hasAgentNow,
+  parseMentions,
+  type Mention,
+  type MentionScan,
+} from "./mentions.ts";
+export {
   askAnswerSchema,
   askKinds,
   askSchema,

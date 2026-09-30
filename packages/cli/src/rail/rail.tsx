@@ -25,6 +25,11 @@
 import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
+// Sub-path import: `@revkit/review-core/mentions` is a leaf module
+// with NO Zod dependency, so the rail bundle stays free of Zod's
+// `new Function` feature-probe (which the daemon's CSP forbids) —
+// see `packages/review-core/package.json` `exports` map.
+import { parseMentions, type Mention } from "@revkit/review-core/mentions";
 
 /** The wire shape the daemon returns from `GET /api/threads` — kept as
  * a minimal duck type here so the rail bundle does not pull the whole
@@ -99,6 +104,61 @@ interface RailReviewEvent {
   readonly seq: number;
   readonly kind: string;
   readonly threadId?: string;
+}
+
+/** Delivery mode wire shape from `GET /api/delivery-mode` (M2 item 6).
+ * Kept a minimal duck-type here so the rail bundle does not pull the
+ * whole `@revkit/review-core` type surface into the browser payload. */
+type DeliveryMode = "handover" | "live" | "quiet";
+interface DeliveryStatus {
+  readonly mode: DeliveryMode;
+  readonly batched: number;
+  readonly lastEventMsAgo: number | null;
+  readonly updatedAt: string;
+  readonly idleFlushMs: number;
+}
+
+/** Presence beacon projected onto rail state — the latest per agent id. */
+interface PresenceBadge {
+  readonly agentId: string;
+  readonly agentDisplayName?: string;
+  readonly state: "editing" | "idle";
+  readonly path?: string;
+  readonly startLine?: number;
+  readonly endLine?: number;
+  readonly ts: string;
+}
+
+/** Fetch the current delivery mode. */
+async function fetchDeliveryMode(): Promise<DeliveryStatus> {
+  const response = await fetch("/api/delivery-mode", {
+    credentials: "same-origin",
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(`GET /api/delivery-mode failed: ${response.status}`);
+  return (await response.json()) as DeliveryStatus;
+}
+
+/** Change the delivery mode. */
+async function setDeliveryMode(mode: DeliveryMode): Promise<DeliveryStatus> {
+  const response = await fetch("/api/delivery-mode", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (!response.ok) throw new Error(`POST /api/delivery-mode failed: ${response.status}`);
+  return (await response.json()) as DeliveryStatus;
+}
+
+/** Flush the handover batch. */
+async function handOverNow(): Promise<void> {
+  const response = await fetch("/api/handover", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(`POST /api/handover failed: ${response.status}`);
 }
 
 /** Build the SHA-256 hex digest of the LF-normalised body — the
@@ -275,7 +335,18 @@ function nearestAnchorAncestor(node: Node | null): HTMLElement | undefined {
  * a comment / thread event. Reconnects on close with an exponential
  * backoff up to 30 s — a paused laptop can wake into a stale stream
  * and this brings it back quickly without hammering the daemon. */
-function subscribeEvents(onBump: () => void): () => void {
+function subscribeEvents(
+  onBump: () => void,
+  onModeBump: () => void = () => {},
+  onPresence: (event: {
+    readonly ts: string;
+    readonly state?: string;
+    readonly path?: string;
+    readonly startLine?: number;
+    readonly endLine?: number;
+    readonly actor?: { readonly id?: string; readonly displayName?: string };
+  }) => void = () => {},
+): () => void {
   let closed = false;
   let source: EventSource | undefined;
   let retryDelayMs = 500;
@@ -303,6 +374,23 @@ function subscribeEvents(onBump: () => void): () => void {
           event.kind === "thread.orphaned"
         ) {
           onBump();
+        }
+        // M2 item 6: `handover` events change the batch count; the
+        // rail's mode-badge re-fetches so the "N drafts" pill goes
+        // to zero. `presence` events surface the "agent is editing …"
+        // chip.
+        if (event.kind === "handover") {
+          onModeBump();
+        }
+        if (event.kind === "presence") {
+          onPresence(event as unknown as {
+            readonly ts: string;
+            readonly state?: string;
+            readonly path?: string;
+            readonly startLine?: number;
+            readonly endLine?: number;
+            readonly actor?: { readonly id?: string; readonly displayName?: string };
+          });
         }
       } catch {
         // A non-JSON frame is the SSE keepalive comment or a corrupt
@@ -352,6 +440,35 @@ function cssEscape(value: string): string {
  * complementary region (ADR-0017). */
 function Rail(): JSX.Element {
   const [threads, { refetch }] = createResource(fetchThreads);
+  const [mode, { refetch: refetchMode }] = createResource(fetchDeliveryMode);
+  // Presence — latest beacon per agent id. Cleared on `idle`.
+  const [presence, setPresence] = createSignal<readonly PresenceBadge[]>([]);
+  const applyPresenceEvent = (event: {
+    readonly ts: string;
+    readonly state?: string;
+    readonly path?: string;
+    readonly startLine?: number;
+    readonly endLine?: number;
+    readonly actor?: { readonly id?: string; readonly displayName?: string };
+  }): void => {
+    const agentId = event.actor?.id;
+    if (typeof agentId !== "string" || agentId.length === 0) return;
+    const state = event.state === "editing" ? "editing" : event.state === "idle" ? "idle" : undefined;
+    if (state === undefined) return;
+    const next = presence().filter((p) => p.agentId !== agentId);
+    if (state === "editing") {
+      next.push({
+        agentId,
+        ...(event.actor?.displayName !== undefined ? { agentDisplayName: event.actor.displayName } : {}),
+        state,
+        ...(event.path !== undefined ? { path: event.path } : {}),
+        ...(event.startLine !== undefined ? { startLine: event.startLine } : {}),
+        ...(event.endLine !== undefined ? { endLine: event.endLine } : {}),
+        ts: event.ts,
+      });
+    }
+    setPresence(next);
+  };
   // The composer builds a fresh line anchor from the reviewer's
   // selection; nothing in this path is ever unanchored. Type as
   // `RailLineAnchor` so `.startLine` / `.endLine` type-check
@@ -367,10 +484,18 @@ function Rail(): JSX.Element {
   // it in Escape's dispatch table.
   const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
 
-  // Wire the SSE stream on mount, tear it down on unmount.
-  const unsubscribe = subscribeEvents(() => {
-    void refetch();
-  });
+  // Wire the SSE stream on mount, tear it down on unmount. The three
+  // subscribers are separated so a `presence` event does not force a
+  // thread refetch, and a comment event does not force a mode refetch.
+  const unsubscribe = subscribeEvents(
+    () => {
+      void refetch();
+    },
+    () => {
+      void refetchMode();
+    },
+    (event) => applyPresenceEvent(event),
+  );
   onCleanup(unsubscribe);
 
   // Selection listener: on `mouseup` (or a keyboard-driven
@@ -597,6 +722,95 @@ function Rail(): JSX.Element {
           aria-label="refresh"
         >refresh</button>
       </header>
+      <section
+        class="revkit-rail__mode"
+        aria-label="delivery mode"
+        data-testid="revkit-rail-mode"
+      >
+        <fieldset class="revkit-rail__mode-fieldset">
+          <legend class="revkit-rail__mode-legend">Delivery</legend>
+          <For each={["handover", "live", "quiet"] as const}>
+            {(m: DeliveryMode) => (
+              <label
+                class={`revkit-rail__mode-option revkit-rail__mode-option--${m}`}
+                data-testid={`revkit-rail-mode-${m}`}
+                data-selected={mode()?.mode === m ? "true" : "false"}
+              >
+                <input
+                  type="radio"
+                  name="revkit-rail-mode"
+                  value={m}
+                  checked={mode()?.mode === m}
+                  onChange={() => {
+                    void (async () => {
+                      try {
+                        await setDeliveryMode(m);
+                        await refetchMode();
+                      } catch (cause) {
+                        setError((cause as Error).message);
+                      }
+                    })();
+                  }}
+                />
+                <span class="revkit-rail__mode-label">{m}</span>
+              </label>
+            )}
+          </For>
+        </fieldset>
+        <Show when={mode()?.mode === "handover" && (mode()?.batched ?? 0) > 0}>
+          <div class="revkit-rail__mode-batched" data-testid="revkit-rail-batched">
+            <span
+              class="revkit-rail__mode-badge"
+              aria-label={`${mode()!.batched} draft${mode()!.batched === 1 ? "" : "s"} pending`}
+            >
+              {mode()!.batched} pending
+            </span>
+            <button
+              type="button"
+              class="revkit-rail__mode-handover"
+              data-testid="revkit-rail-handover"
+              onClick={() => {
+                void (async () => {
+                  try {
+                    await handOverNow();
+                    await refetchMode();
+                  } catch (cause) {
+                    setError((cause as Error).message);
+                  }
+                })();
+              }}
+            >Hand over</button>
+          </div>
+        </Show>
+      </section>
+      <Show when={presence().length > 0}>
+        <section
+          class="revkit-rail__presence"
+          aria-live="polite"
+          aria-label="agent activity"
+          data-testid="revkit-rail-presence"
+        >
+          <For each={presence()}>
+            {(badge: PresenceBadge) => (
+              <p class="revkit-rail__presence-line" data-testid="revkit-rail-presence-line">
+                <span class="revkit-rail__presence-dot" aria-hidden="true"></span>
+                <span class="revkit-rail__presence-who">
+                  {badge.agentDisplayName ?? badge.agentId}
+                </span>
+                <span class="revkit-rail__presence-verb"> is editing </span>
+                <span class="revkit-rail__presence-where">
+                  {badge.path ?? "the review"}
+                  <Show when={badge.startLine !== undefined && badge.endLine !== undefined}>
+                    <span class="revkit-rail__presence-lines">
+                      {" "}L{badge.startLine}-{badge.endLine}
+                    </span>
+                  </Show>
+                </span>
+              </p>
+            )}
+          </For>
+        </section>
+      </Show>
       <Show when={error() !== undefined}>
         <p class="revkit-rail__error" role="alert">{error()}</p>
       </Show>
@@ -703,7 +917,7 @@ function Rail(): JSX.Element {
                         <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
                         <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
                       </p>
-                      <p class="revkit-rail__body">{comment.body}</p>
+                      <p class="revkit-rail__body">{renderBodyWithMentions(comment.body)}</p>
                     </li>
                   )}
                 </For>
@@ -844,7 +1058,7 @@ function Rail(): JSX.Element {
                             <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
                             <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
                           </p>
-                          <p class="revkit-rail__body">{comment.body}</p>
+                          <p class="revkit-rail__body">{renderBodyWithMentions(comment.body)}</p>
                         </li>
                       )}
                     </For>
@@ -957,6 +1171,59 @@ function orphanReasonFor(thread: RailThread): string {
     `L${thread.anchor.startLine}–${thread.anchor.endLine}. ` +
     `The thread is kept — reply or resolve it here.`
   );
+}
+
+/** Render a comment body with `@mention` chips inline (M2 item 6,
+ * ADR-0011). The parser produces typed non-overlapping ranges into
+ * the original body; we walk them once and emit alternating text
+ * spans + chip elements. The rail refuses to render mention text as
+ * HTML — every chip goes through the JSX text path so a body like
+ * `<script>@agent</script>` never lands in the DOM as script. */
+function renderBodyWithMentions(body: string): JSX.Element {
+  const scan = parseMentions(body);
+  if (scan.mentions.length === 0) return body;
+  const nodes: JSX.Element[] = [];
+  let cursor = 0;
+  // Deduplicate ranges: an `@agent now` produces two entries whose
+  // ranges overlap (the bare agent mention + the marker). Prefer the
+  // WIDER range for chip rendering so `@agent now` appears as one
+  // chip, not two overlapping ones.
+  const sorted = [...scan.mentions].sort((a, b) => a.range[0] - b.range[0] || (b.range[1] - b.range[0]) - (a.range[1] - a.range[0]));
+  const chosen: Mention[] = [];
+  let lastEnd = -1;
+  for (const mention of sorted) {
+    if (mention.range[0] >= lastEnd) {
+      chosen.push(mention);
+      lastEnd = mention.range[1];
+    } else if (mention.range[1] > lastEnd) {
+      // The next mention extends the previous — pick the wider by
+      // replacing the last chosen when this one is strictly wider.
+      const previous = chosen[chosen.length - 1];
+      if (previous !== undefined && mention.range[1] - mention.range[0] > previous.range[1] - previous.range[0]) {
+        chosen[chosen.length - 1] = mention;
+        lastEnd = mention.range[1];
+      }
+    }
+  }
+  for (const mention of chosen) {
+    const [start, end] = mention.range;
+    if (cursor < start) nodes.push(body.slice(cursor, start));
+    const label = body.slice(start, end);
+    nodes.push(
+      <span
+        class={`revkit-rail__mention revkit-rail__mention--${mention.kind}`}
+        data-testid="revkit-rail-mention"
+        data-mention-kind={mention.kind}
+        data-mention-id={mention.id}
+        title={mention.kind === "agent-now" ? "flushes handover immediately" : mention.label}
+      >
+        {label}
+      </span>,
+    );
+    cursor = end;
+  }
+  if (cursor < body.length) nodes.push(body.slice(cursor));
+  return nodes as unknown as JSX.Element;
 }
 
 /** Mount the rail into a fresh `<div>` appended to `<body>`. Idempotent

@@ -259,6 +259,24 @@ async function main(): Promise<void> {
       250,
     );
     if (created === undefined) throw new Error("unreachable — waitFor guarantees a match");
+    // 4b. M2 item 6 dogfood — the daemon boots in `handover` mode
+    // (the default), so the human comment above is BATCHED and did
+    // not reach the agent's channel stream yet. Flush the batch
+    // through the daemon's own /api/handover endpoint; the agent
+    // should now receive a `handover` channel notification, look
+    // up the thread via `threads`, and reply. This proves the
+    // handover pipeline end-to-end.
+    const flush = await fetch(`${state.url}/api/handover`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${state.agentToken}`,
+        "content-type": "application/json",
+        host: `127.0.0.1:${state.port}`,
+      },
+      body: "{}",
+    });
+    if (!flush.ok) throw new Error(`handover flush failed: ${flush.status}`);
+    console.log("handover flushed via POST /api/handover"); // guardrails-ok(no-debug-leftovers): CLI progress line
     // stdout is this script's contract — the caller shell
     // (scripts/dogfood-channel.sh) tees each line into the dogfood
     // transcript, so `console.log` IS the tracing facade here.

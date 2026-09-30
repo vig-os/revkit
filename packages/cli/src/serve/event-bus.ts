@@ -22,6 +22,13 @@ export interface Subscriber {
    * on a delivery failure or on a graceful `unsubscribe`). Idempotent;
    * the subscriber uses it to close its underlying transport. */
   close(): void;
+  /** Optional per-event filter. Returns `false` to skip delivery of
+   * this specific event to this specific subscriber; the daemon uses
+   * this to gate the AGENT stream on the delivery-mode state
+   * (`handover` batches, `quiet` suppresses, `live` passes through)
+   * without touching the RAIL stream. Absent = accept every event
+   * (the default, matches pre-M2-item-6 behaviour). */
+  matches?(event: ReviewEvent): boolean;
 }
 
 export class EventBus {
@@ -57,6 +64,7 @@ export class EventBus {
     const snapshot = [...this.#subscribers];
     for (const subscriber of snapshot) {
       try {
+        if (subscriber.matches !== undefined && !subscriber.matches(event)) continue;
         await subscriber.deliver(event);
       } catch {
         failures.push(subscriber);

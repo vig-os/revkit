@@ -53,3 +53,63 @@ call on a human.
   `findRunningDaemon` (auto-starting a fresh daemon via the plan default), verifies the daemons `instanceId` via
   `/-/health`, rebuilds the `DaemonClient` with the new port + token, and resubscribes from `min(lastSeenSeq, head)`
   so a fresh sqlite (head=0) does not stall on a stale resume point. Backoff is bounded (500 ms → 30 s).
+
+## Amendment (2026-09-30) — M2 item 6: delivery modes, presence, `@agent`, hook
+
+M2 item 6 wires the delivery-mode surface, presence, the Monitor-WebSocket fallback and the UserPromptSubmit hook.
+The decisions the design left open:
+
+- **Delivery mode is typed state**, persisted per-repo under `.revkit/delivery.json` (mode 600). The enum is
+  `{handover, live, quiet}`; the default is `handover`. The daemon's fan-out to `/events?for=agent` is gated by the
+  mode on a **per-subscriber basis** (`WebSocketData.audience` + a `Subscriber.matches` predicate on `EventBus`) —
+  the rail's stream is never gated. `handover` batches human `comment.created` / `comment.replied` events and
+  suppresses them from the agent stream until an explicit flush; `quiet` suppresses them entirely (agent must pull
+  via `threads`); `live` passes everything through.
+
+- **The idle flush** in `handover` mode fires after **90 seconds** of no new batched comments, when the batch is
+  non-empty. Rationale: long enough to feel "the reviewer stepped away" rather than "the reviewer paused typing";
+  short enough that walking away doesn't strand a comment on an agent that's actively waiting. Documented in
+  `DEFAULT_IDLE_FLUSH_MS` (`packages/cli/src/serve/delivery-modes.ts`) and tested against its exact value so a
+  silent change breaks the constant test.
+
+- **`handover` is a real event, not a synthesised summary.** On flush the daemon appends one `handover` event
+  carrying `commentIds[]` + a `revision` (SHA-256 of the daemons flush time — the log's frame reference, not an
+  anchor revision). The channel client renders it like any other event; the rail's mode-badge falls to zero when
+  a `handover` fans out.
+
+- **`@agent now` is parsed structurally, not by regex.** The mention parser
+  (`packages/review-core/src/mentions.ts`) tokenises comment bodies into prose / code regions (fenced ``` blocks
+  and inline `` `code` ``  spans are masked), then walks prose respecting word boundaries — an `@agent` inside
+  `` `@agent` `` never fires. On a `comment.created` / `comment.replied` whose body carries `@agent now`, the
+  daemon (a) fans the comment out immediately regardless of mode, and (b) flushes any pending batch. The parser is
+  exported as a leaf sub-path (`@revkit/review-core/mentions`) with **no Zod dependency**, so the rail bundle can
+  import it without pulling in Zod's `new Function` feature-probe (which the daemon's CSP forbids under
+  `script-src` without `'unsafe-eval'`).
+
+- **Presence is agent-only, self-expiring.** `POST /api/presence` accepts `state = editing | idle` (with optional
+  `path` + `startLine`/`endLine`) from a bearer-authed caller only — a cookie caller is refused with 403 so the
+  browser cannot spoof "agent is editing …". An `editing` beacon schedules an automatic `idle` follow-up after
+  **30 seconds** (per-agent-id timer, refreshed on the next `editing` from the same agent). A long tool call must
+  refresh periodically or the badge clears on its own.
+
+- **Monitor-WebSocket fallback = `revkit events --follow`.** A one-shot CLI subcommand that opens
+  `/events?for=agent` with the agent bearer token from `serve.json` and writes one JSON line per event to stdout.
+  `JSON.stringify` is the escape (every user-supplied field is safe on a single line), so a body containing `\n`
+  or `</channel>` cannot break the line-per-frame contract Monitor depends on. Reconnect uses the shared
+  exponential backoff (500 ms → 30 s).
+
+- **UserPromptSubmit hook = `revkit hook user-prompt-submit`.** Fast (soft ~400 ms deadline via `AbortController`),
+  silent on any failure (missing daemon, refused Origin, malformed body all exit 0 with no output — a hook that
+  fails loudly would train reviewers to remove it), and framed as UNTRUSTED input: output goes inside
+  `<revkit-pending count="N">…</revkit-pending>` and every user-supplied field flows through
+  `escapeContentFragment` before it lands in the frame. Bounded: at most 8 threads listed per hook run; comment
+  bodies truncated to 240 chars. Wire-up documented in the file header and the CLI `--help`; the command NEVER
+  touches the owner's global settings — projects wire the hook into their OWN `.claude/settings.json`.
+
+- **`mode` and `presence` MCP tools.** `revkit mcp` gains two tools: `mode` (read + optional `set`) and
+  `presence` (emit an editing / idle beacon). The channel-server tools list now advertises six tools —
+  `threads`, `reply`, `resolve`, `review_url`, `mode`, `presence`.
+
+- **Existing tests that exercised the agent stream directly now pass `deliveryMode: "live"`** to `startDaemon` —
+  the SSE / WS transport tests are about the transport, not the delivery-mode gate. The gate has its own tests
+  in `test/serve/delivery-http.test.ts` and `test/serve/delivery-modes.test.ts`.

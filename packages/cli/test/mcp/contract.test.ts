@@ -174,7 +174,9 @@ describe("revkit mcp — channel + tools contract", () => {
   test("tools/list advertises threads, reply, resolve with expected shape", async () => {
     const listing = await ctx.client.listTools();
     const names = listing.tools.map((t) => t.name).sort();
-    expect(names).toEqual(["reply", "resolve", "review_url", "threads"]);
+    // M2 item 6 (delivery modes + presence): the `mode` and
+    // `presence` tools joined the listing.
+    expect(names).toEqual(["mode", "presence", "reply", "resolve", "review_url", "threads"]);
     const reply = listing.tools.find((t) => t.name === "reply");
     expect(reply?.inputSchema.required).toEqual(["thread_id", "parent_id", "body"]);
     const threads = listing.tools.find((t) => t.name === "threads");
@@ -379,16 +381,63 @@ describe("revkit mcp — mutation checks", () => {
   });
 
   test("MUTATION: formatChannelPayload returns undefined for irrelevant kinds", () => {
-    // `presence` is not a review-comment transition; forwarding it
-    // as a channel notification would spam the agent every keystroke.
+    // Truly-irrelevant kinds (e.g. `ask.created` which is routed via
+    // the `/ask/<id>` page, not through the channel) must drop.
+    // Presence + handover ARE forwarded as of M2 item 6 — that's the
+    // channel-notification promotion path for those events.
     const result = formatChannelPayload({
+      seq: 1,
+      kind: "ask.created",
+      ts: "2026-09-30T00:00:00Z",
+      actor: { kind: "local", id: "u1" },
+      askId: "ask-1",
+    } as unknown as WireEvent);
+    expect(result).toBeUndefined();
+  });
+
+  test("M2 item 6: formatChannelPayload emits a handover frame with count + ids", () => {
+    const payload = formatChannelPayload({
+      seq: 1,
+      kind: "handover",
+      ts: "2026-09-30T00:00:00Z",
+      actor: { kind: "local", id: "u1", displayName: "Alex" },
+      commentIds: ["c-1", "c-2"],
+      revision: "e".repeat(64),
+      note: "Reviewer handed the batch to the agent.",
+    } as unknown as WireEvent);
+    expect(payload).toBeDefined();
+    expect(payload!.content).toContain("2 comments");
+    expect(payload!.content).toContain("c-1, c-2");
+    expect(payload!.meta.kind).toBe("handover");
+    expect(payload!.meta.count).toBe("2");
+  });
+
+  test("M2 item 6: formatChannelPayload emits a presence frame from another local session", () => {
+    const payload = formatChannelPayload({
       seq: 1,
       kind: "presence",
       ts: "2026-09-30T00:00:00Z",
-      actor: { kind: "local", id: "u1" },
+      actor: { kind: "local", id: "u1", displayName: "Alex" },
+      state: "editing",
+      path: "docs/a.md",
+      startLine: 1,
+      endLine: 3,
+    } as unknown as WireEvent);
+    expect(payload).toBeDefined();
+    expect(payload!.meta.kind).toBe("presence");
+    expect(payload!.meta.state).toBe("editing");
+    expect(payload!.content).toContain("docs/a.md:1-3");
+  });
+
+  test("M2 item 6: an agent's OWN presence beacon is skipped (echo suppression)", () => {
+    const payload = formatChannelPayload({
+      seq: 1,
+      kind: "presence",
+      ts: "2026-09-30T00:00:00Z",
+      actor: { kind: "agent", id: "agent" },
       state: "editing",
     } as unknown as WireEvent);
-    expect(result).toBeUndefined();
+    expect(payload).toBeUndefined();
   });
 
   test("MUTATION: formatChannelPayload picks identifier meta keys (no hyphens)", () => {

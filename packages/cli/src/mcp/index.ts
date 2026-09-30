@@ -26,6 +26,8 @@ export {
   REPLY_TOOL,
   RESOLVE_TOOL,
   REVIEW_URL_TOOL,
+  MODE_TOOL,
+  PRESENCE_TOOL,
   type ChannelServerOptions,
   type ChannelServerHandle,
   type ChannelPayload,
