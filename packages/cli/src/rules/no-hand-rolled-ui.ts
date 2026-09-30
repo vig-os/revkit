@@ -67,6 +67,16 @@ export const UI_ALLOWED_PREFIXES: readonly string[] = [
  * make the first real drop of upstream `.tsx` files unshippable. */
 const RULE_EXEMPT_PREFIXES: readonly string[] = [
   "packages/components/vendor/",
+  // The daemon's own overlay UI (the "rail") is bundled by
+  // `packages/cli/src/rail/bundle.ts` and served from the daemon at
+  // `/-/rail.js`. It is not a page-composition component (nothing in
+  // `site/` imports it, and it depends on the daemon's `/api/*` and
+  // `/events` endpoints), so it does not belong under
+  // `packages/components/src/`. Since PR #22 the rail is JSX-compiled
+  // at build time (`babel-preset-solid`) to keep `script-src` free of
+  // `'unsafe-eval'` — hence the `.tsx` extension — and this exemption
+  // lets that file live where the bundler expects it.
+  "packages/cli/src/rail/",
 ];
 
 /** Path prefixes where a code module is out of place: content is data.

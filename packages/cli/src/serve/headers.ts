@@ -129,15 +129,12 @@ export function permissionsPolicyValue(): string {
  *   `cspHashesLoaded` is false we omit the hashes: any inline
  *   script then refuses in the browser, and the daemon logs the
  *   startup message.
- *   `'unsafe-eval'` is included because the rail bundle imports
- *   `solid-js/html`, whose tagged-template runtime compiles
- *   templates into JS functions via `new Function(...)` at first
- *   render — refused without `'unsafe-eval'`. The daemon runs on a
- *   loopback origin under a single user, and the rail bundle is
- *   revkit's own code (never user content), so the widening is
- *   accepted for M2. ADR-0013 amendment (2026-09-30) captures the
- *   scope: the M3/M4 hosted Worker does NOT ship the rail this way
- *   and keeps `script-src` free of `'unsafe-eval'`.
+ *   `'unsafe-eval'` is NOT in this directive. The rail is now JSX-
+ *   compiled at build time by `babel-preset-solid` (see
+ *   `rail/bundle.ts`), so the bundle contains no `eval` or
+ *   `new Function(...)` — the previous `solid-js/html` runtime,
+ *   which forced `'unsafe-eval'`, has been replaced. ADR-0013
+ *   amendment (2026-09-30) documents the switch.
  * - `style-src 'self' 'unsafe-inline'` — Starlight and expressive-
  *   code inject inline styles for syntax highlighting; KaTeX styles
  *   are self-hosted so `'self'` covers them, but the theme-toggle
@@ -166,10 +163,6 @@ export function buildCspHeader(ctx: HeaderContext): string {
   // slash matches exactly one URL.
   scriptSources.push(`http://127.0.0.1:${ctx.port}${RAIL_SCRIPT_URL_PATH}`);
   scriptSources.push(`http://127.0.0.1:${ctx.port}${ASTRO_SCRIPTS_URL_PREFIX}`);
-  // ADR-0013 amendment (2026-09-30): the rail bundle uses
-  // `solid-js/html`, which compiles templates via `new Function()`.
-  // Allow it on the local daemon; drop on the hosted worker.
-  scriptSources.push("'unsafe-eval'");
   if (ctx.cspHashesLoaded) {
     for (const hex of ctx.inlineScriptHashes) {
       // Hashes in CSP use base64, not hex. `check-dist.ts` stores hex

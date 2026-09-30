@@ -13,7 +13,9 @@
     "allowImportingTsExtensions": true,
     "noEmit": true,
     "types": ["bun"],
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js"
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "bin/**/*.js"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "bin/**/*.js"]
 }

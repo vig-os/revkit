@@ -13,12 +13,16 @@
 // content still gets an inert rail (announcing zero threads) so the
 // injection is idempotent and does not break plain HTML.
 //
-// Kept vanilla-Solid using `solid-js/html`'s tagged-template runtime
-// so the bundle does not need JSX transformation — the daemon can
-// build it with `Bun.build` without a babel-preset-solid step.
+// Authored as `.tsx` and compiled at build time by
+// `babel-preset-solid` (via a Bun.build plugin — see
+// `packages/cli/src/rail/bundle.ts`). Solid's JSX transform emits
+// plain DOM code with no `eval` / `new Function`, so the daemon's
+// CSP does NOT need `'unsafe-eval'` (ADR-0013 amendment 2026-09-30).
+// The previous version used `solid-js/html`'s tagged-template
+// runtime, which JIT-compiled templates via `new Function()` — that
+// widening is gone.
 
-import html from "solid-js/html";
-import { createEffect, createResource, createSignal, For, onCleanup, Show } from "solid-js";
+import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 
@@ -283,7 +287,7 @@ function cssEscape(value: string): string {
  * viewport at desktop width; a full-width sheet at phone width. Uses
  * ARIA landmarks / dialogs so a screen reader treats it as a
  * complementary region (ADR-0017). */
-function Rail(): unknown {
+function Rail(): JSX.Element {
   const [threads, { refetch }] = createResource(fetchThreads);
   const [composerAnchor, setComposerAnchor] = createSignal<{
     readonly element: HTMLElement;
@@ -474,18 +478,19 @@ function Rail(): unknown {
     }
   };
 
-  // The DOM shape below is authored with `solid-js/html`'s tagged-
-  // template runtime so the bundle needs no JSX transform. `${...}`
-  // captures children and event handlers exactly like JSX would.
-  return html`
+  // The DOM below is JSX; `babel-preset-solid` compiles it into
+  // plain DOM code at bundle time (no `eval` / `new Function`).
+  // `Show`, `For`, and event handlers work the same way as under
+  // the tagged-template runtime; the migration is textual.
+  return (
     <aside
       class="revkit-rail"
       role="complementary"
       aria-label="review comments"
       data-testid="revkit-rail"
     >
-      <${Show} when=${() => selection() !== undefined && composerAnchor() === undefined}>
-        ${() => {
+      <Show when={selection() !== undefined && composerAnchor() === undefined}>
+        {(() => {
           // Floating "Comment" button pinned to the selection's
           // top-right corner. Uses viewport coordinates from
           // `getBoundingClientRect()` (position: fixed). Clicking
@@ -495,13 +500,13 @@ function Rail(): unknown {
           const style =
             `top: ${Math.max(8, sel.rect.top - 36)}px; ` +
             `left: ${Math.min(window.innerWidth - 120, sel.rect.left + sel.rect.width - 8)}px;`;
-          return html`
+          return (
             <button
               type="button"
               class="revkit-rail__floating"
               data-testid="revkit-rail-floating"
-              style=${style}
-              onMouseDown=${(event: MouseEvent): void => {
+              style={style}
+              onMouseDown={(event: MouseEvent): void => {
                 // `mousedown` fires before the click clears the
                 // selection — otherwise `openComposer(selection())`
                 // sees `undefined` because the click collapsed the
@@ -509,45 +514,42 @@ function Rail(): unknown {
                 event.preventDefault();
                 void openComposer(sel);
               }}
-              aria-label=${`Comment on \"${sel.quote.slice(0, 40)}\" — shortcut: c`}
+              aria-label={`Comment on "${sel.quote.slice(0, 40)}" — shortcut: c`}
             >Comment</button>
-          `;
-        }}
-      <//>
+          );
+        })()}
+      </Show>
       <header class="revkit-rail__header">
         <h2 class="revkit-rail__title">Comments</h2>
         <button
           type="button"
           class="revkit-rail__refresh"
-          onClick=${() => void refetch()}
+          onClick={() => void refetch()}
           aria-label="refresh"
         >refresh</button>
       </header>
-      ${() => {
-        const err = error();
-        return err !== undefined
-          ? html`<p class="revkit-rail__error" role="alert">${err}</p>`
-          : null;
-      }}
-      <${Show} when=${() => selection() !== undefined}>
+      <Show when={error() !== undefined}>
+        <p class="revkit-rail__error" role="alert">{error()}</p>
+      </Show>
+      <Show when={selection() !== undefined}>
         <div class="revkit-rail__selection" role="region" aria-label="selected text">
-          <p class="revkit-rail__quote">"${() => selection()!.quote}"</p>
+          <p class="revkit-rail__quote">"{selection()!.quote}"</p>
           <button
             type="button"
             class="revkit-rail__new"
             data-testid="revkit-rail-new"
-            onClick=${() => void openComposer(selection()!)}
+            onClick={() => void openComposer(selection()!)}
           >comment on selection</button>
         </div>
-      <//>
-      <${Show} when=${() => composerAnchor() !== undefined}>
-        ${() => {
+      </Show>
+      <Show when={composerAnchor() !== undefined}>
+        {(() => {
           const composed = composerAnchor()!;
-          return html`
+          return (
             <form
               class="revkit-rail__composer"
               data-testid="revkit-rail-composer"
-              onSubmit=${(event: SubmitEvent): void => {
+              onSubmit={(event: SubmitEvent): void => {
                 event.preventDefault();
                 const form = event.currentTarget as HTMLFormElement;
                 const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
@@ -556,10 +558,10 @@ function Rail(): unknown {
               }}
             >
               <p class="revkit-rail__composer-anchor">
-                <span class="revkit-rail__composer-path">${composed.anchor.path}</span>
-                <span class="revkit-rail__composer-lines">L${composed.anchor.startLine}–${composed.anchor.endLine}</span>
+                <span class="revkit-rail__composer-path">{composed.anchor.path}</span>
+                <span class="revkit-rail__composer-lines">L{composed.anchor.startLine}–{composed.anchor.endLine}</span>
               </p>
-              <p class="revkit-rail__quote">"${composed.quote}"</p>
+              <p class="revkit-rail__quote">"{composed.quote}"</p>
               <label class="revkit-rail__label">
                 <span class="revkit-rail__label-text">Comment</span>
                 <textarea
@@ -567,7 +569,7 @@ function Rail(): unknown {
                   rows="3"
                   data-testid="revkit-rail-composer-input"
                   aria-label="comment body"
-                  ref=${(el: HTMLTextAreaElement): void => {
+                  ref={(el: HTMLTextAreaElement): void => {
                     // Focus on mount so a reviewer opening the
                     // composer (via keyboard `c` or the mouse) can
                     // type immediately (WCAG 2.4.3 focus order).
@@ -579,7 +581,7 @@ function Rail(): unknown {
                 <button
                   type="button"
                   class="revkit-rail__cancel"
-                  onClick=${() => setComposerAnchor(undefined)}
+                  onClick={() => setComposerAnchor(undefined)}
                 >cancel</button>
                 <button
                   type="submit"
@@ -588,60 +590,62 @@ function Rail(): unknown {
                 >post</button>
               </div>
             </form>
-          `;
-        }}
-      <//>
+          );
+        })()}
+      </Show>
       <ol class="revkit-rail__threads" aria-live="polite" data-testid="revkit-rail-threads">
-        <${For} each=${() => threads()?.threads ?? []}>
-          ${(thread: RailThread) => html`
+        <For each={threads()?.threads ?? []}>
+          {(thread: RailThread) => (
             <li
-              class=${`revkit-rail__thread revkit-rail__thread--${thread.status}`}
-              data-thread-id=${thread.id}
+              class={`revkit-rail__thread revkit-rail__thread--${thread.status}`}
+              data-thread-id={thread.id}
               data-testid="revkit-rail-thread"
             >
               <button
                 type="button"
                 class="revkit-rail__thread-anchor"
-                onClick=${() => focusAnchor(thread.anchor)}
+                onClick={() => focusAnchor(thread.anchor)}
               >
-                <span class="revkit-rail__thread-path">${thread.anchor.path}</span>
-                <span class="revkit-rail__thread-lines">L${thread.anchor.startLine}–${thread.anchor.endLine}</span>
+                <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
+                <span class="revkit-rail__thread-lines">L{thread.anchor.startLine}–{thread.anchor.endLine}</span>
               </button>
               <ol class="revkit-rail__comments">
-                <${For} each=${() => thread.comments}>
-                  ${(comment: RailComment) => html`
+                <For each={thread.comments}>
+                  {(comment: RailComment) => (
                     <li class="revkit-rail__comment">
                       <p class="revkit-rail__author">
-                        <span class=${`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>${comment.author.kind}</span>
-                        <span class="revkit-rail__author-id">${comment.author.displayName ?? comment.author.id}</span>
+                        <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
+                        <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
                       </p>
-                      <p class="revkit-rail__body">${comment.body}</p>
+                      <p class="revkit-rail__body">{comment.body}</p>
                     </li>
-                  `}
-                <//>
+                  )}
+                </For>
               </ol>
-              <${Show} when=${() => thread.status === "open"}>
+              <Show when={thread.status === "open"}>
                 <div class="revkit-rail__thread-actions">
-                  <${Show}
-                    when=${() => replyDraftFor() === thread.id}
-                    fallback=${() => html`
-                      <button
-                        type="button"
-                        class="revkit-rail__reply"
-                        data-testid="revkit-rail-reply"
-                        onClick=${() => setReplyDraftFor(thread.id)}
-                      >reply</button>
-                      <button
-                        type="button"
-                        class="revkit-rail__resolve"
-                        data-testid="revkit-rail-resolve"
-                        onClick=${() => void doResolve(thread)}
-                      >resolve</button>
-                    `}
+                  <Show
+                    when={replyDraftFor() === thread.id}
+                    fallback={
+                      <>
+                        <button
+                          type="button"
+                          class="revkit-rail__reply"
+                          data-testid="revkit-rail-reply"
+                          onClick={() => setReplyDraftFor(thread.id)}
+                        >reply</button>
+                        <button
+                          type="button"
+                          class="revkit-rail__resolve"
+                          data-testid="revkit-rail-resolve"
+                          onClick={() => void doResolve(thread)}
+                        >resolve</button>
+                      </>
+                    }
                   >
                     <form
                       class="revkit-rail__reply-form"
-                      onSubmit=${(event: SubmitEvent): void => {
+                      onSubmit={(event: SubmitEvent): void => {
                         event.preventDefault();
                         const form = event.currentTarget as HTMLFormElement;
                         const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
@@ -662,7 +666,7 @@ function Rail(): unknown {
                         <button
                           type="button"
                           class="revkit-rail__cancel"
-                          onClick=${() => setReplyDraftFor(undefined)}
+                          onClick={() => setReplyDraftFor(undefined)}
                         >cancel</button>
                         <button
                           type="submit"
@@ -671,20 +675,18 @@ function Rail(): unknown {
                         >post reply</button>
                       </div>
                     </form>
-                  <//>
+                  </Show>
                 </div>
-              <//>
+              </Show>
             </li>
-          `}
-        <//>
+          )}
+        </For>
       </ol>
-      <${Show}
-        when=${() => (threads()?.threads.length ?? 0) === 0}
-      >
+      <Show when={(threads()?.threads.length ?? 0) === 0}>
         <p class="revkit-rail__empty" data-testid="revkit-rail-empty">No open threads yet.</p>
-      <//>
+      </Show>
     </aside>
-  `;
+  );
 }
 
 /** Mount the rail into a fresh `<div>` appended to `<body>`. Idempotent
@@ -697,10 +699,9 @@ export function mount(): void {
   const root = document.createElement("div");
   root.setAttribute("data-revkit-rail-mount", "true");
   document.body.appendChild(root);
-  // `Rail()` returns a hyperscript-shaped node object (Solid's
-  // `solid-js/html` runtime); Solid's `render()` accepts any JSX
-  // element expression.
-  render(() => Rail() as unknown as ReturnType<typeof render> extends never ? never : any, root);
+  // `Rail()` returns a Solid JSX element; `render()` accepts any
+  // JSX-element factory.
+  render(() => Rail(), root);
 }
 
 // The bundle's module side-effect: as soon as the browser evaluates

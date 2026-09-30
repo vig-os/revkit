@@ -39,10 +39,12 @@ Details of the M2 CSP wiring on `revkit serve` (issue #22, PR follow-up to this 
 - **`connect-src`.** The header lists both `'self'` and `ws://127.0.0.1:<port>` explicitly. CSP L3 defines `'self'` to
   cover the same-origin WebSocket scheme (Chromium ≥ 96, Firefox ≥ 99); the explicit `ws://` origin is defence in
   depth for older WebKit builds that treat `'self'` and `ws://` as distinct schemes.
-- **`script-src 'unsafe-eval'`.** The rail imports `solid-js/html`, whose tagged-template runtime compiles templates
-  into JS functions via `new Function()`. Without `'unsafe-eval'` those templates refuse. The daemon is a
-  single-user loopback origin serving revkit's own bundle, so the widening is accepted here. The M3/M4 hosted worker
-  (ADR-0012) rebuilds the rail with pre-compiled templates and does **not** allow `'unsafe-eval'`.
+- **`script-src` without `'unsafe-eval'`.** The rail is authored as `.tsx` and compiled at build time by
+  `babel-preset-solid` (Solid's JSX transform, no runtime template compilation): the emitted DOM code contains
+  neither `eval(` nor `new Function(...)`. `script-src` therefore ships without `'unsafe-eval'`, and the test suite
+  (`test/rail/injector.test.ts` — bundle scan; `test/serve/headers.test.ts` — header mutation guard) fails red if
+  either regresses. The previous version of this amendment (also 2026-09-30) allowed `'unsafe-eval'` for the
+  `solid-js/html` runtime; that widening is gone.
 - **Response hygiene.** Every response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
   `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Resource-Policy: same-origin`, and a `Permissions-Policy`
   denying the powerful features (`camera`, `microphone`, `geolocation`, `payment`, `usb`, `publickey-credentials-*`,

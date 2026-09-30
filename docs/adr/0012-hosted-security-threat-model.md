@@ -62,9 +62,10 @@ same date for the local daemon's per-directive specifics).
 - **`script-src` path scoping.** The M2 daemon lists the exact loopback URLs for its script sources
   (`http://127.0.0.1:<port>/-/rail.js` and `.../_astro/`). The hosted Worker will use `/_revkit/<version>/` on the
   revkit-owned origin as this ADR already prescribes; the daemon exception is documented in ADR-0013.
-- **`'unsafe-eval'` scope.** ADR-0012's `script-src` never contains `'unsafe-eval'`. The local daemon (M2) accepts it
-  because the rail bundle uses `solid-js/html`, whose runtime compiles templates via `new Function()`; the hosted
-  Worker (M3/M4) will not ship that runtime and keeps `script-src` free of `'unsafe-eval'`. See ADR-0013 amendment.
+- **`'unsafe-eval'` scope.** ADR-0012's `script-src` never contains `'unsafe-eval'`, and the M2 daemon does not
+  either: the rail is JSX-compiled at build time with `babel-preset-solid`, so the bundle has no runtime template
+  compilation. The mutation guards in `test/serve/headers.test.ts` and `test/rail/injector.test.ts` refuse a
+  regression. See ADR-0013 amendment.
 - **`connect-src` and WebSocket.** CSP L3 (Chromium ≥ 96, Firefox ≥ 99) treats `'self'` as covering `ws://` on the
   same origin; the hosted Worker keeps `'self'` alone. The local daemon adds an explicit `ws://127.0.0.1:<port>` for
   older WebKit builds.

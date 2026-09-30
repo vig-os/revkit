@@ -60,12 +60,13 @@ describe("buildCspHeader — directive shape", () => {
     // the site tries to ship inline. Inline scripts run only through
     // a matching sha256 source.
     expect(sources).not.toContain("'unsafe-inline'");
-    // ADR-0013 amendment (2026-09-30): the daemon accepts
-    // 'unsafe-eval' because the rail bundle uses `solid-js/html`,
-    // which JIT-compiles templates via `new Function()`. Refused
-    // without this widening. The hosted M3/M4 worker rebuilds the
-    // rail with pre-compiled templates and does NOT allow it.
-    expect(sources).toContain("'unsafe-eval'");
+    // ADR-0013 amendment (2026-09-30): the rail bundle is now
+    // JSX-compiled at build time with `babel-preset-solid`, so
+    // there is no runtime `new Function()` / `eval()` and
+    // `'unsafe-eval'` MUST NOT appear in `script-src`. If a
+    // regression reintroduces the `solid-js/html` runtime, this
+    // assertion flips red.
+    expect(sources).not.toContain("'unsafe-eval'");
   });
 
   test("script-src carries the sha256 hashes from `cspHashesLoaded`", () => {
@@ -200,17 +201,17 @@ describe("MUTATION guards — the tests that fail if a directive is dropped", ()
     const csp = buildCspHeader(ctxWith());
     expect(csp).toContain("default-src 'none'");
   });
-  test("MUTATION: adding 'unsafe-inline' to script-src is caught by an explicit refusal", () => {
+  test("MUTATION: neither 'unsafe-inline' nor 'unsafe-eval' may appear in script-src", () => {
     // A regression that widened `script-src` to include
-    // `'unsafe-inline'` (a plausible "just make it work" patch)
-    // must fail here. 'unsafe-eval' is intentionally allowed for
-    // the local daemon (see ADR-0013 amendment 2026-09-30 and the
-    // note in `headers.ts`).
+    // `'unsafe-inline'` (a plausible "just make it work" patch),
+    // or that reintroduced `'unsafe-eval'` (from re-adopting the
+    // `solid-js/html` runtime), must fail here. `style-src` may
+    // legitimately carry `'unsafe-inline'`, so we extract the
+    // script-src portion.
     const csp = buildCspHeader(ctxWith());
-    // Extract the script-src portion — style-src may legitimately
-    // carry 'unsafe-inline'.
     const scriptSrc = parseCsp(csp)["script-src"]!.join(" ");
     expect(scriptSrc).not.toContain("'unsafe-inline'");
+    expect(scriptSrc).not.toContain("'unsafe-eval'");
   });
   test("MUTATION: applyResponseHeaders MUST set x-content-type-options on every response kind", () => {
     for (const kind of ["html", "asset", "json", "sse", "auth", "text"] as const) {
