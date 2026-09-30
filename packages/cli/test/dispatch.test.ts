@@ -85,4 +85,23 @@ describe("dispatch", () => {
     expect(result.stderr).toContain("--port");
     expect(result.exitCode).toBe(ExitCode.usage);
   });
+
+  test("review with no argument exits with usage error (M3 part 2a)", async () => {
+    const result = await dispatch(["review"], noopEnv);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("expected a <pr-number|url>");
+    expect(result.exitCode).toBe(ExitCode.usage);
+  });
+
+  test("review with a bad --trust value exits with usage error", async () => {
+    const result = await dispatch(["review", "1", "--trust", "not-a-sha"], noopEnv);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("--trust");
+    expect(result.exitCode).toBe(ExitCode.usage);
+  });
+
+  test("help text advertises the review subcommand", () => {
+    expect(HELP).toContain("revkit review");
+    expect(HELP).toContain("--trust");
+  });
 });

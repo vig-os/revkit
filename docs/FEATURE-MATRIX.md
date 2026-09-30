@@ -14,7 +14,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md).
 | A6 | Suggested edits on rendered text land in the source | ADR-0006 | M6 | [#11](https://github.com/vig-os/revkit/issues/11) | planned |
 | A7 | Co-editing the source beside the rendered view (later) | ADR-0006, ADR-0023 (deferred) | M7 | [#12](https://github.com/vig-os/revkit/issues/12) | planned |
 | A8 | Comments survive rebuilds; re-anchor, never lost (orphaned) | ADR-0006, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | planned |
-| B0 | Review a PR locally with my own gh identity (no App, no Cloudflare) | ADR-0006, ADR-0009, ADR-0013, ADR-0025 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | planned |
+| B0 | Review a PR locally with my own gh identity (no App, no Cloudflare) | ADR-0006, ADR-0009, ADR-0013, ADR-0025 | M3 | [#8](https://github.com/vig-os/revkit/issues/8) | partial (M3 part 2a: `revkit review <pr>`, safe PR-head build, existing-thread import; pending review + submit is part 2b) |
 | B1 | CI builds a preview and posts the link, pinging requested reviewers | ADR-0008, ADR-0012, ADR-0014, ADR-0025 | M4 | [#9](https://github.com/vig-os/revkit/issues/9) | planned |
 | B2 | Comments become PR review comments on file + line, as the reviewer | ADR-0003, ADR-0006, ADR-0009, ADR-0011, ADR-0012, ADR-0025 | M3 (local) / M4 (hosted) | [#8](https://github.com/vig-os/revkit/issues/8), [#9](https://github.com/vig-os/revkit/issues/9) | planned |
 | B3 | Submit the review (comment / approve / request changes) from the page | ADR-0009, ADR-0012, ADR-0025 | M3 (local) / M4 (hosted) | [#8](https://github.com/vig-os/revkit/issues/8), [#9](https://github.com/vig-os/revkit/issues/9) | planned |
