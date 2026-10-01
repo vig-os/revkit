@@ -58,4 +58,29 @@ describe("walkForCheckables — symlinks under content/UI trees", () => {
     expect(result.files.some((f) => f.endsWith("a.md"))).toBe(true);
     expect(result.symlinks.some((s) => s.posixPath.includes("linked.md"))).toBe(true);
   });
+
+  // Issue #57 regression: `.revkit/` is the daemon-state +
+  // build-staging directory populated by `revkit build`. Scanning
+  // it would double every finding on the consumer's docs, because
+  // `.revkit/build/src/content/docs/` is a COPY of `docs/` (until
+  // the next rebuild rewrites it). This test would flip RED on
+  // b3832661 — before `.revkit` landed on EXCLUDED_DIRS,
+  // walkForCheckables walked the staging copy and returned the
+  // duplicated files.
+  test(".revkit/ is EXCLUDED so a staged copy never doubles the walk (issue #57)", () => {
+    const repo = makeTempRepo();
+    writeFileSync(join(repo, "package.json"), '{"name":"x","revkit":{}}\n');
+    mkdirSync(join(repo, "docs"), { recursive: true });
+    writeFileSync(join(repo, "docs", "a.mdx"), "---\ntitle: a\n---\n# a\n");
+    // Staging copy — same file, different path.
+    mkdirSync(join(repo, ".revkit", "build", "src", "content", "docs"), { recursive: true });
+    writeFileSync(
+      join(repo, ".revkit", "build", "src", "content", "docs", "a.mdx"),
+      "---\ntitle: a\n---\n# a\n",
+    );
+    const result = walkForCheckables(repo);
+    // Only the source path is walked, not the staging copy.
+    expect(result.files.filter((f) => f.endsWith("a.mdx")).length).toBe(1);
+    expect(result.files.some((f) => f.includes(".revkit/build/"))).toBe(false);
+  });
 });

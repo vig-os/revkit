@@ -83,6 +83,18 @@ export interface DataSrcPluginOptions {
   readonly repoRoot: string;
   /** If false, an existing `data-src` attribute is overwritten (default: false). */
   readonly overwriteExisting?: boolean;
+  /** Optional path remaps applied to the file's absolute path
+   * BEFORE the repo-relative calculation (issue #57 blocker).
+   * `revkit build` stages a COPY of the consumer's `docs/` under
+   * `<consumer>/.revkit/build/src/content/docs/`; without a remap
+   * the anchor `data-src` would point at the throwaway staging
+   * path instead of the reviewer-facing source path. Each entry
+   * `{ from, to }` rewrites paths starting with `from + '/'` (or
+   * exactly `from`) to have their prefix replaced with `to`.
+   * Order matters — the first matching entry wins, so a caller
+   * ordering longer/more-specific prefixes first refines the
+   * mapping. Both `from` and `to` MUST be absolute paths. */
+  readonly pathMap?: readonly { readonly from: string; readonly to: string }[];
 }
 
 // `VFileLike`, `filePathOf`, and `repoRelativePosix` moved to
@@ -169,16 +181,44 @@ export function stampTree(
   return stamped;
 }
 
+/** Apply the `pathMap` rewrites to an absolute file path. Exported
+ * so tests can exercise the mapping without a full plugin run. The
+ * first entry whose `from` prefix matches wins; falls through to
+ * the input path when nothing matches. `from` matches when the
+ * path equals it exactly OR starts with `from + '/'` — a prefix
+ * match on a substring that is not a full directory boundary is
+ * rejected on purpose (so `/foo/bar` does not accidentally match
+ * a `from` of `/foo/ba`). */
+export function applyPathMap(
+  absPath: string,
+  pathMap: readonly { readonly from: string; readonly to: string }[] | undefined,
+): string {
+  if (pathMap === undefined) return absPath;
+  for (const entry of pathMap) {
+    if (absPath === entry.from) return entry.to;
+    if (absPath.startsWith(entry.from + "/")) {
+      return entry.to + absPath.slice(entry.from.length);
+    }
+  }
+  return absPath;
+}
+
 /** The plugin's transformer. Signature matches `unified.Plugin<[Options], Root>`.
  * Kept as a plain factory so the CLI package can also call it directly
  * without pulling in `unified` types at every call site. */
 export function rehypeDataSrc(options: DataSrcPluginOptions) {
   const repoRoot = resolve(options.repoRoot);
   const overwriteExisting = options.overwriteExisting ?? false;
+  const pathMap = options.pathMap;
   return (tree: Root, file?: VFileLike): void => {
     const filePath = file !== undefined ? filePathOf(file) : undefined;
     if (filePath === undefined) return;
-    const repoRelPath = repoRelativePosix(repoRoot, filePath);
+    // Remap staged paths to their source path BEFORE computing the
+    // repo-relative form. A comment anchored on a rendered page
+    // should target the reviewer-facing source, not the
+    // staging copy that vanishes on the next `revkit build`.
+    const mappedPath = applyPathMap(filePath, pathMap);
+    const repoRelPath = repoRelativePosix(repoRoot, mappedPath);
     if (repoRelPath === undefined) return;
     stampTree(tree, { repoRelPath, overwriteExisting });
   };

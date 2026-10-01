@@ -23,7 +23,11 @@ import { spawnGit } from "./git-runner.ts";
 
 /** Directory names that are never worth scanning. `node_modules` shows up
  * under packages/, site/ and the workspace root; `dist` and `.astro` are
- * build outputs; `.direnv` and `.git` are tool state. */
+ * build outputs; `.direnv` and `.git` are tool state; `.revkit` is the
+ * daemon-state + build-staging directory a consumer's `revkit build`
+ * populates (issue #57) — scanning it would double every finding on the
+ * consumer's docs, because the staging copy under `.revkit/build/src/
+ * content/docs/` contains the same MDX the reviewer just wrote. */
 const EXCLUDED_DIRS: ReadonlySet<string> = new Set([
   "node_modules",
   "dist",
@@ -32,6 +36,7 @@ const EXCLUDED_DIRS: ReadonlySet<string> = new Set([
   ".git",
   ".vscode",
   ".github_data",
+  ".revkit",
 ]);
 
 /** Extensions any rule looks at. `.json`/`.yaml`/`.yml` cover

@@ -221,6 +221,23 @@ describe("API + launch-code + SSE cache discipline", () => {
     expect(r.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
+  test("/-/health carries `repoId` (issue #60 PR #62 round-3 review)", async () => {
+    const ctx = ctxRef!;
+    const r = await fetch(ctx.handle.url + "/-/health", {
+      headers: { host: `127.0.0.1:${ctx.handle.port}` },
+    });
+    expect(r.status).toBe(200);
+    const body = (await r.json()) as { instanceId?: string; repoId?: string; pid?: number };
+    expect(typeof body.instanceId).toBe("string");
+    expect(typeof body.repoId).toBe("string");
+    // The rail keys its `revkit.rail.seen.v1.<repoId>` bucket by
+    // this — it must be base64url-shaped and long enough to be
+    // an unpredictable tag.
+    expect(body.repoId!).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
+    // Independent of `instanceId` (which is per-start).
+    expect(body.repoId).not.toBe(body.instanceId);
+  });
+
   test("/-/launch-code (POST, bearer) carries Cache-Control: no-store", async () => {
     const ctx = ctxRef!;
     const r = await fetch(ctx.handle.url + "/-/launch-code", {

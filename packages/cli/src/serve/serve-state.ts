@@ -48,6 +48,7 @@ import {
   readFileSync,
   renameSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -74,6 +75,16 @@ export interface ServeState {
 export const SERVE_STATE_DIR = ".revkit";
 export const SERVE_STATE_FILE = "serve.json";
 export const DAEMON_LOCK_FILE = "daemon.lock";
+/** `.revkit/repo-id` — a persistent random tag advertised by
+ * `GET /-/health` (as `repoId`) so the rail's per-viewer "seen"
+ * localStorage bucket is keyed to THIS repo, stable across daemon
+ * restarts (issue #60 PR #62 round-3 review: the pre-fix
+ * `instanceId` keying wiped seen marks on every restart of a
+ * fixed `--port` daemon). Random — never derived from the repo
+ * path — so an unauthenticated `/-/health` cannot fingerprint the
+ * caller's filesystem layout. Mode 0600 like every other secret
+ * under `.revkit/`. */
+export const REPO_ID_FILE = "repo-id";
 
 /** Ensure `.revkit/` exists under `repoRoot` at mode 0700 — the one
  * owner for that directory's create + mode, so a caller that
@@ -100,6 +111,35 @@ export function ensureRevkitDir(repoRoot: string): string {
 /** Absolute path to `.revkit/serve.json` under `repoRoot`. */
 export function serveStatePath(repoRoot: string): string {
   return join(repoRoot, SERVE_STATE_DIR, SERVE_STATE_FILE);
+}
+
+/** Absolute path to `.revkit/repo-id` under `repoRoot`. */
+export function repoIdPath(repoRoot: string): string {
+  return join(repoRoot, SERVE_STATE_DIR, REPO_ID_FILE);
+}
+
+/** Read `.revkit/repo-id`, or mint one at mode 0600 on first run.
+ * The value is a 24-char base64url token (144 bits of entropy — a
+ * long-form random tag, never derived from the repo path, so
+ * `GET /-/health` cannot leak filesystem layout). Idempotent;
+ * stable across daemon restarts, so the rail's `revkit.rail.seen`
+ * localStorage bucket survives a `revkit serve` restart on the
+ * same `--port`. Round-3 review, issue #60. */
+export function readOrMintRepoId(repoRoot: string): string {
+  const path = repoIdPath(repoRoot);
+  if (existsSync(path)) {
+    try {
+      const raw = readFileSync(path, "utf8").trim();
+      // Guard against a truncated / empty file — treat as absent.
+      if (/^[A-Za-z0-9_-]{16,64}$/.test(raw)) return raw;
+    } catch {
+      // Fall through to mint.
+    }
+  }
+  ensureRevkitDir(repoRoot);
+  const id = randomBytes(18).toString("base64url");
+  writeFileSync(path, id + "\n", { mode: 0o600 });
+  return id;
 }
 
 /** Absolute path to `.revkit/daemon.lock` under `repoRoot`. */

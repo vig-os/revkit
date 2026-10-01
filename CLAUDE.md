@@ -14,7 +14,8 @@ review them rendered, with comments that flow back to the agent (locally) or to 
 | Tooling to promote into vig-os/devkit | ledger issue #1, skill `/devkit_elevate` |
 
 Before building a feature, find its story ID in the matrix and cite the ADR it implements. A change that contradicts
-an ADR needs a new ADR (superseding), not a silent deviation.
+an ADR needs a new ADR (superseding), not a silent deviation. Every feature PR must update the affected matrix status
+rows; the `adr-matrix` gate checks ADR traceability, not whether delivery status is current.
 
 ## Environment
 

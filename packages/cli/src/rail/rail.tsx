@@ -22,9 +22,21 @@
 // runtime, which JIT-compiled templates via `new Function()` — that
 // widening is gone.
 
-import { createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
+import { createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
+import {
+  excerptOf,
+  formatRelativeTime,
+  isThreadUnread,
+  latestAgentActivityOf,
+  migrateSeenStorage,
+  pruneSeenMap,
+  readSeenMap as readSeenMapImpl,
+  seenStorageKeyFor,
+  writeSeenMap as writeSeenMapImpl,
+  type SeenMap,
+} from "./unread.ts";
 // Round-2 refactor: the rail no longer parses mention structure
 // itself. The daemon parses every comment body at append time with
 // the real Markdown AST and writes the typed mention list onto the
@@ -86,7 +98,7 @@ interface RailComment {
   readonly mentions?: readonly Mention[];
   readonly createdAt: string;
 }
-interface RailThread {
+export interface RailThread {
   readonly id: string;
   /** `orphaned` (M2 item 5b + issue #46): the re-anchoring pipeline
    * could not find the thread on a later revision (ADR-0006), OR
@@ -99,6 +111,7 @@ interface RailThread {
   readonly status: "open" | "resolved" | "orphaned";
   readonly anchor: RailAnchor;
   readonly comments: readonly RailComment[];
+  readonly updatedAt: string;
   /** Reason string projected from the pipeline's
    * `thread.orphaned.reason` or, for a thread born unanchored,
    * `comment.created.orphanReason`. Read by the orphan panel so
@@ -106,6 +119,16 @@ interface RailThread {
    * account rather than a synthesised sentence. Absent when no
    * reason was supplied. (PR #45 round-2 + issue #46 item 3.) */
   readonly orphanReason?: string;
+  /** The typed actor who resolved this thread, projected onto the
+   * derived thread by the reducer on `thread.resolved`. Absent
+   * for open/orphaned threads. Read by the rail's collapsed
+   * resolved row so the reviewer sees WHO closed the thread
+   * without opening the raw event log. Issue #60. */
+  readonly resolvedBy?: RailAuthor;
+  /** The `ts` of the `thread.resolved` event. Same projection
+   * intent as `resolvedBy`; the rail renders the relative time.
+   * Issue #60. */
+  readonly resolvedAt?: string;
 }
 interface RailListResponse {
   readonly threads: readonly RailThread[];
@@ -325,13 +348,15 @@ async function revisionHex(text: string): Promise<string> {
  * open elsewhere. */
 async function fetchThreads(): Promise<RailListResponse> {
   const paths = collectPagePaths();
-  // Ask for both open AND orphaned threads on THIS page. The rail
-  // renders open threads inline against the block they anchor to,
-  // and orphaned threads in the dedicated panel (M2 item 5b).
-  // Resolved threads are not surfaced here (the review is over) —
-  // an orphaned thread that gets re-anchored becomes `open` again
-  // via the reducer's un-orphan rule (ADR-0006 amendment).
-  const statusFilter = "open,orphaned";
+  // Ask for open, orphaned AND resolved threads on THIS page. Issue
+  // #60: a reply-then-resolve race used to blink the reply out of
+  // sight because the resolved thread was filtered here and the
+  // reviewer never saw the ack. The rail now surfaces resolved
+  // threads collapsed inline (like GitHub does), so a reviewer never
+  // misses the agent's answer. Anchored resolved threads render
+  // next to their block; a resolved thread whose anchor is not
+  // rendered on this page falls into the orphaned/resolved panel.
+  const statusFilter = "open,orphaned,resolved";
   if (paths.length === 0) {
     const response = await fetch(
       "/api/threads?status=" + encodeURIComponent(statusFilter),
@@ -432,6 +457,71 @@ async function resolveThread(threadId: string): Promise<void> {
   );
   if (!response.ok) throw new Error(`POST /api/threads/:id/resolve failed: ${response.status}`);
 }
+
+async function reopenThread(threadId: string): Promise<void> {
+  const response = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/reopen`,
+    {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    },
+  );
+  if (!response.ok) throw new Error(`POST /api/threads/:id/reopen failed: ${response.status}`);
+}
+
+// Local wrappers around the pure helpers in `./unread.ts`. The
+// browser-side seen map is keyed by the daemon's persistent
+// `repoId`, fetched once on mount via `GET /-/health`. The
+// wrappers fall back to the unversioned key when we haven't
+// received the id yet; `migrateSeenStorage` folds anything
+// written under the bare key into the resolved bucket the
+// moment `repoId` arrives, so a "click before /-/health returned"
+// mark cannot be lost (issue #60 PR #62 round-3 review).
+let currentSeenKey: string | undefined;
+function readSeenMap(): SeenMap {
+  return readSeenMapImpl(undefined, currentSeenKey);
+}
+function writeSeenMap(next: SeenMap): void {
+  writeSeenMapImpl(next, undefined, currentSeenKey);
+}
+/** Fetch the daemon's `/-/health` payload and adopt its
+ * `repoId` as the storage key. Called once on mount; a
+ * failure (rare — daemon is loopback) leaves the unversioned key,
+ * so the reviewer's local session still works. */
+async function fetchRepoId(): Promise<string | undefined> {
+  try {
+    const response = await fetch("/-/health", { credentials: "same-origin" });
+    if (!response.ok) return undefined;
+    const parsed = (await response.json()) as { repoId?: string };
+    return typeof parsed.repoId === "string" ? parsed.repoId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+/** Fetch the FULL, unscoped list of thread ids so the prune
+ * pass keeps marks for threads on OTHER pages. Issue #60
+ * PR #62 round-3 review: pruning against the page-scoped
+ * `threads()` wiped seen marks for every other page. */
+async function fetchAllThreadIds(): Promise<readonly string[] | undefined> {
+  try {
+    const response = await fetch(
+      "/api/threads?status=" + encodeURIComponent("open,resolved,orphaned"),
+      { credentials: "same-origin", headers: { accept: "application/json" } },
+    );
+    if (!response.ok) return undefined;
+    const parsed = (await response.json()) as { threads?: ReadonlyArray<{ id?: string }> };
+    if (!Array.isArray(parsed.threads)) return undefined;
+    return parsed.threads.map((t) => t.id).filter((id): id is string => typeof id === "string");
+  } catch {
+    return undefined;
+  }
+}
+/** How many unread threads render EXPANDED before the rest fall
+ * back to collapsed-with-pill. Tuned so a colleague opening a
+ * page with a long agent backlog can still scan the list. */
+const UNREAD_EXPANDED_LIMIT = 5;
 
 /** Compute the source-quote context for a selected text range. The
  * daemon's schema requires `exact` non-empty; `prefix` / `suffix` may
@@ -713,6 +803,216 @@ function Rail(): JSX.Element {
   // open. Declared here so keyboard handlers set up below can read
   // it in Escape's dispatch table.
   const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
+  // Per-viewer "seen" marks for the unread pill (issue #60). Kept
+  // in localStorage; wrapped in try/catch, keyed by the daemon's
+  // `instanceId` (fetched below) so a rebuild starts fresh. The
+  // stored value for each thread is the `latestAgentActivityOf`
+  // timestamp the reviewer acknowledged — NOT `updatedAt`, which
+  // advances on every event including the reviewer's own resolve /
+  // reopen and the re-anchor pipeline (PR #62 review, the L855
+  // pre-reopen mark was masking this).
+  const [seenMap, setSeenMap] = createSignal<SeenMap>(readSeenMap());
+  // On mount:
+  //   1. Fetch `repoId` from `/-/health`. `repoId` is stable across
+  //      daemon restarts on the same repo (issue #60 PR #62
+  //      round-3 review: `instanceId` was per-start so every
+  //      restart wiped the reviewer's ack state and left an
+  //      orphaned key in localStorage).
+  //   2. Migrate: fold any marks under the bare key (from a click
+  //      that landed before `/-/health` responded) into the
+  //      resolved-key bucket, prefer the newer per-thread
+  //      timestamp, and delete every OTHER `revkit.rail.seen.v1*`
+  //      key so stale buckets from previous repos don't linger.
+  //   3. Prune once against the UNSCOPED thread-id list — using
+  //      the page-scoped `threads()` here would wipe marks for
+  //      threads on every OTHER page (the round-3 blocker).
+  //   A `/-/health` failure leaves the bare key in place; the
+  //   session still works, just without the per-repo bucket
+  //   separation.
+  void (async (): Promise<void> => {
+    const id = await fetchRepoId();
+    if (id !== undefined) {
+      const targetKey = seenStorageKeyFor(id);
+      // Migrate uses the underlying storage so it can iterate.
+      try {
+        if (typeof globalThis !== "undefined") {
+          const w = globalThis as unknown as { localStorage?: Storage };
+          if (w.localStorage !== undefined) migrateSeenStorage(w.localStorage, targetKey);
+        }
+      } catch {
+        // Storage inaccessible — skip; the pill will re-fire once
+        // if the click's mark was under the bare key.
+      }
+      currentSeenKey = targetKey;
+      setSeenMap(readSeenMap());
+    }
+    // Prune against the unscoped id list, once. Fresh mounts on
+    // subsequent pages call this again and keep their own marks.
+    const allIds = await fetchAllThreadIds();
+    if (allIds === undefined) return;
+    const current = seenMap();
+    const pruned = pruneSeenMap(current, allIds);
+    if (pruned === current) return;
+    setSeenMap(pruned);
+    writeSeenMap(pruned);
+  })();
+  const markThreadSeen = (thread: RailThread): void => {
+    const current = seenMap();
+    const latest = latestAgentActivityOf(thread);
+    if (latest === undefined) return; // Nothing agent-authored to acknowledge.
+    if (current[thread.id] === latest) return;
+    const next: SeenMap = { ...current, [thread.id]: latest };
+    setSeenMap(next);
+    writeSeenMap(next);
+  };
+  /** Mark every currently-unread thread seen at its latest agent
+   * activity — the header "Mark all seen" bulk action. */
+  const markAllSeen = (): void => {
+    const response = threads();
+    if (response === undefined) return;
+    const current = seenMap();
+    let changed = false;
+    const next: Record<string, string> = { ...current };
+    for (const thread of response.threads) {
+      const latest = latestAgentActivityOf(thread);
+      if (latest === undefined) continue;
+      if (current[thread.id] === latest) continue;
+      next[thread.id] = latest;
+      changed = true;
+    }
+    if (!changed) return;
+    setSeenMap(next);
+    writeSeenMap(next);
+  };
+  // Note: the old per-refetch `createEffect` prune (against
+  // `threads()`, page-scoped) was removed here — the round-3
+  // review caught it wiping every OTHER page's marks. The mount
+  // block above prunes once against the UNSCOPED id list.
+  // The set of unread thread ids that are ALLOWED to auto-expand.
+  // Cap at UNREAD_EXPANDED_LIMIT so a browser opening on a page
+  // with 150 unread agent replies does not render 150 expanded
+  // threads at once. The remaining unread threads still carry the
+  // pill (so the reviewer can navigate to them) but stay collapsed.
+  // Ordering: latest agent activity first — the freshest N.
+  const autoExpandedUnread = createMemo<ReadonlySet<string>>(() => {
+    const response = threads();
+    if (response === undefined) return new Set();
+    const current = seenMap();
+    const withActivity: Array<{ id: string; ts: string }> = [];
+    for (const thread of response.threads) {
+      if (!isThreadUnread(thread, current)) continue;
+      const ts = latestAgentActivityOf(thread) ?? thread.updatedAt;
+      withActivity.push({ id: thread.id, ts });
+    }
+    withActivity.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+    return new Set(withActivity.slice(0, UNREAD_EXPANDED_LIMIT).map((entry) => entry.id));
+  });
+  /** Count of unread agent replies — read by the single polite
+   * live-region below so screen readers announce a summary once,
+   * instead of per-thread `role="status"` pills that would
+   * announce 150 times in a row. */
+  const unreadCount = createMemo<number>(() => {
+    const response = threads();
+    if (response === undefined) return 0;
+    const current = seenMap();
+    let n = 0;
+    for (const thread of response.threads) {
+      if (isThreadUnread(thread, current)) n += 1;
+    }
+    return n;
+  });
+  /** Resolved-thread count for the "Resolved (N)" pill in the
+   * rail header. Memoized so a re-render doesn't repeat the O(N)
+   * filter for the aria-label, header string and empty-state
+   * check — issue #60 exercised these together, so with 150
+   * threads the linear scan was running three times per render.
+   */
+  const resolvedCount = createMemo<number>(() => {
+    const response = threads();
+    if (response === undefined) return 0;
+    let n = 0;
+    for (const thread of response.threads) if (thread.status === "resolved") n += 1;
+    return n;
+  });
+  /** True when the whole thread list is empty — open, resolved,
+   * orphaned, everything. Drives the "No open threads yet."
+   * placeholder. */
+  const isThreadListEmpty = createMemo<boolean>(() => {
+    const response = threads();
+    return response === undefined || response.threads.length === 0;
+  });
+  /** Memoised main-list / sideline partition (PR #62 review nit).
+   * `mainListThreadsFor` and `sidelinedThreadsFor` each call
+   * `hasAnchorOnPage` per resolved thread, which walks the DOM
+   * with `document.querySelector('[data-src=...]')`. On a page
+   * with 150 resolved threads, running the partition twice per
+   * render (once for the main list, once for the sideline) was
+   * doing 300 DOM queries per state change. Compute both together,
+   * one DOM walk per resolved thread. */
+  const partition = createMemo<{ readonly main: readonly RailThread[]; readonly sidelined: readonly RailThread[] }>(
+    () => {
+      const response = threads();
+      if (response === undefined) return { main: [], sidelined: [] };
+      const main: RailThread[] = [];
+      const sidelined: RailThread[] = [];
+      for (const thread of response.threads) {
+        if (thread.status === "open") main.push(thread);
+        else if (thread.status === "resolved") {
+          if (hasAnchorOnPage(thread.anchor)) main.push(thread);
+          else sidelined.push(thread);
+        } else sidelined.push(thread);
+      }
+      return { main, sidelined };
+    },
+  );
+  const mainList = (): readonly RailThread[] => partition().main;
+  const sidelinedList = (): readonly RailThread[] => partition().sidelined;
+  // Which resolved threads the reviewer has manually toggled on the
+  // disclosure button — separate from the unread-driven auto
+  // expansion. Per-session, not persisted. Two sets so a click on
+  // an unread-expanded thread can move it into `collapsed` (marking
+  // it seen at the same time), which is the intent when the caret
+  // is pointing down and the reviewer clicks it. Without this, the
+  // toggle on an unread thread would flip `expanded` on and leave
+  // the visible state unchanged (already expanded), then need a
+  // second click to collapse.
+  const [expandedResolved, setExpandedResolved] = createSignal<ReadonlySet<string>>(new Set());
+  const [collapsedResolved, setCollapsedResolved] = createSignal<ReadonlySet<string>>(new Set());
+  const isResolvedExpanded = (thread: RailThread): boolean => {
+    // A manual collapse wins over any default. Then a manual expand
+    // wins over the seen-default. Otherwise unread → expanded (issue
+    // #60 point 3), but only for threads inside
+    // `autoExpandedUnread` — the N most-recent unread threads
+    // (PR #62 review: a fresh browser with 150 unread agent-resolved
+    // threads must not render 150 expanded rows).
+    if (collapsedResolved().has(thread.id)) return false;
+    if (expandedResolved().has(thread.id)) return true;
+    return autoExpandedUnread().has(thread.id);
+  };
+  const toggleResolvedExpansion = (thread: RailThread): void => {
+    const wasExpanded = isResolvedExpanded(thread);
+    if (wasExpanded) {
+      // Collapse: drop any manual-expand and record a manual
+      // collapse. If the thread is unread, `markThreadSeen` (called
+      // by the button) also clears the unread-driven default, but
+      // we still keep the manual-collapse mark so a future re-fetch
+      // that ticks `updatedAt` (without new agent activity) does not
+      // spring the thread open again on the same viewer.
+      const nextExpanded = new Set(expandedResolved());
+      nextExpanded.delete(thread.id);
+      setExpandedResolved(nextExpanded);
+      const nextCollapsed = new Set(collapsedResolved());
+      nextCollapsed.add(thread.id);
+      setCollapsedResolved(nextCollapsed);
+    } else {
+      const nextCollapsed = new Set(collapsedResolved());
+      nextCollapsed.delete(thread.id);
+      setCollapsedResolved(nextCollapsed);
+      const nextExpanded = new Set(expandedResolved());
+      nextExpanded.add(thread.id);
+      setExpandedResolved(nextExpanded);
+    }
+  };
 
   // Wire the SSE stream on mount, tear it down on unmount. The three
   // subscribers are separated so a `presence` event does not force a
@@ -907,6 +1207,22 @@ function Rail(): JSX.Element {
     }
   };
 
+  const doReopen = async (thread: RailThread): Promise<void> => {
+    setError(undefined);
+    try {
+      // The reviewer's own reopen is not agent activity, so
+      // `latestAgentActivityOf(thread)` — which is what
+      // `markThreadSeen` records now (PR #62 review) — is
+      // unchanged by the reopen. The old "mark seen at
+      // pre-reopen `updatedAt`" ceremony is gone; the pill was
+      // never going to fire from this action anyway.
+      await reopenThread(thread.id);
+      await refetch();
+    } catch (cause) {
+      setError((cause as Error).message);
+    }
+  };
+
   // Scroll the anchor block into view when the reviewer clicks on a
   // thread in the list.
   const focusAnchor = (anchor: RailAnchor): void => {
@@ -961,6 +1277,24 @@ function Rail(): JSX.Element {
       </Show>
       <header class="revkit-rail__header">
         <h2 class="revkit-rail__title">Comments</h2>
+        <Show when={resolvedCount() > 0}>
+          <span
+            class="revkit-rail__header-resolved-count"
+            data-testid="revkit-rail-resolved-count"
+            aria-label={`${resolvedCount()} resolved thread${resolvedCount() === 1 ? "" : "s"}`}
+          >
+            Resolved ({resolvedCount()})
+          </span>
+        </Show>
+        <Show when={unreadCount() > 0}>
+          <button
+            type="button"
+            class="revkit-rail__mark-all-seen"
+            data-testid="revkit-rail-mark-all-seen"
+            onClick={() => markAllSeen()}
+            aria-label={`Mark all ${unreadCount()} unread agent repl${unreadCount() === 1 ? "y" : "ies"} as seen`}
+          >Mark all seen</button>
+        </Show>
         <button
           type="button"
           class="revkit-rail__refresh"
@@ -968,6 +1302,23 @@ function Rail(): JSX.Element {
           aria-label="refresh"
         >refresh</button>
       </header>
+      {/* Single polite live region for the unread count. PR #62
+          review a11y: a screen-reader user should hear one summary
+          ("3 unread agent replies") — not a per-thread barrage of
+          "agent replied — unread" from every pill's role=status. The
+          previous version put role=status on every pill; those pills
+          are now presentational and this region carries the announcement. */}
+      <div
+        class="revkit-rail__unread-live"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="revkit-rail-unread-live"
+      >
+        <Show when={unreadCount() > 0}>
+          {unreadCount()} unread agent repl{unreadCount() === 1 ? "y" : "ies"}
+        </Show>
+      </div>
       <section
         class="revkit-rail__mode"
         aria-label="delivery mode"
@@ -1373,183 +1724,149 @@ function Rail(): JSX.Element {
         })()}
       </Show>
       <ol class="revkit-rail__threads" aria-live="polite" data-testid="revkit-rail-threads">
-        <For each={openThreadsFor(threads())}>
-          {(thread: RailThread) => (
-            <li
-              class={`revkit-rail__thread revkit-rail__thread--${thread.status}`}
-              data-thread-id={thread.id}
-              data-testid="revkit-rail-thread"
-            >
-              <button
-                type="button"
-                class="revkit-rail__thread-anchor"
-                onClick={() => focusAnchor(thread.anchor)}
-                data-anchor-kind={isRailLineAnchor(thread.anchor) ? "line" : "unanchored"}
+        <For each={mainList()}>
+          {(thread: RailThread) => {
+            // Issue #60: a resolved thread stays visible in place,
+            // collapsed under a disclosure button. An "unread"
+            // pill anchors on any thread whose latest touch was
+            // agent-authored (reply or resolve) since the human
+            // last acknowledged it — expanded by default, and
+            // clicking anywhere on the thread marks it seen.
+            const isResolved = (): boolean => thread.status === "resolved";
+            const unread = (): boolean => isThreadUnread(thread, seenMap());
+            // For a resolved thread: collapsed unless unread OR the
+            // reviewer explicitly toggled it open. For an open
+            // thread: always expanded (its comments matter).
+            const expanded = (): boolean => !isResolved() || isResolvedExpanded(thread);
+            const disclosureId = `revkit-rail-panel-${thread.id}`;
+            const lastComment = thread.comments[thread.comments.length - 1];
+            const onThreadInteract = (): void => {
+              // Any interaction with the thread body clears the
+              // unread pill. The mark is per-viewer and stored in
+              // localStorage; a colleague on a different browser
+              // keeps their own unread state.
+              if (unread()) markThreadSeen(thread);
+            };
+            return (
+              <li
+                class={`revkit-rail__thread revkit-rail__thread--${thread.status}${unread() ? " revkit-rail__thread--unread" : ""}`}
+                data-thread-id={thread.id}
+                data-testid="revkit-rail-thread"
+                data-unread={unread() ? "true" : "false"}
+                data-expanded={expanded() ? "true" : "false"}
+                onClick={onThreadInteract}
               >
-                <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
-                <Show
-                  when={isRailLineAnchor(thread.anchor)}
-                  fallback={
-                    // Issue #46 item 5: an unanchored thread renders a
-                    // file-level label, never `Lundefined`. The
-                    // orphan reason (`diffhunk-mismatch`, `binary`, …)
-                    // rides beside it when present, so the reviewer
-                    // sees WHY the anchor was lost.
-                    <span class="revkit-rail__thread-lines revkit-rail__thread-lines--file">
-                      (file-level{thread.orphanReason !== undefined ? ` — ${thread.orphanReason}` : ""})
-                    </span>
-                  }
-                >
-                  <span class="revkit-rail__thread-lines">
-                    L{(thread.anchor as RailLineAnchor).startLine}–{(thread.anchor as RailLineAnchor).endLine}
-                  </span>
-                </Show>
-              </button>
-              <ol class="revkit-rail__comments">
-                <For each={thread.comments}>
-                  {(comment: RailComment) => (
-                    <li class="revkit-rail__comment">
-                      <p class="revkit-rail__author">
-                        <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
-                        <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
-                      </p>
-                      <p class="revkit-rail__body">{renderBodyWithMentions(comment.body, comment.mentions ?? [])}</p>
-                    </li>
-                  )}
-                </For>
-              </ol>
-              <Show when={thread.status === "open"}>
-                <div class="revkit-rail__thread-actions">
-                  <Show
-                    when={replyDraftFor() === thread.id}
-                    fallback={
-                      <>
-                        <button
-                          type="button"
-                          class="revkit-rail__reply"
-                          data-testid="revkit-rail-reply"
-                          onClick={() => setReplyDraftFor(thread.id)}
-                        >reply</button>
-                        <button
-                          type="button"
-                          class="revkit-rail__resolve"
-                          data-testid="revkit-rail-resolve"
-                          onClick={() => void doResolve(thread)}
-                        >resolve</button>
-                      </>
-                    }
+                <div class="revkit-rail__thread-header">
+                  <button
+                    type="button"
+                    class="revkit-rail__thread-anchor"
+                    onClick={() => focusAnchor(thread.anchor)}
+                    data-anchor-kind={isRailLineAnchor(thread.anchor) ? "line" : "unanchored"}
                   >
-                    <form
-                      class="revkit-rail__reply-form"
-                      onSubmit={(event: SubmitEvent): void => {
-                        event.preventDefault();
-                        const form = event.currentTarget as HTMLFormElement;
-                        const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
-                        if (textarea === null || textarea.value.trim().length === 0) return;
-                        void submitReply(thread, textarea.value.trim());
-                      }}
-                    >
-                      <label class="revkit-rail__label">
-                        <span class="revkit-rail__label-text">Reply</span>
-                        <textarea
-                          required
-                          rows="2"
-                          data-testid="revkit-rail-reply-input"
-                          aria-label="reply body"
-                        ></textarea>
-                      </label>
-                      <div class="revkit-rail__actions">
-                        <button
-                          type="button"
-                          class="revkit-rail__cancel"
-                          onClick={() => setReplyDraftFor(undefined)}
-                        >cancel</button>
-                        <button
-                          type="submit"
-                          class="revkit-rail__submit"
-                          data-testid="revkit-rail-reply-submit"
-                        >post reply</button>
-                      </div>
-                    </form>
-                  </Show>
-                </div>
-              </Show>
-            </li>
-          )}
-        </For>
-      </ol>
-      <Show when={openThreadsFor(threads()).length === 0}>
-        <p class="revkit-rail__empty" data-testid="revkit-rail-empty">No open threads yet.</p>
-      </Show>
-      <Show when={orphanedThreadsFor(threads()).length > 0}>
-        {/* Orphan panel (M2 item 5b, story A8). Lists threads the
-            re-anchoring pipeline could not find on the current
-            revision, with the original quote, the file, the "was at
-            L…" note, and the pipeline's reason. Orphaned threads
-            stay repliable and resolvable — the human/agent can
-            still act on them; they just aren't tied to a
-            currently-rendered block. Keyboard-accessible via the
-            same button tab order as open threads. axe: labelled
-            landmark region with `aria-label`. */}
-        <section
-          class="revkit-rail__orphans"
-          aria-label="orphaned review threads"
-          data-testid="revkit-rail-orphans"
-        >
-          <h3 class="revkit-rail__orphans-title">
-            Orphaned threads
-            <span class="revkit-rail__orphans-count" aria-label="count">
-              {" "}({orphanedThreadsFor(threads()).length})
-            </span>
-          </h3>
-          <ol class="revkit-rail__orphans-list">
-            <For each={orphanedThreadsFor(threads())}>
-              {(thread: RailThread) => (
-                <li
-                  class="revkit-rail__thread revkit-rail__thread--orphaned"
-                  data-thread-id={thread.id}
-                  data-testid="revkit-rail-orphan"
-                >
-                  <p class="revkit-rail__thread-anchor revkit-rail__thread-anchor--orphaned">
                     <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
                     <Show
                       when={isRailLineAnchor(thread.anchor)}
                       fallback={
-                        <span
-                          class="revkit-rail__thread-lines revkit-rail__thread-lines--file"
-                          data-testid="revkit-rail-orphan-file-scope"
-                        >
-                          (file-level — no source location)
+                        // Issue #46 item 5: an unanchored thread renders a
+                        // file-level label, never `Lundefined`. The
+                        // orphan reason (`diffhunk-mismatch`, `binary`, …)
+                        // rides beside it when present, so the reviewer
+                        // sees WHY the anchor was lost.
+                        <span class="revkit-rail__thread-lines revkit-rail__thread-lines--file">
+                          (file-level{thread.orphanReason !== undefined ? ` — ${thread.orphanReason}` : ""})
                         </span>
                       }
                     >
-                      {(() => {
-                        const la = thread.anchor as RailLineAnchor;
-                        return (
-                          <span class="revkit-rail__thread-lines">
-                            was at L{la.startLine}–{la.endLine}
-                          </span>
-                        );
-                      })()}
+                      <span class="revkit-rail__thread-lines">
+                        L{(thread.anchor as RailLineAnchor).startLine}–{(thread.anchor as RailLineAnchor).endLine}
+                      </span>
                     </Show>
-                  </p>
-                  <Show when={isRailLineAnchor(thread.anchor)}>
-                    {(() => {
-                      const la = thread.anchor as RailLineAnchor;
-                      return (
-                        <blockquote class="revkit-rail__orphan-quote" aria-label="original quote">
-                          "{la.quote.exact}"
-                        </blockquote>
-                      );
-                    })()}
+                  </button>
+                  <Show when={unread()}>
+                    <span
+                      class="revkit-rail__pill revkit-rail__pill--unread"
+                      data-testid="revkit-rail-unread-pill"
+                    >
+                      <span class="revkit-rail__pill-icon" aria-hidden="true">*</span>
+                      <span class="revkit-rail__pill-text">
+                        {isResolved() ? "agent replied · resolved — unread" : "agent replied — unread"}
+                      </span>
+                    </span>
                   </Show>
-                  <p class="revkit-rail__orphan-reason" data-testid="revkit-rail-orphan-reason">
-                    {orphanReasonFor(thread)}
-                  </p>
+                </div>
+                <Show when={isResolved()}>
+                  {/* Disclosure summary + resolver line. The
+                      disclosure button is a real <button
+                      aria-expanded> so screen readers announce
+                      "collapsed" / "expanded" (ADR-0017). */}
+                  <div class="revkit-rail__resolved-summary">
+                    <button
+                      type="button"
+                      class="revkit-rail__resolved-toggle"
+                      aria-expanded={expanded() ? "true" : "false"}
+                      aria-controls={disclosureId}
+                      data-testid="revkit-rail-resolved-toggle"
+                      onClick={(event: MouseEvent): void => {
+                        event.stopPropagation();
+                        toggleResolvedExpansion(thread);
+                        if (unread()) markThreadSeen(thread);
+                      }}
+                    >
+                      <span class="revkit-rail__resolved-caret" aria-hidden="true">{expanded() ? "▾" : "▸"}</span>
+                      <span class="revkit-rail__resolved-status">Resolved</span>
+                      <Show when={thread.resolvedBy !== undefined || thread.resolvedAt !== undefined}>
+                        <span class="revkit-rail__resolved-meta" data-testid="revkit-rail-resolved-meta">
+                          <Show when={thread.resolvedBy !== undefined}>
+                            {" by "}
+                            <span class="revkit-rail__resolved-who">
+                              {thread.resolvedBy!.displayName ?? thread.resolvedBy!.id}
+                            </span>
+                          </Show>
+                          <Show when={thread.resolvedAt !== undefined}>
+                            {" · "}
+                            <time
+                              class="revkit-rail__resolved-when"
+                              datetime={thread.resolvedAt!}
+                            >{formatRelativeTime(thread.resolvedAt!)}</time>
+                          </Show>
+                        </span>
+                      </Show>
+                    </button>
+                    <Show when={!expanded() && lastComment !== undefined}>
+                      <p class="revkit-rail__resolved-excerpt" data-testid="revkit-rail-resolved-excerpt">
+                        <span class={`revkit-rail__author-kind revkit-rail__author-kind--${lastComment!.author.kind}`}>{lastComment!.author.kind}</span>
+                        {" "}
+                        {excerptOf(lastComment!.body)}
+                      </p>
+                    </Show>
+                    {/* PR #62 review nit: reopen is one click from
+                        the collapsed row, not two (expand → reopen).
+                        The button lives inside the summary so a
+                        reviewer scanning a long list of resolved
+                        threads can reopen without changing the row's
+                        rendered height. */}
+                    <button
+                      type="button"
+                      class="revkit-rail__resolved-reopen"
+                      data-testid="revkit-rail-collapsed-reopen"
+                      onClick={(event: MouseEvent): void => {
+                        event.stopPropagation();
+                        void doReopen(thread);
+                      }}
+                      aria-label={`reopen thread on ${thread.anchor.path}`}
+                    >reopen</button>
+                  </div>
+                </Show>
+                <div
+                  id={disclosureId}
+                  class="revkit-rail__thread-body"
+                  data-expanded={expanded() ? "true" : "false"}
+                  hidden={!expanded()}
+                >
                   <ol class="revkit-rail__comments">
                     <For each={thread.comments}>
                       {(comment: RailComment) => (
-                        <li class="revkit-rail__comment">
+                        <li class="revkit-rail__comment" data-testid="revkit-rail-comment" data-author-kind={comment.author.kind}>
                           <p class="revkit-rail__author">
                             <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
                             <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
@@ -1559,62 +1876,288 @@ function Rail(): JSX.Element {
                       )}
                     </For>
                   </ol>
-                  <div class="revkit-rail__thread-actions">
-                    <Show
-                      when={replyDraftFor() === thread.id}
-                      fallback={
-                        <>
-                          <button
-                            type="button"
-                            class="revkit-rail__reply"
-                            data-testid="revkit-rail-orphan-reply"
-                            onClick={() => setReplyDraftFor(thread.id)}
-                          >reply</button>
-                          <button
-                            type="button"
-                            class="revkit-rail__resolve"
-                            data-testid="revkit-rail-orphan-resolve"
-                            onClick={() => void doResolve(thread)}
-                          >resolve</button>
-                        </>
-                      }
-                    >
-                      <form
-                        class="revkit-rail__reply-form"
-                        onSubmit={(event: SubmitEvent): void => {
-                          event.preventDefault();
-                          const form = event.currentTarget as HTMLFormElement;
-                          const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
-                          if (textarea === null || textarea.value.trim().length === 0) return;
-                          void submitReply(thread, textarea.value.trim());
-                        }}
+                  <Show when={thread.status === "open"}>
+                    <div class="revkit-rail__thread-actions">
+                      <Show
+                        when={replyDraftFor() === thread.id}
+                        fallback={
+                          <>
+                            <button
+                              type="button"
+                              class="revkit-rail__reply"
+                              data-testid="revkit-rail-reply"
+                              onClick={() => setReplyDraftFor(thread.id)}
+                            >reply</button>
+                            <button
+                              type="button"
+                              class="revkit-rail__resolve"
+                              data-testid="revkit-rail-resolve"
+                              onClick={() => void doResolve(thread)}
+                            >resolve</button>
+                          </>
+                        }
                       >
-                        <label class="revkit-rail__label">
-                          <span class="revkit-rail__label-text">Reply</span>
-                          <textarea
-                            required
-                            rows="2"
-                            data-testid="revkit-rail-orphan-reply-input"
-                            aria-label="reply body"
-                          ></textarea>
-                        </label>
-                        <div class="revkit-rail__actions">
+                        <form
+                          class="revkit-rail__reply-form"
+                          onSubmit={(event: SubmitEvent): void => {
+                            event.preventDefault();
+                            const form = event.currentTarget as HTMLFormElement;
+                            const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+                            if (textarea === null || textarea.value.trim().length === 0) return;
+                            void submitReply(thread, textarea.value.trim());
+                          }}
+                        >
+                          <label class="revkit-rail__label">
+                            <span class="revkit-rail__label-text">Reply</span>
+                            <textarea
+                              required
+                              rows="2"
+                              data-testid="revkit-rail-reply-input"
+                              aria-label="reply body"
+                            ></textarea>
+                          </label>
+                          <div class="revkit-rail__actions">
+                            <button
+                              type="button"
+                              class="revkit-rail__cancel"
+                              onClick={() => setReplyDraftFor(undefined)}
+                            >cancel</button>
+                            <button
+                              type="submit"
+                              class="revkit-rail__submit"
+                              data-testid="revkit-rail-reply-submit"
+                            >post reply</button>
+                          </div>
+                        </form>
+                      </Show>
+                    </div>
+                  </Show>
+                  <Show when={thread.status === "resolved"}>
+                    <div class="revkit-rail__thread-actions">
+                      <button
+                        type="button"
+                        class="revkit-rail__reopen"
+                        data-testid="revkit-rail-reopen"
+                        onClick={(event: MouseEvent): void => {
+                          event.stopPropagation();
+                          void doReopen(thread);
+                        }}
+                      >reopen</button>
+                      <Show when={unread()}>
+                        <button
+                          type="button"
+                          class="revkit-rail__mark-seen"
+                          data-testid="revkit-rail-mark-seen"
+                          onClick={(event: MouseEvent): void => {
+                            event.stopPropagation();
+                            markThreadSeen(thread);
+                          }}
+                        >mark seen</button>
+                      </Show>
+                    </div>
+                  </Show>
+                </div>
+              </li>
+            );
+          }}
+        </For>
+      </ol>
+      <Show when={isThreadListEmpty()}>
+        <p class="revkit-rail__empty" data-testid="revkit-rail-empty">No open threads yet.</p>
+      </Show>
+      <Show when={sidelinedList().length > 0}>
+        {/* Sidelined panel (M2 item 5b, story A8 + issue #60).
+            Lists threads that can't render inline — either
+            orphaned (the re-anchoring pipeline couldn't place
+            them on the current revision) or resolved-but-not-on-
+            page (issue #60: instead of vanishing, a resolved
+            thread on a file this page doesn't render still
+            surfaces here). Both kinds stay repliable, resolvable,
+            reopenable. axe: labelled landmark region. */}
+        <section
+          class="revkit-rail__orphans"
+          aria-label="orphaned and resolved review threads"
+          data-testid="revkit-rail-orphans"
+        >
+          <h3 class="revkit-rail__orphans-title">
+            Orphaned &amp; resolved
+            <span class="revkit-rail__orphans-count" aria-label="count">
+              {" "}({sidelinedList().length})
+            </span>
+          </h3>
+          <ol class="revkit-rail__orphans-list">
+            <For each={sidelinedList()}>
+              {(thread: RailThread) => {
+                const unread = (): boolean => isThreadUnread(thread, seenMap());
+                const onThreadInteract = (): void => {
+                  if (unread()) markThreadSeen(thread);
+                };
+                return (
+                  <li
+                    class={`revkit-rail__thread revkit-rail__thread--${thread.status}${unread() ? " revkit-rail__thread--unread" : ""}`}
+                    data-thread-id={thread.id}
+                    data-testid="revkit-rail-orphan"
+                    data-unread={unread() ? "true" : "false"}
+                    onClick={onThreadInteract}
+                  >
+                    <p class="revkit-rail__thread-anchor revkit-rail__thread-anchor--orphaned">
+                      <span class="revkit-rail__thread-path">{thread.anchor.path}</span>
+                      <Show
+                        when={isRailLineAnchor(thread.anchor)}
+                        fallback={
+                          <span
+                            class="revkit-rail__thread-lines revkit-rail__thread-lines--file"
+                            data-testid="revkit-rail-orphan-file-scope"
+                          >
+                            (file-level — no source location)
+                          </span>
+                        }
+                      >
+                        {(() => {
+                          const la = thread.anchor as RailLineAnchor;
+                          return (
+                            <span class="revkit-rail__thread-lines">
+                              was at L{la.startLine}–{la.endLine}
+                            </span>
+                          );
+                        })()}
+                      </Show>
+                    </p>
+                    <Show when={unread()}>
+                      <span
+                        class="revkit-rail__pill revkit-rail__pill--unread"
+                        data-testid="revkit-rail-unread-pill"
+                      >
+                        <span class="revkit-rail__pill-icon" aria-hidden="true">*</span>
+                        <span class="revkit-rail__pill-text">
+                          {thread.status === "resolved" ? "agent replied · resolved — unread" : "agent replied — unread"}
+                        </span>
+                      </span>
+                    </Show>
+                    <Show when={thread.status === "resolved" && (thread.resolvedBy !== undefined || thread.resolvedAt !== undefined)}>
+                      <p class="revkit-rail__resolved-meta" data-testid="revkit-rail-resolved-meta">
+                        Resolved
+                        <Show when={thread.resolvedBy !== undefined}>
+                          {" by "}
+                          <span class="revkit-rail__resolved-who">
+                            {thread.resolvedBy!.displayName ?? thread.resolvedBy!.id}
+                          </span>
+                        </Show>
+                        <Show when={thread.resolvedAt !== undefined}>
+                          {" · "}
+                          <time datetime={thread.resolvedAt!}>{formatRelativeTime(thread.resolvedAt!)}</time>
+                        </Show>
+                      </p>
+                    </Show>
+                    <Show when={isRailLineAnchor(thread.anchor)}>
+                      {(() => {
+                        const la = thread.anchor as RailLineAnchor;
+                        return (
+                          <blockquote class="revkit-rail__orphan-quote" aria-label="original quote">
+                            "{la.quote.exact}"
+                          </blockquote>
+                        );
+                      })()}
+                    </Show>
+                    <Show when={thread.status === "orphaned"}>
+                      <p class="revkit-rail__orphan-reason" data-testid="revkit-rail-orphan-reason">
+                        {orphanReasonFor(thread)}
+                      </p>
+                    </Show>
+                    <ol class="revkit-rail__comments">
+                      <For each={thread.comments}>
+                        {(comment: RailComment) => (
+                          <li class="revkit-rail__comment" data-testid="revkit-rail-comment" data-author-kind={comment.author.kind}>
+                            <p class="revkit-rail__author">
+                              <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
+                              <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
+                            </p>
+                            <p class="revkit-rail__body">{renderBodyWithMentions(comment.body, comment.mentions ?? [])}</p>
+                          </li>
+                        )}
+                      </For>
+                    </ol>
+                    <div class="revkit-rail__thread-actions">
+                      <Show when={thread.status !== "resolved"}>
+                        <Show
+                          when={replyDraftFor() === thread.id}
+                          fallback={
+                            <>
+                              <button
+                                type="button"
+                                class="revkit-rail__reply"
+                                data-testid="revkit-rail-orphan-reply"
+                                onClick={() => setReplyDraftFor(thread.id)}
+                              >reply</button>
+                              <button
+                                type="button"
+                                class="revkit-rail__resolve"
+                                data-testid="revkit-rail-orphan-resolve"
+                                onClick={() => void doResolve(thread)}
+                              >resolve</button>
+                            </>
+                          }
+                        >
+                          <form
+                            class="revkit-rail__reply-form"
+                            onSubmit={(event: SubmitEvent): void => {
+                              event.preventDefault();
+                              const form = event.currentTarget as HTMLFormElement;
+                              const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+                              if (textarea === null || textarea.value.trim().length === 0) return;
+                              void submitReply(thread, textarea.value.trim());
+                            }}
+                          >
+                            <label class="revkit-rail__label">
+                              <span class="revkit-rail__label-text">Reply</span>
+                              <textarea
+                                required
+                                rows="2"
+                                data-testid="revkit-rail-orphan-reply-input"
+                                aria-label="reply body"
+                              ></textarea>
+                            </label>
+                            <div class="revkit-rail__actions">
+                              <button
+                                type="button"
+                                class="revkit-rail__cancel"
+                                onClick={() => setReplyDraftFor(undefined)}
+                              >cancel</button>
+                              <button
+                                type="submit"
+                                class="revkit-rail__submit"
+                                data-testid="revkit-rail-orphan-reply-submit"
+                              >post reply</button>
+                            </div>
+                          </form>
+                        </Show>
+                      </Show>
+                      <Show when={thread.status === "resolved"}>
+                        <button
+                          type="button"
+                          class="revkit-rail__reopen"
+                          data-testid="revkit-rail-reopen"
+                          onClick={(event: MouseEvent): void => {
+                            event.stopPropagation();
+                            void doReopen(thread);
+                          }}
+                        >reopen</button>
+                        <Show when={unread()}>
                           <button
                             type="button"
-                            class="revkit-rail__cancel"
-                            onClick={() => setReplyDraftFor(undefined)}
-                          >cancel</button>
-                          <button
-                            type="submit"
-                            class="revkit-rail__submit"
-                            data-testid="revkit-rail-orphan-reply-submit"
-                          >post reply</button>
-                        </div>
-                      </form>
-                    </Show>
-                  </div>
-                </li>
-              )}
+                            class="revkit-rail__mark-seen"
+                            data-testid="revkit-rail-mark-seen"
+                            onClick={(event: MouseEvent): void => {
+                              event.stopPropagation();
+                              markThreadSeen(thread);
+                            }}
+                          >mark seen</button>
+                        </Show>
+                      </Show>
+                    </div>
+                  </li>
+                );
+              }}
             </For>
           </ol>
         </section>
@@ -1623,21 +2166,18 @@ function Rail(): JSX.Element {
   );
 }
 
-/** Partition helper — open threads only (the main list). Kept out
- * of the JSX to make the count-check in the `Show` block below
- * readable. */
-function openThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => thread.status === "open");
+/** True when this line-anchored thread's block IS on the page.
+ * A resolved thread whose anchor is on-page renders inline
+ * collapsed next to its block; one whose anchor is missing
+ * (source rebuilt, path deleted, unanchored) is moved into the
+ * sidelined panel instead of vanishing. Issue #60. Used by the
+ * memoized `partition` inside the Rail component, not called from
+ * unit tests — those cover the pure derivations in `unread.ts`. */
+function hasAnchorOnPage(anchor: RailAnchor): boolean {
+  if (!isRailLineAnchor(anchor)) return false;
+  return findBlockForAnchor(anchor) !== undefined;
 }
 
-/** Partition helper — orphaned threads only (the orphan panel).
- * See M2 item 5b: an orphan is a thread the re-anchor pipeline
- * could not place on the current revision. */
-function orphanedThreadsFor(response: RailListResponse | undefined): readonly RailThread[] {
-  if (response === undefined) return [];
-  return response.threads.filter((thread) => thread.status === "orphaned");
-}
 
 /** Render the orphan panel's reason line. Priority order:
  *

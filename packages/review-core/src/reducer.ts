@@ -130,6 +130,11 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         ...thread,
         status: "resolved",
         resumeStatus: thread.status,
+        // Issue #60: project the resolving actor + timestamp so the
+        // rail can render "resolved by <actor> · <when>" on a
+        // collapsed resolved thread without walking the raw log.
+        resolvedBy: event.actor,
+        resolvedAt: event.ts,
         updatedAt: event.ts,
       });
       return;
@@ -141,10 +146,13 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       // Restore the pre-resolve status. Fall back to `open` when
       // `resumeStatus` is absent (backfilled from an older log).
       const nextStatus: "open" | "orphaned" = thread.resumeStatus ?? "open";
-      // Drop `resumeStatus` so a subsequent resolve/reopen cycle
-      // starts fresh.
-      const { resumeStatus: _prev, ...rest } = thread;
-      void _prev;
+      // Drop `resumeStatus`, `resolvedBy`, `resolvedAt` so a
+      // subsequent resolve/reopen cycle starts fresh. (Issue #60
+      // for the resolved fields.)
+      const { resumeStatus: _prevResume, resolvedBy: _prevBy, resolvedAt: _prevAt, ...rest } = thread;
+      void _prevResume;
+      void _prevBy;
+      void _prevAt;
       threads.set(event.threadId, {
         ...rest,
         status: nextStatus,

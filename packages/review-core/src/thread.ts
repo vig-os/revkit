@@ -149,6 +149,17 @@ export const threadSchema = z
      * correct pre-resolve state (open or orphaned). Set on
      * resolve, read on reopen. (Issue #46 item 4.) */
     resumeStatus: z.enum(["open", "orphaned"]).optional(),
+    /** The typed actor who authored the most recent
+     * `thread.resolved` event, projected here so the rail can
+     * render "resolved by …" on a collapsed resolved thread
+     * without walking the raw event log (issue #60). Set on
+     * resolve, dropped on reopen. */
+    resolvedBy: authorSchema.optional(),
+    /** The `ts` of the most recent `thread.resolved` event.
+     * Same projection intent as `resolvedBy` — the rail shows
+     * "resolved <relative>". Set on resolve, dropped on
+     * reopen. (Issue #60.) */
+    resolvedAt: isoTimestamp.optional(),
   })
   .strict();
 

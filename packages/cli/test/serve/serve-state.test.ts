@@ -11,13 +11,16 @@ import {
   acquireAndPublish,
   daemonLockPath,
   findRunningDaemon,
+  readOrMintRepoId,
   readServeState,
   readServeStateVerbose,
   removeServeState,
+  repoIdPath,
   serveStatePath,
   writeServeState,
   type ServeState,
 } from "../../src/serve/serve-state.ts";
+import { readFileSync } from "node:fs";
 import { acquireDaemonLock } from "../../src/serve/daemon-lock.ts";
 
 const sample = (instanceId: string, port = 40000): ServeState => ({
@@ -208,5 +211,52 @@ describe("daemon-lock (raw acquire / release)", () => {
     const second = acquireDaemonLock(path);
     expect(second).not.toBeNull();
     second?.release();
+  });
+});
+
+describe("readOrMintRepoId (issue #60 PR #62 round-3)", () => {
+  let repoRoot: string;
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), "revkit-repo-id-"));
+  });
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  test("mints a base64url tag on first call and persists it at mode 0600", () => {
+    const id = readOrMintRepoId(repoRoot);
+    expect(id).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
+    const path = repoIdPath(repoRoot);
+    expect(existsSync(path)).toBe(true);
+    const mode = statSync(path).mode & 0o777;
+    expect(mode).toBe(0o600);
+    expect(readFileSync(path, "utf8").trim()).toBe(id);
+  });
+
+  test("returns the same id on subsequent calls (stable across daemon restarts on same repo)", () => {
+    const a = readOrMintRepoId(repoRoot);
+    const b = readOrMintRepoId(repoRoot);
+    expect(b).toBe(a);
+  });
+
+  test("two independent repos mint distinct ids", () => {
+    const otherRoot = mkdtempSync(join(tmpdir(), "revkit-repo-id-other-"));
+    try {
+      const a = readOrMintRepoId(repoRoot);
+      const b = readOrMintRepoId(otherRoot);
+      expect(a).not.toBe(b);
+    } finally {
+      rmSync(otherRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("a corrupted / empty file is re-minted rather than trusted", () => {
+    const path = repoIdPath(repoRoot);
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+    writeFileSync(path, "", { mode: 0o600 });
+    const id = readOrMintRepoId(repoRoot);
+    expect(id.length).toBeGreaterThanOrEqual(16);
+    // The file has been rewritten with a fresh id.
+    expect(readFileSync(path, "utf8").trim()).toBe(id);
   });
 });
