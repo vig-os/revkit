@@ -806,6 +806,39 @@ export class GitHubAdapter {
    * Ordered by `submittedAt` ascending; PENDING entries have
    * `submittedAt: null` and appear last (GitHub's ordering) but
    * callers should treat this as an unordered set. */
+  /** Round-3 BLOCK-fix 3: fetch a single review by its GraphQL
+   * node id. Preferred over `listViewerReviewsOnPr` in the
+   * reconciler's crash-heal path — a reviewer with 50+ reviews on
+   * the PR trips the old first:50 window and a legitimate SUBMITTED
+   * review reads back as `null`, mis-tripping the deleted-on-github
+   * path. Returns `null` when the review truly no longer exists. */
+  async getReviewById(reviewNodeId: string): Promise<ViewerReviewSummary | null> {
+    const resp = await this.graphqlWithRetry<{
+      data: {
+        node:
+          | {
+              __typename?: string;
+              id?: string;
+              databaseId?: number | null;
+              state?: string;
+              submittedAt?: string | null;
+              commit?: { oid: string } | null;
+            }
+          | null;
+      };
+    }>(GET_REVIEW_BY_ID_QUERY, { id: reviewNodeId });
+    const node = resp.data.node;
+    if (node === undefined || node === null) return null;
+    if (node.__typename !== "PullRequestReview") return null;
+    return {
+      id: node.id ?? reviewNodeId,
+      databaseId: node.databaseId ?? 0,
+      state: (node.state ?? "PENDING") as ViewerReviewSummary["state"],
+      commitSha: node.commit?.oid ?? null,
+      submittedAt: node.submittedAt ?? null,
+    };
+  }
+
   async listViewerReviewsOnPr(input: {
     readonly pullRequestNodeId: string;
     readonly viewerLogin?: string;
@@ -2162,6 +2195,9 @@ export const GITHUB_GRAPHQL_DOCUMENTS = {
   get ViewerReviews() {
     return VIEWER_REVIEWS_QUERY;
   },
+  get GetReviewById() {
+    return GET_REVIEW_BY_ID_QUERY;
+  },
   get AddReview() {
     return ADD_REVIEW_MUTATION;
   },
@@ -2319,7 +2355,9 @@ const VIEWER_PENDING_REVIEW_QUERY = /* GraphQL */ `
 // on this PR across ALL states so the reconciler can tell whether a
 // LOG-known review was submitted or deleted on GitHub. Bounded page
 // size — a single reviewer rarely has more than a handful of
-// reviews on one PR, and we filter by author.
+// reviews on one PR, and we filter by author. Kept in the shape
+// registry for schema validation; the reconciler now prefers
+// `GET_REVIEW_BY_ID_QUERY` when it already knows the id.
 const VIEWER_REVIEWS_QUERY = /* GraphQL */ `
   query ViewerReviews($id: ID!, $author: String!) {
     node(id: $id) {
@@ -2334,6 +2372,26 @@ const VIEWER_REVIEWS_QUERY = /* GraphQL */ `
             commit { oid }
           }
         }
+      }
+    }
+  }
+`;
+
+// Round-3 BLOCK-fix 3 (pagination-free lookup): fetch a SINGLE
+// review by its node id. Skips the reviews connection entirely, so
+// a reviewer with 50+ reviews on the PR never trips the old
+// `first: 50` window. Returns null when the review no longer
+// exists on GitHub (deleted-remotely path in the reconciler).
+const GET_REVIEW_BY_ID_QUERY = /* GraphQL */ `
+  query GetReviewById($id: ID!) {
+    node(id: $id) {
+      __typename
+      ... on PullRequestReview {
+        id
+        databaseId
+        state
+        submittedAt
+        commit { oid }
       }
     }
   }

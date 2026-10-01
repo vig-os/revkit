@@ -163,10 +163,51 @@ async function makeHeadRevisionMap(
  * See file-level doc for the identity/dedup story.
  */
 export async function populateStoreFromPr(options: PopulateOptions): Promise<PopulateOutcome> {
-  const commentIdOf = commentIdOfFactory(options.pr);
+  const commentIdOfBase = commentIdOfFactory(options.pr);
   const paths = options.threads.map((t) => t.path);
   const headSourceOf = makeHeadSourceOf(options.materializedRoot);
   const headRevMap = await makeHeadRevisionMap(options.materializedRoot, paths);
+
+  // Round-3 BLOCK-fix 2: dedupe re-imports on the GitHub node id
+  // already linked to a LOCAL comment. Before round-3 the daemon's
+  // own reply would re-import as a duplicate: the mirror path
+  // linked the local commentId (a uuid) to a GitHub nodeId, but
+  // `commentIdOfFactory` derived a DIFFERENT deterministic id
+  // from the same nodeId, so the second-pass import created a
+  // fresh comment.replied with the derived id, producing
+  // ["my reply", "my reply"] on the local log.
+  //
+  // Walk the log for every `comment.linked` and build a map from
+  // the GitHub nodeId back to the local commentId. The
+  // `commentIdOf` factory used below returns the LOCAL id when
+  // a nodeId is already linked, so importThreads' events line up
+  // with the store's existing rows and the duplicate hits
+  // `duplicate-comment-id` (counted as `skipped`, not `refused`).
+  const nodeIdToLocalCommentId = new Map<string, string>();
+  {
+    const existingEvents = await options.store.since(0);
+    for (const evt of existingEvents) {
+      if (evt.kind !== "comment.linked") continue;
+      const gh = evt.external.github;
+      if (gh === undefined) continue;
+      const nid = gh.nodeId;
+      if (nid === undefined) continue;
+      // Prefer the FIRST link (locally-authored comment). A later
+      // re-link with the same nodeId would trip the validator, so
+      // this map is 1:1 by construction.
+      if (!nodeIdToLocalCommentId.has(nid)) {
+        nodeIdToLocalCommentId.set(nid, evt.commentId);
+      }
+    }
+  }
+  const commentIdOf: typeof commentIdOfBase = (thread, comment) => {
+    const nid = comment.nodeId;
+    if (nid !== undefined && nid !== null) {
+      const existing = nodeIdToLocalCommentId.get(nid);
+      if (existing !== undefined) return existing;
+    }
+    return commentIdOfBase(thread, comment);
+  };
 
   const importResult = await options.adapter.importThreads({
     pr: options.pr,
@@ -232,7 +273,8 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
     // ── Resolve state diff ──
     const remoteResolved = remoteThread.isResolved;
     const localResolved = localThread.status === "resolved";
-    if (remoteResolved && !localResolved) {
+    const lastObservedRemote = localThread.external?.resolved ?? localResolved;
+    if (remoteResolved !== lastObservedRemote && remoteResolved && !localResolved) {
       // orphaned → resolved is allowed (ADR-0025 amendment). The
       // reducer projects `resumeStatus` so a later reopen restores
       // orphaned rather than open.
@@ -247,11 +289,18 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
           resolution: "resolved on GitHub",
         });
         updates.resolved++;
+        await options.store.append({
+          kind: "thread.external_synced",
+          actor,
+          threadId: localTid,
+          resolved: true,
+          ...(remoteThread.resolvedByLogin !== null ? { resolvedByLogin: remoteThread.resolvedByLogin } : {}),
+        });
       } catch (err) {
         if (!(err instanceof ThreadStoreAppendError)) throw err;
         // Already resolved / refused — fine.
       }
-    } else if (!remoteResolved && localResolved) {
+    } else if (remoteResolved !== lastObservedRemote && !remoteResolved && localResolved) {
       // Round-2 BLOCK-fix 3 (probe R6): the remote UN-resolved a
       // thread. Mirror as `thread.reopened` under a gh-user actor.
       const actor = { kind: "gh-user" as const, id: "github", displayName: "GitHub" };
@@ -263,6 +312,27 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
           reason: "reopened on GitHub",
         });
         updates.reopened++;
+        await options.store.append({
+          kind: "thread.external_synced",
+          actor,
+          threadId: localTid,
+          resolved: false,
+        });
+      } catch (err) {
+        if (!(err instanceof ThreadStoreAppendError)) throw err;
+      }
+    } else if (remoteResolved !== lastObservedRemote && remoteResolved === localResolved) {
+      const actor = remoteThread.resolvedByLogin !== null
+        ? { kind: "gh-user" as const, id: remoteThread.resolvedByLogin, displayName: remoteThread.resolvedByLogin }
+        : { kind: "gh-user" as const, id: "github", displayName: "GitHub" };
+      try {
+        await options.store.append({
+          kind: "thread.external_synced",
+          actor,
+          threadId: localTid,
+          resolved: remoteResolved,
+          ...(remoteThread.resolvedByLogin !== null ? { resolvedByLogin: remoteThread.resolvedByLogin } : {}),
+        });
       } catch (err) {
         if (!(err instanceof ThreadStoreAppendError)) throw err;
       }

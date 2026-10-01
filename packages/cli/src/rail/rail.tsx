@@ -231,7 +231,15 @@ interface RailReviewState {
           }>;
         }
       | null;
-    readonly terminal: ReadonlyArray<{ readonly reviewNodeId: string; readonly outcome: unknown }>;
+    readonly terminal: ReadonlyArray<{
+      readonly reviewNodeId: string;
+      readonly outcome: {
+        readonly kind: "submitted" | "abandoned";
+        readonly reason?: string;
+        readonly event?: "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
+      };
+      readonly at?: string;
+    }>;
     readonly unsyncedCommentIds?: readonly string[];
     readonly commentSync?: ReadonlyArray<{
       readonly commentId: string;
@@ -1457,6 +1465,96 @@ function Rail(): JSX.Element {
               <code>{reviewState()!.state.openPending!.headSha.slice(0, 12)}</code>
             </Show>
           </p>
+          {/* Round-3 BLOCK-fix 1 (deleted-on-github recovery): when
+              the reconciler detected the pending review was
+              deleted on GitHub, the reducer reverts every synced
+              draft to `pending-sync` and appends a terminal
+              `review.abandoned` with reason `deleted-on-github`.
+              The rail surfaces a clear banner asking the human to
+              re-post — a click hits /api/review/reconcile under
+              cookie auth, which now sees openPending=null +
+              unsynced intents and opens a fresh pending review. */}
+          <Show
+            when={
+              reviewState()!.state.openPending === null &&
+              (reviewState()!.state.commentSync ?? []).some((c) => c.state.kind === "pending-sync") &&
+              reviewState()!.state.terminal.some(
+                (t) => t.outcome.kind === "abandoned" && t.outcome.reason === "deleted-on-github",
+              )
+            }
+          >
+            <div
+              class="revkit-rail__review-deleted-remotely"
+              data-testid="revkit-rail-review-deleted-remotely"
+              role="alert"
+            >
+              <p class="revkit-rail__review-deleted-remotely-summary">
+                Your pending review was deleted on GitHub — {(reviewState()!.state.commentSync ?? []).filter((c) => c.state.kind === "pending-sync").length}{" "}
+                draft{(reviewState()!.state.commentSync ?? []).filter((c) => c.state.kind === "pending-sync").length === 1 ? "" : "s"} not on GitHub.
+              </p>
+              <div class="revkit-rail__review-deleted-remotely-actions">
+                <button
+                  type="button"
+                  class="revkit-rail__review-deleted-remotely-repost"
+                  data-testid="revkit-rail-review-deleted-remotely-repost"
+                  disabled={reviewBusy()}
+                  onClick={() => {
+                    void (async () => {
+                      setReviewBusy(true);
+                      setError(undefined);
+                      try {
+                        const url = new URL(location.href);
+                        const response = await fetch(new URL("/api/review/reconcile", url.origin), {
+                          method: "POST",
+                          headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
+                          credentials: "same-origin",
+                          body: "{}",
+                        });
+                        if (!response.ok) throw new Error(`Re-post failed (${response.status})`);
+                        await refetchReview();
+                      } catch (cause) {
+                        setError((cause as Error).message);
+                      } finally {
+                        setReviewBusy(false);
+                      }
+                    })();
+                  }}
+                >Re-post {(reviewState()!.state.commentSync ?? []).filter((c) => c.state.kind === "pending-sync").length} draft{(reviewState()!.state.commentSync ?? []).filter((c) => c.state.kind === "pending-sync").length === 1 ? "" : "s"}</button>
+                <button
+                  type="button"
+                  class="revkit-rail__review-deleted-remotely-discard"
+                  data-testid="revkit-rail-review-deleted-remotely-discard"
+                  disabled={reviewBusy()}
+                  onClick={() => {
+                    void (async () => {
+                      setReviewBusy(true);
+                      setError(undefined);
+                      try {
+                        // POST /api/review/decline-repost — marks
+                        // every stranded pending-sync as failed
+                        // with reason "user-declined-repost" so
+                        // the banner clears. There is no pending
+                        // review to delete on GitHub here.
+                        const url = new URL(location.href);
+                        const response = await fetch(new URL("/api/review/decline-repost", url.origin), {
+                          method: "POST",
+                          headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
+                          credentials: "same-origin",
+                          body: "{}",
+                        });
+                        if (!response.ok) throw new Error(`Discard failed (${response.status})`);
+                        await refetchReview();
+                      } catch (cause) {
+                        setError((cause as Error).message);
+                      } finally {
+                        setReviewBusy(false);
+                      }
+                    })();
+                  }}
+                >Discard</button>
+              </div>
+            </div>
+          </Show>
           {/* Round-2 (ADR-0025): per-comment sync state — a local
               comment whose GitHub AddThread failed shows a "not on
               GitHub — retry" line here. Submit is gated on

@@ -158,10 +158,9 @@ const commentRepliedPayload = {
 /** Round-2 BLOCK-fix 3 (B4 pull update): a remote comment's body
  * changed. Emitted only on refresh, when the local log's last
  * body for `commentId` differs from the remote's current body.
- * The reducer projects it on `Comment.body`; the rail's SSE
- * refetches the thread when this arrives. Idempotency: on
- * refresh, only emitted when the remote's `updatedAt` moved past
- * the local's last-seen. */
+ * The reducer projects it on `Comment.body` and stamps
+ * `Comment.editedAt`; the rail's SSE refetches the thread when
+ * this arrives, showing an "edited" marker. */
 const commentEditedPayload = {
   kind: z.literal("comment.edited"),
   commentId: idSchema,
@@ -183,6 +182,18 @@ const threadReopenedPayload = {
   kind: z.literal("thread.reopened"),
   threadId: idSchema,
   reason: z.string().min(1).optional(),
+} as const;
+
+/** Last GitHub resolve state observed after a local resolve/reopen
+ * intent. Local thread lifecycle remains the durable intent; this
+ * event advances the external baseline only after GitHub confirms
+ * that state, including an accepted mutation whose response was
+ * lost. */
+const threadExternalSyncedPayload = {
+  kind: z.literal("thread.external_synced"),
+  threadId: idSchema,
+  resolved: z.boolean(),
+  resolvedByLogin: z.string().min(1).optional(),
 } as const;
 
 /** Trigger for a `handover` delivery event (M2 item 6 review round 2).
@@ -422,6 +433,14 @@ const commentSyncRequestedPayload = {
       SHA256_HEX_REGEX,
       "comment.sync_requested.bodyHash must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
     ),
+  /** Present for a reply intent. The reconciler posts through
+   * addPullRequestReviewThreadReply instead of creating a new
+   * top-level thread, and reads this thread before retrying. */
+  replyThreadNodeId: z.string().min(1).optional(),
+  /** Remote comment node ids observed before the reply intent.
+   * A matching viewer/body comment outside this set proves an
+   * accepted-but-response-lost mutation without duplicating it. */
+  knownCommentNodeIds: z.array(z.string().min(1)).optional(),
 } as const;
 
 /** M3 part 2b round-2 (BLOCK-fix): the reconciler tried to sync a
@@ -445,6 +464,7 @@ const eventVariants = [
   z.object({ ...envelope, ...commentEditedPayload }).strict(),
   z.object({ ...envelope, ...threadResolvedPayload }).strict(),
   z.object({ ...envelope, ...threadReopenedPayload }).strict(),
+  z.object({ ...envelope, ...threadExternalSyncedPayload }).strict(),
   z.object({ ...envelope, ...handoverPayload }).strict(),
   z.object({ ...envelope, ...deliveryModeChangedPayload }).strict(),
   z.object({ ...envelope, ...askCreatedPayload }).strict(),
@@ -518,6 +538,7 @@ export const reviewEventKinds = [
   "comment.edited",
   "thread.resolved",
   "thread.reopened",
+  "thread.external_synced",
   "handover",
   "delivery.mode_changed",
   "ask.created",

@@ -187,6 +187,9 @@ export type AppendRejection =
   | { kind: "not-open"; threadId: string; message: string }
   | { kind: "not-resolved"; threadId: string; message: string }
   | { kind: "unknown-comment"; commentId: string; message: string }
+  /** Round-3 nit: an event's actor is not the one the shape
+   * allows (e.g. an agent trying to edit a human comment). */
+  | { kind: "invalid-actor"; actor: unknown; message: string }
   | { kind: "duplicate-ask"; askId: string; message: string }
   | { kind: "unknown-ask"; askId: string; message: string }
   /** Kept as a distinct kind so a caller can special-case
@@ -304,6 +307,21 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
           },
         };
       }
+      // Round-3 (nit): restrict the actor to the comment's own
+      // author (a self-edit) or the github-import gh-user actor
+      // (a B4-pull edit mirrored from GitHub). This blocks an
+      // agent bearer from editing a human's comment body under
+      // a hostile appendReviewLifecycleEvent path.
+      if (event.actor.kind !== "gh-user" && event.actor.kind !== "local") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "invalid-actor",
+            actor: event.actor,
+            message: `comment.edited: actor must be the comment's author (local) or the github-import actor (gh-user), got '${event.actor.kind}'.`,
+          },
+        };
+      }
       return { ok: true };
     }
     case "thread.resolved": {
@@ -345,6 +363,10 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       // Falls back to `open` for logs from before this field existed.
       thread.status = thread.resumeStatus ?? "open";
       thread.resumeStatus = undefined;
+      return { ok: true };
+    }
+    case "thread.external_synced": {
+      if (!state.threads.has(event.threadId)) return unknownThread(event.threadId, event.kind);
       return { ok: true };
     }
     case "handover": {

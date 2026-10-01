@@ -30,6 +30,7 @@ import {
   type Author,
   type CommentSyncState,
   type GitHubAdapter,
+  type GhReviewThread,
   type PendingReviewComment as AdapterPendingReviewComment,
   type PrRef,
   type PrFile,
@@ -236,6 +237,10 @@ export interface ReconcileInput {
   readonly store: ThreadStore;
   readonly actor: Author;
   readonly appendAndPublish: (input: ReviewEventInput) => Promise<ReviewEvent | undefined>;
+  /** False during daemon boot: read GitHub and heal local completion
+   * events, but never create reviews or issue mutations without a
+   * current cookie-authenticated human action. */
+  readonly allowMutations: boolean;
 }
 
 /** Compare two `SyncFingerprint`s. `nodeId` matching is the primary
@@ -265,7 +270,7 @@ export async function fingerprintMatches(
  * fatal read-side error (network to `viewer` or the pending-review
  * query). */
 export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome> {
-  const { review, store, actor, appendAndPublish } = input;
+  const { review, store, actor, appendAndPublish, allowMutations } = input;
 
   let state = await review.readState(store);
   const currentHeadSha = review.currentHeadSha();
@@ -302,17 +307,20 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
   //     "your pending review was deleted on GitHub — re-post N
   //     drafts?" and the human confirms before a new one opens.
   if (state.openPending !== null) {
-    let viewerReviews: readonly ViewerReviewSummary[];
+    // Round-3 BLOCK-fix 3: look up the RECORDED review directly by
+    // its node id. The old `listViewerReviewsOnPr(first: 50)`
+    // window would drop a legitimately-SUBMITTED review out of the
+    // page for any reviewer with 50+ reviews on the PR, tripping a
+    // false `deleted-on-github`.
+    let recorded: ViewerReviewSummary | null;
     try {
-      viewerReviews = await review.options.adapter.listViewerReviewsOnPr({
-        pullRequestNodeId: review.options.summary.nodeId,
-        viewerLogin: review.options.viewerLogin,
-      });
+      recorded = await review.options.adapter.getReviewById(
+        state.openPending.reviewNodeId,
+      );
     } catch (err) {
       throw err;
     }
-    const recorded = viewerReviews.find((r) => r.id === state.openPending!.reviewNodeId);
-    if (recorded === undefined) {
+    if (recorded === null) {
       // Deleted on GitHub — mark it terminal locally, refuse to
       // create anything without a human's confirmation.
       try {
@@ -372,7 +380,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
   // recorded intents. When there's no pending review, the bearer
   // reconciler returns the failed-count and lets the human retry.
   if (reviewNodeId === null) {
-    if (actor.kind !== "local") {
+    if (actor.kind !== "local" || !allowMutations) {
       // Agent bearer without an existing pending review: refuse
       // to open one. Every unsynced intent stays unsynced, and
       // the rail's retry surface handles the recovery under the
@@ -452,6 +460,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
   const newlySynced: string[] = [];
   const newlyFailed: Array<{ commentId: string; reason: string }> = [];
   const usedDraftIds = new Set<string>();
+  let liveThreads: readonly GhReviewThread[] | undefined;
   for (const commentId of state.unsyncedCommentIds) {
     const syncState = state.commentSync.get(commentId);
     if (syncState === undefined) continue;
@@ -461,6 +470,71 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
     // fingerprint; scan for the latest one.
     const fingerprint = syncStateFingerprint(syncState);
     if (fingerprint === undefined) continue;
+
+    // Replies use a different GitHub mutation and cannot be matched
+    // against the pending review's top-level draft coordinates. Read
+    // the target thread and look for a new viewer-authored comment
+    // with the intended body. This heals an accepted mutation whose
+    // response (and therefore comment.linked append) was lost.
+    if (fingerprint.replyThreadNodeId !== undefined) {
+      if (liveThreads === undefined) {
+        liveThreads = await review.options.adapter.listReviewThreads(review.options.pr);
+      }
+      const remoteThread = liveThreads.find((thread) => thread.id === fingerprint.replyThreadNodeId);
+      const known = new Set(fingerprint.knownCommentNodeIds ?? []);
+      let matchedReply: { readonly nodeId: string; readonly databaseId: number } | undefined;
+      if (remoteThread !== undefined) {
+        for (const comment of remoteThread.comments) {
+          if (known.has(comment.nodeId) || comment.authorLogin !== review.options.viewerLogin) continue;
+          if (await revisionOf(comment.body) !== fingerprint.bodyHash) continue;
+          matchedReply = { nodeId: comment.nodeId, databaseId: comment.databaseId };
+          break;
+        }
+      }
+
+      let postedReply = matchedReply;
+      if (postedReply === undefined && allowMutations) {
+        const threadId = await threadIdOfComment(store, commentId);
+        const thread = threadId === undefined ? undefined : await store.thread(threadId);
+        const body = thread?.comments.find((comment) => comment.id === commentId)?.body;
+        if (body === undefined || await revisionOf(body) !== fingerprint.bodyHash) {
+          const reason = body === undefined ? "body-not-in-log" : "body-drift";
+          newlyFailed.push({ commentId, reason });
+          await appendAndPublish({ kind: "comment.sync_failed", actor, commentId, reason });
+          continue;
+        }
+        try {
+          const posted = await review.options.adapter.addReviewThreadReply({
+            threadNodeId: fingerprint.replyThreadNodeId,
+            body,
+            pendingReviewId: reviewNodeId,
+          });
+          postedReply = { nodeId: posted.nodeId, databaseId: posted.databaseId };
+        } catch (err) {
+          const reason = `adapter:${(err as Error).name}`;
+          newlyFailed.push({ commentId, reason });
+          await appendAndPublish({ kind: "comment.sync_failed", actor, commentId, reason });
+          continue;
+        }
+      }
+      if (postedReply !== undefined) {
+        await appendAndPublish({
+          kind: "comment.linked",
+          actor,
+          commentId,
+          external: {
+            github: {
+              commentId: postedReply.databaseId,
+              nodeId: postedReply.nodeId,
+              pending: true,
+              reviewNodeId,
+            },
+          },
+        });
+        newlySynced.push(commentId);
+      }
+      continue;
+    }
     let matched: AdapterPendingReviewComment | undefined;
     for (const draft of liveDrafts) {
       if (usedDraftIds.has(draft.nodeId)) continue;
@@ -566,6 +640,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
       });
       continue;
     }
+    if (!allowMutations) continue;
     try {
       const posted = await review.options.adapter.addPendingReviewThread({
         reviewId: reviewNodeId,
@@ -835,6 +910,7 @@ export async function reanchorPendingReviewAtNewHead(input: {
     outcome: "moved" | "fuzzy" | "file-fallback" | "orphaned";
     reason?: string;
   }> = [];
+  const reanchoredThreadIds = new Set<string>();
   for (const p of perComment) {
     if (p.outcome === "orphaned") {
       orphaned++;
@@ -847,24 +923,52 @@ export async function reanchorPendingReviewAtNewHead(input: {
       continue;
     }
     if (p.newAnchor === undefined) continue;
-    // Emit thread.reanchored so the rail moves the marker.
-    try {
-      const method: "quote-exact" | "fuzzy" = p.outcome === "fuzzy" ? "fuzzy" : "quote-exact";
-      await appendAndPublish({
-        kind: "thread.reanchored",
-        actor,
-        threadId: p.threadId,
-        anchor: p.newAnchor,
-        method,
-        // Fuzzy score isn't threaded through the reanchor result
-        // — omit and the wire schema's `superRefine` accepts.
-      } as ReviewEventInput);
-    } catch {
-      /* fine */
+    // One thread can contain several pending replies. Move its local
+    // anchor once; each comment below keeps its own body/operation.
+    if (!reanchoredThreadIds.has(p.threadId)) {
+      try {
+        const method: "quote-exact" | "fuzzy" = p.outcome === "fuzzy" ? "fuzzy" : "quote-exact";
+        await appendAndPublish({
+          kind: "thread.reanchored",
+          actor,
+          threadId: p.threadId,
+          anchor: p.newAnchor,
+          method,
+        } as ReviewEventInput);
+        reanchoredThreadIds.add(p.threadId);
+      } catch {
+        /* fine */
+      }
     }
     const thread = await store.thread(p.threadId);
     if (thread === undefined) continue;
-    const body = thread.comments[0]?.body ?? "";
+    const body = thread.comments.find((comment) => comment.id === p.commentId)?.body;
+    if (body === undefined) continue;
+    const previousSync = state.commentSync.get(p.commentId);
+    const previousFingerprint = previousSync !== undefined && "fingerprint" in previousSync
+      ? previousSync.fingerprint
+      : undefined;
+    if (previousFingerprint?.replyThreadNodeId !== undefined) {
+      await appendAndPublish({
+        kind: "comment.sync_requested",
+        actor,
+        commentId: p.commentId,
+        path: p.newAnchor.path,
+        subjectType: "FILE",
+        bodyHash: await revisionOf(body),
+        replyThreadNodeId: previousFingerprint.replyThreadNodeId,
+        ...(previousFingerprint.knownCommentNodeIds !== undefined
+          ? { knownCommentNodeIds: [...previousFingerprint.knownCommentNodeIds] }
+          : {}),
+      });
+      newIntents++;
+      repositions.push({
+        localCommentId: p.commentId,
+        path: p.path,
+        outcome: p.outcome === "fuzzy" ? "fuzzy" : "moved",
+      });
+      continue;
+    }
     const mapping = mapAnchorForPending(p.newAnchor, review.options.files, body);
     if (mapping.kind === "orphan") {
       // Round-2 nit: an orphan mapping AFTER a reanchor must
@@ -903,7 +1007,7 @@ export async function reanchorPendingReviewAtNewHead(input: {
 
   // Run the reconciler now to actually post the new intents. The
   // reconciler opens a fresh pending review on GitHub as needed.
-  const reconcileOutcome = await reconcile({ review, store, actor, appendAndPublish });
+  const reconcileOutcome = await reconcile({ review, store, actor, appendAndPublish, allowMutations: true });
 
   return {
     abandonedReviewNodeId: oldReviewNodeId,

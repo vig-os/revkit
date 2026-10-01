@@ -679,7 +679,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           store,
           actor: localActor,
           appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, "boot-reconcile"),
+          allowMutations: false,
         });
+        await reconcileThreadStateIntents(reviewMode, false, "boot-thread-reconcile");
       } catch (error) {
         logger.warn("review.boot.reconcile-failed", {
           errorKind: (error as Error).name,
@@ -1303,7 +1305,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           await mirrorResolveOnGitHubThread({
             reviewMode,
             threadId,
-            resolve: true,
             requestId,
           });
         }
@@ -1327,7 +1328,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           await mirrorResolveOnGitHubThread({
             reviewMode,
             threadId,
-            resolve: false,
             requestId,
           });
         }
@@ -1753,6 +1753,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         store,
         actor: input.actor,
         appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, input.requestId),
+        allowMutations: true,
       });
       logger.info("review.mirror.reconciled", {
         requestId: input.requestId,
@@ -1796,15 +1797,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return "";
   }
 
-  /** M3 part 2b B4 two-way: mirror a local reply to a GitHub-
-   * imported thread. Reads the thread's external.github to get
-   * the thread's GraphQL node id, then calls the adapter's
-   * `addReviewThreadReply`. On success, appends a
-   * `comment.linked` for the local reply comment. On failure,
-   * appends `comment.sync_failed` so the rail surfaces a
-   * retryable "not on GitHub" state (round-2 nit — the local
-   * reply is already persisted, but silently swallowing the
-   * mirror failure hid the drift). */
+  /** Record a durable reply intent, then reconcile read-first. The
+   * local comment is the source body; comment.sync_requested stores
+   * the remote thread and pre-intent node ids so a restart can tell
+   * pre-accept failure from accepted-but-response-lost. */
   async function mirrorReplyToGitHubThread(input: {
     readonly reviewMode: ReviewModeHandle;
     readonly threadId: string;
@@ -1826,71 +1822,50 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return;
     }
     if (thread === undefined) return;
-    // Round-2 nit: the reply uses the imported thread's GraphQL
-    // node id (recorded on `Thread.external.threadId`) and posts
-    // through `addPullRequestReviewThreadReply` — pinned to the
-    // viewer's pending review when one exists (ADR-0025 (b)).
-    // Every imported thread now carries `external.provider =
-    // "github"` (round-2 BLOCK-fix 4), so the mirror fires for
-    // anchored imports too, not only for unanchored ones.
     const external = thread.external;
     if (external === undefined || external.provider !== "github") return;
-    // `external.threadId` is the GitHub review-thread node id
-    // (see `mapThreadsToEvents`). If a pending review is open for
-    // the viewer, PIN the reply to it (ADR-0025 (b)): a mid-review
-    // reply is a DRAFT that submits with the review, not a
-    // published comment that leaks out unpended.
-    const state = await input.reviewMode.readState(store);
-    const pendingReviewId = state.openPending?.reviewNodeId;
     try {
-      const posted = await input.reviewMode.options.adapter.addReviewThreadReply({
-        threadNodeId: external.threadId,
-        body: input.body,
-        ...(pendingReviewId !== undefined ? { pendingReviewId } : {}),
-      });
       await appendReviewLifecycleEvent(
         {
-          kind: "comment.linked",
+          kind: "comment.sync_requested",
           actor: input.actor,
           commentId: input.localCommentId,
-          external: {
-            github: {
-              commentId: posted.databaseId,
-              nodeId: posted.nodeId,
-              ...(pendingReviewId !== undefined ? { pending: true, reviewNodeId: pendingReviewId } : {}),
-            },
-          },
+          path: thread.anchor.path,
+          subjectType: "FILE",
+          bodyHash: await revisionOf(input.body),
+          replyThreadNodeId: external.threadId,
+          knownCommentNodeIds: thread.comments.flatMap((comment) => {
+            const nodeId = comment.external?.github?.nodeId;
+            return nodeId === undefined ? [] : [nodeId];
+          }),
         },
         input.requestId,
       );
-      logger.info("review.reply.mirrored", {
+      const outcome = await reconcile({
+        review: input.reviewMode,
+        store,
+        actor: input.actor,
+        appendAndPublish: async (event) => await appendReviewLifecycleEvent(event, input.requestId),
+        allowMutations: true,
+      });
+      logger.info("review.reply.reconciled", {
         requestId: input.requestId,
         threadId: input.threadId,
+        count: outcome.newlySynced.length,
       });
     } catch (error) {
-      if (
-        error instanceof ThreadStoreAppendError &&
-        (error.rejection.kind === "duplicate-link" ||
-          error.rejection.kind === "duplicate-external-id")
-      ) {
-        return;
-      }
-      logger.warn("review.reply.mirror-failed", {
+      logger.warn("review.reply.reconcile-failed", {
         requestId: input.requestId,
         threadId: input.threadId,
         errorKind: (error as Error).name,
       });
-      // Round-2 nit: emit `comment.sync_failed` so the rail sees a
-      // retryable "not on GitHub" state, instead of only a log
-      // line. The local reply is already persisted; failing the
-      // mirror silently was the drift the coordinator flagged.
       try {
         await appendReviewLifecycleEvent(
           {
             kind: "comment.sync_failed",
             actor: input.actor,
             commentId: input.localCommentId,
-            reason: `reply-mirror-failed:${(error as Error).name}`,
+            reason: `reply-reconcile-failed:${(error as Error).name}`,
           },
           input.requestId,
         );
@@ -1906,7 +1881,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   async function mirrorResolveOnGitHubThread(input: {
     readonly reviewMode: ReviewModeHandle;
     readonly threadId: string;
-    readonly resolve: boolean;
     readonly requestId: string;
   }): Promise<void> {
     let thread;
@@ -1924,12 +1898,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const external = thread.external;
     if (external === undefined || external.provider !== "github") return;
     try {
-      if (input.resolve) {
-        await input.reviewMode.options.adapter.resolveReviewThread({ threadNodeId: external.threadId });
-      } else {
-        await input.reviewMode.options.adapter.unresolveReviewThread({ threadNodeId: external.threadId });
-      }
-      logger.info("review.resolve.mirrored", {
+      await reconcileThreadStateIntents(input.reviewMode, true, input.requestId);
+      logger.info("review.resolve.reconciled", {
         requestId: input.requestId,
         threadId: input.threadId,
       });
@@ -1939,6 +1909,64 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         threadId: input.threadId,
         errorKind: (error as Error).name,
       });
+    }
+  }
+
+  /** Boot-time read-only healing for accepted resolve/reopen writes.
+   * A mismatch is left pending for the next cookie-authenticated
+   * action; a matching remote state advances only the local baseline. */
+  async function reconcileThreadStateIntents(
+    review: ReviewModeHandle,
+    allowMutations: boolean,
+    requestId: string,
+  ): Promise<void> {
+    const events = await store.since(0);
+    const pending = new Map<string, boolean>();
+    for (const event of events) {
+      if (event.kind === "thread.resolved" && event.actor.kind === "local") {
+        pending.set(event.threadId, true);
+      } else if (event.kind === "thread.reopened" && event.actor.kind === "local") {
+        pending.set(event.threadId, false);
+      } else if (event.kind === "thread.external_synced" && pending.get(event.threadId) === event.resolved) {
+        pending.delete(event.threadId);
+      }
+    }
+    if (pending.size === 0) return;
+
+    const remoteThreads = await review.options.adapter.listReviewThreads(review.options.pr);
+    const remoteById = new Map(remoteThreads.map((thread) => [thread.id, thread]));
+    for (const [threadId, desiredResolved] of pending) {
+      const thread = await store.thread(threadId);
+      if (thread === undefined) continue;
+      const external = thread.external;
+      if (external?.provider !== "github") continue;
+      const remote = remoteById.get(external.threadId);
+      if (remote === undefined) continue;
+      if (remote.isResolved !== desiredResolved) {
+        if (!allowMutations) continue;
+        if (desiredResolved) {
+          await review.options.adapter.resolveReviewThread({ threadNodeId: external.threadId });
+        } else {
+          await review.options.adapter.unresolveReviewThread({ threadNodeId: external.threadId });
+        }
+      }
+      try {
+        await appendReviewLifecycleEvent(
+          {
+            kind: "thread.external_synced",
+            actor: localActor,
+            threadId: thread.id,
+            resolved: desiredResolved,
+            ...(remote.resolvedByLogin !== null ? { resolvedByLogin: remote.resolvedByLogin } : {}),
+          },
+          requestId,
+        );
+      } catch (error) {
+        logger.warn("review.thread-reconcile-failed", {
+          threadId: thread.id,
+          errorKind: (error as Error).name,
+        });
+      }
     }
   }
 
@@ -2082,7 +2110,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             store,
             actor,
             appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+            allowMutations: true,
           });
+          await reconcileThreadStateIntents(reviewMode, true, requestId);
         } catch (error) {
           logger.warn("review.submit.reconcile-failed", {
             requestId,
@@ -2170,22 +2200,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         submitInFlight = false;
       }
     }
-    // POST /api/review/reconcile — session cookie or agent bearer.
-    // Idempotent read-first sync between the log and GitHub. Used
-    // by the rail's "retry" button and by daemon startup.
+    // POST /api/review/reconcile — session cookie ONLY. Although
+    // reconciliation reads before writing, it can still create a
+    // pending review or post drafts as the reviewer. ADR-0013 does
+    // not authorize the agent bearer to replay those mutations.
     if (url.pathname === "/api/review/reconcile" && method === "POST") {
-      // NOTE: reconcile is a READ-then-mutate that never approves
-      // or submits. Both actor kinds may invoke it — the mutations
-      // it can make are only "post the pending drafts the human
-      // already intended to post". An agent invoking reconcile
-      // does not cross the "no submit / no approve" line.
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.reconcile.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(JSON.stringify({ error: "agent-forbidden" }), { status: 403 }),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
       try {
         const outcome = await reconcile({
           review: reviewMode,
           store,
           actor,
           appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+          allowMutations: true,
         });
+        await reconcileThreadStateIntents(reviewMode, true, requestId);
         return jsonResponse({ ok: true, ...outcome, newlyFailed: [...outcome.newlyFailed] }, 201);
       } catch (error) {
         logger.warn("review.reconcile.failed", {
@@ -2194,6 +2233,49 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         });
         return internalServerError({ error: "reconcile-failed" });
       }
+    }
+
+    // POST /api/review/decline-repost — session cookie ONLY.
+    // Round-3 BLOCK-fix 1: when the pending review was deleted on
+    // GitHub, the reducer reverts the synced drafts to
+    // pending-sync. If the human chooses NOT to re-post them
+    // (rail's "Discard" on the deleted-on-github banner), we
+    // append `comment.sync_failed` with reason
+    // `user-declined-repost` for each stranded pending-sync.
+    // Clears the banner (which is gated on pending-sync +
+    // deleted-on-github terminal) without hitting GitHub.
+    if (url.pathname === "/api/review/decline-repost" && method === "POST") {
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.decline-repost.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(JSON.stringify({ error: "agent-forbidden" }), { status: 403 }),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const st = await reviewMode.readState(store);
+      let declined = 0;
+      for (const [commentId, syncState] of st.commentSync) {
+        if (syncState.kind !== "pending-sync") continue;
+        try {
+          await appendReviewLifecycleEvent(
+            {
+              kind: "comment.sync_failed",
+              actor,
+              commentId,
+              reason: "user-declined-repost",
+            },
+            requestId,
+          );
+          declined++;
+        } catch (err) {
+          void err; // duplicate — fine.
+        }
+      }
+      return jsonResponse({ ok: true, declined }, 201);
     }
 
     // POST /api/review/discard — session cookie ONLY. Deletes the
@@ -2349,7 +2431,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             store,
             actor,
             appendAndPublish: async (evt) => await appendReviewLifecycleEvent(evt, requestId),
+            allowMutations: true,
           });
+          await reconcileThreadStateIntents(reviewMode, true, requestId);
         } catch (error) {
           logger.warn("review.refresh.reconcile-failed", {
             requestId,

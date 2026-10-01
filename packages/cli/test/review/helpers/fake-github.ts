@@ -136,6 +136,14 @@ export interface FakeFetchOptions {
   readonly pendingState?: FakePendingState;
   readonly refuseAllWrites?: boolean;
   readonly blobs?: ReadonlyMap<string, string>;
+  /** Round-3 BLOCK-fix 2: live GitHub's `reviewThreads` query
+   * returns the viewer's OWN PENDING draft threads. Set this to
+   * true to have the fake mirror that behaviour — the dedupe
+   * path in `populateStoreFromPr` then treats the viewer's
+   * mirrored comment as already-linked instead of re-importing
+   * it as a duplicate. Off by default so tests that pre-date
+   * this behaviour keep their earlier expectations. */
+  readonly includePendingInReviewThreads?: boolean;
 }
 
 /** Mutable pending-review state the fake maintains across calls.
@@ -271,7 +279,70 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
           const name = vars.name as string | undefined;
           const num = vars.number as number | undefined;
           const pr = byNumber.get(`${owner}/${name}/${num}`);
-          return jsonResponse(threadsGraphqlBody(pr?.threads ?? []));
+          // Round-3 BLOCK-fix 2: live GitHub returns the viewer's
+          // own PENDING draft threads inside `reviewThreads` too.
+          // If the caller wired a `pending` state and it has
+          // drafts, project them onto the returned list so the
+          // dedupe path in `populateStoreFromPr` gets exercised.
+          const baseThreads = (pr?.threads ?? []).map((thread) => {
+            const latestResolution = pending?.resolutions
+              .filter((entry) => entry.threadNodeId === thread.id)
+              .at(-1);
+            const replies = pending?.replies
+              .filter((entry) => entry.threadNodeId === thread.id)
+              .map((entry) => ({
+                nodeId: entry.commentNodeId,
+                databaseId: entry.databaseId,
+                body: entry.body,
+                authorLogin: viewerLogin,
+                authorType: "User" as const,
+                createdAt: new Date().toISOString(),
+                url: `https://github.com/example/pull/1#discussion_r${entry.databaseId}`,
+                originalCommitOid: pending?.commitOid ?? null,
+                diffHunk: null,
+              })) ?? [];
+            return {
+              ...thread,
+              ...(latestResolution !== undefined
+                ? {
+                    isResolved: latestResolution.op === "resolve",
+                    resolvedByLogin: latestResolution.op === "resolve" ? viewerLogin : null,
+                  }
+                : {}),
+              comments: [...thread.comments, ...replies],
+            };
+          });
+          const draftThreads: GhReviewThread[] =
+            pending !== undefined && options.includePendingInReviewThreads === true
+              ? pending.drafts.map((d) => ({
+                  id: d.threadNodeId,
+                  path: d.path,
+                  isResolved: false,
+                  isOutdated: false,
+                  line: d.line ?? null,
+                  startLine: d.startLine ?? null,
+                  originalLine: d.line ?? null,
+                  originalStartLine: d.startLine ?? null,
+                  diffSide: (d.side ?? "RIGHT") as "RIGHT" | "LEFT",
+                  startDiffSide: null,
+                  subjectType: d.subjectType,
+                  resolvedByLogin: null,
+                  comments: [
+                    {
+                      nodeId: d.commentNodeId,
+                      databaseId: d.databaseId,
+                      body: d.body,
+                      authorLogin: viewerLogin,
+                      authorType: "User" as const,
+                      createdAt: new Date().toISOString(),
+                      url: `https://github.com/example/pull/1#discussion_r${d.databaseId}`,
+                      originalCommitOid: pending.commitOid ?? null,
+                      diffHunk: null,
+                    },
+                  ],
+                }))
+              : [];
+          return jsonResponse(threadsGraphqlBody([...baseThreads, ...draftThreads]));
         }
         case "FetchBlobText": {
           const expr = String(vars.expression ?? "");
@@ -341,6 +412,48 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
           return jsonResponse({
             data: { node: { __typename: "PullRequest", reviews: { nodes } } },
           });
+        }
+        case "GetReviewById": {
+          // Round-3 BLOCK-fix 3: return the single review named by
+          // `id` — no pagination. The reconciler uses this to
+          // resolve submitted-vs-deleted without scanning the PR's
+          // full review list.
+          if (pending === undefined) return jsonResponse({ data: { node: null } });
+          const rid = vars.id as string;
+          if (pending.reviewNodeId === rid) {
+            return jsonResponse({
+              data: {
+                node: {
+                  __typename: "PullRequestReview",
+                  id: rid,
+                  databaseId: 1,
+                  state: "PENDING",
+                  submittedAt: null,
+                  commit: { oid: pending.commitOid ?? "0".repeat(40) },
+                },
+              },
+            });
+          }
+          const submitted = pending.submits.find((s) => s.reviewNodeId === rid);
+          if (submitted !== undefined) {
+            const state =
+              submitted.event === "APPROVE" ? "APPROVED"
+                : submitted.event === "REQUEST_CHANGES" ? "CHANGES_REQUESTED"
+                : "COMMENTED";
+            return jsonResponse({
+              data: {
+                node: {
+                  __typename: "PullRequestReview",
+                  id: rid,
+                  databaseId: 2,
+                  state,
+                  submittedAt: new Date().toISOString(),
+                  commit: { oid: pending.commitOid ?? "0".repeat(40) },
+                },
+              },
+            });
+          }
+          return jsonResponse({ data: { node: null } });
         }
         case "ReviewComments": {
           // Serve back the drafts on the review named by `id`.
@@ -498,6 +611,9 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
           pending.reviewNodeId = null;
           pending.commitOid = null;
           pending.drafts.length = 0;
+          for (let i = pending.replies.length - 1; i >= 0; i--) {
+            if (pending.replies[i]?.pendingReviewId === deleteReviewId) pending.replies.splice(i, 1);
+          }
           return jsonResponse({
             data: { deletePullRequestReview: { pullRequestReview: { id: deleteReviewId, state: "DISMISSED" } } },
           });

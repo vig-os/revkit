@@ -301,7 +301,7 @@ describe("B2 — agent bearer never opens a new review; body drift is refused", 
       },
       body: "{}",
     });
-    expect(bearerReconcile.status).toBe(201);
+    expect(bearerReconcile.status).toBe(403);
     // No new pending review was created on the fake.
     expect(ctx.fake.reviewNodeId).toBe(before);
     expect(ctx.fake.reviewNodeId).toBeNull();

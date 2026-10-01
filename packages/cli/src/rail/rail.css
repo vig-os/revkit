@@ -757,6 +757,36 @@
   font-size: 0.8rem;
   color: var(--revkit-rail-fg);
 }
+.revkit-rail__review-deleted-remotely {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #b45309;
+  background: color-mix(in srgb, #b45309 10%, transparent);
+}
+.revkit-rail__review-deleted-remotely-summary {
+  margin: 0 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-deleted-remotely-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+.revkit-rail__review-deleted-remotely-repost,
+.revkit-rail__review-deleted-remotely-discard {
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.revkit-rail__review-deleted-remotely-repost:disabled,
+.revkit-rail__review-deleted-remotely-discard:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
 .revkit-rail__review-reanchor {
   padding: 0.3rem 0.6rem;
   border: 1px solid var(--revkit-rail-accent);

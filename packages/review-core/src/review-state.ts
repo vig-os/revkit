@@ -56,6 +56,7 @@ export type CommentSyncState =
       readonly reviewNodeId: string;
       readonly pendingCommentDatabaseId: number;
       readonly pendingCommentNodeId?: string;
+      readonly fingerprint?: SyncFingerprint;
     }
   | {
       readonly kind: "failed";
@@ -78,6 +79,8 @@ export interface SyncFingerprint {
   readonly line?: number;
   readonly startLine?: number;
   readonly bodyHash: string;
+  readonly replyThreadNodeId?: string;
+  readonly knownCommentNodeIds?: readonly string[];
 }
 
 /** One entry in the derived pending set — a local comment linked to
@@ -215,6 +218,38 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
           });
           openByNodeId.delete(event.reviewNodeId);
         }
+        // Round-3 BLOCK-fix 1 (deleted-on-github recovery): when
+        // the review was abandoned because GitHub deleted it, any
+        // comment we had SYNCED against that reviewNodeId is now
+        // stranded — it's still visible in the log but the draft
+        // it was linked to is gone. Revert those comments back to
+        // `pending-sync` so the rail can surface the recovery
+        // banner and a Re-post lands them on a fresh review.
+        if (event.reason === "deleted-on-github") {
+          for (const [cid, st] of syncState) {
+            if (st.kind === "synced" && st.reviewNodeId === event.reviewNodeId) {
+              const fingerprint = syncStateFingerprintForRevert(syncState, cid, st.requestedAtSeq, ordered);
+              syncState.set(cid, {
+                kind: "pending-sync",
+                requestedAtSeq: st.requestedAtSeq,
+                ...(fingerprint !== undefined ? { fingerprint } : {
+                  // No sync_requested was recorded — synthesise a
+                  // minimal fingerprint from the comment's own
+                  // metadata. `bodyHash` is empty here; the
+                  // reconciler's body-drift check will refuse a
+                  // retry until a fresh sync_requested lands. In
+                  // practice a synced comment always had a prior
+                  // sync_requested, so this branch is defensive.
+                  fingerprint: {
+                    path: "",
+                    subjectType: "FILE",
+                    bodyHash: "",
+                  },
+                }),
+              });
+            }
+          }
+        }
         break;
       }
       case "comment.linked": {
@@ -237,6 +272,9 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
               reviewNodeId: gh.reviewNodeId,
               pendingCommentDatabaseId: gh.commentId,
               ...(gh.nodeId !== undefined ? { pendingCommentNodeId: gh.nodeId } : {}),
+              ...(prev !== undefined && (prev.kind === "pending-sync" || prev.kind === "failed") && prev.fingerprint !== undefined
+                ? { fingerprint: prev.fingerprint }
+                : {}),
             });
             let path = commentPath.get(event.commentId);
             if (path === undefined) {
@@ -272,6 +310,8 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
           ...(event.side !== undefined ? { side: event.side } : {}),
           ...(event.line !== undefined ? { line: event.line } : {}),
           ...(event.startLine !== undefined ? { startLine: event.startLine } : {}),
+          ...(event.replyThreadNodeId !== undefined ? { replyThreadNodeId: event.replyThreadNodeId } : {}),
+          ...(event.knownCommentNodeIds !== undefined ? { knownCommentNodeIds: event.knownCommentNodeIds } : {}),
         };
         syncState.set(event.commentId, {
           kind: "pending-sync",
@@ -344,6 +384,57 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
   });
 
   return { openPending, terminal: terminalWithoutSeq, commentSync: syncState, unsyncedCommentIds };
+}
+
+/** Round-3 BLOCK-fix 1: walk the log to recover the fingerprint
+ * from the LATEST `comment.sync_requested` for a comment being
+ * reverted from `synced` back to `pending-sync` on a
+ * `deleted-on-github` abandon. Called only from within the
+ * reducer's own event walk, so it re-uses the already-sorted
+ * `ordered` view. Returns undefined when no sync_requested was
+ * recorded for that comment. */
+function syncStateFingerprintForRevert(
+  _syncState: ReadonlyMap<string, CommentSyncState>,
+  commentId: string,
+  requestedAtSeq: number,
+  ordered: readonly ReviewEvent[],
+): SyncFingerprint | undefined {
+  // Prefer a scan from the highest-seq downward that reaches the
+  // requestedAtSeq — the fingerprint of the intent that originally
+  // produced this sync-then-link cycle.
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    const e = ordered[i]!;
+    if (e.kind !== "comment.sync_requested" || e.commentId !== commentId) continue;
+    if (e.seq !== requestedAtSeq) continue;
+    return {
+      path: e.path,
+      subjectType: e.subjectType,
+      bodyHash: e.bodyHash,
+      ...(e.side !== undefined ? { side: e.side } : {}),
+      ...(e.line !== undefined ? { line: e.line } : {}),
+      ...(e.startLine !== undefined ? { startLine: e.startLine } : {}),
+      ...(e.replyThreadNodeId !== undefined ? { replyThreadNodeId: e.replyThreadNodeId } : {}),
+      ...(e.knownCommentNodeIds !== undefined ? { knownCommentNodeIds: e.knownCommentNodeIds } : {}),
+    };
+  }
+  // Fallback: any sync_requested for this comment (in case the
+  // requestedAtSeq marker drifted through a later re-sync).
+  for (let i = ordered.length - 1; i >= 0; i--) {
+    const e = ordered[i]!;
+    if (e.kind === "comment.sync_requested" && e.commentId === commentId) {
+      return {
+        path: e.path,
+        subjectType: e.subjectType,
+        bodyHash: e.bodyHash,
+        ...(e.side !== undefined ? { side: e.side } : {}),
+        ...(e.line !== undefined ? { line: e.line } : {}),
+        ...(e.startLine !== undefined ? { startLine: e.startLine } : {}),
+        ...(e.replyThreadNodeId !== undefined ? { replyThreadNodeId: e.replyThreadNodeId } : {}),
+        ...(e.knownCommentNodeIds !== undefined ? { knownCommentNodeIds: e.knownCommentNodeIds } : {}),
+      };
+    }
+  }
+  return undefined;
 }
 
 /** A pending review is `stale` when its opened `headSha` differs

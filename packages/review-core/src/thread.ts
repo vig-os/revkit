@@ -77,6 +77,13 @@ export const commentSchema = z
     author: authorSchema,
     body: z.string().min(1),
     createdAt: isoTimestamp,
+    /** Round-3 (nit): timestamp of the last `comment.edited` event
+     * for this comment, absent when the comment has not been
+     * edited. The rail shows an "edited" marker when this is
+     * present; a reply prompts an "edited after your reply"
+     * hint when its parent's `editedAt` is later than the
+     * reply's `createdAt`. */
+    editedAt: isoTimestamp.optional(),
     external: externalRefSchema.optional(),
     /** M2 item 6 round 2: typed mentions parsed on the daemon at
      * append time (see `commentMentionSchema` in `./events.ts`).

@@ -63,6 +63,15 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     kind: "thread.reopened",
     threadId: "th-1",
   },
+  "thread.external_synced": {
+    seq: 5,
+    ts: t,
+    actor,
+    kind: "thread.external_synced",
+    threadId: "th-1",
+    resolved: true,
+    resolvedByLogin: "gerchowl",
+  },
   handover: {
     seq: 5,
     ts: t,

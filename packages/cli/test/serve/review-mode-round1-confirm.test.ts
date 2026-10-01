@@ -173,15 +173,15 @@ async function postComment(ctx: Ctx, body: string, suffix: string, auth: "cookie
 // R1: agent-bearer 403 on every /api/review/* write route.
 // ────────────────────────────────────────────────────────────────
 describe("R1 — agent bearer is 403 on all review write routes", () => {
-  // The reconcile endpoint intentionally accepts the agent
-  // bearer — the reconciler is a repair path a channel client
-  // might call after a network hiccup. Every OTHER write route
-  // rejects an agent bearer with 403 agent-forbidden.
+  // Every mutation-capable review route requires the browser's
+  // session cookie. Reconcile can post drafts, so the agent bearer
+  // is not a safe repair credential.
   const routes = [
     { path: "/api/review/submit", method: "POST" as const },
     { path: "/api/review/discard", method: "POST" as const },
     { path: "/api/review/refresh", method: "POST" as const },
     { path: "/api/review/reanchor", method: "POST" as const },
+    { path: "/api/review/reconcile", method: "POST" as const },
   ];
   for (const r of routes) {
     test(`${r.method} ${r.path} with agent bearer → 403 agent-forbidden`, async () => {

@@ -97,17 +97,18 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       return;
     }
     case "comment.edited": {
-      // Round-2 BLOCK-fix 3: update the referenced comment's body.
-      // We walk every thread to find it — a `commentId` is unique
-      // across the log by construction. `remoteUpdatedAt` is
-      // treated as an idempotency marker at the emitter, so the
-      // reducer trusts what it's handed.
+      // Round-2 BLOCK-fix 3 + round-3 nit: update the referenced
+      // comment's body AND stamp `editedAt` so the rail can show
+      // an "edited" marker. We walk every thread to find it — a
+      // `commentId` is unique across the log by construction.
+      // `remoteUpdatedAt` is treated as an idempotency marker at
+      // the emitter, so the reducer trusts what it's handed.
       for (const [tid, thread] of threads) {
         const idx = thread.comments.findIndex((c) => c.id === event.commentId);
         if (idx < 0) continue;
         const nextComments = thread.comments.slice();
         const existing = nextComments[idx]!;
-        nextComments[idx] = { ...existing, body: event.body };
+        nextComments[idx] = { ...existing, body: event.body, editedAt: event.ts };
         threads.set(tid, {
           ...thread,
           comments: nextComments,
@@ -156,6 +157,22 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       threads.set(event.threadId, {
         ...rest,
         status: nextStatus,
+        updatedAt: event.ts,
+      });
+      return;
+    }
+    case "thread.external_synced": {
+      const thread = threads.get(event.threadId);
+      if (thread === undefined || thread.external?.provider !== "github") return;
+      const { resolvedByLogin: _previousResolver, ...external } = thread.external;
+      void _previousResolver;
+      threads.set(event.threadId, {
+        ...thread,
+        external: {
+          ...external,
+          resolved: event.resolved,
+          ...(event.resolvedByLogin !== undefined ? { resolvedByLogin: event.resolvedByLogin } : {}),
+        },
         updatedAt: event.ts,
       });
       return;
