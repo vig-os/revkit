@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nudge a stalled revkit run: if the coordinator pane has been idle for too long (a subagent hung, a notification was
+# Nudge a stalled revkit run: if the coordinator pane has been quiescent too long (a subagent hung, a notification was
 # lost, a usage limit passed), type the resume prompt. Single instance per run dir; exits on STOP or DONE.
 # Never exits on a transient flk/jq failure: that is the situation it exists to survive.
 #
@@ -19,12 +19,14 @@ log "started for $pane"
 
 while ! halted; do
   sleep "$poll_secs"
-  agent=$(flk agent get "$pane" 2>/dev/null | jq -ce '.result.agent // .result' 2>/dev/null) || continue
+  halted && break
+  agent=$(get_agent "$pane") || continue
   status=$(jq -r '.agent_status // empty' <<<"$agent")
   age=$(jq -r '.status_age_secs // 0 | floor' <<<"$agent" 2>/dev/null)
   [[ "$age" =~ ^[0-9]+$ ]] || continue
-  if [[ "$status" == idle && "$age" -ge "$idle_limit_secs" ]]; then
-    type_line "$pane" "$resume" && log "nudged (idle ${age}s)"
+  if is_quiescent "$status" && [[ "$age" -ge "$idle_limit_secs" ]]; then
+    halted && break
+    type_line "$pane" "$resume" && log "nudged (quiescent ${age}s)"
   fi
 done
 log "exit (STOP or DONE)"

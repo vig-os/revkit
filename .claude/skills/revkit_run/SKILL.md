@@ -2,7 +2,7 @@
 name: revkit_run
 description: >-
   Unattended "ralph" loop that works through revkit's accepted plan (milestones M1…, DESIGN-0001, ADRs) one chunk at a
-  time inside an interactive Claude session in a flock pane: build via subagent, fresh-context review, fix, merge into
+  time inside an interactive agent session in a flock pane: build via subagent, fresh-context review, fix, merge into
   dev, tick the tracking issue, update .revkit/run/HANDOFF.md, then self-compact through flock and resume. Use when
   asked to run, continue or resume the revkit plan unattended, or when a resume prompt names this skill.
 ---
@@ -11,7 +11,8 @@ description: >-
 
 State lives in **`.revkit/run/HANDOFF.md`** (gitignored) and on GitHub (milestone tracking issues and their
 checklists). Never in conversation memory alone: every chunk ends with a self-compaction, so write down what the next
-iteration needs.
+iteration needs. The coordinator supports Claude Code (`idle` after a turn) and OpenCode (`done` after a turn); both
+states are treated as quiescent before the helper types into the pane.
 
 ## Starting a run
 
@@ -54,7 +55,7 @@ A chunk is one checklist item of the current milestone's tracking issue (e.g. #6
      >/dev/null 2>&1 &
    ```
 
-   It waits until this pane is idle, types `/compact …`, waits again, then types the resume prompt.
+   It waits until this pane is quiescent, types `/compact …`, waits again, then types the resume prompt.
 
 ## Boundaries (unattended)
 
@@ -68,7 +69,7 @@ A chunk is one checklist item of the current milestone's tracking issue (e.g. #6
 
 ## Watchdog
 
-`watchdog.sh` (started above, one instance per run dir) types a nudge when the pane has been idle for
+`watchdog.sh` (started above, one instance per run dir) types a nudge when the pane has been quiescent for
 45 min (hung subagent, lost notification, usage limit). On a nudge: check running subagents (never spawn a duplicate),
 their branches and PRs, then continue from HANDOFF.md. When the goal is reached or nothing unblocked is left,
 `touch .revkit/run/DONE` so the watchdog exits, then `flk notification`.
