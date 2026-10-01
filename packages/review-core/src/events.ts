@@ -193,6 +193,9 @@ const threadExternalSyncedPayload = {
   kind: z.literal("thread.external_synced"),
   threadId: idSchema,
   resolved: z.boolean(),
+  /** Seq of the local thread.resolved/thread.reopened intent this
+   * completion acknowledges. Remote observations have no intentSeq. */
+  intentSeq: z.number().int().positive().optional(),
   resolvedByLogin: z.string().min(1).optional(),
 } as const;
 
@@ -455,6 +458,15 @@ const commentSyncFailedPayload = {
   reason: z.string().min(1).max(512),
 } as const;
 
+/** The reviewer explicitly declined recovery of one sync intent.
+ * Correlation to requestedAtSeq prevents a delayed decline from
+ * cancelling a newer explicit sync request for the same comment. */
+const commentSyncCancelledPayload = {
+  kind: z.literal("comment.sync_cancelled"),
+  commentId: idSchema,
+  requestedAtSeq: z.number().int().positive(),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
@@ -515,6 +527,7 @@ const eventVariants = [
   z.object({ ...envelope, ...reviewAbandonedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncRequestedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncFailedPayload }).strict(),
+  z.object({ ...envelope, ...commentSyncCancelledPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -553,6 +566,7 @@ export const reviewEventKinds = [
   "review.abandoned",
   "comment.sync_requested",
   "comment.sync_failed",
+  "comment.sync_cancelled",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

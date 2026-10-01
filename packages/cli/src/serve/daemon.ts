@@ -1921,21 +1921,25 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     requestId: string,
   ): Promise<void> {
     const events = await store.since(0);
-    const pending = new Map<string, boolean>();
+    const pending = new Map<string, { readonly desiredResolved: boolean; readonly intentSeq: number }>();
     for (const event of events) {
       if (event.kind === "thread.resolved" && event.actor.kind === "local") {
-        pending.set(event.threadId, true);
+        pending.set(event.threadId, { desiredResolved: true, intentSeq: event.seq });
       } else if (event.kind === "thread.reopened" && event.actor.kind === "local") {
-        pending.set(event.threadId, false);
-      } else if (event.kind === "thread.external_synced" && pending.get(event.threadId) === event.resolved) {
-        pending.delete(event.threadId);
+        pending.set(event.threadId, { desiredResolved: false, intentSeq: event.seq });
+      } else if (event.kind === "thread.external_synced" && event.intentSeq !== undefined) {
+        const intent = pending.get(event.threadId);
+        if (intent?.intentSeq === event.intentSeq && intent.desiredResolved === event.resolved) {
+          pending.delete(event.threadId);
+        }
       }
     }
     if (pending.size === 0) return;
 
     const remoteThreads = await review.options.adapter.listReviewThreads(review.options.pr);
     const remoteById = new Map(remoteThreads.map((thread) => [thread.id, thread]));
-    for (const [threadId, desiredResolved] of pending) {
+    for (const [threadId, intent] of pending) {
+      const { desiredResolved, intentSeq } = intent;
       const thread = await store.thread(threadId);
       if (thread === undefined) continue;
       const external = thread.external;
@@ -1957,6 +1961,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             actor: localActor,
             threadId: thread.id,
             resolved: desiredResolved,
+            intentSeq,
             ...(remote.resolvedByLogin !== null ? { resolvedByLogin: remote.resolvedByLogin } : {}),
           },
           requestId,
@@ -2240,10 +2245,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // GitHub, the reducer reverts the synced drafts to
     // pending-sync. If the human chooses NOT to re-post them
     // (rail's "Discard" on the deleted-on-github banner), we
-    // append `comment.sync_failed` with reason
-    // `user-declined-repost` for each stranded pending-sync.
-    // Clears the banner (which is gated on pending-sync +
-    // deleted-on-github terminal) without hitting GitHub.
+    // append a correlated terminal cancellation for each stranded
+    // intent. Cancelled intents are excluded from reconciliation and
+    // the submit gate across restarts; unlike sync_failed they are
+    // never retried implicitly.
     if (url.pathname === "/api/review/decline-repost" && method === "POST") {
       if (hasValidBearer && actor.kind === "agent") {
         logger.warn("review.decline-repost.rejected.agent-bearer", { requestId });
@@ -2263,10 +2268,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         try {
           await appendReviewLifecycleEvent(
             {
-              kind: "comment.sync_failed",
+              kind: "comment.sync_cancelled",
               actor,
               commentId,
-              reason: "user-declined-repost",
+              requestedAtSeq: syncState.requestedAtSeq,
             },
             requestId,
           );

@@ -34,13 +34,18 @@ import type { Comment, Thread } from "./thread.ts";
 export function reduce(events: readonly ReviewEvent[]): Map<string, Thread> {
   const ordered = [...events].sort((a, b) => a.seq - b.seq);
   const threads = new Map<string, Thread>();
+  const latestLocalThreadIntentSeq = new Map<string, number>();
   for (const event of ordered) {
-    applyEvent(threads, event);
+    applyEvent(threads, event, latestLocalThreadIntentSeq);
   }
   return threads;
 }
 
-function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
+function applyEvent(
+  threads: Map<string, Thread>,
+  event: ReviewEvent,
+  latestLocalThreadIntentSeq: Map<string, number>,
+): void {
   switch (event.kind) {
     case "comment.created": {
       if (threads.has(event.threadId)) return;
@@ -138,6 +143,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         resolvedAt: event.ts,
         updatedAt: event.ts,
       });
+      if (event.actor.kind === "local") latestLocalThreadIntentSeq.set(event.threadId, event.seq);
       return;
     }
     case "thread.reopened": {
@@ -159,11 +165,16 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         status: nextStatus,
         updatedAt: event.ts,
       });
+      if (event.actor.kind === "local") latestLocalThreadIntentSeq.set(event.threadId, event.seq);
       return;
     }
     case "thread.external_synced": {
       const thread = threads.get(event.threadId);
       if (thread === undefined || thread.external?.provider !== "github") return;
+      if (
+        event.intentSeq !== undefined &&
+        latestLocalThreadIntentSeq.get(event.threadId) !== event.intentSeq
+      ) return;
       const { resolvedByLogin: _previousResolver, ...external } = thread.external;
       void _previousResolver;
       threads.set(event.threadId, {

@@ -68,6 +68,11 @@ export type CommentSyncState =
        * GitHub. Absent only when a failed event lands with no
        * preceding sync_requested (defensive path). */
       readonly fingerprint?: SyncFingerprint;
+    }
+  | {
+      readonly kind: "cancelled";
+      readonly requestedAtSeq: number;
+      readonly cancelledAtSeq: number;
     };
 
 /** Data the reconciler needs to fingerprint a pending draft on
@@ -261,6 +266,7 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
           const open = openByNodeId.get(gh.reviewNodeId);
           if (open !== undefined) {
             const prev = syncState.get(event.commentId);
+            if (prev?.kind === "cancelled") break;
             const requestedAtSeq =
               prev !== undefined && (prev.kind === "pending-sync" || prev.kind === "failed" || prev.kind === "synced")
                 ? prev.requestedAtSeq
@@ -322,6 +328,7 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
       }
       case "comment.sync_failed": {
         const prev = syncState.get(event.commentId);
+        if (prev?.kind === "cancelled") break;
         const requestedAtSeq =
           prev !== undefined && (prev.kind === "pending-sync" || prev.kind === "failed" || prev.kind === "synced")
             ? prev.requestedAtSeq
@@ -341,6 +348,21 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
           reason: event.reason,
           ...(preservedFingerprint !== undefined ? { fingerprint: preservedFingerprint } : {}),
         });
+        break;
+      }
+      case "comment.sync_cancelled": {
+        const prev = syncState.get(event.commentId);
+        if (
+          prev !== undefined &&
+          (prev.kind === "pending-sync" || prev.kind === "failed" || prev.kind === "synced") &&
+          prev.requestedAtSeq === event.requestedAtSeq
+        ) {
+          syncState.set(event.commentId, {
+            kind: "cancelled",
+            requestedAtSeq: event.requestedAtSeq,
+            cancelledAtSeq: event.seq,
+          });
+        }
         break;
       }
       default:

@@ -697,7 +697,8 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       return { ok: true };
     }
     case "comment.sync_requested":
-    case "comment.sync_failed": {
+    case "comment.sync_failed":
+    case "comment.sync_cancelled": {
       // The comment must exist. Cross-review lifecycle is enforced
       // by the reducer / derived view — a sync_requested on an
       // already-terminal review is dead intent, not a validator

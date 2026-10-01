@@ -179,6 +179,35 @@ describe("reduceReviewState (M3 part 2b)", () => {
     expect(state.openPending).toBeNull();
   });
 
+  test("a correlated cancellation is terminal until a newer explicit sync request", () => {
+    const requested = {
+      seq: 2,
+      ts: t,
+      actor: localActor,
+      kind: "comment.sync_requested" as const,
+      commentId: "c-1",
+      path: "docs/index.md",
+      subjectType: "FILE" as const,
+      bodyHash: REV_B,
+    };
+    const base: ReviewEvent[] = [
+      commentCreated(1, "th-1", "c-1", "docs/index.md"),
+      requested,
+      { seq: 3, ts: t, actor: localActor, kind: "comment.sync_cancelled", commentId: "c-1", requestedAtSeq: 2 },
+      { seq: 4, ts: t, actor: localActor, kind: "comment.sync_failed", commentId: "c-1", reason: "late-failure" },
+    ];
+    const cancelled = reduceReviewState(base);
+    expect(cancelled.commentSync.get("c-1")).toEqual({ kind: "cancelled", requestedAtSeq: 2, cancelledAtSeq: 3 });
+    expect(cancelled.unsyncedCommentIds).toEqual([]);
+
+    const retried = reduceReviewState([
+      ...base,
+      { ...requested, seq: 5, bodyHash: REV_A },
+    ]);
+    expect(retried.commentSync.get("c-1")?.kind).toBe("pending-sync");
+    expect(retried.unsyncedCommentIds).toEqual(["c-1"]);
+  });
+
   test("isPendingReviewStale detects a head move", () => {
     expect(isPendingReviewStale(null, HEAD_A)).toBe(false);
     expect(isPendingReviewStale({ reviewNodeId: "R", headSha: HEAD_A, comments: [] }, HEAD_A)).toBe(false);

@@ -765,6 +765,7 @@ export async function reanchorPendingReviewAtNewHead(input: {
     readonly path: string;
     readonly newAnchor?: Anchor;
     readonly outcome: "moved" | "fuzzy" | "orphaned";
+    readonly score?: number;
     readonly reason?: string;
   }
   const perComment: Reposition[] = [];
@@ -843,6 +844,7 @@ export async function reanchorPendingReviewAtNewHead(input: {
         path: oldAnchor.path,
         newAnchor,
         outcome: result.kind === "fuzzy" ? "fuzzy" : "moved",
+        ...(result.kind === "fuzzy" ? { score: result.score } : {}),
       });
     } else {
       perComment.push({
@@ -926,19 +928,26 @@ export async function reanchorPendingReviewAtNewHead(input: {
     // One thread can contain several pending replies. Move its local
     // anchor once; each comment below keeps its own body/operation.
     if (!reanchoredThreadIds.has(p.threadId)) {
-      try {
-        const method: "quote-exact" | "fuzzy" = p.outcome === "fuzzy" ? "fuzzy" : "quote-exact";
+      if (p.outcome === "fuzzy") {
+        if (p.score === undefined) throw new Error("fuzzy re-anchor result is missing its score");
         await appendAndPublish({
           kind: "thread.reanchored",
           actor,
           threadId: p.threadId,
           anchor: p.newAnchor,
-          method,
-        } as ReviewEventInput);
-        reanchoredThreadIds.add(p.threadId);
-      } catch {
-        /* fine */
+          method: "fuzzy",
+          score: p.score,
+        });
+      } else {
+        await appendAndPublish({
+          kind: "thread.reanchored",
+          actor,
+          threadId: p.threadId,
+          anchor: p.newAnchor,
+          method: "quote-exact",
+        });
       }
+      reanchoredThreadIds.add(p.threadId);
     }
     const thread = await store.thread(p.threadId);
     if (thread === undefined) continue;

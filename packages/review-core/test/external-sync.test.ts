@@ -43,6 +43,7 @@ describe("thread.external_synced", () => {
       actor,
       threadId: "thread-1",
       resolved: true,
+      intentSeq: 2,
       resolvedByLogin: "reviewer",
     }));
 
@@ -72,11 +73,45 @@ describe("thread.external_synced", () => {
       actor,
       threadId: "thread-1",
       resolved: false,
+      intentSeq: 3,
     }));
 
     const thread = reduce(events).get("thread-1");
     expect(thread?.status).toBe("open");
     expect(thread?.external?.resolved).toBe(false);
     expect(thread?.external?.resolvedByLogin).toBeUndefined();
+  });
+
+  test("a stale completion cannot overwrite the baseline for a newer opposite intent", () => {
+    const events = baseEvents();
+    events.push(reviewEventSchema.parse({
+      kind: "thread.reopened",
+      seq: 3,
+      ts: "2026-10-01T00:00:02.000Z",
+      actor,
+      threadId: "thread-1",
+    }));
+    events.push(reviewEventSchema.parse({
+      kind: "thread.external_synced",
+      seq: 4,
+      ts: "2026-10-01T00:00:03.000Z",
+      actor,
+      threadId: "thread-1",
+      resolved: false,
+      intentSeq: 3,
+    }));
+    events.push(reviewEventSchema.parse({
+      kind: "thread.external_synced",
+      seq: 5,
+      ts: "2026-10-01T00:00:04.000Z",
+      actor,
+      threadId: "thread-1",
+      resolved: true,
+      intentSeq: 2,
+    }));
+
+    const thread = reduce(events).get("thread-1");
+    expect(thread?.status).toBe("open");
+    expect(thread?.external?.resolved).toBe(false);
   });
 });

@@ -244,7 +244,7 @@ interface RailReviewState {
     readonly commentSync?: ReadonlyArray<{
       readonly commentId: string;
       readonly state: {
-        readonly kind: "not-attempted" | "pending-sync" | "synced" | "failed";
+        readonly kind: "not-attempted" | "pending-sync" | "synced" | "failed" | "cancelled";
         readonly reason?: string;
       };
     }>;
@@ -1530,11 +1530,9 @@ function Rail(): JSX.Element {
                       setReviewBusy(true);
                       setError(undefined);
                       try {
-                        // POST /api/review/decline-repost — marks
-                        // every stranded pending-sync as failed
-                        // with reason "user-declined-repost" so
-                        // the banner clears. There is no pending
-                        // review to delete on GitHub here.
+                        // POST /api/review/decline-repost durably
+                        // cancels every stranded intent. There is no
+                        // pending review to delete on GitHub here.
                         const url = new URL(location.href);
                         const response = await fetch(new URL("/api/review/decline-repost", url.origin), {
                           method: "POST",

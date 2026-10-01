@@ -70,6 +70,7 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     kind: "thread.external_synced",
     threadId: "th-1",
     resolved: true,
+    intentSeq: 3,
     resolvedByLogin: "gerchowl",
   },
   handover: {
@@ -198,6 +199,14 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     kind: "comment.sync_failed",
     commentId: "c-1",
     reason: "adapter-rate-limited",
+  },
+  "comment.sync_cancelled": {
+    seq: 17,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "comment.sync_cancelled",
+    commentId: "c-1",
+    requestedAtSeq: 15,
   },
 };
 
