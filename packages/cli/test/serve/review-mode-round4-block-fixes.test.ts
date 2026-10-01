@@ -81,6 +81,11 @@ async function startCtx(overrides?: {
   failBeforeOnce?: string;
   loseResponseOnce?: string;
   rejectOperation?: string;
+  delayAfterAcceptOnce?: {
+    operation: string;
+    onAccepted: () => void;
+    wait: Promise<void>;
+  };
 }): Promise<Ctx> {
   const root = mkdtempSync(join(tmpdir(), "revkit-r4b-"));
   tempDirs.push(root);
@@ -117,6 +122,13 @@ async function startCtx(overrides?: {
       if (overrides?.failBeforeOnce !== undefined) throw new Error("injected-before-accept");
       await fakeFetch(input, init);
       throw new Error("injected-response-lost");
+    }
+    if (!injected && overrides?.delayAfterAcceptOnce !== undefined && body.includes(`mutation ${overrides.delayAfterAcceptOnce.operation}`)) {
+      injected = true;
+      const response = await fakeFetch(input, init);
+      overrides.delayAfterAcceptOnce.onAccepted();
+      await overrides.delayAfterAcceptOnce.wait;
+      return response;
     }
     return await fakeFetch(input, init);
   }) as typeof fetch;
@@ -378,8 +390,8 @@ describe("B1 — deleted-on-github recovery: strands revert to pending-sync + Re
     expect(stillStranded.length).toBe(0);
   });
 
-  test("Decline: /api/review/decline-repost clears the banner (marks pending-sync as failed)", async () => {
-    const ctx = await startCtx();
+  test("Decline durably cancels the intent across reconcile, restart and later submit", async () => {
+    let ctx = await startCtx();
     await postComment(ctx, "draft a", "b1-d-a");
     const reviewId = ctx.fake.reviewNodeId!;
     const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
@@ -415,8 +427,33 @@ describe("B1 — deleted-on-github recovery: strands revert to pending-sync + Re
     const decBody = (await decline.json()) as { declined: number };
     expect(decBody.declined).toBe(1);
     state = await readState(ctx);
-    const stillPending = (state.state.commentSync ?? []).filter((c) => c.state.kind === "pending-sync");
-    expect(stillPending.length).toBe(0);
+    expect(state.state.unsyncedCommentIds).toEqual([]);
+    expect(state.state.commentSync?.find((entry) => entry.commentId === "c-b1-d-a")?.state.kind).toBe("cancelled");
+
+    ctx = await restartCtx(ctx);
+    await Bun.sleep(50);
+    expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
+    expect(ctx.fake.reviewNodeId).toBeNull();
+    expect(ctx.fake.drafts).toHaveLength(0);
+
+    const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(ctx.fake.reviewNodeId).toBeNull();
+    expect(ctx.fake.drafts).toHaveLength(0);
+
+    await postComment(ctx, "new intentional draft", "after-decline");
+    expect(ctx.fake.drafts.map((draft) => draft.body)).toEqual(["new intentional draft"]);
+    const submit = await fetch(`${ctx.handle.url}/api/review/submit`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: JSON.stringify({ event: "COMMENT" }),
+    });
+    expect(submit.status).toBe(201);
+    expect(ctx.fake.submits).toHaveLength(1);
   });
 });
 
@@ -459,6 +496,36 @@ describe("B2 — dedupe on GitHub node id: locally-authored replies do not re-im
     expect(threads).toHaveLength(1);
     expect(threads[0]?.comments).toHaveLength(1);
     expect(threads[0]?.comments[0]?.id).toBe("c-b2-local");
+    store.close();
+  });
+
+  test("an actual local reply keeps its local id after the same GitHub node is imported twice", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_own_reply")] });
+    const imported = await refreshAndReadImportedThread(ctx);
+    const localReplyId = "reply-own-refresh";
+    const reply = await fetch(`${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/replies`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: JSON.stringify({ commentId: localReplyId, parentId: imported.parentId, body: "actual local reply" }),
+    });
+    expect(reply.status).toBe(201);
+    expect(ctx.fake.replies).toHaveLength(1);
+
+    for (let i = 0; i < 2; i++) {
+      const refresh = await fetch(`${ctx.handle.url}/api/review/refresh`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+        body: "{}",
+      });
+      expect([200, 201]).toContain(refresh.status);
+    }
+
+    await ctx.handle.stop();
+    const { SqliteThreadStore } = await import("../../src/serve/sqlite-store.ts");
+    const store = SqliteThreadStore.open({ filename: join(ctx.root, "threads.sqlite") });
+    const thread = await store.thread(imported.id);
+    expect(thread?.comments.map((comment) => comment.id)).toEqual([imported.parentId, localReplyId]);
+    expect(thread?.comments.filter((comment) => comment.body === "actual local reply")).toHaveLength(1);
     store.close();
   });
 });
@@ -664,6 +731,140 @@ describe("B4 — durable reply and resolve intents", () => {
     });
     expect(retry.status).toBe(201);
     expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_reopen_pre", op: "unresolve" }]);
+  });
+
+  for (const scenario of [
+    { first: "resolve" as const, second: "reopen" as const, initialResolved: false, delayedOperation: "ResolveReviewThread", expectedResolved: false },
+    { first: "reopen" as const, second: "resolve" as const, initialResolved: true, delayedOperation: "UnresolveReviewThread", expectedResolved: true },
+  ]) {
+    test(`a delayed ${scenario.first} completion cannot clear a newer ${scenario.second} intent`, async () => {
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      let accepted!: () => void;
+      const acceptedPromise = new Promise<void>((resolve) => { accepted = resolve; });
+      const remote = {
+        ...importedThread(`PRT_race_${scenario.first}`),
+        isResolved: scenario.initialResolved,
+        resolvedByLogin: scenario.initialResolved ? "other-reviewer" : null,
+      };
+      let ctx = await startCtx({
+        threads: [remote],
+        delayAfterAcceptOnce: { operation: scenario.delayedOperation, onAccepted: accepted, wait },
+      });
+      const imported = await refreshAndReadImportedThread(ctx);
+      const mutate = (operation: "resolve" | "reopen") => fetch(
+        `${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/${operation}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+          body: "{}",
+        },
+      );
+
+      const first = mutate(scenario.first);
+      await acceptedPromise;
+      const second = await mutate(scenario.second);
+      expect(second.status).toBe(201);
+      release();
+      expect((await first).status).toBe(201);
+
+      ctx = await restartCtx(ctx);
+      await Bun.sleep(50);
+      const before = ctx.fake.resolutions.length;
+      const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+        body: "{}",
+      });
+      expect(reconcile.status).toBe(201);
+      expect(ctx.fake.resolutions).toHaveLength(before);
+      const list = await fetch(`${ctx.handle.url}/api/threads`, {
+        headers: { cookie: ctx.cookie, "sec-fetch-site": "same-origin" },
+      });
+      const body = (await list.json()) as { threads: Array<{ id: string; status: string; external?: { resolved: boolean } }> };
+      const thread = body.threads.find((candidate) => candidate.id === imported.id);
+      expect(thread?.status).toBe(scenario.expectedResolved ? "resolved" : "open");
+      expect(thread?.external?.resolved).toBe(scenario.expectedResolved);
+    });
+  }
+
+  test("fuzzy head-move persists the scored local anchor and reposts at the same location", async () => {
+    const root = mkdtempSync(join(tmpdir(), "revkit-r4-fuzzy-reanchor-"));
+    tempDirs.push(root);
+    const oldSource = "prelude paragraph\n\nthe target phrase lives here\n\ntrailer paragraph\n";
+    const newSource = oldSource.replace("target", "modified");
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "docs/index.md"), newSource);
+    const pending = makePendingState();
+    pending.reviewNodeId = "PRR_fuzzy_old";
+    pending.commitOid = HEAD_A;
+    pending.drafts.push({
+      threadNodeId: "PRT_fuzzy_old", commentNodeId: "PRRC_fuzzy_old", databaseId: 901,
+      path: "docs/index.md", body: "fuzzy body", line: 3, side: "RIGHT", subjectType: "LINE",
+    });
+    const fakeFetch = makeFakeGithubFetch([{
+      owner: "vig-os", repo: "revkit", pullNumber: 42, headSha: HEAD_B,
+      baseSha: "b".repeat(40), baseRef: "main", headRef: "test-head", title: "fuzzy",
+      nodeId: "PR_42", state: "open", headRepoFullName: "vig-os/revkit",
+      baseRepoFullName: "vig-os/revkit", url: "https://github.com/vig-os/revkit/pull/42",
+    }], { pendingState: pending, viewerLogin: "test-reviewer", blobs: new Map([[`${HEAD_B}:docs/index.md`, newSource]]) });
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: fakeFetch });
+    const { SqliteThreadStore } = await import("../../src/serve/sqlite-store.ts");
+    const store = SqliteThreadStore.open({ filename: join(root, "threads.sqlite") });
+    const actor = { kind: "local" as const, id: "reviewer", displayName: "Reviewer" };
+    const revision = await revisionOf(oldSource);
+    await store.append({
+      kind: "comment.created", actor, threadId: "thread-fuzzy", commentId: "comment-fuzzy",
+      anchor: {
+        path: "docs/index.md", startLine: 3, endLine: 3,
+        quote: { exact: "the target phrase lives here", prefix: "prelude paragraph\n\n", suffix: "\n\ntrailer paragraph\n" },
+        revision,
+      },
+      body: "fuzzy body",
+    });
+    await store.append({ kind: "review.opened", actor, reviewNodeId: "PRR_fuzzy_old", headSha: HEAD_A });
+    await store.append({
+      kind: "comment.sync_requested", actor, commentId: "comment-fuzzy", path: "docs/index.md",
+      subjectType: "LINE", side: "RIGHT", line: 3, bodyHash: await revisionOf("fuzzy body"),
+    });
+    await store.append({
+      kind: "comment.linked", actor, commentId: "comment-fuzzy",
+      external: { github: { commentId: 901, nodeId: "PRRC_fuzzy_old", pending: true, reviewNodeId: "PRR_fuzzy_old" } },
+    });
+    store.putSnapshot(revision, oldSource);
+    const review = makeReviewModeHandle({
+      adapter,
+      pr: { owner: "vig-os", repo: "revkit", pullNumber: 42 },
+      summary: {
+        number: 42, nodeId: "PR_42", title: "fuzzy", state: "open", draft: false,
+        headSha: HEAD_B, headRef: "test-head", baseSha: "b".repeat(40), baseRef: "main",
+        headRepoFullName: "vig-os/revkit", baseRepoFullName: "vig-os/revkit",
+        url: "https://github.com/vig-os/revkit/pull/42",
+      },
+      viewerLogin: "test-reviewer",
+      files: [{ filename: "docs/index.md", status: "modified", patch: "@@ -3 +3 @@\n-the target phrase lives here\n+the modified phrase lives here" }],
+    });
+    const outcome = await reanchorPendingReviewAtNewHead({
+      review, store, actor,
+      appendAndPublish: async (event) => {
+        const seq = await store.append(event);
+        return (await store.since(seq - 1)).find((candidate) => candidate.seq === seq);
+      },
+    });
+
+    expect(outcome.repositions).toEqual([{ localCommentId: "comment-fuzzy", path: "docs/index.md", outcome: "fuzzy" }]);
+    const thread = await store.thread("thread-fuzzy");
+    if (thread === undefined) throw new Error("expected thread");
+    expect("kind" in thread.anchor ? thread.anchor.kind : undefined).toBeUndefined();
+    if ("kind" in thread.anchor) throw new Error("expected line anchor");
+    expect(thread?.anchor.quote.exact).toBe("the modified phrase lives here");
+    const fuzzyEvent = (await store.since(0)).find((event) => event.kind === "thread.reanchored" && event.method === "fuzzy");
+    expect(fuzzyEvent?.kind).toBe("thread.reanchored");
+    if (fuzzyEvent?.kind !== "thread.reanchored") throw new Error("expected fuzzy event");
+    expect(fuzzyEvent.score).toBeGreaterThan(0);
+    expect(pending.drafts).toHaveLength(1);
+    expect(pending.drafts[0]?.line).toBe(thread?.anchor.startLine);
+    store.close();
   });
 
   test("head-move replay preserves a pending reply body and reply target", async () => {
