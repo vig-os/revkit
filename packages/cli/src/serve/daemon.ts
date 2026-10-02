@@ -2023,7 +2023,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         open !== null &&
         syncState.reviewNodeId === open.reviewNodeId
       ) {
-        remoteNodeId = syncState.pendingCommentNodeId;
+        const linkedNodeId = syncState.pendingCommentNodeId;
+        if (linkedNodeId !== undefined && liveDrafts.some((draft) => draft.nodeId === linkedNodeId)) {
+          remoteNodeId = linkedNodeId;
+        }
       }
       if (remoteNodeId === undefined && "fingerprint" in syncState && syncState.fingerprint !== undefined) {
         for (const draft of liveDrafts) {
