@@ -540,6 +540,28 @@ describe("B1 — deleted-on-github recovery: strands revert to pending-sync + Re
     });
   }
 
+  test("Discard is idempotent when the linked remote draft was already removed", async () => {
+    const ctx = await startCtx();
+    await postComment(ctx, "already removed", "discard-already-removed");
+    await deletePendingAndHeal(ctx);
+    const repost = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(repost.status).toBe(201);
+    const draftNodeId = ctx.fake.drafts[0]?.commentNodeId;
+    if (draftNodeId === undefined) throw new Error("expected reposted draft");
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    await adapter.deletePendingReviewComment({ commentNodeId: draftNodeId });
+
+    const decline = await declineRecovery(ctx);
+    expect(decline.status).toBe(201);
+    expect(ctx.fake.drafts).toHaveLength(0);
+    expect(ctx.fake.reviewNodeId).toBeNull();
+    expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
+  });
+
   test("Discard cancels a mixed pending-sync and failed recovery set", async () => {
     let ctx = await startCtx({ failBeforeOnce: "AddThread", operationOccurrence: 2 });
     await postComment(ctx, "pending recovery", "mixed-pending");
