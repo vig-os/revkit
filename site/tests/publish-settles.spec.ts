@@ -16,10 +16,28 @@
 // the settle window, plus a zero-delta quiescence check afterwards.
 //
 // The daemon here is the real CLI (`revkit serve`) against the real
-// `site/dist`. The build scenarios exercise the REAL `revkit build`
-// primitive — there is no stub — so a background build against this
-// temp consumer either succeeds or fails on its own merits, and both
-// terminals must settle.
+// `site/dist`, with NO runner override — so every scheduled build runs
+// the real shared `revkit build` primitive, not a stub.
+//
+// ## Why every scheduled build in this file fails at the PRE-BUILD CHECK
+//
+// These tests care about the RAIL's reaction to build events, not about
+// whether astro can compile a site. `runBuildCommand`'s first step is
+// `revkit check` over the whole consumer tree, so a consumer carrying
+// one vocab-violating sibling makes every scheduled build fail there in
+// ~100 ms — with NO `stageAstroRoot` and NO spawned `astro`.
+//
+// That is a suite-stability decision, not just a speed one. Playwright
+// runs fully parallel, so a handful of real astro builds here contend
+// with every Chromium instance and starve other specs' timing-sensitive
+// assertions: `rail-reanchor.spec.ts`'s rename-save assertion failed
+// ~2 in 10 of the full leg while passing 8/8 on its own. The
+// packaged-astro proof — that the shared composition really completes
+// against a consumer with no `site/` — is not lost to this choice: it
+// is owned by the E2E lane of
+// `packages/cli/test/build/publish-build-real.test.ts`, which execs the
+// PACKAGED binary. Nothing here is faked; this file simply does not ask
+// for a build that has to compile anything.
 
 import { test, expect } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -180,6 +198,23 @@ async function restartDaemon(ctx: DaemonCtx): Promise<void> {
   throw new Error("restarted daemon never wrote serve.json");
 }
 
+/** Plant a sibling file the consumer-tree `revkit check` inside
+ * `revkit build` refuses, so every build this daemon schedules fails
+ * at the PRE-BUILD CHECK instead of reaching astro.
+ *
+ * It is deliberately NOT part of any publish batch: `runPublish` checks
+ * only the batch, so the publish still succeeds and the daemon still
+ * schedules its build. The build then walks the whole tree, finds this,
+ * and exits — a real `build.failed` with a real diagnostic, produced by
+ * the real shared primitive. */
+function plantCheckFailingSibling(root: string): void {
+  writeFileSync(
+    join(root, "docs", "adr", "0997-broken-sibling.md"),
+    "# ADR-0997: Broken sibling\n\n- Status: Proposed\n- Date: 2026-10-02\n\n## Context\n\nA term the vocabulary does not define: [[no-such-term-anywhere]].\n",
+    "utf8",
+  );
+}
+
 async function shutdown(ctx: DaemonCtx): Promise<void> {
   try {
     ctx.child.kill("SIGTERM");
@@ -306,6 +341,8 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
   });
 
   test("data-only publish: an UNRELATED route reloads at most once for the build and stops", async ({ page }) => {
+    // Every scheduled build fails fast at the pre-build check — no astro spawn.
+    plantCheckFailingSibling(ctx.root);
     await page.goto(ctx.launchUrl);
     await page.waitForLoadState("domcontentloaded");
     // Open a route the publish below never touches — this is where
@@ -330,6 +367,8 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
   });
 
   test("refused publish: the banner appears and the page stops reloading", async ({ page }) => {
+    // Every scheduled build fails fast at the pre-build check — no astro spawn.
+    plantCheckFailingSibling(ctx.root);
     await page.goto(ctx.launchUrl);
     await page.waitForLoadState("domcontentloaded");
     await page.goto(`${ctx.url}${UNRELATED_ROUTE}`);
@@ -349,6 +388,8 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
   });
 
   test("COLD TAB requests `/events?since=<head>`, not `since=0`", async ({ page }) => {
+    // Every scheduled build fails fast at the pre-build check — no astro spawn.
+    plantCheckFailingSibling(ctx.root);
     // The whole point of `/api/events-head`. A cold tab has just
     // loaded current server state, so replaying the log can only
     // re-fire actions — it must start at the tip. `since=0` here would
@@ -404,7 +445,107 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
     await settle(page, nav, "cold tab");
   });
 
+  test("a publish landing BETWEEN the HTML GET and the stream attach is not lost", async ({ page }) => {
+    // Every scheduled build fails fast at the pre-build check — no astro spawn.
+    plantCheckFailingSibling(ctx.root);
+    // The lost-update window, made deterministic.
+    //
+    // A working resume point TRADES unconditional replay for
+    // conditional updates: with `since=<head>` the page only sees
+    // frames after its resume point, so anything appended between the
+    // page's own HTML GET and the moment the stream attaches is in
+    // neither — the page goes stale with no banner and no self-heal.
+    // Before the resume point existed, full replay meant it could
+    // not miss it.
+    //
+    // Determinism: `page.route` HOLDS the rail bundle, so the page's
+    // HTML has been fetched and rendered but the rail has not even
+    // loaded. The publish lands in exactly that window. Releasing the
+    // bundle lets the rail mount and attach — with the head stamped
+    // into the HTML at RENDER time, which predates the publish, so
+    // the stream replays it.
+    await page.goto(ctx.launchUrl);
+    await page.waitForLoadState("domcontentloaded");
+    // Give the log some history, so the replay range is non-trivial.
+    const seed = await page.request.post(`${ctx.url}/api/publish`, {
+      headers: { authorization: `Bearer ${ctx.agentToken}`, "content-type": "application/json" },
+      data: { data: [{ path: PLOT_REL_PATH, content: JSON.stringify([{ x: 1, y: 2 }]) }] },
+    });
+    expect(seed.status(), await seed.text()).toBe(201);
+
+    let releaseBundle: () => void = () => {};
+    const bundleHeld = new Promise<void>((resolve) => {
+      releaseBundle = resolve;
+    });
+    let heldOnce = false;
+    await page.route("**/-/rail.js", async (route) => {
+      heldOnce = true;
+      await bundleHeld;
+      await route.continue();
+    });
+    // Force a COLD tab. Without this the test passes for the wrong
+    // reason: the launch-code page earlier in the same tab already
+    // wrote a persisted resume point, and resuming from THAT also
+    // covers the window — so the assertion would hold even if the
+    // page-render stamp did nothing. Clearing sessionStorage makes the
+    // stamp the only mechanism that can close the window, which is
+    // what makes this a regression test rather than a tautology.
+    await page.addInitScript(() => {
+      try {
+        window.sessionStorage.clear();
+      } catch {
+        /* nothing to clear */
+      }
+    });
+
+    // `waitUntil: "commit"` — NOT "load". The rail bundle is held, so
+    // the load event never fires and a load-waiting goto would time
+    // out. "commit" returns as soon as the navigation is committed,
+    // which is exactly the state we want: the response has been
+    // fetched, and we then wait for the parse ourselves.
+    await page.goto(`${ctx.url}${ADR_ROUTE}`, { waitUntil: "commit" });
+    // The stamp proves the daemon captured a head AT RENDER TIME.
+    // `state: "attached"` — a `<meta>` is never "visible", so the
+    // default wait would time out against a tag that is right there.
+    await page.waitForSelector('meta[name="revkit-log-head"]', { state: "attached", timeout: 10_000 });
+    const stamped = await page.evaluate(() =>
+      document.querySelector('meta[name="revkit-log-head"]')?.getAttribute("content") ?? null,
+    );
+    process.stdout.write(`SETTLES[window] page-render head stamp = ${stamped}\n`);
+    expect(Number.parseInt(stamped ?? "0", 10)).toBeGreaterThan(0);
+
+    // Wait until the bundle request is actually intercepted — the
+    // window is only open once the rail is blocked on load.
+    for (let i = 0; i < 150 && !heldOnce; i++) {
+      await page.waitForTimeout(20);
+    }
+    expect(heldOnce, "the rail bundle was never held, so the window was never open").toBe(true);
+
+    const nav = countNavigations(page);
+    const before = nav.count();
+    // THE EVENT IN THE WINDOW: the page HTML is already rendered, the
+    // rail is not loaded, and this publish must still reach the page.
+    const inWindow = await page.request.post(`${ctx.url}/api/publish`, {
+      headers: { authorization: `Bearer ${ctx.agentToken}`, "content-type": "application/json" },
+      data: { docs: [{ path: ADR_REL_PATH, content: FAST_BODY }] },
+    });
+    expect(inWindow.status(), await inWindow.text()).toBe(201);
+
+    releaseBundle();
+    // The rail mounts, attaches from the page-render head, replays
+    // the in-window publish, and refreshes the open route — exactly
+    // once.
+    await page.waitForFunction((marker) => document.body.innerText.includes(marker), MARKER, { timeout: 8_000 });
+    expect(nav.count(), "the in-window publish must still refresh the open route").toBe(before + 1);
+    await page.unroute("**/-/rail.js");
+
+    // And the seq gate means the replay did not turn into a loop.
+    await settle(page, nav, "in-window publish");
+  });
+
   test("RAPID publishes settle: a burst does not multiply reloads", async ({ page }) => {
+    // Every scheduled build fails fast at the pre-build check — no astro spawn.
+    plantCheckFailingSibling(ctx.root);
     // Five publishes back to back, each with a distinct body so the
     // check gate cannot collapse them. The rail reloads once per
     // genuinely new publish, but the pages it reloads AWAY from are
@@ -436,6 +577,8 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
   });
 
   test("a DAEMON RESTART settles: the new daemon's log replays nothing into a loop", async ({ page }) => {
+    // Every scheduled build fails fast at the pre-build check — no astro spawn.
+    plantCheckFailingSibling(ctx.root);
     // The rail holds a session cookie and an EventSource. When the
     // daemon restarts on the SAME port the stream drops and the rail
     // reconnects with `Last-Event-ID` — the resume path that has to
@@ -467,15 +610,7 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
   });
 
   test("failed build: the terminal banner appears and the page stops reloading", async ({ page }) => {
-    // Plant a file the TREE-wide `revkit check` inside `revkit build`
-    // refuses. It is not part of any publish batch, so the publish's
-    // own check passes; the build's pre-build check then fails fast,
-    // which is a real build failure without waiting on astro.
-    writeFileSync(
-      join(ctx.root, "docs", "adr", "0997-broken-sibling.md"),
-      "# ADR-0997: Broken sibling\n\n- Status: Proposed\n- Date: 2026-10-02\n\n## Context\n\nA term that the vocabulary does not define: [[no-such-term-anywhere]].\n",
-      "utf8",
-    );
+    plantCheckFailingSibling(ctx.root);
 
     await page.goto(ctx.launchUrl);
     await page.waitForLoadState("domcontentloaded");

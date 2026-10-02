@@ -27,6 +27,7 @@ import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 import {
   createSeqGate,
+  readPageRenderHead,
   readResumeSeq,
   sinceForSubscribe,
   writeResumeSeq,
@@ -592,20 +593,37 @@ function normaliseCurrentRoute(pathname: string): string {
 
 /** Where to open `/events` from.
  *
- * A warm tab (something already wrote a resume point — i.e. this page
- * load was itself caused by an event) resumes from that point. A cold
- * tab probes `/api/events-head` and resumes from the log's tip: the
- * page has just loaded current server state, so replaying history
- * could only re-fire actions, never inform it.
+ * Primary source: the log head the daemon stamped into THIS page when
+ * it rendered it (`<meta name="revkit-log-head">`). That value is
+ * guaranteed to predate the window between this page's HTML GET and
+ * the stream attaching, so subscribing from it REPLAYS any update
+ * that landed in that window — an update a page which had subscribed
+ * unconditionally would have received. The per-seq gate drops the
+ * frames the page already handled, so replaying costs nothing.
  *
- * A failed probe degrades to `since=0` (full replay). That is safe,
- * not merely degraded: the per-seq gate in `onmessage` means a
- * replayed event this tab already acted on is dropped, so the worst
- * case is ONE extra reload followed by quiescence. The resume point is
- * the optimisation; the gate is the safety net. */
+ * This matters because a working resume point TRADES unconditional
+ * replay for conditional updates: before one existed the rail replayed
+ * the whole log on every load, so it was never blind — and re-fired
+ * its reload triggers forever. With a resume point the trade is only
+ * sound if the blind window is closed BY CONSTRUCTION, which is what
+ * the server-side stamp does. Probing the head from the page cannot
+ * do it, because the probe itself runs inside the window it would
+ * need to cover.
+ *
+ * Fallbacks, in order: this tab's persisted resume point (a WARM
+ * reload), then a live read of `/api/events-head`.
+ *
+ * A total failure degrades to `since=0` (full replay) — safe, not
+ * merely degraded: the per-seq gate drops anything already handled, so
+ * the worst case is ONE extra reload followed by quiescence. The
+ * resume point is the optimisation; the gate is the safety net. */
 async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<number> {
   const stored = readResumeSeq(storage);
-  if (stored > 0) return stored;
+  // The stamp is in the HTML the browser already has — no request, so
+  // no window between reading it and using it.
+  const pageHead = readPageRenderHead(document);
+  if (pageHead > 0) return sinceForSubscribe(stored, 0, pageHead);
+  if (stored > 0) return sinceForSubscribe(stored, 0, 0);
   try {
     const response = await fetch("/api/events-head", {
       headers: { accept: "application/json" },
@@ -613,7 +631,7 @@ async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<
     });
     if (!response.ok) return 0;
     const body = (await response.json()) as { head?: unknown };
-    return sinceForSubscribe(stored, typeof body.head === "number" ? body.head : 0);
+    return sinceForSubscribe(stored, typeof body.head === "number" ? body.head : 0, 0);
   } catch {
     return 0;
   }
@@ -669,10 +687,8 @@ function subscribeEvents(
    * `rail/resume-point.ts`. */
   const gate = createSeqGate(readResumeSeq(sessionStorageOrUndefined()));
   /** Resolved once, on first subscribe; reused across reconnects so a
-   * reconnect does not re-probe (and does not drift to a newer head,
-   * which would skip events the browser missed while disconnected —
-   * the daemon's `?since` plus the persisted resume point covers that
-   * window instead). */
+   * reconnect does not re-probe and does not drift to a newer head,
+   * which would skip events the browser missed while disconnected. */
   let initialSince: Promise<number> | undefined;
   const kick = (): void => {
     if (closed) return;
@@ -689,13 +705,19 @@ function subscribeEvents(
   };
   const attach = (): void => {
     if (closed || source === undefined) return;
-    // Close the head-probe race. A COLD tab reads `head` and then
-    // opens the stream; anything appended in between is neither in
-    // the head it read nor in the frames that follow it, so a live
-    // update can be missed entirely. One authoritative refetch after
-    // the stream is open covers that window — it is a fetch, not a
-    // navigation, so it cannot become a reload loop, and the data it
-    // returns is exactly what the daemon holds.
+    // ONE authoritative thread-list refetch once the stream is open.
+    //
+    // What this does: re-reads `GET /api/threads`, so the rail's
+    // thread list reflects anything that landed while it was wiring
+    // itself up.
+    //
+    // What this does NOT do, and used to be claimed to do: re-read
+    // THIS ROUTE's HTML. It cannot — the route's page HTML is not
+    // reachable from a thread-list fetch. The lost-update window
+    // between this page's HTML GET and the stream attaching is closed
+    // instead by resuming from the head stamped into this page at
+    // RENDER time (`resolveInitialSince`), which REPLAYS that window
+    // rather than papering over it.
     onAttached();
     source.onmessage = (message: MessageEvent<string>): void => {
       try {

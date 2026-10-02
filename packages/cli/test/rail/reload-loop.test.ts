@@ -16,9 +16,13 @@
 // and it is pure logic over a storage object.
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
+  RAIL_LOG_HEAD_META,
   RESUME_SEQ_KEY,
   createSeqGate,
+  readPageRenderHead,
   readResumeSeq,
   sinceForSubscribe,
   writeResumeSeq,
@@ -54,24 +58,77 @@ function fakeStorage(initial: Record<string, string> = {}): DraftStorage & Resum
 }
 
 describe("resume point — where the rail opens /events", () => {
-  test("a COLD tab (nothing persisted) starts at the daemon's head", () => {
-    // The page has just loaded current server state; replaying history
-    // could only re-fire actions, never inform it.
-    expect(sinceForSubscribe(0, 42)).toBe(42);
+  test("a PAGE-RENDER stamp wins over everything: it is the only value older than the attach window", () => {
+    // This is the whole fix for the lost-update window. A head read
+    // from the page (probe or otherwise) is taken AT OR AFTER attach,
+    // so it cannot cover the window between the page's HTML GET and
+    // the stream opening. The server stamps the head into the page at
+    // render time; resuming from it replays the window.
+    expect(sinceForSubscribe(0, 999, 40)).toBe(40);
+    // Even a STALE persisted point does not override the stamp: the
+    // stamp is where this page's data came from, so it is exactly the
+    // right resume point for it.
+    expect(sinceForSubscribe(7, 999, 40)).toBe(40);
   });
 
-  test("a WARM tab (something already acted) resumes from its own point, NOT head", () => {
-    // Head has moved on since the reload — resuming from head would
-    // skip every event that landed while the page was navigating, and
-    // a genuinely new publish would go unnoticed.
-    expect(sinceForSubscribe(17, 42)).toBe(17);
+  test("a WARM tab with no stamp resumes from its persisted point", () => {
+    // The fallback for a page the injector passed through untouched
+    // (oversize) or a daemon too old to stamp one.
+    expect(sinceForSubscribe(17, 999, 0)).toBe(17);
   });
 
-  test("a zero or unusable head degrades to `since=0`", () => {
-    expect(sinceForSubscribe(0, 0)).toBe(0);
-    expect(sinceForSubscribe(0, -1)).toBe(0);
-    expect(sinceForSubscribe(0, Number.NaN)).toBe(0);
-    expect(sinceForSubscribe(0, 1.5)).toBe(0);
+  test("a COLD tab with neither a stamp nor a stored point probes the head", () => {
+    expect(sinceForSubscribe(0, 42, 0)).toBe(42);
+  });
+
+  test("every unusable input degrades to `since=0` rather than a bogus point", () => {
+    expect(sinceForSubscribe(0, 0, 0)).toBe(0);
+    expect(sinceForSubscribe(0, -1, 0)).toBe(0);
+    expect(sinceForSubscribe(0, Number.NaN, 0)).toBe(0);
+    expect(sinceForSubscribe(0, 1.5, 0)).toBe(0);
+    // A junk stamp must not be trusted over a working probe.
+    expect(sinceForSubscribe(0, 42, -1)).toBe(42);
+    expect(sinceForSubscribe(0, 42, 2.5)).toBe(42);
+  });
+
+  test("readPageRenderHead reads the stamp and rejects junk", () => {
+    const withContent = (content: string | null): { querySelector: () => { getAttribute: (a: string) => string | null } | null } => ({
+      querySelector: () => (content === null ? null : { getAttribute: () => content }),
+    });
+    expect(readPageRenderHead(withContent("42"))).toBe(42);
+    expect(readPageRenderHead(withContent(null))).toBe(0);
+    expect(readPageRenderHead(withContent("0"))).toBe(0);
+    expect(readPageRenderHead(withContent("-3"))).toBe(0);
+    // `Number.parseInt("42abc")` is 42 — accepting it would skip live
+    // events up to 42 on a corrupt stamp.
+    expect(readPageRenderHead(withContent("42abc"))).toBe(0);
+    expect(readPageRenderHead(withContent("4.2"))).toBe(0);
+    expect(readPageRenderHead(withContent("not a number"))).toBe(0);
+  });
+
+  test("the rail's meta name and the injector's agree", () => {
+    // Duplicated as a literal in each module on purpose (the rail
+    // bundle must not import the daemon's node:fs graph), so this
+    // pins the duplication.
+    expect(RAIL_LOG_HEAD_META).toBe("revkit-log-head");
+    const injectorSource = readFileSync(
+      join(import.meta.dir, "..", "..", "src", "rail", "injector.ts"),
+      "utf8",
+    );
+    expect(injectorSource).toContain('RAIL_LOG_HEAD_META = "revkit-log-head"');
+  });
+
+  test("the daemon stamps the head at all three HTML injectRail sites", () => {
+    // A site that forgets `logHead` silently serves a page whose rail
+    // falls back to the weaker probe. Count the sites and the stamps.
+    const daemonSource = readFileSync(
+      join(import.meta.dir, "..", "..", "src", "serve", "daemon.ts"),
+      "utf8",
+    );
+    const sites = daemonSource.match(/injectRail\(rawResponse, \{/g) ?? [];
+    expect(sites.length).toBe(3);
+    const stamps = daemonSource.match(/logHead: store\.head\(\),/g) ?? [];
+    expect(stamps.length).toBe(3);
   });
 
   test("readResumeSeq rejects a corrupt value rather than trusting parseInt", () => {

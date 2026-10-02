@@ -24,6 +24,12 @@
 export const RAIL_JS_PATH = "/-/rail.js";
 export const RAIL_CSS_PATH = "/-/rail.css";
 
+/** `name` of the `<meta>` the injector stamps with the log head at
+ * page-render time. The rail reads it to choose its SSE resume point;
+ * see `InjectRailOptions.logHead` for why the value must be captured
+ * server-side rather than probed from the page. */
+export const RAIL_LOG_HEAD_META = "revkit-log-head";
+
 /** Hard cap on the response body size for injection. Above this we
  * hand the page through untouched (with a log line the daemon can
  * pick up), so an accidentally huge asset served with a `text/html`
@@ -64,6 +70,26 @@ export interface InjectRailOptions {
   /** Called with the body byte length when the response is too big
    * to inject the rail into. The caller may log a warning. */
   onOversize?: (bodyBytes: number) => void;
+  /** The durable log's tip AT THE MOMENT THIS PAGE IS RENDERED.
+   *
+   * Stamped into the HTML as `<meta name="revkit-log-head">` so the
+   * rail can resume its SSE stream from PAGE-RENDER time rather than
+   * from whenever it happens to attach.
+   *
+   * Why that matters (M2 item 9, story A4): subscribing from a head
+   * read at attach time leaves a window between the page's own HTML
+   * GET and the stream opening, and an event landing in that window
+   * is in neither the head nor the frames that follow it — the page
+   * silently misses an update it would previously have received from
+   * an unconditional replay. Capturing the head server-side, at
+   * render time, makes the resume point EARLIER than the window, so
+   * the window is replayed. The rail's per-seq gate then drops the
+   * frames the page already handled, so replaying costs nothing.
+   *
+   * Omitted (or non-positive) → no meta tag, and the rail falls back
+   * to its attach-time probe. That fallback is weaker, not wrong.
+   */
+  logHead?: number;
 }
 
 export async function injectRail(
@@ -98,6 +124,13 @@ export async function injectRail(
         `<script type="module" src="${RAIL_JS_PATH}"></script>`,
         { html: true },
       );
+      // The log head at render time. Attribute value is an integer we
+      // minted, so it needs no escaping; the rail reads it with
+      // `content`-attribute parsing and ignores anything else.
+      const logHead = options.logHead;
+      if (typeof logHead === "number" && Number.isInteger(logHead) && logHead > 0) {
+        element.append(`<meta name="${RAIL_LOG_HEAD_META}" content="${logHead}">`, { html: true });
+      }
     },
   });
   const rewritten = rewriter.transform(

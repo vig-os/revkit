@@ -35,6 +35,57 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+/** Wait for a rail element count to be STABLE at `expected` across a
+ * window, rather than to be `expected` at some instant.
+ *
+ * The re-anchor pipeline is debounced — a ~300 ms file debounce plus a
+ * ~500 ms build debounce — so a source edit moves the thread through a
+ * TRANSIENT state (re-anchoring, momentarily orphaned) on its way to
+ * its settled one. An assertion of the form `toPass(() =>
+ * toHaveCount(1))` is not merely tight, it is wrong: `toPass` returns
+ * on the FIRST successful sample, so it can pass while the pipeline is
+ * still mid-flight and fail on the very next transient sample. Both
+ * outcomes are noise, and under parallel load — when the rest of the
+ * suite is spawning Chromium instances — the transient lands often
+ * enough to make this spec the suite's flake.
+ *
+ * What this asserts instead: the count reaches `expected` and STAYS
+ * there for `stableForMs`. A transient is tolerated by construction;
+ * a genuinely lost thread is not, because the count never settles.
+ * The window is deliberately wider than the debounce sum so a slow
+ * pipeline is not mistaken for an unstable one. */
+async function expectStableCount(
+  page: Page,
+  testId: string,
+  expected: number,
+  options: { readonly stableForMs?: number; readonly timeoutMs?: number; readonly sampleMs?: number } = {},
+): Promise<void> {
+  const stableForMs = options.stableForMs ?? 1_500;
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const sampleMs = options.sampleMs ?? 150;
+  const locator = page.getByTestId(testId);
+  const deadline = Date.now() + timeoutMs;
+  let stableSince: number | undefined;
+  let last: number | undefined;
+  while (Date.now() < deadline) {
+    last = await locator.count();
+    if (last === expected) {
+      stableSince ??= Date.now();
+      if (Date.now() - stableSince >= stableForMs) return;
+    } else {
+      // Any excursion restarts the stability window — that is the whole
+      // point: one passing sample is not evidence of settling.
+      stableSince = undefined;
+    }
+    await page.waitForTimeout(sampleMs);
+  }
+  const orphanCount = await page.getByTestId("revkit-rail-orphan").count().catch(() => -1);
+  throw new Error(
+    `expected "${testId}" to hold at ${expected} for ${stableForMs}ms within ${timeoutMs}ms; ` +
+      `last seen ${String(last)} (orphan panel count: ${String(orphanCount)})`,
+  );
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
 const DIST = resolve(__dirname, "..", "dist");
@@ -307,10 +358,28 @@ test.describe("rail re-anchor round-trip @chromium-only", () => {
       // re-anchor.
       const sourcePath = join(daemon.root, SOURCE_REL_PATH);
       const original = readFileSync(sourcePath, "utf8");
+      // Insert a paragraph ABOVE the anchored block. That shifts the
+      // anchor's line while leaving ANCHOR_QUOTE intact, which is the
+      // situation this test is named for: an atomic replace that MOVES
+      // an anchor must re-anchor it.
+      //
+      // The previous edit REPLACED the anchored quote with different
+      // text. That is a different scenario and the pipeline is right
+      // to ORPHAN it — the quoted text no longer exists — so the
+      // assertion "the thread must still be open" was asserting
+      // something the edit itself invalidated. Worse, the old
+      // `toPass` shape passed on a transient: it returned on the first
+      // sample showing 1, which is what the rail still displayed in
+      // the window BEFORE the debounced pipeline ran. Under parallel
+      // load the pipeline finished before the first sample, the count
+      // read 0, and the spec failed — the ~2-in-10 flake. Nothing was
+      // ever "settled at 1"; the test was sampling a state that was
+      // always about to change.
       const edited = original.replace(
-        "Comments must survive edits and rebuilds",
-        "The daemon must ensure comments survive rebuilds",
+        "## Context\n\n",
+        "## Context\n\nInserted paragraph A.\n\nInserted paragraph B.\n\n",
       );
+      expect(edited, "the rename-save fixture must still contain the anchor quote").toContain(ANCHOR_QUOTE);
       const tmpPath = sourcePath + ".rename.tmp";
       writeFileSync(tmpPath, edited, "utf8");
       // Rename over the target — this is what breaks file-bound
@@ -318,18 +387,15 @@ test.describe("rail re-anchor round-trip @chromium-only", () => {
       const { renameSync } = await import("node:fs");
       renameSync(tmpPath, sourcePath);
       await page.locator(".revkit-rail__refresh").click();
-      // Assert the anchor moved (label changed) — proves the
-      // pipeline read the NEW content.
-      await expect(async () => {
-        const labelNow = await page
-          .locator(".revkit-rail__thread-lines")
-          .first()
-          .textContent();
-        // Line number may or may not change depending on the edit,
-        // but the thread must still be open (not orphaned).
-        void labelNow;
-        await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
-      }).toPass({ timeout: 5000 });
+      // The claim is about the SETTLED state, not about any instant:
+      // the thread must hold open once the debounced pipeline has run.
+      // Sampling with `toPass` returned on the first success, which is
+      // both too weak (it passes mid-pipeline) and load-flaky (it fails
+      // once the pipeline wins the race). See `expectStableCount`.
+      await expectStableCount(page, "revkit-rail-thread", 1);
+      // And it really MOVED — a stable open thread at the old line
+      // would mean the pipeline never read the new content.
+      await expect(page.locator(".revkit-rail__thread-lines").first()).not.toHaveText(initialLabel ?? "");
       void initialLabel;
     } finally {
       await shutdown(daemon);

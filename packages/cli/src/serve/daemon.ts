@@ -3104,6 +3104,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // large Astro page is a few hundred KiB.
     if (contentType.startsWith("text/html")) {
       return await injectRail(rawResponse, {
+      logHead: store.head(),
         onOversize: (bodyBytes: number) => {
           logger.warn("static.rail.skipped-oversize", {
             requestId,
@@ -3243,6 +3244,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       "text/html; charset=utf-8",
     );
     return await injectRail(rawResponse, {
+    logHead: store.head(),
       onOversize: (bodyBytes: number) => {
         logger.warn("static.rail.skipped-oversize", {
           requestId: args.requestId,
@@ -3445,6 +3447,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       "text/html; charset=utf-8",
     );
     return await injectRail(rawResponse, {
+    logHead: store.head(),
       onOversize: (bodyBytes: number) => {
         logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
       },

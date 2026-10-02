@@ -30,6 +30,13 @@
  * does not re-receive the event that caused the reload. */
 export const RESUME_SEQ_KEY = "revkit.rail.lastHandledSeq";
 
+/** `name` of the `<meta>` the daemon stamps with the log head at
+ * page-render time. Mirrors `RAIL_LOG_HEAD_META` in
+ * `rail/injector.ts`; duplicated as a literal because the rail bundle
+ * is built for the BROWSER and must not import the daemon's module
+ * graph (which pulls in node:fs). A test asserts the two agree. */
+export const RAIL_LOG_HEAD_META = "revkit-log-head";
+
 /** The slice of the Web Storage API this module needs. Passing it in
  * keeps the module free of a global dependency, so a test can supply
  * a plain object and a browser supplies `window.sessionStorage`. */
@@ -94,13 +101,48 @@ export function createSeqGate(initial = 0): { accept(seq: number): boolean } {
   };
 }
 
-/** Where to open `/events`, given the daemon's current head.
+/** Read the log head the daemon stamped into THIS page at render time
+ * (`<meta name="revkit-log-head">`, see `rail/injector.ts`). Returns 0
+ * when the page has no such tag — an oversize page the injector passed
+ * through untouched, or a daemon old enough not to stamp one. */
+export function readPageRenderHead(doc: {
+  querySelector: (selector: string) => { getAttribute: (name: string) => string | null } | null;
+}): number {
+  try {
+    const raw = doc.querySelector(`meta[name="${RAIL_LOG_HEAD_META}"]`)?.getAttribute("content");
+    if (raw === null || raw === undefined) return 0;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isInteger(parsed) && parsed > 0 && String(parsed) === raw.trim() ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Where to open `/events`.
+ *
+ * Three inputs, in strict priority order:
+ *
+ * 1. **`pageHead` — the head stamped into THIS page at render time.**
+ *    Preferred because it is the only value guaranteed to be EARLIER
+ *    than the window between the page's HTML GET and the stream
+ *    attaching. Subscribing from it replays that window; the per-seq
+ *    gate drops whatever the page already handled, so the replay costs
+ *    nothing and the lost update is not lost.
+ * 2. **`stored` — this tab's persisted resume point.** The fallback
+ *    when the page carries no stamp (a WARM reload whose previous
+ *    page did, or a page the injector passed through).
+ * 3. **`probedHead` — a live read of `GET /api/events-head`.** The
+ *    last resort, and the weakest: reading it at attach time cannot
+ *    cover a window that closed before the probe ran. Kept so a
+ *    page with neither a stamp nor a stored point still subscribes
+ *    live-only rather than replaying the entire log.
  *
  * Exported so the decision is unit-testable without a DOM: the
  * alternative — asserting only that "the page settles" in a browser —
- * cannot distinguish a resume point from an idempotence guard, and a
- * regression in either would look identical there. */
-export function sinceForSubscribe(stored: number, head: number): number {
+ * cannot distinguish a page-render resume point from an attach-time
+ * one, and a regression in either looks identical there. */
+export function sinceForSubscribe(stored: number, probedHead: number, pageHead: number): number {
+  if (Number.isInteger(pageHead) && pageHead > 0) return pageHead;
   if (stored > 0) return stored;
-  return Number.isInteger(head) && head > 0 ? head : 0;
+  return Number.isInteger(probedHead) && probedHead > 0 ? probedHead : 0;
 }
