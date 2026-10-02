@@ -98,12 +98,27 @@ import {
   cancelAskRequestSchema,
   createAskRequestSchema,
   createThreadRequestSchema,
+  publishRequestSchema,
   discardReviewRequestSchema,
   reopenRequestSchema,
   replyRequestSchema,
   resolveRequestSchema,
   submitReviewRequestSchema,
 } from "./api-schemas.ts";
+import { runPublish, spliceArticleBody, ARTICLE_OPEN_MARKER } from "./publish.ts";
+import {
+  createPublishBuildCoordinator,
+  type BuildRunner,
+  type PublishBuildCoordinator,
+  type PublishBuildItem,
+  type PublishBuildRecord,
+} from "./publish-build.ts";
+import { renderDocFragment, fastPathRefusalReasons, type FastPathRefusalReason } from "./publish-render.ts";
+import { extractDocRevision } from "../rehype-stamp-revision.ts";
+import { revisionOf as revisionOfBytes } from "@revkit/review-core";
+import { statSync } from "node:fs";
+import { runCheck, toCheckFiles } from "../check.ts";
+import { spawnGh } from "../gh-runner.ts";
 import { applyResponseHeaders, type HeaderContext, type ResponseKind } from "./headers.ts";
 // The inline-script hash allowlist is the SAME committed set that
 // `revkit check-dist` enforces: `dist-check-allowlist.json`'s
@@ -159,6 +174,36 @@ export interface StartDaemonOptions {
   readonly reanchor?: Partial<
     Omit<ReanchorDaemonOptions, "store" | "bus" | "repoRoot" | "distDir" | "logger">
   >;
+  /** `owner/name` for the GitHub repo `revkit escalate` files
+   * component-request issues against and `revkit check --online`
+   * verifies allow-annotations against. Defaults to
+   * `"vig-os/revkit"`; the CLI top-level derives it from
+   * `env.repoSlug`, and tests may pin any string. */
+  readonly repoSlug?: string;
+  /** Background full-build coordinator (M2 item 9, story A4).
+   * `true` (default) means any publish outcome the fast path cannot
+   * serve — a refusal, a render exception, a data-only file, a route
+   * with no built shell — schedules a full `revkit build` so the
+   * reviewer eventually sees the new content without running anything
+   * by hand. `false` disables scheduling; tests set this when they do
+   * not want a build to run at all. The daemon still records refused
+   * routes and serves the banner either way. */
+  readonly enableBackgroundBuild?: boolean;
+  /** Test-only override for the build primitive. Production omits it
+   * and the coordinator calls the shared `runBuildCommand`; a test
+   * that passes a stub is exercising the SAME call shape (args +
+   * env) the real build gets, just without the astro spawn. */
+  readonly backgroundBuildRun?: BuildRunner;
+  /** Test-only override for the build coordinator's coalescing
+   * window. Defaults to 500 ms in production; tests set it near
+   * 0 so a "publish → banner → build succeeded → reload" sequence
+   * fits inside a Playwright deadline. */
+  readonly backgroundBuildDebounceMs?: number;
+  /** Test-only barrier awaited inside `runPublish` after `revkit
+   * check` approves the staged batch and immediately before the
+   * commit, so a confinement-race test can swap a path for a symlink
+   * at exactly that point. */
+  readonly publishBeforeStagedCommit?: () => Promise<void>;
   /** Test-only override for the delivery-mode idle-flush window
    * (`handover` mode, M2 item 6). 0 disables the idle timer; the
    * production default (90 s) lives in `delivery-modes.ts`. */
@@ -293,6 +338,26 @@ const presenceRequestSchema = z
     }
   });
 
+/** Every reason a served page can be behind its source, and the
+ * phrase the banner uses to explain it. Three are the fast
+ * renderer's refusal tags; the other two are outcomes the renderer
+ * never got far enough to produce a tag for.
+ *
+ * Module scope on purpose: it is a pure table, and a `const` declared
+ * inside `startDaemon` AFTER `Bun.serve(...)` would sit in the
+ * temporal dead zone for the very first request — Bun starts serving
+ * synchronously, so the first page view could arrive before the
+ * initialiser ran. */
+type BannerReason = FastPathRefusalReason | "render-failed" | "shell-missing";
+
+const BUILD_REASON_PHRASE: Readonly<Record<BannerReason, string>> = Object.freeze({
+  "code-fence": "fenced code blocks",
+  "indented-code": "indented code blocks",
+  "starlight-directive": "Starlight asides",
+  "render-failed": "a construct the fast renderer could not process",
+  "shell-missing": "no previously built page to update",
+});
+
 /** Start the daemon. Returns a handle whose `stop()` is idempotent. */
 export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHandle> {
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
@@ -413,6 +478,73 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // and never surfaces.
   const systemActor: Author = { kind: "system", id: "revkit-daemon" };
 
+  // Fast-path render cache (M2 item 9, story A4, PR-56 blocker 2,
+  // round-2 blocker 3).
+  //
+  // Content-addressed by **(route, source revision)**. The route
+  // in the key defends against a byte-identical source living at
+  // two different routes: without it, doc A's render would serve
+  // doc B if they shared bytes (the round-2 review's live probe
+  // showed exactly that — B's page was served with A's data-src
+  // attributes). The revision in the key is the SHA-256 of the
+  // LF-normalised source so a re-render of the SAME (route,
+  // source) is a Map hit.
+  //
+  // The cache never expires by TTL. A restart wipes it — that's
+  // fine, because serving is DERIVED from files: on the first
+  // request after boot for a route whose source has drifted from
+  // dist, the fast path renders again (~30 ms). Nothing is lost.
+  const RENDER_CACHE_MAX = 128;
+  interface RenderCacheEntry {
+    readonly html: string;
+    readonly revision: string;
+    readonly dataSrcCount: number;
+  }
+  const renderCache = new Map<string, RenderCacheEntry>();
+  // Cache of `revkit check` verdicts, keyed on source revision.
+  // The fast path refuses to serve a source that `revkit check`
+  // rejects (a hand-rolled `<div onclick>` in a committed source
+  // would otherwise reach the reviewer's browser — round-2 NEW
+  // finding). Cached because check-per-request would double the
+  // fast-path latency; the revision key is content-addressed, so
+  // an edit that fixes the source is picked up automatically.
+  const CHECK_CACHE_MAX = 256;
+  const checkCache = new Map<string, { pass: boolean; diagnostics: readonly string[] }>();
+  const checkCacheGet = (revision: string): { pass: boolean; diagnostics: readonly string[] } | undefined => {
+    const entry = checkCache.get(revision);
+    if (entry === undefined) return undefined;
+    checkCache.delete(revision);
+    checkCache.set(revision, entry);
+    return entry;
+  };
+  const checkCacheSet = (revision: string, pass: boolean, diagnostics: readonly string[]): void => {
+    if (checkCache.size >= CHECK_CACHE_MAX) {
+      const oldest = checkCache.keys().next();
+      if (!oldest.done && typeof oldest.value === "string") checkCache.delete(oldest.value);
+    }
+    checkCache.set(revision, { pass, diagnostics });
+  };
+  const cacheKey = (route: string, revision: string): string => `${route}␟${revision}`;
+  const cacheGet = (route: string, revision: string): RenderCacheEntry | undefined => {
+    const key = cacheKey(route, revision);
+    const entry = renderCache.get(key);
+    if (entry === undefined) return undefined;
+    // LRU touch: move to the tail by delete + re-set.
+    renderCache.delete(key);
+    renderCache.set(key, entry);
+    return entry;
+  };
+  const cacheSet = (route: string, entry: RenderCacheEntry): void => {
+    const key = cacheKey(route, entry.revision);
+    if (renderCache.size >= RENDER_CACHE_MAX) {
+      const oldest = renderCache.keys().next();
+      if (!oldest.done && typeof oldest.value === "string") {
+        renderCache.delete(oldest.value);
+      }
+    }
+    renderCache.set(key, entry);
+  };
+
   // M3 part 2b — review-mode handle (undefined outside review mode).
   const reviewMode: ReviewModeHandle | undefined =
     options.reviewMode !== undefined ? makeReviewModeHandle(options.reviewMode) : undefined;
@@ -422,6 +554,139 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // the daemon layer. The lock is process-local — GitHub's own
   // pending-review uniqueness is the ultimate guard.
   let submitInFlight = false;
+
+  // Routes the fast path could NOT serve for the publish generation
+  // named in the value; each gets a banner spliced into the served
+  // HTML so the reviewer sees that the page is behind the source and
+  // whether the build that will fix it is running or broken.
+  //
+  // `generation` is what makes the map safe to clear. A build
+  // completes for the generation it was scheduled FOR; a publish that
+  // landed while that build was running has a DIFFERENT generation and
+  // its refusal must survive. So `onSettled` deletes exactly the
+  // entries whose generation matches, and nothing else. The
+  // independent safety net is the dist-revision comparison in
+  // `tryServeFreshForRoute`: when the built page's stamped revision
+  // equals the current source's, dist has caught up and the entry is
+  // dropped whatever the build bookkeeping says.
+  //
+  // The map is seeded from the persisted publish state at startup, so
+  // a daemon that restarts mid-build still shows the banner (and the
+  // coordinator reschedules the pending build) instead of silently
+  // serving a stale page as if it were current.
+  interface RefusedRouteState {
+    readonly reason: BannerReason;
+    readonly generation: string;
+    readonly since: number;
+  }
+  const refusedRoutes = new Map<string, RefusedRouteState>();
+
+  /** Map a build item onto a banner reason. A `fast-path-refused`
+   * item carries the renderer's tag in `detail`; the persisted
+   * build-state file is untrusted input (it is a file on disk), so
+   * an unrecognised tag degrades to a generic refusal rather than
+   * reaching the banner copy. */
+  const bannerReasonFor = (item: PublishBuildItem): BannerReason => {
+    if (item.reason === "fast-path-refused") {
+      const detail: unknown = item.detail;
+      return typeof detail === "string" &&
+        (fastPathRefusalReasons as readonly string[]).includes(detail)
+        ? (detail as FastPathRefusalReason)
+        : "code-fence";
+    }
+    // `data-only` never reaches here (callers skip it), but a
+    // persisted record could carry it for a route by mistake; treat it
+    // as a generic refusal rather than falling through to a reason
+    // the banner vocabulary does not have.
+    return item.reason === "data-only" ? "render-failed" : item.reason;
+  };
+
+  /** Apply one publish generation's build items to the refusal map.
+   * A route that fast-rendered is removed (its page is current); a
+   * route that needs a build is recorded against `generation`. */
+  const applyBuildItems = (
+    generation: string,
+    items: readonly PublishBuildItem[],
+  ): void => {
+    for (const item of items) {
+      if (item.route === undefined) continue;
+      if (item.reason === "data-only") {
+        refusedRoutes.delete(item.route);
+        continue;
+      }
+      refusedRoutes.set(item.route, { reason: bannerReasonFor(item), generation, since: Date.now() });
+    }
+  };
+
+  // Background full build. Debounced + single-flight; `runPublish`
+  // records a generation on every batch that needs one. Optional:
+  // tests can skip building by passing `enableBackgroundBuild: false`.
+  let publishBuild: PublishBuildCoordinator | undefined;
+  if (options.enableBackgroundBuild !== false) {
+    publishBuild = createPublishBuildCoordinator({
+      repoRoot: options.repoRoot,
+      distDir: options.dir,
+      version: options.version,
+      repoSlug: options.repoSlug ?? "vig-os/revkit",
+      ...(options.backgroundBuildRun !== undefined ? { runBuildCommand: options.backgroundBuildRun } : {}),
+      ...(options.backgroundBuildDebounceMs !== undefined ? { debounceMs: options.backgroundBuildDebounceMs } : {}),
+      // Lifecycle events go through the STORE, so each one carries a
+      // real positive seq: an SSE client that reconnects with
+      // `Last-Event-ID` replays the build, and a client that never
+      // disconnected sees the same frames in order. A seq-0
+      // pseudo-event would break the monotonic resume contract the
+      // rail and the agent channel both rely on, so the durable path
+      // is the only path.
+      appendEvent: async (event) => {
+        const seq = await store.append(event);
+        const [materialised] = await store.since(seq - 1);
+        if (materialised === undefined || materialised.seq !== seq) return;
+        await safeIngest(materialised);
+        // BOTH audiences, for the same reason `doc.published` uses
+        // both: the agent scheduled this build with its own publish
+        // and is the party that has to act on the outcome. A rail-only
+        // fan-out left the agent that published unable to learn its
+        // build had failed until it happened to poll — and the
+        // failure it most needs to see is usually a source problem
+        // only the agent can fix. The `error` tail rides the event,
+        // so the agent has the diagnostic, not just the fact.
+        //
+        // `shouldFanOutToAgent` returns true for kinds it does not
+        // special-case, so no delivery mode suppresses a build event:
+        // delivery modes gate COMMENT fan-out, not build outcomes.
+        await bus.publish(materialised, { audiences: ["rail", "agent"] });
+      },
+      // Generation-scoped clear. A success for generation G retires
+      // exactly G's refusals; a failure keeps them, because the page
+      // is still behind and the reviewer needs the banner (with the
+      // error tail) more than ever.
+      onSettled: (settlement) => {
+        if (settlement.status !== "succeeded") return;
+        for (const [route, entry] of [...refusedRoutes]) {
+          if (entry.generation === settlement.generation) refusedRoutes.delete(route);
+        }
+      },
+      log: (level, event, data) => {
+        logger[level === "error" ? "error" : level === "warn" ? "warn" : "info"](event, data ?? {});
+      },
+    });
+    // Restart reconciliation: a record left `pending` by a dead
+    // process is retried by the coordinator itself, but its refusal
+    // banners are in-memory state that died with it. Re-seed them so
+    // the first page view after a restart already explains the stale
+    // content instead of waiting for the reviewer to publish again.
+    const resumed = publishBuild.state();
+    if (resumed !== undefined && resumed.status !== "fast") {
+      for (const item of resumed.items) {
+        if (item.route === undefined || item.reason === "data-only") continue;
+        refusedRoutes.set(item.route, {
+          reason: bannerReasonFor(item),
+          generation: resumed.generation,
+          since: Date.parse(resumed.updatedAt) || Date.now(),
+        });
+      }
+    }
+  }
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -725,6 +990,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
       delivery.stop();
       presence.stop();
+      publishBuild?.stop();
       try {
         server.stop(true);
       } catch {
@@ -871,6 +1137,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return handleApi(request, url, method, requestId);
     }
 
+    // Event-log tip (M2 item 9, story A4). A browser subscriber needs
+    // a resume point BEFORE it can open `/events`, and this is the one
+    // route that answers "where does the log end right now" — the
+    // same `since` value `/events` accepts. It gets its own dispatcher
+    // branch rather than living inside `handleApi`: `handleApi` is
+    // reached only for `/api/threads*`, so a handler placed there for
+    // a different path is unreachable and 404s. (It did, once.)
+    if (url.pathname === "/api/events-head") {
+      return handleEventsHeadApi(request, method, requestId);
+    }
+
     // Delivery mode + handover + presence + delivered-set (M2 item 6,
     // ADR-0007). All share the /api/ auth + Origin discipline the
     // thread endpoints use.
@@ -887,6 +1164,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Ask JSON API (M2 item 7, story A1). Same Origin gate as threads.
     if (url.pathname === "/api/asks" || url.pathname.startsWith("/api/asks/")) {
       return handleAsksApi(request, url, method, requestId);
+    }
+
+    // Publish JSON API (M2 item 9, story A4). Agent-bearer only, one
+    // POST endpoint. The Origin discipline runs inside the handler
+    // for the same reasons as the other API branches.
+    if (url.pathname === "/api/publish") {
+      return handlePublishApi(request, method, requestId);
     }
 
     // Review-mode JSON API (M3 part 2b, ADR-0025). Only meaningful in
@@ -2756,6 +3040,23 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       logger.warn("static.rejected.invalid-encoding", { requestId, path: url.pathname });
       return withHygiene(new Response("Bad Request", { status: 400 }), "text", "text/plain; charset=utf-8");
     }
+    // M2 item 9 (PR-56 blocker 2): derive-from-files serving.
+    //
+    // For a page route whose source file we can identify (an
+    // ADR / design / feature-matrix), read the current source
+    // and compute its revision. If that revision matches what
+    // dist was built against (extracted from the stamp
+    // `rehypeStampRevision` injects), dist is current — fall
+    // through to the static branch. Otherwise render the current
+    // source into the dist shell and serve that. Cached by
+    // revision, so a second request in the same second is
+    // a Map hit. Nothing is stored per-route; a restart just
+    // repeats the derivation on demand.
+    if (request.method === "GET" || request.method === "HEAD") {
+      const overrideRoute = normalisePublishRoute(decodedPath);
+      const fresh = await tryServeFreshForRoute(overrideRoute, request.method, requestId);
+      if (fresh !== undefined) return fresh;
+    }
     const result = staticServer.resolve(decodedPath);
     if (!result.ok) {
       // Refused paths log the kind (traversal / symlink / outside /
@@ -2803,6 +3104,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // large Astro page is a few hundred KiB.
     if (contentType.startsWith("text/html")) {
       return await injectRail(rawResponse, {
+        logHead: store.head(),
         onOversize: (bodyBytes: number) => {
           logger.warn("static.rail.skipped-oversize", {
             requestId,
@@ -2813,6 +3115,343 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       });
     }
     return rawResponse;
+  }
+
+  /** HTML for the two banners the daemon splices into dist HTML
+   * when the fast path can't serve the current source directly:
+   *
+   *   - `stale-check` — the current source fails `revkit check`.
+   *   - `rendering` / `build-failed` — the current source is on disk
+   *     but the page behind it was built from an older revision, and
+   *     a full build is either running or has failed.
+   *
+   * Both banners carry the same shape (an `<aside>` with a
+   * `data-revkit-banner` tag and a CSS class the rail's styles
+   * target). Text is HTML-escaped since diagnostics may contain
+   * source-controlled paths. Round-3 nit: no inline `style` — the
+   * class hooks into `rail.css` where the styles live outside the
+   * per-response CSP. */
+  function escapeBannerText(s: string): string {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function buildStaleCheckBanner(sourcePath: string, diagnostics: readonly string[]): string {
+    const escape = escapeBannerText;
+    const lines = diagnostics.slice(0, 5).map((line) => `<li>${escape(line)}</li>`).join("");
+    const more = diagnostics.length > 5 ? `<p>…and ${diagnostics.length - 5} more diagnostic(s).</p>` : "";
+    return (
+      `<aside class="revkit-daemon-banner revkit-daemon-banner--stale-check" ` +
+      `role="status" aria-live="polite" ` +
+      `data-revkit-banner="stale-check">` +
+      `<strong>Source changed — failing <code>revkit check</code>.</strong>` +
+      ` The site is showing the previous full build's rendering of ` +
+      `<code>${escape(sourcePath)}</code>. Fix the source and republish.` +
+      `<ul>${lines}</ul>${more}</aside>`
+    );
+  }
+  function buildBackgroundBuildBanner(
+    sourcePath: string,
+    refusal: RefusedRouteState,
+    buildState: PublishBuildRecord | undefined,
+  ): string {
+    const escape = escapeBannerText;
+    const reasonPhrase = BUILD_REASON_PHRASE[refusal.reason];
+    // Only surface a build failure when the FAILED build is the one
+    // this route is actually waiting on.
+    //
+    // The coordinator's record is for whichever generation is CURRENT
+    // (the newest publish that needed a build), which is not
+    // necessarily the generation that recorded this route's refusal.
+    // A `build.failed` for a different generation says nothing about
+    // this route — showing its diagnostic here would tell a reviewer
+    // their page is broken for a reason that has nothing to do with
+    // it. Comparing the record's generation against the refusal's is
+    // what makes the claim true; the previous version asserted the
+    // scoping in a comment without doing the comparison.
+    //
+    // A read-time refusal carries a synthetic `read:<revision>`
+    // generation that no build will ever match, so it always shows
+    // the progress banner. That is the intended reading: nobody has
+    // scheduled a build for it, so claiming "a build is in
+    // progress" would itself be a lie. Its own text says the source
+    // uses a feature the fast path cannot render, and the reviewer
+    // gets the truth on the next publish (which schedules one).
+    const failure =
+      buildState?.status === "failed"
+      && buildState.error !== undefined
+      && buildState.generation === refusal.generation
+        ? buildState.error
+        : undefined;
+    if (failure !== undefined) {
+      // The build failed — show the tail so the reviewer can act.
+      // This is a TERMINAL banner, not a spinner: the page stays
+      // stale until someone republishes or fixes the source, so it
+      // must not claim a build is still in progress.
+      return (
+        `<aside class="revkit-daemon-banner revkit-daemon-banner--build-failed" ` +
+        `role="status" aria-live="polite" ` +
+        `data-revkit-banner="build-failed">` +
+        `<strong>Build failed while rendering <code>${escape(sourcePath)}</code>.</strong>` +
+        ` The previous full build's HTML is still on the page. Fix the source and ` +
+        `republish to try again.` +
+        `<pre>${escape(failure)}</pre></aside>`
+      );
+    }
+    return (
+      `<aside class="revkit-daemon-banner revkit-daemon-banner--rendering" ` +
+      `role="status" aria-live="polite" ` +
+      `data-revkit-banner="rendering">` +
+      `<strong>Source changed — rendering&hellip; (full build in progress).</strong>` +
+      ` <code>${escape(sourcePath)}</code> uses ${escape(reasonPhrase)}, which the fast ` +
+      `path can't render byte-for-byte. The build is running; the page ` +
+      `will refresh automatically.</aside>`
+    );
+  }
+
+  /** Serve `shellHtml` with `banner` spliced in at the top of the
+   * article body, through the same hygiene + rail-injection path a
+   * normal HTML response takes. One helper rather than three copies
+   * because the three banner sites (`stale-check`, `rendering`,
+   * `build-failed`) must stay indistinguishable on the wire apart
+   * from the `<aside>` they carry — in particular all of them must
+   * get the rail injected and the CSP hygiene headers, or a page
+   * showing a banner silently loses its comment UI. */
+  async function serveBannerOverDist(args: {
+    readonly shellHtml: string;
+    readonly banner: string;
+    readonly method: "GET" | "HEAD";
+    readonly requestId: string;
+    readonly route: string;
+  }): Promise<Response> {
+    const marker = ARTICLE_OPEN_MARKER;
+    const withBanner = args.shellHtml.replace(marker, `${marker}${args.banner}`);
+    if (args.method === "HEAD") {
+      return withHygiene(
+        new Response(null, {
+          status: 200,
+          headers: { "content-length": String(Buffer.byteLength(withBanner, "utf8")) },
+        }),
+        "html",
+        "text/html; charset=utf-8",
+      );
+    }
+    const rawResponse = withHygiene(
+      new Response(withBanner, { status: 200 }),
+      "html",
+      "text/html; charset=utf-8",
+    );
+    return await injectRail(rawResponse, {
+      logHead: store.head(),
+      onOversize: (bodyBytes: number) => {
+        logger.warn("static.rail.skipped-oversize", {
+          requestId: args.requestId,
+          path: args.route,
+          bytes: bodyBytes,
+        });
+      },
+    });
+  }
+
+  /** Derive-from-files serving (M2 item 9, PR-56 blocker 2).
+   *
+   * For a page route whose source file is one of the publishable
+   * roots (ADR, design, feature-matrix), compute the current
+   * source's revision. If dist has already been built against
+   * this revision (extracted from the stamp on the dist HTML),
+   * return undefined so the caller serves dist untouched. If
+   * dist is stale (source has moved on), fast-render the current
+   * source into the dist shell, cache by revision, and serve
+   * that. On any error (dist missing, source missing, render
+   * failed), return undefined so the caller falls back to the
+   * static branch. */
+  async function tryServeFreshForRoute(
+    route: string,
+    method: "GET" | "HEAD",
+    requestId: string,
+  ): Promise<Response | undefined> {
+    // 1. Reverse the site route to a source path.
+    const sourcePath = reverseSiteRoute(route);
+    if (sourcePath === undefined) return undefined;
+    // 2. Read the current source. LF-normalise so revisionOf
+    //    matches what the fast-path and full-build hash.
+    let source: string;
+    let sourceRev: string;
+    try {
+      const abs = `${options.repoRoot}/${sourcePath}`;
+      const raw = await Bun.file(abs).text();
+      source = raw.replace(/\r\n?/g, "\n");
+      sourceRev = await revisionOfBytes(source);
+    } catch {
+      return undefined;
+    }
+    // 3. Locate the dist HTML for this route. Path shape is
+    //    `<distDir>/<route sans slashes>/index.html`.
+    const distPath = shellPathForRouteInStaticDir(options.dir, route);
+    if (distPath === undefined) return undefined;
+    let shellHtml: string;
+    try {
+      shellHtml = await Bun.file(distPath).text();
+    } catch {
+      return undefined;
+    }
+    // 4. Extract the dist's stamped revision. When it matches,
+    //    dist is current and serving fresh is unnecessary — let
+    //    the static branch below handle it (cheaper: no rerender,
+    //    no splice, no rail-injection buffer copy). A refusal can
+    //    be cleared here too: if dist matches the current source,
+    //    the build has caught up and the banner is no longer
+    //    accurate. This comparison is the authority, not the
+    //    build bookkeeping — dist's stamped revision IS the proof
+    //    that the built page matches the source on disk.
+    const distRev = extractDocRevision(shellHtml);
+    if (distRev === sourceRev) {
+      refusedRoutes.delete(route);
+      return undefined;
+    }
+    // 4a. A route the fast path could not serve for its publish
+    //     generation gets a banner over the stale dist: the source
+    //     is committed and a build is scheduled, so the honest
+    //     page is "this is behind, and here is why". The rail
+    //     reloads on `build.succeeded` (fresh content, no banner)
+    //     and on `build.failed` (banner switches to the error tail
+    //     rather than spinning forever).
+    const refusal = refusedRoutes.get(route);
+    if (refusal !== undefined) {
+      return await serveBannerOverDist({
+        shellHtml,
+        banner: buildBackgroundBuildBanner(sourcePath, refusal, publishBuild?.state()),
+        method,
+        requestId,
+        route,
+      });
+    }
+    // 4b. Gate the fast-render on `revkit check` (round-2 NEW).
+    //     A source that would be refused by check (hand-rolled
+    //     UI, off-list inline script, etc.) must NOT reach the
+    //     browser via the fast path; the daemon falls back to
+    //     dist and stamps a visible banner into the article body
+    //     so the reviewer sees that dist is stale AND why.
+    let checkVerdict = checkCacheGet(sourceRev);
+    if (checkVerdict === undefined) {
+      try {
+        const absSource = `${options.repoRoot}/${sourcePath}`;
+        const output = await runCheck(
+          options.repoRoot,
+          toCheckFiles([absSource], options.repoRoot),
+          [],
+          { online: false, repoSlug: options.repoSlug ?? "vig-os/revkit", gh: spawnGh },
+        );
+        checkVerdict = {
+          pass: output.exitCode === 0,
+          diagnostics: output.lines,
+        };
+      } catch (error) {
+        // `runCheck` throws only on hard I/O errors; treat as
+        // failure and log so a reviewer can diagnose.
+        logger.warn("static.fresh-render.check-threw", {
+          requestId,
+          path: sourcePath,
+          errorKind: (error as Error).name,
+        });
+        checkVerdict = { pass: false, diagnostics: [(error as Error).message] };
+      }
+      checkCacheSet(sourceRev, checkVerdict.pass, checkVerdict.diagnostics);
+    }
+    if (!checkVerdict.pass) {
+      // Serve dist with a banner spliced into the article body.
+      return await serveBannerOverDist({
+        shellHtml,
+        banner: buildStaleCheckBanner(sourcePath, checkVerdict.diagnostics),
+        method,
+        requestId,
+        route,
+      });
+    }
+    // 5. Cache lookup by (route, source revision).
+    let entry = cacheGet(route, sourceRev);
+    if (entry === undefined) {
+      let fragment: string;
+      let dataSrcCount: number;
+      try {
+        const result = await renderDocFragment({
+          repoRoot: options.repoRoot,
+          path: sourcePath,
+          source,
+        });
+        if (result.refused === true) {
+          // Fast path can't match dist for this source (code
+          // fences, Starlight asides, indented code). Serve dist
+          // untouched — but SAY SO. Returning undefined here used to
+          // hand the reviewer a silently stale page: the source on
+          // disk differed from the HTML in front of them and nothing
+          // on the page admitted it. Recording the refusal gives the
+          // next request (and the next restart) a banner.
+          const refusal: RefusedRouteState = {
+            reason: result.reason,
+            // A read-time refusal is attributed to the source's own
+            // revision, which stands in for a publish generation: the
+            // build that eventually clears it is scheduled from a
+            // publish whose generation differs, so this entry is only
+            // retired by the dist-revision check above or by an
+            // explicit publish. That is the conservative direction —
+            // a lingering banner is visible, a missing one is not.
+            //
+            // It also means no build record's generation can ever
+            // match this one, so `buildBackgroundBuildBanner` shows
+            // the progress wording rather than borrowing another
+            // generation's diagnostic. See its comment.
+            generation: `read:${sourceRev}`,
+            since: Date.now(),
+          };
+          refusedRoutes.set(route, refusal);
+          return await serveBannerOverDist({
+            shellHtml,
+            banner: buildBackgroundBuildBanner(sourcePath, refusal, publishBuild?.state()),
+            method,
+            requestId,
+            route,
+          });
+        }
+        fragment = result.html;
+        dataSrcCount = result.dataSrcCount;
+      } catch (error) {
+        logger.warn("static.fresh-render.failed", {
+          requestId,
+          path: sourcePath,
+          errorKind: (error as Error).name,
+        });
+        return undefined;
+      }
+      const spliced = spliceArticleBody(shellHtml, fragment);
+      if (spliced === undefined) return undefined;
+      entry = { html: spliced, revision: sourceRev, dataSrcCount };
+      cacheSet(route, entry);
+    }
+    // 6. Serve.
+    if (method === "HEAD") {
+      return withHygiene(
+        new Response(null, {
+          status: 200,
+          headers: { "content-length": String(Buffer.byteLength(entry.html, "utf8")) },
+        }),
+        "html",
+        "text/html; charset=utf-8",
+      );
+    }
+    const rawResponse = withHygiene(
+      new Response(entry.html, { status: 200 }),
+      "html",
+      "text/html; charset=utf-8",
+    );
+    return await injectRail(rawResponse, {
+      logHead: store.head(),
+      onOversize: (bodyBytes: number) => {
+        logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
+      },
+    });
   }
 
   /** Serve the rail bundle (`/-/rail.js` and `/-/rail.css`). Built
@@ -3154,6 +3793,176 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
   }
 
+  /** Handle `GET /api/events-head` (M2 item 9, story A4).
+   *
+   * Returns `{ head }`, the durable log's current tip. The rail
+   * subscribes to `/events?since=<head>` on a cold load so a page that
+   * has just fetched current server state is not replayed the whole
+   * history — a replay is not merely wasteful here, it re-fires the
+   * rail's reload triggers and the page never settles (PR-56 blocker).
+   *
+   * Auth posture matches the sibling rail-facing reads: the rail
+   * holds the session cookie and is same-origin, so a session cookie
+   * plus a matching `Origin` is accepted and an agent bearer works
+   * too (the MCP subscriber uses the same `since` contract). The
+   * extra Origin check is DEFENCE IN DEPTH rather than the primary
+   * control: the cookie rides along automatically on a cross-origin
+   * browser request, and this endpoint's body is a log position with
+   * no content in it — so the realistic worst case from a leak is
+   * "how much history does this repo have", not "what is in it". It
+   * stays because the cost is one comparison and the sibling routes
+   * set the precedent.
+   */
+  function handleEventsHeadApi(request: Request, method: string, requestId: string): Response {
+    if (method !== "GET") return methodNotAllowed();
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+    if (!hasValidBearer && !auth.hasSession(readCookie(request.headers.get("cookie"), cookieName(port)))) {
+      logger.warn("api.events-head.rejected.role", { requestId });
+      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    }
+    return jsonResponse({ head: store.head() });
+  }
+
+  // ── /api/publish branch (M2 item 9, story A4) ──────────────────
+
+  /** Handle `POST /api/publish`. Agent-bearer only; the Origin
+   * discipline is the same as `/api/threads` and `/api/asks`.
+   * The `runPublish` orchestrator does the confinement,
+   * `revkit check`, atomic write, fast-path render, event fanout
+   * and re-anchoring. */
+  async function handlePublishApi(request: Request, method: string, requestId: string): Promise<Response> {
+    if (method !== "POST") return methodNotAllowed();
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+    if (!hasValidBearer) {
+      logger.warn("api.publish.rejected.role", { requestId });
+      return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+    }
+    const bodyRead = await readCappedJsonBody(request);
+    if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+    const parsed = publishRequestSchema.safeParse(bodyRead.value);
+    if (!parsed.success) return badRequest(parsed.error.issues);
+    const outcome = await runPublish(
+      {
+        docs: parsed.data.docs ?? [],
+        ...(parsed.data.data !== undefined ? { data: parsed.data.data } : {}),
+      },
+      {
+        repoRoot: options.repoRoot,
+        store,
+        bus,
+        presence,
+        agentActor,
+        systemActor,
+        repoSlug: options.repoSlug ?? "vig-os/revkit",
+        refreshAnchors: async (path: string) => {
+          await reanchor.refresh(path);
+        },
+        reconcileWatchers: () => {
+          void reanchor.reconcileWatchers();
+        },
+        ingestDelivery: safeIngest,
+        distDir: options.dir,
+        setRenderCache: (route, revision, html, dataSrcCount) => {
+          cacheSet(route, { html, revision, dataSrcCount });
+        },
+        // The coordinator owns scheduling; the daemon owns what the
+        // reviewer sees while the build runs. `applyBuildItems` turns
+        // the batch's typed outcome into per-route banner state, so a
+        // refusal, a render exception, a data-only file and a missing
+        // shell all get the same treatment without `runPublish`
+        // needing to know how the daemon renders a banner.
+        recordGeneration: async (generation, items) => {
+          if (publishBuild === undefined) {
+            // Scheduling disabled (`enableBackgroundBuild: false`).
+            // The routes still need their banner state — the reviewer
+            // is looking at stale content either way.
+            applyBuildItems(generation, items);
+            return { generation, status: items.length === 0 ? "fast" : "pending", items };
+          }
+          const record = await publishBuild.record(generation, items);
+          applyBuildItems(generation, items);
+          return {
+            generation: record.generation,
+            status: record.status,
+            items: record.items,
+          };
+        },
+        ...(options.publishBeforeStagedCommit !== undefined
+          ? { beforeStagedCommit: options.publishBeforeStagedCommit }
+          : {}),
+      },
+    );
+    if (!outcome.ok) {
+      // Status per kind:
+      //   check-failed   422 the content is wrong, not the request shape
+      //   too-large      413 a byte cap (per file or per batch)
+      //   too-many-files 400 a count cap — the request shape is fine,
+      //                 there are simply too many parts
+      //   confinement    400 the path is outside the allowlist
+      //   shell-missing  200 unreachable on the failure branch today —
+      //                 a missing shell is a build item, not an error —
+      //                 kept so the mapping stays total
+      //   everything else 500
+      const status =
+        outcome.kind === "check-failed"
+          ? 422
+          : outcome.kind === "too-large"
+            ? 413
+            : outcome.kind === "confinement" || outcome.kind === "too-many-files"
+              ? 400
+              : outcome.kind === "shell-missing"
+                ? 200
+                : 500;
+      logger.warn("api.publish.rejected", { requestId, errorKind: outcome.kind });
+      return jsonResponse(
+        {
+          error: outcome.kind,
+          reason: outcome.reason,
+          ...(outcome.diagnostics !== undefined ? { diagnostics: outcome.diagnostics } : {}),
+        },
+        status,
+      );
+    }
+    const warning = outcome.notice?.message;
+    logger.info("api.publish.ok", {
+      requestId,
+      files: outcome.published.length,
+      overrides: outcome.overrides.length,
+      refused: outcome.refused.length,
+      building: outcome.build.items.length,
+      buildStatus: outcome.build.status,
+      ...(warning !== undefined ? { warning } : {}),
+    });
+    return jsonResponse(
+      {
+        published: outcome.published,
+        seqs: outcome.seqs,
+        overrides: outcome.overrides.map((o) => ({ route: o.route, dataSrcCount: o.dataSrcCount })),
+        // `refused` names paths whose fast-path render was REFUSED
+        // (fenced code, aside, indented code). The agent should not
+        // retry immediately — a build is already scheduled and the
+        // page will refresh when it lands.
+        refused: outcome.refused,
+        // The batch boundary + the per-path render state. `state:
+        // "fast"` means served from the in-memory splice; any other
+        // entry names the reason a full build was scheduled for that
+        // path. `build.status` is `fast` only when EVERY path in the
+        // batch rendered — a batch of data-only files still builds.
+        generation: outcome.generation,
+        rendering: outcome.rendering,
+        build: { generation: outcome.build.generation, status: outcome.build.status },
+        ...(warning !== undefined ? { warning } : {}),
+      },
+      201,
+    );
+  }
+
   /** Load one ask by id, first sweeping it for expiry so a caller
    * that hits `/api/asks/:id` after the deadline sees the terminal
    * `expired` state rather than a stale `pending`. Returns
@@ -3265,6 +4074,64 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
  * (a `--dir` pointing at some other directory on disk); the caller has
  * asked us to serve that path, so hiding it in a log would be
  * worse than an absolute leak. */
+/** Normalise a URL pathname into the shape publish routes are
+ * keyed on: leading slash, trailing slash. `/adr/foo` and
+ * `/adr/foo/` and `/adr/foo/index.html` all normalise to
+ * `/adr/foo/`. Exported for tests. */
+export function normalisePublishRoute(pathname: string): string {
+  let p = pathname;
+  if (p.endsWith("/index.html")) p = p.slice(0, -"index.html".length);
+  if (!p.startsWith("/")) p = "/" + p;
+  if (!p.endsWith("/")) p = p + "/";
+  // Collapse double slashes so `/adr//foo/` never sneaks past the
+  // canonical spelling.
+  return p.replace(/\/+/g, "/");
+}
+
+/** Inverse of `siteRouteForPath` — a repo-relative source path for
+ * a site route, or undefined when the route is not a publishable
+ * doc (a landing page, an asset, an `/ask/<id>`, etc.). Kept as
+ * a single-place static map so both directions round-trip.
+ * `/adr/foo/`     → `docs/adr/foo.md`
+ * `/designs/bar/` → `docs/designs/bar.md`
+ * `/feature-matrix/` → `docs/FEATURE-MATRIX.md`
+ * The routes we recognise here match the writable prefixes
+ * `publish-confine.ts` accepts, so a publish that lands is a
+ * route the derive-from-files path serves. */
+export function reverseSiteRoute(route: string): string | undefined {
+  const normalised = route.replace(/^\/+|\/+$/g, "");
+  if (normalised === "feature-matrix") return "docs/FEATURE-MATRIX.md";
+  const adrMatch = normalised.match(/^adr\/([^/]+)$/);
+  if (adrMatch !== null && adrMatch[1] !== undefined) {
+    return `docs/adr/${adrMatch[1]}.md`;
+  }
+  const designMatch = normalised.match(/^designs\/([^/]+)$/);
+  if (designMatch !== null && designMatch[1] !== undefined) {
+    return `docs/designs/${designMatch[1]}.md`;
+  }
+  return undefined;
+}
+
+/** Locate the dist HTML for a site route relative to a served dir
+ * (`options.dir`). Returns undefined when the file does not exist
+ * — the caller falls back to the ordinary static branch. Kept
+ * separate from `spliceIntoShell` in `publish.ts` because the
+ * write path needs the file's absolute location; the request path
+ * only needs to know whether the file exists. */
+export function shellPathForRouteInStaticDir(distDir: string, route: string): string | undefined {
+  const normalised = route.replace(/^\/+|\/+$/g, "");
+  const candidate = normalised.length === 0
+    ? `${distDir}/index.html`
+    : `${distDir}/${normalised}/index.html`;
+  try {
+    if (statSync(candidate).isFile()) return candidate;
+  } catch {
+    // Not-found → undefined.
+  }
+  return undefined;
+}
+
+
 function repoRelativeDisplay(repoRoot: string, absolute: string): string {
   const rel = relativePath(repoRoot, absolute);
   if (rel === "" || rel.startsWith("..")) return absolute;

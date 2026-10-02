@@ -126,6 +126,18 @@ describe.skipIf(!E2E)("revkit build — packaged CLI e2e", () => {
 
     const consumer = scaffoldConsumer();
 
+    // The claim this test now pins EXPLICITLY (M2 item 9, PR-56): a
+    // normal consumer has no `site/` directory and therefore no
+    // `site/node_modules/.bin/astro`. Any build path that shelled out
+    // to that binary works in the revkit checkout — where the dev
+    // shell has it — and fails for every consumer. The daemon's
+    // background builds go through this same primitive, so proving
+    // the primitive works WITHOUT the consumer-side binary is what
+    // makes a background build safe to schedule.
+    expect(existsSync(join(consumer, "site"))).toBe(false);
+    expect(existsSync(join(consumer, "site", "node_modules", ".bin", "astro"))).toBe(false);
+    expect(existsSync(join(consumer, "node_modules"))).toBe(false);
+
     // Snapshot the packaged libexec BEFORE the build. Under the
     // read-only-store contract, this must be byte-identical after.
     const before = snapshot(join(store, "libexec"));

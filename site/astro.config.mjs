@@ -19,10 +19,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import remarkMath from "remark-math";
-import { rehypeKatexStrict } from "./src/lib/rehype-katex-strict.ts";
-import { rehypeDataSrc } from "../packages/cli/src/rehype-data-src.ts";
-import { rehypeDropRepoDocTitle } from "../packages/cli/src/rehype-drop-repo-doc-title.ts";
+import { buildSharedMarkdownConfig } from "./src/lib/markdown-processor.ts";
 import { readConsumerRoot } from "./src/lib/consumer-root.ts";
 
 // Consumer-root mode (M5 part 2, issue #57): when `revkit build` sets
@@ -276,67 +273,17 @@ export default defineConfig({
   // src/lib/rehype-katex-strict.ts). `trust: false` (the default) blocks
   // `\href` and `\includegraphics`, so LaTeX cannot smuggle a link or an
   // external asset through math either.
-  markdown: {
-    remarkPlugins: [remarkMath],
-    // `rehypeDataSrc` runs AFTER `rehype-katex-strict`: KaTeX rewrites
-    // math regions to `<span class="katex">` trees WITHOUT position
-    // info, so running the stamper after keeps it from stamping the
-    // math internals with a garbage position. The stamper is a pure
-    // walker (no I/O), so ordering is a semantics choice, not a
-    // performance one.
-    rehypePlugins: [
-      [rehypeKatexStrict, { trust: false }],
-      // Drop the repo-doc's leading `# Title` in hast — Starlight's
-      // layout already renders the title from frontmatter. Done in
-      // hast (not in source) so `rehype-data-src` below stamps every
-      // block with its ORIGINAL source line number; a source-side
-      // strip shifted every anchor by 2 lines (PR #38 blocker 1).
-      //
-      // `pathMap` — issue #57 blocker. In consumer mode, `revkit
-      // build` copies `<consumer>/docs/*` to `<staging>/src/content/
-      // docs/*` before spawning astro. Without a remap, both plugins
-      // see the staged path and either (rehype-data-src) stamp every
-      // block with `data-src=".revkit/build/…"` — pointing at a
-      // throwaway staging copy the reviewer never edits — or (drop-
-      // title) skip the leading-H1 drop because the staged path
-      // does not match `docs/**/*.md`. Remap the staged prefix back
-      // to `<consumer>/docs/` so anchors target the source (the
-      // path a comment reads, an agent edits, and a GitHub review
-      // targets) and the title drop still fires.
-      [
-        rehypeDropRepoDocTitle,
-        {
-          repoRoot: REPO_ROOT,
-          ...(CONSUMER_ROOT
-            ? {
-                pathMap: [
-                  {
-                    from: join(CONSUMER_ROOT, ".revkit", "build", "src", "content", "docs"),
-                    to: join(CONSUMER_ROOT, "docs"),
-                  },
-                ],
-              }
-            : {}),
-        },
-      ],
-      [
-        rehypeDataSrc,
-        {
-          repoRoot: REPO_ROOT,
-          ...(CONSUMER_ROOT
-            ? {
-                pathMap: [
-                  {
-                    from: join(CONSUMER_ROOT, ".revkit", "build", "src", "content", "docs"),
-                    to: join(CONSUMER_ROOT, "docs"),
-                  },
-                ],
-              }
-            : {}),
-        },
-      ],
-    ],
-  },
+  // The remark + rehype list comes from ONE shared module that the
+  // daemon's fast-path publish also imports (M2 item 9, story A4).
+  // A new plugin lands in ONE place; both consumers see it.
+  markdown: buildSharedMarkdownConfig(REPO_ROOT, {
+    pathMap: CONSUMER_ROOT
+      ? [{
+          from: join(CONSUMER_ROOT, ".revkit", "build", "src", "content", "docs"),
+          to: join(CONSUMER_ROOT, "docs"),
+        }]
+      : undefined,
+  }),
   // `cacheDir` — astro's default is `./node_modules/.astro`. In the
   // packaged CLI's flow that would land INSIDE the read-only nix
   // store, so `revkit build` sets `REVKIT_ASTRO_CACHE_DIR` to a

@@ -330,6 +330,82 @@ export class DaemonClient {
     return await response.json();
   }
 
+  /** `POST /api/publish` — write one or more source files to the
+   * repo, run `revkit check` on them, re-render the affected pages
+   * for < 1 s live-update, and append `doc.published` events (M2
+   * item 9, story A4). The daemon is the write authority — the
+   * client sends the FULL file bodies.
+   *
+   * The response is deliberately explicit about VISIBILITY, because
+   * "published" alone would over-promise. Every path in the batch is
+   * either in `rendering[]` as `{ state: "fast" }` — served from the
+   * in-memory splice within the request — or as a build item naming
+   * the reason a full build was scheduled instead:
+   *
+   *   - `fast-path-refused` (also mirrored in `refused[]` with the
+   *     renderer's tag in `reason`): the source uses fenced code, an
+   *     indented code block or a Starlight aside, which the fast path
+   *     cannot reproduce byte-for-byte. A build is scheduled; the page
+   *     refreshes when it lands. Do NOT retry.
+   *   - `render-failed`: the renderer threw after check approved the
+   *     source. Same visible state, different cause.
+   *   - `shell-missing`: the route has no previously built page to
+   *     splice into (brand-new route, or a consumer that never ran a
+   *     build). The build creates it.
+   *   - `data-only`: the path has no route of its own (plot spec /
+   *     data file, `vocab/terms.yaml`). The plots and pages that
+   *     embed it are build-time products, so a build is scheduled.
+   *
+   * `build.status` is `fast` only when EVERY path in the batch
+   * rendered; anything else means a build is outstanding. Lifecycle
+   * events (`build.requested` / `build.started` / `build.succeeded`
+   * / `build.failed`) are durable log events with positive seqs, so
+   * they survive an SSE reconnect and a daemon restart.
+   *
+   * `warning` is present when the sources landed but a `doc.published`
+   * append was rejected — the build is still scheduled, so the page
+   * will refresh, but the rail learned about the batch from the build
+   * rather than from `doc.published`. */
+  async publish(request: {
+    docs: readonly { path: string; content: string }[];
+    data?: readonly { path: string; content: string }[];
+  }): Promise<{
+    published: readonly { path: string; route?: string; revision: string }[];
+    seqs: readonly number[];
+    overrides: readonly { route: string; dataSrcCount: number }[];
+    refused: readonly { path: string; route?: string; reason: string }[];
+    generation: string;
+    rendering: readonly ({
+      path: string;
+      route?: string;
+    } & (
+      | { state: "fast" }
+      | {
+          reason: "data-only" | "fast-path-refused" | "render-failed" | "shell-missing";
+          detail?: string;
+        }
+    ))[];
+    build: { generation: string; status: "fast" | "pending" | "running" | "succeeded" | "failed" };
+    warning?: string;
+  }> {
+    const body: Record<string, unknown> = { docs: request.docs };
+    if (request.data !== undefined) body.data = request.data;
+    const response = await this.#fetch(`${this.#url}/api/publish`, {
+      method: "POST",
+      headers: this.#authHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new DaemonHttpError(
+        `daemon POST /api/publish → ${response.status} ${text}`,
+        response.status,
+        text,
+      );
+    }
+    return (await response.json()) as Awaited<ReturnType<DaemonClient["publish"]>>;
+  }
+
   /** `POST /api/threads/:id/resolve`. */
   async resolve(threadId: string, resolution?: string): Promise<AppendResponse> {
     const body = resolution !== undefined ? { resolution } : {};

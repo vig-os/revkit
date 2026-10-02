@@ -171,21 +171,29 @@ describe("revkit mcp — channel + tools contract", () => {
     await tearDown(ctx);
   });
 
-  test("tools/list advertises threads, reply, resolve, review_url, ask, await_answer with expected shape", async () => {
+  test("tools/list advertises threads, reply, resolve, review_url, ask, await_answer, publish with expected shape", async () => {
     const listing = await ctx.client.listTools();
     const names = listing.tools.map((t) => t.name).sort();
-    // M2 item 6 (delivery modes + presence) + M2 item 7 (asks):
-    // `mode`, `presence`, `ask`, `await_answer` joined the listing.
+    // M2 item 6 (delivery modes + presence), item 7 (asks) and
+    // item 9 (publish): `mode`, `presence`, `ask`, `await_answer`,
+    // `publish` joined the listing.
     expect(names).toEqual([
       "ask",
       "await_answer",
       "mode",
       "presence",
+      "publish",
       "reply",
       "resolve",
       "review_url",
       "threads",
     ]);
+    // Publish tool: additive properties, no required batch (`docs`
+    // and `data` are both optional; the daemon refuses empty).
+    const publish = listing.tools.find((t) => t.name === "publish");
+    expect(publish?.inputSchema.additionalProperties).toBe(false);
+    expect((publish?.inputSchema as { properties?: Record<string, unknown> }).properties).toHaveProperty("docs");
+    expect((publish?.inputSchema as { properties?: Record<string, unknown> }).properties).toHaveProperty("data");
     const ask = listing.tools.find((t) => t.name === "ask");
     expect(ask?.inputSchema.required).toEqual(["spec"]);
     expect(ask?.inputSchema.additionalProperties).toBe(false);

@@ -113,6 +113,10 @@ grep -q "revkit build" "$smoke_dir/help.txt" || {
   echo "smoke: FAIL — --help does not list 'revkit build'" >&2
   exit 1
 }
+grep -q "revkit skill install" "$smoke_dir/help.txt" || {
+  echo "smoke: FAIL — --help does not list 'revkit skill install'" >&2
+  exit 1
+}
 
 # --- Step 5: revkit build (M5 part 2) ----------------------------------
 echo "smoke: revkit build (render docs via packaged site)"
@@ -156,7 +160,37 @@ if find "$REVKIT_BIN" -newer "$smoke_dir/.revkit/dist/index.html" 2>/dev/null | 
   exit 1
 fi
 
-# --- Step 6: revkit serve, GET / and assert rail.js --------------------
+# --- Step 6: install the packaged consumer skill -----------------------
+echo "smoke: revkit skill install"
+cd "$smoke_dir"
+"$REVKIT_BIN" skill install >"$smoke_dir/skill.txt"
+target="$smoke_dir/.claude/skills/revkit/SKILL.md"
+test -f "$target" || {
+  echo "smoke: FAIL — skill install did not write $target" >&2
+  exit 1
+}
+grep -q "^name: revkit$" "$target" || {
+  echo "smoke: FAIL — installed skill has no revkit frontmatter" >&2
+  exit 1
+}
+if "$REVKIT_BIN" skill install >/dev/null 2>"$smoke_dir/skill-refuse.txt"; then
+  echo "smoke: FAIL — repeated skill install should require --force" >&2
+  exit 1
+fi
+grep -q "already exists" "$smoke_dir/skill-refuse.txt" || {
+  echo "smoke: FAIL — repeated skill install did not explain refusal" >&2
+  exit 1
+}
+"$REVKIT_BIN" skill install --force >/dev/null
+shopt -s nullglob
+skill_backups=("$smoke_dir"/.claude/skills/revkit/SKILL.md.backup-*)
+shopt -u nullglob
+if [ "${#skill_backups[@]}" -eq 0 ]; then
+  echo "smoke: FAIL — skill install --force did not preserve a backup" >&2
+  exit 1
+fi
+
+# --- Step 7: revkit serve, GET / and assert rail.js --------------------
 echo "smoke: revkit serve --no-auto-build (already built above)"
 cd "$smoke_dir"
 "$REVKIT_BIN" serve --port 0 --no-auto-build >"$smoke_dir/serve.out" 2>"$smoke_dir/serve.err" &

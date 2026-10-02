@@ -26,6 +26,21 @@ import { createMemo, createResource, createSignal, For, onCleanup, Show, type JS
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 import {
+  createSeqGate,
+  readPageRenderHead,
+  readResumeSeq,
+  sinceForSubscribe,
+  writeResumeSeq,
+  type ResumeStorage,
+} from "./resume-point.ts";
+import {
+  readDraft,
+  removeDraft,
+  saveDraft,
+  sweepExpiredDrafts,
+  type DraftStorage,
+} from "./drafts.ts";
+import {
   excerptOf,
   formatRelativeTime,
   isThreadUnread,
@@ -138,6 +153,8 @@ interface RailReviewEvent {
   readonly seq: number;
   readonly kind: string;
   readonly threadId?: string;
+  readonly route?: string;
+  readonly path?: string;
 }
 
 /** Delivery mode wire shape from `GET /api/delivery-mode` (M2 item 6).
@@ -566,10 +583,79 @@ function nearestAnchorAncestor(node: Node | null): HTMLElement | undefined {
   return undefined;
 }
 
+function normaliseCurrentRoute(pathname: string): string {
+  let path = pathname;
+  if (path.endsWith("/index.html")) path = path.slice(0, -"index.html".length);
+  if (!path.startsWith("/")) path = "/" + path;
+  if (!path.endsWith("/")) path += "/";
+  return path.replace(/\/+/g, "/");
+}
+
+/** Where to open `/events` from.
+ *
+ * Primary source: the log head the daemon stamped into THIS page when
+ * it rendered it (`<meta name="revkit-log-head">`). That value is
+ * guaranteed to predate the window between this page's HTML GET and
+ * the stream attaching, so subscribing from it REPLAYS any update
+ * that landed in that window — an update a page which had subscribed
+ * unconditionally would have received. The per-seq gate drops the
+ * frames the page already handled, so replaying costs nothing.
+ *
+ * This matters because a working resume point TRADES unconditional
+ * replay for conditional updates: before one existed the rail replayed
+ * the whole log on every load, so it was never blind — and re-fired
+ * its reload triggers forever. With a resume point the trade is only
+ * sound if the blind window is closed BY CONSTRUCTION, which is what
+ * the server-side stamp does. Probing the head from the page cannot
+ * do it, because the probe itself runs inside the window it would
+ * need to cover.
+ *
+ * Fallbacks, in order: this tab's persisted resume point (a WARM
+ * reload), then a live read of `/api/events-head`.
+ *
+ * A total failure degrades to `since=0` (full replay) — safe, not
+ * merely degraded: the per-seq gate drops anything already handled, so
+ * the worst case is ONE extra reload followed by quiescence. The
+ * resume point is the optimisation; the gate is the safety net. */
+async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<number> {
+  const stored = readResumeSeq(storage);
+  // The stamp is in the HTML the browser already has — no request, so
+  // no window between reading it and using it.
+  const pageHead = readPageRenderHead(document);
+  if (pageHead > 0) return sinceForSubscribe(stored, 0, pageHead);
+  if (stored > 0) return sinceForSubscribe(stored, 0, 0);
+  try {
+    const response = await fetch("/api/events-head", {
+      headers: { accept: "application/json" },
+      credentials: "same-origin",
+    });
+    if (!response.ok) return 0;
+    const body = (await response.json()) as { head?: unknown };
+    return sinceForSubscribe(stored, typeof body.head === "number" ? body.head : 0, 0);
+  } catch {
+    return 0;
+  }
+}
+
 /** SSE subscriber that re-fetches threads whenever the daemon reports
  * a comment / thread event. Reconnects on close with an exponential
  * backoff up to 30 s — a paused laptop can wake into a stale stream
- * and this brings it back quickly without hammering the daemon. */
+ * and this brings it back quickly without hammering the daemon.
+ *
+ * **Two independent guards against acting twice on one event** (M2
+ * item 9, PR-56 blocker):
+ *
+ * 1. A resume point, so the daemon does not replay what this tab has
+ *    already seen (see `resolveInitialSince`).
+ * 2. A monotonic per-seq gate inside `onmessage`, so ANY
+ *    duplicate — a replay that raced the resume point, a reconnect
+ *    that re-delivered a frame, a second tab's worth of history — is
+ *    dropped before it can bump state or navigate. This is what makes
+ *    "reload on `build.succeeded`" safe: the reload is a reaction to a
+ *    NEW event, never to the replay of the one that caused it.
+ *
+ * The resume point is persisted BEFORE any action, so the reload the
+ * action triggers starts the next page load already past it. */
 function subscribeEvents(
   onBump: (event: RailReviewEvent) => void,
   onModeBump: () => void = () => {},
@@ -590,18 +676,61 @@ function subscribeEvents(
     readonly to?: string;
     readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   }) => void = () => {},
+  onAttached: () => void = () => {},
 ): () => void {
   let closed = false;
   let source: EventSource | undefined;
   let retryDelayMs = 500;
+  /** Monotonic per-seq gate: a replay is dropped before it can bump
+   * state or navigate. Seeded with the persisted resume point so the
+   * gate holds on its own even if `?since=` does not — see
+   * `rail/resume-point.ts`. */
+  const gate = createSeqGate(readResumeSeq(sessionStorageOrUndefined()));
+  /** Resolved once, on first subscribe; reused across reconnects so a
+   * reconnect does not re-probe and does not drift to a newer head,
+   * which would skip events the browser missed while disconnected. */
+  let initialSince: Promise<number> | undefined;
   const kick = (): void => {
     if (closed) return;
-    // `EventSource` sends the session cookie automatically because we
-    // opened the page under the daemon's own origin.
-    source = new EventSource("/events");
+    initialSince ??= resolveInitialSince(sessionStorageOrUndefined());
+    void initialSince.then((since) => {
+      if (closed) return;
+      // `EventSource` sends the session cookie automatically because
+      // we opened the page under the daemon's own origin.
+      source = new EventSource(
+        since > 0 ? `/events?since=${encodeURIComponent(String(since))}` : "/events?since=0",
+      );
+      attach();
+    });
+  };
+  const attach = (): void => {
+    if (closed || source === undefined) return;
+    // ONE authoritative thread-list refetch once the stream is open.
+    //
+    // What this does: re-reads `GET /api/threads`, so the rail's
+    // thread list reflects anything that landed while it was wiring
+    // itself up.
+    //
+    // What this does NOT do, and used to be claimed to do: re-read
+    // THIS ROUTE's HTML. It cannot — the route's page HTML is not
+    // reachable from a thread-list fetch. The lost-update window
+    // between this page's HTML GET and the stream attaching is closed
+    // instead by resuming from the head stamped into this page at
+    // RENDER time (`resolveInitialSince`), which REPLAYS that window
+    // rather than papering over it.
+    onAttached();
     source.onmessage = (message: MessageEvent<string>): void => {
       try {
         const event = JSON.parse(message.data) as RailReviewEvent;
+        // Idempotence gate. A durable event carries a positive seq; a
+        // replay of one this tab already handled is dropped HERE,
+        // before any bump or navigation. Ephemeral frames (presence)
+        // carry no seq and are always processed — they are not on the
+        // log and cannot be replayed.
+        if (typeof event.seq === "number" && !gate.accept(event.seq)) return;
+        // Persist BEFORE acting: a reload triggered below must start
+        // the next page load past this seq.
+        writeResumeSeq(sessionStorageOrUndefined(), event.seq);
         // Any comment/thread transition is a reason to re-fetch. We
         // do not merge into local state — the daemon is authoritative
         // and a re-fetch is one round-trip we can afford.
@@ -630,6 +759,28 @@ function subscribeEvents(
           event.kind === "review.abandoned"
         ) {
           onBump(event);
+        }
+        if (event.kind === "doc.published" && typeof event.route === "string") {
+          if (normaliseCurrentRoute(window.location.pathname) === normaliseCurrentRoute(event.route)) {
+            saveReplyDraftsToSessionStorage();
+            window.location.reload();
+          }
+        }
+        // M2 item 9, story A4: a scheduled full build finished —
+        // either way. On `build.succeeded` the daemon has fresh dist
+        // HTML for every route, so a page that was showing the
+        // "rendering..." banner reloads and swaps it out. On
+        // `build.failed` the page must ALSO reload, because the
+        // banner's content changes from "a build is running" to the
+        // build's error tail. Reloading only on success left the
+        // reviewer staring at a spinner for a build that had already
+        // died — the one state the banner could not self-correct.
+        // Reload unconditionally: the server-side derive-from-files
+        // logic serves dist untouched when source and dist agree,
+        // so an up-to-date page pays a no-op reload at worst.
+        if (event.kind === "build.succeeded" || event.kind === "build.failed") {
+          saveReplyDraftsToSessionStorage();
+          window.location.reload();
         }
         // M2 item 6: any event that could change the batch count
         // re-fetches the mode. A `comment.created` / `comment.replied`
@@ -689,6 +840,47 @@ function subscribeEvents(
     closed = true;
     source?.close();
   };
+}
+
+function sessionStorageOrUndefined(): (Storage & DraftStorage) | undefined {
+  // `sessionStorage` is a getter on `window` and throws in some
+  // sandboxed / privacy contexts; a bare read would take the whole rail
+  // down, so probe once per call and let the helpers degrade.
+  try {
+    return window.sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveReplyDraftsToSessionStorage(): void {
+  const storage = sessionStorageOrUndefined();
+  if (storage === undefined) return;
+  // Sweep first, so an abandoned tab's drafts do not accumulate
+  // indefinitely even while the reviewer is actively using the rail.
+  sweepExpiredDrafts(storage, Date.now());
+  const forms = document.querySelectorAll<HTMLFormElement>(
+    "form.revkit-rail__reply-form[data-thread-id]",
+  );
+  for (const form of Array.from(forms)) {
+    const threadId = form.getAttribute("data-thread-id");
+    const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+    if (threadId === null || textarea === null) continue;
+    saveDraft(storage, threadId, textarea.value, Date.now());
+  }
+}
+
+function restoreReplyDraftFromSessionStorage(threadId: string, textarea: HTMLTextAreaElement): boolean {
+  const draft = readDraft(sessionStorageOrUndefined(), threadId, Date.now());
+  if (draft !== undefined && draft.text.length > 0) {
+    textarea.value = draft.text;
+    return true;
+  }
+  return false;
+}
+
+function clearReplyDraftFor(threadId: string): void {
+  removeDraft(sessionStorageOrUndefined(), threadId);
 }
 
 /** Try to find the block on the page whose `data-src` matches
@@ -811,6 +1003,10 @@ function Rail(): JSX.Element {
   // open. Declared here so keyboard handlers set up below can read
   // it in Escape's dispatch table.
   const [replyDraftFor, setReplyDraftFor] = createSignal<string | undefined>(undefined);
+
+  function restoreReplyDraftForThread(threadId: string, textarea: HTMLTextAreaElement): void {
+    if (restoreReplyDraftFromSessionStorage(threadId, textarea)) setReplyDraftFor(threadId);
+  }
   // Per-viewer "seen" marks for the unread pill (issue #60). Kept
   // in localStorage; wrapped in try/catch, keyed by the daemon's
   // `instanceId` (fetched below) so a rebuild starts fresh. The
@@ -1049,6 +1245,12 @@ function Rail(): JSX.Element {
     },
     (event) => applyPresenceEvent(event),
     (event) => applyDeliveryEvent(event),
+    // One authoritative refetch once the SSE stream is open, so an
+    // event appended between the head probe and the connection is not
+    // missed. See `subscribeEvents`.
+    () => {
+      void refetch();
+    },
   );
   onCleanup(unsubscribe);
 
@@ -1995,12 +2197,14 @@ function Rail(): JSX.Element {
                       >
                         <form
                           class="revkit-rail__reply-form"
+                          data-thread-id={thread.id}
                           onSubmit={(event: SubmitEvent): void => {
                             event.preventDefault();
                             const form = event.currentTarget as HTMLFormElement;
                             const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
                             if (textarea === null || textarea.value.trim().length === 0) return;
                             void submitReply(thread, textarea.value.trim());
+                            clearReplyDraftFor(thread.id);
                           }}
                         >
                           <label class="revkit-rail__label">
@@ -2010,6 +2214,7 @@ function Rail(): JSX.Element {
                               rows="2"
                               data-testid="revkit-rail-reply-input"
                               aria-label="reply body"
+                              ref={(element: HTMLTextAreaElement) => restoreReplyDraftForThread(thread.id, element)}
                             ></textarea>
                           </label>
                           <div class="revkit-rail__actions">
@@ -2196,12 +2401,14 @@ function Rail(): JSX.Element {
                         >
                           <form
                             class="revkit-rail__reply-form"
+                            data-thread-id={thread.id}
                             onSubmit={(event: SubmitEvent): void => {
                               event.preventDefault();
                               const form = event.currentTarget as HTMLFormElement;
                               const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
                               if (textarea === null || textarea.value.trim().length === 0) return;
                               void submitReply(thread, textarea.value.trim());
+                              clearReplyDraftFor(thread.id);
                             }}
                           >
                             <label class="revkit-rail__label">
@@ -2211,6 +2418,7 @@ function Rail(): JSX.Element {
                                 rows="2"
                                 data-testid="revkit-rail-orphan-reply-input"
                                 aria-label="reply body"
+                                ref={(element: HTMLTextAreaElement) => restoreReplyDraftForThread(thread.id, element)}
                               ></textarea>
                             </label>
                             <div class="revkit-rail__actions">

@@ -162,3 +162,42 @@ describe("validateNext — thread.orphaned", () => {
     expect(result.rejection.kind).toBe("unknown-thread");
   });
 });
+
+describe("validateNext — doc.published (M2 item 9)", () => {
+  test("doc.published is accepted (no thread state affected)", () => {
+    const state = emptyLogState();
+    // Publish alongside a comment already on the same path — validates
+    // that the publish event does NOT rewrite the existing thread's
+    // status (that transition belongs to the re-anchor pipeline, which
+    // emits its own events).
+    validateNext(state, created("th-1", "c-1", 1));
+    const preThread = state.threads.get("th-1");
+    const preStatus = preThread?.status;
+    const result = validateNext(state, {
+      seq: 2,
+      ts: t,
+      actor: { kind: "agent", id: "revkit-live" },
+      kind: "doc.published",
+      path: anchor.path,
+      revision: "d".repeat(64),
+      route: "/adr/0006-comments-anchoring-event-log/",
+      generation: "e".repeat(64),
+    });
+    expect(result.ok).toBe(true);
+    expect(state.threads.get("th-1")?.status).toBe(preStatus);
+  });
+
+  test("doc.published without a route is accepted (data side files carry no route)", () => {
+    const state = emptyLogState();
+    const result = validateNext(state, {
+      seq: 1,
+      ts: t,
+      actor: { kind: "agent", id: "revkit-live" },
+      kind: "doc.published",
+      path: "plots/curve/data.json",
+      revision: "d".repeat(64),
+      generation: "e".repeat(64),
+    });
+    expect(result.ok).toBe(true);
+  });
+});

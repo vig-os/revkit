@@ -152,16 +152,16 @@ export function siteRouteForDoc(repoRelativePath: string): string | null {
 }
 
 /**
- * Rewrite `href="…md(#anchor)?"` attributes in a rendered HTML fragment.
+ * DEPRECATED. The link rewrite now lives in the shared rehype chain
+ * (`rehype-rewrite-md-links.ts`) so the full build AND the daemon's
+ * fast-path renderer apply the SAME transform on the same source —
+ * a string post-process ran only on the full build and left the
+ * fast path emitting raw `.md` hrefs (PR-56 round 2 blocker 1a).
  *
- * - Absolute URLs (`https:`, `mailto:`, `#anchor`) pass through untouched.
- * - A link that points at a rendered doc becomes the site route for that
- *   doc, with any fragment preserved.
- * - Anything else (files revkit does not publish) becomes a GitHub blob URL
- *   on `main` — the fixed default branch, so the link stays live after any
- *   feature branch is deleted.
- *
- * Exported so unit tests can exercise the mapping without a full render.
+ * The function is kept in-source to keep its unit tests useful as
+ * a self-contained regression check on the mapping (the exact
+ * shape of a site route, the shape of a GitHub blob URL). New code
+ * MUST use `rehypeRewriteMdLinks` — the shared plugin — not this.
  */
 export function rewriteInternalMarkdownLinks(
   html: string,
@@ -235,11 +235,17 @@ async function loadSource(
     fileURL: pathToFileURL(source.filePath),
   });
 
-  const rewrittenHtml = rewriteInternalMarkdownLinks(rendered.html, source.filePath, repoRoot);
-  const residual = findResidualMdHrefs(rewrittenHtml);
+  // Cross-doc `.md` link rewriting is done in the shared rehype
+  // chain (`rehype-rewrite-md-links.ts`) so the fast path and the
+  // full build agree by construction. A post-process here would
+  // reintroduce the fast-path drift PR-56 round 2 caught. Instead
+  // we assert no residual `.md` href leaked through — if the plugin
+  // was dropped from the shared chain this loud failure surfaces
+  // in `astro build`, not later during a live fast-path request.
+  const residual = findResidualMdHrefs(rendered.html);
   if (residual.length > 0) {
     throw new Error(
-      `repo-docs loader: ${source.filePath} still contains internal .md hrefs after rewrite: ${residual.join(", ")}. Fix rewriteInternalMarkdownLinks so every internal link either resolves to a site route or a GitHub blob URL.`,
+      `repo-docs loader: ${source.filePath} still contains internal .md hrefs after the shared rehype chain: ${residual.join(", ")}. Restore \`rehypeRewriteMdLinks\` in site/src/lib/markdown-processor.ts.`,
     );
   }
 
@@ -254,7 +260,7 @@ async function loadSource(
     body,
     filePath,
     digest: ctx.generateDigest(raw),
-    rendered: { ...rendered, html: rewrittenHtml },
+    rendered,
   });
 }
 

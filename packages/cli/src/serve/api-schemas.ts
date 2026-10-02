@@ -18,6 +18,7 @@
 
 import { z } from "zod";
 import { anchorSchema, askAnswerSchema, askSchema, idSchema, reviewSubmitEventSchema } from "@revkit/review-core";
+import { PUBLISH_ARRAY_SHAPE_MAX } from "./publish.ts";
 
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
@@ -105,6 +106,45 @@ export const cancelAskRequestSchema = z
   })
   .strict();
 export type CancelAskRequest = z.infer<typeof cancelAskRequestSchema>;
+
+// ── Publish (M2 item 9, story A4 — ADR-0001 amendment) ─────────────
+
+/** One file in a publish batch. `path` is repo-relative POSIX; the
+ * daemon-side confinement (`resolvePublishTarget`) enforces the
+ * allowlist. `content` is the LF-normalised source (the orchestrator
+ * normalises again as a defence in depth). The daemon caps sizes
+ * outside this schema (`PUBLISH_FILE_MAX_BYTES`, `PUBLISH_REQUEST_MAX_BYTES`)
+ * because the byte total spans MULTIPLE fields, which zod does not
+ * express cleanly. */
+const publishFileSchema = z
+  .object({
+    path: z.string().min(1).max(4096),
+    content: z.string(),
+  })
+  .strict();
+
+/** POST /api/publish. Agent-bearer only. Batch shape:
+ *
+ *   { docs: [ { path, content }, … ], data?: [ { path, content }, … ] }
+ *
+ * `docs` carries the primary source files (the .md documents the
+ * daemon renders through the fast path). `data` carries side files
+ * (plot data, `vocab/terms.yaml`) which do not produce their own
+ * override HTML but still trigger `revkit check` + re-anchoring +
+ * a `doc.published` event.
+ *
+ * Both arrays are optional-at-schema (the daemon refuses empty
+ * batches with a runtime error so the schema-level `min(1)` isn't
+ * needed) so a batch that carries only data doesn't need an empty
+ * `docs: []` on the wire.
+ */
+export const publishRequestSchema = z
+  .object({
+    docs: z.array(publishFileSchema).max(PUBLISH_ARRAY_SHAPE_MAX).optional(),
+    data: z.array(publishFileSchema).max(PUBLISH_ARRAY_SHAPE_MAX).optional(),
+  })
+  .strict();
+export type PublishRequest = z.infer<typeof publishRequestSchema>;
 
 // ── Review-mode (M3 part 2b, ADR-0025) ────────────────────────────
 

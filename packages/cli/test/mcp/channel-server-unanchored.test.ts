@@ -127,6 +127,29 @@ describe("formatCatchupSummary — issue #46 item 5", () => {
   });
 });
 
+describe("formatChannelPayload — M2 item 9 (story A4)", () => {
+  test("doc.published is filtered out of the channel (agent-only event, not a review transition)", () => {
+    // The channel is the agent's LIVE inbox for review activity by
+    // the human. `doc.published` is emitted BY the agent and would
+    // otherwise be a loopback echo. The channel's `relevantKinds`
+    // allowlist excludes it. Regression: this test flips red if a
+    // future change accidentally lets doc.published leak onto the
+    // channel (which would fire spurious notifications after every
+    // publish and re-arm the "N threads waiting" summary with
+    // events that don't require attention).
+    const payload = formatChannelPayload({
+      seq: 42,
+      ts: "2026-09-30T00:00:00.000Z",
+      kind: "doc.published",
+      actor: { kind: "agent", id: "revkit-live" },
+      path: "docs/adr/0999-test.md",
+      revision: "f".repeat(64),
+      route: "/adr/0999-test/",
+    } as unknown as Parameters<typeof formatChannelPayload>[0]);
+    expect(payload).toBeUndefined();
+  });
+});
+
 describe("formatChannelPayload — issue #46 item 5", () => {
   test("comment.created on an unanchored anchor still formats safely (no `undefined-undefined`)", () => {
     const payload = formatChannelPayload({

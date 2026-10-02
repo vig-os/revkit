@@ -22,13 +22,13 @@ import type { GhRunner } from "./gh-runner.ts";
 import { parseSourceFor } from "./mdx-parse.ts";
 import { checkComponentRegistryFile } from "./rules/component-registry.ts";
 import { checkFrontmatter } from "./rules/frontmatter.ts";
-import { checkLinksFile } from "./rules/links.ts";
+import { checkLinksFile, type StagedOverlay } from "./rules/links.ts";
 import { checkNoHandRolledUiFile } from "./rules/no-hand-rolled-ui.ts";
 import { checkPlotSpecFile } from "./rules/plot-structure.ts";
 import { checkVegaUntrusted } from "./rules/vega-untrusted.ts";
 import { checkVendoredCode } from "./rules/vendored-code.ts";
 import type { LoadedVocabEntry } from "./rules/vocabulary.ts";
-import { checkVocabularyFile, loadVocab } from "./rules/vocabulary.ts";
+import { checkVocabularyFile, loadVocab, parseVocabYaml } from "./rules/vocabulary.ts";
 
 /** Directories whose MDX/MD files are treated as content — the
  * component-registry, vocabulary and links rules only run there.
@@ -102,6 +102,18 @@ export interface CheckOptions {
   readonly repoSlug: string;
   readonly gh: GhRunner;
   readonly trust?: Trust;
+  /** Files staged in the SAME batch as the files under check, keyed
+   * by ABSOLUTE path (see `rules/links.ts::StagedOverlay`).
+   *
+   * The publish orchestrator stages each batch member to a sibling
+   * `.tmp-<random>` file so nothing reaches a final path before the
+   * check approves it. Cross-file rules must still see the batch as
+   * ONE coherent snapshot: a doc that links to a doc landing in the
+   * same batch resolves, heading anchors come from the STAGED
+   * target's headings, and the vocabulary comes from the batch's own
+   * staged `vocab/terms.yaml` rather than the previous one on disk.
+   * Omit for a whole-tree `revkit check` — there is no batch. */
+  readonly staged?: StagedOverlay;
 }
 
 /** The check's public result: rendered lines + the numeric exit code. */
@@ -165,9 +177,29 @@ export async function runCheck(
   // the consumer omits `vocab/terms.yaml`), and `check` should match
   // — a repo without any `<Term id>` usages does not need a vocab.
   // A file that exists but fails to parse still produces a finding.
+  //
+  // `options.staged` wins over the filesystem: a publish batch that
+  // ADDS a term to `vocab/terms.yaml` while also using `<Term id=…>`
+  // in a doc must validate against the batch's own vocabulary, not
+  // the pre-commit one — otherwise a coherent batch is refused for a
+  // term it is itself defining (and a batch that REMOVES a term
+  // would pass against the stale, more permissive file).
   const vocabYamlPath = join(repoRoot, "vocab", "terms.yaml");
+  const stagedVocabYaml = options.staged?.get(vocabYamlPath);
   let vocab: LoadedVocabEntry[];
-  if (!existsSync(vocabYamlPath)) {
+  if (stagedVocabYaml !== undefined) {
+    try {
+      vocab = parseVocabYaml(stagedVocabYaml);
+    } catch (error) {
+      findings.push({
+        file: "vocab/terms.yaml",
+        line: 0,
+        rule: "vocabulary",
+        message: `failed to load vocab: ${(error as Error).message}`,
+      });
+      vocab = [];
+    }
+  } else if (!existsSync(vocabYamlPath)) {
     vocab = [];
   } else {
     try {
@@ -264,6 +296,8 @@ export async function runCheck(
 
   // 4) links — relative links + heading anchors. Confined to repoRoot:
   //    a `../../..` traversal that escapes the workspace is flagged.
+  //    `options.staged` extends the world with the batch's own
+  //    members, so a same-batch link target resolves.
   const slugCache = new Map<string, Set<string>>();
   for (const entry of loaded) {
     findings.push(
@@ -274,6 +308,7 @@ export async function runCheck(
         slugCache,
         repoRoot,
         entry.root ?? undefined,
+        options.staged,
       ),
     );
   }

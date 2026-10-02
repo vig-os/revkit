@@ -49,6 +49,12 @@
 //                      redundant repeat (`already-orphaned`). Both
 //                      cases carry their own rejection kind so a
 //                      caller can branch without parsing messages.
+//   doc.published    — no thread state; always accepted. Records
+//                      that the agent wrote a new revision at
+//                      `path`; downstream `thread.reanchored` /
+//                      `thread.orphaned` events on threads that
+//                      lived on `path` fire from the re-anchor
+//                      pipeline the daemon triggers after the write.
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -387,6 +393,23 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
     case "delivery.mode_changed":
       // Mode changes have no cross-event invariant (the daemon
       // dedupes no-op changes at emit time). Always accept.
+      return { ok: true };
+    case "doc.published":
+      // No thread state to update: the event records that the agent
+      // wrote a new revision of `path`. Any thread on that path
+      // reaches the re-anchor pipeline through the daemon's
+      // `reanchor.refresh(path)` call, which emits its own
+      // `thread.reanchored`/`thread.orphaned` events. The event
+      // itself is stateless (like `presence` and `handover` above).
+      return { ok: true };
+    case "build.requested":
+    case "build.started":
+    case "build.succeeded":
+    case "build.failed":
+      // Background astro-build lifecycle (M2 item 9, PR-56 round 3).
+      // No cross-event invariants — the daemon emits these purely so
+      // the rail can reload once dist catches up after a fast-path
+      // refusal. Stateless.
       return { ok: true };
     case "ask.created": {
       if (state.asks.has(event.askId)) {

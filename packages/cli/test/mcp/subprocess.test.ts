@@ -87,12 +87,13 @@ describe("revkit mcp — real subprocess", () => {
       // tools/list returns our three names.
       const listing = await client.listTools();
       const names = listing.tools.map((t) => t.name).sort();
-      // M2 item 6 + item 7 tools joined the listing.
+      // M2 items 6, 7 and 9 tools joined the listing.
       expect(names).toEqual([
         "ask",
         "await_answer",
         "mode",
         "presence",
+        "publish",
         "reply",
         "resolve",
         "review_url",
