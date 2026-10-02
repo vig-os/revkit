@@ -34,13 +34,18 @@ import type { Comment, Thread } from "./thread.ts";
 export function reduce(events: readonly ReviewEvent[]): Map<string, Thread> {
   const ordered = [...events].sort((a, b) => a.seq - b.seq);
   const threads = new Map<string, Thread>();
+  const latestLocalThreadIntentSeq = new Map<string, number>();
   for (const event of ordered) {
-    applyEvent(threads, event);
+    applyEvent(threads, event, latestLocalThreadIntentSeq);
   }
   return threads;
 }
 
-function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
+function applyEvent(
+  threads: Map<string, Thread>,
+  event: ReviewEvent,
+  latestLocalThreadIntentSeq: Map<string, number>,
+): void {
   switch (event.kind) {
     case "comment.created": {
       if (threads.has(event.threadId)) return;
@@ -96,6 +101,28 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       });
       return;
     }
+    case "comment.edited": {
+      // Round-2 BLOCK-fix 3 + round-3 nit: update the referenced
+      // comment's body AND stamp `editedAt` so the rail can show
+      // an "edited" marker. We walk every thread to find it — a
+      // `commentId` is unique across the log by construction.
+      // `remoteUpdatedAt` is treated as an idempotency marker at
+      // the emitter, so the reducer trusts what it's handed.
+      for (const [tid, thread] of threads) {
+        const idx = thread.comments.findIndex((c) => c.id === event.commentId);
+        if (idx < 0) continue;
+        const nextComments = thread.comments.slice();
+        const existing = nextComments[idx]!;
+        nextComments[idx] = { ...existing, body: event.body, editedAt: event.ts };
+        threads.set(tid, {
+          ...thread,
+          comments: nextComments,
+          updatedAt: event.ts,
+        });
+        return;
+      }
+      return;
+    }
     case "thread.resolved": {
       const thread = threads.get(event.threadId);
       if (thread === undefined) return;
@@ -116,6 +143,7 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
         resolvedAt: event.ts,
         updatedAt: event.ts,
       });
+      if (event.actor.kind === "local") latestLocalThreadIntentSeq.set(event.threadId, event.seq);
       return;
     }
     case "thread.reopened": {
@@ -135,6 +163,27 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
       threads.set(event.threadId, {
         ...rest,
         status: nextStatus,
+        updatedAt: event.ts,
+      });
+      if (event.actor.kind === "local") latestLocalThreadIntentSeq.set(event.threadId, event.seq);
+      return;
+    }
+    case "thread.external_synced": {
+      const thread = threads.get(event.threadId);
+      if (thread === undefined || thread.external?.provider !== "github") return;
+      if (
+        event.intentSeq !== undefined &&
+        latestLocalThreadIntentSeq.get(event.threadId) !== event.intentSeq
+      ) return;
+      const { resolvedByLogin: _previousResolver, ...external } = thread.external;
+      void _previousResolver;
+      threads.set(event.threadId, {
+        ...thread,
+        external: {
+          ...external,
+          resolved: event.resolved,
+          ...(event.resolvedByLogin !== undefined ? { resolvedByLogin: event.resolvedByLogin } : {}),
+        },
         updatedAt: event.ts,
       });
       return;
@@ -225,7 +274,14 @@ function applyEvent(threads: Map<string, Thread>, event: ReviewEvent): void {
     case "ask.answered":
     case "ask.cancelled":
     case "ask.expired":
+    case "review.opened":
+    case "review.submitted":
+    case "review.abandoned":
+    case "comment.sync_requested":
+    case "comment.sync_failed":
       // Handled outside the Thread view — see the file header.
+      // Review-lifecycle + sync-state events project into their
+      // own derived view; see `review-state.ts::reduceReviewState`.
       return;
   }
 }

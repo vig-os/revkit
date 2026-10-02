@@ -272,13 +272,8 @@ export async function dispatch(
         sqlitePath,
         repoRoot,
         localUserId,
-      }: {
-        readonly materializedRoot: string;
-        readonly distDir: string;
-        readonly sqlitePath: string;
-        readonly repoRoot: string;
-        readonly localUserId: string;
-      }) => {
+        reviewMode,
+      }: Parameters<NonNullable<Parameters<typeof runReviewCommand>[1]["startServe"]>>[0]) => {
         const handle = await startDaemon({
           dir: distDir,
           repoRoot,
@@ -288,6 +283,7 @@ export async function dispatch(
           port: 0,
           announce: false,
           installSignalHandlers: true,
+          ...(reviewMode !== undefined ? { reviewMode } : {}),
         });
         const blockForever = new Promise<void>((resolveDone) => {
           const originalStop = handle.stop.bind(handle);

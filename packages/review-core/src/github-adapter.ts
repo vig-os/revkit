@@ -261,6 +261,16 @@ export interface PendingReview {
   readonly state: "PENDING" | "COMMENTED" | "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED";
 }
 
+/** Round-2 BLOCK-fix 1: one entry in `listViewerReviewsOnPr`.
+ * `state` is GitHub's enum; PENDING has `submittedAt: null`. */
+export interface ViewerReviewSummary {
+  readonly id: string;
+  readonly databaseId: number;
+  readonly state: "PENDING" | "COMMENTED" | "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED";
+  readonly commitSha: string | null;
+  readonly submittedAt: string | null;
+}
+
 export type ReviewSubmissionEvent = "COMMENT" | "APPROVE" | "REQUEST_CHANGES";
 
 /** Snapshot for a thread — one of three shapes (see
@@ -780,6 +790,88 @@ export class GitHubAdapter {
     };
   }
 
+  /** Round-2 BLOCK-fix 1: list the viewer's reviews on the PR
+   * across ALL states. The reconciler uses this to distinguish
+   * "our recorded pending review was SUBMITTED on GitHub" (in
+   * which case we heal by appending `review.submitted`) from
+   * "our recorded pending review is gone from GitHub" (in which
+   * case we mark it deleted-remotely and NEVER auto-create a
+   * replacement).
+   *
+   * The old crash-heal path called `findOrCreatePendingReview`
+   * which CREATED a new pending review when none was found —
+   * producing a duplicate APPROVE when GitHub had accepted the
+   * submit and our log had lost the terminal event.
+   *
+   * Ordered by `submittedAt` ascending; PENDING entries have
+   * `submittedAt: null` and appear last (GitHub's ordering) but
+   * callers should treat this as an unordered set. */
+  /** Round-3 BLOCK-fix 3: fetch a single review by its GraphQL
+   * node id. Preferred over `listViewerReviewsOnPr` in the
+   * reconciler's crash-heal path — a reviewer with 50+ reviews on
+   * the PR trips the old first:50 window and a legitimate SUBMITTED
+   * review reads back as `null`, mis-tripping the deleted-on-github
+   * path. Returns `null` when the review truly no longer exists. */
+  async getReviewById(reviewNodeId: string): Promise<ViewerReviewSummary | null> {
+    const resp = await this.graphqlWithRetry<{
+      data: {
+        node:
+          | {
+              __typename?: string;
+              id?: string;
+              databaseId?: number | null;
+              state?: string;
+              submittedAt?: string | null;
+              commit?: { oid: string } | null;
+            }
+          | null;
+      };
+    }>(GET_REVIEW_BY_ID_QUERY, { id: reviewNodeId });
+    const node = resp.data.node;
+    if (node === undefined || node === null) return null;
+    if (node.__typename !== "PullRequestReview") return null;
+    return {
+      id: node.id ?? reviewNodeId,
+      databaseId: node.databaseId ?? 0,
+      state: (node.state ?? "PENDING") as ViewerReviewSummary["state"],
+      commitSha: node.commit?.oid ?? null,
+      submittedAt: node.submittedAt ?? null,
+    };
+  }
+
+  async listViewerReviewsOnPr(input: {
+    readonly pullRequestNodeId: string;
+    readonly viewerLogin?: string;
+  }): Promise<readonly ViewerReviewSummary[]> {
+    const login = input.viewerLogin ?? (await this.viewerLogin());
+    const resp = await this.graphqlWithRetry<{
+      data: {
+        node: {
+          __typename?: string;
+          reviews?: {
+            nodes: Array<{
+              id: string;
+              databaseId?: number | null;
+              state: string;
+              submittedAt?: string | null;
+              commit?: { oid: string } | null;
+            }>;
+          } | null;
+        } | null;
+      };
+    }>(VIEWER_REVIEWS_QUERY, { id: input.pullRequestNodeId, author: login });
+    const node = resp.data.node;
+    if (node === undefined || node === null || node.__typename !== "PullRequest") return [];
+    const nodes = node.reviews?.nodes ?? [];
+    return nodes.map((n) => ({
+      id: n.id,
+      databaseId: n.databaseId ?? 0,
+      state: n.state as ViewerReviewSummary["state"],
+      commitSha: n.commit?.oid ?? null,
+      submittedAt: n.submittedAt ?? null,
+    }));
+  }
+
   /** Add one draft thread to the pending review. Line- or file-
    * subject; multi-line ranges supported (single side only —
    * `startSide` defaults to `side`, and per the schema both must be
@@ -918,6 +1010,57 @@ export class GitHubAdapter {
     };
     if (input.body !== undefined) variables.body = input.body;
     await this.graphql(SUBMIT_REVIEW_MUTATION, variables);
+  }
+
+  /** M3 part 2b round-2 (ADR-0025 (b)): reply to an existing review
+   * thread, optionally pinned to a pending review so the reply is a
+   * DRAFT that submits alongside the rest of the review. When
+   * `pendingReviewId` is undefined the reply is published
+   * immediately (used only outside a review). Mutation — no
+   * auto-retry. */
+  async addReviewThreadReply(input: {
+    readonly threadNodeId: string;
+    readonly body: string;
+    readonly pendingReviewId?: string;
+  }): Promise<{ nodeId: string; databaseId: number; body: string; url: string }> {
+    const result = await this.graphql<{
+      data: {
+        addPullRequestReviewThreadReply?: {
+          comment?: { id: string; databaseId: number; body: string; url: string } | null;
+        } | null;
+      };
+    }>(ADD_REVIEW_THREAD_REPLY_MUTATION, {
+      pullRequestReviewThreadId: input.threadNodeId,
+      body: input.body,
+      ...(input.pendingReviewId !== undefined ? { pullRequestReviewId: input.pendingReviewId } : {}),
+    });
+    const comment = result.data.addPullRequestReviewThreadReply?.comment;
+    if (comment === undefined || comment === null) {
+      throw new GitHubApiError({
+        message: `addReviewThreadReply: mutation returned no comment`,
+        status: 0,
+        method: "POST",
+        url: this.graphqlUrl,
+      });
+    }
+    return {
+      nodeId: comment.id,
+      databaseId: comment.databaseId,
+      body: comment.body,
+      url: comment.url,
+    };
+  }
+
+  /** M3 part 2b — resolve a review thread on GitHub. Mutation
+   * — no auto-retry. */
+  async resolveReviewThread(input: { readonly threadNodeId: string }): Promise<void> {
+    await this.graphql(RESOLVE_REVIEW_THREAD_MUTATION, { threadId: input.threadNodeId });
+  }
+
+  /** M3 part 2b — unresolve (reopen) a review thread on GitHub.
+   * Mutation — no auto-retry. */
+  async unresolveReviewThread(input: { readonly threadNodeId: string }): Promise<void> {
+    await this.graphql(UNRESOLVE_REVIEW_THREAD_MUTATION, { threadId: input.threadNodeId });
   }
 
   /** Look up the authenticated user's login (`viewer { login }`).
@@ -1136,18 +1279,20 @@ export class GitHubAdapter {
 
       if (anchor === undefined) continue;
 
-      // Structured import metadata for an unanchored / orphaned
-      // thread whose remote is GitHub. PR-43 round-5 nit: proper
-      // field, not a `;was-resolved-on-github` reason suffix.
-      const externalMetadata =
-        forceOrphan
-          ? {
-              provider: "github" as const,
-              threadId: thread.id,
-              resolved: thread.isResolved,
-              ...(thread.resolvedByLogin !== null ? { resolvedByLogin: thread.resolvedByLogin } : {}),
-            }
-          : undefined;
+      // Round-2 BLOCK-fix 4: structured import metadata for EVERY
+      // imported thread whose remote is GitHub — not just the
+      // unanchored / orphaned ones. The daemon's B4 mirror path
+      // (reply / resolve / reopen) refuses to hit the adapter
+      // unless `external.provider === "github"`, so a plain
+      // anchored import used to be a dead end for two-way sync.
+      // The `resolved` field is the round-1 PR-43 nit — proper
+      // state, not a reason-string suffix.
+      const externalMetadata = {
+        provider: "github" as const,
+        threadId: thread.id,
+        resolved: thread.isResolved,
+        ...(thread.resolvedByLogin !== null ? { resolvedByLogin: thread.resolvedByLogin } : {}),
+      };
       // Issue #46 item 3: for a forced-orphan thread (unanchored
       // anchor), no `thread.orphaned` event will follow, so carry
       // the pipeline's reason ON `comment.created`. The reducer
@@ -1164,7 +1309,7 @@ export class GitHubAdapter {
         commentId: input.commentIdOf(thread, firstComment),
         anchor,
         body: firstComment.body,
-        ...(externalMetadata !== undefined ? { external: externalMetadata } : {}),
+        external: externalMetadata,
         ...(forcedOrphanReason !== undefined ? { orphanReason: forcedOrphanReason } : {}),
       });
       events.push({
@@ -2047,6 +2192,12 @@ export const GITHUB_GRAPHQL_DOCUMENTS = {
   get ViewerPendingReview() {
     return VIEWER_PENDING_REVIEW_QUERY;
   },
+  get ViewerReviews() {
+    return VIEWER_REVIEWS_QUERY;
+  },
+  get GetReviewById() {
+    return GET_REVIEW_BY_ID_QUERY;
+  },
   get AddReview() {
     return ADD_REVIEW_MUTATION;
   },
@@ -2064,6 +2215,15 @@ export const GITHUB_GRAPHQL_DOCUMENTS = {
   },
   get SubmitReview() {
     return SUBMIT_REVIEW_MUTATION;
+  },
+  get AddReviewThreadReply() {
+    return ADD_REVIEW_THREAD_REPLY_MUTATION;
+  },
+  get ResolveReviewThread() {
+    return RESOLVE_REVIEW_THREAD_MUTATION;
+  },
+  get UnresolveReviewThread() {
+    return UNRESOLVE_REVIEW_THREAD_MUTATION;
   },
 } as const;
 
@@ -2191,6 +2351,52 @@ const VIEWER_PENDING_REVIEW_QUERY = /* GraphQL */ `
   }
 `;
 
+// Round-2 BLOCK-fix 1 (double-APPROVE): list the viewer's reviews
+// on this PR across ALL states so the reconciler can tell whether a
+// LOG-known review was submitted or deleted on GitHub. Bounded page
+// size — a single reviewer rarely has more than a handful of
+// reviews on one PR, and we filter by author. Kept in the shape
+// registry for schema validation; the reconciler now prefers
+// `GET_REVIEW_BY_ID_QUERY` when it already knows the id.
+const VIEWER_REVIEWS_QUERY = /* GraphQL */ `
+  query ViewerReviews($id: ID!, $author: String!) {
+    node(id: $id) {
+      __typename
+      ... on PullRequest {
+        reviews(first: 50, author: $author) {
+          nodes {
+            id
+            databaseId
+            state
+            submittedAt
+            commit { oid }
+          }
+        }
+      }
+    }
+  }
+`;
+
+// Round-3 BLOCK-fix 3 (pagination-free lookup): fetch a SINGLE
+// review by its node id. Skips the reviews connection entirely, so
+// a reviewer with 50+ reviews on the PR never trips the old
+// `first: 50` window. Returns null when the review no longer
+// exists on GitHub (deleted-remotely path in the reconciler).
+const GET_REVIEW_BY_ID_QUERY = /* GraphQL */ `
+  query GetReviewById($id: ID!) {
+    node(id: $id) {
+      __typename
+      ... on PullRequestReview {
+        id
+        databaseId
+        state
+        submittedAt
+        commit { oid }
+      }
+    }
+  }
+`;
+
 const ADD_REVIEW_MUTATION = /* GraphQL */ `
   mutation AddReview($pullRequestId: ID!, $commitOID: GitObjectID) {
     addPullRequestReview(input: { pullRequestId: $pullRequestId, commitOID: $commitOID }) {
@@ -2276,6 +2482,47 @@ const SUBMIT_REVIEW_MUTATION = /* GraphQL */ `
       body: $body
     }) {
       pullRequestReview { id state }
+    }
+  }
+`;
+
+/** M3 part 2b round-2 (BLOCK-fix, ADR-0025 (b)):
+ * `addPullRequestReviewThreadReply` accepts a
+ * `pullRequestReviewId` argument so a reply on an existing thread
+ * during a review becomes a DRAFT on that pending review rather
+ * than a published comment. Without it, replies leak out
+ * unpended — a reviewer's mid-review reply appears immediately
+ * on GitHub, which contradicts the ADR-0025 write model. */
+const ADD_REVIEW_THREAD_REPLY_MUTATION = /* GraphQL */ `
+  mutation AddReviewThreadReply(
+    $pullRequestReviewThreadId: ID!,
+    $body: String!,
+    $pullRequestReviewId: ID
+  ) {
+    addPullRequestReviewThreadReply(input: {
+      pullRequestReviewThreadId: $pullRequestReviewThreadId,
+      body: $body,
+      pullRequestReviewId: $pullRequestReviewId
+    }) {
+      comment { id databaseId body url }
+    }
+  }
+`;
+
+/** M3 part 2b — resolve a review thread. */
+const RESOLVE_REVIEW_THREAD_MUTATION = /* GraphQL */ `
+  mutation ResolveReviewThread($threadId: ID!) {
+    resolveReviewThread(input: { threadId: $threadId }) {
+      thread { id isResolved }
+    }
+  }
+`;
+
+/** M3 part 2b — unresolve a review thread. */
+const UNRESOLVE_REVIEW_THREAD_MUTATION = /* GraphQL */ `
+  mutation UnresolveReviewThread($threadId: ID!) {
+    unresolveReviewThread(input: { threadId: $threadId }) {
+      thread { id isResolved }
     }
   }
 `;
