@@ -37,6 +37,10 @@
 // whenever the daemon-lock is free (or its content is unparsable /
 // missing fields) — the lock is the source of truth, so no port
 // probe / pid check is needed.
+//
+// `.revkit/repo-id` follows the same write path through the shared
+// `writeSecretAtomic` helper, and is minted while the daemon lock is
+// HELD (see `acquireAndPublish` / `readOrMintRepoId`, issue #63).
 
 import {
   chmodSync,
@@ -113,32 +117,87 @@ export function serveStatePath(repoRoot: string): string {
   return join(repoRoot, SERVE_STATE_DIR, SERVE_STATE_FILE);
 }
 
+/** Write `payload` to `path` atomically at mode 0600 — the ONE
+ * publish path for a secret-bearing file under `.revkit/`.
+ *
+ * 1. `openSync(tmp, "wx", 0o600)` — O_EXCL create at mode 0600, so
+ *    the temp name can never collide with a live file and can never
+ *    be followed by a symlink planted in `.revkit/`.
+ * 2. write → `fsync` → close.
+ * 3. `chmodSync(tmp, 0o600)` — defence against a umask that clamped
+ *    the create mode.
+ * 4. `renameSync(tmp, path)` — atomic within the same directory, so
+ *    a reader of `path` sees either the previous file or the new
+ *    one. Never a truncated payload (issue #63: `repo-id` used to be
+ *    written in place).
+ *
+ * A crash between steps 2 and 4 leaves the temp file behind. It is
+ * named apart from `path`, so no reader ever sees it, and the next
+ * write ignores it. */
+function writeSecretAtomic(path: string, payload: string): void {
+  const tmpSuffix = randomBytes(6).toString("hex");
+  const tmpPath = `${path}.${tmpSuffix}.tmp`;
+  const fd = openSync(tmpPath, "wx", 0o600);
+  try {
+    writeSync(fd, payload);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  chmodSync(tmpPath, 0o600);
+  renameSync(tmpPath, path);
+}
+
 /** Absolute path to `.revkit/repo-id` under `repoRoot`. */
 export function repoIdPath(repoRoot: string): string {
   return join(repoRoot, SERVE_STATE_DIR, REPO_ID_FILE);
 }
 
-/** Read `.revkit/repo-id`, or mint one at mode 0600 on first run.
- * The value is a 24-char base64url token (144 bits of entropy — a
- * long-form random tag, never derived from the repo path, so
- * `GET /-/health` cannot leak filesystem layout). Idempotent;
- * stable across daemon restarts, so the rail's `revkit.rail.seen`
- * localStorage bucket survives a `revkit serve` restart on the
- * same `--port`. Round-3 review, issue #60. */
+/** Read `.revkit/repo-id` and return it when the payload is a
+ * well-formed tag, else `undefined` (absent, unreadable, truncated,
+ * or otherwise not the shape this module writes). One read, no
+ * `existsSync` pre-check — the pre-check was a second syscall AND a
+ * TOCTOU window between "is it there?" and "read it". */
+function readRepoIdFile(path: string): string | undefined {
+  try {
+    const raw = readFileSync(path, "utf8").trim();
+    // Guard against a truncated / empty file — treat as absent.
+    if (/^[A-Za-z0-9_-]{16,64}$/.test(raw)) return raw;
+  } catch {
+    // Absent or unreadable — the caller mints.
+  }
+  return undefined;
+}
+
+/** Read `.revkit/repo-id`, or mint one on first run. The value is a
+ * 24-char base64url token (144 bits of entropy — a long-form random
+ * tag, never derived from the repo path, so `GET /-/health` cannot
+ * leak filesystem layout). Idempotent; stable across daemon
+ * restarts, so the rail's `revkit.rail.seen.v1.<repoId>`
+ * localStorage bucket survives a `revkit serve` restart on the same
+ * `--port`. Round-3 review, issue #60.
+ *
+ * **Atomic (issue #63).** The write goes through a 0600 temp file
+ * plus `rename(2)` — the same shape `writeServeState` uses — so a
+ * concurrent reader sees either the previous file or the new one,
+ * never a truncated payload. The pre-fix `writeFileSync(path)` was
+ * an in-place O_TRUNC + write.
+ *
+ * **Callers must hold `.revkit/daemon.lock`** (via
+ * `acquireAndPublish`, the only production caller). Minting is a
+ * check-then-write, so two starts overlapping that window would each
+ * mint a different id and each write it; the lock then elects one
+ * winner while the file is left holding the loser's id — the winner
+ * advertises an id that is not on disk, and the next restart reads a
+ * third one and resets the reviewer's ack state. Under the lock the
+ * winner is the only writer. */
 export function readOrMintRepoId(repoRoot: string): string {
   const path = repoIdPath(repoRoot);
-  if (existsSync(path)) {
-    try {
-      const raw = readFileSync(path, "utf8").trim();
-      // Guard against a truncated / empty file — treat as absent.
-      if (/^[A-Za-z0-9_-]{16,64}$/.test(raw)) return raw;
-    } catch {
-      // Fall through to mint.
-    }
-  }
+  const existing = readRepoIdFile(path);
+  if (existing !== undefined) return existing;
   ensureRevkitDir(repoRoot);
   const id = randomBytes(18).toString("base64url");
-  writeFileSync(path, id + "\n", { mode: 0o600 });
+  writeSecretAtomic(path, id + "\n");
   return id;
 }
 
@@ -226,24 +285,10 @@ export interface WriteRefused {
  *
  * Atomicity: tmp file (O_EXCL create at 0600) → write → fsync →
  * close → chmod 0600 (defence against umask clamping) → rename.
- * Rename is atomic on POSIX within the same directory. Any partial
- * state on a crash lives in the tmp file, which we leave for the
- * next start to notice / ignore. */
+ * See `writeSecretAtomic`, which is the shared implementation. */
 export function writeServeState(repoRoot: string, state: ServeState): void {
-  const path = serveStatePath(repoRoot);
   ensureRevkitDir(repoRoot);
-  const tmpSuffix = randomBytes(6).toString("hex");
-  const tmpPath = `${path}.${tmpSuffix}.tmp`;
-  const fd = openSync(tmpPath, "wx", 0o600);
-  try {
-    const payload = JSON.stringify(state, null, 2) + "\n";
-    writeSync(fd, payload);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  chmodSync(tmpPath, 0o600);
-  renameSync(tmpPath, path);
+  writeSecretAtomic(serveStatePath(repoRoot), JSON.stringify(state, null, 2) + "\n");
 }
 
 /** Reason a caller tried to start but the lock was already held. */
@@ -253,11 +298,20 @@ export interface StaleFileClaim {
 }
 
 /** Try to acquire the daemon lock and (once acquired) publish
- * `state` to `serve.json`. Returns `{ ok: true, release }` where
- * `release` un-locks + removes the state file (only if it still
- * carries our `instanceId`); returns `{ ok: false, refused }` when
- * another daemon holds the lock, with the existing state advertised
- * on disk (which may be stale — the caller decides).
+ * `state` to `serve.json`. Returns `{ ok: true, repoId, release }`
+ * where `release` un-locks + removes the state file (only if it
+ * still carries our `instanceId`); returns `{ ok: false, refused }`
+ * when another daemon holds the lock, with the existing state
+ * advertised on disk (which may be stale — the caller decides).
+ *
+ * `repoId` is read (or minted) INSIDE the lock (issue #63): the
+ * pre-fix call order minted it from `revkit serve` before the lock
+ * was attempted, so two overlapping starts could each mint and write
+ * a different id while the lock elected one winner. Under the lock
+ * exactly one process ever writes it, which is what makes the id on
+ * disk and the id the winner advertises on `/-/health` the same
+ * value — and therefore what keeps the rail's per-repo seen bucket
+ * stable across a restart.
  *
  * Callers keep the returned `release` alive for the daemon's
  * lifetime. On process exit (including SIGKILL), the OS releases
@@ -265,11 +319,17 @@ export interface StaleFileClaim {
  * the next start. */
 export interface AcquiredDaemon {
   readonly kind: "ok";
+  /** The repo's persistent id, read-or-minted while we held the
+   * lock. The daemon serves this on `/-/health`. */
+  readonly repoId: string;
   release(): void;
 }
 export interface RefusedDaemon {
   readonly kind: "already-running";
   readonly state: ServeState | undefined;
+  /** The id already on disk, when there is one — the winner's. The
+   * refused start never mints, so this is never a value it wrote. */
+  readonly repoId: string | undefined;
   readonly reason: string;
 }
 
@@ -281,15 +341,20 @@ export function acquireAndPublish(repoRoot: string, state: ServeState): Acquired
     return {
       kind: "already-running",
       state: readServeState(repoRoot),
+      repoId: readRepoIdFile(repoIdPath(repoRoot)),
       reason: "another revkit daemon holds .revkit/daemon.lock",
     };
   }
-  // We have the lock. Any existing `serve.json` is stale (an
-  // exited-uncleanly daemon left it behind). Overwrite it.
+  // We have the lock, so we are the only writer for the life of the
+  // daemon: any existing `serve.json` is stale (an exited-uncleanly
+  // daemon left it behind) and any existing `repo-id` is THE repo
+  // id. Overwrite the former, read-or-mint the latter.
+  const repoId = readOrMintRepoId(repoRoot);
   writeServeState(repoRoot, state);
   let released = false;
   return {
     kind: "ok",
+    repoId,
     release(): void {
       if (released) return;
       released = true;
