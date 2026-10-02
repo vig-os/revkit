@@ -562,6 +562,49 @@ describe("B1 — deleted-on-github recovery: strands revert to pending-sync + Re
     expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
   });
 
+  test("Discard resumes after crash between cancellation persistence and replacement-review abandonment", async () => {
+    let ctx = await startCtx({ failBeforeOnce: "DeleteReview", operationOccurrence: 2 });
+    await postComment(ctx, "crash cleanup", "discard-crash-after-cancel");
+    await deletePendingAndHeal(ctx);
+    const repost = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(repost.status).toBe(201);
+    expect(ctx.fake.drafts).toHaveLength(1);
+
+    const crashed = await declineRecovery(ctx);
+    expect(crashed.status).toBe(500);
+    expect(ctx.fake.drafts).toHaveLength(0);
+    expect(ctx.fake.reviewNodeId).not.toBeNull();
+    let state = await readState(ctx);
+    expect(state.state.unsyncedCommentIds).toEqual([]);
+    expect(state.state.commentSync?.map((entry) => entry.state.kind)).toEqual(["cancelled"]);
+    expect(state.state.openPending).not.toBeNull();
+
+    ctx = await restartCtx(ctx);
+    const resumed = await declineRecovery(ctx);
+    expect(resumed.status).toBe(201);
+    expect(ctx.fake.reviewNodeId).toBeNull();
+    state = await readState(ctx);
+    expect(state.state.openPending).toBeNull();
+    expect(state.state.unsyncedCommentIds).toEqual([]);
+
+    const submit = await fetch(`${ctx.handle.url}/api/review/submit`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: JSON.stringify({ event: "COMMENT" }),
+    });
+    expect(submit.status).not.toBe(201);
+    expect(ctx.fake.submits).toHaveLength(0);
+
+    const repeated = await declineRecovery(ctx);
+    expect(repeated.status).toBe(201);
+    expect(((await repeated.json()) as { declined: number }).declined).toBe(0);
+    expect(ctx.fake.reviewNodeId).toBeNull();
+  });
+
   test("Discard cancels a mixed pending-sync and failed recovery set", async () => {
     let ctx = await startCtx({ failBeforeOnce: "AddThread", operationOccurrence: 2 });
     await postComment(ctx, "pending recovery", "mixed-pending");
