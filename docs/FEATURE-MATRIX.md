@@ -10,7 +10,7 @@ cited here; the ADR index lives in [`adr/README.md`](adr/README.md). Feature PRs
 | A1 | Rich question pages instead of chat prompts, answer to agent < 1 s | ADR-0007, ADR-0002, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 item 7) |
 | A2 | Inline comments on any block, persistent, structured to the agent | ADR-0002, ADR-0006, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 items 3 and 5) |
 | A3 | Threads with the agent anchored on a block | ADR-0007, ADR-0011, ADR-0013, ADR-0017 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 items 3, 5 and 6) |
-| A4 | Agent publishes a report; page refreshes < 1 s without a full build | ADR-0001, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7), [PR #56](https://github.com/vig-os/revkit/pull/56) | in progress (M2 item 9) |
+| A4 | Agent publishes a report; page refreshes < 1 s without a full build | ADR-0001, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7), [PR #56](https://github.com/vig-os/revkit/pull/56) | shipped (M2 item 9) |
 | A5 | Live delivery: mid-turn / while away; live, handover, quiet modes | ADR-0006, ADR-0007, ADR-0011, ADR-0013 | M2 | [#7](https://github.com/vig-os/revkit/issues/7) | shipped (M2 item 6: modes + handover + presence + hook + `@agent now`) |
 | A6 | Suggested edits on rendered text land in the source | ADR-0006 | M6 | [#11](https://github.com/vig-os/revkit/issues/11) | planned |
 | A7 | Co-editing the source beside the rendered view (later) | ADR-0006, ADR-0023 (deferred) | M7 | [#12](https://github.com/vig-os/revkit/issues/12) | planned |
