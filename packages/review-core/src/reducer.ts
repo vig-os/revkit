@@ -281,6 +281,11 @@ function applyEvent(
     case "review.abandoned":
     case "comment.sync_requested":
     case "comment.sync_failed":
+    case "comment.sync_cancelled":
+    case "build.requested":
+    case "build.started":
+    case "build.succeeded":
+    case "build.failed":
       // Handled outside the Thread view — see the file header.
       // Review-lifecycle + sync-state events project into their
       // own derived view; see `review-state.ts::reduceReviewState`.

@@ -105,8 +105,15 @@ import {
   resolveRequestSchema,
   submitReviewRequestSchema,
 } from "./api-schemas.ts";
-import { runPublish, spliceArticleBody } from "./publish.ts";
-import { renderDocFragment } from "./publish-render.ts";
+import { runPublish, spliceArticleBody, ARTICLE_OPEN_MARKER } from "./publish.ts";
+import {
+  createPublishBuildCoordinator,
+  type BuildRunner,
+  type PublishBuildCoordinator,
+  type PublishBuildItem,
+  type PublishBuildRecord,
+} from "./publish-build.ts";
+import { renderDocFragment, fastPathRefusalReasons, type FastPathRefusalReason } from "./publish-render.ts";
 import { extractDocRevision } from "../rehype-stamp-revision.ts";
 import { revisionOf as revisionOfBytes } from "@revkit/review-core";
 import { statSync } from "node:fs";
@@ -173,6 +180,30 @@ export interface StartDaemonOptions {
    * `"vig-os/revkit"`; the CLI top-level derives it from
    * `env.repoSlug`, and tests may pin any string. */
   readonly repoSlug?: string;
+  /** Background full-build coordinator (M2 item 9, story A4).
+   * `true` (default) means any publish outcome the fast path cannot
+   * serve — a refusal, a render exception, a data-only file, a route
+   * with no built shell — schedules a full `revkit build` so the
+   * reviewer eventually sees the new content without running anything
+   * by hand. `false` disables scheduling; tests set this when they do
+   * not want a build to run at all. The daemon still records refused
+   * routes and serves the banner either way. */
+  readonly enableBackgroundBuild?: boolean;
+  /** Test-only override for the build primitive. Production omits it
+   * and the coordinator calls the shared `runBuildCommand`; a test
+   * that passes a stub is exercising the SAME call shape (args +
+   * env) the real build gets, just without the astro spawn. */
+  readonly backgroundBuildRun?: BuildRunner;
+  /** Test-only override for the build coordinator's coalescing
+   * window. Defaults to 500 ms in production; tests set it near
+   * 0 so a "publish → banner → build succeeded → reload" sequence
+   * fits inside a Playwright deadline. */
+  readonly backgroundBuildDebounceMs?: number;
+  /** Test-only barrier awaited inside `runPublish` after `revkit
+   * check` approves the staged batch and immediately before the
+   * commit, so a confinement-race test can swap a path for a symlink
+   * at exactly that point. */
+  readonly publishBeforeStagedCommit?: () => Promise<void>;
   /** Test-only override for the delivery-mode idle-flush window
    * (`handover` mode, M2 item 6). 0 disables the idle timer; the
    * production default (90 s) lives in `delivery-modes.ts`. */
@@ -306,6 +337,26 @@ const presenceRequestSchema = z
       });
     }
   });
+
+/** Every reason a served page can be behind its source, and the
+ * phrase the banner uses to explain it. Three are the fast
+ * renderer's refusal tags; the other two are outcomes the renderer
+ * never got far enough to produce a tag for.
+ *
+ * Module scope on purpose: it is a pure table, and a `const` declared
+ * inside `startDaemon` AFTER `Bun.serve(...)` would sit in the
+ * temporal dead zone for the very first request — Bun starts serving
+ * synchronously, so the first page view could arrive before the
+ * initialiser ran. */
+type BannerReason = FastPathRefusalReason | "render-failed" | "shell-missing";
+
+const BUILD_REASON_PHRASE: Readonly<Record<BannerReason, string>> = Object.freeze({
+  "code-fence": "fenced code blocks",
+  "indented-code": "indented code blocks",
+  "starlight-directive": "Starlight asides",
+  "render-failed": "a construct the fast renderer could not process",
+  "shell-missing": "no previously built page to update",
+});
 
 /** Start the daemon. Returns a handle whose `stop()` is idempotent. */
 export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHandle> {
@@ -503,6 +554,127 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // the daemon layer. The lock is process-local — GitHub's own
   // pending-review uniqueness is the ultimate guard.
   let submitInFlight = false;
+
+  // Routes the fast path could NOT serve for the publish generation
+  // named in the value; each gets a banner spliced into the served
+  // HTML so the reviewer sees that the page is behind the source and
+  // whether the build that will fix it is running or broken.
+  //
+  // `generation` is what makes the map safe to clear. A build
+  // completes for the generation it was scheduled FOR; a publish that
+  // landed while that build was running has a DIFFERENT generation and
+  // its refusal must survive. So `onSettled` deletes exactly the
+  // entries whose generation matches, and nothing else. The
+  // independent safety net is the dist-revision comparison in
+  // `tryServeFreshForRoute`: when the built page's stamped revision
+  // equals the current source's, dist has caught up and the entry is
+  // dropped whatever the build bookkeeping says.
+  //
+  // The map is seeded from the persisted publish state at startup, so
+  // a daemon that restarts mid-build still shows the banner (and the
+  // coordinator reschedules the pending build) instead of silently
+  // serving a stale page as if it were current.
+  interface RefusedRouteState {
+    readonly reason: BannerReason;
+    readonly generation: string;
+    readonly since: number;
+  }
+  const refusedRoutes = new Map<string, RefusedRouteState>();
+
+  /** Map a build item onto a banner reason. A `fast-path-refused`
+   * item carries the renderer's tag in `detail`; the persisted
+   * build-state file is untrusted input (it is a file on disk), so
+   * an unrecognised tag degrades to a generic refusal rather than
+   * reaching the banner copy. */
+  const bannerReasonFor = (item: PublishBuildItem): BannerReason => {
+    if (item.reason === "fast-path-refused") {
+      const detail: unknown = item.detail;
+      return typeof detail === "string" &&
+        (fastPathRefusalReasons as readonly string[]).includes(detail)
+        ? (detail as FastPathRefusalReason)
+        : "code-fence";
+    }
+    // `data-only` never reaches here (callers skip it), but a
+    // persisted record could carry it for a route by mistake; treat it
+    // as a generic refusal rather than falling through to a reason
+    // the banner vocabulary does not have.
+    return item.reason === "data-only" ? "render-failed" : item.reason;
+  };
+
+  /** Apply one publish generation's build items to the refusal map.
+   * A route that fast-rendered is removed (its page is current); a
+   * route that needs a build is recorded against `generation`. */
+  const applyBuildItems = (
+    generation: string,
+    items: readonly PublishBuildItem[],
+  ): void => {
+    for (const item of items) {
+      if (item.route === undefined) continue;
+      if (item.reason === "data-only") {
+        refusedRoutes.delete(item.route);
+        continue;
+      }
+      refusedRoutes.set(item.route, { reason: bannerReasonFor(item), generation, since: Date.now() });
+    }
+  };
+
+  // Background full build. Debounced + single-flight; `runPublish`
+  // records a generation on every batch that needs one. Optional:
+  // tests can skip building by passing `enableBackgroundBuild: false`.
+  let publishBuild: PublishBuildCoordinator | undefined;
+  if (options.enableBackgroundBuild !== false) {
+    publishBuild = createPublishBuildCoordinator({
+      repoRoot: options.repoRoot,
+      distDir: options.dir,
+      version: options.version,
+      repoSlug: options.repoSlug ?? "vig-os/revkit",
+      ...(options.backgroundBuildRun !== undefined ? { runBuildCommand: options.backgroundBuildRun } : {}),
+      ...(options.backgroundBuildDebounceMs !== undefined ? { debounceMs: options.backgroundBuildDebounceMs } : {}),
+      // Lifecycle events go through the STORE, so each one carries a
+      // real positive seq: an SSE client that reconnects with
+      // `Last-Event-ID` replays the build, and a client that never
+      // disconnected sees the same frames in order. A seq-0
+      // pseudo-event would break the monotonic resume contract the
+      // rail and the agent channel both rely on, so the durable path
+      // is the only path.
+      appendEvent: async (event) => {
+        const seq = await store.append(event);
+        const [materialised] = await store.since(seq - 1);
+        if (materialised === undefined || materialised.seq !== seq) return;
+        await safeIngest(materialised);
+        await bus.publish(materialised, { audiences: ["rail"] });
+      },
+      // Generation-scoped clear. A success for generation G retires
+      // exactly G's refusals; a failure keeps them, because the page
+      // is still behind and the reviewer needs the banner (with the
+      // error tail) more than ever.
+      onSettled: (settlement) => {
+        if (settlement.status !== "succeeded") return;
+        for (const [route, entry] of [...refusedRoutes]) {
+          if (entry.generation === settlement.generation) refusedRoutes.delete(route);
+        }
+      },
+      log: (level, event, data) => {
+        logger[level === "error" ? "error" : level === "warn" ? "warn" : "info"](event, data ?? {});
+      },
+    });
+    // Restart reconciliation: a record left `pending` by a dead
+    // process is retried by the coordinator itself, but its refusal
+    // banners are in-memory state that died with it. Re-seed them so
+    // the first page view after a restart already explains the stale
+    // content instead of waiting for the reviewer to publish again.
+    const resumed = publishBuild.state();
+    if (resumed !== undefined && resumed.status !== "fast") {
+      for (const item of resumed.items) {
+        if (item.route === undefined || item.reason === "data-only") continue;
+        refusedRoutes.set(item.route, {
+          reason: bannerReasonFor(item),
+          generation: resumed.generation,
+          since: Date.parse(resumed.updatedAt) || Date.now(),
+        });
+      }
+    }
+  }
 
   const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
 
@@ -806,6 +978,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       }
       delivery.stop();
       presence.stop();
+      publishBuild?.stop();
       try {
         server.stop(true);
       } catch {
@@ -2920,28 +3093,120 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return rawResponse;
   }
 
-  /** HTML for the "source changed — failing check" banner. Kept
-   * as a plain string so the CSP inline-style hash is stable
-   * (the daemon's check-dist allowlist can pre-approve it if the
-   * banner ever needs one). Body text is untrusted (a diagnostic
-   * line may contain a source-controlled path) so both `<pre>`
-   * and prose are HTML-escaped before insertion. */
+  /** HTML for the two banners the daemon splices into dist HTML
+   * when the fast path can't serve the current source directly:
+   *
+   *   - `stale-check` — the current source fails `revkit check`.
+   *   - `rendering` / `build-failed` — the current source is on disk
+   *     but the page behind it was built from an older revision, and
+   *     a full build is either running or has failed.
+   *
+   * Both banners carry the same shape (an `<aside>` with a
+   * `data-revkit-banner` tag and a CSS class the rail's styles
+   * target). Text is HTML-escaped since diagnostics may contain
+   * source-controlled paths. Round-3 nit: no inline `style` — the
+   * class hooks into `rail.css` where the styles live outside the
+   * per-response CSP. */
+  function escapeBannerText(s: string): string {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
   function buildStaleCheckBanner(sourcePath: string, diagnostics: readonly string[]): string {
-    const escape = (s: string): string =>
-      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+    const escape = escapeBannerText;
     const lines = diagnostics.slice(0, 5).map((line) => `<li>${escape(line)}</li>`).join("");
     const more = diagnostics.length > 5 ? `<p>…and ${diagnostics.length - 5} more diagnostic(s).</p>` : "";
     return (
-      `<aside class="revkit-stale-check-banner" role="status" aria-live="polite" ` +
-      `data-revkit-banner="stale-check" ` +
-      `style="border:2px solid #b45309;background:#fff7ed;color:#7c2d12;padding:0.75rem 1rem;` +
-      `margin:0 0 1rem 0;border-radius:0.5rem;font-family:ui-sans-serif,system-ui;">` +
+      `<aside class="revkit-daemon-banner revkit-daemon-banner--stale-check" ` +
+      `role="status" aria-live="polite" ` +
+      `data-revkit-banner="stale-check">` +
       `<strong>Source changed — failing <code>revkit check</code>.</strong>` +
       ` The site is showing the previous full build's rendering of ` +
       `<code>${escape(sourcePath)}</code>. Fix the source and republish.` +
       `<ul>${lines}</ul>${more}</aside>`
     );
+  }
+  function buildBackgroundBuildBanner(
+    sourcePath: string,
+    reason: RefusedRouteState["reason"],
+    buildState: PublishBuildRecord | undefined,
+  ): string {
+    const escape = escapeBannerText;
+    const reasonPhrase = BUILD_REASON_PHRASE[reason];
+    // Only surface a build failure when it belongs to THIS route's
+    // generation. A failed build for an unrelated earlier publish
+    // must not make this page claim its own build broke.
+    const failure =
+      buildState?.status === "failed" && buildState.error !== undefined ? buildState.error : undefined;
+    if (failure !== undefined) {
+      // The build failed — show the tail so the reviewer can act.
+      // This is a TERMINAL banner, not a spinner: the page stays
+      // stale until someone republishes or fixes the source, so it
+      // must not claim a build is still in progress.
+      return (
+        `<aside class="revkit-daemon-banner revkit-daemon-banner--build-failed" ` +
+        `role="status" aria-live="polite" ` +
+        `data-revkit-banner="build-failed">` +
+        `<strong>Build failed while rendering <code>${escape(sourcePath)}</code>.</strong>` +
+        ` The previous full build's HTML is still on the page. Fix the source and ` +
+        `republish to try again.` +
+        `<pre>${escape(failure)}</pre></aside>`
+      );
+    }
+    return (
+      `<aside class="revkit-daemon-banner revkit-daemon-banner--rendering" ` +
+      `role="status" aria-live="polite" ` +
+      `data-revkit-banner="rendering">` +
+      `<strong>Source changed — rendering&hellip; (full build in progress).</strong>` +
+      ` <code>${escape(sourcePath)}</code> uses ${escape(reasonPhrase)}, which the fast ` +
+      `path can't render byte-for-byte. The build is running; the page ` +
+      `will refresh automatically.</aside>`
+    );
+  }
+
+  /** Serve `shellHtml` with `banner` spliced in at the top of the
+   * article body, through the same hygiene + rail-injection path a
+   * normal HTML response takes. One helper rather than three copies
+   * because the three banner sites (`stale-check`, `rendering`,
+   * `build-failed`) must stay indistinguishable on the wire apart
+   * from the `<aside>` they carry — in particular all of them must
+   * get the rail injected and the CSP hygiene headers, or a page
+   * showing a banner silently loses its comment UI. */
+  async function serveBannerOverDist(args: {
+    readonly shellHtml: string;
+    readonly banner: string;
+    readonly method: "GET" | "HEAD";
+    readonly requestId: string;
+    readonly route: string;
+  }): Promise<Response> {
+    const marker = ARTICLE_OPEN_MARKER;
+    const withBanner = args.shellHtml.replace(marker, `${marker}${args.banner}`);
+    if (args.method === "HEAD") {
+      return withHygiene(
+        new Response(null, {
+          status: 200,
+          headers: { "content-length": String(Buffer.byteLength(withBanner, "utf8")) },
+        }),
+        "html",
+        "text/html; charset=utf-8",
+      );
+    }
+    const rawResponse = withHygiene(
+      new Response(withBanner, { status: 200 }),
+      "html",
+      "text/html; charset=utf-8",
+    );
+    return await injectRail(rawResponse, {
+      onOversize: (bodyBytes: number) => {
+        logger.warn("static.rail.skipped-oversize", {
+          requestId: args.requestId,
+          path: args.route,
+          bytes: bodyBytes,
+        });
+      },
+    });
   }
 
   /** Derive-from-files serving (M2 item 9, PR-56 blocker 2).
@@ -2989,9 +3254,34 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // 4. Extract the dist's stamped revision. When it matches,
     //    dist is current and serving fresh is unnecessary — let
     //    the static branch below handle it (cheaper: no rerender,
-    //    no splice, no rail-injection buffer copy).
+    //    no splice, no rail-injection buffer copy). A refusal can
+    //    be cleared here too: if dist matches the current source,
+    //    the build has caught up and the banner is no longer
+    //    accurate. This comparison is the authority, not the
+    //    build bookkeeping — dist's stamped revision IS the proof
+    //    that the built page matches the source on disk.
     const distRev = extractDocRevision(shellHtml);
-    if (distRev === sourceRev) return undefined;
+    if (distRev === sourceRev) {
+      refusedRoutes.delete(route);
+      return undefined;
+    }
+    // 4a. A route the fast path could not serve for its publish
+    //     generation gets a banner over the stale dist: the source
+    //     is committed and a build is scheduled, so the honest
+    //     page is "this is behind, and here is why". The rail
+    //     reloads on `build.succeeded` (fresh content, no banner)
+    //     and on `build.failed` (banner switches to the error tail
+    //     rather than spinning forever).
+    const refusal = refusedRoutes.get(route);
+    if (refusal !== undefined) {
+      return await serveBannerOverDist({
+        shellHtml,
+        banner: buildBackgroundBuildBanner(sourcePath, refusal.reason, publishBuild?.state()),
+        method,
+        requestId,
+        route,
+      });
+    }
     // 4b. Gate the fast-render on `revkit check` (round-2 NEW).
     //     A source that would be refused by check (hand-rolled
     //     UI, off-list inline script, etc.) must NOT reach the
@@ -3026,31 +3316,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
     if (!checkVerdict.pass) {
       // Serve dist with a banner spliced into the article body.
-      const banner = buildStaleCheckBanner(sourcePath, checkVerdict.diagnostics);
-      const marker = '<div class="sl-markdown-content">';
-      const withBanner = shellHtml.replace(
-        marker,
-        `${marker}${banner}`,
-      );
-      if (method === "HEAD") {
-        return withHygiene(
-          new Response(null, {
-            status: 200,
-            headers: { "content-length": String(Buffer.byteLength(withBanner, "utf8")) },
-          }),
-          "html",
-          "text/html; charset=utf-8",
-        );
-      }
-      const rawResponse = withHygiene(
-        new Response(withBanner, { status: 200 }),
-        "html",
-        "text/html; charset=utf-8",
-      );
-      return await injectRail(rawResponse, {
-        onOversize: (bodyBytes: number) => {
-          logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
-        },
+      return await serveBannerOverDist({
+        shellHtml,
+        banner: buildStaleCheckBanner(sourcePath, checkVerdict.diagnostics),
+        method,
+        requestId,
+        route,
       });
     }
     // 5. Cache lookup by (route, source revision).
@@ -3066,8 +3337,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         });
         if (result.refused === true) {
           // Fast path can't match dist for this source (code
-          // fences, Starlight asides). Serve dist untouched.
-          return undefined;
+          // fences, Starlight asides, indented code). Serve dist
+          // untouched — but SAY SO. Returning undefined here used to
+          // hand the reviewer a silently stale page: the source on
+          // disk differed from the HTML in front of them and nothing
+          // on the page admitted it. Recording the refusal gives the
+          // next request (and the next restart) a banner.
+          refusedRoutes.set(route, {
+            reason: result.reason,
+            // A read-time refusal is attributed to the source's own
+            // revision, which stands in for a publish generation: the
+            // build that eventually clears it is scheduled from a
+            // publish whose generation differs, so this entry is only
+            // retired by the dist-revision check above or by an
+            // explicit publish. That is the conservative direction —
+            // a lingering banner is visible, a missing one is not.
+            generation: `read:${sourceRev}`,
+            since: Date.now(),
+          });
+          return await serveBannerOverDist({
+            shellHtml,
+            banner: buildBackgroundBuildBanner(sourcePath, result.reason, publishBuild?.state()),
+            method,
+            requestId,
+            route,
+          });
         }
         fragment = result.html;
         dataSrcCount = result.dataSrcCount;
@@ -3491,6 +3785,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         setRenderCache: (route, revision, html, dataSrcCount) => {
           cacheSet(route, { html, revision, dataSrcCount });
         },
+        // The coordinator owns scheduling; the daemon owns what the
+        // reviewer sees while the build runs. `applyBuildItems` turns
+        // the batch's typed outcome into per-route banner state, so a
+        // refusal, a render exception, a data-only file and a missing
+        // shell all get the same treatment without `runPublish`
+        // needing to know how the daemon renders a banner.
+        recordGeneration: async (generation, items) => {
+          if (publishBuild === undefined) {
+            // Scheduling disabled (`enableBackgroundBuild: false`).
+            // The routes still need their banner state — the reviewer
+            // is looking at stale content either way.
+            applyBuildItems(generation, items);
+            return { generation, status: items.length === 0 ? "fast" : "pending", items };
+          }
+          const record = await publishBuild.record(generation, items);
+          applyBuildItems(generation, items);
+          return {
+            generation: record.generation,
+            status: record.status,
+            items: record.items,
+          };
+        },
+        ...(options.publishBeforeStagedCommit !== undefined
+          ? { beforeStagedCommit: options.publishBeforeStagedCommit }
+          : {}),
       },
     );
     if (!outcome.ok) {
@@ -3514,16 +3833,35 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         status,
       );
     }
+    const warning = outcome.notice?.message;
     logger.info("api.publish.ok", {
       requestId,
       files: outcome.published.length,
       overrides: outcome.overrides.length,
+      refused: outcome.refused.length,
+      building: outcome.build.items.length,
+      buildStatus: outcome.build.status,
+      ...(warning !== undefined ? { warning } : {}),
     });
     return jsonResponse(
       {
         published: outcome.published,
         seqs: outcome.seqs,
         overrides: outcome.overrides.map((o) => ({ route: o.route, dataSrcCount: o.dataSrcCount })),
+        // `refused` names paths whose fast-path render was REFUSED
+        // (fenced code, aside, indented code). The agent should not
+        // retry immediately — a build is already scheduled and the
+        // page will refresh when it lands.
+        refused: outcome.refused,
+        // The batch boundary + the per-path render state. `state:
+        // "fast"` means served from the in-memory splice; any other
+        // entry names the reason a full build was scheduled for that
+        // path. `build.status` is `fast` only when EVERY path in the
+        // batch rendered — a batch of data-only files still builds.
+        generation: outcome.generation,
+        rendering: outcome.rendering,
+        build: { generation: outcome.build.generation, status: outcome.build.status },
+        ...(warning !== undefined ? { warning } : {}),
       },
       201,
     );

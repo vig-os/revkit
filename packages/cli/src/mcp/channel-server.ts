@@ -313,14 +313,30 @@ const PUBLISH_TOOL = {
   description:
     "Publish (write and render) a document plus any data side files. The daemon confines writes to " +
     "the review content roots (docs/adr/, docs/designs/, docs/FEATURE-MATRIX.md, plots/, vocab/), " +
-    "runs `revkit check` on the batch (registered components only, one vocabulary, valid links + " +
-    "sets, structured plots), atomically writes each file, re-anchors comments on the changed " +
-    "paths, and re-renders the affected pages so the live page swaps in under a second — WITHOUT " +
-    "a full site build (ADR-0001 amendment, story A4). Presence events (`agent is editing X`) " +
-    "wrap the write. `docs[].content` and `data[].content` are the FULL file bodies; there is no " +
-    "diff/patch shape (v1) — a partial update reads the file first (`fs`), edits in memory, then " +
-    "sends the whole new content. Refuses raw HTML in the source: the check gate is the guard, " +
-    "not the render. Path shape: repo-relative POSIX, no `..`, no leading `/`, no symlinks.",
+    "runs `revkit check` on the batch as ONE snapshot (registered components only, one " +
+    "vocabulary, valid links + sets, structured plots — so a term or a linked document this " +
+    "same batch defines validates), atomically writes each file, re-anchors comments on the " +
+    "changed paths, and re-renders the affected pages so the live page swaps in under a second — " +
+    "WITHOUT a full site build (ADR-0001 amendment, story A4). Presence events `agent is " +
+    "editing X` wrap the write. `docs[].content` and `data[].content` are the FULL file bodies; " +
+    "there is no diff/patch shape (v1) — a partial update reads the file first (`fs`), edits in " +
+    "memory, then sends the whole new content. Refuses raw HTML in the source: the check gate " +
+    "is the guard, not the render. Path shape: repo-relative POSIX, no `..`, no leading `/`, no " +
+    "symlinks. " +
+    "\n\nREAD THE RESPONSE BEFORE YOU ACT ON IT. `rendering[]` says what the reviewer can see " +
+    "right now, per path: `{ state: \"fast\" }` means the page already shows the new content. " +
+    "Anything else names the reason a full build was scheduled instead, and you must NOT " +
+    "republish or retry — the daemon already started one, the page shows a visible banner " +
+    "instead of silently stale content, and it refreshes by itself when the build lands: " +
+    "`fast-path-refused` (fenced code, indented code or a Starlight aside — the same entries " +
+    "appear in `refused[]` with the renderer tag in `reason`), `render-failed` (the renderer " +
+    "threw after check approved the source), `shell-missing` (the route has no built page yet " +
+    "— brand-new document or a consumer that never built), `data-only` (plot spec / data / " +
+    "vocab: no page of its own, but the plots and pages embedding it are build-time products). " +
+    "`build.status` is `fast` only when EVERY path rendered; anything else means a build is " +
+    "outstanding. `build.requested` / `build.started` / `build.succeeded` / `build.failed` are " +
+    "durable events on the event log, so a failed build is reported with the diagnostic you " +
+    "need to fix the source rather than an in-progress banner that never resolves.",
   inputSchema: {
     type: "object",
     properties: {

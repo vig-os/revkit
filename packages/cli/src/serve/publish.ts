@@ -29,34 +29,55 @@
 // - The shell (Starlight sidebar / header / footer / CSP-safe
 //   scripts) is preserved BYTE FOR BYTE by splicing only the
 //   `<div class="sl-markdown-content">…</div>` region. A page that
-//   has never been built ("brand-new document") falls back to
-//   emitting `doc.published` without an override; a background
-//   full build catches up.
-// - The daemon does NOT write into `site/dist/`. Overrides live in
-//   memory; the next `bun run build` produces a fresh `site/dist/`
-//   that the daemon serves from disk again (the override map is
-//   cleared for that route on daemon restart or when a fresh dist
-//   file is served with the matching revision).
+//   has never been built ("brand-new document") has no shell to
+//   splice into: it is recorded as a `shell-missing` build item and
+//   the scheduled full build creates it.
+// - The daemon does NOT write into the serve dir itself; the
+//   scheduled build does, through the shared `revkit build`
+//   primitive. Overrides live in memory, keyed by route together
+//   with the source revision they were rendered from. The next full
+//   build produces a fresh dist that the daemon serves from disk
+//   again — the cache entry is then simply unused, and a refusal is
+//   cleared once the build for its generation succeeds.
 //
 // **Security discipline** (ADR-0013 amendment):
 //
 // - Every path goes through `resolvePublishTarget` — allowlisted
-//   subtrees, extensions, symlink refusal.
+//   subtrees, extensions, symlink refusal — and then through
+//   `stillConfined` AGAIN, after the check and immediately before
+//   the rename. The second pass re-derives the answer from the
+//   filesystem instead of trusting the first one, so a parent
+//   directory or leaf swapped for a symlink while `revkit check`
+//   was running cannot redirect the write outside the repo.
 // - Every file's serialised size is capped
 //   (`PUBLISH_FILE_MAX_BYTES`), and the whole request too
 //   (`PUBLISH_REQUEST_MAX_BYTES`).
-// - Writes are ATOMIC (write to a sibling `.tmp-<random>` then
-//   rename). A partial write cannot leave a half-written file on
-//   disk for the next `revkit check` to trip over.
-// - Rollback on `revkit check` failure: the previous content is
-//   restored (or the newly-created file is deleted if it did not
-//   exist before the publish). The daemon's own reads see the
-//   rollback because they always go to disk via the store's
-//   snapshot path.
+// - Writes are ATOMIC (stage to a sibling `.tmp-<random>` created
+//   with `O_EXCL | O_NOFOLLOW`, then rename). A partial write cannot
+//   leave a half-written file on disk for the next `revkit check` to
+//   trip over, and a rolled-back file is restored through its own
+//   rename rather than an in-place truncate.
+// - The check runs against the STAGED bytes plus a `staged`
+//   overlay, so cross-file rules (vocabulary, links) see the batch as
+//   one snapshot: a doc may use a term or link to a doc that the
+//   same batch defines.
+// - Rollback on `revkit check` failure: nothing has been committed
+//   yet, so the staged files are simply removed. On a mid-batch
+//   rename failure the already-committed files are restored from a
+//   pre-rename snapshot, each through its own atomic rename.
 // - `revkit check` runs in-process (no `bun`/`bunx`, per
 //   CLAUDE.md's "no bunx/npx in a trusted path"). It uses the
 //   same rule set as the pre-commit hook — refuses hand-rolled
 //   HTML, off-vocab terms, mis-shaped plots, and so on.
+//
+// **Every no-override outcome schedules a real build.** A document
+// is either served by the fast path (`state: "fast"`) or recorded
+// as a build item with a typed reason — `data-only`,
+// `fast-path-refused`, `render-failed`, `shell-missing`. There is no
+// third outcome in which a committed source stays invisible until a
+// human runs a build by hand. `deps.recordGeneration` is called with
+// every item in the batch BEFORE the first event append, so a batch
+// whose log append fails is still reconciled by a restart.
 //
 // **Presence** (ADR-0007 §5.3 last paragraph, M2 item 6 round 2):
 // presence beacons are EPHEMERAL — a viewer chip, not a durable
@@ -77,7 +98,20 @@
 // changes that, this is the one call site to update.
 
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import type { Author, ReviewEvent } from "@revkit/review-core";
 import { revisionOf } from "@revkit/review-core";
 import { runCheck, toCheckFiles } from "../check.ts";
@@ -91,13 +125,18 @@ import {
   UNIFORM_PUBLISH_REJECTION,
   resolvePublishTarget,
 } from "./publish-confine.ts";
-import { isRenderablePath, renderDocFragment } from "./publish-render.ts";
+import { isRenderablePath, renderDocFragment, type FastPathRefusalReason } from "./publish-render.ts";
+import type { PublishBuildItem, PublishBuildRecord } from "./publish-build.ts";
 
 /** Result of one publish. `published` is one entry per file in the
  * batch that reached disk; `overrides` names the routes for which
- * the daemon now serves a fast-path HTML fragment. On any failure
- * (validation, check, disk) the whole batch is rolled back and
- * `ok: false` is returned with a `kind` the caller can branch on. */
+ * the daemon now serves a fast-path HTML fragment; `refused` names
+ * the paths where the fast path REFUSED to render (fenced code
+ * blocks, Starlight asides) — the daemon then triggers a
+ * background full build and serves a "rendering..." banner on
+ * those routes until the build lands. On any failure (validation,
+ * check, disk) the whole batch is rolled back and `ok: false` is
+ * returned with a `kind` the caller can branch on. */
 export type PublishOutcome =
   | {
       readonly ok: true;
@@ -112,6 +151,39 @@ export type PublishOutcome =
         readonly html: string;
         readonly dataSrcCount: number;
       }[];
+      /** Paths whose fast-path render was REFUSED. Each entry
+       * names the file and the reason. The caller can:
+       *   - Show the reviewer a "rendering..." banner on that
+       *     route (the daemon injects one automatically);
+       *   - Wait for the background full build (`buildStarted`
+       *     on the event bus, then a fresh `astro build`);
+       *   - Tell the agent to rewrite the source to use a
+       *     supported feature.
+       *
+       * `reason` matches `FastPathRefusal.reason` — the same
+       * tag `renderDocFragment` returns for the source. */
+      readonly refused: readonly {
+        readonly path: string;
+        readonly route: string | undefined;
+        readonly reason: FastPathRefusalReason;
+      }[];
+      readonly generation: string;
+      readonly rendering: readonly ({
+        readonly path: string;
+        readonly route?: string;
+        readonly state: "fast";
+      } | PublishBuildItem)[];
+      readonly build: Pick<PublishBuildRecord, "generation" | "status" | "items">;
+      /** Set when the batch landed on disk but one or more
+       * `doc.published` appends to the durable log were rejected.
+       * The publish is NOT rolled back (the source is valid and the
+       * build is scheduled), so the outcome stays `ok: true` — but
+       * the caller is told the rail will learn about this batch from
+       * the build's own events rather than from `doc.published`. */
+      readonly notice?: {
+        readonly code: "event-append-failed";
+        readonly message: string;
+      };
     }
   | {
       readonly ok: false;
@@ -171,6 +243,17 @@ export interface PublishDependencies {
     html: string,
     dataSrcCount: number,
   ) => void;
+  readonly recordGeneration: (
+    generation: string,
+    items: readonly PublishBuildItem[],
+  ) => Promise<Pick<PublishBuildRecord, "generation" | "status" | "items">>;
+  /** TEST-ONLY hook: awaited after `revkit check` approves the staged
+   * bytes and immediately before they are renamed onto their final
+   * paths. Production passes nothing. A confinement-race test passes a
+   * function that swaps a parent directory or the leaf itself for a
+   * symlink, which is what makes the re-validation that follows this
+   * call provably load-bearing rather than decorative. */
+  readonly beforeStagedCommit?: () => Promise<void>;
 }
 
 /** Public entry point. Runs the whole publish pipeline for one
@@ -264,7 +347,11 @@ async function runPublishInner(
   //    — a brief window in which the on-disk source held content
   //    that check had not yet approved. The staged-copy approach
   //    keeps the final paths untouched until step 3 passes.
-  const staged: { absolutePath: string; tmp: string }[] = [];
+  //
+  //    The staged file is created with `O_EXCL | O_NOFOLLOW`: a
+  //    swapped leaf cannot be followed, and the random name cannot
+  //    already exist.
+  const staged: { absolutePath: string; repoRelativePath: string; tmp: string }[] = [];
   const cleanupStaged = (): void => {
     for (const { tmp } of staged) {
       try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
@@ -273,8 +360,17 @@ async function runPublishInner(
   try {
     for (const entry of resolved) {
       const tmp = `${entry.absolutePath}.tmp-${randomBytes(8).toString("hex")}`;
-      writeFileSync(tmp, entry.normalised, "utf8");
-      staged.push({ absolutePath: entry.absolutePath, tmp });
+      const fd = openSync(
+        tmp,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(fd, entry.normalised, "utf8");
+      } finally {
+        closeSync(fd);
+      }
+      staged.push({ absolutePath: entry.absolutePath, repoRelativePath: entry.input.path, tmp });
     }
   } catch (error) {
     cleanupStaged();
@@ -305,15 +401,24 @@ async function runPublishInner(
   //    developer running `revkit check` locally. `revkit check`
   //    reads files by absolute path; the batch's paths are the
   //    ones just written.
-  const stagedCheckFiles = staged.map((s, i) => ({
+  //
+  //    The `staged` overlay is what makes the batch ONE snapshot
+  //    rather than a set of independent files: the cross-file rules
+  //    (vocabulary, links) consult it before the filesystem, so a
+  //    doc that uses a term the same batch defines, or links to a
+  //    doc the same batch creates, validates against the batch and
+  //    not against the previous contents of files that have not
+  //    landed yet.
+  const stagedCheckFiles = staged.map((s) => ({
     absolute: s.tmp,
-    relative: resolved[i]!.input.path,
+    relative: s.repoRelativePath,
   }));
+  const stagedOverlay = buildStagedOverlay(deps.repoRoot, resolved, staged);
   const checkOutput = await runCheck(
     deps.repoRoot,
     stagedCheckFiles,
     [],
-    { online: false, repoSlug: deps.repoSlug, gh: spawnGh },
+    { online: false, repoSlug: deps.repoSlug, gh: spawnGh, staged: stagedOverlay },
   );
   if (checkOutput.exitCode !== 0) {
     cleanupStaged();
@@ -325,14 +430,37 @@ async function runPublishInner(
     };
   }
 
-  // 3b) Commit the staged files to their final paths atomically.
+  // 3b) The check took time. Re-verify confinement BEFORE the
+  //     commit: `resolvePublishTarget` ran at step 1, and between
+  //     then and the rename a concurrent writer could have replaced
+  //     `docs/adr` with a symlink to `/etc`, or made the leaf itself
+  //     a symlink pointing outside the repo. Re-running the same
+  //     resolver and requiring the SAME absolute path — plus a
+  //     realpath check on the parent directory, which must still be
+  //     a real directory inside the repo root — turns that window
+  //     from "the write trusts a stale decision" into "the write
+  //     refuses unless the decision still holds".
+  await deps.beforeStagedCommit?.();
+  for (const { absolutePath, repoRelativePath } of staged) {
+    if (!stillConfined(deps.repoRoot, repoRelativePath, absolutePath)) {
+      cleanupStaged();
+      return {
+        ok: false,
+        kind: "confinement",
+        reason: UNIFORM_PUBLISH_REJECTION,
+      };
+    }
+  }
+
+  // 3c) Commit the staged files to their final paths atomically.
   //     `renameSync` on the same filesystem is atomic on
   //     Linux/macOS — a reader sees either the OLD file or the
   //     NEW file, never a half-written one. If a rename fails
   //     mid-batch, roll back the ones that already landed by
-  //     replacing them with their previous contents (snapshotted
-  //     just before the rename, so no window sees the new bytes
-  //     at the final path until check has passed).
+  //     renaming a freshly written copy of their previous contents
+  //     back into place (a plain `writeFileSync` would expose a
+  //     truncated window to a concurrent reader; the new-file case
+  //     is removed outright).
   interface CommitSnapshot {
     absolutePath: string;
     existed: boolean;
@@ -343,9 +471,22 @@ async function runPublishInner(
     for (const snap of [...committed].reverse()) {
       try {
         if (snap.existed && snap.previous !== undefined) {
-          writeFileSync(snap.absolutePath, snap.previous, "utf8");
+          // Restore through a rename so a concurrent reader sees the
+          // old bytes or the new bytes, never a truncated file.
+          const restore = `${snap.absolutePath}.rollback-${randomBytes(8).toString("hex")}`;
+          const fd = openSync(
+            restore,
+            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+            0o600,
+          );
+          try {
+            writeFileSync(fd, snap.previous, "utf8");
+          } finally {
+            closeSync(fd);
+          }
+          renameSync(restore, snap.absolutePath);
         } else if (existsSync(snap.absolutePath)) {
-          unlinkSync(snap.absolutePath);
+          rmSync(snap.absolutePath, { force: true });
         }
       } catch { /* best-effort */ }
     }
@@ -355,7 +496,7 @@ async function runPublishInner(
       let existed = false;
       let previous: string | undefined;
       try {
-        const stat = statSync(absolutePath);
+        const stat = lstatSync(absolutePath);
         if (stat.isFile()) {
           existed = true;
           previous = readFileSync(absolutePath, "utf8");
@@ -373,28 +514,38 @@ async function runPublishInner(
       reason: `publish: rename failed after check: ${(error as Error).message}`,
     };
   }
-  const writtenPaths = committed.map((snap) => snap.absolutePath);
+  const generation = await revisionOf(
+    JSON.stringify(resolved.map((entry) => [entry.input.path, entry.revision])),
+  );
 
   // 4) Emit `presence editing` for every doc in the batch. Round-2
   //    (M2 item 6) makes presence EPHEMERAL — no store append; the
   //    hub broadcasts the frame straight to `/events` subscribers.
   //    A restart forgets the beacon, which is exactly the right
   //    lifetime for "agent is editing X RIGHT NOW".
+  //
+  //    Steps 4–8 run inside a try whose `finally` always clears the
+  //    beacon. Everything after this point can throw (an event append
+  //    against a locked sqlite file, a re-anchor pipeline that dies,
+  //    a render cache that rejects), and a beacon left lit is a
+  //    permanently-occupied chip in every reviewer's rail with
+  //    nothing behind it — the one failure mode a restart does NOT
+  //    heal, because presence is in-memory by design.
   for (const entry of resolved) {
     deps.presence.editing(deps.agentActor, { path: entry.input.path });
   }
-
+  try {
   // 5) Fast-path render + shell splice.
   interface Rendered {
     readonly entry: Resolved;
     readonly override?: { route: string; html: string; dataSrcCount: number };
+    readonly refused?: { reason: FastPathRefusalReason };
+    readonly buildItem?: PublishBuildItem;
   }
   const rendered: Rendered[] = [];
   for (const entry of resolved) {
     if (entry.siteRoute === undefined || !isRenderablePath(entry.input.path)) {
-      // Data side file (plot data, vocab) — no override, just the
-      // event fanout below.
-      rendered.push({ entry });
+      rendered.push({ entry, buildItem: { path: entry.input.path, reason: "data-only" } });
       continue;
     }
     let fragment: string;
@@ -409,9 +560,19 @@ async function runPublishInner(
         // Source uses a feature the fast path can't render
         // byte-parity with the full build (fenced code blocks,
         // Starlight asides). Skip the override — dist serves
-        // the previous build's HTML until the background full
-        // build catches up (M2 item 9, PR-56 round 2 blocker 1b).
-        rendered.push({ entry });
+        // the previous build's HTML with a "rendering..." banner
+        // until the background full build catches up
+        // (M2 item 9, PR-56 round 3 blocker).
+        rendered.push({
+          entry,
+          refused: { reason: result.reason },
+          buildItem: {
+            path: entry.input.path,
+            route: entry.siteRoute,
+            reason: "fast-path-refused",
+            detail: result.reason,
+          },
+        });
         continue;
       }
       fragment = result.html;
@@ -421,7 +582,15 @@ async function runPublishInner(
       // file was accepted by `revkit check`, so leaving the write
       // in place is the right call (the next full build will still
       // render it). Emit `doc.published` without an override.
-      rendered.push({ entry });
+      rendered.push({
+        entry,
+        buildItem: {
+          path: entry.input.path,
+          route: entry.siteRoute,
+          reason: "render-failed",
+          detail: (error as Error).message,
+        },
+      });
       // eslint-disable-next-line no-console
       console.error(`publish: fast-path render failed for ${entry.input.path}: ${(error as Error).message}`);
       continue;
@@ -435,7 +604,10 @@ async function runPublishInner(
     if (spliced === undefined) {
       // Shell missing (no full build ever ran, or the route is
       // new). Emit `doc.published` without an override.
-      rendered.push({ entry });
+      rendered.push({
+        entry,
+        buildItem: { path: entry.input.path, route: entry.siteRoute, reason: "shell-missing" },
+      });
       continue;
     }
     rendered.push({
@@ -450,9 +622,22 @@ async function runPublishInner(
   //    same source at the same revision (before dist catches up)
   //    is a Map hit; after dist catches up the entry is simply
   //    unused. (M2 item 9, PR-56 blocker 2.)
+  //
+  //    The build is recorded FIRST, before any event append. Order
+  //    is load-bearing: the batch is already on disk at this point,
+  //    so the only durable record that a build is owed lives in
+  //    `.revkit/publish-state.json`. Recording it before the first
+  //    append means an append that throws on the very first event
+  //    still leaves a restart-reconcilable record — the daemon comes
+  //    back, sees `pending`, re-announces `build.requested` and runs
+  //    the build. Recording it after would leave the source
+  //    committed, invisible and unbuilt until the next publish.
   const overrides: { route: string; html: string; dataSrcCount: number }[] = [];
   const seqs: number[] = [];
   const publishedPaths = resolved.map((entry) => entry.input.path);
+  const buildItems = rendered.flatMap((item) => item.buildItem === undefined ? [] : [item.buildItem]);
+  const build = await deps.recordGeneration(generation, buildItems);
+  let appendFailure: string | undefined;
   for (const item of rendered) {
     if (item.override !== undefined) {
       deps.setRenderCache(
@@ -473,9 +658,21 @@ async function runPublishInner(
       // can decide whether a plot data change on the same batch
       // affects it.
       paths: publishedPaths,
+      // The batch boundary. Every event in this loop carries the
+      // same generation, so a consumer can group the batch and
+      // never mix revisions from two publishes.
+      generation,
     };
-    const seq = await appendAndFanOut(deps, event, ["rail", "agent"] as const);
-    seqs.push(seq);
+    try {
+      seqs.push(await appendAndFanOut(deps, event, ["rail", "agent"] as const));
+    } catch (error) {
+      // The source is committed and the build is scheduled; only
+      // the log append failed. Keep going for the rest of the batch
+      // (a later event may well succeed — an isolated constraint
+      // violation on one path should not blind the others) and
+      // report the gap on the outcome.
+      appendFailure ??= `${item.entry.input.path}: ${(error as Error).message}`;
+    }
   }
 
   // 7) Re-anchor each source-carrying path so any thread whose
@@ -498,12 +695,15 @@ async function runPublishInner(
   }
   deps.reconcileWatchers();
 
-  // 8) Emit `presence idle` per doc so the "agent is editing X"
-  //    beacon flips off. Ephemeral broadcast; no store append.
-  for (const entry of resolved) {
-    deps.presence.idle(deps.agentActor, { path: entry.input.path });
-  }
-
+  const refused = rendered
+    .filter((item): item is Rendered & { refused: { reason: FastPathRefusalReason } } =>
+      item.refused !== undefined,
+    )
+    .map((item) => ({
+      path: item.entry.input.path,
+      route: item.entry.siteRoute,
+      reason: item.refused.reason,
+    }));
   return {
     ok: true,
     published: resolved.map((entry) => ({
@@ -513,7 +713,90 @@ async function runPublishInner(
     })),
     seqs,
     overrides,
+    refused,
+    generation,
+    rendering: rendered.map((item) => item.buildItem ?? {
+      path: item.entry.input.path,
+      ...(item.entry.siteRoute !== undefined ? { route: item.entry.siteRoute } : {}),
+      state: "fast" as const,
+    }),
+    build,
+    ...(appendFailure !== undefined ? { notice: { code: "event-append-failed", message: appendFailure } } : {}),
   };
+  } finally {
+    // 8) Emit `presence idle` per doc so the "agent is editing X"
+    //    beacon flips off. Ephemeral broadcast; no store append.
+    for (const entry of resolved) {
+      deps.presence.idle(deps.agentActor, { path: entry.input.path });
+    }
+  }
+}
+
+// ── staged batch snapshot ───────────────────────────────────────────
+
+/** The batch as ONE snapshot for `revkit check`'s cross-file rules,
+ * keyed by the ABSOLUTE path each staged file will occupy once
+ * committed.
+ *
+ * Two keys per entry, deliberately. `resolvePublishTarget` composes
+ * paths from the REALSYSPATH of the repo root (so a symlinked
+ * `repoRoot` yields a realpath-keyed absolute), while the check
+ * anchors its own cross-file lookups — the vocabulary file above all
+ * — at the `repoRoot` string the caller passed. Keying by both makes
+ * the overlay hit regardless of whether the daemon was started with a
+ * real or a symlinked repo root, and both spellings name the same
+ * inode, so neither key can shadow the other's content. */
+function buildStagedOverlay(
+  repoRoot: string,
+  resolved: readonly { input: PublishFileInput; normalised: string }[],
+  staged: readonly { absolutePath: string; repoRelativePath: string }[],
+): Map<string, string> {
+  const overlay = new Map<string, string>();
+  resolved.forEach((entry, index) => {
+    const absolutePath = staged[index]!.absolutePath;
+    overlay.set(absolutePath, entry.normalised);
+    overlay.set(join(repoRoot, entry.input.path), entry.normalised);
+  });
+  return overlay;
+}
+
+/** Is `repoRelativePath` STILL confined to the repo root, resolving to
+ * exactly `expectedAbsolutePath`?
+ *
+ * This is the second half of a two-step confinement decision, run
+ * after `revkit check` and immediately before the rename. The first
+ * resolution is a point-in-time answer; between it and the write, a
+ * concurrent process (or the agent itself, via another tool) can
+ * replace `docs/adr` with a symlink to `/etc`, or make the leaf a
+ * symlink to `/etc/passwd`. Three conditions have to hold together:
+ *
+ *   1. `resolvePublishTarget` still accepts the path — same
+ *      allowlist, same no-symlink rule, same real root.
+ *   2. It resolves to the SAME absolute path as before, so the write
+ *      cannot be redirected somewhere else inside the repo.
+ *   3. The parent directory still realpaths to itself and still sits
+ *      under the repo's realpath, so the leaf name cannot be
+ *      interpreted through a swapped directory.
+ *
+ * A swap that lands between THIS check and the rename is still
+ * possible in principle; that residual window is why the staged file
+ * itself is created with `O_NOFOLLOW` and why the parent is re-checked
+ * per file. The point is that the decision is re-derived from the
+ * filesystem at the last moment rather than trusted from earlier. */
+function stillConfined(repoRoot: string, repoRelativePath: string, expectedAbsolutePath: string): boolean {
+  const target = resolvePublishTarget(repoRoot, repoRelativePath);
+  if (!target.ok || target.absolutePath !== expectedAbsolutePath) return false;
+  const parent = dirname(expectedAbsolutePath);
+  let rootReal: string;
+  let parentReal: string;
+  try {
+    rootReal = realpathSync(resolvePath(repoRoot));
+    parentReal = realpathSync(parent);
+  } catch {
+    return false;
+  }
+  if (parentReal !== parent) return false;
+  return parentReal === rootReal || parentReal.startsWith(`${rootReal}/`);
 }
 
 // ── shell splicing ─────────────────────────────────────────────────

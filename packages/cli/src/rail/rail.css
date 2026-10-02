@@ -874,3 +874,47 @@
   opacity: 0.5;
   cursor: wait;
 }
+
+/* Daemon banners (M2 item 9, PR-56 round 3). Rendered by the
+ * daemon when it must serve stale dist HTML — `stale-check` when
+ * the current source fails `revkit check`, `rendering` when the
+ * fast path refused and a background astro build is running,
+ * `build-failed` when that background build errored. Styles
+ * ship with the rail bundle so the daemon does not need inline
+ * `style=` (round-3 nit — inline styles would fight the CSP). */
+.revkit-daemon-banner {
+  border-radius: 0.5rem;
+  border: 2px solid;
+  padding: 0.75rem 1rem;
+  margin: 0 0 1rem 0;
+  font-family: ui-sans-serif, system-ui;
+  line-height: 1.4;
+}
+.revkit-daemon-banner code {
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+.revkit-daemon-banner ul { margin: 0.5rem 0 0 1.5rem; }
+.revkit-daemon-banner pre {
+  margin: 0.5rem 0 0 0;
+  padding: 0.5rem;
+  border-radius: 0.25rem;
+  background: rgba(0, 0, 0, 0.05);
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+.revkit-daemon-banner--stale-check {
+  border-color: #b45309;
+  background: #fff7ed;
+  color: #7c2d12;
+}
+.revkit-daemon-banner--rendering {
+  border-color: #0369a1;
+  background: #eff6ff;
+  color: #0c4a6e;
+}
+.revkit-daemon-banner--build-failed {
+  border-color: #b91c1c;
+  background: #fef2f2;
+  color: #7f1d1d;
+}

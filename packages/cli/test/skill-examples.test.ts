@@ -23,6 +23,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type { ZodSchema } from "zod";
+import { publishBuildReasons } from "../src/serve/publish-build.ts";
+import { fastPathRefusalReasons } from "../src/serve/publish-render.ts";
+import { reviewEventKinds } from "@revkit/review-core";
 import {
   askArgsSchema,
   awaitAnswerArgsSchema,
@@ -184,12 +187,56 @@ describe("SKILL.md tool-call examples validate against zod schemas", () => {
     expect(missing).toEqual([]);
   });
 
-  test("the SKILL text does NOT claim a background build the daemon does not run", () => {
-    // Round-2 review: the SKILL's earlier text said "the background
-    // full build catches up", but nothing in the daemon triggers a
-    // build. The prose now says the human reruns `bun run build`.
+  test("the SKILL describes the build the daemon ACTUALLY schedules", () => {
+    // Round-2 caught the SKILL promising "the background full build
+    // catches up" when nothing in the daemon triggered one. The
+    // daemon now does — so the guard flips from "the prose must not
+    // promise a build" to "the prose must describe the build that
+    // exists", which is a stronger claim: the vocabulary the SKILL
+    // teaches has to match the code's vocabulary exactly.
     expect(md).not.toMatch(/background full build catches up/);
-    expect(md).toMatch(/bun run build|astro build/);
+    // Every build-item reason the code can return is taught.
+    for (const reason of publishBuildReasons) {
+      expect(md).toContain(`"${reason}"`);
+    }
+    // Every renderer refusal tag the code can return is taught.
+    for (const reason of fastPathRefusalReasons) {
+      expect(md).toContain(`\`${reason}\``);
+    }
+    // The accepted state is named, so "fast path served it" is as
+    // discoverable as "a build was scheduled".
+    expect(md).toContain('state: "fast"');
+    // Every build lifecycle kind on the log is taught.
+    for (const kind of reviewEventKinds.filter((k) => k.startsWith("build."))) {
+      expect(md).toContain(kind);
+    }
+    // The SKILL must NOT teach a reason or event the code cannot emit
+    // — that is the same drift in the other direction.
+    const taught = [...md.matchAll(/"(data-only|fast-path-refused|render-failed|shell-missing)"/g)]
+      .map((m) => m[1]);
+    expect([...new Set(taught)].sort()).toEqual([...publishBuildReasons].sort());
+  });
+
+  test("the SKILL's claim that the rail reloads on build.failed is backed by the rail's code", () => {
+    // The prose promises a reviewer is never left watching a spinner
+    // for a build that already died. That promise lives in exactly
+    // one place in the rail — assert it here so the prose and the
+    // subscription handler cannot drift apart.
+    const railSource = readFileSync(resolve(__dirname, "../src/rail/rail.tsx"), "utf8");
+    expect(railSource).toMatch(/event\.kind === "build\.succeeded" \|\| event\.kind === "build\.failed"/);
+    expect(md).toMatch(/reloads?\s+(the\s+)?page on BOTH `build\.succeeded` and `build\.failed`/i);
+  });
+
+  test("the SKILL's claim that a batch is checked as one snapshot matches the check's option", () => {
+    // "you can add a term to the vocabulary AND use `<Term id=…/>` in
+    // a document in the SAME publish call" is only true because
+    // `runCheck` accepts a staged overlay and `runPublish` passes it.
+    // Assert both halves so the promise cannot survive on one side.
+    const checkSource = readFileSync(resolve(__dirname, "../src/check.ts"), "utf8");
+    expect(checkSource).toMatch(/readonly staged\?: StagedOverlay/);
+    const publishSource = readFileSync(resolve(__dirname, "../src/serve/publish.ts"), "utf8");
+    expect(publishSource).toMatch(/staged: stagedOverlay/);
+    expect(md).toMatch(/checked as ONE snapshot/);
   });
 
   test("the SKILL's 'publish returns' claim matches the code (`published[].revision`)", () => {

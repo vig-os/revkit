@@ -46,6 +46,22 @@ export interface LogFields {
   /** M2 item 9 (publish): number of route overrides installed by
    * one publish (== the count of docs that had a rendered shell). */
   readonly overrides?: number;
+  /** M2 item 9 (publish): number of paths in one publish batch whose
+   * fast-path render was refused. */
+  readonly refused?: number;
+  /** M2 item 9 (publish): number of paths in one publish batch that
+   * need a full build (refusals, render failures, data-only files,
+   * routes with no built shell). */
+  readonly building?: number;
+  /** M2 item 9 (publish): the coordinator's status for the batch —
+   * `fast` when nothing needed building, else the lifecycle state. */
+  readonly buildStatus?: string;
+  /** Non-fatal gap the operator should know about. Currently only
+   * the publish outcome's `event-append-failed` notice: the source
+   * landed and a build was scheduled, but the durable log append
+   * was rejected, so the rail learns about the batch from the
+   * build's events rather than from `doc.published`. */
+  readonly warning?: string;
   /** Delivery-mode transition (M2 item 6). `from` and `to` are the
    * previous and next `DeliveryMode` values; kept as strings on the
    * log field so a rename of the enum does not touch every logger
@@ -182,6 +198,12 @@ const ALLOWED_KEYS = [
   "previousHeadSha",
   "currentHeadSha",
   "fileFallback",
+  "files",
+  "overrides",
+  "refused",
+  "building",
+  "buildStatus",
+  "warning",
 ] as const satisfies readonly (keyof LogFields)[];
 
 /** Exported so `test/serve/logger.test.ts` can iterate the allowlist —

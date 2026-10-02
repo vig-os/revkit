@@ -164,6 +164,7 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     path: "docs/adr/0006-comments-anchoring-event-log.md",
     revision: "f".repeat(64),
     route: "/adr/0006-comments-anchoring-event-log/",
+    generation: "1".repeat(64),
   },
   "review.opened": {
     seq: 12,
@@ -216,6 +217,39 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     kind: "comment.sync_cancelled",
     commentId: "c-1",
     requestedAtSeq: 15,
+  },
+  "build.requested": {
+    seq: 18,
+    ts: t,
+    actor: { kind: "system", id: "revkit-daemon" },
+    kind: "build.requested",
+    generation: "a".repeat(64),
+    routes: ["/adr/example/"],
+  },
+  "build.started": {
+    seq: 19,
+    ts: t,
+    actor: { kind: "system", id: "revkit-daemon" },
+    kind: "build.started",
+    generation: "a".repeat(64),
+    routes: ["/adr/example/"],
+  },
+  "build.succeeded": {
+    seq: 20,
+    ts: t,
+    actor: { kind: "system", id: "revkit-daemon" },
+    kind: "build.succeeded",
+    generation: "a".repeat(64),
+    routes: ["/adr/example/"],
+  },
+  "build.failed": {
+    seq: 21,
+    ts: t,
+    actor: { kind: "system", id: "revkit-daemon" },
+    kind: "build.failed",
+    generation: "a".repeat(64),
+    routes: ["/adr/example/"],
+    error: "astro build exited 1. Tail:\nRollupError: something bad",
   },
 };
 

@@ -26,11 +26,14 @@ export interface LoadedVocabEntry {
   readonly aliases: readonly string[];
 }
 
-/** Load and validate `vocab/terms.yaml`. Throws if the file is missing,
- * unparsable or does not satisfy the schema — the check should not
- * silently pass when the vocabulary itself is broken. */
-export function loadVocab(vocabYamlPath: string): LoadedVocabEntry[] {
-  const raw = readFileSync(vocabYamlPath, "utf8");
+/** Parse + validate the vocabulary YAML itself. Split out of
+ * `loadVocab` so a caller holding the RAW bytes — the publish
+ * orchestrator, which stages the batch's own `vocab/terms.yaml`
+ * before committing it — validates the same schema without first
+ * writing the file to disk. Throws when the YAML is unparsable or
+ * does not satisfy the schema; the check should not silently pass
+ * when the vocabulary itself is broken. */
+export function parseVocabYaml(raw: string): LoadedVocabEntry[] {
   const parsedYaml: unknown = parseYaml(raw);
   const file = vocabFileSchema.parse(parsedYaml);
   return file.entries.map((entry) => ({
@@ -38,6 +41,13 @@ export function loadVocab(vocabYamlPath: string): LoadedVocabEntry[] {
     term: entry.term,
     aliases: entry.aliases,
   }));
+}
+
+/** Load and validate `vocab/terms.yaml`. Throws if the file is missing,
+ * unparsable or does not satisfy the schema — the check should not
+ * silently pass when the vocabulary itself is broken. */
+export function loadVocab(vocabYamlPath: string): LoadedVocabEntry[] {
+  return parseVocabYaml(readFileSync(vocabYamlPath, "utf8"));
 }
 
 /** Build a lookup by id for `<Term id>` and `[[id]]` checks. */

@@ -261,32 +261,68 @@ describe("fast-path ↔ full-build FULL HTML equivalence (ADR-0001 amendment)", 
     });
   }
 
-  test("removing the link-rewriter from ONLY the fast path breaks equivalence", async () => {
-    // Round-2 negative-guard (blocker 2): a maintainer who
-    // accidentally drops a plugin from the shared chain must
-    // fail this test. We simulate the drop by hand-rewriting
-    // links back to raw `.md` targets on the fast render, then
-    // confirm the equivalence check would have caught it.
-    const doc = DOCS.find((d) => d.relPath.startsWith("docs/designs/DESIGN-0001"));
+  test("removing the link-rewriter plugin from the shared chain breaks equivalence on an ACCEPTED doc (round-3 nit)", async () => {
+    // Round-2 negative-guard, tightened per round-3 review: pick
+    // an ACCEPTED doc (one the fast path renders in full), and
+    // rebuild its render WITH THE LINK-REWRITER PLUGIN DROPPED.
+    // The equivalence check must fail — that proves the plugin
+    // in the shared chain is what makes the two paths agree.
+    //
+    // Uses ADR-0001 which the fast path accepts (no code fence,
+    // no aside) and which has cross-doc `.md` links in prose.
+    const doc = DOCS.find((d) => d.relPath === "docs/adr/0001-static-first-site-stack.md");
     expect(doc).toBeDefined();
     if (doc === undefined) return;
     const source = readFileSync(resolve(REPO_ROOT, doc.relPath), "utf8");
-    const result = await renderDocFragment({
+    // First confirm the doc is accepted, then run a MINUS-PLUGIN
+    // render through a hand-built processor.
+    const accepted = await renderDocFragment({
       repoRoot: REPO_ROOT,
       path: doc.relPath,
       source,
     });
-    if (result.refused === true) return; // DESIGN-0001 has code blocks; the refusal path is exercised elsewhere.
-    // Break the fast render by un-rewriting `.md` links, then
-    // verify equivalence FAILS.
-    const broken = result.html.replace(/href="\/adr\/([^"]+)\/"/g, 'href="../adr/$1.md"');
+    expect(accepted.refused).toBeUndefined();
+    if (accepted.refused === true) return;
+    // Build a processor with the SAME shared config but WITHOUT
+    // the link-rewriter. If dropping it breaks parity, this
+    // proves the equivalence test is not tautological — the
+    // plugin actually earns its place.
+    const { createMarkdownProcessor } = await import("@astrojs/markdown-remark");
+    const { buildSharedMarkdownConfig } = await import(
+      "../../../../site/src/lib/markdown-processor.ts"
+    );
+    const shared = buildSharedMarkdownConfig(REPO_ROOT);
+    const withoutLinkRewriter = {
+      remarkPlugins: shared.remarkPlugins,
+      rehypePlugins: shared.rehypePlugins.filter(
+        (entry) => {
+          // Each entry is `[plugin, options]`; identify by function
+          // name so a rename in the source is caught by another test.
+          if (!Array.isArray(entry)) return true;
+          const plugin = entry[0] as { name?: string } | undefined;
+          const name = typeof plugin === "function" ? plugin.name : plugin?.name;
+          return name !== "rehypeRewriteMdLinks";
+        },
+      ),
+      syntaxHighlight: false as const,
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const processor = await createMarkdownProcessor(withoutLinkRewriter as any);
+    const { pathToFileURL } = await import("node:url");
+    const rendered = await processor.render(source, {
+      fileURL: pathToFileURL(`${REPO_ROOT}/${doc.relPath}`),
+    });
+    const brokenFast = rendered.code;
     const builtHtml = readFileSync(doc.distHtmlPath, "utf8");
     const fullArticle = extractArticleBody(builtHtml)!;
-    if (broken !== result.html) {
-      // The plugin was in the chain (rewrote at least one link).
-      // Whitespace-normalised, broken !== full.
-      expect(normaliseWhitespace(broken)).not.toBe(normaliseWhitespace(fullArticle));
-    }
+    // With the plugin dropped, at least one `.md` href must
+    // remain in the fast output that isn't in the full one.
+    expect(normaliseWhitespace(brokenFast)).not.toBe(normaliseWhitespace(fullArticle));
+    // And there should be at least ONE residual `.md` link in
+    // the broken render — otherwise the doc had no cross-doc
+    // links and this test doesn't prove anything.
+    const residual = brokenFast.match(/href="[^"]+\.md(?:#[^"]*)?"/g) ?? [];
+    expect(residual.length).toBeGreaterThan(0);
   });
 });
 

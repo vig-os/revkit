@@ -402,6 +402,15 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       // `thread.reanchored`/`thread.orphaned` events. The event
       // itself is stateless (like `presence` and `handover` above).
       return { ok: true };
+    case "build.requested":
+    case "build.started":
+    case "build.succeeded":
+    case "build.failed":
+      // Background astro-build lifecycle (M2 item 9, PR-56 round 3).
+      // No cross-event invariants — the daemon emits these purely so
+      // the rail can reload once dist catches up after a fast-path
+      // refusal. Stateless.
+      return { ok: true };
     case "ask.created": {
       if (state.asks.has(event.askId)) {
         return {

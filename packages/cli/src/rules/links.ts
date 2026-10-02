@@ -37,17 +37,46 @@ export function headingSlug(text: string): string {
     .replace(/^-|-$/g, "");
 }
 
+/** Overlay of file contents that are staged in the SAME batch as the
+ * file under test, keyed by ABSOLUTE path. The publish orchestrator
+ * stages every batch member before `revkit check` runs (so nothing
+ * unvalidated ever reaches a final path) — without this overlay a
+ * doc that links to a doc published in the same batch would be
+ * reported as a broken link, because the target does not exist on
+ * disk yet. `undefined` means "no overlay"; consult the overlay
+ * FIRST, then the filesystem. */
+export type StagedOverlay = ReadonlyMap<string, string>;
+
+/** Read a file for the links rule, preferring the staged batch
+ * overlay. Returns undefined when neither the overlay nor the
+ * filesystem has the file. */
+function readWithOverlay(absolutePath: string, overlay: StagedOverlay | undefined): string | undefined {
+  const staged = overlay?.get(absolutePath);
+  if (staged !== undefined) return staged;
+  try {
+    return readFileSync(absolutePath, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Does this path resolve to something the links rule should accept?
+ * The staged overlay counts as existing — that is the whole point of
+ * a coherent batch snapshot. */
+function existsWithOverlay(absolutePath: string, overlay: StagedOverlay | undefined): boolean {
+  if (overlay?.has(absolutePath) === true) return true;
+  return existsSync(absolutePath);
+}
+
 /** Extract every heading's anchor slug for a markdown / MDX file. The
  * parse is cached in `cache` — a docs tree with many cross-links reads
  * each file at most once. */
-function slugsFor(filePath: string, cache: SlugCache): Set<string> {
+function slugsFor(filePath: string, cache: SlugCache, overlay: StagedOverlay | undefined): Set<string> {
   const cached = cache.get(filePath);
   if (cached) return cached;
   const slugs = new Set<string>();
-  let source: string;
-  try {
-    source = readFileSync(filePath, "utf8");
-  } catch {
+  const source = readWithOverlay(filePath, overlay);
+  if (source === undefined) {
     cache.set(filePath, slugs);
     return slugs;
   }
@@ -91,6 +120,7 @@ export function checkLinksFile(
   cache: SlugCache = new Map(),
   repoRoot?: string,
   preparsedRoot?: import("mdast").Parent,
+  staged?: StagedOverlay,
 ): Diagnostic[] {
   let root;
   try {
@@ -143,7 +173,7 @@ export function checkLinksFile(
       }
     }
 
-    if (!existsSync(targetAbsolute)) {
+    if (!existsWithOverlay(targetAbsolute, staged)) {
       findings.push({
         file: reportPath,
         line: lineOf(node),
@@ -153,18 +183,24 @@ export function checkLinksFile(
       return;
     }
 
-    let stat;
+    const isStaged = staged?.has(targetAbsolute) === true;
+    let isFile: boolean;
     try {
-      stat = statSync(targetAbsolute);
+      isFile = statSync(targetAbsolute).isFile();
     } catch {
-      return;
+      // A staged target has no on-disk inode yet; the overlay IS its
+      // content, so it is by definition a regular file. Anything else
+      // that fails to stat is unresolvable — skip quietly rather than
+      // reporting a second diagnostic for one missing link.
+      if (!isStaged) return;
+      isFile = true;
     }
 
     if (fragment.length === 0) {
       // File exists, no anchor to check.
       return;
     }
-    if (!stat.isFile()) {
+    if (!isFile) {
       // Fragment against a directory — cannot resolve to a heading.
       findings.push({
         file: reportPath,
@@ -178,7 +214,7 @@ export function checkLinksFile(
     // verify — a link into a JSON or PNG with an anchor is a shape a
     // reviewer would need to explain, not our concern here.
     if (!/\.(md|mdx)$/i.test(targetAbsolute)) return;
-    const slugs = slugsFor(targetAbsolute, cache);
+    const slugs = slugsFor(targetAbsolute, cache, staged);
     if (!slugs.has(fragment)) {
       findings.push({
         file: reportPath,

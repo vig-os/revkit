@@ -370,7 +370,19 @@ const threadOrphanedPayload = {
  * in a page but does not have a page of its own. `paths` carries
  * every co-published file in the same publish batch so a live-
  * update listener can refresh a page whose plot data changed
- * without listing the plot document as the primary path. */
+ * without listing the plot document as the primary path.
+ *
+ * `generation` is the BATCH boundary: a SHA-256 over the ordered
+ * `(path, revision)` pairs of every file in the publish request that
+ * produced this event. Every `doc.published` in one batch carries
+ * the SAME generation, so a reader that reconnects mid-batch (or
+ * receives frames out of order across an SSE gap) can tell which
+ * events belong to one atomic publish and never mix revisions from
+ * two batches. Required — an event without it cannot be attributed
+ * to a batch. The `build.*` kinds reuse the same field for the same
+ * reason: a build is scheduled for ONE generation, and its terminal
+ * event names that generation so a newer publish's refusal is not
+ * cleared by an older build's success. */
 const docPublishedPayload = {
   kind: z.literal("doc.published"),
   path: z.string().min(1).max(4096),
@@ -382,6 +394,12 @@ const docPublishedPayload = {
     ),
   route: z.string().min(1).max(4096).optional(),
   paths: z.array(z.string().min(1).max(4096)).min(1).max(64).optional(),
+  generation: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "doc.published.generation must be a lowercase 64-char SHA-256 hex string (see generationOf).",
+    ),
 } as const;
 
 /** Submitted-review event options: COMMENT / APPROVE / REQUEST_CHANGES.
@@ -503,6 +521,49 @@ const commentSyncCancelledPayload = {
   requestedAtSeq: z.number().int().positive(),
 } as const;
 
+/** Shared envelope for the four `build.*` kinds (M2 item 9, story
+ * A4). `generation` names the publish generation the build was
+ * scheduled FOR, so a terminal `build.succeeded` clears exactly the
+ * refusals recorded by that generation and a LATER publish's
+ * refusal survives. `routes` lists the site routes the build is
+ * expected to refresh (empty for a data-only publish, which has no
+ * route of its own but still needs the rebuild for the plots and
+ * vocabulary that embed it).
+ *
+ * These are DURABLE log events, not transient bus frames: the daemon
+ * appends them through the store, so each carries a real positive
+ * `seq` from the envelope, an SSE client that reconnects with
+ * `Last-Event-ID` replays them, and a daemon restart can reconcile a
+ * build that was in flight when it died. Never mint a seq-0
+ * pseudo-event for these — a seq-0 frame breaks the monotonic resume
+ * contract the rail and the agent channel both rely on. */
+const buildEnvelope = {
+  generation: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "build.*.generation must be a lowercase 64-char SHA-256 hex string (see generationOf).",
+    ),
+  routes: z.array(z.string().min(1).max(4096)).max(64),
+} as const;
+const buildRequestedPayload = {
+  kind: z.literal("build.requested"),
+  ...buildEnvelope,
+} as const;
+const buildStartedPayload = {
+  kind: z.literal("build.started"),
+  ...buildEnvelope,
+} as const;
+const buildSucceededPayload = {
+  kind: z.literal("build.succeeded"),
+  ...buildEnvelope,
+} as const;
+const buildFailedPayload = {
+  kind: z.literal("build.failed"),
+  ...buildEnvelope,
+  error: z.string().min(1).max(8192),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
@@ -565,6 +626,10 @@ const eventVariants = [
   z.object({ ...envelope, ...commentSyncRequestedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncFailedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncCancelledPayload }).strict(),
+  z.object({ ...envelope, ...buildRequestedPayload }).strict(),
+  z.object({ ...envelope, ...buildStartedPayload }).strict(),
+  z.object({ ...envelope, ...buildSucceededPayload }).strict(),
+  z.object({ ...envelope, ...buildFailedPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -605,6 +670,10 @@ export const reviewEventKinds = [
   "comment.sync_requested",
   "comment.sync_failed",
   "comment.sync_cancelled",
+  "build.requested",
+  "build.started",
+  "build.succeeded",
+  "build.failed",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

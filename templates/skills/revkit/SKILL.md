@@ -38,7 +38,7 @@ undocumented sneaks past.
 
 | Tool | Purpose | Required args |
 |---|---|---|
-| `publish` | Write / update `.md` docs and their data side files. The daemon validates with `revkit check`, re-renders the page live (under 1 s, no full build) and re-anchors existing comments. | `docs?: [{ path, content }]`, `data?: [{ path, content }]` |
+| `publish` | Write / update `.md` docs and their data side files. The daemon validates the batch with `revkit check`, re-renders accepted pages live (under 1 s, no full build) and re-anchors existing comments. Sources the fast path cannot render byte-parity land anyway and schedule a full build; `rendering[]` says which is which per path. | `docs?: [{ path, content }]`, `data?: [{ path, content }]` |
 | `threads` | List review threads. Filter by `path` or `status`. Returns `{ threads, head }`. | *(none — all fields optional)* |
 | `reply` | Reply to a thread. The daemon fills the actor from the bearer token. | `thread_id`, `parent_id`, `body` |
 | `resolve` | Close a thread. Optional resolution note. | `thread_id` |
@@ -92,9 +92,38 @@ Rules the daemon enforces:
   the spec.
 - **Sizes.** 5 MiB per file, 10 MiB per batch, 16 files max.
 
-After `publish` returns `201`, the human's open page for that route
-refreshes in under a second — the daemon serves a fast-path render that
-matches a full build's `data-src` stamps and CSP shape.
+After `publish` returns `201`, check what the reviewer can actually
+see. The response is explicit per path:
+
+```jsonc
+// publish → 201
+{
+  "published":  [{ "path": "docs/adr/0042-x.md", "route": "/adr/0042-x/", "revision": "…" }],
+  "seqs":       [7],
+  "overrides":  [{ "route": "/adr/0042-x/", "dataSrcCount": 0 }],
+  "refused":    [],
+  "generation": "…",
+  "rendering":  [{ "path": "docs/adr/0042-x.md", "route": "/adr/0042-x/", "state": "fast" }],
+  "build":      { "generation": "…", "status": "fast" }
+}
+```
+
+- `rendering[].state === "fast"` — the human's open page for that
+  route already shows the new content. It refreshed in under a second
+  because the daemon serves a fast-path render that matches a full
+  build's `data-src` stamps and CSP shape. This is the CONDITIONAL
+  promise, not an unconditional one: it holds only for paths the fast
+  renderer accepts.
+- Any other `rendering[]` entry means a full build was scheduled
+  instead, and the human's page shows a banner saying so rather than
+  silently stale content. See "What DOESN'T fast-render" below.
+- `build.status === "fast"` only when EVERY path in the batch
+  rendered. `pending` / `running` means a build is outstanding.
+
+If `rendering[]` contains something other than `state: "fast"`, do NOT
+republish and do NOT poll — the daemon owns the retry, the page
+refreshes itself when the build lands, and a republish would only
+invalidate the build already in flight. Wait for the human to react.
 
 ### 2. Share the review URL
 
@@ -293,30 +322,85 @@ the reply itself.
 
 ## What DOESN'T fast-render
 
+The sub-second refresh is CONDITIONAL. Whenever the fast renderer
+cannot reproduce a full build byte-for-byte, the source still lands on
+disk and a full build is scheduled — the reviewer sees a banner over
+the previous page instead of silently stale content, and the page
+refreshes itself when the build lands (typically 3–5 s). Nothing
+requires a manual `bun run build`, and nothing requires you to retry.
+
+Read `rendering[]` in the response: `state: "fast"` means served now,
+anything else names the reason a build was scheduled instead.
+
+`refused[]` mirrors one subset of those reasons with the renderer's own
+tag in `reason`:
+
+| `refused[].reason` | What it means | What to do |
+|---|---|---|
+| `code-fence` | Source has one or more ` ``` ` fenced blocks. Starlight's expressive-code frame is not in the shared pipeline yet. | Nothing. The daemon schedules a build; the page refreshes when it lands. |
+| `indented-code` | Source has a 4-space-indented code block. Same reason as above. | Nothing. (Converting it to a fenced block is also fine, and still schedules a build.) |
+| `starlight-directive` | Source has a `:::note` / `:::tip` / `:::caution` / `:::danger` aside. | Nothing. The daemon schedules a build. |
+
+The full `rendering[]` vocabulary, so you can tell "no build needed"
+from "build scheduled":
+
+| `rendering[]` entry | Meaning | What to do |
+|---|---|---|
+| `{ state: "fast" }` | Fast-rendered and spliced into the existing page. Visible now. | Nothing. |
+| `{ reason: "fast-path-refused" }` | One of the three reasons above (`detail` carries the tag). | Nothing. |
+| `{ reason: "render-failed" }` | `revkit check` approved the source, then the fast renderer threw. The source is on disk and will build. | Nothing, unless it recurs across unrelated sources — that is a daemon bug worth reporting. |
+| `{ reason: "shell-missing" }` | The route has no previously built page (brand-new document, or a consumer that never ran a build), so there was no page to splice into. | Nothing. The scheduled build creates the page. |
+| `{ reason: "data-only" }` | The path has no page of its own (`plots/<name>/spec.vl.json`, a sibling data file, `vocab/terms.yaml`). | Nothing. The plots and pages that embed it are build-time products, so a build is still scheduled. |
+
+Every one of these is a TYPED state in the response, not silence. If a
+path is missing from `rendering[]` entirely, that is a bug — report it.
+
+### Build lifecycle events
+
+The daemon coalesces a burst of publishes into ONE build and records it
+as durable events on the review log:
+
+| Event | When |
+|---|---|
+| `build.requested` | A batch scheduled a build (re-announced after a daemon restart that found one outstanding). |
+| `build.started` | The build began. |
+| `build.succeeded` | It finished; dist is fresh and the banners are gone. |
+| `build.failed` | It errored; the banner switches to the build's diagnostic tail. |
+
+They are ordinary log events with real sequence numbers, so they replay
+across an SSE reconnect and survive a daemon restart. The rail reloads
+the page on BOTH `build.succeeded` and `build.failed` — on failure the
+reload is what swaps the "a build is running" banner for the error, so
+a reviewer is never left watching a spinner for a build that already
+died. You can see the same events on the event log if you want to
+confirm a build landed before asking the human to look.
+
+A `build.failed` is worth reading: it usually means the SOURCE is
+broken in a way `revkit check` does not catch (a component that throws
+at render time, a plot that cannot compile). Fix the source and
+republish; the failed build is not retried in a loop.
+
+### Other paths
+
 - **MDX (`site/src/content/docs/*.mdx`)**. `publish` refuses MDX
   paths at the confinement gate (`400 confinement`) — the write
-  never lands, no build runs. To update MDX in v1, edit the file
-  outside `publish` and run `astro build` yourself.
-- **Fenced code blocks and Starlight asides (`:::note`, …)**. The
-  file is written and `doc.published` fans out, but the daemon
-  keeps serving the previous full build's HTML for that route
-  until you rerun `astro build` — the fast path refuses to render
-  a mismatch against Starlight's expressive-code frame. `publish`
-  is still safe to call; it just isn't sub-second visible.
-- **Plot spec / data files**. Writes to `plots/<name>/…` land on
-  disk and `doc.published` fans out with the batch's paths, but
-  the plot's own SVG is rendered at `astro build` time (Vega-Lite
-  → SVG); the referencing doc's page shows the old plot until
-  the next full build.
-
-None of the above triggers an automatic build. When the human wants
-to see stale content refresh, they rerun `bun run build` in
-`site/`; the daemon serves the new dist as soon as it lands.
+  never lands and no build is scheduled. To update MDX in v1, edit
+  the file outside `publish` and run `revkit build` yourself.
+- **Plot spec / data files** (`plots/<name>/…`). Writes land on disk
+  and `doc.published` fans out, but the plot's own SVG is produced at
+  build time. That is exactly the `data-only` state above: a build is
+  scheduled and the pages embedding the plot refresh when it lands.
+- **The vocabulary** (`vocab/terms.yaml`). Same `data-only` handling,
+  plus one thing worth knowing: a batch is checked as ONE snapshot, so
+  you can add a term to the vocabulary AND use `<Term id="…"/>` in a
+  document in the SAME publish call. You do not have to publish the
+  vocabulary in a separate, earlier call.
 
 The skill's channel notifications carry a `path` and a `revision`;
 if `revision` differs from the source's current revision on disk,
-the human is looking at a stale render — call `publish` again with
-the current source to refresh.
+the human is looking at a stale render. Check `rendering[]` from your
+last publish before assuming a fix is needed — if it scheduled a build,
+the page will refresh on its own.
 
 ## `mode` and `presence`
 
@@ -354,13 +438,32 @@ waking the agent mid-turn.
 
 - **`publish` returns `422 check-failed`** — `revkit check` refused the
   batch. The response body carries `diagnostics: [...]` naming the file
-  - rule + message. Fix the source and republish; the daemon rolled back
-  the on-disk write, so a retry is safe.
+  - rule + message. Fix the source and republish; nothing was committed
+  to disk (the batch is staged and checked before any rename), so a
+  retry is safe.
 - **`publish` returns `400 confinement`** — path is outside the
   publishable roots or malformed (traversal, symlink, dot-prefixed
-  segment, wrong extension). Rename or move the file.
+  segment, wrong extension). Rename or move the file. The daemon also
+  re-checks confinement after the check runs, so a path that was
+  swapped for a symlink mid-request is refused the same way — that
+  rejection means "the tree moved under the request", not "your path is
+  wrong", and it is safe to retry once the tree is stable.
 - **`publish` returns `413 too-large`** — a single file exceeded 5 MiB
   or the batch exceeded 10 MiB. Split the batch or shrink the file.
+- **`publish` returns `201` with a `warning` field** — the sources
+  landed and a build was scheduled, but the `doc.published` append to
+  the durable log was rejected. The page will still refresh when the
+  build lands, and the rail learns about the batch from the build's own
+  events. A daemon restart reconciles it. Not an error to retry, but do
+  not treat it as a normal response either.
+- **`publish` returns `201` and `rendering[]` names a reason** — the
+  fast path did not serve that path; a build is scheduled. See "What
+  DOESN'T fast-render". Do not retry.
+- **`build.failed` appears on the event log** — the scheduled build
+  errored. The affected pages show the build's diagnostic tail in a
+  banner. Read the `error` field: it is usually a source problem check
+  does not catch. Fix the source and republish; the build is not
+  retried in a loop, so the page will not fix itself.
 - **`await_answer` returns `{ status: "pending" }`** — normal; call
   again. Answer latency for a live poll is under 1 s, but a user who is
   away may take longer than the tool deadline (8 s).

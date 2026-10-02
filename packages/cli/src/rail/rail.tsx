@@ -647,6 +647,22 @@ function subscribeEvents(
             window.location.reload();
           }
         }
+        // M2 item 9, story A4: a scheduled full build finished —
+        // either way. On `build.succeeded` the daemon has fresh dist
+        // HTML for every route, so a page that was showing the
+        // "rendering..." banner reloads and swaps it out. On
+        // `build.failed` the page must ALSO reload, because the
+        // banner's content changes from "a build is running" to the
+        // build's error tail. Reloading only on success left the
+        // reviewer staring at a spinner for a build that had already
+        // died — the one state the banner could not self-correct.
+        // Reload unconditionally: the server-side derive-from-files
+        // logic serves dist untouched when source and dist agree,
+        // so an up-to-date page pays a no-op reload at worst.
+        if (event.kind === "build.succeeded" || event.kind === "build.failed") {
+          saveReplyDraftsToSessionStorage();
+          window.location.reload();
+        }
         // M2 item 6: any event that could change the batch count
         // re-fetches the mode. A `comment.created` / `comment.replied`
         // adds to the pending set under `handover`; a `handover`

@@ -80,36 +80,51 @@ export function isRenderablePath(path: string): boolean {
 
 /** Markdown source features the fast path CANNOT match against
  * the full build's Starlight-driven output. The daemon refuses
- * to fast-render these — dist keeps serving the old HTML until
- * the background full build lands the update. Kept as a single
- * source-content predicate so both the render side (short-
- * circuits before invoking the shared processor) and the
- * equivalence test (asserts the refusal contract) look at the
- * same rules.
+ * to fast-render these — dist keeps serving the old HTML with a
+ * visible "rendering..." banner until the background full build
+ * lands the update (PR-56 round 3). Kept as a single source-
+ * content predicate so both the render side (short-circuits
+ * before invoking the shared processor) and the equivalence test
+ * (asserts the refusal contract) look at the same rules.
  *
  * Refused features:
- *   1. **Fenced code blocks** (```…``` or ~~~…~~~). The full
- *      build wraps every code block in Starlight's expressive-
- *      code frame (`<div class="expressive-code">…</div>` with
- *      themed shiki output and copy-button chrome). The fast
- *      path renders a plain `<pre>` and therefore diverges on
- *      HTML byte parity. Adding expressive-code to the shared
- *      chain is tracked as follow-up work — it wants Starlight's
- *      full theme + i18n preprocessor to match byte-for-byte.
- *   2. **Starlight directives / asides** (`:::note`, `:::tip`,
+ *   1. **Fenced code blocks** (```…``` or ~~~…~~~). Starlight's
+ *      expressive-code wraps every code block in a themed
+ *      `<div class="expressive-code">` frame; the fast path
+ *      renders a plain `<pre>`.
+ *   2. **Indented code blocks** (four or more leading spaces on
+ *      a paragraph line, per CommonMark's "code block by
+ *      indentation"). Starlight's expressive-code wraps these
+ *      too, so byte parity fails just like a fenced block.
+ *      (PR-56 round 3 nit: previously accepted, would render
+ *      divergent HTML.)
+ *   3. **Starlight directives / asides** (`:::note`, `:::tip`,
  *      `:::caution`, `:::danger`). Starlight compiles these
- *      through `remark-directive` + a custom transformer;
- *      dropping either from the shared chain lets the fast path
- *      emit `<span class="…">` where the full build emits an
- *      `<aside>` with a translated title. Refused to keep the
- *      "same HTML or refuse" contract crisp.
+ *      through `remark-directive` + a custom transformer.
  *
  * On a refusal, `renderDocFragment` returns `{ refused: true,
- * reason }` and the daemon skips the fast-path override — the
- * on-disk dist serves the previous full build's HTML. */
+ * reason }` and the daemon skips the fast-path override,
+ * splices a banner into the dist HTML, and kicks off a
+ * background astro build (see `serve/daemon.ts::tryServeFreshForRoute`). */
+/** Why the fast path refused a source. One tag per refused feature,
+ * carried unchanged onto the `refused[]` publish outcome, into the
+ * build item's `detail`, and into the daemon's banner copy — so an
+ * agent reading the response and a reviewer reading the page are
+ * told the same thing. */
+export type FastPathRefusalReason = "code-fence" | "starlight-directive" | "indented-code";
+
+/** The three tags, as a runtime set. Callers that accept the reason
+ * from an untyped source (the persisted build-state file) validate
+ * against this rather than casting. */
+export const fastPathRefusalReasons: readonly FastPathRefusalReason[] = Object.freeze([
+  "code-fence",
+  "starlight-directive",
+  "indented-code",
+]);
+
 export interface FastPathRefusal {
   readonly refused: true;
-  readonly reason: "code-fence" | "starlight-directive";
+  readonly reason: FastPathRefusalReason;
 }
 
 /** Detect whether the fast path can render `source` byte-parity
@@ -119,10 +134,7 @@ export interface FastPathRefusal {
 export function fastPathRefusalFor(source: string): FastPathRefusal | undefined {
   // Fenced code blocks — three or more backticks or tildes at
   // the start of a line, treated as an opening fence per the
-  // CommonMark spec. Indentation up to three spaces is still a
-  // fence; four or more is a code block by indentation (which
-  // Astro's default shiki handles the same as expressive-code
-  // would — so no divergence — and does NOT trigger a refusal).
+  // CommonMark spec.
   const fenceLine = /^ {0,3}(?:```+|~~~+)/m;
   if (fenceLine.test(source)) return { refused: true, reason: "code-fence" };
   // Starlight asides: `:::note`, `:::tip`, `:::caution`,
@@ -130,6 +142,18 @@ export function fastPathRefusalFor(source: string): FastPathRefusal | undefined 
   // is remark-directive's block-container prefix.
   const asideLine = /^ {0,3}::: ?(?:note|tip|caution|danger)\b/m;
   if (asideLine.test(source)) return { refused: true, reason: "starlight-directive" };
+  // Indented code blocks. CommonMark opens one on a line with four
+  // or more leading spaces that is not a list-item continuation.
+  // Telling a real continuation apart needs a mini-parser, so the
+  // test stays conservative and counts any 4-space-indented line
+  // that follows a BLANK line — a blank line means the next
+  // indented line starts a block rather than continuing a list.
+  // Line 1 counts too. A false positive at worst refuses a document
+  // the full build would have rendered as prose, which costs a
+  // banner and a build instead of a byte mismatch.
+  const indentedCodeBlock = /(?:^|\n)\n {4,}\S/;
+  if (indentedCodeBlock.test(source)) return { refused: true, reason: "indented-code" };
+  if (/^ {4,}\S/.test(source)) return { refused: true, reason: "indented-code" };
   return undefined;
 }
 

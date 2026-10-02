@@ -181,6 +181,7 @@ describe("validateNext — doc.published (M2 item 9)", () => {
       path: anchor.path,
       revision: "d".repeat(64),
       route: "/adr/0006-comments-anchoring-event-log/",
+      generation: "e".repeat(64),
     });
     expect(result.ok).toBe(true);
     expect(state.threads.get("th-1")?.status).toBe(preStatus);
@@ -195,6 +196,7 @@ describe("validateNext — doc.published (M2 item 9)", () => {
       kind: "doc.published",
       path: "plots/curve/data.json",
       revision: "d".repeat(64),
+      generation: "e".repeat(64),
     });
     expect(result.ok).toBe(true);
   });
