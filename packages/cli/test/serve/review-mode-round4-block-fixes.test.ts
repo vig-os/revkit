@@ -84,6 +84,7 @@ async function startCtx(overrides?: {
   rejectOperation?: string;
   delayAfterAcceptOnce?: {
     operation: string;
+    occurrence?: number;
     onAccepted: () => void;
     wait: Promise<void>;
   };
@@ -113,6 +114,7 @@ async function startCtx(overrides?: {
   );
   let injected = false;
   let operationCount = 0;
+  let delayedOperationCount = 0;
   const wrappedFetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const body = typeof init?.body === "string" ? init.body : "";
     if (overrides?.rejectOperation !== undefined && body.includes(overrides.rejectOperation)) {
@@ -131,7 +133,15 @@ async function startCtx(overrides?: {
       await fakeFetch(input, init);
       throw new Error("injected-response-lost");
     }
-    if (!injected && overrides?.delayAfterAcceptOnce !== undefined && body.includes(`mutation ${overrides.delayAfterAcceptOnce.operation}`)) {
+    if (overrides?.delayAfterAcceptOnce !== undefined && body.includes(`mutation ${overrides.delayAfterAcceptOnce.operation}`)) {
+      delayedOperationCount++;
+    }
+    if (
+      !injected &&
+      overrides?.delayAfterAcceptOnce !== undefined &&
+      delayedOperationCount === (overrides.delayAfterAcceptOnce.occurrence ?? 1) &&
+      body.includes(`mutation ${overrides.delayAfterAcceptOnce.operation}`)
+    ) {
       injected = true;
       const response = await fakeFetch(input, init);
       overrides.delayAfterAcceptOnce.onAccepted();
@@ -558,6 +568,62 @@ describe("B1 — deleted-on-github recovery: strands revert to pending-sync + Re
     expect(ctx.fake.drafts).toHaveLength(0);
     expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
   });
+
+  for (const ordering of ["repost-first", "discard-first"] as const) {
+    test(`${ordering}: queued Re-post and Discard leave no publishable draft`, async () => {
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      let accepted!: () => void;
+      const acceptedPromise = new Promise<void>((resolve) => { accepted = resolve; });
+      const ctx = await startCtx({
+        delayAfterAcceptOnce: {
+          operation: ordering === "repost-first" ? "AddThread" : "DeleteComment",
+          ...(ordering === "repost-first" ? { occurrence: 2 } : {}),
+          onAccepted: accepted,
+          wait,
+        },
+      });
+      await postComment(ctx, "race discard", `race-${ordering}`);
+      await deletePendingAndHeal(ctx);
+
+      if (ordering === "repost-first") {
+        const repost = fetch(`${ctx.handle.url}/api/review/reconcile`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+          body: "{}",
+        });
+        await acceptedPromise;
+        const discard = declineRecovery(ctx);
+        await Promise.resolve();
+        release();
+        expect((await repost).status).toBe(201);
+        expect((await discard).status).toBe(201);
+      } else {
+        const initialRepost = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+          body: "{}",
+        });
+        expect(initialRepost.status).toBe(201);
+        const discard = declineRecovery(ctx);
+        await acceptedPromise;
+        const repost = fetch(`${ctx.handle.url}/api/review/reconcile`, {
+          method: "POST",
+          headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+          body: "{}",
+        });
+        await Promise.resolve();
+        release();
+        expect((await discard).status).toBe(201);
+        expect((await repost).status).toBe(201);
+      }
+
+      expect(ctx.fake.drafts).toHaveLength(0);
+      expect(ctx.fake.reviewNodeId).toBeNull();
+      expect(ctx.fake.submits).toHaveLength(0);
+      expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
+    });
+  }
 });
 
 // ────────────────────────────────────────────────────────────────
@@ -866,10 +932,12 @@ describe("B4 — durable reply and resolve intents", () => {
 
       const first = mutate(scenario.first);
       await acceptedPromise;
-      const second = await mutate(scenario.second);
-      expect(second.status).toBe(201);
+      const second = mutate(scenario.second);
+      await Promise.resolve();
       release();
-      expect((await first).status).toBe(201);
+      const [firstResponse, secondResponse] = await Promise.all([first, second]);
+      expect(firstResponse.status).toBe(201);
+      expect(secondResponse.status).toBe(201);
 
       ctx = await restartCtx(ctx);
       await Bun.sleep(50);

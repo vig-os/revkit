@@ -48,7 +48,12 @@ import type { ReviewEvent } from "./events.ts";
  * the state back to `pending-sync`. */
 export type CommentSyncState =
   | { readonly kind: "not-attempted" }
-  | { readonly kind: "pending-sync"; readonly requestedAtSeq: number; readonly fingerprint: SyncFingerprint }
+  | {
+      readonly kind: "pending-sync";
+      readonly requestedAtSeq: number;
+      readonly fingerprint: SyncFingerprint;
+      readonly recoveryReviewNodeId?: string;
+    }
   | {
       readonly kind: "synced";
       readonly requestedAtSeq: number;
@@ -57,6 +62,7 @@ export type CommentSyncState =
       readonly pendingCommentDatabaseId: number;
       readonly pendingCommentNodeId?: string;
       readonly fingerprint?: SyncFingerprint;
+      readonly recoveryReviewNodeId?: string;
     }
   | {
       readonly kind: "failed";
@@ -68,11 +74,13 @@ export type CommentSyncState =
        * GitHub. Absent only when a failed event lands with no
        * preceding sync_requested (defensive path). */
       readonly fingerprint?: SyncFingerprint;
+      readonly recoveryReviewNodeId?: string;
     }
   | {
       readonly kind: "cancelled";
       readonly requestedAtSeq: number;
       readonly cancelledAtSeq: number;
+      readonly recoveryReviewNodeId?: string;
     };
 
 /** Data the reconciler needs to fingerprint a pending draft on
@@ -251,7 +259,10 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
                     bodyHash: "",
                   },
                 }),
+                recoveryReviewNodeId: event.reviewNodeId,
               });
+            } else if (st.kind === "pending-sync" || st.kind === "failed") {
+              syncState.set(cid, { ...st, recoveryReviewNodeId: event.reviewNodeId });
             }
           }
         }
@@ -280,6 +291,9 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
               ...(gh.nodeId !== undefined ? { pendingCommentNodeId: gh.nodeId } : {}),
               ...(prev !== undefined && (prev.kind === "pending-sync" || prev.kind === "failed") && prev.fingerprint !== undefined
                 ? { fingerprint: prev.fingerprint }
+                : {}),
+              ...(prev !== undefined && "recoveryReviewNodeId" in prev && prev.recoveryReviewNodeId !== undefined
+                ? { recoveryReviewNodeId: prev.recoveryReviewNodeId }
                 : {}),
             });
             let path = commentPath.get(event.commentId);
@@ -347,6 +361,9 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
           failedAtSeq: event.seq,
           reason: event.reason,
           ...(preservedFingerprint !== undefined ? { fingerprint: preservedFingerprint } : {}),
+          ...(prev !== undefined && "recoveryReviewNodeId" in prev && prev.recoveryReviewNodeId !== undefined
+            ? { recoveryReviewNodeId: prev.recoveryReviewNodeId }
+            : {}),
         });
         break;
       }
@@ -361,6 +378,7 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
             kind: "cancelled",
             requestedAtSeq: event.requestedAtSeq,
             cancelledAtSeq: event.seq,
+            ...(prev.recoveryReviewNodeId !== undefined ? { recoveryReviewNodeId: prev.recoveryReviewNodeId } : {}),
           });
         }
         break;
@@ -388,7 +406,7 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
       ? {
           reviewNodeId: pickedId,
           headSha: picked.headSha,
-          comments: picked.comments.slice(),
+          comments: picked.comments.filter((comment) => syncState.get(comment.commentId)?.kind !== "cancelled"),
         }
       : null;
 
