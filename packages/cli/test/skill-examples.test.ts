@@ -19,12 +19,15 @@
 // test would have caught it before the SKILL shipped.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type { ZodSchema } from "zod";
 import { publishBuildReasons } from "../src/serve/publish-build.ts";
 import { MAX_FILES_PER_PUBLISH, PUBLISH_ARRAY_SHAPE_MAX } from "../src/serve/publish.ts";
+import { resolvePublishTarget } from "../src/serve/publish-confine.ts";
 import { fastPathRefusalReasons } from "../src/serve/publish-render.ts";
 import { reviewEventKinds } from "@revkit/review-core";
 import {
@@ -263,28 +266,106 @@ describe("SKILL.md tool-call examples validate against zod schemas", () => {
     expect(publishSource).not.toMatch(/kind: "confinement",\s*\n\s*reason: `publish: batch has/);
   });
 
-  test("the SKILL's publishable-path list matches the real allowlist", () => {
-    // The SKILL previously enumerated filenames
-    // (`{spec.vl.json,data.json,data.csv,data.tsv}`) where the code
-    // accepts ANY `.json`/`.csv`/`.tsv` under `plots/`, and said
-    // nothing about the uppercase-extension refusal. Assert both
-    // directions against the code's own allowlist.
-    const confineSource = readFileSync(resolve(__dirname, "../src/serve/publish-confine.ts"), "utf8");
-    for (const prefix of ["docs/adr/", "docs/designs/", "docs/FEATURE-MATRIX.md", "plots/", "vocab/terms.yaml"]) {
-      expect(confineSource).toContain(`prefix: "${prefix}"`);
-      expect(md).toContain(prefix);
+  test("the SKILL's publishable-path list matches the REAL resolver, path by path", () => {
+    // The previous version of this test grepped `publish-confine.ts`
+    // for substrings, which cannot tell ACCEPTED from REFUSED and so
+    // happily passed a SKILL table that contradicted itself: the prose
+    // claimed `docs/adr/README.md` was refused while the table claimed
+    // every `docs/adr/*.md` was accepted (it is accepted), and the
+    // plots row implied two required segments plus unlimited nesting
+    // (it is one-or-more, and nesting is bounded by which parent
+    // directories already exist).
+    //
+    // So: drive `resolvePublishTarget` itself. Every row below is the
+    // resolver's verdict on a real repo shape, and the SKILL's table
+    // must name a shape on the correct side of each one.
+    const root = mkdtempSync(join(tmpdir(), "revkit-skill-paths-"));
+    try {
+      mkdirSync(join(root, "docs", "adr"), { recursive: true });
+      mkdirSync(join(root, "docs", "designs"), { recursive: true });
+      mkdirSync(join(root, "plots", "series"), { recursive: true });
+      mkdirSync(join(root, "plots", "series", "nested"), { recursive: true });
+      mkdirSync(join(root, "vocab"), { recursive: true });
+      writeFileSync(join(root, "docs", "adr", "README.md"), "# readme\n", "utf8");
+
+      const accepted = [
+        // The SKILL table's five accepted shapes, one concrete path each.
+        "docs/adr/0001-example.md",
+        "docs/designs/DESIGN-0001-example.md",
+        "docs/FEATURE-MATRIX.md",
+        "plots/series/spec.vl.json",
+        "vocab/terms.yaml",
+        // The cases the table used to get WRONG, all of which are
+        // accepted — the table and prose must not contradict these.
+        "docs/adr/README.md",
+        "plots/spec.json",
+        "plots/series/data.csv",
+        "plots/series/data.tsv",
+        "plots/series/anything.json",
+        "plots/series/nested/deep.json",
+      ] as const;
+      const refused = [
+        // Wrong extension.
+        "docs/adr/note.txt",
+        // UPPERCASE extension.
+        "docs/adr/UPPER.MD",
+        // Missing the trailing slash, so the prefix does not match.
+        "docs/adr.md",
+        // Parent directory does not exist — the daemon does not mkdir.
+        "docs/adr/deep/new.md",
+        // Exact-file root: only `terms.yaml`, not its siblings.
+        "vocab/other.yaml",
+        // MDX is deliberately outside the allowlist in M2.
+        "site/src/content/docs/x.mdx",
+        // Outside every publishable root.
+        "README.md",
+      ] as const;
+
+      for (const path of accepted) {
+        const verdict = resolvePublishTarget(root, path);
+        expect(verdict.ok, `resolver rejected ${path}, but the SKILL table presents it as accepted`).toBe(true);
+      }
+      for (const path of refused) {
+        const verdict = resolvePublishTarget(root, path);
+        expect(verdict.ok, `resolver ACCEPTED ${path}, which the SKILL must list as refused`).toBe(false);
+      }
+
+      // Now the SKILL's own text. Each claim reports WHICH one failed,
+      // because `toMatch` against the whole document otherwise prints
+      // 19 KB of markdown and names nothing.
+      const claims: readonly [string, boolean][] = [
+        // 1) `docs/adr/` siblings are ACCEPTED — the table says so and
+        //    the prose must not contradict it.
+        [
+          "SKILL does not list docs/adr/README.md as refused",
+          !/including\s*\n?\s*`docs\/adr\/README\.md`/.test(md),
+        ],
+        [
+          "SKILL's docs/adr row is a shape, not a filename enumeration",
+          /`docs\/adr\/<[a-z]+>\.md`/.test(md),
+        ],
+        [
+          "SKILL's docs/adr row says every .md under it is accepted",
+          /EVERY `\.md` directly under it/.test(md),
+        ],
+        // 2) The plots row is one-or-more segments, not exactly two.
+        [
+          "SKILL's plots row does not imply exactly two path segments",
+          !/plots\/<any>\/<any>/.test(md),
+        ],
+        ["SKILL's plots row names the plots/<name>/ shape", /`plots\/<name>\//.test(md)],
+        [
+          "SKILL says plots nesting is bounded by existing parent directories",
+          /parent directories must (?:already )?exist|every directory\s*\n?between/i.test(md),
+        ],
+        // 3) The lowercase-extension rule is stated.
+        ["SKILL states the LOWERCASE extension rule", /LOWERCASE/.test(md)],
+      ];
+      const broken = claims.filter(([, ok]) => !ok).map(([label]) => label);
+      expect(broken, `SKILL.md path-list claims that are not true:\n  - ${broken.join("\n  - ")}`).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
-    // Every allowed plot extension is named in the SKILL.
-    for (const ext of [".json", ".csv", ".tsv"]) {
-      expect(confineSource).toContain(`"${ext}"`);
-      expect(md).toContain(ext);
-    }
-    // The lowercase-extension rule is documented, because `foo.MD`
-    // would land at a second collection id.
-    expect(confineSource).toMatch(/ext !== ext\.toLowerCase\(\)/);
-    expect(md).toMatch(/LOWERCASE/i);
-    // MDX stays refused, and the SKILL says so.
-    expect(md).toMatch(/site\/src\/content\/docs\/\*\.mdx/);
   });
 
   test("the SKILL tells the agent its build can FAIL and how it learns that", () => {

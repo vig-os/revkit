@@ -76,24 +76,37 @@ editing in memory, and sending the whole new body.
 Rules the daemon enforces:
 
 - **Confined write paths.** The allowlist is a PREFIX + EXTENSION
-  rule, not an enumeration of filenames. A publish is accepted when:
+  rule, not an enumeration of filenames:
 
   | Accepted | Rule |
   |---|---|
-  | `docs/adr/<anything>.md` | prefix `docs/adr/`, extension `.md` |
-  | `docs/designs/<anything>.md` | prefix `docs/designs/`, extension `.md` |
+  | `docs/adr/<name>.md` | prefix `docs/adr/`, extension `.md`. EVERY `.md` directly under it — `docs/adr/README.md` included. |
+  | `docs/designs/<name>.md` | prefix `docs/designs/`, extension `.md` |
   | `docs/FEATURE-MATRIX.md` | that exact path, no children |
-  | `plots/<any>/<any>/<anything>.{json,csv,tsv}` | prefix `plots/`, extension `.json` / `.csv` / `.tsv` — so `data.csv` and `data.tsv` work, and so does a second data file beside the spec. The plot STRUCTURE is what `revkit check` polices, not the filename. |
+  | `plots/<name>/<file>.{json,csv,tsv}` | prefix `plots/`, extension `.json` / `.csv` / `.tsv` |
   | `vocab/terms.yaml` | that exact path, no children |
 
-  Anything else is refused with `confinement` — including
-  `docs/adr/README.md` siblings you might expect, `docs/` top-level
-  files other than the matrix, and `site/src/content/docs/*.mdx`.
-  The extension must be LOWERCASE: `foo.MD` and `foo.md` would land at
-  two different collection ids, so the uppercase shape is refused
-  rather than silently creating a second page. A brand-new file is
-  fine, but its parent directory must already exist — the daemon does
-  not create directories for you.
+  On `plots/`: **one or more** path segments after `plots/`, not
+  exactly two. `plots/series/spec.vl.json` is the conventional shape,
+  but `plots/spec.json` and `plots/series/nested/deep.json` are
+  equally accepted — the FILENAME is not policed, the plot STRUCTURE
+  is (`revkit check` reads the spec). How deep you can nest is bounded
+  only by which parent directories already exist: every directory
+  between `plots/` and the file must be there, because the daemon does
+  not create directories for you. A brand-new FILE is fine under an
+  existing directory.
+
+  Refused with `confinement`:
+
+  | Refused | Why |
+  |---|---|
+  | `docs/adr/note.txt`, `docs/adr/x.json` | extension not in the allowlist |
+  | `docs/adr/UPPER.MD` | the extension must be LOWERCASE — `foo.MD` and `foo.md` would land at two different collection ids, so the uppercase shape is refused rather than silently creating a second page |
+  | `docs/adr.md` | the prefix is `docs/adr/` WITH the trailing slash, so a sibling of the `adr/` directory is not under it |
+  | `docs/adr/deep/new.md` | `docs/adr/deep/` does not exist |
+  | `vocab/other.yaml` | `vocab/terms.yaml` is an exact-file root, not a prefix |
+  | `site/src/content/docs/*.mdx` | MDX is deliberately outside the M2 allowlist (the fast path cannot match its component JSX) |
+  | anything outside the five accepted shapes | including `docs/` top-level files other than the matrix, and the repo `README.md` |
 - **`revkit check` is the gate.** Registered components only (no
   hand-rolled `<div>` / `<span>` / inline `<script>`), one vocabulary,
   valid links + sets, structured plots. `revkit-allow: #N` is an

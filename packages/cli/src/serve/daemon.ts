@@ -1137,6 +1137,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return handleApi(request, url, method, requestId);
     }
 
+    // Event-log tip (M2 item 9, story A4). A browser subscriber needs
+    // a resume point BEFORE it can open `/events`, and this is the one
+    // route that answers "where does the log end right now" — the
+    // same `since` value `/events` accepts. It gets its own dispatcher
+    // branch rather than living inside `handleApi`: `handleApi` is
+    // reached only for `/api/threads*`, so a handler placed there for
+    // a different path is unreachable and 404s. (It did, once.)
+    if (url.pathname === "/api/events-head") {
+      return handleEventsHeadApi(request, method, requestId);
+    }
+
     // Delivery mode + handover + presence + delivered-set (M2 item 6,
     // ADR-0007). All share the /api/ auth + Origin discipline the
     // thread endpoints use.
@@ -1382,35 +1393,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (actor === undefined) {
       logger.warn("api.rejected.auth", { requestId, path: url.pathname });
       return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
-    }
-
-    // GET /api/events-head — the log's current tip, for a subscriber
-    // that wants LIVE events only.
-    //
-    // A browser subscriber (the rail) needs a resume point before it
-    // can open `/events`, and deriving that point from a business
-    // endpoint couples the SSE contract to the shape of
-    // `GET /api/threads`. This endpoint is the one thing that answers
-    // "where does the log end right now", which is precisely the
-    // `since` value `/events` accepts.
-    //
-    // Why the rail needs it (M2 item 9, PR-56 blocker): opening
-    // `/events` with no resume point replays the ENTIRE durable log,
-    // and any subscriber that RELOADS the page on a replayed event
-    // reloads forever. On a cold load the page has just fetched
-    // current server state, so replaying history tells it nothing it
-    // does not already have — it only re-fires actions. Starting at
-    // `head` makes a cold load live-only. A warm load (a reload
-    // inside the same tab) resumes from the rail's own persisted
-    // point instead, so the event that CAUSED the reload is not
-    // replayed into it.
-    //
-    // Session-authenticated, same as the rail's other reads: the rail
-    // is the only caller and it holds the session cookie.
-    if (url.pathname === "/api/events-head" && method === "GET") {
-      const originRejection = checkOrigin(request, requestId, false);
-      if (originRejection !== undefined) return originRejection;
-      return jsonResponse({ head: store.head() });
     }
 
     // GET /api/threads?path=&status=
@@ -3806,6 +3788,39 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
 
     return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+  }
+
+  /** Handle `GET /api/events-head` (M2 item 9, story A4).
+   *
+   * Returns `{ head }`, the durable log's current tip. The rail
+   * subscribes to `/events?since=<head>` on a cold load so a page that
+   * has just fetched current server state is not replayed the whole
+   * history — a replay is not merely wasteful here, it re-fires the
+   * rail's reload triggers and the page never settles (PR-56 blocker).
+   *
+   * Auth posture matches the sibling rail-facing reads: the rail
+   * holds the session cookie and is same-origin, so a session cookie
+   * plus a matching `Origin` is accepted and an agent bearer works
+   * too (the MCP subscriber uses the same `since` contract). The
+   * extra Origin check is DEFENCE IN DEPTH rather than the primary
+   * control: the cookie rides along automatically on a cross-origin
+   * browser request, and this endpoint's body is a log position with
+   * no content in it — so the realistic worst case from a leak is
+   * "how much history does this repo have", not "what is in it". It
+   * stays because the cost is one comparison and the sibling routes
+   * set the precedent.
+   */
+  function handleEventsHeadApi(request: Request, method: string, requestId: string): Response {
+    if (method !== "GET") return methodNotAllowed();
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const originRejection = checkOrigin(request, requestId, hasValidBearer);
+    if (originRejection !== undefined) return originRejection;
+    if (!hasValidBearer && !auth.hasSession(readCookie(request.headers.get("cookie"), cookieName(port)))) {
+      logger.warn("api.events-head.rejected.role", { requestId });
+      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    }
+    return jsonResponse({ head: store.head() });
   }
 
   // ── /api/publish branch (M2 item 9, story A4) ──────────────────

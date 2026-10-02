@@ -658,6 +658,7 @@ function subscribeEvents(
     readonly to?: string;
     readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   }) => void = () => {},
+  onAttached: () => void = () => {},
 ): () => void {
   let closed = false;
   let source: EventSource | undefined;
@@ -688,6 +689,14 @@ function subscribeEvents(
   };
   const attach = (): void => {
     if (closed || source === undefined) return;
+    // Close the head-probe race. A COLD tab reads `head` and then
+    // opens the stream; anything appended in between is neither in
+    // the head it read nor in the frames that follow it, so a live
+    // update can be missed entirely. One authoritative refetch after
+    // the stream is open covers that window — it is a fetch, not a
+    // navigation, so it cannot become a reload loop, and the data it
+    // returns is exactly what the daemon holds.
+    onAttached();
     source.onmessage = (message: MessageEvent<string>): void => {
       try {
         const event = JSON.parse(message.data) as RailReviewEvent;
@@ -1214,6 +1223,12 @@ function Rail(): JSX.Element {
     },
     (event) => applyPresenceEvent(event),
     (event) => applyDeliveryEvent(event),
+    // One authoritative refetch once the SSE stream is open, so an
+    // event appended between the head probe and the connection is not
+    // missed. See `subscribeEvents`.
+    () => {
+      void refetch();
+    },
   );
   onCleanup(unsubscribe);
 

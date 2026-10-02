@@ -70,7 +70,7 @@ ${MARKER}
 `;
 
 interface DaemonCtx {
-  readonly child: ChildProcess;
+  child: ChildProcess;
   readonly root: string;
   readonly url: string;
   readonly launchUrl: string;
@@ -154,6 +154,32 @@ async function bootDaemon(): Promise<DaemonCtx> {
   return { child, root, url: state.url, launchUrl, agentToken: state.agentToken, port: state.port };
 }
 
+/** Restart the daemon on the SAME port with the SAME sqlite file, so
+ * the log continues rather than restarting at seq 1 — which is the
+ * realistic "daemon died and came back" case and the one that would
+ * expose a resume point of 0. */
+async function restartDaemon(ctx: DaemonCtx): Promise<void> {
+  ctx.child.kill("SIGTERM");
+  await new Promise((r) => setTimeout(r, 700));
+  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST, "--port", String(ctx.port)], {
+    cwd: ctx.root,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+    env: process.env,
+  });
+  // Mutate the handle so `shutdown` kills the right process.
+  (ctx as { child: ChildProcess }).child = child;
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (existsSync(join(ctx.root, ".revkit", "serve.json"))) {
+      await new Promise((r) => setTimeout(r, 250));
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("restarted daemon never wrote serve.json");
+}
+
 async function shutdown(ctx: DaemonCtx): Promise<void> {
   try {
     ctx.child.kill("SIGTERM");
@@ -175,6 +201,32 @@ function countNavigations(page: import("@playwright/test").Page): { count: () =>
   return { count: () => count };
 }
 
+/** Observe every `/events` URL the page's EventSource opens.
+ *
+ * This is what makes the cold-tab resume point ASSERTABLE rather than
+ * assumed. The rejected head shipped `/api/events-head` without a
+ * dispatcher branch, so the rail's probe 404'd, `since` fell back to
+ * 0, and every cold tab replayed the whole log — a behaviour no
+ * navigation-count assertion could distinguish from "the fix works".
+ * Reading the actual URL settles it. */
+async function observeEventStreamUrls(page: import("@playwright/test").Page): Promise<string[]> {
+  await page.addInitScript(() => {
+    const w = window as unknown as {
+      __revkitEventUrls?: string[];
+      EventSource: typeof EventSource;
+    };
+    w.__revkitEventUrls = [];
+    const Native = w.EventSource;
+    w.EventSource = class extends Native {
+      constructor(url: string | URL, init?: EventSourceInit) {
+        w.__revkitEventUrls?.push(String(url));
+        super(url, init);
+      }
+    } as unknown as typeof EventSource;
+  });
+  return page.evaluate(() => (window as unknown as { __revkitEventUrls?: string[] }).__revkitEventUrls ?? []);
+}
+
 /** Budget for the settle window. One publish reloads at most once per
  * genuinely new event; a data-only / refused publish additionally
  * sees `build.requested` + `build.started` (neither of which
@@ -189,6 +241,7 @@ async function settle(
   nav: { count: () => number },
   label: string,
   settleMs = 2_500,
+  budget = SETTLE_BUDGET,
 ): Promise<void> {
   // Let the publish's events arrive and any legitimate reload happen.
   const before = nav.count();
@@ -199,12 +252,12 @@ async function settle(
   // as a leftover probe, and this measurement is the point of the
   // spec rather than a debugging aid.
   process.stdout.write(
-    `SETTLES[${label}] navigations: at-open=${before} after-settle=${afterSettle} budget=${SETTLE_BUDGET}\n`,
+    `SETTLES[${label}] navigations: at-open=${before} after-settle=${afterSettle} budget=${budget}\n`,
   );
   expect(
     afterSettle,
     `${label}: the page must reach a fixed point within the settle budget (navigations=${afterSettle}, budget=${SETTLE_BUDGET})`,
-  ).toBeLessThanOrEqual(SETTLE_BUDGET);
+  ).toBeLessThanOrEqual(budget);
 
   // Quiescence: no further navigations at all while nothing else is
   // happening. This is the assertion the old spec could not make.
@@ -293,6 +346,124 @@ test.describe("revkit publish — the page SETTLES (no reload loop)", () => {
     expect(outcome.refused?.[0]?.reason).toBe("code-fence");
 
     await settle(page, nav, "refused publish");
+  });
+
+  test("COLD TAB requests `/events?since=<head>`, not `since=0`", async ({ page }) => {
+    // The whole point of `/api/events-head`. A cold tab has just
+    // loaded current server state, so replaying the log can only
+    // re-fire actions — it must start at the tip. `since=0` here would
+    // mean the probe 404'd (as it did on the rejected head) or the
+    // head read 0, and the reload-loop risk is back.
+    await page.goto(ctx.launchUrl);
+    await page.waitForLoadState("domcontentloaded");
+    // Put durable events on the log FIRST. On a daemon with an empty
+    // log the head IS 0, and `since=0` is then correct rather than a
+    // broken probe — so a test that opens a virgin daemon cannot tell
+    // the two apart. A data-only publish appends `doc.published` plus
+    // the build lifecycle, which is what makes head > 0.
+    const seeded = await page.request.post(`${ctx.url}/api/publish`, {
+      headers: { authorization: `Bearer ${ctx.agentToken}`, "content-type": "application/json" },
+      data: { data: [{ path: PLOT_REL_PATH, content: JSON.stringify([{ x: 1, y: 2 }, { x: 2, y: 4 }]) }] },
+    });
+    expect(seeded.status(), await seeded.text()).toBe(201);
+
+    const urls = await observeEventStreamUrls(page);
+    await page.goto(`${ctx.url}${ADR_ROUTE}`);
+    await page.waitForLoadState("domcontentloaded");
+    await page.waitForTimeout(600);
+    const all = [...urls, ...(await page.evaluate(() => (window as unknown as { __revkitEventUrls?: string[] }).__revkitEventUrls ?? []))];
+    const eventsUrls = all.filter((u) => u.includes("/events"));
+    process.stdout.write(`SETTLES[cold tab] /events URLs: ${JSON.stringify(eventsUrls)}\n`);
+    expect(eventsUrls.length).toBeGreaterThan(0);
+    for (const url of eventsUrls) {
+      expect(url, "a cold tab must resume from the log head, never from 0").toMatch(/[?&]since=[1-9]\d*$/);
+      expect(url).not.toMatch(/[?&]since=0($|&)/);
+    }
+    // And the head the rail used is the daemon's real tip.
+    // `page.request` sends neither Origin nor Sec-Fetch-Site, and the
+    // daemon's Origin discipline refuses a cookie call with neither —
+    // so send Origin explicitly, exactly as the rail's own fetch does.
+    const headResp = await page.request.get(`${ctx.url}/api/events-head`, {
+      headers: { origin: ctx.url, accept: "application/json" },
+    });
+    expect(headResp.status()).toBe(200);
+    const head = (await headResp.json()) as { head: number };
+    const sinceValues = eventsUrls.map((u) => Number.parseInt(new URL(u, ctx.url).searchParams.get("since") ?? "0", 10));
+    for (const since of sinceValues) expect(since).toBeLessThanOrEqual(head.head);
+    expect(sinceValues.some((v) => v > 0)).toBe(true);
+
+    // And a genuinely new publish still refreshes the open route once.
+    const nav = countNavigations(page);
+    const before = nav.count();
+    await page.request.post(`${ctx.url}/api/publish`, {
+      headers: { authorization: `Bearer ${ctx.agentToken}`, "content-type": "application/json" },
+      data: { docs: [{ path: ADR_REL_PATH, content: FAST_BODY }] },
+    });
+    await page.waitForFunction((marker) => document.body.innerText.includes(marker), MARKER, { timeout: 5_000 });
+    expect(nav.count(), "a new publish on a cold tab must still refresh exactly once").toBe(before + 1);
+    await settle(page, nav, "cold tab");
+  });
+
+  test("RAPID publishes settle: a burst does not multiply reloads", async ({ page }) => {
+    // Five publishes back to back, each with a distinct body so the
+    // check gate cannot collapse them. The rail reloads once per
+    // genuinely new publish, but the pages it reloads AWAY from are
+    // gone by the next event, so the observable requirement is a
+    // bounded total and then silence — not "one reload each".
+    await page.goto(ctx.launchUrl);
+    await page.waitForLoadState("domcontentloaded");
+    await page.goto(`${ctx.url}${UNRELATED_ROUTE}`);
+    await page.waitForLoadState("domcontentloaded");
+    await page.waitForTimeout(300);
+    const nav = countNavigations(page);
+    for (let i = 0; i < 5; i++) {
+      const response = await page.request.post(`${ctx.url}/api/publish`, {
+        headers: { authorization: `Bearer ${ctx.agentToken}`, "content-type": "application/json" },
+        data: {
+          docs: [
+            {
+              path: ADR_REL_PATH,
+              content: FAST_BODY.replace(MARKER, `${MARKER}-BURST-${i}`),
+            },
+          ],
+        },
+      });
+      expect(response.status(), await response.text()).toBe(201);
+    }
+    // The burst coalesces into one build; a build terminal reloads
+    // once. Budget covers the handful of genuinely new events.
+    await settle(page, nav, "rapid publishes", 4_000, 8);
+  });
+
+  test("a DAEMON RESTART settles: the new daemon's log replays nothing into a loop", async ({ page }) => {
+    // The rail holds a session cookie and an EventSource. When the
+    // daemon restarts on the SAME port the stream drops and the rail
+    // reconnects with `Last-Event-ID` — the resume path that has to
+    // keep working, since a reconnect that resumed from 0 would replay
+    // the build events and reload again.
+    await page.goto(ctx.launchUrl);
+    await page.waitForLoadState("domcontentloaded");
+    await page.goto(`${ctx.url}${UNRELATED_ROUTE}`);
+    await page.waitForLoadState("domcontentloaded");
+    await page.waitForTimeout(300);
+    const nav = countNavigations(page);
+    // Produce a build so there ARE durable build events to replay.
+    await page.request.post(`${ctx.url}/api/publish`, {
+      headers: { authorization: `Bearer ${ctx.agentToken}`, "content-type": "application/json" },
+      data: { data: [{ path: PLOT_REL_PATH, content: JSON.stringify([{ x: 3, y: 4 }]) }] },
+    });
+    await page.waitForTimeout(1_500);
+    const beforeRestart = nav.count();
+    // Restart the daemon in place on the same port, keeping the same
+    // sqlite so seqs continue rather than restarting at 1.
+    await restartDaemon(ctx);
+    // Let the rail's backoff reconnect fire.
+    await page.waitForTimeout(4_000);
+    const afterReconnect = nav.count();
+    process.stdout.write(
+      `SETTLES[daemon restart] navigations: before=${beforeRestart} after-reconnect=${afterReconnect}\n`,
+    );
+    await settle(page, nav, "daemon restart", 2_500, SETTLE_BUDGET + 2);
   });
 
   test("failed build: the terminal banner appears and the page stops reloading", async ({ page }) => {

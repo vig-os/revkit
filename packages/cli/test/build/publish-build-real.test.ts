@@ -10,29 +10,38 @@
 // test in this repo (the dev shell has `site/node_modules/.bin/astro`,
 // so a private spawn appears to work here).
 //
-// This file closes that gap without the E2E lane: it boots a real
-// daemon with NO `backgroundBuildRun` override — so the coordinator
-// resolves its DEFAULT runner — publishes a data-only file, and waits
-// for the build to reach a terminal state. The assertions are about
-// WHICH primitive ran, not about the build's output:
+// ## What runs where, and why that matters
 //
-//   - the build's output names the pre-build check, the packaged site,
-//     the consumer staging directory and the post-build output gate —
-//     four steps only the shared `runBuildCommand` performs
-//   - output lands in `.revkit/dist`, the same directory
-//     `defaultConsumerDist` names and the daemon serves from
-//   - a consumer with no `site/` and no `node_modules/` builds
-//     anyway, because astro is resolved from the PACKAGED root.
+// The previous version of this file had a plot-spec fixture with no
+// `schemaVersion`, so the pre-build `revkit check` REFUSED it and the
+// build never reached `stageAstroRoot` / `spawnAstroBuild`. Every
+// packaged-path assertion sat behind `if (exitCode === 0)` and
+// silently never ran — the test "passed" in 21–48 ms having proved
+// only that check rejects a malformed spec. The fixture is fixed, and
+// the assertions are now split by what each lane can honestly prove:
 //
-// A failing build is the SUCCESS case for this test's purpose: a
-// failure still proves the real composition ran (its stderr names the
-// check), and it keeps the test off the slow astro path. Both
-// terminals are asserted explicitly.
+//   - **Fast lane (always).** The fixture is now VALID, so the build
+//     gets past the pre-build check — that alone is a real result: it
+//     means the daemon's scheduled build ran `runBuildCommand`'s step
+//     1, not some private spawn. The assertions are therefore
+//     LAYOUT-INDEPENDENT: whatever the terminal, a failure must NOT
+//     come from `revkit check`, and the output must show check ran and
+//     passed. A dev checkout's isolated linker cannot always complete
+//     the astro step, and pretending otherwise would be a worse lie
+//     than the one it replaces.
+//
+//   - **E2E lane (`REVKIT_E2E_BUILD=1`).** The packaged CLI from
+//     `nix build .#revkit`, whose dependency tree is
+//     FOD-materialised, completes the whole chain. Only there are the
+//     astro / staging / `check-dist` / output assertions made — and
+//     they are `describe.skipIf`, so a skipped reader sees plainly
+//     that they did not run.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePath } from "node:path";
+import { execSync } from "node:child_process";
 import type { RunBuildResult } from "../../src/build/cli.ts";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
 import { createPublishBuildCoordinator } from "../../src/serve/publish-build.ts";
@@ -65,6 +74,11 @@ function scaffoldConsumer(): string {
   writeFileSync(
     join(root, "plots", "series", "spec.vl.json"),
     JSON.stringify({
+      // REQUIRED by the plot-structure rule (ADR-0003). Its absence
+      // made the pre-build check refuse this fixture and stopped the
+      // build before the astro step, which is the bug this file was
+      // written to catch.
+      schemaVersion: 1,
       $schema: "https://vega.github.io/schema/vega-lite/v5.json",
       data: { url: "data.json" },
       mark: "point",
@@ -72,6 +86,14 @@ function scaffoldConsumer(): string {
     }),
   );
   writeFileSync(join(root, "plots", "series", "data.json"), JSON.stringify([{ x: 1, y: 2 }]), "utf8");
+  // A doc the packaged site can actually render, so the packaged lane
+  // has something to prove. `Consumer Marker` is the string that lane
+  // greps for in the built HTML.
+  writeFileSync(
+    join(root, "docs", "index.mdx"),
+    "---\ntitle: Consumer\ndescription: A packaged-lane consumer.\n---\n\n## Consumer Marker\n\nBody paragraph.\n",
+    "utf8",
+  );
   return root;
 }
 
@@ -108,23 +130,33 @@ describe("the shared `revkit build` composition runs against a consumer with no 
     const combined = `${result.stdout}\n${result.stderr}`;
     expect(combined).toContain("revkit build: consumer=");
     expect(combined).toContain("revkit build: dist=");
-    // The pre-build check is the first thing `runBuildCommand` does.
-    // A private astro spawn has no such step, so this line alone
-    // distinguishes the two compositions.
-    expect(combined).toMatch(/revkit build: check ok \(\d+ files\)|revkit build: 'revkit check' failed/);
+
+    // THE FAST-LANE ASSERTION. The pre-build `revkit check` is the
+    // first thing `runBuildCommand` does and a private astro spawn
+    // has no such step, so this line alone distinguishes the two
+    // compositions. It is an EQUALITY against the passing form, not a
+    // disjunction with the failing one: the fixture is valid, so a
+    // check refusal here means something regressed and must be red
+    // rather than quietly accepted.
+    expect(combined).toMatch(/revkit build: check ok \(\d+ files\)/);
+    expect(combined).not.toContain("'revkit check' failed");
+
     if (result.exitCode === 0) {
-      // A full success means every remaining step ran too.
       expect(result.stdout).toContain("revkit build: astro ok");
       expect(result.stdout).toContain("revkit build: check-dist ok");
-      // Output landed where `defaultConsumerDist` says it should.
-      expect(result.stdout).toContain(".revkit/dist");
       expect(existsSync(join(distDir, "index.html"))).toBe(true);
-      // Consumer staging under `.revkit/build/`, per DESIGN-0002 §5.
       expect(existsSync(join(root, ".revkit", "build"))).toBe(true);
     } else {
-      // A failure must name the step that failed, not crash.
+      // A failure must name the step that failed, and that step must
+      // be AFTER the check. Asserting "not the check" is what makes
+      // this lane-independent: a dev checkout can fail to complete the
+      // astro step (an isolated linker cannot always resolve the
+      // packaged dep tree), and a packaged one can complete it — both
+      // are fine, and both prove the shared composition ran.
       expect(result.stderr.length).toBeGreaterThan(0);
-      expect(combined).not.toContain("ENOENT");
+      expect(result.stderr).toMatch(/revkit build: (astro build failed|'revkit check-dist' refused)/);
+      // No registry-fetching subprocess anywhere in the output: the
+      // trusted-toolchain rule (CLAUDE.md / ADR-0010).
       expect(combined).not.toMatch(/bunx|npx/);
     }
   }, 600_000);
@@ -186,14 +218,27 @@ describe("the shared `revkit build` composition runs against a consumer with no 
       // only `runBuildCommand` performs.
       const record = JSON.parse(readFileSync(statePath, "utf8")) as { error?: string };
       if (status === "failed") {
+        // The error must be the SHARED primitive's own diagnostic, and
+        // must NOT be a pre-build check refusal: a check refusal would
+        // mean the build stopped before the astro step, which is the
+        // fixture bug this file exists to rule out. A private astro
+        // spawn produces no `revkit build:` prefix at all, so this
+        // assertion is what pins the composition.
         expect(record.error).toBeDefined();
-        expect(record.error).toMatch(/revkit build:|check|astro/);
+        expect(record.error).toMatch(/^revkit build: /);
+        expect(record.error).not.toContain("'revkit check' failed");
       } else {
+        // A full success means the packaged site step ran and the
+        // output landed.
         expect(existsSync(join(root, ".revkit", "dist"))).toBe(true);
+        expect(existsSync(join(root, ".revkit", "dist", "index.html"))).toBe(true);
       }
       // Nothing wrote into a consumer-side tree — there isn't one, and
       // the build did not create one.
       expect(existsSync(join(root, "site"))).toBe(false);
+      // And no consumer-side node_modules appeared either: astro came
+      // from the packaged root, not from anything the consumer owns.
+      expect(existsSync(join(root, "node_modules"))).toBe(false);
     } finally {
       await daemon.stop();
     }
@@ -231,4 +276,57 @@ describe("the shared `revkit build` composition runs against a consumer with no 
     expect(daemonSource).not.toMatch(/from "\.\/background-build\.ts"/);
     void createPublishBuildCoordinator;
   });
+});
+
+// The packaged-CLI lane. `REVKIT_E2E_BUILD=1` (which `just test`
+// sets, and which CI's `Tests` job sets) lets this exec the PACKAGED
+// CLI from `nix build .#revkit`, whose dependency tree is
+// FOD-materialised, so the astro step completes and every packaged
+// assertion can be made for real.
+//
+// It execs the binary rather than importing `runBuildCommand` again,
+// and that distinction is the whole reason this is a separate lane:
+// importing the source function runs the DEV checkout's linker, which
+// cannot resolve the packaged dep tree from a staged
+// `node_modules` — so it fails for a reason unrelated to the code.
+// Only the packaged binary proves what a consumer actually gets.
+const E2E = process.env.REVKIT_E2E_BUILD === "1";
+const CHECKOUT_ROOT = resolvePath(import.meta.dirname!, "..", "..", "..", "..");
+
+describe.skipIf(!E2E)("packaged CLI lane — the build completes the whole chain", () => {
+  test("the packaged CLI builds a consumer with no site/ end to end", async () => {
+    const storePath = execSync("nix build .#revkit --no-link --print-out-paths", {
+      cwd: CHECKOUT_ROOT,
+      encoding: "utf8",
+    }).trim().split("\n").at(-1)!.trim();
+    const revkitBin = join(storePath, "bin", "revkit");
+    expect(existsSync(revkitBin)).toBe(true);
+
+    const root = scaffoldConsumer();
+    // A fresh consumer has neither tree. Everything below has to work
+    // without them.
+    expect(existsSync(join(root, "site"))).toBe(false);
+    expect(existsSync(join(root, "node_modules"))).toBe(false);
+    const stdout = execSync(`"${revkitBin}" build --dir "${root}"`, {
+      encoding: "utf8",
+      env: { ...process.env, HOME: mkdtempSync(join(tmpdir(), "e2e-home-")) },
+    });
+    // Every step of the shared composition, in order.
+    expect(stdout).toContain("revkit build: check ok");
+    expect(stdout).toContain("revkit build: astro ok");
+    expect(stdout).toContain("revkit build: staging");
+    expect(stdout).toContain("revkit build: check-dist ok");
+    // Real output, in the directory the daemon serves from.
+    const distIndex = join(root, ".revkit", "dist", "index.html");
+    expect(existsSync(distIndex)).toBe(true);
+    expect(readFileSync(distIndex, "utf8")).toContain("Consumer Marker");
+    // Consumer staging + cache dirs (DESIGN-0002 §5), and still no
+    // consumer-side site/ or node_modules/ afterwards — the packaged
+    // root supplied astro, not the consumer.
+    expect(existsSync(join(root, ".revkit", "build"))).toBe(true);
+    expect(existsSync(join(root, ".revkit", "cache", "astro"))).toBe(true);
+    expect(existsSync(join(root, ".revkit", "cache", "vite"))).toBe(true);
+    expect(existsSync(join(root, "site"))).toBe(false);
+    expect(existsSync(join(root, "node_modules"))).toBe(false);
+  }, 900_000);
 });
