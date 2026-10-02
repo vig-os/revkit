@@ -1998,12 +1998,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       allowMutations: false,
     });
     const state = await review.readState(store);
-    type RecoverableSyncState = Exclude<CommentSyncState, { readonly kind: "not-attempted" | "cancelled" }>;
+    type RecoverableSyncState = Exclude<CommentSyncState, { readonly kind: "not-attempted" }>;
     const recoveries: Array<readonly [string, RecoverableSyncState]> = [];
     for (const [commentId, syncState] of state.commentSync) {
       if (
         syncState.kind !== "not-attempted" &&
-        syncState.kind !== "cancelled" &&
         syncState.recoveryReviewNodeId !== undefined
       ) {
         recoveries.push([commentId, syncState]);
@@ -2042,7 +2041,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       deletedNodeIds.add(remoteNodeId);
     }
 
-    for (const [commentId, syncState] of recoveries) {
+    const activeRecoveries = recoveries.filter((entry) => entry[1].kind !== "cancelled");
+    for (const [commentId, syncState] of activeRecoveries) {
       await appendReviewLifecycleEvent(
         {
           kind: "comment.sync_cancelled",
@@ -2069,7 +2069,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         );
       }
     }
-    return { declined: recoveries.length, deletedDrafts: deletedNodeIds.size };
+    return { declined: activeRecoveries.length, deletedDrafts: deletedNodeIds.size };
   }
 
   /** Append a review-lifecycle event (`review.opened`, `review.
