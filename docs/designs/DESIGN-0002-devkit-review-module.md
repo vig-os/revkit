@@ -128,36 +128,101 @@ DEVKIT_MODULES="node review"
 
 There is no compatibility break: the hand-wired form continues to work. The module is sugar.
 
-## 5. Gap between M5 part 1 and full D1 acceptance
+## 5. M5 part 2 (shipped): consumer-docs rendering through the packaged site
 
-M5 part 1 ships the flake plumbing but NOT a way for a consumer to render their own docs. The template's third
-command (`revkit serve`) currently binds and serves whatever tree is passed to `--dir`, but there is no
-`revkit build` that renders arbitrary consumer docs through the packaged Astro/Starlight site. That gap is
-called out explicitly on the [FEATURE-MATRIX](../FEATURE-MATRIX.md) D1 row and blocks the row from flipping to
-`shipped`.
+M5 part 1 shipped the flake plumbing without a way for a consumer to render their own docs. M5 part 2
+(closed by [vig-os/revkit#57](https://github.com/vig-os/revkit/issues/57)) fills that gap so the D1
+row on the [FEATURE-MATRIX](../FEATURE-MATRIX.md) can flip to `shipped`.
 
-What is missing (M5 part 2, tracked at [vig-os/revkit#57](https://github.com/vig-os/revkit/issues/57)):
+### 5.1 What ships
 
-- **`revkit build [--dir <root>]`** — renders the consumer's `docs/` (plus `vocab/`, `plots/`) with revkit's
-  PACKAGED site. Uses the packaged `node_modules/.bin/astro` by ABSOLUTE PATH (no `bunx`, no PATH lookup),
-  reuses the safety machinery from `packages/cli/src/review/build.ts` shipped by PR #48 (env allowlist, token
-  denylist, per-build `HOME`, vite `cacheDir` outside the sandbox). Output at
-  `<consumer>/.revkit/dist/`.
-- **Site becomes root-configurable.** `site/astro.config.mjs`, `site/src/content.config.ts` and the
-  `repoDocsLoader` / `plotsLoader` / vocab-file loader currently read from a hardcoded `REPO_ROOT` two
-  parents up from `site/`. They need to accept a `REVKIT_CONSUMER_ROOT` env var so the packaged site can
-  render an external tree. Sidebar generation switches from the ADR/design-specific
-  `slugsFromRepoDir("adr")` / `slugsFromRepoDir("designs")` to Starlight's autogenerate when no ADR tree
-  exists — behaviour still to design.
-- **`revkit serve` auto-build.** When `--dir` is missing and `<root>/.revkit/dist/` does not exist, `serve`
-  runs `revkit build` first (or prints the exact command). Today it refuses on a missing dir.
-- **Template smoke asserts real content.** `scripts/template-smoke.sh` currently accepts a `404` from
-  `GET /` as proof-of-life; once `revkit build` exists, the smoke asserts the built page's title AND the
-  rail's `<script src="/-/rail.js">` tag (injected by the daemon).
-- **Coordinate with PR #48.** `runSafeBuild` in `packages/cli/src/review/build.ts` already handles trusted-
-  toolchain-by-absolute-path, an env allowlist and a per-build `HOME`. M5 part 2 either extracts a shared
-  primitive both `revkit review` and `revkit build` call, or `revkit build` reuses PR #48's module directly.
-  A single build implementation is the target — not two.
+- **`revkit build [--dir <root>] [--out <path>]`** — renders the consumer's `docs/` (plus `vocab/`, `plots/`)
+  through revkit's PACKAGED Astro/Starlight site. Invokes the packaged `node_modules/.bin/astro` by
+  ABSOLUTE PATH (no `bunx`, no `npx`, no PATH lookup). Runs `revkit check` first (authoring guards)
+  and `revkit check-dist` after (ADR-0012 output-gate). Output at `<consumer>/.revkit/dist/`.
+- **A shared safe-build primitive.** `packages/cli/src/review/build.ts` now exports `spawnAstroBuild`,
+  a low-level spawn wrapper with the env allowlist, the token denylist, the per-build `HOME` / `TMPDIR`
+  scratch, the `--outDir` pass-through and the deny of every CI-shape variable. Both `runSafeBuild`
+  (the `revkit review` sandbox path from PR #48) and `runPackagedBuild` (the new `revkit build` path)
+  call it. One implementation of the primitive; two callers, each carrying their own layout / wrapper-
+  config / symlink concerns.
+- **Site becomes root-configurable via `REVKIT_CONSUMER_ROOT`.** `site/astro.config.mjs` and
+  `site/src/content.config.ts` read the env var through `site/src/lib/consumer-root.ts` and switch:
+  - `REPO_ROOT` (used by `rehype-data-src` for source anchors) points at the consumer root.
+  - The Starlight sidebar autogenerates from the consumer's `docs/` directory shape via
+    `buildConsumerSidebar` — each top-level `.md`/`.mdx` becomes a link item at the collection
+    root, each subdirectory becomes a labeled group. The revkit-specific `slugsFromRepoDir("adr")` /
+    `slugsFromRepoDir("designs")` groups only run when `REVKIT_CONSUMER_ROOT` is UNSET.
+  - `repoDocsLoader` is skipped in consumer mode; the docs collection uses Starlight's default
+    `docsLoader()` reading from `<staging>/src/content/docs/` (a real dir populated by copying the
+    consumer's docs tree at build time).
+  - `vocab` and `plots` collections fall back to empty inline loaders when the consumer omits those
+    trees; when present, they resolve through symlinks staged next to the astro root.
+  - **When `REVKIT_CONSUMER_ROOT` is UNSET, every branch is byte-for-byte the pre-#57 value.** The
+    revkit own-repo build is unchanged, verified by the smoke test's `bun run build` producing 32
+    pages just as it did before.
+- **Sidebar decision (documented here per issue #57).** Consumers name their `docs/` tree freely,
+  so a hard-coded sidebar shape does not fit. `buildConsumerSidebar` walks the tree at
+  astro-config-eval time and emits Starlight sidebar entries. Starlight's own "autogenerate from
+  `src/content/docs/` filesystem" mode would work too, but it walks BEFORE the docs collection
+  loads, and we're loading through a custom-shaped staging (a real dir with copied docs, not the
+  default). Enumerating in the config keeps the sidebar coherent with what the collection loads.
+- **`revkit serve` auto-build.** When `--dir` is absent and `<root>/.revkit/dist/` does not exist,
+  `serve` runs `revkit build` first. `--no-auto-build` refuses with a clear message instead.
+  The daemon's CSP, auth, rail injection are unchanged.
+- **Staging + cache layout.** `<consumer>/.revkit/` holds four subtrees:
+  - `build/` — writable astro root: per-entry symlinks to packaged site source, per-package symlinks
+    into packaged `node_modules/`, and a copy of the consumer's `docs/` under `src/content/docs/`.
+  - `dist/` — astro build output.
+  - `cache/astro/` and `cache/vite/` — cache dirs redirected via `REVKIT_ASTRO_CACHE_DIR` /
+    `REVKIT_VITE_CACHE_DIR` env vars the config reads. Nothing lands in the nix store or the
+    packaged site directory.
+  - `serve.json`, `daemon.lock`, `local-user`, `asks/` — daemon state (unchanged from M5 part 1).
+- **Template smoke asserts real content.** `scripts/template-smoke.sh` runs `revkit check`, then
+  `nix build`, then `revkit build`, then `revkit serve --port 0 --no-auto-build`; extracts the
+  launch URL, mints a session cookie, GETs `/` and asserts (a) HTTP 200, (b) the rendered doc
+  text is in the body ("welcome"), (c) the rail's `<script src="/-/rail.js">` tag is injected.
+  The daemon is killed on exit via a trap. CI runs it through the existing
+  `.github/workflows/revkit-flake.yml` template-smoke job.
+- **Nix package changes.** `nix/revkit-package.nix` now ships the whole `site/` (astro.config.mjs,
+  tsconfig.json, scripts/, src/) — not only `site/src/` — so the packaged CLI has a working astro
+  project root to stage from. The `node_modules/.bin/` directory is symlinked in (shell glob would
+  otherwise skip the hidden entry), which is where `astro` lives after `bun install --linker=hoisted`.
+- **Symlink layout quirks and their fixes.**
+  1. `NODE_PRESERVE_SYMLINKS=1` is set on the astro child so Node's `require.resolve` keeps
+     paths on the staging tree rather than resolving into `/nix/store/…`. Paired with
+     `vite.resolve.preserveSymlinks: true` in consumer mode so vite reports the SAME paths.
+     Without both, astro's `normalizeFilename` corrupts an out-of-root `/nix/store/…` module id
+     by prepending `<staging>/` — a subtle bug that surfaces as ENOENT deep inside vite's
+     virtual-module cache.
+  2. Solid's `include` glob gains `**/node_modules/@revkit/components/**` so Callout / Aside /
+     … are transformed under `preserveSymlinks: true`, where the trusted `packages/components`
+     copy is only reachable through the staging path.
+  3. `@astrojs/mdx` is added explicitly to the integrations list in consumer mode. Starlight
+     auto-adds it in its own `astro:config:setup`, but in the packaged flow the pushed
+     integration sometimes registers `.mdx` too late for the FIRST content-sync pass, leaving
+     the docs collection empty. An explicit entry participates from the first pass.
+
+### 5.2 Nothing changed for the review path (PR #48)
+
+`packages/cli/src/review/build.ts` still owns `runSafeBuild` for the `revkit review` sandbox: the same
+wrapper-config approach, the same trusted checkout path, the same seven rules from PR #48's file header.
+It now delegates the actual spawn to `spawnAstroBuild` so the env allowlist and denylist live in one
+place; the wrapper's own concerns (vite cache dir inside the sandbox, the `astro.config.revkit-review.mjs`
+wrapper file, the sandbox HOME/vite-cache tempdirs) are unchanged. Every review-path test still passes.
+
+### 5.3 Open items for M5 part 3 (or later)
+
+- Move revkit's own site dogfood from `bun run build` in `site/` to `revkit build --dir .` at the
+  repo root. Would exercise the packaged path against a maximally-complex consumer (revkit itself)
+  every CI run, sharpening the "own build unchanged" assertion into a "own build is the packaged
+  build" one. Deferred because it would touch every dev workflow at once.
+- Move the sidebar autogenerate rule to a config option (`revkit.sidebar = "autogenerate" | "flat"
+  | { ... }`) so a consumer can override the default without dropping into astro config. Nothing
+  demands it yet.
+- Pin down the `@astrojs/mdx` late-registration issue upstream — either a bug in
+  `runHookConfigSetup`'s loop or a Starlight `splice` timing quirk. Working around it is cheap;
+  fixing it upstream removes a config-file line.
 
 ## 6. Open questions for the devkit maintainers
 

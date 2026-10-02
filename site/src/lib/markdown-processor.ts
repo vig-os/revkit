@@ -46,7 +46,10 @@ type RehypePlugins = (unknown | readonly unknown[])[];
  * A single source of truth for the plugin list; a new plugin needs
  * one edit, not two.
  */
-export function buildSharedMarkdownConfig(repoRoot: string): {
+export function buildSharedMarkdownConfig(
+  repoRoot: string,
+  options: { readonly pathMap?: readonly { readonly from: string; readonly to: string }[] } = {},
+): {
   readonly remarkPlugins: RemarkPlugins;
   readonly rehypePlugins: RehypePlugins;
 } {
@@ -64,7 +67,7 @@ export function buildSharedMarkdownConfig(repoRoot: string): {
       // Runs before `rehype-data-src` so the surviving blocks
       // keep their ORIGINAL source-line positions (a source-side
       // strip would shift every downstream anchor).
-      [rehypeDropRepoDocTitle, { repoRoot }],
+      [rehypeDropRepoDocTitle, { repoRoot, ...(options.pathMap !== undefined ? { pathMap: options.pathMap } : {}) }],
       // Rewrite cross-doc `.md` links to their site route (or a
       // GitHub blob URL for docs outside the publishable roots).
       // Historically the `repo-docs` loader did this as a post-
@@ -76,7 +79,7 @@ export function buildSharedMarkdownConfig(repoRoot: string): {
       [rehypeRewriteMdLinks, { repoRoot }],
       // Stamp every block with `data-src="repo/relative:start-end"`
       // — the rail anchors on these.
-      [rehypeDataSrc, { repoRoot }],
+      [rehypeDataSrc, { repoRoot, ...(options.pathMap !== undefined ? { pathMap: options.pathMap } : {}) }],
       // Inject a hidden `<span data-revkit-revision="…">` at the
       // top of the article body. The daemon reads this at
       // request time to decide whether the on-disk `site/dist/`

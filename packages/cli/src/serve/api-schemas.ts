@@ -17,7 +17,7 @@
 // wants a specific id (test harness, replay) passes one in.
 
 import { z } from "zod";
-import { anchorSchema, askAnswerSchema, askSchema, idSchema } from "@revkit/review-core";
+import { anchorSchema, askAnswerSchema, askSchema, idSchema, reviewSubmitEventSchema } from "@revkit/review-core";
 
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
@@ -144,3 +144,28 @@ export const publishRequestSchema = z
   })
   .strict();
 export type PublishRequest = z.infer<typeof publishRequestSchema>;
+
+// ── Review-mode (M3 part 2b, ADR-0025) ────────────────────────────
+
+/** POST /api/review/submit. Cookie-authenticated only (the agent
+ * bearer is refused with 403 at the route). `event` matches
+ * `GitHubAdapter.ReviewSubmissionEvent`; `body` is the top-level
+ * review message (optional — the daemon composes a default). */
+export const submitReviewRequestSchema = z
+  .object({
+    event: reviewSubmitEventSchema,
+    body: z.string().max(65_536).optional(),
+  })
+  .strict();
+export type SubmitReviewRequest = z.infer<typeof submitReviewRequestSchema>;
+
+/** POST /api/review/discard. Cookie-authenticated only. Deletes
+ * the pending review on GitHub and records the abandon. Body is
+ * optional — an omitted body defaults to `reason: "user-discarded"`
+ * at the daemon. */
+export const discardReviewRequestSchema = z
+  .object({
+    reason: z.string().min(1).max(256).optional(),
+  })
+  .strict();
+export type DiscardReviewRequest = z.infer<typeof discardReviewRequestSchema>;

@@ -3,22 +3,40 @@
 A minimal revkit docs repo. Scaffolded by:
 
 ```bash
+# After the next release lands M5 on main:
 nix flake init -t github:vig-os/revkit
+
+# Until then, target the dev branch — main does not yet carry
+# `packages.revkit` / `templates.default`:
+nix flake init -t github:vig-os/revkit/dev
 ```
 
-## Two commands (M5 part 1)
+## Three commands
 
 ```bash
 direnv allow       # or: nix develop
 revkit check       # run the ADR-0005 authoring guards on this tree
-nix build          # runs `revkit check` inside a docs derivation
+revkit build       # render `docs/` through revkit's packaged Astro/Starlight
+revkit serve       # boot the local review daemon on 127.0.0.1
 ```
 
-`revkit serve` (the local review daemon that mounts the rail on rendered pages) is **M5 part 2**, tracked at
-[vig-os/revkit#57](https://github.com/vig-os/revkit/issues/57) — see also
-[revkit's DESIGN-0002 §5](https://github.com/vig-os/revkit/blob/main/docs/designs/DESIGN-0002-devkit-review-module.md#5-gap-between-m5-part-1-and-full-d1-acceptance).
-It needs a `revkit build` step (not yet shipped) that renders this `docs/` tree through revkit's packaged
-Astro/Starlight site. Until then the daemon works but has no rendered content to serve.
+`revkit build` (M5 part 2, [#57][57]) copies your docs into a writable
+staging tree under `.revkit/build/`, renders them with revkit's packaged
+site, and writes the built HTML to `.revkit/dist/`. Astro and Vite caches
+land under `.revkit/cache/` — nothing is written into the nix store.
+The command runs `revkit check` first and `revkit check-dist` after
+(ADR-0012 output-gate), so the served output is fit for a reviewer.
+
+`revkit serve` picks up `.revkit/dist/` by default. If it does not
+exist, `revkit build` runs automatically (pass `--no-auto-build`
+to refuse instead). The daemon binds to 127.0.0.1, prints a
+single-use launch URL, and mounts the rail on every rendered page
+(ADR-0006, ADR-0007, ADR-0013).
+
+`nix build` runs `revkit check` inside a sandboxed docs derivation —
+a second, stricter pass that CI can gate on.
+
+[57]: https://github.com/vig-os/revkit/issues/57
 
 See [revkit][revkit] for the architecture (DESIGN-0001, ADR-0001…0025).
 
@@ -31,7 +49,19 @@ See [revkit][revkit] for the architecture (DESIGN-0001, ADR-0001…0025).
 | `docs/` | MDX docs. Only [registered components][adr-0002] are allowed; new needs go through `revkit escalate`. |
 | `vocab/terms.yaml` | The one place a term is defined ([ADR-0005 C2][adr-0005]). |
 | `flake.nix` | Consumes `revkit.packages.<system>.revkit`. |
-| `.gitignore` | Ignores `.revkit/` (daemon state — never committed). |
+| `.gitignore` | Ignores `.revkit/` (daemon state, build staging, dist — never committed). |
+
+## `docs/` — no symlinks
+
+`revkit build` refuses any symlink inside your `docs/` tree — the
+staging walker (`copyConfined`) fails fast whether the symlink
+escapes the docs root or stays inside it. This matches
+`revkit check`'s content-directory policy. If you have a
+legitimate reason to share content across pages, factor the shared
+text into a plain file and import it as MDX. A stray symlink from
+a `git-checkout` reset or a `just clean` script surfaces as a
+`revkit build: refusing symlink under the consumer's docs/ tree`
+error at build time.
 
 ## What `revkit check` enforces (ADR-0005)
 

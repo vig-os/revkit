@@ -23,6 +23,7 @@ import { spawnGh } from "./gh-runner.ts";
 import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
 import { runServeCommand } from "./serve/cli.ts";
+import { runBuildCommand } from "./build/cli.ts";
 import { runMcpCommand } from "./mcp/cli.ts";
 import { runOpenCommand } from "./open-cli.ts";
 import { runReviewCommand, defaultReviewEnv } from "./review/cli.ts";
@@ -45,7 +46,8 @@ Usage:
   revkit check [--staged | <paths...>] [--online]
   revkit check-dist <dist-dir> [--print-hashes]
   revkit escalate "<need>"
-  revkit serve [--dir <path>] [--port <n>]
+  revkit build [--dir <path>] [--out <path>]
+  revkit serve [--dir <path>] [--port <n>] [--no-auto-build]
   revkit mcp [--dir <path>]
   revkit open [<path>]
   revkit review <pr-number|url> [--trust <sha>] [--no-serve] [--repo <slug>]
@@ -68,12 +70,23 @@ data: / vbscript: URLs, off-list <script> hashes, <iframe>/<object>/
 --print-hashes prints every distinct inline-script hash in the dir so
   a maintainer can update dist-check-allowlist.json after an upgrade.
 
+build (M5 part 2, D1) renders the consumer's docs/ (plus vocab/,
+plots/) through revkit's packaged Astro/Starlight site by absolute
+path — no bunx, no npx, no registry fetch. Output lands at
+<consumer>/.revkit/dist/. Astro and Vite caches go under
+<consumer>/.revkit/cache/ so nothing is written into the nix store
+or the packaged site directory. Runs 'revkit check' before and
+'revkit check-dist' after (ADR-0012 output gate).
+
 serve boots the local daemon (ADR-0013, ADR-0006/0007): Bun.serve
 bound to 127.0.0.1 on a random free port (--port 0), serving
-'site/dist' by default with a JSON thread API, /events (SSE +
-WebSocket) and the launch-code → session-cookie flow. Prints the
-launch URL on stdout; the agent bearer token is written to
-.revkit/serve.json at mode 600. Ctrl-C stops gracefully.
+'<consumer>/.revkit/dist' by default with a JSON thread API,
+/events (SSE + WebSocket) and the launch-code → session-cookie
+flow. Prints the launch URL on stdout; the agent bearer token is
+written to .revkit/serve.json at mode 600. When --dir is absent
+and <consumer>/.revkit/dist/ does not exist, 'revkit build' runs
+automatically first (--no-auto-build refuses instead). Ctrl-C
+stops gracefully.
 
 review (ADR-0025, M3 part 2a) resolves a PR through the reviewer's
 own 'gh auth token', fetches the head + base commits into the local
@@ -195,13 +208,26 @@ export async function dispatch(
   }
 
   if (first === "serve") {
-    const outcome = await runServeCommand(rest, { cwd: env.cwd, version: VERSION });
+    const outcome = await runServeCommand(rest, {
+      cwd: env.cwd,
+      version: VERSION,
+      repoSlug: env.repoSlug,
+    });
     return {
       stdout: outcome.stdout,
       stderr: outcome.stderr,
       exitCode: outcome.exitCode,
       ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
     };
+  }
+
+  if (first === "build") {
+    const outcome = await runBuildCommand(rest, {
+      cwd: env.cwd,
+      version: VERSION,
+      repoSlug: env.repoSlug,
+    });
+    return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
   }
 
   if (first === "mcp") {
@@ -248,13 +274,8 @@ export async function dispatch(
         sqlitePath,
         repoRoot,
         localUserId,
-      }: {
-        readonly materializedRoot: string;
-        readonly distDir: string;
-        readonly sqlitePath: string;
-        readonly repoRoot: string;
-        readonly localUserId: string;
-      }) => {
+        reviewMode,
+      }: Parameters<NonNullable<Parameters<typeof runReviewCommand>[1]["startServe"]>>[0]) => {
         const handle = await startDaemon({
           dir: distDir,
           repoRoot,
@@ -264,6 +285,7 @@ export async function dispatch(
           port: 0,
           announce: false,
           installSignalHandlers: true,
+          ...(reviewMode !== undefined ? { reviewMode } : {}),
         });
         const blockForever = new Promise<void>((resolveDone) => {
           const originalStop = handle.stop.bind(handle);

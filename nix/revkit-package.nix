@@ -141,6 +141,9 @@ let
     (src + "/packages/review-core")
     (src + "/packages/components")
     (src + "/site/package.json")
+    (src + "/site/tsconfig.json")
+    (src + "/site/astro.config.mjs")
+    (src + "/site/scripts")
     (src + "/site/src")
     # The consumer skill file `revkit skill install` copies. Kept at
     # `templates/skills/revkit/SKILL.md` (a static asset in the
@@ -290,6 +293,19 @@ stdenvNoCC.mkDerivation {
           ln -s "$entry" "$out/libexec/revkit/node_modules/$base"
         fi
       done
+      # `.bin` — shell glob above skips dotfiles, so a plain `*`
+      # loop does NOT symlink `node_modules/.bin/`. That is where
+      # hoisted bun install puts the `astro` binary, which the
+      # `revkit build` subcommand (M5 part 2, issue #57) invokes
+      # by ABSOLUTE PATH. Symlink the whole `.bin` directory —
+      # its inner entries are relative symlinks like
+      # `../astro/bin/astro.mjs` that resolve against the FOD's
+      # physical `.bin/` (they stay inside the FOD, no dangling
+      # references into $out), so a single top-level symlink is
+      # correct here.
+      if [ -d ${nodeModules}/node_modules/.bin ]; then
+        ln -s ${nodeModules}/node_modules/.bin $out/libexec/revkit/node_modules/.bin
+      fi
       # Fresh `@revkit/*` relative symlinks that resolve inside $out:
       # `../../packages/<name>` from `.../node_modules/@revkit/<name>`
       # → `$out/libexec/revkit/packages/<name>` (present).

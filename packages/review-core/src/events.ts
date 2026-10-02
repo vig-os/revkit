@@ -166,6 +166,23 @@ const commentRepliedPayload = {
   mentions: z.array(commentMentionSchema).optional(),
 } as const;
 
+/** Round-2 BLOCK-fix 3 (B4 pull update): a remote comment's body
+ * changed. Emitted only on refresh, when the local log's last
+ * body for `commentId` differs from the remote's current body.
+ * The reducer projects it on `Comment.body` and stamps
+ * `Comment.editedAt`; the rail's SSE refetches the thread when
+ * this arrives, showing an "edited" marker. */
+const commentEditedPayload = {
+  kind: z.literal("comment.edited"),
+  commentId: idSchema,
+  body: z.string().min(1),
+  /** ISO-8601 timestamp of the remote edit — the caller's own
+   * clock for a local edit. Used as a monotonic idempotency
+   * marker on refresh: the reducer skips an edit whose
+   * `remoteUpdatedAt` is not newer than the last seen. */
+  remoteUpdatedAt: z.string().min(1).optional(),
+} as const;
+
 const threadResolvedPayload = {
   kind: z.literal("thread.resolved"),
   threadId: idSchema,
@@ -176,6 +193,21 @@ const threadReopenedPayload = {
   kind: z.literal("thread.reopened"),
   threadId: idSchema,
   reason: z.string().min(1).optional(),
+} as const;
+
+/** Last GitHub resolve state observed after a local resolve/reopen
+ * intent. Local thread lifecycle remains the durable intent; this
+ * event advances the external baseline only after GitHub confirms
+ * that state, including an accepted mutation whose response was
+ * lost. */
+const threadExternalSyncedPayload = {
+  kind: z.literal("thread.external_synced"),
+  threadId: idSchema,
+  resolved: z.boolean(),
+  /** Seq of the local thread.resolved/thread.reopened intent this
+   * completion acknowledges. Remote observations have no intentSeq. */
+  intentSeq: z.number().int().positive().optional(),
+  resolvedByLogin: z.string().min(1).optional(),
 } as const;
 
 /** Trigger for a `handover` delivery event (M2 item 6 review round 2).
@@ -352,14 +384,135 @@ const docPublishedPayload = {
   paths: z.array(z.string().min(1).max(4096)).min(1).max(64).optional(),
 } as const;
 
+/** Submitted-review event options: COMMENT / APPROVE / REQUEST_CHANGES.
+ * Same enum shape as `GitHubAdapter.ReviewSubmissionEvent`; declared
+ * here so the wire schema does not import the adapter (review-core
+ * runs in Bun AND in a Cloudflare Worker — the adapter imports plain
+ * `fetch` only, but importing it into events.ts would still couple
+ * layers). M3 part 2b. */
+const reviewSubmitEvents = ["COMMENT", "APPROVE", "REQUEST_CHANGES"] as const;
+export const reviewSubmitEventSchema = z.enum(reviewSubmitEvents);
+export type ReviewSubmitEvent = (typeof reviewSubmitEvents)[number];
+
+/** M3 part 2b: a pending review was OPENED. The daemon writes this
+ * before it writes any `comment.linked` event with
+ * `external.github.pending: true`, so a restart can derive the
+ * "currently-open pending review" without reading anything but the
+ * log. `reviewNodeId` is the GraphQL id GitHub assigned; `headSha`
+ * is the commit the review was pinned to (must match the pending
+ * comments' anchor commit). */
+const reviewOpenedPayload = {
+  kind: z.literal("review.opened"),
+  reviewNodeId: z.string().min(1),
+  headSha: z
+    .string()
+    // `originalCommitOid` shape — hex, may be short or long. Use the
+    // same regex the adapter's `github-adapter.ts` uses for oids to
+    // avoid an inconsistent constraint. Deliberately not tightened
+    // to 40 hex: GitHub's own diff-hunk fixtures sometimes carry
+    // short oids and we accept them at import time.
+    .regex(/^[0-9a-fA-F]{7,64}$/, "review.opened.headSha must be a 7..64-char hex string"),
+} as const;
+
+/** M3 part 2b: the pending review was SUBMITTED. Terminal for the
+ * `reviewNodeId`. `event` is the GitHub review event; `body` the
+ * top-level review message. */
+const reviewSubmittedPayload = {
+  kind: z.literal("review.submitted"),
+  reviewNodeId: z.string().min(1),
+  event: reviewSubmitEventSchema,
+  body: z.string().max(65_536).optional(),
+} as const;
+
+/** M3 part 2b: the pending review was ABANDONED (deleted). Used by
+ * the head-move re-anchor flow — the old pending review's draft
+ * comments no longer point at valid lines on the new head, so we
+ * delete it before opening a fresh one. Terminal for the
+ * `reviewNodeId`. `reason` is a short machine-parseable tag
+ * (`head-moved`, `user-discarded`, …). */
+const reviewAbandonedPayload = {
+  kind: z.literal("review.abandoned"),
+  reviewNodeId: z.string().min(1),
+  reason: z.string().min(1).max(256).optional(),
+} as const;
+
+/** M3 part 2b round-2 (BLOCK-fix): a local comment's sync to the
+ * reviewer's PENDING GitHub review was REQUESTED. This is an
+ * intent, not a completion — the reconciler is what turns intent
+ * into confirmation (via `comment.linked`) or into a visible
+ * failure (`comment.sync_failed`). Emitted:
+ *   - by the daemon's POST /api/threads handler right after the
+ *     local `comment.created`, BEFORE any GitHub call;
+ *   - by the re-anchor pipeline for each carried-forward comment
+ *     at the new head.
+ * Body / anchor coordinates are stored so the reconciler can
+ * fingerprint a candidate draft on GitHub (by nodeId when known,
+ * else by path+line+side+body). `bodyHash` is `revisionOf(body)`
+ * — reconstructable, so the reconciler never trusts the body
+ * bytes themselves. */
+const commentSyncRequestedPayload = {
+  kind: z.literal("comment.sync_requested"),
+  commentId: idSchema,
+  /** The path the pending comment was posted against — matches the
+   * anchor's path except when the anchor mapped to a file-level
+   * fallback (renamed file, etc.). */
+  path: z.string().min(1),
+  /** `LINE` (line-scoped, has line + side) or `FILE` (file-level,
+   * no line). */
+  subjectType: z.enum(["LINE", "FILE"]),
+  side: z.enum(["RIGHT", "LEFT"]).optional(),
+  line: z.number().int().positive().optional(),
+  startLine: z.number().int().positive().optional(),
+  /** SHA-256 hex of the body the daemon INTENDS to post. The
+   * reconciler compares GitHub's draft body hash against this to
+   * detect an already-posted match. */
+  bodyHash: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "comment.sync_requested.bodyHash must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
+    ),
+  /** Present for a reply intent. The reconciler posts through
+   * addPullRequestReviewThreadReply instead of creating a new
+   * top-level thread, and reads this thread before retrying. */
+  replyThreadNodeId: z.string().min(1).optional(),
+  /** Remote comment node ids observed before the reply intent.
+   * A matching viewer/body comment outside this set proves an
+   * accepted-but-response-lost mutation without duplicating it. */
+  knownCommentNodeIds: z.array(z.string().min(1)).optional(),
+} as const;
+
+/** M3 part 2b round-2 (BLOCK-fix): the reconciler tried to sync a
+ * comment and GitHub refused / the network broke / etc. Carries a
+ * short machine-readable `reason` so the rail's "not on GitHub —
+ * retry" state can be actioned. A subsequent `comment.sync_requested`
+ * or `comment.linked` clears the failed state — the log's LAST
+ * event on a comment decides its sync state. */
+const commentSyncFailedPayload = {
+  kind: z.literal("comment.sync_failed"),
+  commentId: idSchema,
+  reason: z.string().min(1).max(512),
+} as const;
+
+/** The reviewer explicitly declined recovery of one sync intent.
+ * Correlation to requestedAtSeq prevents a delayed decline from
+ * cancelling a newer explicit sync request for the same comment. */
+const commentSyncCancelledPayload = {
+  kind: z.literal("comment.sync_cancelled"),
+  commentId: idSchema,
+  requestedAtSeq: z.number().int().positive(),
+} as const;
+
 /** All event variants — one per `kind`. Each carries the envelope plus
  * its own payload; `.strict()` refuses stray fields so a wire message that
  * looks close but adds an unknown property fails at the boundary. */
 const eventVariants = [
   z.object({ ...envelope, ...commentCreatedPayload }).strict(),
   z.object({ ...envelope, ...commentRepliedPayload }).strict(),
+  z.object({ ...envelope, ...commentEditedPayload }).strict(),
   z.object({ ...envelope, ...threadResolvedPayload }).strict(),
   z.object({ ...envelope, ...threadReopenedPayload }).strict(),
+  z.object({ ...envelope, ...threadExternalSyncedPayload }).strict(),
   z.object({ ...envelope, ...handoverPayload }).strict(),
   z.object({ ...envelope, ...deliveryModeChangedPayload }).strict(),
   z.object({ ...envelope, ...askCreatedPayload }).strict(),
@@ -406,6 +559,12 @@ const eventVariants = [
     }),
   z.object({ ...envelope, ...threadOrphanedPayload }).strict(),
   z.object({ ...envelope, ...docPublishedPayload }).strict(),
+  z.object({ ...envelope, ...reviewOpenedPayload }).strict(),
+  z.object({ ...envelope, ...reviewSubmittedPayload }).strict(),
+  z.object({ ...envelope, ...reviewAbandonedPayload }).strict(),
+  z.object({ ...envelope, ...commentSyncRequestedPayload }).strict(),
+  z.object({ ...envelope, ...commentSyncFailedPayload }).strict(),
+  z.object({ ...envelope, ...commentSyncCancelledPayload }).strict(),
 ] as const;
 
 /** The wire-shape event, discriminated on `kind`. Consumers narrow on
@@ -426,8 +585,10 @@ export type ReviewEventKind = ReviewEvent["kind"];
 export const reviewEventKinds = [
   "comment.created",
   "comment.replied",
+  "comment.edited",
   "thread.resolved",
   "thread.reopened",
+  "thread.external_synced",
   "handover",
   "delivery.mode_changed",
   "ask.created",
@@ -438,6 +599,12 @@ export const reviewEventKinds = [
   "thread.reanchored",
   "thread.orphaned",
   "doc.published",
+  "review.opened",
+  "review.submitted",
+  "review.abandoned",
+  "comment.sync_requested",
+  "comment.sync_failed",
+  "comment.sync_cancelled",
 ] as const satisfies readonly ReviewEventKind[];
 
 /**

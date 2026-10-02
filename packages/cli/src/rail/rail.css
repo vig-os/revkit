@@ -228,6 +228,198 @@
   color: var(--revkit-rail-resolved);
 }
 
+/*
+ * Unread state (issue #60). A thread whose latest touch was an
+ * agent action since the human last acknowledged it keeps a
+ * left-hand accent stripe AND a text pill — so the reviewer notices
+ * it even when the accent hue reads badly for a colour-blind
+ * viewer. axe: the pill carries text and an aria-hidden glyph, so
+ * screen readers announce "agent replied — unread".
+ */
+.revkit-rail__thread--unread {
+  border-left-width: 3px;
+  border-left-color: var(--revkit-rail-accent);
+}
+
+.revkit-rail__thread-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.revkit-rail__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4;
+  border: 1px solid currentColor;
+}
+
+.revkit-rail__pill--unread {
+  color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 10%, transparent);
+}
+
+.revkit-rail__pill-icon {
+  font-weight: 700;
+}
+
+/* Resolved-summary disclosure row (issue #60). The button is a real
+ * <button aria-expanded>; the caret is a text glyph so no bitmap
+ * font is needed. Full-width click target so a reviewer can hit it
+ * without pixel-hunting on mobile. */
+.revkit-rail__resolved-summary {
+  margin-top: 0.35rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.revkit-rail__resolved-toggle {
+  all: unset;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-resolved);
+  padding: 0.15rem 0.25rem;
+  border-radius: 4px;
+}
+
+.revkit-rail__resolved-toggle:focus-visible {
+  outline: 2px solid var(--revkit-rail-accent);
+  outline-offset: 2px;
+}
+
+.revkit-rail__resolved-caret {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  color: var(--revkit-rail-resolved);
+}
+
+.revkit-rail__resolved-status {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 0.7rem;
+}
+
+.revkit-rail__resolved-meta {
+  color: var(--revkit-rail-muted);
+  font-size: 0.75rem;
+  margin: 0.15rem 0 0 0;
+}
+
+.revkit-rail__resolved-who {
+  color: var(--revkit-rail-fg);
+  font-weight: 500;
+}
+
+.revkit-rail__resolved-excerpt {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-muted);
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+}
+
+.revkit-rail__reopen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.revkit-rail__reopen:hover,
+.revkit-rail__reopen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+.revkit-rail__mark-seen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-muted);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.revkit-rail__header-resolved-count {
+  font-size: 0.75rem;
+  color: var(--revkit-rail-resolved);
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--revkit-rail-resolved);
+  border-radius: 999px;
+  margin-left: auto;
+  margin-right: 0.5rem;
+}
+
+/* Bulk "Mark all seen" action in the rail header (PR #62 review).
+ * Only rendered when unread > 0, so it doesn't clutter the header
+ * on a quiet page. */
+.revkit-rail__mark-all-seen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.15rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  margin-right: 0.35rem;
+}
+
+.revkit-rail__mark-all-seen:hover,
+.revkit-rail__mark-all-seen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+/* Single polite live region for unread announcements — visually
+ * hidden but announced by screen readers. sr-only pattern. */
+.revkit-rail__unread-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Reopen button lives inside the collapsed row, so a reviewer
+ * can reopen a resolved thread with one click (no need to expand
+ * first). Smaller than the in-body reopen so a long list of
+ * collapsed rows stays scannable. */
+.revkit-rail__resolved-reopen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.1rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.72rem;
+  justify-self: end;
+  align-self: start;
+}
+
+.revkit-rail__resolved-reopen:hover,
+.revkit-rail__resolved-reopen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
 .revkit-rail__comments {
   list-style: none;
   padding: 0;
@@ -526,4 +718,159 @@
   margin: 0;
   font-size: 0.8rem;
   color: var(--revkit-rail-fg);
+}
+
+/* M3 part 2b — review-mode panel. Shown when the daemon is in
+   review mode (`/api/review/state` returns 200). Adds a submit
+   form (event radios + optional body), a stale banner with a
+   re-anchor button, and a pending-count line. */
+.revkit-rail__review {
+  padding: 0.6rem 0.75rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 15%, transparent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 4%, transparent);
+}
+.revkit-rail__review-heading {
+  margin: 0 0 0.25rem 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-meta,
+.revkit-rail__review-count {
+  margin: 0.1rem 0;
+  font-size: 0.75rem;
+  color: color-mix(in srgb, var(--revkit-rail-fg) 75%, transparent);
+}
+.revkit-rail__review-meta code,
+.revkit-rail__review-count code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+}
+.revkit-rail__review-stale {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #d97706;
+  background: color-mix(in srgb, #d97706 8%, transparent);
+}
+.revkit-rail__review-stale-text {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-deleted-remotely {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #b45309;
+  background: color-mix(in srgb, #b45309 10%, transparent);
+}
+.revkit-rail__review-deleted-remotely-summary {
+  margin: 0 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-deleted-remotely-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+.revkit-rail__review-deleted-remotely-repost,
+.revkit-rail__review-deleted-remotely-discard {
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.revkit-rail__review-deleted-remotely-repost:disabled,
+.revkit-rail__review-deleted-remotely-discard:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.revkit-rail__review-reanchor {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--revkit-rail-accent);
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+.revkit-rail__review-reanchor:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--revkit-rail-accent) 15%, transparent);
+}
+.revkit-rail__review-reanchor:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.revkit-rail__review-submit {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.revkit-rail__review-event {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0;
+  margin: 0;
+  border: none;
+}
+.revkit-rail__review-event-legend {
+  padding: 0;
+  font-size: 0.75rem;
+  color: color-mix(in srgb, var(--revkit-rail-fg) 80%, transparent);
+}
+.revkit-rail__review-event-option {
+  display: inline-flex;
+  gap: 0.2rem;
+  font-size: 0.75rem;
+  align-items: center;
+}
+.revkit-rail__review-body-label {
+  font-size: 0.75rem;
+  color: color-mix(in srgb, var(--revkit-rail-fg) 80%, transparent);
+}
+.revkit-rail__review-body {
+  width: 100%;
+  padding: 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 20%, transparent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-fg);
+  font-family: inherit;
+  font-size: 0.8rem;
+  resize: vertical;
+  min-height: 3rem;
+}
+.revkit-rail__review-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.revkit-rail__review-submit-button,
+.revkit-rail__review-discard,
+.revkit-rail__review-refresh {
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 25%, transparent);
+  background: transparent;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-submit-button {
+  background: var(--revkit-rail-accent);
+  color: #ffffff;
+  border-color: var(--revkit-rail-accent);
+}
+.revkit-rail__review-submit-button:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.revkit-rail__review-submit-button:disabled,
+.revkit-rail__review-discard:disabled,
+.revkit-rail__review-refresh:disabled {
+  opacity: 0.5;
+  cursor: wait;
 }

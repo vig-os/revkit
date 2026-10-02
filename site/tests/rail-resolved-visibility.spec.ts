@@ -1,0 +1,789 @@
+// Rail resolved-thread visibility spec (issue #60).
+//
+// The bug this spec pins:
+//
+//   The reviewer posts a comment. The agent's channel bundles
+//   `reply` and `resolve` in the same turn, so
+//   `comment.replied` + `thread.resolved` events land 300-400 ms
+//   apart. The pre-fix rail filtered `resolved` threads out of
+//   `fetchThreads`, so the reply was only visible in the DOM for
+//   that narrow window before vanishing. A reviewer with only the
+//   rail open never saw the ack — and a reload did not help,
+//   because the daemon's status filter still excluded resolved.
+//
+// The fix (this repo's amendment): resolved threads stay visible
+// in the rail, anchored to their block, in a collapsed row like
+// GitHub does. When agent activity landed since the human last
+// looked, the thread stays expanded with an "unread" pill until
+// the human acknowledges it. Runs on BUILT output — the rail
+// bundle is what the daemon serves.
+//
+// Chromium-only (WebKit is #19). axe gate at each of the three
+// states: collapsed, expanded, unread.
+
+import { test, expect, type Page } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
+import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
+const DIST = resolve(__dirname, "..", "dist");
+
+const FIXTURE_REL_PATH = "docs/adr/0003-content-model-mdx-typed-data.md";
+const FIXTURE_START_LINE = 5;
+const FIXTURE_END_LINE = 5;
+const FIXTURE_PARAGRAPH_TEXT = "The rail selects text inside a stamped block and opens the composer.";
+const FIXTURE_SELECTED_QUOTE = "rail selects text inside a stamped block";
+
+interface DaemonCtx {
+  readonly child: ChildProcess;
+  readonly root: string;
+  readonly url: string;
+  readonly launchUrl: string;
+  readonly agentToken: string;
+  readonly port: number;
+}
+
+async function bootDaemon(opts: { root?: string; port?: number } = {}): Promise<DaemonCtx> {
+  if (!existsSync(DIST)) throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
+  // Round-3 test hook: an explicit `root` lets the restart spec
+  // point a second daemon at the SAME repo so `.revkit/repo-id`
+  // persists across the restart. `port` fixes the loopback port
+  // so localStorage (keyed by origin) survives too.
+  let root: string;
+  if (opts.root !== undefined) {
+    root = opts.root;
+  } else {
+    root = mkdtempSync(join(tmpdir(), "revkit-60-"));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
+    const seedRelPath = FIXTURE_REL_PATH;
+    mkdirSync(join(root, dirname(seedRelPath)), { recursive: true });
+    writeFileSync(
+      join(root, seedRelPath),
+      "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+      "utf8",
+    );
+  }
+  const args = [REVKIT_BIN, "serve", "--dir", DIST];
+  if (opts.port !== undefined) args.push("--port", String(opts.port));
+  const child = spawn("bun", args, {
+    cwd: root,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+    env: process.env,
+  });
+  const stderrChunks: string[] = [];
+  const stdoutChunks: string[] = [];
+  child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString("utf8")));
+  child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk.toString("utf8")));
+  child.on("exit", (code, signal) => {
+    if (code !== 0 && code !== null) {
+      process.stderr.write(
+        `[rail-60] daemon exited ${code}/${signal}\nstderr:\n${stderrChunks.join("")}\nstdout:\n${stdoutChunks.join("")}\n`,
+      );
+    }
+  });
+  const deadline = Date.now() + 15_000;
+  let state: { readonly pid: number; readonly port: number; readonly url: string; readonly agentToken: string } | undefined;
+  while (Date.now() < deadline) {
+    const path = join(root, ".revkit", "serve.json");
+    if (existsSync(path)) {
+      try {
+        state = JSON.parse(readFileSync(path, "utf8"));
+        break;
+      } catch {
+        // Mid-write; retry.
+      }
+    }
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (state === undefined) {
+    child.kill("SIGTERM");
+    throw new Error(
+      `revkit serve did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
+    );
+  }
+  const deadline2 = Date.now() + 2000;
+  while (Date.now() < deadline2) {
+    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
+  if (launchUrl === undefined) {
+    child.kill("SIGTERM");
+    throw new Error(`daemon started but never printed 'launch:' — stdout: ${stdoutChunks.join("")}`);
+  }
+  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+}
+
+async function shutdown(ctx: DaemonCtx, opts: { keepRoot?: boolean } = {}): Promise<void> {
+  try {
+    ctx.child.kill("SIGTERM");
+  } catch {
+    // Already dead.
+  }
+  // Wait for the child to actually exit, so `.revkit/daemon.lock`
+  // is released before a follow-on restart tries to acquire it.
+  await new Promise<void>((r) => {
+    ctx.child.on("exit", () => r());
+    // Fallback: 800 ms is well past `SIGTERM → onCleanup → exit`.
+    setTimeout(() => r(), 800);
+  });
+  if (opts.keepRoot !== true) {
+    rmSync(ctx.root, { recursive: true, force: true });
+  }
+}
+
+/** Write the same fixture the round-trip spec uses so we can drive
+ * a real DOM selection against a predictable `data-src` block. A
+ * unique suffix keeps the file per-test so `fullyParallel: true`
+ * runs cannot race on the same dist path. */
+let fixtureCounter = 0;
+function writeFixtureHtml(): { relPath: string; cleanup: () => void } {
+  fixtureCounter += 1;
+  const relPath = `rail-60-fixture-${process.pid}-${fixtureCounter}.html`;
+  const abs = join(DIST, relPath);
+  writeFileSync(
+    abs,
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail 60 fixture</title></head>
+     <body>
+       <main>
+         <h1 data-src="${FIXTURE_REL_PATH}:1-1">Rail issue #60 fixture</h1>
+         <p id="target" data-src="${FIXTURE_REL_PATH}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
+       </main>
+     </body></html>`,
+    "utf8",
+  );
+  return {
+    relPath,
+    cleanup: (): void => {
+      try {
+        rmSync(abs, { force: true });
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+/** A second fixture on a DIFFERENT source path so the multi-page
+ * round-3 spec can navigate to a page whose thread set does NOT
+ * include page A's threads (i.e. the daemon's page-scoped fetch
+ * returns empty). Round-3 review — the prune must NOT wipe page
+ * A's marks when the browser visits page B. */
+function writeSecondFixtureHtml(): { relPath: string; cleanup: () => void } {
+  fixtureCounter += 1;
+  const relPath = `rail-60-fixture-b-${process.pid}-${fixtureCounter}.html`;
+  const abs = join(DIST, relPath);
+  // Anchor at a wholly unrelated source path so a thread here
+  // could never collide with page A's data-src.
+  const otherPath = "docs/adr/0007-daemon-mcp-transport.md";
+  writeFileSync(
+    abs,
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail 60 fixture B</title></head>
+     <body>
+       <main>
+         <p data-src="${otherPath}:1-1">Page B has its own source anchors.</p>
+       </main>
+     </body></html>`,
+    "utf8",
+  );
+  return {
+    relPath,
+    cleanup: (): void => {
+      try {
+        rmSync(abs, { force: true });
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
+
+async function selectSubstring(page: Page, substring: string): Promise<void> {
+  await page.evaluate((needle: string): void => {
+    const paragraph = document.getElementById("target");
+    if (paragraph === null) throw new Error("no #target paragraph");
+    const textNode = paragraph.firstChild;
+    if (textNode === null || textNode.nodeType !== Node.TEXT_NODE) {
+      throw new Error("target has no text node");
+    }
+    const full = textNode.textContent ?? "";
+    const start = full.indexOf(needle);
+    if (start < 0) throw new Error(`'${needle}' not found in '${full}'`);
+    const range = document.createRange();
+    range.setStart(textNode, start);
+    range.setEnd(textNode, start + needle.length);
+    const sel = window.getSelection();
+    if (sel === null) throw new Error("no selection API");
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+  }, substring);
+}
+
+test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () => {
+  test.skip(({ browserName }) => browserName !== "chromium", "chromium-only");
+  test.setTimeout(120_000);
+
+  test("agent replies then resolves in a tight window; reply stays visible and is marked unread", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    try {
+      // Step 1 — launch flow, then open the fixture.
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await expect(page.getByTestId("revkit-rail-empty")).toBeVisible();
+
+      // Step 2 — the reviewer selects text and posts a comment
+      // through the rail's real DOM composer. This is the exact
+      // path the round-trip spec exercises; the bug can only fire
+      // when the thread was created by the human first.
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await expect(page.getByTestId("revkit-rail-floating")).toBeVisible();
+      await page.getByTestId("revkit-rail-floating").click();
+      await expect(page.getByTestId("revkit-rail-composer")).toBeVisible();
+      await page.getByTestId("revkit-rail-composer-input").fill("what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-composer")).toBeHidden();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+
+      // Step 3 — read the thread id back through the daemon so we
+      // can drive the fake agent against it. The daemon requires
+      // the agent bearer plus a loopback Host header.
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      expect(listRes.status).toBe(200);
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      expect(list.threads.length).toBe(1);
+      const threadId = list.threads[0]!.id;
+      const parentId = list.threads[0]!.comments[0]!.id;
+
+      // Step 4 — a fake agent immediately replies and resolves
+      // through the API with the agent bearer. This is the race
+      // the harness caught (reply + resolve inside 300-400 ms).
+      // The agent bearer makes the daemon resolve the actor as
+      // `agent`, so `comment.replied.actor.kind === "agent"` and
+      // `thread.resolved.actor.kind === "agent"` on the log —
+      // exactly what the reducer needs to project `resolvedBy`.
+      const replyRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadId)}/replies`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId, body: "ack — the fix is trivial" }),
+      });
+      expect(replyRes.status).toBe(201);
+      const resolveRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadId)}/resolve`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(resolveRes.status).toBeLessThan(300);
+
+      // Step 5 — after BOTH events, the reply is still visible in
+      // the rail and the thread carries the unread pill. This is
+      // the pre-fix regression point: `fetchThreads` filtered the
+      // resolved thread out and the reply vanished from the DOM.
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1, { timeout: 5000 });
+      await expect(page.locator(".revkit-rail__thread")).toContainText("ack — the fix is trivial", { timeout: 5000 });
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible();
+
+      // Step 6 — a full reload also shows the reply (unread
+      // persists via localStorage until the reviewer acknowledges).
+      // Pre-fix, a reload showed nothing.
+      await page.reload();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      await expect(page.locator(".revkit-rail__thread")).toContainText("ack — the fix is trivial");
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible();
+
+      // Step 7 — the header shows "Resolved (1)".
+      await expect(page.getByTestId("revkit-rail-resolved-count")).toContainText("Resolved");
+      await expect(page.getByTestId("revkit-rail-resolved-count")).toContainText("1");
+
+      // Step 8 — axe on the unread + expanded state.
+      {
+        const results = await new AxeBuilder({ page }).analyze();
+        expect(
+          results.violations,
+          JSON.stringify(results.violations, null, 2),
+        ).toEqual([]);
+      }
+
+      // Step 9 — clicking the disclosure marks it seen and
+      // collapses the thread body (a resolved-seen thread is
+      // collapsed by default, GitHub-style).
+      const toggle = page.getByTestId("revkit-rail-resolved-toggle");
+      await expect(toggle).toBeVisible();
+      // First click marks-seen and toggles expansion off.
+      await toggle.click();
+      // After the click the pill is gone (per-viewer seen state).
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      // The thread body under the disclosure is now hidden.
+      await expect(page.locator(".revkit-rail__thread-body")).toHaveAttribute("data-expanded", "false");
+      // Clicking again re-expands (manual expand overrides collapsed).
+      await toggle.click();
+      await expect(page.locator(".revkit-rail__thread-body")).toHaveAttribute("data-expanded", "true");
+      // The excerpt disappears because the thread is expanded (the
+      // full comments render instead of the collapsed summary).
+      await expect(page.getByTestId("revkit-rail-resolved-excerpt")).toBeHidden();
+
+      // Step 10 — axe on the collapsed + expanded (manual) states.
+      await toggle.click(); // collapse
+      await expect(page.locator(".revkit-rail__thread-body")).toHaveAttribute("data-expanded", "false");
+      {
+        const results = await new AxeBuilder({ page }).analyze();
+        expect(
+          results.violations,
+          JSON.stringify(results.violations, null, 2),
+        ).toEqual([]);
+      }
+      await toggle.click(); // expand
+      {
+        const results = await new AxeBuilder({ page }).analyze();
+        expect(
+          results.violations,
+          JSON.stringify(results.violations, null, 2),
+        ).toEqual([]);
+      }
+
+      // Step 11 — reopen restores the actionable state. Two entry
+      // points: the collapsed-row `revkit-rail-collapsed-reopen`
+      // button (PR #62 review) or the in-body `revkit-rail-reopen`.
+      // Verify the collapsed-row button first — it's one click from
+      // the summary. Collapse again so the button is present.
+      await toggle.click(); // collapse
+      const collapsedReopen = page.getByTestId("revkit-rail-collapsed-reopen");
+      await expect(collapsedReopen).toBeVisible();
+      await collapsedReopen.click();
+      await expect(page.getByTestId("revkit-rail-resolve")).toBeVisible({ timeout: 5000 });
+      await expect(page.getByTestId("revkit-rail-reply")).toBeVisible();
+      const afterReopen = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const reopenedList = (await afterReopen.json()) as { threads: ReadonlyArray<{ id: string; status: string }> };
+      expect(reopenedList.threads.find((t) => t.id === threadId)?.status).toBe("open");
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
+  /** Shared setup: boot daemon, write fixture, seed a thread and
+   * post an agent reply through the API, then click to mark the
+   * pill seen. Ends with a resolved-by-agent thread that the
+   * viewer has acknowledged (no pill). Returns handles to drive
+   * the follow-up steps. */
+  async function setUpAckedThread(page: Page): Promise<{
+    daemon: DaemonCtx;
+    fixture: ReturnType<typeof writeFixtureHtml>;
+    threadId: string;
+    cleanup: () => Promise<void>;
+  }> {
+    const daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    let cleanedUp = false;
+    const cleanup = async (): Promise<void> => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      fixture.cleanup();
+      await shutdown(daemon);
+    };
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      await page.getByTestId("revkit-rail-composer-input").fill("what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      const threadId = list.threads[0]!.id;
+      const parentId = list.threads[0]!.comments[0]!.id;
+      const replyRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadId)}/replies`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId, body: "ack — done" }),
+      });
+      expect(replyRes.status).toBe(201);
+      // Wait for the reply to reach the DOM, then acknowledge it
+      // by clicking the thread body. After this, the seen-mark is
+      // set to the agent-reply createdAt.
+      await expect(page.locator(".revkit-rail__thread")).toContainText("ack — done", { timeout: 5000 });
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible();
+      await page.getByTestId("revkit-rail-thread").click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      return { daemon, fixture, threadId, cleanup };
+    } catch (err) {
+      await cleanup();
+      throw err;
+    }
+  }
+
+  test("PR #62 blocker: human's own resolve does NOT retrigger the unread pill", async ({ page }) => {
+    const { daemon, threadId, cleanup } = await setUpAckedThread(page);
+    try {
+      // Human resolves through the rail (browser-side). Even
+      // though `updatedAt` bumps, this must not fire the pill.
+      await page.getByTestId("revkit-rail-resolve").click();
+      // Wait for the resolve to reach the daemon so the SSE has
+      // fired at least once (proves `updatedAt` bumped).
+      await expect.poll(async () => {
+        const r = await fetch(`${daemon.url}/api/threads`, {
+          headers: {
+            host: `127.0.0.1:${daemon.port}`,
+            authorization: `Bearer ${daemon.agentToken}`,
+            accept: "application/json",
+          },
+        });
+        const l = (await r.json()) as { threads: Array<{ id: string; status: string }> };
+        return l.threads.find((t) => t.id === threadId)?.status;
+      }, { timeout: 5000 }).toBe("resolved");
+      // The load-bearing assertion: no pill after the reviewer's
+      // own resolve. The pre-fix `updatedAt` compare would fire
+      // it because `updatedAt` was bumped by the resolve event.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      // Reload as well — the seen mark persists.
+      await page.reload();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("PR #62 blocker: human's own reopen does NOT retrigger the unread pill", async ({ page }) => {
+    const { daemon, threadId, cleanup } = await setUpAckedThread(page);
+    try {
+      // Resolve then reopen — both by the human. Each bumps
+      // `updatedAt`; neither is agent activity.
+      await page.getByTestId("revkit-rail-resolve").click();
+      await expect.poll(async () => {
+        const r = await fetch(`${daemon.url}/api/threads`, {
+          headers: {
+            host: `127.0.0.1:${daemon.port}`,
+            authorization: `Bearer ${daemon.agentToken}`,
+            accept: "application/json",
+          },
+        });
+        const l = (await r.json()) as { threads: Array<{ id: string; status: string }> };
+        return l.threads.find((t) => t.id === threadId)?.status;
+      }, { timeout: 5000 }).toBe("resolved");
+      // Reopen via the collapsed-row shortcut (one click).
+      const collapsedReopen = page.getByTestId("revkit-rail-collapsed-reopen");
+      await expect(collapsedReopen).toBeVisible();
+      await collapsedReopen.click();
+      await expect.poll(async () => {
+        const r = await fetch(`${daemon.url}/api/threads`, {
+          headers: {
+            host: `127.0.0.1:${daemon.port}`,
+            authorization: `Bearer ${daemon.agentToken}`,
+            accept: "application/json",
+          },
+        });
+        const l = (await r.json()) as { threads: Array<{ id: string; status: string }> };
+        return l.threads.find((t) => t.id === threadId)?.status;
+      }, { timeout: 5000 }).toBe("open");
+      // Load-bearing assertion: no pill after the reviewer's reopen.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      await page.reload();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("PR #62 blocker: a re-anchor / orphan pipeline event does NOT retrigger the unread pill", async ({ page }) => {
+    const { daemon, threadId, cleanup } = await setUpAckedThread(page);
+    try {
+      // Trigger the re-anchor pipeline by mutating the seeded
+      // source file so the pipeline moves / orphans the thread.
+      // GET /api/threads triggers the daemon's `refresh(path)` and
+      // emits `thread.reanchored` or `thread.orphaned`, either of
+      // which bumps `updatedAt`.
+      const seedPath = join(daemon.root, FIXTURE_REL_PATH);
+      writeFileSync(
+        seedPath,
+        // Replace with different content so the anchor cannot
+        // resolve — the pipeline emits `thread.orphaned`.
+        "# Title\n\ncompletely different content on every line\nmore\nmore still\nmore\nfinal\n",
+        "utf8",
+      );
+      // Poke the daemon to force a refresh scan.
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      expect(listRes.status).toBe(200);
+      // Wait for the SSE to propagate the orphan event — either
+      // the thread is orphaned OR its updatedAt is newer than the
+      // pre-existing agent reply's createdAt.
+      await expect.poll(async () => {
+        const r = await fetch(`${daemon.url}/api/threads`, {
+          headers: {
+            host: `127.0.0.1:${daemon.port}`,
+            authorization: `Bearer ${daemon.agentToken}`,
+            accept: "application/json",
+          },
+        });
+        const l = (await r.json()) as {
+          threads: Array<{ id: string; status: string; updatedAt: string; comments: Array<{ createdAt: string; author: { kind: string } }> }>;
+        };
+        const t = l.threads.find((th) => th.id === threadId);
+        if (t === undefined) return false;
+        const lastAgentAt = t.comments
+          .filter((c) => c.author.kind === "agent")
+          .map((c) => c.createdAt)
+          .sort()
+          .pop();
+        // A re-anchor bumped updatedAt strictly past the last
+        // agent activity — that's the pre-fix trigger condition.
+        return lastAgentAt !== undefined && t.updatedAt > lastAgentAt;
+      }, { timeout: 5000 }).toBe(true);
+      // Load-bearing assertion: no pill fired from the pipeline
+      // event. Pre-fix, this was the "phantom unread" bug.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("PR #62 review nit: 'Mark all seen' clears the pill on every unread thread at once", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      // Create three human threads (three different substrings
+      // so we get three separate anchors), then post an
+      // agent reply to each.
+      const slices = [
+        "rail selects text",
+        "inside a stamped block",
+        "opens the composer",
+      ];
+      for (const slice of slices) {
+        await selectSubstring(page, slice);
+        await page.getByTestId("revkit-rail-floating").click();
+        await page.getByTestId("revkit-rail-composer-input").fill(`ask about "${slice}"`);
+        await page.getByTestId("revkit-rail-submit").click();
+        await expect(page.getByTestId("revkit-rail-composer")).toBeHidden();
+      }
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(3);
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      expect(list.threads.length).toBe(3);
+      for (const thread of list.threads) {
+        const r = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(thread.id)}/replies`, {
+          method: "POST",
+          headers: {
+            host: `127.0.0.1:${daemon.port}`,
+            authorization: `Bearer ${daemon.agentToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ parentId: thread.comments[0]!.id, body: "ack" }),
+        });
+        expect(r.status).toBe(201);
+      }
+      // Wait for all three unread pills to render, then hit "Mark
+      // all seen" and assert every pill is gone in one click.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toHaveCount(3, { timeout: 5000 });
+      const bulk = page.getByTestId("revkit-rail-mark-all-seen");
+      await expect(bulk).toBeVisible();
+      await bulk.click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toHaveCount(0);
+      // The bulk button hides itself when there is nothing left
+      // to acknowledge.
+      await expect(bulk).toBeHidden();
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
+  test("PR #62 round-3 blocker: seen mark on page A survives a visit to page B and back", async ({ page }) => {
+    // The pre-round-3 prune ran against `threads()` — the
+    // page-scoped list — so visiting page B (which has a
+    // DIFFERENT set of threads) wiped page A's mark, and the pill
+    // sprang back with no new agent activity. The round-3 fix
+    // prunes against the UNSCOPED thread-id list (from
+    // `/api/threads` with no `path` filter).
+    const daemon = await bootDaemon();
+    // Two fixtures on DIFFERENT source paths: the threads on each
+    // page have distinct `data-src` anchors, and `fetchThreads`
+    // asks the daemon for threads on the current page's paths.
+    const pageA = writeFixtureHtml();
+    const pageB = writeSecondFixtureHtml();
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      // ── Page A: create thread + agent reply + acknowledge ──
+      await page.goto(`${daemon.url}/${pageA.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      await page.getByTestId("revkit-rail-composer-input").fill("A: what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      const threadA = list.threads[0]!;
+      const replyRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadA.id)}/replies`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId: threadA.comments[0]!.id, body: "A: ack" }),
+      });
+      expect(replyRes.status).toBe(201);
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible({ timeout: 5000 });
+      await page.getByTestId("revkit-rail-thread").click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      // ── Navigate to page B ──
+      await page.goto(`${daemon.url}/${pageB.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      // Page B has no threads of its own; the daemon has threads
+      // on other paths, but the page-scoped fetch here returns
+      // an empty set.
+      await expect(page.getByTestId("revkit-rail-empty")).toBeVisible();
+      // ── Back to page A ──
+      await page.goto(`${daemon.url}/${pageA.relPath}`);
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // Load-bearing: the seen mark for thread A must have
+      // survived the round-trip to page B. Pre-round-3, the
+      // page-B prune wiped it and the pill fired again.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+    } finally {
+      pageA.cleanup();
+      pageB.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
+  test("PR #62 round-3 blocker: seen mark survives a daemon restart on the same --port", async ({ page }) => {
+    // Round-3: the pre-fix key was the per-start `instanceId`, so
+    // a restart minted a new key and every ack looked unread
+    // again. The fix keys by the persistent `.revkit/repo-id`,
+    // which survives the restart.
+    let daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      await page.getByTestId("revkit-rail-composer-input").fill("restart: what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // Agent replies + acknowledge.
+      const listRes = await fetch(`${daemon.url}/api/threads`, {
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          accept: "application/json",
+        },
+      });
+      const list = (await listRes.json()) as {
+        threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+      };
+      const parentId = list.threads[0]!.comments[0]!.id;
+      const threadId = list.threads[0]!.id;
+      const replyRes = await fetch(`${daemon.url}/api/threads/${encodeURIComponent(threadId)}/replies`, {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId, body: "restart: ack" }),
+      });
+      expect(replyRes.status).toBe(201);
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible({ timeout: 5000 });
+      await page.getByTestId("revkit-rail-thread").click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      // ── Restart the daemon on the same repo + same port ──
+      const savedPort = daemon.port;
+      const savedRoot = daemon.root;
+      await shutdown(daemon, { keepRoot: true });
+      daemon = await bootDaemon({ root: savedRoot, port: savedPort });
+      // A restart mints a new launch code — walk the launch URL
+      // again so the browser has a valid session cookie.
+      const nav2 = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav2?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // Load-bearing: the seen mark from before the restart must
+      // still be in effect (keyed by `repoId`, which is
+      // persistent). Pre-round-3, the pill was back.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+});
