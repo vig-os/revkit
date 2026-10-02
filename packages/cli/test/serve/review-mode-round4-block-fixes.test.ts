@@ -80,6 +80,7 @@ async function startCtx(overrides?: {
   threads?: readonly GhReviewThread[];
   failBeforeOnce?: string;
   loseResponseOnce?: string;
+  operationOccurrence?: number;
   rejectOperation?: string;
   delayAfterAcceptOnce?: {
     operation: string;
@@ -111,13 +112,20 @@ async function startCtx(overrides?: {
     { pendingState: pending, viewerLogin: "test-reviewer", ...overrides },
   );
   let injected = false;
+  let operationCount = 0;
   const wrappedFetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const body = typeof init?.body === "string" ? init.body : "";
     if (overrides?.rejectOperation !== undefined && body.includes(overrides.rejectOperation)) {
       throw new Error(`forbidden-operation:${overrides.rejectOperation}`);
     }
     const operation = overrides?.failBeforeOnce ?? overrides?.loseResponseOnce;
-    if (!injected && operation !== undefined && body.includes(`mutation ${operation}`)) {
+    if (operation !== undefined && body.includes(`mutation ${operation}`)) operationCount++;
+    if (
+      !injected &&
+      operation !== undefined &&
+      operationCount === (overrides?.operationOccurrence ?? 1) &&
+      body.includes(`mutation ${operation}`)
+    ) {
       injected = true;
       if (overrides?.failBeforeOnce !== undefined) throw new Error("injected-before-accept");
       await fakeFetch(input, init);
@@ -291,6 +299,27 @@ async function restartCtx(ctx: Ctx): Promise<Ctx> {
   return { ...ctx, handle, cookie: setCookie.slice(0, setCookie.indexOf(";")) };
 }
 
+async function deletePendingAndHeal(ctx: Ctx): Promise<void> {
+  const reviewNodeId = ctx.fake.reviewNodeId;
+  if (reviewNodeId === null) throw new Error("expected pending review");
+  const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+  await adapter.deletePendingReview({ reviewId: reviewNodeId });
+  const response = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+    body: "{}",
+  });
+  expect(response.status).toBe(201);
+}
+
+async function declineRecovery(ctx: Ctx): Promise<Response> {
+  return await fetch(`${ctx.handle.url}/api/review/decline-repost`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+    body: "{}",
+  });
+}
+
 // ────────────────────────────────────────────────────────────────
 // B1 — deleted-on-github recovery flow.
 // ────────────────────────────────────────────────────────────────
@@ -454,6 +483,80 @@ describe("B1 — deleted-on-github recovery: strands revert to pending-sync + Re
     });
     expect(submit.status).toBe(201);
     expect(ctx.fake.submits).toHaveLength(1);
+  });
+
+  for (const phase of ["linked", "response-lost"] as const) {
+    test(`Discard removes a remotely accepted recovery draft after ${phase}`, async () => {
+      let ctx = await startCtx(
+        phase === "response-lost"
+          ? { loseResponseOnce: "AddThread", operationOccurrence: 2 }
+          : undefined,
+      );
+      await postComment(ctx, "discard me", `discard-${phase}`);
+      await deletePendingAndHeal(ctx);
+
+      const repost = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+        body: "{}",
+      });
+      expect(repost.status).toBe(201);
+      expect(ctx.fake.drafts).toHaveLength(1);
+      expect(ctx.fake.reviewNodeId).not.toBeNull();
+
+      const decline = await declineRecovery(ctx);
+      expect(decline.status).toBe(201);
+      expect(ctx.fake.drafts).toHaveLength(0);
+      expect(ctx.fake.reviewNodeId).toBeNull();
+      expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
+
+      const submit = await fetch(`${ctx.handle.url}/api/review/submit`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+        body: JSON.stringify({ event: "COMMENT" }),
+      });
+      expect(submit.status).not.toBe(201);
+      expect(ctx.fake.submits).toHaveLength(0);
+
+      ctx = await restartCtx(ctx);
+      const retry = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+        body: "{}",
+      });
+      expect(retry.status).toBe(201);
+      expect(ctx.fake.drafts).toHaveLength(0);
+      expect(ctx.fake.reviewNodeId).toBeNull();
+    });
+  }
+
+  test("Discard cancels a mixed pending-sync and failed recovery set", async () => {
+    let ctx = await startCtx({ failBeforeOnce: "AddThread", operationOccurrence: 2 });
+    await postComment(ctx, "pending recovery", "mixed-pending");
+    await postComment(ctx, "failed recovery", "mixed-failed");
+    let state = await readState(ctx);
+    expect(state.state.commentSync?.map((entry) => entry.state.kind).sort()).toEqual(["failed", "synced"]);
+
+    await deletePendingAndHeal(ctx);
+    state = await readState(ctx);
+    expect(state.state.commentSync?.map((entry) => entry.state.kind).sort()).toEqual(["failed", "pending-sync"]);
+    const decline = await declineRecovery(ctx);
+    expect(decline.status).toBe(201);
+    expect(((await decline.json()) as { declined: number }).declined).toBe(2);
+    state = await readState(ctx);
+    expect(state.state.unsyncedCommentIds).toEqual([]);
+    expect(state.state.commentSync?.map((entry) => entry.state.kind)).toEqual(["cancelled", "cancelled"]);
+
+    ctx = await restartCtx(ctx);
+    const retry = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(retry.status).toBe(201);
+    expect(ctx.fake.reviewNodeId).toBeNull();
+    expect(ctx.fake.drafts).toHaveLength(0);
+    expect((await readState(ctx)).state.unsyncedCommentIds).toEqual([]);
   });
 });
 

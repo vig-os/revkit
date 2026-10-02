@@ -565,6 +565,20 @@ export function makeFakeGithubFetch(prs: readonly FakePr[], options: FakeFetchOp
             },
           });
         }
+        case "DeleteComment": {
+          if (refuseAllWrites || pending === undefined) {
+            throw new Error("fake github: refusing DeleteComment");
+          }
+          const id = vars.id as string;
+          const draftIndex = pending.drafts.findIndex((draft) => draft.commentNodeId === id);
+          if (draftIndex >= 0) pending.drafts.splice(draftIndex, 1);
+          const replyIndex = pending.replies.findIndex((reply) => reply.commentNodeId === id);
+          if (replyIndex >= 0) pending.replies.splice(replyIndex, 1);
+          if (draftIndex < 0 && replyIndex < 0) {
+            return jsonResponse({ errors: [{ type: "NOT_FOUND", message: `Comment '${id}' does not exist.` }] });
+          }
+          return jsonResponse({ data: { deletePullRequestReviewComment: { clientMutationId: null } } });
+        }
         case "SubmitReview": {
           if (refuseAllWrites || pending === undefined) {
             throw new Error(`fake github: refusing SubmitReview`);
