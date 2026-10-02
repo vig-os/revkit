@@ -20,8 +20,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   RENDERABLE_EXTENSIONS,
+  fastPathRefusalReasons,
   isRenderablePath,
   renderDocFragment,
+  type FastPathRefusalReason,
 } from "../../src/serve/publish-render.ts";
 import { ARTICLE_OPEN_MARKER, spliceArticleBody } from "../../src/serve/publish.ts";
 
@@ -179,5 +181,162 @@ ${ARTICLE_OPEN_MARKER}<div><div>a</div><div>b</div></div></div>
     if (spliced === undefined) return;
     expect(spliced).toContain("<p>replaced</p>");
     expect(spliced).not.toContain("<div><div>a</div>");
+  });
+});
+
+/** Feature coverage matrix for the fast path (M2 item 9, story A4).
+ *
+ * Table-driven on purpose: the ADR pins "the fast path either renders
+ * a source byte-parity with a full build or REFUSES it", and this
+ * table is the exhaustive statement of which is which for every
+ * markdown feature the corpus contains. A new refusal tag, a widened
+ * `RENDERABLE_EXTENSIONS`, or a feature quietly flipping from refused
+ * to accepted (which would break the equivalence contract) turns one
+ * of these red rather than needing a human to notice.
+ *
+ * The "missing shell" row is not a renderer concern — it is a SPLICE
+ * concern, and it is covered here because the two together are the
+ * full decision the daemon makes for one route: render → splice →
+ * serve, or refuse → build → serve. */
+describe("fast-path feature matrix", () => {
+  const ACCEPTED: readonly {
+    readonly label: string;
+    readonly source: string;
+    readonly expect: readonly RegExp[];
+  }[] = [
+    {
+      label: "prose",
+      source: "A plain paragraph with **bold**, _emphasis_ and a [link](../adr/0001-static-first-site-stack.md).\n",
+      expect: [/<strong>bold<\/strong>/, /<em>emphasis<\/em>/, /href="\/adr\/0001-static-first-site-stack\/"/],
+    },
+    {
+      label: "display + inline math",
+      source: "$$\nE = \\sum_{n=1}^{N} p_n\n$$\n\nInline $\\varphi$ math.\n",
+      // KaTeX emits both the MathML and the HTML rendering; assert on
+      // the parts that survive independently of KaTeX's version.
+      expect: [/class="katex-display"/, /class="katex-mathml"/, /<annotation encoding="application\/x-tex">E = /],
+    },
+    {
+      label: "a GFM table",
+      source: "| Option | Cost |\n|---|---|\n| `fast` | low |\n| `full` | high |\n",
+      expect: [/<table/, /<th/, /<td/],
+    },
+    {
+      label: "footnotes",
+      source: "Body text[^a].\n\n[^a]: The note.\n",
+      expect: [/footnote/],
+    },
+    {
+      label: "nested list items",
+      source: "- outer\n  - inner\n    - deepest\n",
+      expect: [/<ul/, /outer/, /deepest/],
+    },
+    {
+      label: "inline code and a blockquote",
+      source: "Inline `code` here.\n\n> Quoted text.\n",
+      expect: [/<code>code<\/code>/, /<blockquote[ >]/],
+    },
+  ];
+
+  const REFUSED: readonly {
+    readonly label: string;
+    readonly source: string;
+    readonly reason: FastPathRefusalReason;
+  }[] = [
+    {
+      label: "a top-level fenced code block",
+      source: "Text.\n\n```ts\nconst x = 1;\n```\n",
+      reason: "code-fence",
+    },
+    {
+      label: "a tilde fence",
+      source: "Text.\n\n~~~python\nx = 1\n~~~\n",
+      reason: "code-fence",
+    },
+    {
+      label: "a NESTED fence (inside a list item) — the case a naive line-start regex misses",
+      source: "- Item\n\n  ```ts\n  const x = 1;\n  ```\n",
+      reason: "code-fence",
+    },
+    {
+      label: "an indented code block after a blank line",
+      source: "Text.\n\n    const x = 1;\n",
+      reason: "indented-code",
+    },
+    {
+      label: "an indented code block at the very start of the source",
+      source: "    const x = 1;\n",
+      reason: "indented-code",
+    },
+    {
+      label: "a Starlight aside",
+      source: "Text.\n\n:::note\nA note.\n:::\n",
+      reason: "starlight-directive",
+    },
+    {
+      label: "a Starlight `caution` aside",
+      source: "Text.\n\n:::caution\nCareful.\n:::\n",
+      reason: "starlight-directive",
+    },
+  ];
+
+  for (const row of ACCEPTED) {
+    test(`ACCEPTS ${row.label}, rendering the feature it names`, async () => {
+      const result = await renderDocFragment({
+        repoRoot: REPO_ROOT,
+        path: "docs/adr/x.md",
+        source: `# Title\n\n${row.source}`,
+      });
+      if (result.refused === true) {
+        throw new Error(`expected ${row.label} to be accepted, got refusal '${result.reason}'`);
+      }
+      for (const pattern of row.expect) expect(result.html).toMatch(pattern);
+    });
+  }
+
+  for (const row of REFUSED) {
+    test(`REFUSES ${row.label} as '${row.reason}'`, async () => {
+      const result = await renderDocFragment({
+        repoRoot: REPO_ROOT,
+        path: "docs/adr/x.md",
+        source: `# Title\n\n${row.source}`,
+      });
+      expect(result.refused).toBe(true);
+      if (result.refused !== true) return;
+      expect(result.reason).toBe(row.reason);
+    });
+  }
+
+  test("every refusal reason the renderer can return is exercised by this table", async () => {
+    // Guards the table against rotting: a new tag added to the
+    // renderer must be added here, or this goes red.
+    for (const reason of fastPathRefusalReasons) {
+      expect(REFUSED.some((row) => row.reason === reason)).toBe(true);
+    }
+  });
+
+  test("a plot component renders through the fast path (ADR-0004)", async () => {
+    const result = await renderDocFragment({
+      repoRoot: REPO_ROOT,
+      path: "docs/adr/x.md",
+      source: `# Title\n\nimport { Plot } from "@revkit/components/Plot";\n\n<Plot spec="../../../plots/curve/spec.vl.json" />\n`,
+    });
+    if (result.refused === true) throw new Error(`expected the plot fixture to be accepted, got '${result.reason}'`);
+    // The component survives into the HTML as an element; the SVG
+    // itself is produced at build time by the site's plot loader,
+    // which is why a plot publish is `data-only` rather than fast.
+    expect(result.html).toMatch(/<Plot|sl-markdown|Plot/);
+  });
+
+  test("a route with no built shell splices to undefined — the shape `shell-missing` reports", async () => {
+    // `spliceArticleBody` returns undefined when the shell has no
+    // article region at all. The daemon maps that to a `shell-missing`
+    // build item; assert the mapping's premise here so a change to
+    // the splicer's contract cannot silently turn a missing shell
+    // into a silently-empty page.
+    expect(spliceArticleBody("<!doctype html><html><body><h1>no article region</h1></body></html>", "<p>x</p>"))
+      .toBeUndefined();
+    expect(spliceArticleBody(`<div>${ARTICLE_OPEN_MARKER}<p>old</p></div>`, "<p>new</p>"))
+      .toBe(`<div>${ARTICLE_OPEN_MARKER}<p>new</p></div>`);
   });
 });

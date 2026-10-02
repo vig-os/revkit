@@ -42,6 +42,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import {
   fastPathRefusalFor,
+  fastPathRefusalReasons,
   renderDocFragment,
 } from "../../src/serve/publish-render.ts";
 
@@ -97,6 +98,19 @@ in-line with the surrounding text.
 [^drift]: The fast path and \`astro build\` MUST emit the same article
 body — same \`data-src\` stamps, same heading ids, same cross-doc
 links.
+
+## A table and a cross-doc link
+
+| Path | Route | Refused fast? |
+| --- | --- | --- |
+| \`docs/adr/0001-static-first-site-stack.md\` | \`/adr/0001-static-first-site-stack/\` | no |
+| \`docs/FEATURE-MATRIX.md\` | \`/feature-matrix/\` | no |
+
+The ADR above is [ADR-0001](./0001-static-first-site-stack.md#decision);
+the matrix is [the feature matrix](../FEATURE-MATRIX.md). Both hrefs
+must come out rewritten to site routes, which is what the round-3
+negative guard (drop the link-rewriter, watch equivalence break)
+depends on.
 `;
 
 /** Discover every `.md` doc under `docs/adr/`, `docs/designs/` and
@@ -233,7 +247,11 @@ describe("fast-path ↔ full-build FULL HTML equivalence (ADR-0001 amendment)", 
         // The test asserts the refusal shape here.
         expect(result.refused).toBe(true);
         if (result.refused === true) {
-          expect(["code-fence", "starlight-directive"]).toContain(result.reason);
+          // Every tag the renderer can return, not a hardcoded pair —
+          // the round-3 `indented-code` tag slipped past the old
+          // two-element list and would have failed here had a repo doc
+          // used one.
+          expect(fastPathRefusalReasons).toContain(result.reason);
         }
         return;
       }
