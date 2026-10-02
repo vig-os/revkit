@@ -26,6 +26,20 @@ import { createMemo, createResource, createSignal, For, onCleanup, Show, type JS
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 import {
+  createSeqGate,
+  readResumeSeq,
+  sinceForSubscribe,
+  writeResumeSeq,
+  type ResumeStorage,
+} from "./resume-point.ts";
+import {
+  readDraft,
+  removeDraft,
+  saveDraft,
+  sweepExpiredDrafts,
+  type DraftStorage,
+} from "./drafts.ts";
+import {
   excerptOf,
   formatRelativeTime,
   isThreadUnread,
@@ -576,10 +590,54 @@ function normaliseCurrentRoute(pathname: string): string {
   return path.replace(/\/+/g, "/");
 }
 
+/** Where to open `/events` from.
+ *
+ * A warm tab (something already wrote a resume point — i.e. this page
+ * load was itself caused by an event) resumes from that point. A cold
+ * tab probes `/api/events-head` and resumes from the log's tip: the
+ * page has just loaded current server state, so replaying history
+ * could only re-fire actions, never inform it.
+ *
+ * A failed probe degrades to `since=0` (full replay). That is safe,
+ * not merely degraded: the per-seq gate in `onmessage` means a
+ * replayed event this tab already acted on is dropped, so the worst
+ * case is ONE extra reload followed by quiescence. The resume point is
+ * the optimisation; the gate is the safety net. */
+async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<number> {
+  const stored = readResumeSeq(storage);
+  if (stored > 0) return stored;
+  try {
+    const response = await fetch("/api/events-head", {
+      headers: { accept: "application/json" },
+      credentials: "same-origin",
+    });
+    if (!response.ok) return 0;
+    const body = (await response.json()) as { head?: unknown };
+    return sinceForSubscribe(stored, typeof body.head === "number" ? body.head : 0);
+  } catch {
+    return 0;
+  }
+}
+
 /** SSE subscriber that re-fetches threads whenever the daemon reports
  * a comment / thread event. Reconnects on close with an exponential
  * backoff up to 30 s — a paused laptop can wake into a stale stream
- * and this brings it back quickly without hammering the daemon. */
+ * and this brings it back quickly without hammering the daemon.
+ *
+ * **Two independent guards against acting twice on one event** (M2
+ * item 9, PR-56 blocker):
+ *
+ * 1. A resume point, so the daemon does not replay what this tab has
+ *    already seen (see `resolveInitialSince`).
+ * 2. A monotonic per-seq gate inside `onmessage`, so ANY
+ *    duplicate — a replay that raced the resume point, a reconnect
+ *    that re-delivered a frame, a second tab's worth of history — is
+ *    dropped before it can bump state or navigate. This is what makes
+ *    "reload on `build.succeeded`" safe: the reload is a reaction to a
+ *    NEW event, never to the replay of the one that caused it.
+ *
+ * The resume point is persisted BEFORE any action, so the reload the
+ * action triggers starts the next page load already past it. */
 function subscribeEvents(
   onBump: (event: RailReviewEvent) => void,
   onModeBump: () => void = () => {},
@@ -604,14 +662,44 @@ function subscribeEvents(
   let closed = false;
   let source: EventSource | undefined;
   let retryDelayMs = 500;
+  /** Monotonic per-seq gate: a replay is dropped before it can bump
+   * state or navigate. Seeded with the persisted resume point so the
+   * gate holds on its own even if `?since=` does not — see
+   * `rail/resume-point.ts`. */
+  const gate = createSeqGate(readResumeSeq(sessionStorageOrUndefined()));
+  /** Resolved once, on first subscribe; reused across reconnects so a
+   * reconnect does not re-probe (and does not drift to a newer head,
+   * which would skip events the browser missed while disconnected —
+   * the daemon's `?since` plus the persisted resume point covers that
+   * window instead). */
+  let initialSince: Promise<number> | undefined;
   const kick = (): void => {
     if (closed) return;
-    // `EventSource` sends the session cookie automatically because we
-    // opened the page under the daemon's own origin.
-    source = new EventSource("/events");
+    initialSince ??= resolveInitialSince(sessionStorageOrUndefined());
+    void initialSince.then((since) => {
+      if (closed) return;
+      // `EventSource` sends the session cookie automatically because
+      // we opened the page under the daemon's own origin.
+      source = new EventSource(
+        since > 0 ? `/events?since=${encodeURIComponent(String(since))}` : "/events?since=0",
+      );
+      attach();
+    });
+  };
+  const attach = (): void => {
+    if (closed || source === undefined) return;
     source.onmessage = (message: MessageEvent<string>): void => {
       try {
         const event = JSON.parse(message.data) as RailReviewEvent;
+        // Idempotence gate. A durable event carries a positive seq; a
+        // replay of one this tab already handled is dropped HERE,
+        // before any bump or navigation. Ephemeral frames (presence)
+        // carry no seq and are always processed — they are not on the
+        // log and cannot be replayed.
+        if (typeof event.seq === "number" && !gate.accept(event.seq)) return;
+        // Persist BEFORE acting: a reload triggered below must start
+        // the next page load past this seq.
+        writeResumeSeq(sessionStorageOrUndefined(), event.seq);
         // Any comment/thread transition is a reason to re-fetch. We
         // do not merge into local state — the daemon is authoritative
         // and a re-fetch is one round-trip we can afford.
@@ -723,44 +811,45 @@ function subscribeEvents(
   };
 }
 
-const DRAFT_KEY_PREFIX = "revkit.rail.draft:";
+function sessionStorageOrUndefined(): (Storage & DraftStorage) | undefined {
+  // `sessionStorage` is a getter on `window` and throws in some
+  // sandboxed / privacy contexts; a bare read would take the whole rail
+  // down, so probe once per call and let the helpers degrade.
+  try {
+    return window.sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
 
 function saveReplyDraftsToSessionStorage(): void {
-  try {
-    const forms = document.querySelectorAll<HTMLFormElement>(
-      "form.revkit-rail__reply-form[data-thread-id]",
-    );
-    for (const form of Array.from(forms)) {
-      const threadId = form.getAttribute("data-thread-id");
-      const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
-      if (threadId === null || textarea === null) continue;
-      if (textarea.value.length === 0) sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${threadId}`);
-      else sessionStorage.setItem(`${DRAFT_KEY_PREFIX}${threadId}`, textarea.value);
-    }
-  } catch {
-    // Storage can be unavailable in private browsing contexts.
+  const storage = sessionStorageOrUndefined();
+  if (storage === undefined) return;
+  // Sweep first, so an abandoned tab's drafts do not accumulate
+  // indefinitely even while the reviewer is actively using the rail.
+  sweepExpiredDrafts(storage, Date.now());
+  const forms = document.querySelectorAll<HTMLFormElement>(
+    "form.revkit-rail__reply-form[data-thread-id]",
+  );
+  for (const form of Array.from(forms)) {
+    const threadId = form.getAttribute("data-thread-id");
+    const textarea = form.querySelector<HTMLTextAreaElement>("textarea");
+    if (threadId === null || textarea === null) continue;
+    saveDraft(storage, threadId, textarea.value, Date.now());
   }
 }
 
 function restoreReplyDraftFromSessionStorage(threadId: string, textarea: HTMLTextAreaElement): boolean {
-  try {
-    const saved = sessionStorage.getItem(`${DRAFT_KEY_PREFIX}${threadId}`);
-    if (saved !== null && saved.length > 0) {
-      textarea.value = saved;
-      return true;
-    }
-  } catch {
-    // Best effort only.
+  const draft = readDraft(sessionStorageOrUndefined(), threadId, Date.now());
+  if (draft !== undefined && draft.text.length > 0) {
+    textarea.value = draft.text;
+    return true;
   }
   return false;
 }
 
 function clearReplyDraftFor(threadId: string): void {
-  try {
-    sessionStorage.removeItem(`${DRAFT_KEY_PREFIX}${threadId}`);
-  } catch {
-    // Best effort only.
-  }
+  removeDraft(sessionStorageOrUndefined(), threadId);
 }
 
 /** Try to find the block on the page whose `data-src` matches

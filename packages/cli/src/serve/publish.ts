@@ -189,6 +189,7 @@ export type PublishOutcome =
       readonly ok: false;
       readonly kind:
         | "confinement"
+        | "too-many-files"
         | "too-large"
         | "check-failed"
         | "render-failed"
@@ -282,11 +283,20 @@ async function runPublishInner(
   if (files.length === 0) {
     return { ok: false, kind: "confinement", reason: "publish: batch is empty" };
   }
+  // The cap is over the WHOLE batch (`docs` + `data` together), not
+  // per array — a caller splitting its work across the two arrays does
+  // not get a bigger budget. `too-many-files` is its own kind rather
+  // than `confinement`: `confinement` tells an agent its PATH is
+  // wrong, and pointing it at a non-existent path bug when the real
+  // problem is batch size costs a debugging round-trip on every
+  // occurrence.
   if (files.length > MAX_FILES_PER_PUBLISH) {
     return {
       ok: false,
-      kind: "confinement",
-      reason: `publish: batch has ${files.length} files, cap is ${MAX_FILES_PER_PUBLISH}`,
+      kind: "too-many-files",
+      reason:
+        `publish: batch has ${files.length} files (${input.docs.length} docs + ${(input.data ?? []).length} data), ` +
+        `cap is ${MAX_FILES_PER_PUBLISH} across BOTH arrays combined — split it into two publishes`,
     };
   }
   // 1) Aggregate size + per-file size caps + normalise line endings.
@@ -768,34 +778,58 @@ function buildStagedOverlay(
  * resolution is a point-in-time answer; between it and the write, a
  * concurrent process (or the agent itself, via another tool) can
  * replace `docs/adr` with a symlink to `/etc`, or make the leaf a
- * symlink to `/etc/passwd`. Three conditions have to hold together:
+ * symlink to `/etc/passwd`. Four conditions have to hold together:
  *
  *   1. `resolvePublishTarget` still accepts the path — same
  *      allowlist, same no-symlink rule, same real root.
  *   2. It resolves to the SAME absolute path as before, so the write
  *      cannot be redirected somewhere else inside the repo.
- *   3. The parent directory still realpaths to itself and still sits
- *      under the repo's realpath, so the leaf name cannot be
- *      interpreted through a swapped directory.
+ *   3. The parent realpaths to ITSELF, so no symlink sits between the
+ *      repo root and the directory the leaf name will be created in.
+ *   4. The parent realpaths INSIDE the repo root, and is a DIRECTORY
+ *      (not a file that happens to sit where the directory was).
  *
- * A swap that lands between THIS check and the rename is still
- * possible in principle; that residual window is why the staged file
- * itself is created with `O_NOFOLLOW` and why the parent is re-checked
- * per file. The point is that the decision is re-derived from the
- * filesystem at the last moment rather than trusted from earlier. */
+ * **What this guarantees, precisely.** The decision is re-derived from
+ * the filesystem at the last moment rather than trusted from earlier,
+ * and the staged file is created with `O_NOFOLLOW`, so neither the
+ * parent directory nor the leaf name can be followed through a
+ * symlink that was swapped in before the write began.
+ *
+ * **What it does NOT guarantee.** There is no atomic
+ * check-then-rename primitive in POSIX: a swap landing in the instant
+ * between the `realpathSync` here and the `renameSync` a few
+ * statements later is not observable by this function. Closing that
+ * window needs an `openat`-relative walk pinned to directory file
+ * descriptors, which Node/Bun do not expose. The staging step narrows
+ * the exposure — the bytes are already written and validated, and
+ * only the rename is left — and the per-file re-check means each file
+ * is verified independently rather than inheriting one decision made
+ * for the whole batch. Treat this as defence in depth around a
+ * single-process trust boundary (ADR-0013: the agent has already been
+ * invited by the owner into this repo), not as a sandbox. */
 function stillConfined(repoRoot: string, repoRelativePath: string, expectedAbsolutePath: string): boolean {
   const target = resolvePublishTarget(repoRoot, repoRelativePath);
   if (!target.ok || target.absolutePath !== expectedAbsolutePath) return false;
   const parent = dirname(expectedAbsolutePath);
   let rootReal: string;
   let parentReal: string;
+  let parentStat: ReturnType<typeof lstatSync>;
   try {
     rootReal = realpathSync(resolvePath(repoRoot));
     parentReal = realpathSync(parent);
+    // `lstat` (not `stat`) so a symlink AT the parent path is reported
+    // as a symlink rather than silently followed to its target. The
+    // `realpathSync === parent` comparison above already rejects that
+    // case; asserting `isDirectory()` as well rejects the sibling case
+    // where something replaced the directory with a regular file, which
+    // would otherwise satisfy "realpaths to itself" and then make the
+    // write fail (or, with `O_EXCL`, land beside it).
+    parentStat = lstatSync(parent);
   } catch {
     return false;
   }
   if (parentReal !== parent) return false;
+  if (!parentStat.isDirectory()) return false;
   return parentReal === rootReal || parentReal.startsWith(`${rootReal}/`);
 }
 
@@ -932,10 +966,33 @@ const publishMutex = new Mutex();
 
 // ── configuration ──────────────────────────────────────────────────
 
-/** Hard cap on files per publish batch. Sixteen comfortably covers
- * an ADR with a plot (spec + data) plus a vocab tweak; a runaway
- * batch is refused so the mutex cannot be held for long. */
+/** Hard cap on files in ONE publish batch — counted across `docs` and
+ * `data` TOGETHER, not per array. Sixteen comfortably covers an ADR
+ * with a plot (spec + data) plus a vocab tweak; a runaway batch is
+ * refused so the mutex cannot be held for long.
+ *
+ * The MCP schema advertises `maxItems: 16` on each array, which is the
+ * per-array bound the schema can express; the total is enforced here
+ * and reported as its own `too-many-files` kind. `skill-examples.test.ts`
+ * asserts the SKILL.md text states the total, so the two cannot drift. */
 export const MAX_FILES_PER_PUBLISH = 16;
+
+/** Per-array ceiling the request SCHEMAS enforce, deliberately well
+ * above `MAX_FILES_PER_PUBLISH`.
+ *
+ * A schema cap of 16 per array would reject a 17-file batch with
+ * `invalid-body` — a shape error that says nothing about the real
+ * limit and nothing about what to do. Raising the schema ceiling
+ * means every batch that is merely OVER THE LIMIT reaches the
+ * orchestrator and is refused with `too-many-files` and a reason that
+ * names the count and the fix. The schema ceiling remains as a hard
+ * request-shape bound so a runaway array cannot allocate unbounded
+ * before the orchestrator ever sees it; anything past it is genuinely
+ * a malformed request rather than a large publish.
+ *
+ * Both the HTTP body schema and the MCP tool schema import this, so
+ * the two cannot drift apart. */
+export const PUBLISH_ARRAY_SHAPE_MAX = 64;
 
 /** Re-export the confinement rejection so `daemon.ts` uses the same
  * spelling as the module tests. */

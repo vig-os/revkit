@@ -18,6 +18,7 @@
 
 import { z } from "zod";
 import { anchorSchema, askAnswerSchema, askSchema, idSchema, reviewSubmitEventSchema } from "@revkit/review-core";
+import { PUBLISH_ARRAY_SHAPE_MAX } from "./publish.ts";
 
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
@@ -139,8 +140,8 @@ const publishFileSchema = z
  */
 export const publishRequestSchema = z
   .object({
-    docs: z.array(publishFileSchema).max(16).optional(),
-    data: z.array(publishFileSchema).max(16).optional(),
+    docs: z.array(publishFileSchema).max(PUBLISH_ARRAY_SHAPE_MAX).optional(),
+    data: z.array(publishFileSchema).max(PUBLISH_ARRAY_SHAPE_MAX).optional(),
   })
   .strict();
 export type PublishRequest = z.infer<typeof publishRequestSchema>;

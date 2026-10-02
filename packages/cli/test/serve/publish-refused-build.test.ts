@@ -209,14 +209,16 @@ async function publish(
  * (`?since=0`), which is the same durable path a reconnecting client
  * takes. Also returns the seqs so a test can assert they are real
  * positive sequence numbers rather than synthetic frames. */
-async function replayedEvents(ctx: { readonly handle: DaemonHandle }): Promise<{ kind: string; seq: number; generation?: string }[]> {
+async function replayedEvents(
+  ctx: { readonly handle: DaemonHandle },
+): Promise<{ kind: string; seq: number; generation?: string; error?: string }[]> {
   const resp = await fetch(`${ctx.handle.url}/events?since=0`, {
     headers: { authorization: `Bearer ${ctx.handle.agentToken}` },
   });
   expect(resp.ok).toBe(true);
   const reader = resp.body!.getReader();
   const decoder = new TextDecoder();
-  const events: { kind: string; seq: number; generation?: string }[] = [];
+  const events: { kind: string; seq: number; generation?: string; error?: string }[] = [];
   const deadline = Date.now() + 2_000;
   while (Date.now() < deadline) {
     const read = await Promise.race([
@@ -227,9 +229,14 @@ async function replayedEvents(ctx: { readonly handle: DaemonHandle }): Promise<{
       for (const line of decoder.decode(read.value).split("\n")) {
         if (!line.startsWith("data:")) continue;
         try {
-          const parsed = JSON.parse(line.slice("data:".length).trim()) as { kind?: string; seq?: number; generation?: string };
+          const parsed = JSON.parse(line.slice("data:".length).trim()) as { kind?: string; seq?: number; generation?: string; error?: string };
           if (typeof parsed.kind === "string" && typeof parsed.seq === "number") {
-            events.push({ kind: parsed.kind, seq: parsed.seq, ...(parsed.generation !== undefined ? { generation: parsed.generation } : {}) });
+            events.push({
+              kind: parsed.kind,
+              seq: parsed.seq,
+              ...(parsed.generation !== undefined ? { generation: parsed.generation } : {}),
+              ...(parsed.error !== undefined ? { error: parsed.error } : {}),
+            });
           }
         } catch {
           // keepalive comment
@@ -506,6 +513,167 @@ test("a daemon that restarts with a build outstanding reschedules it and re-anno
     await resumed.stop();
     rmSync(held.root, { recursive: true, force: true });
   }
+});
+
+test("build.* reaches the AGENT audience, not only the rail", async () => {
+  // The rejected head fanned build events out to `["rail"]` alone, so
+  // the agent that scheduled the build could not learn it had failed —
+  // and a failed build is almost always a source problem only the
+  // agent can fix. Assert the wire, not the intent: open the agent's
+  // OWN stream (`?for=agent`) with the agent bearer and read frames.
+  const resp = await fetch(`${ctx.handle.url}/events?for=agent&since=0`, {
+    headers: { authorization: `Bearer ${ctx.handle.agentToken}` },
+  });
+  expect(resp.ok).toBe(true);
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  const kinds: string[] = [];
+  const readLoop = (async () => {
+    while (true) {
+      let read;
+      try {
+        read = await reader.read();
+      } catch {
+        return;
+      }
+      if (read.done) return;
+      for (const line of decoder.decode(read.value).split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        try {
+          const parsed = JSON.parse(line.slice("data:".length).trim()) as { kind?: string };
+          if (typeof parsed.kind === "string") kinds.push(parsed.kind);
+        } catch {
+          // keepalive
+        }
+      }
+    }
+  })();
+
+  ctx.failNextBuild.value = "agent-audience-probe: boom";
+  await publish(ctx, [{ path: ADR_REL, content: NEW_SOURCE }]);
+  await waitFor(() => kinds.includes("build.failed"), 10_000);
+
+  // The full lifecycle, on the agent's own stream.
+  expect(kinds).toContain("build.requested");
+  expect(kinds).toContain("build.started");
+  expect(kinds).toContain("build.failed");
+  // And the doc the agent published is on the same stream, so the two
+  // are one coherent conversation rather than two channels.
+  expect(kinds).toContain("doc.published");
+
+  reader.cancel();
+  await readLoop.catch(() => { /* ignore */ });
+});
+
+test("a batch over the file cap is refused as `too-many-files`, not `confinement`", async () => {
+  // `confinement` tells an agent its PATH is wrong. Labelling a count
+  // problem that way sends it hunting a path bug that does not exist.
+  const tooMany = Array.from({ length: 17 }, (_, i) => ({
+    path: `plots/bulk-${i}/data.json`,
+    content: JSON.stringify([{ x: i, y: i }]),
+  }));
+  const resp = await fetch(`${ctx.handle.url}/api/publish`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${ctx.handle.agentToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ data: tooMany }),
+  });
+  expect(resp.status).toBe(400);
+  const body = (await resp.json()) as { error?: string; reason?: string };
+  expect(body.error).toBe("too-many-files");
+  expect(body.reason).toContain("17");
+  expect(body.reason).toContain("16");
+  // The reason names the split, because that is the action.
+  expect(body.reason).toMatch(/split/i);
+  // Nothing was written and no build was scheduled.
+  expect(existsSync(join(ctx.root, "plots", "bulk-0"))).toBe(false);
+  expect(ctx.buildCalls).toHaveLength(0);
+});
+
+test("the cap is on the WHOLE batch: 16 docs plus 1 data file is over", async () => {
+  // The MCP schema can only express `maxItems: 16` per array. The
+  // TOTAL is what `MAX_FILES_PER_PUBLISH` enforces, and this is the
+  // case a per-array reading would miss.
+  const docs = Array.from({ length: 16 }, (_, i) => ({
+    path: `docs/adr/99${String(50 + i).padStart(2, "0")}-bulk.md`,
+    content: `# ADR: bulk ${i}\n\n- Status: Proposed\n- Date: 2026-10-02\n\n## Context\n\nBody ${i}.\n`,
+  }));
+  const resp = await fetch(`${ctx.handle.url}/api/publish`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${ctx.handle.agentToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ docs, data: [{ path: "plots/9998-series/data.json", content: "[]" }] }),
+  });
+  expect(resp.status).toBe(400);
+  const body = (await resp.json()) as { error?: string; reason?: string };
+  expect(body.error).toBe("too-many-files");
+  expect(body.reason).toContain("16 docs");
+  expect(body.reason).toContain("1 data");
+});
+
+test("an UNRELATED generation's build failure is not blamed on this route's page", async () => {
+  // The bug: the banner showed whatever failure the coordinator
+  // happened to hold LAST, so a build that had nothing to do with this
+  // route was reported as the reason this page was stale.
+  //
+  //   A) Publish a REFUSED doc to the ADR route, with its build held
+  //      open. Its refusal is recorded against generation A.
+  //   B) Publish a DATA-ONLY plot file while A's build is in flight.
+  //      Its build becomes the coordinator's CURRENT record —
+  //      generation B — and B's build fails with a plot diagnostic.
+  //   C) Open the ADR route. The banner must NOT show B's plot
+  //      diagnostic: no build was ever scheduled for the ADR route
+  //      under generation B, so blaming it there is a lie.
+  //
+  // A's build is made to FAIL too, so it never writes fresh dist and
+  // the page stays legitimately behind — otherwise the dist-revision
+  // check would (correctly) clear the refusal and the assertion would
+  // pass vacuously.
+  let releaseFirst: () => void = () => {};
+  ctx.buildGates[0] = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+
+  ctx.failNextBuild.value = "GENERATION-A-FAILURE: the ADR source did not render";
+  await publish(ctx, [{ path: ADR_REL, content: NEW_SOURCE }]);
+  await waitFor(() => ctx.buildCalls.length === 1);
+
+  ctx.failNextBuild.value = "PLOT-ONLY-FAILURE: the plot spec could not compile";
+  await publish(ctx, [
+    { path: "plots/9998-series/data.json", content: JSON.stringify([{ x: 1, y: 2 }, { x: 2, y: 4 }]) },
+  ]);
+
+  releaseFirst();
+  // Build 1 (generation A) is dropped as superseded; build 2 runs for
+  // generation B and fails with the plot diagnostic.
+  await waitFor(() => ctx.buildCalls.length === 2);
+  await waitFor(async () =>
+    (await replayedEvents(ctx)).some((e) => e.kind === "build.failed"),
+  );
+
+  // The coordinator's record is now generation B / failed, carrying the
+  // PLOT diagnostic. The ADR route's refusal is generation A.
+  const state = JSON.parse(
+    readFileSync(join(ctx.root, ".revkit", "publish-state.json"), "utf8"),
+  ) as { generation: string; status: string; error?: string };
+  expect(state.status).toBe("failed");
+  expect(state.error).toContain("PLOT-ONLY-FAILURE");
+  const generationB = state.generation;
+  const second = await replayedEvents(ctx);
+  const failed = second.find((e) => e.kind === "build.failed");
+  expect(failed?.generation).toBe(generationB);
+  expect(failed?.error).toContain("PLOT-ONLY-FAILURE");
+
+  // The page: banner present (it IS behind), but NOT build-failed and
+  // NOT carrying B's diagnostic.
+  const html = await (await fetch(`${ctx.handle.url}${ADR_ROUTE}`)).text();
+  expect(html).toContain('data-revkit-banner="rendering"');
+  expect(html).not.toContain('data-revkit-banner="build-failed"');
+  expect(html).not.toContain("PLOT-ONLY-FAILURE");
 });
 
 /** Poll `predicate` until it is truthy. Keeps the assertions above

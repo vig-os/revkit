@@ -50,6 +50,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { DaemonClient, DaemonHttpError } from "./daemon-client.ts";
+import { PUBLISH_ARRAY_SHAPE_MAX } from "../serve/publish.ts";
 import {
   startEventSubscriber,
   type EventSubscriberHandle,
@@ -344,7 +345,8 @@ const PUBLISH_TOOL = {
         type: "array",
         description:
           "Primary source files to publish (`.md` under docs/adr/, docs/designs/, docs/FEATURE-MATRIX.md). " +
-          "Each entry: `{ path, content }`. Cap: 16 files.",
+          "Each entry: `{ path, content }`. At most 16 entries here — and the 16 is the cap on the " +
+          "WHOLE batch, shared with `data`, so 16 docs + 1 data file is refused.",
         items: {
           type: "object",
           properties: {
@@ -354,13 +356,15 @@ const PUBLISH_TOOL = {
           required: ["path", "content"],
           additionalProperties: false,
         },
-        maxItems: 16,
+        maxItems: PUBLISH_ARRAY_SHAPE_MAX,
       },
       data: {
         type: "array",
         description:
-          "Data side files (plot data under plots/<name>/, vocab/terms.yaml). Each entry: " +
-          "`{ path, content }`. Cap: 16 files.",
+          "Data side files (plot spec + data under plots/<name>/ — any .json / .csv / .tsv — and " +
+          "vocab/terms.yaml). Each entry: `{ path, content }`. At most 16 entries here — and the 16 " +
+          "is the cap on the WHOLE batch, shared with `docs`, so 16 data files + 1 doc is refused. " +
+          "Split a larger batch into two publishes.",
         items: {
           type: "object",
           properties: {
@@ -370,7 +374,7 @@ const PUBLISH_TOOL = {
           required: ["path", "content"],
           additionalProperties: false,
         },
-        maxItems: 16,
+        maxItems: PUBLISH_ARRAY_SHAPE_MAX,
       },
     },
     additionalProperties: false,
@@ -538,6 +542,19 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     // rail renders them, and other agent sessions can see peer
     // activity. Emitted on `editing` and on the daemon's auto-idle.
     "presence",
+    // M2 item 9: the TERMINAL build events only. The agent scheduled
+    // the build with its own `publish` and has to act on the
+    // outcome — a failed build is almost always a source problem only
+    // the agent can fix, and the `error` tail rides the event. A
+    // rail-only fan-out (the rejected head's behaviour) left the
+    // publishing agent unable to learn its build had failed.
+    //
+    // `build.requested` and `build.started` are deliberately NOT
+    // here: they are progress the agent cannot act on, and four
+    // notifications per publish would be noise on a channel the
+    // human also reads. The terminal pair is the actionable pair.
+    "build.succeeded",
+    "build.failed",
   ]);
   if (!relevantKinds.has(kind)) return undefined;
   const actor = event.actor as { readonly kind?: string; readonly id?: string; readonly displayName?: string } | undefined;
@@ -563,7 +580,16 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
     // would filter by its own name. Absent that, pass through.
     if (actor.id === "agent") return undefined;
   }
-  if (!isReanchorSystemEvent && actor.kind === "agent" && kind !== "handover" && kind !== "presence") return undefined;
+  // Build events carry `actor: { kind: "system", id: "revkit-daemon" }`
+  // (see `serve/publish-build.ts`), so they are not agent-authored and
+  // never reach this filter as an echo. The exclusion below is
+  // therefore about a DIFFERENT event — a build emitted by some
+  // future agent-attributed path — and is written for the day it
+  // happens rather than left to fall through by accident.
+  const isBuildEvent = kind === "build.succeeded" || kind === "build.failed";
+  if (!isReanchorSystemEvent && actor.kind === "agent" && kind !== "handover" && kind !== "presence" && !isBuildEvent) {
+    return undefined;
+  }
   const threadId = typeof event.threadId === "string" ? event.threadId : undefined;
   const anchor = event.anchor as
     | { readonly path?: string; readonly startLine?: number; readonly endLine?: number }
@@ -668,6 +694,38 @@ export function formatChannelPayload(event: WireEvent): ChannelPayload | undefin
         `Hand-over from ${safeActor}: ${ids.length} comment${ids.length === 1 ? "" : "s"} to review. ` +
         (safeNote.length > 0 ? `${safeNote} ` : "") +
         `Call the \`threads\` tool for details. Comment ids: ${idList}${more}.`;
+      break;
+    }
+    case "build.succeeded": {
+      // M2 item 9. The agent scheduled this build; the page it wrote
+      // is now live. No action required, but the agent benefits from
+      // knowing its publish is fully visible rather than assuming the
+      // `publish` 201 was the whole story.
+      const generation = typeof event.generation === "string" ? escapeContentFragment(event.generation.slice(0, 12)) : "unknown";
+      put("kind", "build_succeeded");
+      put("generation", generation);
+      const routes = Array.isArray(event.routes)
+        ? (event.routes as unknown[]).filter((r): r is string => typeof r === "string").length
+        : 0;
+      content =
+        `Build for publish generation ${generation} finished — ` +
+        `${routes} route${routes === 1 ? "" : "s"} refreshed. The published content is now live.`;
+      break;
+    }
+    case "build.failed": {
+      // M2 item 9. The actionable one. The diagnostic tail is the
+      // build's own stderr, which can contain source-controlled paths
+      // and code — escape it exactly like a comment body, because
+      // `content` lands inside a channel tag the receiver wraps.
+      const generation = typeof event.generation === "string" ? escapeContentFragment(event.generation.slice(0, 12)) : "unknown";
+      const rawError = typeof event.error === "string" ? event.error : "no diagnostic was reported";
+      const safeError = escapeContentFragment(rawError);
+      put("kind", "build_failed");
+      put("generation", generation);
+      content =
+        `Build for publish generation ${generation} FAILED — the reviewer is still ` +
+        `seeing the previous build and the page shows the error. Fix the source and ` +
+        `republish; the build is not retried in a loop.\n\n${safeError}`;
       break;
     }
     case "presence": {
@@ -791,10 +849,16 @@ const publishFileArgSchema = z
   })
   .strict();
 
+/** The tool-level schema mirrors the HTTP body schema's SHAPE ceiling,
+ * not the real limit — see `PUBLISH_ARRAY_SHAPE_MAX`. A `.max(16)`
+ * here would reject a 17-file call as a `ToolValidationError` before
+ * the daemon ever sees it, so the agent would get a schema complaint
+ * instead of the truthful `too-many-files` refusal that names the
+ * count and the fix. */
 const publishArgsSchema = z
   .object({
-    docs: z.array(publishFileArgSchema).max(16).optional(),
-    data: z.array(publishFileArgSchema).max(16).optional(),
+    docs: z.array(publishFileArgSchema).max(PUBLISH_ARRAY_SHAPE_MAX).optional(),
+    data: z.array(publishFileArgSchema).max(PUBLISH_ARRAY_SHAPE_MAX).optional(),
   })
   .strict();
 

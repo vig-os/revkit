@@ -642,7 +642,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         const [materialised] = await store.since(seq - 1);
         if (materialised === undefined || materialised.seq !== seq) return;
         await safeIngest(materialised);
-        await bus.publish(materialised, { audiences: ["rail"] });
+        // BOTH audiences, for the same reason `doc.published` uses
+        // both: the agent scheduled this build with its own publish
+        // and is the party that has to act on the outcome. A rail-only
+        // fan-out left the agent that published unable to learn its
+        // build had failed until it happened to poll — and the
+        // failure it most needs to see is usually a source problem
+        // only the agent can fix. The `error` tail rides the event,
+        // so the agent has the diagnostic, not just the fact.
+        //
+        // `shouldFanOutToAgent` returns true for kinds it does not
+        // special-case, so no delivery mode suppresses a build event:
+        // delivery modes gate COMMENT fan-out, not build outcomes.
+        await bus.publish(materialised, { audiences: ["rail", "agent"] });
       },
       // Generation-scoped clear. A success for generation G retires
       // exactly G's refusals; a failure keeps them, because the page
@@ -1370,6 +1382,35 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (actor === undefined) {
       logger.warn("api.rejected.auth", { requestId, path: url.pathname });
       return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    }
+
+    // GET /api/events-head — the log's current tip, for a subscriber
+    // that wants LIVE events only.
+    //
+    // A browser subscriber (the rail) needs a resume point before it
+    // can open `/events`, and deriving that point from a business
+    // endpoint couples the SSE contract to the shape of
+    // `GET /api/threads`. This endpoint is the one thing that answers
+    // "where does the log end right now", which is precisely the
+    // `since` value `/events` accepts.
+    //
+    // Why the rail needs it (M2 item 9, PR-56 blocker): opening
+    // `/events` with no resume point replays the ENTIRE durable log,
+    // and any subscriber that RELOADS the page on a replayed event
+    // reloads forever. On a cold load the page has just fetched
+    // current server state, so replaying history tells it nothing it
+    // does not already have — it only re-fires actions. Starting at
+    // `head` makes a cold load live-only. A warm load (a reload
+    // inside the same tab) resumes from the rail's own persisted
+    // point instead, so the event that CAUSED the reload is not
+    // replayed into it.
+    //
+    // Session-authenticated, same as the rail's other reads: the rail
+    // is the only caller and it holds the session cookie.
+    if (url.pathname === "/api/events-head" && method === "GET") {
+      const originRejection = checkOrigin(request, requestId, false);
+      if (originRejection !== undefined) return originRejection;
+      return jsonResponse({ head: store.head() });
     }
 
     // GET /api/threads?path=&status=
@@ -3130,16 +3171,37 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   }
   function buildBackgroundBuildBanner(
     sourcePath: string,
-    reason: RefusedRouteState["reason"],
+    refusal: RefusedRouteState,
     buildState: PublishBuildRecord | undefined,
   ): string {
     const escape = escapeBannerText;
-    const reasonPhrase = BUILD_REASON_PHRASE[reason];
-    // Only surface a build failure when it belongs to THIS route's
-    // generation. A failed build for an unrelated earlier publish
-    // must not make this page claim its own build broke.
+    const reasonPhrase = BUILD_REASON_PHRASE[refusal.reason];
+    // Only surface a build failure when the FAILED build is the one
+    // this route is actually waiting on.
+    //
+    // The coordinator's record is for whichever generation is CURRENT
+    // (the newest publish that needed a build), which is not
+    // necessarily the generation that recorded this route's refusal.
+    // A `build.failed` for a different generation says nothing about
+    // this route — showing its diagnostic here would tell a reviewer
+    // their page is broken for a reason that has nothing to do with
+    // it. Comparing the record's generation against the refusal's is
+    // what makes the claim true; the previous version asserted the
+    // scoping in a comment without doing the comparison.
+    //
+    // A read-time refusal carries a synthetic `read:<revision>`
+    // generation that no build will ever match, so it always shows
+    // the progress banner. That is the intended reading: nobody has
+    // scheduled a build for it, so claiming "a build is in
+    // progress" would itself be a lie. Its own text says the source
+    // uses a feature the fast path cannot render, and the reviewer
+    // gets the truth on the next publish (which schedules one).
     const failure =
-      buildState?.status === "failed" && buildState.error !== undefined ? buildState.error : undefined;
+      buildState?.status === "failed"
+      && buildState.error !== undefined
+      && buildState.generation === refusal.generation
+        ? buildState.error
+        : undefined;
     if (failure !== undefined) {
       // The build failed — show the tail so the reviewer can act.
       // This is a TERMINAL banner, not a spinner: the page stays
@@ -3276,7 +3338,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (refusal !== undefined) {
       return await serveBannerOverDist({
         shellHtml,
-        banner: buildBackgroundBuildBanner(sourcePath, refusal.reason, publishBuild?.state()),
+        banner: buildBackgroundBuildBanner(sourcePath, refusal, publishBuild?.state()),
         method,
         requestId,
         route,
@@ -3343,7 +3405,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // disk differed from the HTML in front of them and nothing
           // on the page admitted it. Recording the refusal gives the
           // next request (and the next restart) a banner.
-          refusedRoutes.set(route, {
+          const refusal: RefusedRouteState = {
             reason: result.reason,
             // A read-time refusal is attributed to the source's own
             // revision, which stands in for a publish generation: the
@@ -3352,12 +3414,18 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             // retired by the dist-revision check above or by an
             // explicit publish. That is the conservative direction —
             // a lingering banner is visible, a missing one is not.
+            //
+            // It also means no build record's generation can ever
+            // match this one, so `buildBackgroundBuildBanner` shows
+            // the progress wording rather than borrowing another
+            // generation's diagnostic. See its comment.
             generation: `read:${sourceRev}`,
             since: Date.now(),
-          });
+          };
+          refusedRoutes.set(route, refusal);
           return await serveBannerOverDist({
             shellHtml,
-            banner: buildBackgroundBuildBanner(sourcePath, result.reason, publishBuild?.state()),
+            banner: buildBackgroundBuildBanner(sourcePath, refusal, publishBuild?.state()),
             method,
             requestId,
             route,
@@ -3813,12 +3881,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       },
     );
     if (!outcome.ok) {
+      // Status per kind:
+      //   check-failed   422 the content is wrong, not the request shape
+      //   too-large      413 a byte cap (per file or per batch)
+      //   too-many-files 400 a count cap — the request shape is fine,
+      //                 there are simply too many parts
+      //   confinement    400 the path is outside the allowlist
+      //   shell-missing  200 unreachable on the failure branch today —
+      //                 a missing shell is a build item, not an error —
+      //                 kept so the mapping stays total
+      //   everything else 500
       const status =
         outcome.kind === "check-failed"
           ? 422
           : outcome.kind === "too-large"
             ? 413
-            : outcome.kind === "confinement"
+            : outcome.kind === "confinement" || outcome.kind === "too-many-files"
               ? 400
               : outcome.kind === "shell-missing"
                 ? 200

@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type { ZodSchema } from "zod";
 import { publishBuildReasons } from "../src/serve/publish-build.ts";
+import { MAX_FILES_PER_PUBLISH, PUBLISH_ARRAY_SHAPE_MAX } from "../src/serve/publish.ts";
 import { fastPathRefusalReasons } from "../src/serve/publish-render.ts";
 import { reviewEventKinds } from "@revkit/review-core";
 import {
@@ -237,6 +238,72 @@ describe("SKILL.md tool-call examples validate against zod schemas", () => {
     const publishSource = readFileSync(resolve(__dirname, "../src/serve/publish.ts"), "utf8");
     expect(publishSource).toMatch(/staged: stagedOverlay/);
     expect(md).toMatch(/checked as ONE snapshot/);
+  });
+
+  test("the SKILL's file-count claim matches the code's TOTAL cap", () => {
+    // The rejected head had three truths out of step: the code
+    // enforced a TOTAL, the MCP schema advertised a PER-ARRAY max, and
+    // the refusal was labelled `confinement` — which tells an agent its
+    // PATH is wrong when the real problem is batch size. Assert all
+    // three against the code, and the SKILL's failure table.
+    expect(MAX_FILES_PER_PUBLISH).toBe(16);
+    expect(md).toContain(String(MAX_FILES_PER_PUBLISH));
+    expect(md).toMatch(/across `docs` AND\s*\n?`data` TOGETHER|across `docs` and `data` together/i);
+    // The per-array schema ceiling must EXCEED the total, or a batch
+    // that is merely over the limit never reaches the orchestrator and
+    // the agent gets a schema complaint instead of the truthful kind.
+    expect(PUBLISH_ARRAY_SHAPE_MAX).toBeGreaterThan(MAX_FILES_PER_PUBLISH);
+    // The truthful kind is named in the failure table.
+    expect(md).toContain("too-many-files");
+    // And the mislabel is gone from the schema descriptions.
+    expect(md).not.toMatch(/maxItems: 16/);
+    // The orchestrator really does refuse with that kind.
+    const publishSource = readFileSync(resolve(__dirname, "../src/serve/publish.ts"), "utf8");
+    expect(publishSource).toMatch(/kind: "too-many-files"/);
+    expect(publishSource).not.toMatch(/kind: "confinement",\s*\n\s*reason: `publish: batch has/);
+  });
+
+  test("the SKILL's publishable-path list matches the real allowlist", () => {
+    // The SKILL previously enumerated filenames
+    // (`{spec.vl.json,data.json,data.csv,data.tsv}`) where the code
+    // accepts ANY `.json`/`.csv`/`.tsv` under `plots/`, and said
+    // nothing about the uppercase-extension refusal. Assert both
+    // directions against the code's own allowlist.
+    const confineSource = readFileSync(resolve(__dirname, "../src/serve/publish-confine.ts"), "utf8");
+    for (const prefix of ["docs/adr/", "docs/designs/", "docs/FEATURE-MATRIX.md", "plots/", "vocab/terms.yaml"]) {
+      expect(confineSource).toContain(`prefix: "${prefix}"`);
+      expect(md).toContain(prefix);
+    }
+    // Every allowed plot extension is named in the SKILL.
+    for (const ext of [".json", ".csv", ".tsv"]) {
+      expect(confineSource).toContain(`"${ext}"`);
+      expect(md).toContain(ext);
+    }
+    // The lowercase-extension rule is documented, because `foo.MD`
+    // would land at a second collection id.
+    expect(confineSource).toMatch(/ext !== ext\.toLowerCase\(\)/);
+    expect(md).toMatch(/LOWERCASE/i);
+    // MDX stays refused, and the SKILL says so.
+    expect(md).toMatch(/site\/src\/content\/docs\/\*\.mdx/);
+  });
+
+  test("the SKILL tells the agent its build can FAIL and how it learns that", () => {
+    // The rejected head's channel never surfaced a build outcome, so an
+    // agent could not learn its build had failed. The SKILL must not
+    // imply builds always succeed, and must name the live path.
+    expect(md).toContain("build.failed");
+    expect(md).toMatch(/not\s+retried in a loop|is not retried in a loop/i);
+    // The MCP tool description carries the same contract.
+    // The daemon's fan-out: build events go to BOTH audiences, so the
+    // publishing agent's own stream carries them.
+    const daemonSource = readFileSync(resolve(__dirname, "../src/serve/daemon.ts"), "utf8");
+    expect(daemonSource).toContain('audiences: ["rail", "agent"]');
+    // The channel surfaces the TERMINAL pair as a notification the
+    // agent can act on, and only those two.
+    const channelSource = readFileSync(resolve(__dirname, "../src/mcp/channel-server.ts"), "utf8");
+    expect(channelSource).toContain('"build.succeeded"');
+    expect(channelSource).toContain('"build.failed"');
+    expect(channelSource).toContain('case "build.failed"');
   });
 
   test("the SKILL's 'publish returns' claim matches the code (`published[].revision`)", () => {

@@ -75,13 +75,25 @@ editing in memory, and sending the whole new body.
 
 Rules the daemon enforces:
 
-- **Confined write paths.** Only these trees accept a publish (v1):
-  - `docs/adr/*.md` — architecture decisions
-  - `docs/designs/*.md` — design notes
-  - `docs/FEATURE-MATRIX.md` — the feature matrix
-  - `plots/<name>/{spec.vl.json,data.json,data.csv,data.tsv}` — plot spec + siblings
-  - `vocab/terms.yaml` — the vocabulary
-  Anything else is refused with `confinement`.
+- **Confined write paths.** The allowlist is a PREFIX + EXTENSION
+  rule, not an enumeration of filenames. A publish is accepted when:
+
+  | Accepted | Rule |
+  |---|---|
+  | `docs/adr/<anything>.md` | prefix `docs/adr/`, extension `.md` |
+  | `docs/designs/<anything>.md` | prefix `docs/designs/`, extension `.md` |
+  | `docs/FEATURE-MATRIX.md` | that exact path, no children |
+  | `plots/<any>/<any>/<anything>.{json,csv,tsv}` | prefix `plots/`, extension `.json` / `.csv` / `.tsv` — so `data.csv` and `data.tsv` work, and so does a second data file beside the spec. The plot STRUCTURE is what `revkit check` polices, not the filename. |
+  | `vocab/terms.yaml` | that exact path, no children |
+
+  Anything else is refused with `confinement` — including
+  `docs/adr/README.md` siblings you might expect, `docs/` top-level
+  files other than the matrix, and `site/src/content/docs/*.mdx`.
+  The extension must be LOWERCASE: `foo.MD` and `foo.md` would land at
+  two different collection ids, so the uppercase shape is refused
+  rather than silently creating a second page. A brand-new file is
+  fine, but its parent directory must already exist — the daemon does
+  not create directories for you.
 - **`revkit check` is the gate.** Registered components only (no
   hand-rolled `<div>` / `<span>` / inline `<script>`), one vocabulary,
   valid links + sets, structured plots. `revkit-allow: #N` is an
@@ -90,7 +102,11 @@ Rules the daemon enforces:
 - **Data goes in side files, never inline.** A plot's `data.url`
   references a sibling file (ADR-0004); do NOT set `data.values` on
   the spec.
-- **Sizes.** 5 MiB per file, 10 MiB per batch, 16 files max.
+- **Sizes.** 5 MiB per file, 10 MiB per batch.
+- **File COUNT.** 16 files per batch, counted across `docs` AND
+  `data` TOGETHER — 16 docs plus 1 data file is over the cap and comes
+  back as `too-many-files`, not `confinement`. Split it into two
+  publishes.
 
 After `publish` returns `201`, check what the reviewer can actually
 see. The response is explicit per path:
@@ -450,6 +466,10 @@ waking the agent mid-turn.
   wrong", and it is safe to retry once the tree is stable.
 - **`publish` returns `413 too-large`** — a single file exceeded 5 MiB
   or the batch exceeded 10 MiB. Split the batch or shrink the file.
+- **`publish` returns `400 too-many-files`** — the batch carried more
+  than 16 files in total across `docs` + `data`. Nothing was written.
+  Split it into two publishes; do not look for a path problem, this
+  is a count.
 - **`publish` returns `201` with a `warning` field** — the sources
   landed and a build was scheduled, but the `doc.published` append to
   the durable log was rejected. The page will still refresh when the
