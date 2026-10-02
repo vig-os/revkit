@@ -1025,8 +1025,12 @@ function Rail(): JSX.Element {
   //   2. Migrate: fold any marks under the bare key (from a click
   //      that landed before `/-/health` responded) into the
   //      resolved-key bucket, prefer the newer per-thread
-  //      timestamp, and delete every OTHER `revkit.rail.seen.v1*`
-  //      key so stale buckets from previous repos don't linger.
+  //      timestamp, touch this repo's bucket in a bounded LRU
+  //      index, and reclaim only the seen keys that index does not
+  //      list. Another repo's bucket is KEPT (issue #63) — a second
+  //      repo served on the same fixed `--port` shares this
+  //      origin's localStorage, and deleting its bucket re-fired
+  //      every ack the reviewer had already made there.
   //   3. Prune once against the UNSCOPED thread-id list — using
   //      the page-scoped `threads()` here would wipe marks for
   //      threads on every OTHER page (the round-3 blocker).

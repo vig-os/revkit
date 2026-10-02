@@ -228,38 +228,111 @@ export interface IterableStorage {
   removeItem(key: string): void;
 }
 
+/** Index key naming the live per-repo seen buckets on this origin,
+ * oldest first. Deliberately OUTSIDE the `revkit.rail.seen.v1`
+ * namespace so the bucket scan (which matches the bare prefix and
+ * `prefix + "."`) never mistakes it for a bucket — an index listed in
+ * its own index is the kind of self-reference that survives every
+ * "delete the orphans" pass. Versioned with the bucket shape, since
+ * an index written by an older shape would vouch for keys the newer
+ * code cannot interpret. */
+export const SEEN_INDEX_KEY = "revkit.rail.seen.index.v1";
+
+/** How many per-repo seen buckets one origin keeps. Eight covers a
+ * working set (the current repo plus a handful of alternates served
+ * on the same fixed `--port`) while bounding what a long-lived
+ * browser profile can accumulate to a size no eviction policy ever
+ * gets to — the round-3 pile this replaced. */
+export const SEEN_BUCKET_LIMIT = 8;
+
+/** True for a per-repo bucket key (`revkit.rail.seen.v1.<repoId>`).
+ * The bare `revkit.rail.seen.v1` key is NOT a bucket: it only ever
+ * served the window before `/-/health` resolved a `repoId`. */
+function isSeenBucketKey(key: string): boolean {
+  return key.startsWith(`${SEEN_STORAGE_KEY_PREFIX}.`);
+}
+
+/** Parse the LRU index. Returns `[]` for anything we cannot trust —
+ * a missing key, non-JSON, a non-array payload, or an entry that is
+ * not a string bucket key. The failure mode is deliberate and
+ * one-directional: an entry we refuse to trust vouches for nothing,
+ * so its bucket gets reclaimed and the marks read as UNREAD again.
+ * A mark can never be manufactured into the current bucket from an
+ * index entry we could not read, so the worst case is a re-fired
+ * pill (loud), never a silent ack for the wrong repo. */
+function readSeenIndex(storage: Pick<IterableStorage, "getItem">): string[] {
+  let raw: string | null;
+  try {
+    raw = storage.getItem(SEEN_INDEX_KEY);
+  } catch {
+    return [];
+  }
+  if (raw === null) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: string[] = [];
+  for (const entry of parsed) {
+    if (typeof entry !== "string" || !isSeenBucketKey(entry)) continue;
+    if (out.includes(entry)) continue;
+    out.push(entry);
+  }
+  return out;
+}
+
+/** Every seen-bucket key the browser currently holds, snapshotted
+ * before any write so the passes below see a stable list. */
+function snapshotSeenBucketKeys(storage: IterableStorage): string[] {
+  const found: string[] = [];
+  for (let i = 0; i < storage.length; i += 1) {
+    const k = storage.key(i);
+    if (k === null) continue;
+    if (k === SEEN_STORAGE_KEY_PREFIX || isSeenBucketKey(k)) found.push(k);
+  }
+  return found;
+}
+
 /** Called once on mount, after `GET /-/health` returned `repoId`.
  *
- *  1. Reads every `revkit.rail.seen.v1*` bucket the browser
- *     currently holds — the bare key from the "no repoId yet"
- *     window at the top of mount, plus any leftover key from a
- *     previous session on the same origin.
- *  2. Merges them into the target-key bucket, preferring the
- *     newer per-thread ISO timestamp.
- *  3. Writes the merged map back under the target key.
- *  4. Removes every OTHER `revkit.rail.seen.v1*` bucket, so a
- *     stale key from a previous repo does not linger in the
- *     origin's local storage forever.
+ *  1. Folds the BARE key into the target-key bucket, preferring the
+ *     newer per-thread ISO timestamp. That key only ever holds marks
+ *     made on THIS origin before `/-/health` resolved, so it is the
+ *     one bucket whose contents legitimately move between repos
+ *     (issue #60 PR #62 round-3: the "early mark race").
+ *  2. Touches the target in a bounded LRU index
+ *     (`SEEN_INDEX_KEY`), keeping every bucket the previous index
+ *     vouched for and evicting oldest-first past `SEEN_BUCKET_LIMIT`.
+ *  3. Reclaims only the keys the new index does not list, plus the
+ *     bare key.
  *
- * Every branch is wrapped in try/catch — the reviewer's session
- * is never fatal on a storage failure; the pill just re-fires
- * once, then the seen map catches up on the next mark. Issue #60
- * PR #62 round-3 review: fixes the "early mark race" (a click
- * before `/-/health` returned lost its mark) AND the "orphaned
- * bucket" (a rebuild left a growing pile of stale keys). */
+ * **Why the other buckets survive (issue #63).** This used to merge
+ * EVERY `revkit.rail.seen.v1*` bucket into the target and then delete
+ * them all. An origin is `127.0.0.1:<port>`, so two repos served one
+ * after the other on the same fixed `--port` share one localStorage:
+ * opening repo Y therefore wiped repo X's acks, and the reviewer had
+ * to re-acknowledge them. Only the bare key crosses that boundary
+ * now; a repoId bucket belongs to the repo that minted the id.
+ *
+ * Order matters: the index is written BEFORE the reclaim pass, so a
+ * storage quota failure (which throws out to the catch below) can
+ * only ever leave buckets un-reclaimed, never buckets deleted with no
+ * index left to justify them.
+ *
+ * Every branch is wrapped in try/catch — the reviewer's session is
+ * never fatal on a storage failure; the pill just re-fires once, then
+ * the seen map catches up on the next mark. */
 export function migrateSeenStorage(storage: IterableStorage | undefined, targetKey: string): void {
   if (storage === undefined) return;
   try {
-    // Snapshot every seen-bucket key currently present.
-    const foundKeys: string[] = [];
-    for (let i = 0; i < storage.length; i += 1) {
-      const k = storage.key(i);
-      if (k === null) continue;
-      if (k === SEEN_STORAGE_KEY_PREFIX || k.startsWith(`${SEEN_STORAGE_KEY_PREFIX}.`)) foundKeys.push(k);
-    }
-    // Merge, preferring the LATER ISO timestamp per thread id.
-    // Read the target key first so any per-thread mark under the
-    // target's current bucket wins ties.
+    const foundKeys = snapshotSeenBucketKeys(storage);
+    const found = new Set(foundKeys);
+    // Fold the pre-`repoId` bucket into the resolved one. Read the
+    // target first so a per-thread mark already under the target's
+    // own bucket wins ties.
     const merged: Record<string, string> = {};
     const readOne = (k: string): void => {
       const map = readSeenMap(storage, k);
@@ -269,17 +342,30 @@ export function migrateSeenStorage(storage: IterableStorage | undefined, targetK
       }
     };
     if (foundKeys.includes(targetKey)) readOne(targetKey);
-    for (const k of foundKeys) {
-      if (k === targetKey) continue;
-      readOne(k);
+    if (foundKeys.includes(SEEN_STORAGE_KEY_PREFIX) && SEEN_STORAGE_KEY_PREFIX !== targetKey) {
+      readOne(SEEN_STORAGE_KEY_PREFIX);
     }
-    // Write the merged map under the target key.
     writeSeenMap(merged, storage, targetKey);
-    // Remove every OTHER seen bucket. The bare-key entry is
-    // included here — it was only used during the "before
-    // /-/health responded" window.
+    // Rebuild the LRU: previous members that still exist (and are
+    // not the target, which we re-touch), then the target itself.
+    // Order is oldest first, so `shift()` evicts oldest-first.
+    const next: string[] = [];
+    for (const k of readSeenIndex(storage)) {
+      if (k === targetKey || next.includes(k)) continue;
+      if (!found.has(k)) continue;
+      next.push(k);
+    }
+    if (isSeenBucketKey(targetKey)) next.push(targetKey);
+    while (next.length > SEEN_BUCKET_LIMIT) next.shift();
+    storage.setItem(SEEN_INDEX_KEY, JSON.stringify(next));
+    // Reclaim what the index cannot vouch for. The bare key is not a
+    // member (it is not a repo bucket) so it lands here, and a target
+    // that IS the bare key is never removed — that would delete the
+    // bucket the rail is about to read.
+    const keep = new Set(next);
+    keep.add(targetKey);
     for (const k of foundKeys) {
-      if (k === targetKey) continue;
+      if (keep.has(k)) continue;
       try {
         storage.removeItem(k);
       } catch {
