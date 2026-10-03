@@ -257,7 +257,7 @@ export default {
       // `AuthorizedSession` — a type whose brand symbol is module-private
       // to `authz.ts`.
       if (!route.requiresSession) {
-        const response = handleOpen(route, request, env, scope);
+        const response = handleOpen(route, env, scope);
         status = response.status;
         return response;
       }
@@ -313,7 +313,7 @@ export default {
  * else. Nothing here can return review data, which is the whole reason these
  * three are exempt rather than an oversight.
  */
-function handleOpen(route: Route, request: Request, env: Env, scope: RequestScope): Response {
+function handleOpen(route: Route, env: Env, scope: RequestScope): Response {
   switch (route.kind) {
     case "health": {
       // A `HEAD` probe takes this same branch; the platform drops the body
@@ -332,6 +332,13 @@ function handleOpen(route: Route, request: Request, env: Env, scope: RequestScop
 }
 
 /**
+ * The three routes that touch no data, and therefore need no session. `/healthz`
+ * is a liveness probe that reads no database and returns no review content,
+ * `/_revkit/` is ADR-0012's never-redirecting bundle path, and `unknown` is not a
+ * route at all. Every one of those is asserted in
+ * `test/authorization.test.ts`, so "these three are the exception" is a claim
+ * about a table rather than about this function.
+ *
  * Every route that requires a session, reached only with a
  * `decision.authorized` in hand. `authorized` is not used here except to log
  * the identity kind — and it is not LOGGED AS AN ID: `identity_kind` is a
