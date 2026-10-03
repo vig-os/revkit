@@ -65,11 +65,25 @@ const hasProcFd = process.platform === "linux";
 /** Descriptors leaked per `startDaemon`/`stop()` cycle.
  *
  * MEASURED 2.00 on `bun 1.3.13` (20 cycles → 41 fds, reproduced 3x;
- * see the file header). Budgeted at 4 — 2x headroom, chosen so a
- * doubling of the leak (a plausible new leak of one extra
- * descriptor per watcher) trips the test, while a future Bun that
- * allocates one or two more per watch does not. */
-const FDS_PER_DAEMON_CYCLE_BUDGET = 4;
+ * see the file header). Budgeted at 3, which is the number that makes
+ * this test do its job: the first DOUBLING of the leak has to trip it.
+ *
+ * An earlier revision budgeted 4 and its comment claimed a doubling
+ * would be caught. It would not: 4 fds/cycle against a ceiling of
+ * 4xCYCLES is exactly at the limit, and the assertion is `<=`, so a
+ * doubling passed — the guard tripped at 2.5x, not 2x. Worse, that
+ * same comment justified 4 two incompatible ways ("a doubling trips
+ * it" / "one or two more per watch does not"), which is what made the
+ * number look chosen rather than derived.
+ *
+ * At 3 the sensitivity is: trips at >=1.5x the measured rate, so the
+ * first doubling (2.0x) clears it by 33%. The 1.5x headroom over the
+ * measured 2.00 is deliberate and tight, because the measurement is
+ * exact — three runs at N=5/10/20 gave 11/20/40 every time, i.e. 2.00
+ * per cycle with no drift at all. If a future Bun changes the constant
+ * this test goes red and says so, which is the correct signal: the
+ * budget gets re-derived, not rubber-stamped. */
+const FDS_PER_DAEMON_CYCLE_BUDGET = 3;
 
 /** Cycles per measurement. 10 keeps the test under a second while
  * giving the delta enough resolution to distinguish 2 from 4. */
