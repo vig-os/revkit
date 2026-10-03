@@ -95,3 +95,28 @@ canonical after the initial navigation redirect.
 Alternative rejected: accepting the exact `http://localhost:<port>` origin (and keeping two parallel session
 cookies) would double the auth surface and leave the "user pastes localhost URL after exchanging on 127.0.0.1"
 case still broken. Canonicalisation is one origin, one cookie jar, one mental model.
+
+## Amendment (2026-10-03, issue #63 — the persistent repo id)
+
+`.revkit/repo-id` is a third file under the mode-0700 `.revkit/` alongside `serve.json` and `daemon.lock`, and until
+issue #63 it was documented nowhere. It exists because an ORIGIN is `127.0.0.1:<port>`: a browser profile that serves
+two repos in turn on one fixed `--port` keeps ONE `localStorage`, so the rail's per-viewer "seen" marks need a key that
+changes per repo. Per-start `instanceId` was the wrong key (every restart re-fires every unread pill); a repo-scoped id
+is the right one.
+
+**Decision.**
+
+- **What it is.** A 24-char base64url random tag (144 bits), mode 0600, written once per repo and never rotated. It is
+  NOT derived from the repo path, so the unauthenticated `GET /-/health` that echoes it as `repoId` cannot let a caller
+  fingerprint the caller's filesystem layout. It is NOT a credential: it authorises nothing, is not accepted by any
+  endpoint, and carries no data — contrast the per-start `agentToken` in the Decision above. Removing the file only
+  costs the reviewer their acknowledge history for that repo.
+- **Minted once, under the daemon lock.** The mint is a check-then-write, so it happens inside `acquireAndPublish`
+  AFTER the `flock(2)` on `.revkit/daemon.lock` is won, never before it. Two starts that overlapped an unlocked mint
+  would each mint and each write a different id; the lock then elects one winner while the file is left holding the
+  loser's — the winner advertises an id that is not on disk and the next restart reads a third, which resets the very
+  ack state the id exists to protect. A start that does not win the lock does not read or write the file at all.
+- **Published by rename.** The write goes through a 0600 temp file plus `rename(2)` — the same path `serve.json`
+  already uses — so a concurrent reader sees the old file or the new one, never a truncated payload. A truncated file
+  is not a cosmetic failure here: it fails the shape check, the daemon mints a replacement, and that alone resets the
+  reviewer's marks.
