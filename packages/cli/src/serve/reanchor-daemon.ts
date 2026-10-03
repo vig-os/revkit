@@ -24,8 +24,12 @@
 //      On systems where `fs.watch` does not signal — WSL bind
 //      mounts, some FUSE filesystems, containerised bind mounts on
 //      macOS — the class falls back to a `stat`-poll at 2 s. The
-//      fallback engages after a fs.watch error OR after start-up if
-//      `poll: true` is passed explicitly.
+//      fallback engages after a fs.watch error, after a directory
+//      rebind, or after start-up if `poll: true` is passed
+//      explicitly. A rebound directory is re-armed onto `fs.watch`
+//      once it has been observably stable, but only where the runtime
+//      can still register on that path — see the rebind probe and
+//      issue #49.
 //   3. **Build watcher on `site/dist`.** A site rebuild changes
 //      rendered HTML but the anchors live in the SOURCE files
 //      (`docs/…`, `site/src/content/docs/…`). A rebuild often
@@ -111,6 +115,22 @@ export const DEFAULT_POLL_INTERVAL_MS = 2_000;
  * poll interval so a common shape for both is exercised together. */
 export const DEFAULT_BUILD_REBIND_INTERVAL_MS = 2_000;
 
+/** How many CONSECUTIVE clean observations of a rebound directory the
+ * rebind probe must make before the daemon tries to re-arm `fs.watch`
+ * on it (issue #49). "Clean" means: this tick performed no rebind, saw
+ * no watch error, and found the directory's `(dev, ino)` unchanged
+ * since the last tick.
+ *
+ * Stability is therefore derived from the probe's own observable
+ * state — not from a sleep. One tick is not enough (the very first
+ * tick after a rebind can land mid-`mkdir`), and the count costs
+ * nothing extra because the probe already runs every
+ * `dirRebindIntervalMs`. With the defaults this is 3 × 2 s = 6 s, well
+ * inside the window where the `stat`-poll (2 s worst case) is still
+ * serving correctness; the poll is what carries the directory until
+ * the watcher is genuinely back. */
+export const DEFAULT_DIR_STABLE_INTERVALS = 3;
+
 /** Options a caller can override. In production the daemon calls
  * `startReanchorDaemon({ store, bus, repoRoot, distDir, logger })`
  * with the defaults; tests inject clocks and shorter debounces so
@@ -137,6 +157,22 @@ export interface ReanchorDaemonOptions {
    * value so a probe-G reproduction settles inside a few hundred
    * ms. */
   readonly dirRebindIntervalMs?: number;
+  /** Consecutive clean probe observations a rebound directory needs
+   * before the daemon re-arms `fs.watch` on it. Default
+   * `DEFAULT_DIR_STABLE_INTERVALS`. See that constant for the exact
+   * definition of "clean". */
+  readonly dirStableIntervals?: number;
+  /** **Test-only.** The `fs.watch` implementation the daemon installs
+   * directory watchers with. Production never passes one; a test that
+   * needs to prove the POLLING fallback survives a failed re-arm
+   * injects a `watchFn` that throws. Typed as the loose shape the
+   * daemon actually uses (`watch(dir, opts, listener)`) so a test can
+   * delegate to the real `watch` for the calls it wants to succeed. */
+  readonly watchFn?: (
+    target: string,
+    options: { persistent: boolean },
+    listener: (eventType: string, filename: string | null) => void,
+  ) => FSWatcher;
   /** **Test-only.** Called during `doRefresh` after the file has
    * been read + hashed but before any state is consulted. A probe
    * awaits this to sequence a concurrent write against the pipeline
@@ -198,6 +234,18 @@ export interface ReanchorDaemonHandle {
    * skips the pipeline" test asserts on. Diagnostic; not exposed
    * over HTTP. */
   pipelineRunCount(): number;
+  /** How the directory watcher for `dir` is currently served:
+   * `"watch"` (a live `fs.watch`), `"poll"` (the `stat`-poll
+   * fallback), or `undefined` when the directory has no watcher.
+   * Diagnostic for tests only — issue #49's re-arm contract is
+   * asserted through this, because "which mechanism is live" is not
+   * otherwise observable. */
+  dirWatchMode(dir: string): "watch" | "poll" | undefined;
+  /** Size of the per-thread orphan-check memo (`orphanCheckRevision`).
+   * Diagnostic for tests only — issue #49 prunes an entry the moment
+   * its thread is re-anchored, and the entry is inert by then, so
+   * there is no behavioural proxy for "was it pruned?". */
+  orphanMemoSize(): number;
   stop(): Promise<void>;
 }
 
@@ -217,6 +265,8 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     buildDebounceMs = DEFAULT_BUILD_DEBOUNCE_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     dirRebindIntervalMs = DEFAULT_BUILD_REBIND_INTERVAL_MS,
+    dirStableIntervals = DEFAULT_DIR_STABLE_INTERVALS,
+    watchFn = watch,
     postReadHook,
   } = options;
 
@@ -239,10 +289,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * naturally per-thread (round-4 blocker 1 fix). Set only after a
    * successful check where the thread stayed orphaned; the next
    * refresh at the SAME `newRevision` skips this thread. An
-   * un-orphan event (`thread.reanchored`) leaves the memo behind
-   * but the thread's status flips to `open`, so subsequent
-   * up-to-date checks look at `anchor.revision` instead — the memo
-   * is inert. `reconcileWatchers` sweeps entries for threads no
+   * un-orphan event (`thread.reanchored`) DELETES the entry — the
+   * thread's status flips to `open`, so the entry is dead weight, and
+   * issue #49 prunes it at the moment the re-anchor lands rather than
+   * waiting for the next `reconcileWatchers`. The prune is keyed on an
+   * explicit re-anchor of THAT thread, never a sweep, so a thread that
+   * is still orphaned always keeps the entry the skip test reads.
+   * `reconcileWatchers` additionally sweeps entries for threads no
    * longer under a watcher, so the map stays bounded. */
   const orphanCheckRevision = new Map<string, string>();
   /** Per-directory watcher, fanned out to the set of threaded
@@ -280,6 +333,31 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
      * even though `existsSync(dir)` says the path exists. Round-4
      * blocker G(a). */
     boundIdent?: { dev: number; ino: number };
+    /** Has a `fs.watch` REGISTRATION ever succeeded on this exact
+     * canonical `dir` path? Once true it stays true for the lifetime
+     * of this watcher, which is what makes a re-arm safe to attempt
+     * only when it is false.
+     *
+     * The asymmetry is a BUN defect, not a platform limit. Issue #49
+     * measured, on one kernel and filesystem: after a re-arm on a path
+     * whose inode was replaced, raw `inotify_add_watch` via ctypes
+     * SIGNALS (new wd) and `node v24.21.0` `fs.watch` SIGNALS, but
+     * `bun 1.3.13` receives ZERO events (5/5 re-arms; also via
+     * `dir + "/."`, after `rm -rf`, and before a rename-save). So on
+     * this runtime a swapped directory can only be served by polling.
+     * `false` means the path was never successfully watched — the dir
+     * was missing at install time, or `watch()` threw before
+     * registering — and that is the case a re-arm can actually fix.
+     *
+     * If a future Bun recovers, this gate is CONSERVATIVE, not wrong:
+     * those directories keep the poll (2 s slower, never blind). The
+     * runtime probe in `test/serve/watcher-rearm.test.ts` is the
+     * signal to re-measure and relax this, not the daemon itself. */
+    everWatched: boolean;
+    /** Consecutive clean observations by the rebind probe (see
+     * `DEFAULT_DIR_STABLE_INTERVALS`). Reset to 0 on any rebind, any
+     * watch error, and after every re-arm attempt. */
+    stableObs: number;
   }
   const dirWatchers = new Map<string, DirectoryWatcher>();
   /** Per-path debounce timer for the fan-out. */
@@ -313,6 +391,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     watchedDirs: () => dirWatchers.size,
     fileReadCount: () => fileReadCount,
     pipelineRunCount: () => pipelineRunCount,
+    dirWatchMode: (dir) => {
+      const dw = dirWatchers.get(dir);
+      if (dw === undefined) return undefined;
+      if (dw.watcher !== undefined) return "watch";
+      return dw.poll !== undefined ? "poll" : undefined;
+    },
+    orphanMemoSize: () => orphanCheckRevision.size,
     stop,
   };
 
@@ -560,13 +645,19 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         const event = reanchorEvent(thread.id, actor, result);
         if (event === null) continue;
         const seq = await tryEmitEvent(event);
-        // A rejected append leaves the memo untouched — retry on
-        // the next refresh. A successful append that moved a
-        // thread from `orphaned` → `open` leaves the stale memo,
-        // but the state-derived skip now checks `anchor.revision`
-        // (open) so the memo is inert.
-        if (seq !== null && result.kind === "orphaned") {
+        if (seq === null) continue;
+        if (result.kind === "orphaned") {
           orphanCheckRevision.set(thread.id, newRevision);
+        } else {
+          // Issue #49: a `thread.reanchored` that LANDED flips this
+          // thread back to `open`, so its orphan-check memo is dead
+          // weight — prune it here rather than letting it linger until
+          // the next `reconcileWatchers`. Keyed on this thread's own
+          // re-anchor, never a sweep, so a still-orphaned sibling
+          // keeps the entry its skip test reads. Only on a successful
+          // append: a rejected event leaves the thread orphaned and
+          // still in need of its memo.
+          orphanCheckRevision.delete(thread.id);
         }
       }
     }
@@ -720,7 +811,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     const basename = basenameOf(rooted);
     let dw = dirWatchers.get(dir);
     if (dw === undefined) {
-      dw = { basenames: new Map(), needsRebind: false };
+      dw = { basenames: new Map(), needsRebind: false, everWatched: false, stableObs: 0 };
       dirWatchers.set(dir, dw);
       installDirectoryWatcher(dir, dw);
     }
@@ -739,8 +830,23 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    *
    * Captures `boundIdent = (dev, ino)` at bind time so the rebind
    * probe can spot a rename-swap: the path exists, but its inode
-   * differs from the one we bound to (round-4 blocker G(a)). */
-  function installDirectoryWatcher(dir: string, dw: DirectoryWatcher): void {
+   * differs from the one we bound to (round-4 blocker G(a)).
+   *
+   * `handoverFromPolling` is the issue-#49 re-arm mode. On a plain
+   * install we fire a catch-up refresh for EVERY tracked path (the
+   * round-4 blocker G(b) requirement: events between the old watcher
+   * dying and this one installing were missed). A re-arm is a
+   * different thing — the poll has been serving that directory
+   * correctly right up to the swap, so a blind fan-out would be a
+   * pointless refresh burst. Instead the poll's own snapshot is used
+   * as the handover baseline and only paths whose `(mtime, size)`
+   * actually moved are fired, which closes the switchover window
+   * without the storm. */
+  function installDirectoryWatcher(
+    dir: string,
+    dw: DirectoryWatcher,
+    options: { handoverFromPolling?: boolean } = {},
+  ): void {
     if (forcePoll) {
       installDirectoryPolling(dir, dw);
       return;
@@ -762,7 +868,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       // error event can clobber a NEW watcher's state after a
       // rebind. (PR #45 round-5 defence-in-depth.)
       let capturedWatcher: FSWatcher | undefined;
-      capturedWatcher = watch(dir, { persistent: false }, (eventType, filename) => {
+      capturedWatcher = watchFn(dir, { persistent: false }, (eventType, filename) => {
         if (dw.watcher !== capturedWatcher) return;
         // Any event on the DIRECTORY itself (its own inode) — no
         // `filename` on most kernels — dispatch to every threaded
@@ -803,12 +909,18 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         }
         dw.watcher = undefined;
         dw.needsRebind = true;
+        dw.stableObs = 0;
         installDirectoryPolling(dir, dw);
       });
       const watcher = capturedWatcher;
       dw.watcher = watcher;
       dw.needsRebind = false;
       dw.boundIdent = boundIdent;
+      // Issue #49: a registration now exists on this canonical path.
+      // From here on, if the inode is replaced the path can no longer
+      // be re-armed (see `DirectoryWatcher.everWatched`).
+      dw.everWatched = true;
+      const handover = options.handoverFromPolling === true ? dw.pollStat : undefined;
       // If a polling fallback was previously installed, tear it down
       // — the fs.watch is now live.
       if (dw.poll !== undefined) {
@@ -816,14 +928,45 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         dw.poll = undefined;
         dw.pollStat = undefined;
       }
-      // Round-4 blocker G(b): after a fresh bind we may have missed
-      // events between the old watcher dying and the new one
-      // installing. Trigger a refresh for every tracked path so
-      // an already-written file is reprocessed against the current
-      // content.
-      for (const trackedPath of dw.basenames.values()) fireForPath(trackedPath);
+      if (handover !== undefined) {
+        // Issue #49 re-arm: fire only what the poll had not yet seen.
+        // Nothing else — the poll was live a moment ago, so a write in
+        // the switchover window is the ONLY thing this can owe.
+        fireChangedSince(dir, dw, handover);
+      } else {
+        // Round-4 blocker G(b): after a fresh bind we may have missed
+        // events between the old watcher dying and the new one
+        // installing. Trigger a refresh for every tracked path so
+        // an already-written file is reprocessed against the current
+        // content.
+        for (const trackedPath of dw.basenames.values()) fireForPath(trackedPath);
+      }
     } catch {
       installDirectoryPolling(dir, dw);
+    }
+  }
+
+  /** Fire a refresh for every tracked path under `dir` whose current
+   * `(mtime, size)` differs from `baseline`, and update the live poll
+   * snapshot. Shared by the polling fallback's tick and the issue-#49
+   * poll→watch handover so both answer the same question with the
+   * same comparison. */
+  function fireChangedSince(
+    dir: string,
+    dw: DirectoryWatcher,
+    baseline: Map<string, { mtimeMs: number; size: number } | undefined>,
+  ): void {
+    for (const path of dw.basenames.values()) {
+      const rooted = repoRoot + "/" + path;
+      const now = safeStat(rooted);
+      const prev = baseline.get(path);
+      const absentBoth = prev === undefined && now === undefined;
+      const moved = prev === undefined || now === undefined
+        ? !absentBoth
+        : prev.mtimeMs !== now.mtimeMs || prev.size !== now.size;
+      if (!moved) continue;
+      dw.pollStat?.set(path, now);
+      fireForPath(path);
     }
   }
 
@@ -859,22 +1002,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
     const interval = setInterval(() => {
       if (stopped) return;
-      for (const [basename, path] of dw.basenames) {
-        void basename;
-        const rooted = repoRoot + "/" + path;
-        const now = safeStat(rooted);
-        const prev = dw.pollStat!.get(path);
-        if (prev === undefined && now === undefined) continue;
-        if (prev === undefined || now === undefined) {
-          dw.pollStat!.set(path, now);
-          fireForPath(path);
-          continue;
-        }
-        if (prev.mtimeMs !== now.mtimeMs || prev.size !== now.size) {
-          dw.pollStat!.set(path, now);
-          fireForPath(path);
-        }
-      }
+      fireChangedSince(dir, dw, dw.pollStat!);
     }, pollIntervalMs);
     (interval as unknown as { unref?: () => void }).unref?.();
     dw.poll = interval;
@@ -980,66 +1108,118 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    *       is now bound to the DEAD one. Without this check the
    *       daemon silently misses every subsequent event.
    *
-   * **Rebind → polling (round-5 blocker G).** A REBOUND directory
-   * uses the polling fallback for the rest of its lifetime, not a
-   * fresh `fs.watch`. `fs.watch` on Bun/libuv silently no-ops on a
-   * path that had a prior watcher armed then closed then the path
-   * was renamed away — the inotify state for that path stays
-   * broken until the process exits. Verified with a minimal
-   * repro against `bun 1.3.13` on Linux 6.8: two consecutive
-   * `watch(dir)` calls, with a rename+mkdir in between, receive
-   * zero events on the second. Polling costs one `stat(2)` per
-   * tracked file per `pollIntervalMs` (default 2 s) — cheap and
-   * correct. */
-  function rebindMissingDirWatchers(): void {
+   * **Rebind → polling, then re-arm once stable (round-5 blocker G +
+   * issue #49).** A REBOUND directory does not get a fresh `fs.watch`
+   * on the same canonical path — but the reason is a BUN defect, not
+   * a platform limit, and the distinction decides what to do about it.
+   * On `bun 1.3.13`, after a `renameSync(dir, …); mkdirSync(dir)`,
+   * FIVE consecutive re-arms each received zero events (also via
+   * `dir + "/."`, after `rm -rf`, and ahead of a rename-save), and a
+   * recursive watch on the parent never saw the recreated directory's
+   * writes. On the SAME kernel and filesystem, raw `inotify_add_watch`
+   * via ctypes SIGNALS (allocating a new wd) and `node v24.21.0`
+   * SIGNALS — so inotify is healthy and this is Bun's watch
+   * implementation, version-specific to 1.3.13. Remediation is to
+   * report/track the Bun bug and cross-check under Node; a native
+   * inotify binding is explicitly NOT warranted, because inotify is
+   * not what is broken. Such a directory is served by the
+   * `stat`-poll — one `stat(2)` per tracked file per `pollIntervalMs`
+   * (default 2 s): cheap, correct.
+   *
+   * **What #49 changed, and how narrow it is.** `DirectoryWatcher.
+   * everWatched` records whether a registration ever succeeded on the
+   * canonical path, and the probe re-arms once `dirStableIntervals`
+   * consecutive clean observations prove the directory has settled,
+   * ONLY when `everWatched` is false — i.e. the directory was missing
+   * at install time, or `watch()` threw before registering. **The
+   * rename-swap and `rm -rf` shapes have necessarily carried a
+   * registration, so they keep the poll and keep the 2 s worst-case
+   * detection latency; #49 did not remove it for them.** The poll
+   * carries a directory until a re-arm lands and is torn down only
+   * once a watcher is actually live, so a failed re-arm degrades to
+   * the status quo rather than to a blind directory. */
+  function rebindMissingDirWatchers(options: { tick?: boolean } = {}): void {
     for (const [dir, dw] of dirWatchers) {
-      // Explicit rebind flag (needsRebind path).
-      if (dw.needsRebind) {
-        if (!existsSync(dir)) continue;
-        installDirectoryPolling(dir, dw, { force: true });
-        // Capture the fresh identity so the inode-swap check below
-        // does not fire again on the same swap.
-        try {
-          const st = statSync(dir);
-          dw.boundIdent = { dev: st.dev, ino: st.ino };
-        } catch {
-          dw.boundIdent = undefined;
-        }
-        dw.needsRebind = false;
-        // Round-4 blocker G(b): the polling fallback's own tick
-        // will spot the write eventually, but firing a refresh
-        // right now covers a write that already landed before the
-        // rebind ran.
-        for (const p of dw.basenames.values()) fireForPath(p);
+      if (stepDirRebind(dir, dw)) {
+        // The directory was rebound (or is still missing): it has not
+        // demonstrated stability, so the re-arm counter restarts.
+        dw.stableObs = 0;
         continue;
       }
-      // Silent inode swap — dir looks fine but the watcher is bound
-      // to a dead inode.
-      if (dw.watcher !== undefined && dw.boundIdent !== undefined) {
-        let currentIdent: { dev: number; ino: number } | undefined;
+      // Stability is a WALL-CLOCK notion — count it on the periodic
+      // probe only. `reconcileWatchers` also calls this function, and
+      // letting a POST /api/threads advance the counter would make
+      // "N intervals" mean "N events" instead.
+      if (options.tick !== true) continue;
+      if (dw.watcher !== undefined || forcePoll || dw.everWatched) continue;
+      if (dw.stableObs < dirStableIntervals) {
+        dw.stableObs += 1;
+        continue;
+      }
+      // Attempt the re-arm. Either outcome resets the counter: a
+      // success now has to prove itself over the next N ticks, and a
+      // failure re-arms the stability gate so a persistently
+      // unwatchable directory costs one `watch()` per N probe
+      // intervals rather than one per tick.
+      dw.stableObs = 0;
+      installDirectoryWatcher(dir, dw, { handoverFromPolling: true });
+    }
+  }
+
+  /** One rebind step for `dir`. Returns true when the watcher is
+   * disturbed — a rebind was performed, or the directory is missing
+   * and still needs one — which is precisely the condition that
+   * resets the stability counter. Returns false only when this tick
+   * found nothing wrong with `dir`. */
+  function stepDirRebind(dir: string, dw: DirectoryWatcher): boolean {
+    // Explicit rebind flag (needsRebind path).
+    if (dw.needsRebind) {
+      if (!existsSync(dir)) return true;
+      installDirectoryPolling(dir, dw, { force: true });
+      // Capture the fresh identity so the inode-swap check below
+      // does not fire again on the same swap.
+      try {
+        const st = statSync(dir);
+        dw.boundIdent = { dev: st.dev, ino: st.ino };
+      } catch {
+        dw.boundIdent = undefined;
+      }
+      dw.needsRebind = false;
+      // Round-4 blocker G(b): the polling fallback's own tick
+      // will spot the write eventually, but firing a refresh
+      // right now covers a write that already landed before the
+      // rebind ran.
+      for (const p of dw.basenames.values()) fireForPath(p);
+      return true;
+    }
+    // Silent inode swap — dir looks fine but the watcher is bound
+    // to a dead inode.
+    if (dw.watcher !== undefined && dw.boundIdent !== undefined) {
+      let currentIdent: { dev: number; ino: number } | undefined;
+      try {
+        const st = statSync(dir);
+        currentIdent = { dev: st.dev, ino: st.ino };
+      } catch {
+        // Dir gone since; the next tick's `needsRebind` path handles it.
+        return true;
+      }
+      if (currentIdent.dev !== dw.boundIdent.dev || currentIdent.ino !== dw.boundIdent.ino) {
         try {
-          const st = statSync(dir);
-          currentIdent = { dev: st.dev, ino: st.ino };
+          dw.watcher.close();
         } catch {
-          // Dir gone since; the next tick's `needsRebind` path handles it.
-          continue;
+          // Already closed.
         }
-        if (
-          currentIdent.dev !== dw.boundIdent.dev ||
-          currentIdent.ino !== dw.boundIdent.ino
-        ) {
-          try {
-            dw.watcher.close();
-          } catch {
-            // Already closed.
-          }
-          dw.watcher = undefined;
-          dw.boundIdent = currentIdent;
-          installDirectoryPolling(dir, dw, { force: true });
-          for (const p of dw.basenames.values()) fireForPath(p);
-        }
+        dw.watcher = undefined;
+        dw.boundIdent = currentIdent;
+        // A swap means this path HAS carried a registration, so
+        // `everWatched` is already true and no re-arm will be
+        // attempted: polling is the terminal mechanism here.
+        installDirectoryPolling(dir, dw, { force: true });
+        for (const p of dw.basenames.values()) fireForPath(p);
+        return true;
       }
     }
+    return false;
   }
 
   /** Install a watcher on `distDir`. Reinstalled after an error or
@@ -1058,7 +1238,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     if (dirRebindTimer !== undefined || stopped) return;
     dirRebindTimer = setInterval(() => {
       if (stopped) return;
-      rebindMissingDirWatchers();
+      rebindMissingDirWatchers({ tick: true });
     }, dirRebindIntervalMs);
     (dirRebindTimer as unknown as { unref?: () => void }).unref?.();
   }
