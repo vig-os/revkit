@@ -98,9 +98,9 @@ precommit:
 #      peak: 4449. GitHub-hosted runners cap the soft `nofile` limit at
 #      1024, so `EMFILE` is a matter of time. `ulimit -n` is set to give the
 #      run headroom so it COMPLETES, and the peak is then checked against
-#      `test_fd_budget` so the next leak is a NAMED failure instead of a
-#      crash. This is headroom plus a tripwire, NOT a fix — the fds are
-#      Bun's to leak and revkit's teardown is already correct.
+#      the per-leg `test_fd_budget_*` so the next leak is a NAMED failure
+#      instead of a crash. This is headroom plus a tripwire, NOT a fix — the
+#      fds are Bun's to leak and revkit's teardown is already correct.
 #
 #   3. WALL-CLOCK BOUNDS. `timeout --signal=ABRT` per leg, so a stall is
 #      a red leg that names itself instead of a cancelled job. Be precise
@@ -154,9 +154,16 @@ test *args:
 
     .claude/skills/revkit_run/test-lib.sh
 
-    # run_leg <label> <budget-seconds> <command...>
+    # run_leg <label> <wall-clock-budget> <fd-budget> -- <command...>
     # Wraps one leg in BOTH the wall-clock bound and the fd peak check, so
     # no leg can be added later that silently lacks them.
+    #
+    # The two budgets differ per leg because the underlying quantity does:
+    # bun test legs are a single process with a stable count, while the
+    # Playwright leg's peak scales with the worker count (see
+    # `test_fd_budget_*`). One shared ceiling would have to be loose enough
+    # for the biggest workstation, which throws away the guard on the legs
+    # that have a stable number.
     #
     # On a stall, the leg's captured output is grepped for the test file bun
     # was working on, when the runtime is one that says. Best-effort by
@@ -167,12 +174,13 @@ test *args:
     # reason the runtime line is printed first is precisely that these two
     # runtimes differ.
     run_leg() {
-      local label="$1" budget="$2"; shift 2
+      local label="$1" budget="$2" fd_budget="$3"; shift 3
+      [ "$1" = "--" ] && shift
       local log; log="$(mktemp)"
-      printf '\njust test: === %s (budget %ss) ===\n' "$label" "$budget"
+      printf '\njust test: === %s (wall %ss, fds %s) ===\n' "$label" "$budget" "$fd_budget"
       set +e
       timeout --signal=ABRT --kill-after=30s "${budget}s" \
-        ./scripts/fd-budget.sh --budget "{{test_fd_budget}}" -- "$@" 2>&1 | tee "$log"
+        ./scripts/fd-budget.sh --budget "$fd_budget" -- "$@" 2>&1 | tee "$log"
       local status="${PIPESTATUS[0]}"
       set -e
       if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
@@ -205,11 +213,11 @@ test *args:
     # workflow's 20-minute ceiling: worst case is a stalled Playwright leg
     # at 241s of healthy work + 720s = 16 min, a stalled cli leg at
     # 540s + 241s = 13 min.
-    run_leg packages/cli "{{test_leg_timeout_cli}}" env REVKIT_E2E_BUILD=1 bash -c "cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
-    run_leg packages/review-core "{{test_leg_timeout_review_core}}" bash -c "cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
-    run_leg site/schemas "{{test_leg_timeout_schemas}}" bash -c "cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}"
+    run_leg packages/cli "{{test_leg_timeout_cli}}" "{{test_fd_budget_stable}}" -- env REVKIT_E2E_BUILD=1 bash -c "cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
+    run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" -- bash -c "cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
+    run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" -- bash -c "cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}"
     just check
-    run_leg site/playwright "{{test_leg_timeout_e2e}}" just e2e
+    run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" -- just e2e
 
 # Wall-clock budget per leg, in seconds. See note 3 on `test` above for
 # the measurements these come from.
@@ -229,27 +237,34 @@ bun_test_timeout_ms := "30000"
 # peak and inside every host's hard limit.
 test_fd_limit := "65536"
 
-# Descriptor ceiling for one leg, checked by scripts/fd-budget.sh.
+# Per-leg descriptor ceilings, checked by scripts/fd-budget.sh (peak = the
+# whole process TREE, so Playwright's workers and their daemons count).
+# Two values because the quantity behaves differently per leg.
 #
-# Measured on `bun 1.3.13` (peak = the whole process TREE, so the
-# Playwright workers and their daemons are included):
+# Measured on `bun 1.3.13`:
 #
-#   packages/cli        4449   worker-count independent — bun test is a
-#                              single process; the stable number, and the
-#                              one the budget is sized from
-#   site/playwright      499   at CI settings (`workers: 1`)
-#                      4683   on an 88-core host, i.e. ~44 Playwright
-#                              workers — scales with worker count
+#   packages/cli        4449   single process, so worker-count INDEPENDENT
+#                              and stable across runs — the number a leak
+#                              guard should be sized from
 #   packages/review-core   98
 #   site/schemas          139
 #
-# 8192 clears the worst leg observed in either configuration (4683) by
-# ~1.75x while staying far below a runaway, so the guard fails on a leak
-# that got an order of magnitude worse rather than on ordinary drift.
-# It is deliberately NOT tightened to the 4449 figure: a dev box with
-# many cores legitimately runs more Playwright workers, and a budget that
-# red-lined on a big workstation would train everyone to ignore it.
-test_fd_budget := "8192"
+# The Playwright leg is different: its peak scales with the worker count.
+#   site/playwright      499   at CI settings (`workers: 1`) — this is what
+#                              CI will actually see
+#                      4683 / 6008 / 6481   across ~44 workers on this
+#                              88-core host, varying run to run with how
+#                              many browsers launch at once
+#
+# So the bun legs get 8192 (~1.8x over the stable 4449) and the Playwright
+# leg gets 16384 (~2.5x over its worst observed 6481). Sizing the
+# Playwright budget off 4449 would red a busy workstation for no reason,
+# and a guard that cries wolf gets ignored — which is the one outcome
+# worse than having no guard. Both still fail well before the 65536 fd
+# `ulimit` above, so a real runaway is caught as a named assertion rather
+# than as `EMFILE`.
+test_fd_budget_stable := "8192"
+test_fd_budget_playwright := "16384"
 
 # Regenerate the pipeline-digest fixture that
 # `packages/cli/test/build/own-build-unchanged.test.ts` compares
