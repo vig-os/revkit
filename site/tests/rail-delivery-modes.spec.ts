@@ -37,7 +37,6 @@ interface DaemonCtx {
   readonly child: ChildProcess;
   readonly root: string;
   readonly url: string;
-  readonly launchUrl: string;
   readonly agentToken: string;
   readonly port: number;
 }
@@ -77,17 +76,21 @@ async function bootDaemon(): Promise<DaemonCtx> {
     child.kill("SIGTERM");
     throw new Error("daemon never wrote serve.json");
   }
+  // Readiness gate only. The daemon's launch URL is deliberately NOT kept:
+  // the code in it is single-use, so the one field that caused #74's ask-page
+  // cluster has no reason to exist on a ctx at all. Each test mints its own
+  // via `mintLaunchUrl` — see `fixtures/launch-code.ts`.
   const deadline2 = Date.now() + 2000;
+  let announcedLaunch = false;
   while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
+    if (stdoutChunks.join("").match(/launch:\s+(\S+)/) !== null) { announcedLaunch = true; break; }
     await new Promise((r) => setTimeout(r, 20));
   }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
+  if (!announcedLaunch) {
     child.kill("SIGTERM");
     throw new Error("daemon never printed launch URL");
   }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken };
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
