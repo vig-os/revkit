@@ -17,7 +17,7 @@
 // ENFORCED, three mechanisms:
 //
 //   1. **The message is a closed vocabulary.** `msg` must be one of the
-//      five names in `LOG_MESSAGES`, enforced in the TYPE (`LogMessage` is a
+//      names in `LOG_MESSAGES`, enforced in the TYPE (`LogMessage` is a
 //      literal union) and at RUNTIME (`KNOWN_MESSAGES.has(msg)`). This is the
 //      only mechanism that can stop a COMMENT BODY, because no regex
 //      distinguishes prose from a log line: the earlier version put a whole
@@ -30,7 +30,10 @@
 //   3. **Value shapes.** Every remaining string — in any field, at any
 //      depth — is tested for a credential shape or an email address. This is
 //      what catches the leak under an INNOCENT key, which is how leaks
-//      actually happen.
+//      actually happen. Slice 2 added revkit's own token shape to this set
+//      after MEASURING that a minted session id logged under the key `seen`
+//      came out verbatim: the shape pass knew six credential families and
+//      none of them was the one this repo mints.
 //
 // NOT ENFORCED, and stated so nobody relies on it:
 //
@@ -47,18 +50,36 @@
 // be logged under a content-shaped key, and cannot leak an address or a
 // credential under any key" — NOT "nothing sensitive can reach a log".
 
+import { TOKEN_CHARS } from "./session.ts";
+
 /** Severity of one line. Explicit rather than inferred so a log query
  * can filter without parsing the message. */
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 /** Every log line's message is one of these. A literal union, so a new
  * call site cannot invent a message without TypeScript objecting, AND a
- * runtime guard for callers that are not TypeScript. */
+ * runtime guard for callers that are not TypeScript.
+ *
+ * `auth.denied` / `auth.granted` / `csrf.rejected` are the slice-2 addition.
+ * Their `reason` field is a closed vocabulary too, but it lives with the gate
+ * that chooses it (`DENIAL_REASONS` in `src/authz.ts`), not here — an earlier
+ * revision of this file put the list HERE, on the theory that half its members
+ * ("expired-session", "malformed-session-cookie") are credential-shaped and
+ * would be eaten by the key-name pattern. That theory was WRONG and the
+ * mutation run is what proved it: `SENSITIVE_KEY` is tested against the KEY,
+ * never the value, and no reason matches a credential VALUE shape, so deleting
+ * the exemption changed no output at all (0 of 30 logger tests). A mechanism
+ * with a plausible justification and no measured effect is worse than none,
+ * so it is gone and the closed vocabulary is enforced by the TYPE where it is
+ * produced. `test/authorization.test.ts` pins the list. */
 export const LOG_MESSAGES = [
   "request.start",
   "request.end",
   "request.error",
-  "api.threads.read.disabled",
+  "auth.denied",
+  "auth.granted",
+  "csrf.rejected",
+  "api.session.refresh.ok",
   "api.threads.append.disabled",
 ] as const;
 
@@ -101,7 +122,16 @@ export interface Logger {
  * `session`/`session_id`/`sid` are here because ADR-0012 makes the session
  * cookie the bearer credential for a hosted request, and `sessions.id` is
  * the schema's own identifier for it: a session id in a log line is a
- * credential in a log line.
+ * credential in a log line. M4 slice 2 made that concrete rather than
+ * theoretical — the cookie carries a 256-bit token and
+ * `POST /api/session/refresh` mints one per request's caller, so from slice 2
+ * there IS a real session id in every authorized request. `test/logger.test.ts`
+ * drives a genuinely minted one through this redactor.
+ *
+ * `csrf` is here for the same reason one step along: the CSRF token is a
+ * bearer credential that authorises state changes, `CSRF_HEADER` is literally
+ * named `x-revkit-csrf`, and a field called `csrf` must not keep its value
+ * whatever it contains.
  *
  * **`cookie[s]?` rather than `cookie`.** The first alternative's
  * non-letter guards are what stop `authorship` matching `auth`, and they also
@@ -121,6 +151,31 @@ const SENSITIVE_KEY =
  * it is prose. */
 const SECRET_VALUE =
   /(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{16,}={0,2}|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})/;
+
+/**
+ * Revkit's OWN credential shape: a `TOKEN_CHARS`-long base64url string.
+ *
+ * **Measured, not hypothesised.** M4 slice 2 added a session id and a CSRF
+ * token, both `mintToken()` output, and the test below logs a minted one under
+ * the key `seen` — an innocent name, exactly the shape of leak the value pass
+ * exists to catch. Before this pattern that test FAILED: the line came out
+ * with 256 bits of CSPRNG output verbatim, because `ghp_`-prefix matching does
+ * not cover a credential this repo mints itself. So the gap was real, the
+ * fix is to state the shape, and it is stated rather than generalised because
+ * a broader "looks like a token" rule would start eating git object ids.
+ *
+ * The false-positive cost here is zero and is a property of what gets logged,
+ * not luck: this module's own values are timestamps, HTTP verbs, pathnames,
+ * status codes, closed-vocabulary reasons and UUID request ids (36 chars,
+ * dashed — not 43 undashed), so nothing legitimate in a line is this shape.
+ * If a future field starts logging base64url of some other length, this rule
+ * will not cover it and the caller rule is what it will rely on — which is
+ * the boundary this module's header already draws.
+ *
+ * The length comes from `session.ts` rather than being written here, so the
+ * rule cannot drift away from the mints it is describing.
+ */
+const REVKIT_TOKEN_VALUE = new RegExp(`^(?:[A-Za-z0-9_-]{${TOKEN_CHARS}})$`);
 
 /** An email address. ADR-0015 and ADR-0020 both name emails explicitly,
  * and an address is the single most likely personal datum to appear in a
@@ -157,7 +212,9 @@ const KNOWN_MESSAGES: ReadonlySet<string> = new Set<string>(LOG_MESSAGES);
  * it replaces the WHOLE value, so a partially-redacted address
  * (`re***@example.com`) never appears. */
 function redactString(value: string): string {
-  return SECRET_VALUE.test(value) || EMAIL_ADDRESS.test(value) ? REDACTED : value;
+  return SECRET_VALUE.test(value) || EMAIL_ADDRESS.test(value) || REVKIT_TOKEN_VALUE.test(value)
+    ? REDACTED
+    : value;
 }
 
 /** Recursively redact one value. Depth-bounded so a cyclic object from a

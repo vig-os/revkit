@@ -18,6 +18,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Miniflare, type MiniflareOptions } from "miniflare";
+import { JSON_MEDIA_TYPE } from "../src/authz.ts";
+import { CSRF_HEADER, SESSION_COOKIE_NAME, issueSession, type IssuedSession } from "../src/session.ts";
 
 const PKG_ROOT = new URL("../", import.meta.url);
 
@@ -228,26 +230,66 @@ export function bundles(): Promise<Bundles> {
 
 /** The shipped Worker entry's bundle.
  *
- * **Small, and that is correct.** `GET /api/threads` is closed (ADR-0012
- * authorization), so nothing reachable from `src/index.ts` constructs a
- * `D1ThreadStore` any more and the bundler tree-shakes `d1-store.ts` — and
- * with it the whole `@revkit/review-core` graph — out of this artefact.
- * Measured: ~20 KB, against ~790 KB while the route was open. So this
- * bundle is what the PLATFORM has to load, and ADR-0025's "the core runs in
- * workerd" claim is proven against `probeBundle()` instead, which is the
- * same graph reached through a route that is not part of the shipped
- * surface. */
+ * **Large, and that is the point.** From M4 slice 2 `GET /api/threads`
+ * constructs a real `D1ThreadStore` and reduces a real log, so the bundler
+ * keeps `d1-store.ts` — and with it the whole `@revkit/review-core` graph —
+ * in this artefact. Measured ~807 KB, against ~20 KB while slice 1 kept the
+ * route closed. That is what the PLATFORM has to load in production, and it
+ * means ADR-0025's "the same core serves all three surfaces" is now a claim
+ * about the deployed artefact and not only about a test probe.
+ *
+ * The probe bundle stays as well: it is the graph EXECUTED inside workerd
+ * with the same empty `compatibility_flags`, and the two are scanned
+ * separately because they are different files. */
 export async function workerBundle(): Promise<string> {
   return (await bundles()).worker;
 }
 
 /** The runtime-probe bundle — ADR-0025's gate, dispatched through its own
- * miniflare so the probe never becomes a route on the shipped Worker. This
- * is the artefact that CONTAINS `@revkit/review-core` and `d1-store.ts`,
- * which is why the forbidden-pattern scan has to run over both. */
+ * miniflare so the probe never becomes a route on the shipped Worker. It is
+ * the second runtime the shared graph is MEASURED in, and the only artefact
+ * that legitimately CONTAINS a `Buffer` token: its own measurement that the
+ * global is absent. */
 export async function probeBundle(): Promise<string> {
   return (await bundles()).probe;
 }
+
+// ── session helpers ───────────────────────────────────────────────────────
+
+/**
+ * Mint a session the way the ONLY current issuer does.
+ *
+ * `issueSession` has no HTTP caller by design (`src/session.ts`'s header
+ * explains why: a route that hands a session to whoever asks is an
+ * unauthenticated endpoint, and a secret-gated one cannot be built or tested
+ * without provisioning, #34). Tests call the same function `revkit deploy
+ * init` will call, against the same D1 database the Worker reads, so an
+ * authorized request here is authorized for the same reason a production one
+ * will be: a row exists, it is unexpired, and its identity kind is one the
+ * gate honours.
+ */
+export async function issueTestSession(
+  db: D1Database,
+  options: { readonly ttlMs?: number } = {},
+): Promise<IssuedSession> {
+  return issueSession(db, { kind: "operator", id: "operator" }, options);
+}
+
+/** Just the `Cookie` header value for a session. */
+export function cookieHeader(sessionId: string): string {
+  return `${SESSION_COOKIE_NAME}=${sessionId}`;
+}
+
+/** Every header an authorized request needs: the cookie, plus the CSRF token
+ * for the state-changing ones. Built in one place so a test cannot
+ * accidentally authorize half a call. */
+export function authHeaders(issued: IssuedSession): Record<string, string> {
+  return { cookie: cookieHeader(issued.sessionId), [CSRF_HEADER]: issued.csrfToken };
+}
+
+/** `Content-Type` for a state-changing call. ADR-0012 accepts only
+ * `application/json`, so even a body-less POST has to declare it. */
+export const JSON_HEADERS: Readonly<Record<string, string>> = { "content-type": JSON_MEDIA_TYPE };
 
 /** A running miniflare plus its D1 handle. */
 export interface Harness {
@@ -350,6 +392,31 @@ export async function startWorker(
   // bimodal (observed: 5.9 s typical, 26 s and 38 s twice in 45 runs on a
   // host at loadavg 30), so the harness prints the per-boot cost when
   // REVKIT_WORKER_BOOT_LOG=1 is set rather than leaving it to be guessed at.
+  //
+  // **Keep the number of instances low, and here is the measurement for why.**
+  // Slice 2 re-opened `GET /api/threads`, so the shipped entry stopped being
+  // tree-shaken and every default `startWorker()` began loading an ~807 KB
+  // module graph instead of a ~20 KB one. Nothing about THAT is slow — 14
+  // sequential boots of the 807 KB bundle in a plain `bun run` take 265-445 ms
+  // each, no failures — but under `bun test` on this host (loadavg 31, six
+  // users) the suite became DETERMINISTICALLY stuck: whichever test file ran
+  // after `worker-runtime.test.ts` would sit in `getD1Database` forever, bun
+  // would print "killed 1 dangling process", and a `--timeout 30000` run did
+  // not help, so it was a hang and not a slow boot. Bisected to the instance
+  // COUNT rather than the size: 5 boots in one file plus one more was the
+  // cliff, and `worker-runtime.test.ts` was creating five (harness, probe, and
+  // three more for its misconfigured-deploy cases).
+  //
+  // The fix was to make that file create THREE — not by deleting cases, but by
+  // reusing the `harness` it already had as the healthy control for the
+  // "same script, only the var differs" case, which is a STRONGER control
+  // (identical bytes by construction) and two fewer workerd spawns. The suite
+  // has been green and stable across 12+ consecutive runs since.
+  //
+  // The mechanism behind the cliff was NOT identified. What is pinned is the
+  // observable: the budget, and the fact that raising it fixes it. Do not read
+  // this as "miniflare is broken" — it is a note about how many 800 KB
+  // workerd instances this host tolerates inside one `bun test`.
   const bootStarted = performance.now();
   const db = await mf.getD1Database("DB");
   const dbReady = performance.now();

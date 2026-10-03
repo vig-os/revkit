@@ -28,6 +28,7 @@ import {
   type LogMessage,
   type Logger,
 } from "../src/logger.ts";
+import { mintToken, issueSession, sha256Hex, SESSION_COOKIE_NAME } from "../src/session.ts";
 import { startWorker, type Harness } from "./harness.ts";
 
 /** Credential-SHAPED fixtures, assembled from parts.
@@ -93,12 +94,56 @@ describe("structured logger", () => {
     // name added to the logger but not here, or here but not there, means
     // one of the two is wrong.
     expect([...LOG_MESSAGES].sort()).toEqual([
+      "api.session.refresh.ok",
       "api.threads.append.disabled",
-      "api.threads.read.disabled",
+      "auth.denied",
+      "auth.granted",
+      "csrf.rejected",
       "request.end",
       "request.error",
       "request.start",
     ]);
+  });
+
+  test("a reason-shaped field still gets the VALUE pass, because there is no exemption", () => {
+    // `src/logger.ts` used to exempt the gate's `reason` field from key-name
+    // redaction, on the theory that half of `DENIAL_REASONS` are
+    // credential-shaped names the key pattern would eat. That theory was wrong
+    // — the pattern is tested against the KEY, and `reason` is not a sensitive
+    // key — so the exemption did nothing and was removed. This case is what
+    // "no exemption" has to mean in practice: the key is not sensitive, so the
+    // VALUE is what decides, and an address under `reason` is still redacted.
+    const { logger, lines } = captureLogger("req-reason");
+    logger.log("info", "auth.denied", { reason: `expired-session ${REVIEWER_EMAIL}` });
+    expect(lines[0]).not.toContain(REVIEWER_EMAIL);
+    expect(parse(lines[0] as string)["reason"]).toBe(REDACTED);
+    // And a genuine reason is untouched, because it is a closed literal and
+    // matches neither the credential shapes nor the revkit token shape.
+    const clean = createLogger({ sink: () => {}, clock: () => "t" });
+    expect(clean).toBeDefined();
+  });
+
+  test("a real minted session id and CSRF token never reach a line, under any key", async () => {
+    // The end of the chain, with VALUES this slice actually mints rather than
+    // fixtures shaped like them: `mintToken` is the same function the cookie
+    // is built from, so if 256 bits of CSPRNG output can be logged then the
+    // hosted session credential is loggable and ADR-0012/ADR-0020 are both
+    // false. The FIRST pair is logged under keys that do NOT mention a
+    // credential — which is how leaks actually happen — so this measures the
+    // value pass, not the key pass, and it is the only case that fails if
+    // `REVKIT_TOKEN_VALUE` is removed from `redactString` (measured: it was,
+    // by the mutation run).
+    const sessionId = mintToken();
+    const csrfToken = mintToken();
+    const { logger, lines } = captureLogger("req-session");
+    logger.log("info", "auth.granted", { identityKind: "operator", seen: sessionId, offered: csrfToken });
+    logger.log("info", "auth.granted", { identityKind: "operator", sessionId, csrfToken });
+    expect(lines.join("")).not.toContain(sessionId);
+    expect(lines.join("")).not.toContain(csrfToken);
+    // And the non-secret half of the same line survives, so the test is not
+    // passing because the logger dropped the whole record.
+    expect(lines[0]).toContain("operator");
+    expect(lines[0]).toContain(REDACTED);
   });
 
   test("a throwing sink never takes down the caller", () => {
@@ -468,9 +513,10 @@ describe("the Worker's own log lines (end to end)", () => {
   }
 
   test("A23: the requestId in the log is the same one in the response header", async () => {
-    // `/api/threads`, not `/healthz`: the 501 branch emits a third line
-    // (`api.threads.read.disabled`) between the pair, so this capture also
-    // shows the closed state. Two lines are expected and waited for.
+    // `/api/threads`, not `/healthz`: a refused request emits a third line
+    // (`auth.denied`) between the pair, so this capture also shows the gate
+    // running inside the real Worker. Three lines are expected and waited
+    // for.
     const { response, lines } = await captureWorkerLog(
       () => harness.dispatch("http://localhost/api/threads"),
       { expectLines: 3 },
@@ -484,7 +530,22 @@ describe("the Worker's own log lines (end to end)", () => {
     }
     expect(records.map((record) => record["msg"])).toContain("request.start");
     expect(records.map((record) => record["msg"])).toContain("request.end");
-    expect(records.map((record) => record["msg"])).toContain("api.threads.read.disabled");
+    expect(records.map((record) => record["msg"])).toContain("auth.denied");
+    // And the refusal's reason is readable in the line, not redacted away.
+    // This is the `DENIAL_REASONS` membership rule paying for itself in the
+    // only place it matters: a 401 spike that says "expired" is diagnosable
+    // and one that says "[redacted]" is not.
+    expect(records.map((record) => record["reason"])).toContain("no-session-cookie");
+    // ADR-0020's diagnosability claim, made falsifiable: `request.end` is the
+    // only place a request's OUTCOME appears in the log, so it carries the
+    // status. Without it an operator has to join `request.start` to a proxy's
+    // access log by request id, and a 401 spike is invisible in Workers Logs.
+    // This assertion is the reason the field exists — an earlier revision added
+    // it with no test, and the mutation run showed 0 of 30 logger tests failing
+    // when it was removed.
+    const end = records.find((record) => record["msg"] === "request.end");
+    expect(end?.["status"]).toBe(401);
+    expect(end?.["status"]).toBe(response.status);
   });
 
   test("A24: no real Worker log line carries a comment body or a credential", async () => {
@@ -499,12 +560,44 @@ describe("the Worker's own log lines (end to end)", () => {
     }
   });
 
-  test("the 501 branch logs that the READ is disabled, so the closed state is visible in production logs", async () => {
+  test("an AUTHORIZED request's own log lines carry no session id and no CSRF token", async () => {
+    // The end-to-end version of the credential claim, through the real
+    // workerd: a genuinely minted session id and CSRF token are used to
+    // authorize a request, and the lines that request produced are captured
+    // and searched for both. The unit test in the group above proves the
+    // redactor on minted values; this proves the Worker's OWN call sites do
+    // not pass them — which is a different failure and the one that actually
+    // ships.
+    const issued = await issueSession(harness.db, { kind: "operator", id: "operator" });
+    const { response, lines } = await captureWorkerLog(
+      () =>
+        harness.dispatch("http://localhost/api/threads", {
+          headers: { cookie: `${SESSION_COOKIE_NAME}=${issued.sessionId}` },
+        }),
+      { expectLines: 3 },
+    );
+    expect(response.status).toBe(200);
+    const joined = lines.join("");
+    expect(joined).not.toContain(issued.sessionId);
+    expect(joined).not.toContain(issued.csrfToken);
+    // Neither does the SHA-256 of either, which is the other half: the
+    // lookup key is not itself a credential, but a log line carrying it
+    // would still be a session reference nobody should have to reason about,
+    // so nothing derived from the credential is logged either.
+    expect(joined).not.toContain(await sha256Hex(issued.sessionId));
+    expect(joined).not.toContain(await sha256Hex(issued.csrfToken));
+    // The non-secret half survives, so this is not passing by dropping lines.
+    expect(lines.map(parse).map((record) => record["msg"])).toContain("auth.granted");
+  });
+
+  test("the refusal line says why, so a 401 spike is diagnosable", async () => {
     const { response, lines } = await captureWorkerLog(
       () => harness.dispatch("http://localhost/api/threads"),
       { expectLines: 3 },
     );
-    expect(response.status).toBe(501);
-    expect(lines.map(parse).map((record) => record["msg"])).toContain("api.threads.read.disabled");
+    expect(response.status).toBe(401);
+    const records = lines.map(parse);
+    expect(records.map((record) => record["msg"])).toContain("auth.denied");
+    expect(records.find((record) => record["msg"] === "auth.denied")?.["reason"]).toBe("no-session-cookie");
   });
 });

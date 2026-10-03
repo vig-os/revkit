@@ -110,3 +110,70 @@ export function parsePreviewPath(pathname: string): PreviewRef | undefined {
 export function isRevkitBundlePath(pathname: string): boolean {
   return pathname === REVKIT_BUNDLE_ROOT.slice(0, -1) || pathname.startsWith(REVKIT_BUNDLE_ROOT);
 }
+
+// ── the `?since=` query on the thread read ─────────────────────────────────
+
+/** The only query parameter `GET /api/threads` accepts. */
+export const SINCE_PARAM = "since";
+
+/**
+ * A canonical non-negative decimal integer: no sign, no leading zero unless
+ * the value IS `0`, no radix prefix, no exponent, no decimal point, no
+ * surrounding whitespace, no thousands separator, and at most 16 digits so a
+ * path cannot carry an unbounded integer into a query.
+ *
+ * Every one of those refusals is a real spelling, not a hypothetical: `?since=`
+ * (empty) means the client lost its resume point, `?since=-1` would ask for
+ * the whole log by a route that is supposed to ask for a DELTA, `?since=1e3`
+ * and `?since=0x10` are the two ways a number can be written and read as
+ * different numbers by different parsers, and `?SINCE=1` is a case variant
+ * that a case-insensitive read would treat as a different parameter entirely.
+ * Refusing them with 400 is the point: the alternative — coerce and hope —
+ * is how a resume point silently becomes "from 0" and a client re-reads the
+ * whole log on every poll.
+ */
+const CANONICAL_INTEGER = /^(?:0|[1-9][0-9]{0,15})$/;
+
+/** The parse result, as a union rather than a `number | undefined` so
+ * "absent" and "malformed" cannot be confused by a caller: `undefined` used
+ * to mean both, which is exactly the confusion that produced slice 1's
+ * "a query string never turns the 501 into anything else" test. */
+export type ThreadsQuery =
+  | { readonly kind: "full" }
+  | { readonly kind: "delta"; readonly since: number }
+  | {
+      readonly kind: "invalid";
+      /** A CLOSED vocabulary of reasons — this string is returned in the
+       * response body, so it must never be built from the input. */
+      readonly reason: "since-not-a-canonical-integer" | "since-repeated" | "unknown-parameter";
+      /** The offending parameter NAME, or `"since"` — a name is a bounded
+       * token, never a value, so this is safe to echo. */
+      readonly parameter: string;
+    };
+
+/**
+ * Parse `GET /api/threads`'s query string.
+ *
+ * **Unknown parameters are REFUSED, not ignored.** Ignoring them is how a
+ * second spelling of a request grows unnoticed: today there is no `repo` or
+ * `scope` parameter, and a client sending one would be told nothing, so it
+ * would ship believing it was scoped when it was not. When slice 3 adds real
+ * parameters, this is the line that has to change — and changing it here,
+ * where the refusal is already the behaviour, is the cheap direction.
+ *
+ * `parameter` is the name and never the value: a reflected value in a
+ * response body is a reflected-XSS vector the moment anything renders it.
+ */
+export function parseThreadsQuery(search: string): ThreadsQuery {
+  const params = new URLSearchParams(search);
+  let since: number | undefined;
+  for (const [name, value] of params) {
+    if (name !== SINCE_PARAM) return { kind: "invalid", reason: "unknown-parameter", parameter: name };
+    if (since !== undefined) return { kind: "invalid", reason: "since-repeated", parameter: SINCE_PARAM };
+    if (!CANONICAL_INTEGER.test(value)) {
+      return { kind: "invalid", reason: "since-not-a-canonical-integer", parameter: SINCE_PARAM };
+    }
+    since = Number.parseInt(value, 10);
+  }
+  return since === undefined ? { kind: "full" } : { kind: "delta", since };
+}

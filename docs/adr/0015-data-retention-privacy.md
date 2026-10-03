@@ -21,3 +21,24 @@ Hosted mode stores review threads and guest identities for an org.
   deletes those mirrors too; a member's own GitHub review comments belong to GitHub and must be deleted there.
 
 ## Consequences
+
+## Amendment (2026-10-04, issue #9) — `sessions` rows are personal data with no sweep
+
+M4 slice 2 made the `sessions` table real: a row per issued session, carrying an
+`identity_kind`, an opaque `identity_id`, `created_at` and `expires_at`.
+
+- **Nothing deletes a session row.** Expiry is a *decision* the gate makes on every
+  read, not a deletion, and there is no retention job, no sweep and no
+  `revkit data delete` for sessions. `test/authorization.test.ts` asserts that an
+  expired session is refused *while its row is still present*, so the distinction
+  cannot be quietly collapsed. ADR-0015's clock above starts at the guests table;
+  sessions need the same treatment and do not have it yet.
+- **`identity_id` is opaque, and stays that way.** It is never a login, an email or
+  a guest display name, which is what makes a session row a pseudonymous record
+  rather than a personal one (ADR-0020). The gate logs `identity_kind` and never
+  `identity_id` or the session id, and `test/logger.test.ts` drives genuinely
+  minted values through the redactor to prove it.
+- **The guest linkage arrives in slice 3**, when `identity_id` becomes a guest id
+  and ADR-0015's "deleted 30 days after the invite is revoked or expires" applies
+  to it. Until then a session row's `identity_kind` is `operator` — a deployment's
+  own first session — and is not a guest record.

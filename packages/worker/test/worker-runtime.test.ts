@@ -15,9 +15,21 @@
 //        `src-imports.test.ts`, which guards the core's SOURCES; this
 //        guards the shipped ARTIFACT, including its dependencies.
 
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { revisionOf } from "@revkit/review-core";
-import { probeBundle, scanAllForbidden, scanForForbidden, startWorker, workerBundle, type Harness } from "./harness.ts";
+import {
+  authHeaders,
+  cookieHeader,
+  issueTestSession,
+  JSON_HEADERS,
+  probeBundle,
+  scanAllForbidden,
+  scanForForbidden,
+  startWorker,
+  workerBundle,
+  type Harness,
+} from "./harness.ts";
 
 /** ADR-0006's acceptance: the revision id is the SHA-256 of the source
  * normalised to LF line endings. This literal was computed on a third
@@ -25,6 +37,51 @@ import { probeBundle, scanAllForbidden, scanForForbidden, startWorker, workerBun
  * runtimes agree, and a change to the normalisation is caught here rather
  * than by a reviewer noticing that every existing thread re-anchors. */
 const PINNED_REVISION = "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a941725be80";
+
+/** The comment body the seeded log carries. Named so the "an unauthorized
+ * caller does not get it" and "an authorized one does" halves of this file
+ * assert against the SAME string rather than against two literals that could
+ * drift apart. */
+const SEED_BODY = "a comment body that must never be served to an unauthorized caller";
+
+/**
+ * A four-event log with a GAP: seqs 1, 2, 3 and 7.
+ *
+ * The gap is the point and it is slice 1's fixture, kept deliberately.
+ * ADR-0006 blesses it — a D1-backed store may hand out gaps and consumers
+ * use `since(lastSeen)` and never assume contiguity — so a hosted read that
+ * renumbered 7 to 4, or that served `since=2` as two events, would be wrong
+ * in a way a contiguous fixture cannot detect. The #76 review found exactly
+ * that bug through this seed.
+ */
+async function seedClosedLog(db: D1Database): Promise<void> {
+  await db.prepare("DELETE FROM events").run();
+  for (const seq of [1, 2, 3, 7]) {
+    await db
+      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+      .bind(
+        seq,
+        `2026-10-03T12:00:0${seq}Z`,
+        JSON.stringify({
+          seq,
+          ts: `2026-10-03T12:00:0${seq}Z`,
+          actor: { kind: "gh-user", id: "gerchowl" },
+          kind: "comment.created",
+          threadId: `th-closed-${seq}`,
+          commentId: `c-closed-${seq}`,
+          anchor: {
+            path: "docs/a.mdx",
+            startLine: 1,
+            endLine: 1,
+            quote: { exact: "x", prefix: "", suffix: "" },
+            revision: "b".repeat(64),
+          },
+          body: SEED_BODY,
+        }),
+      )
+      .run();
+  }
+}
 
 describe("ADR-0025 runtime gate", () => {
   let harness: Harness;
@@ -124,16 +181,43 @@ describe("ADR-0025 runtime gate", () => {
 
   test("A4: the SHIPPED Worker entry bundle has no Node or Bun escape hatches", async () => {
     const bundle = await workerBundle();
-    // Magnitude guard FIRST, and it is load-bearing. `GET /api/threads` is
-    // closed, so nothing reachable from `src/index.ts` reaches
-    // `@revkit/review-core` and the bundler tree-shakes the core out: this
-    // artefact is ~20 KB, where it was ~790 KB while the route was open.
-    // Without a floor, a bundle that lost a chunk would still pass a
-    // forbidden-pattern scan — and an earlier revision of this file had a
-    // 100 KB floor, which is why it caught the misattribution that made
-    // this scan vacuous in the first place.
-    expect(bundle.length).toBeGreaterThan(10_000);
+    // Magnitude guards FIRST, and they are load-bearing in both directions.
+    // Slice 2 re-opened `GET /api/threads`, so this artefact went from ~20 KB
+    // (tree-shaken, because nothing reachable touched the store) back to
+    // ~807 KB — and the floor moves with it. A FLOOR alone would be
+    // satisfied by a bundle that lost a chunk; an earlier revision of this
+    // file had only a 100 KB floor, which is why it caught the
+    // misattribution that made the scan vacuous in the first place.
+    expect(bundle.length).toBeGreaterThan(500_000);
+    // Positive markers, so "clean" cannot mean "empty". These are names that
+    // exist ONLY in `@revkit/review-core`, and the read handler cannot run
+    // without them: `D1ThreadStore` calls `selectThreads` and `validateNext`.
+    // So this asserts, on the ARTEFACT THAT WILL BE DEPLOYED, that the
+    // shared core is in it — which is ADR-0025's claim about the hosted
+    // surface, and which slice 1 could only assert about the probe.
+    expect(bundle).toContain("selectThreads");
+    expect(bundle).toContain("ThreadStoreContendedError");
+    // And only now does the scan mean anything: zero hits over an artefact
+    // that demonstrably contains the graph.
     expect(scanForForbidden(bundle)).toEqual([]);
+  });
+
+  test("A4: the shipped entry reaches the store, so no route can be added that skips the gate", async () => {
+    // A structural check rather than a behavioural one, and it is what makes
+    // the previous case's positive markers meaningful: `D1ThreadStore` is
+    // constructed ONLY inside `readThreads`, and `readThreads` takes an
+    // `AuthorizedSession` whose brand symbol is private to `src/authz.ts`.
+    // So "the store is in the bundle" and "the store is unreachable without
+    // the gate" are the same fact read twice, and neither can drift by
+    // adding a handler.
+    const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    const constructions = [...source.matchAll(/new D1ThreadStore\(/g)];
+    expect(constructions).toHaveLength(1);
+    // …and it is inside a function whose signature demands the gate's type.
+    const readThreadsIndex = source.indexOf("async function readThreads(");
+    expect(readThreadsIndex).toBeGreaterThan(-1);
+    const signature = source.slice(readThreadsIndex, source.indexOf("): Promise<Response>", readThreadsIndex));
+    expect(signature).toContain("authorized: AuthorizedSession");
   });
 
   test("A4: the PROBE bundle — the graph ADR-0025 is actually about — is clean AND non-empty", async () => {
@@ -195,98 +279,113 @@ describe("ADR-0025 runtime gate", () => {
   });
 
   // ── the HTTP surface ─────────────────────────────────────────────────
-  // ── B1: /api/threads is CLOSED for every verb ─────────────────────────
-  test("GET /api/threads is 501 — ADR-0012 authorization is unconditional, and a read is the bigger exposure", async () => {
-    // A previous revision left GET open behind a config flag. It was wrong
-    // twice: ADR-0012 requires authorization on EVERY request, and an open
-    // read needs no CSRF bypass, no browser and no user interaction — it
-    // just returns comment bodies.
-    await harness.db.prepare("DELETE FROM events").run();
-    for (const seq of [1, 2, 3, 7]) {
-      await harness.db
-        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-        .bind(
-          seq,
-          `2026-10-03T12:00:0${seq}Z`,
-          JSON.stringify({
-            seq,
-            ts: `2026-10-03T12:00:0${seq}Z`,
-            actor: { kind: "gh-user", id: "gerchowl" },
-            kind: "comment.created",
-            threadId: `th-closed-${seq}`,
-            commentId: `c-closed-${seq}`,
-            anchor: {
-              path: "docs/a.mdx",
-              startLine: 1,
-              endLine: 1,
-              quote: { exact: "x", prefix: "", suffix: "" },
-              revision: "b".repeat(64),
-            },
-            body: "a comment body that must never be served",
-          }),
-        )
-        .run();
-    }
-    const response = await harness.dispatch("http://localhost/api/threads");
-    expect(response.status).toBe(501);
-    // Read the body ONCE — a `Response` body is a stream, and both
-    // `json()` and `text()` consume it.
-    const raw = await response.text();
-    const body = JSON.parse(raw) as { error: string; enabledIn: string; detail: string };
-    expect(body.error).toBe("not-implemented");
-    expect(body.enabledIn).toContain("M4 slice 2");
-    expect(body.detail).toContain("ADR-0012");
-    // The point of the case: a NON-EMPTY log with real comment bodies in it
-    // is still not readable, and nothing about the response carries any of
-    // them.
-    expect(raw).not.toContain("a comment body");
-    expect(raw).not.toContain("th-closed");
-    expect(raw).not.toContain("docs/a.mdx");
+  // ── the surface slice 2 re-opened, and the parts it did not ──────────
+  // The NEGATIVE matrix for every route and verb — no cookie, forged cookie,
+  // expired cookie, wrong identity kind, every alias spelling of the path and
+  // of `?since=` — lives in `test/authorization.test.ts`. What is here is the
+  // runtime gate's own territory: that the re-opened routes answer what they
+  // claim to, through real workerd, against a real log.
+  test("GET /api/threads answers 200 with a session and the real projection", async () => {
+    // The transition slice 1 existed for. Slice 1 answered 501 for every
+    // verb because ADR-0012 requires authorization per request and there was
+    // no session; this is the same route with a session, reading the SAME
+    // seeded log (seqs 1, 2, 3, 7 — a gap, which ADR-0006 permits and the
+    // reducer must survive).
+    await seedClosedLog(harness.db);
+    const issued = await issueTestSession(harness.db);
+    const response = await harness.dispatch("http://localhost/api/threads", {
+      headers: { cookie: cookieHeader(issued.sessionId) },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { head: number; threads: { id: string; status: string }[] };
+    // `head` is MAX(seq) read from D1 — 7, not 4. It is the resume point the
+    // hosted rail needs, and getting it from the store's per-instance
+    // watermark instead is the #76 bug this shape would reintroduce.
+    expect(body.head).toBe(7);
+    expect(body.threads).toHaveLength(4);
+    expect(body.threads.map((thread) => thread.id).sort()).toEqual([
+      "th-closed-1",
+      "th-closed-2",
+      "th-closed-3",
+      "th-closed-7",
+    ]);
+    // And the data the projection is built from really is served to a
+    // session that has one — the negative half is `authorization.test.ts`.
+    const raw = await harness.db.prepare("SELECT payload FROM events WHERE seq = 1").first<{ payload: string }>();
+    expect(JSON.parse(raw?.payload ?? "{}")).toMatchObject({ body: SEED_BODY });
   });
 
-  test("a query string never turns the 501 into anything else", async () => {
-    for (const path of [
-      "/api/threads",
-      "/api/threads?since=0",
-      "/api/threads?since=2",
-      "/api/threads?since=-1",
-      "/api/threads?since=abc",
-    ]) {
-      const response = await harness.dispatch(`http://localhost${path}`);
-      expect(response.status).toBe(501);
-      const body = (await response.json()) as { error: string };
-      expect(body.error).toBe("not-implemented");
-    }
+  test("GET /api/threads?since=2 returns exactly the events after 2, over the gap", async () => {
+    const issued = await issueTestSession(harness.db);
+    const response = await harness.dispatch("http://localhost/api/threads?since=2", {
+      headers: { cookie: cookieHeader(issued.sessionId) },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { head: number; events: { seq: number }[] };
+    expect(body.head).toBe(7);
+    // 3 and 7 — the gap between 3 and 7 is NOT renumbered, which is
+    // `store.ts:9-14`'s "a D1 store may hand out gaps and consumers use
+    // `since(lastSeen)` and never assume contiguity", exercised over HTTP.
+    expect(body.events.map((event) => event.seq)).toEqual([3, 7]);
+  });
+
+  test("?since=<head> is empty, so a caught-up client polls for nothing", async () => {
+    const issued = await issueTestSession(harness.db);
+    const response = await harness.dispatch("http://localhost/api/threads?since=7", {
+      headers: { cookie: cookieHeader(issued.sessionId) },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { head: number; events: unknown[] };
+    expect(body.head).toBe(7);
+    expect(body.events).toEqual([]);
   });
 
   test("a trailing-slash variant is a DISTINCT path and 404s — no alias", async () => {
     // `/api/threads/` is not `/api/threads`, and it must not be: the same
     // rule ADR-0012 states for `/_revkit/` is that a trailing-slash alias is
-    // a second spelling of one resource, and aliases are how a closed route
-    // quietly reopens. Both answers are closed; only one of them is a route.
-    const response = await harness.dispatch("http://localhost/api/threads/");
+    // a second spelling of one resource, and aliases are how a gated route
+    // quietly reopens. It 404s even WITH a valid session, so no alias can be
+    // reached by any credential at all.
+    const issued = await issueTestSession(harness.db);
+    const response = await harness.dispatch("http://localhost/api/threads/", {
+      headers: { cookie: cookieHeader(issued.sessionId) },
+    });
     expect(response.status).toBe(404);
     expect(response.headers.get("location")).toBeNull();
   });
 
-  test("POST /api/threads is 501 with the same shape as GET", async () => {
+  test("POST /api/threads is still 501 — and it gets past the gate to say so", async () => {
+    // The status is unchanged from slice 1 and the REASON is not: this call
+    // now carries a valid session, a valid per-session CSRF token and
+    // `application/json`, so ADR-0012's three state-changing checks all PASS
+    // before the route answers. That is the honest distinction — the write is
+    // missing (slice 4), the authorization is not.
+    const issued = await issueTestSession(harness.db);
     const response = await harness.dispatch("http://localhost/api/threads", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { ...authHeaders(issued), ...JSON_HEADERS },
       body: JSON.stringify({ kind: "comment.created" }),
     });
     expect(response.status).toBe(501);
     const body = (await response.json()) as { error: string; enabledIn: string; detail: string };
     expect(body.error).toBe("not-implemented");
-    expect(body.enabledIn).toContain("M4 slice 2");
-    expect(body.detail).toContain("ADR-0012");
+    expect(body.enabledIn).toContain("slice 4");
+    expect(body.detail).toContain("CSRF");
     // And nothing was written.
     const counted = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
     expect(counted?.n).toBe(4);
   });
 
-  test("PUT /api/threads is 405, not 501 — the verb is wrong, not the feature", async () => {
-    const response = await harness.dispatch("http://localhost/api/threads", { method: "PUT" });
+  test("PUT /api/threads is 405, not 401 — a session is present, the verb is wrong", async () => {
+    // Order matters and is asserted: authorization first (unconditionally),
+    // then the verb. Without a session the SAME request is 401, which
+    // `authorization.test.ts` drives — so a 405 here is evidence the gate
+    // let a known caller through, not evidence the route ignores verbs.
+    const issued = await issueTestSession(harness.db);
+    const response = await harness.dispatch("http://localhost/api/threads", {
+      method: "PUT",
+      headers: { cookie: cookieHeader(issued.sessionId) },
+    });
     expect(response.status).toBe(405);
   });
 
@@ -302,25 +401,43 @@ describe("ADR-0025 runtime gate", () => {
     expect(bundle.headers.get("location")).toBeNull();
   });
 
-  test("a recognised preview path is 501 naming slice 5, not a silent 404", async () => {
-    const response = await harness.dispatch("http://localhost/revkit/pr-7/index.html");
+  test("a recognised preview path is 501 naming slice 5, for a caller with a session", async () => {
+    // Preview paths are GATED from slice 2 even though they have nothing to
+    // serve, so slice 5 inherits the gate from the route table instead of
+    // having to remember it. The unauthenticated answer is 401 — driven in
+    // `authorization.test.ts` — and it is the stricter one, because the day
+    // R2 exists a 501 is a 200.
+    const issued = await issueTestSession(harness.db);
+    const response = await harness.dispatch("http://localhost/revkit/pr-7/index.html", {
+      headers: { cookie: cookieHeader(issued.sessionId) },
+    });
     expect(response.status).toBe(501);
     const body = (await response.json()) as { enabledIn: string };
     expect(body.enabledIn).toContain("slice 5");
   });
 
   test("every response carries the request id in a header, on every status", async () => {
+    const issued = await issueTestSession(harness.db);
     for (const [path, method] of [
       ["/healthz", "GET"],
       ["/nope", "GET"],
       ["/api/threads", "GET"],
       ["/api/threads", "POST"],
+      ["/api/session/refresh", "POST"],
       ["/_revkit/0.0.0/x.js", "GET"],
       ["/revkit/pr-1/", "GET"],
     ] as const) {
-      const response = await harness.dispatch(`http://localhost${path}`, { method });
+      const response = await harness.dispatch(`http://localhost${path}`, {
+        method,
+        headers: { ...authHeaders(issued), ...JSON_HEADERS },
+      });
       expect(response.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
     }
+    // And the refusal branch, with NO credential at all, which is the one a
+    // reviewer will hit first when something is misconfigured.
+    const refused = await harness.dispatch("http://localhost/api/threads");
+    expect(refused.status).toBe(401);
+    expect(refused.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   // ── the catch block, actually entered ─────────────────────────────────
@@ -364,21 +481,24 @@ describe("ADR-0025 runtime gate", () => {
 
   test("the 500's cause is the missing var, not an unrelated fault", async () => {
     // Proves the case above is not passing for some other reason: the SAME
-    // script with `REVKIT_VERSION` bound answers 200, so the only variable
-    // is the var. Without this, a future change that made `/healthz` throw
-    // unconditionally would keep both tests green and leave the catch block
-    // untested for the reason that matters.
-    const healthy = await startWorker();
+    // script bytes with `REVKIT_VERSION` bound answer 200, so the only
+    // variable is the var.
+    //
+    // **The control is this file's OWN `harness`, not a freshly-spawned
+    // Worker.** An earlier revision built a second healthy miniflare for
+    // this, which is a weaker control AND cost a workerd spawn: two separate
+    // `Miniflare` instances are not obviously running the same bytes, so a
+    // difference between them could have been the cause. `harness` was built
+    // from `workerBundle()` and `broken` from the same call, so the script is
+    // byte-identical by construction and the only variable is `vars`. It also
+    // answers `/healthz` 200 in the A1 case above, so nothing new has to be
+    // believed.
+    expect((await harness.dispatch("http://localhost/healthz")).status).toBe(200);
+    const broken = await startWorker({ vars: null });
     try {
-      expect((await healthy.dispatch("http://localhost/healthz")).status).toBe(200);
-      const broken = await startWorker({ vars: null });
-      try {
-        expect((await broken.dispatch("http://localhost/healthz")).status).toBe(500);
-      } finally {
-        await broken.dispose();
-      }
+      expect((await broken.dispatch("http://localhost/healthz")).status).toBe(500);
     } finally {
-      await healthy.dispose();
+      await broken.dispose();
     }
   });
 });
