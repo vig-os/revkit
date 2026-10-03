@@ -98,19 +98,28 @@ precommit:
 #   2. FD BUDGET. Every `startDaemon` leaks 2 descriptors on bun 1.3.13
 #      (Bun's `fs.watch(...).close()` does not free the fd; cross-checked
 #      against node v24.21.0, which does not leak). Measured `packages/cli`
-#      peak: 4449 local, 4687 on CI.
-#      The `ulimit -n` set below is belt-and-braces, NOT a CI fix, and the
-#      first CI run showed why: that runner's soft limit was ALREADY 65535
-#      against a 4687 peak, so `EMFILE` was never in reach there. It is
-#      here for the runner or container that does default low (1024 is the
-#      classic unprivileged default), where this suite would otherwise die
-#      partway through. What CI actually gets is the PEAK CHECK, which
-#      turns the next leak into a NAMED failure instead of a mystery.
-#      Neither of these fixes the leak — the fds are Bun's to leak and
-#      revkit's teardown is already correct.
+#      peak: 4449 local, 4683 on CI.
 #
-#   3. WALL-CLOCK BOUNDS. `timeout --signal=ABRT` per leg, so a stall is
-#      a red leg that names itself instead of a cancelled job. Be precise
+#      The `ulimit -n` below is belt-and-braces and WEAK, and it is worth
+#      being exact about why, because the first version of this comment
+#      overstated it. It only helps when the soft limit is low AND the hard
+#      limit is already high enough to permit the raise: simulated with
+#      `prlimit --nofile=1024:1024`, the `if !` guard catches the refusal,
+#      warns, and the suite carries on at 1024 — where it would still die of
+#      `EMFILE`. So it rescues the soft-low/hard-high case and nothing else.
+#      On CI it is a NO-OP: that runner's default was already 65536, exactly
+#      the value we set.
+#
+#      What actually protects CI is the fd check in instrument 3, and even
+#      that needs honest scope. See `test_fd_delta_budget_*` for why it is
+#      split into an absolute ceiling and a growth delta: the ~3.2k of
+#      module-load descriptors swamp the ~1.2k leak component, so a ceiling
+#      tight enough to catch the first doubling of the leak is impossible
+#      against the raw total. Neither of these fixes the leak — the fds are
+#      Bun's to leak and revkit's teardown is already correct.
+#
+#   3. WALL-CLOCK AND FD BOUNDS. `timeout --signal=ABRT` per leg, so a stall
+#      is a red leg that names itself instead of a cancelled job. Be precise
 #      about what that buys: bun emits NO JS stack for a blocked event loop
 #      (verified on 1.3.13 — ABRT just dumps core), so the bound does not
 #      produce a trace. What it does produce is the leg label, the budget
@@ -123,10 +132,27 @@ precommit:
 #      `timeout-minutes` — a bound that could lose the race to GitHub's
 #      cancellation would be worthless.
 #
-#   4. `bun --timeout`. The default is 5000ms per test, which is below
-#      what a legitimately slow daemon or E2E-build test needs on a 2-core
-#      CI container. Raised to 30s. NOTE this is NECESSARY BUT NOT
-#      SUFFICIENT, and both halves were verified on bun 1.3.13:
+#      `run_leg` reports exit 124 and exit 137 DIFFERENTLY, on purpose. 124
+#      is `timeout` firing: a genuine stall. 137 is the process being
+#      SIGKILLed — with `--kill-after` that means it ignored the grace
+#      period, and from outside it is indistinguishable from the OOM killer.
+#      Reporting a SIGKILL as a hang would be precisely the
+#      misleading-failure-mode this instrumentation exists to remove.
+#
+#   4. `bun --timeout`. Raised from the 5s default to 10s, and the reason is
+#      the SLOW tail, not hang latency. Measured over the full `packages/cli`
+#      suite (1349 tests, junit timings): the slowest single test is 6067ms
+#      and 3 of 1349 exceed the 5s default. CI's own run peaked lower
+#      (4625ms, none over 5s), but CI is not the environment that has to
+#      pass — a contributor on a slower box is. So 10s: 1.65x the worst
+#      single test observed anywhere, 2x the old default.
+#      Be clear about the trade, because it is a real one: any value above
+#      5s makes a hung `await` take LONGER to surface. That is accepted,
+#      because the default was already firing on legitimate tests, and a
+#      timeout that fires spuriously costs far more than one that fires a
+#      few seconds later. This value is for the slow tail.
+#      Either way it is NECESSARY BUT NOT SUFFICIENT, and both halves were
+#      verified on bun 1.3.13:
 #        - a hung `await` in `beforeEach` DOES trip it ("a
 #          beforeEach/afterEach hook timed out for this test");
 #        - an unbounded SYNC block does NOT. `--timeout` is detected only
@@ -139,148 +165,204 @@ test *args:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -f package.json ]; then echo "just test: no package.json — skipping"; exit 0; fi
-    REVKIT_FD_ULIMIT_BEFORE="$(ulimit -n)"
+    REVKIT_FD_ULIMIT_BEFORE="$(ulimit -Sn)"
 
     # --- 1. record which runtime is under test (see note 1 above) ---
     printf 'just test: bun %s at %s\n' "$(bun --version)" "$(command -v bun)"
 
-    # --- 2. fd headroom (see note 2 above) ---
-    # `ulimit -n` is a soft limit. Set it unconditionally so the suite gets
-    # the SAME ceiling everywhere, and so the log records what the run
-    # actually got rather than leaving it to be inferred. Lowering a host
-    # that is already generous is harmless because the budget sits ~14x
-    # above the measured peak. A failure is NOT fatal (the hard limit may
-    # be lower), but the resulting value is printed either way.
+    # --- 2. fd headroom, best-effort (see note 2 above) ---
+    # `-S` sets the SOFT limit only. Plain `ulimit -n` sets the hard limit
+    # too, which measurably drags a host's ceiling down for the whole tree
+    # (1048576 -> 65536 here) — the opposite of adding headroom, and a
+    # side effect on sibling processes that has nothing to do with the tests.
     ulimit_in="{{test_fd_limit}}"
-    if ! ulimit -n "$ulimit_in" 2>/dev/null; then
-      printf 'just test: WARNING could not set ulimit -n to %s (hard limit %s); continuing\n' \
+    if ! ulimit -S -n "$ulimit_in" 2>/dev/null; then
+      printf 'just test: WARNING could not raise the soft fd limit to %s (hard limit %s); continuing\n' \
         "$ulimit_in" "$(ulimit -Hn)"
+      printf 'just test: WARNING this only helps when the HARD limit is already high. With soft %s and hard %s\n' \
+        "$(ulimit -Sn)" "$(ulimit -Hn)"
+      printf 'just test: WARNING the suite peaks near 4.7k descriptors, so it can still die of EMFILE here.\n'
     fi
-    printf 'just test: ulimit -n is now %s (host default was %s)\n' "$(ulimit -n)" "$REVKIT_FD_ULIMIT_BEFORE"
+    printf 'just test: soft fd limit is now %s (was %s), hard limit %s (unchanged)\n' \
+      "$(ulimit -Sn)" "$REVKIT_FD_ULIMIT_BEFORE" "$(ulimit -Hn)"
 
     .claude/skills/revkit_run/test-lib.sh
 
-    # run_leg <label> <wall-clock-budget> <fd-budget> -- <command...>
-    # Wraps one leg in BOTH the wall-clock bound and the fd peak check, so
-    # no leg can be added later that silently lacks them.
+    # run_leg <label> <wall-clock-budget> <fd-ceiling> <fd-delta-budget> -- <command...>
+    # Wraps one leg in BOTH the wall-clock bound and the fd check, so no leg
+    # can be added later that silently lacks them. That includes `just check`,
+    # which an earlier revision of this recipe ran bare — a hang there
+    # reproduces #74's symptom completely uncaught.
     #
-    # The two budgets differ per leg because the underlying quantity does:
-    # bun test legs are a single process with a stable count, while the
-    # Playwright leg's peak scales with the worker count (see
-    # `test_fd_budget_*`). One shared ceiling would have to be loose enough
-    # for the biggest workstation, which throws away the guard on the legs
-    # that have a stable number.
+    # Both fd budgets are needed, and neither alone is sufficient; see
+    # `test_fd_delta_budget_*` for the arithmetic. The ceiling catches a
+    # runaway; the delta catches the leak GROWTH that the ~3.2k of
+    # module-load descriptors would otherwise hide.
+    #
+    # The budgets differ per leg because the underlying quantity does: bun
+    # test legs are a single process with a stable count, while the
+    # Playwright leg's peak scales with the worker count. One shared ceiling
+    # would have to be loose enough for the biggest workstation, which throws
+    # away the guard on the legs that have a stable number.
     #
     # On a stall, the leg's captured output is grepped for the test file bun
     # was working on, when the runtime is one that says. Best-effort by
     # design: bun 1.3.13 buffers its per-file headers when stdout is not a
     # TTY, so on THAT runtime the stalling file is genuinely absent from the
     # log and the message says so and hands over a bisect command instead. A
-    # CI runtime that does emit headers gets the file named for free — the
-    # reason the runtime line is printed first is precisely that these two
-    # runtimes differ.
+    # CI runtime that does emit headers gets the file named for free.
     run_leg() {
-      local label="$1" budget="$2" fd_budget="$3"; shift 3
+      local label="$1" budget="$2" fd_ceiling="$3" fd_delta="$4"; shift 4
       [ "$1" = "--" ] && shift
       local log; log="$(mktemp)"
-      printf '\njust test: === %s (wall %ss, fds %s) ===\n' "$label" "$budget" "$fd_budget"
+      printf '\njust test: === %s (wall %ss, fds<=%s, fd-growth<=%s) ===\n' \
+        "$label" "$budget" "$fd_ceiling" "$fd_delta"
       set +e
       timeout --signal=ABRT --kill-after=30s "${budget}s" \
-        ./scripts/fd-budget.sh --budget "$fd_budget" -- "$@" 2>&1 | tee "$log"
+        ./scripts/fd-budget.sh --budget "$fd_ceiling" --delta-budget "$fd_delta" -- "$@" 2>&1 | tee "$log"
       local status="${PIPESTATUS[0]}"
       set -e
-      if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-        {
-          printf '\njust test: STALL — leg %s exceeded its %ss wall-clock budget and was killed.\n' "$label" "$budget"
-          local last
-          last="$(grep -oE '[A-Za-z0-9_./-]+\.(test|spec)\.[cm]?[jt]sx?:' "$log" | tail -1 || true)"
-          if [ -n "$last" ]; then
-            printf 'just test: last test file named in the output was %s.\n' "$last"
-          else
-            printf 'just test: bun named no test file, so the hang cannot be pinned to one from the log.\n'
-            printf 'just test: bun %s buffers its per-file headers when stdout is not a TTY, so the file\n' "$(bun --version)"
-            printf 'just test: that stalled is invisible here. Re-run the leg with a path filter to bisect:\n'
-            printf 'just test:   just test test/serve/<file>.test.ts\n'
-          fi
-          printf 'just test: a leg that overruns this long is a STALL, not a slow test. bun --timeout\n'
-          printf 'just test: cannot catch a blocked event loop (verified on bun 1.3.13), which is why this\n'
-          printf 'just test: outer bound exists.\n'
-        } >&2
-      fi
+      case "$status" in
+        124)
+          {
+            printf '\njust test: STALL — leg %s exceeded its %ss wall-clock budget and was killed.\n' "$label" "$budget"
+            local last
+            last="$(grep -oE '[A-Za-z0-9_./-]+\.(test|spec)\.[cm]?[jt]sx?:' "$log" | tail -1 || true)"
+            if [ -n "$last" ]; then
+              printf 'just test: last test file named in the output was %s.\n' "$last"
+            else
+              printf 'just test: bun named no test file, so the hang cannot be pinned to one from the log.\n'
+              printf 'just test: bun %s buffers its per-file headers when stdout is not a TTY, so the file\n' "$(bun --version)"
+              printf 'just test: that stalled is invisible here. Re-run the leg with a path filter to bisect:\n'
+              printf 'just test:   just test test/serve/<file>.test.ts\n'
+            fi
+            printf 'just test: a leg that overruns this long is a STALL, not a slow test. bun --timeout\n'
+            printf 'just test: cannot catch a blocked event loop (verified on bun 1.3.13), which is why this\n'
+            printf 'just test: outer bound exists.\n'
+          } >&2
+          ;;
+        137)
+          {
+            printf '\njust test: KILLED — leg %s was SIGKILLed after the %ss budget expired.\n' "$label" "$budget"
+            printf 'just test: this is NOT a confirmed hang. 137 is SIGKILL, which is also what the OOM\n'
+            printf 'just test: killer sends and what --kill-after sends after the grace period, and from\n'
+            printf 'just test: outside the process the three are indistinguishable. Check the runner for an\n'
+            printf 'just test: out-of-memory event before treating this as a stall.\n'
+          } >&2
+          ;;
+      esac
       rm -f "$log"
       return "$status"
     }
 
-    # Budgets, from measured healthy local times on an 88-core host
-    # (packages/cli 104s / review-core 2s / site schemas 1s / check 3s /
-    # build 8s / Playwright 228s) and the one known good CI run (7m33s
-    # for the whole job, so ~1.3x local). Each leg gets >=3x its measured
-    # time, and any single stalled leg still trips its bound before the
-    # workflow's 20-minute ceiling: worst case is a stalled Playwright leg
-    # at 241s of healthy work + 720s = 16 min, a stalled cli leg at
-    # 540s + 241s = 13 min.
-    run_leg packages/cli "{{test_leg_timeout_cli}}" "{{test_fd_budget_stable}}" -- env REVKIT_E2E_BUILD=1 bash -c "cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
-    run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" -- bash -c "cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
-    run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" -- bash -c "cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}"
-    just check
-    run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" -- just e2e
+
+    # Wall-clock budgets, from measured healthy local times on an 88-core
+    # host (packages/cli 104s / review-core 2s / site schemas 1s / check 3s /
+    # build 8s / Playwright 228s) and the one known good CI run (7m33s for
+    # the whole job, so ~1.3x local). Each leg gets >=3x its measured time,
+    # and any single stalled leg still trips its bound before the workflow's
+    # 20-minute ceiling: worst case is a stalled Playwright leg at 241s of
+    # healthy work + 720s = 16 min, a stalled cli leg at 540s + 241s = 13 min.
+    #
+    # `just check` goes through `run_leg` too. An earlier revision ran it
+    # bare, which meant a hang there reproduced #74's symptom — an 18-minute
+    # dead job — with neither a wall bound nor an fd check on it.
+    #
+    # `{{ args }}` sits inside single quotes rather than double. That is
+    # NOT a safety fix, and it is worth being precise about why, because an
+    # earlier revision of this comment claimed it was. `bash -c 'SCRIPT'`
+    # has the OUTER shell strip the quotes and hand `SCRIPT` to a second
+    # shell, which parses it fresh — so `{{ args }}` lands unquoted in that
+    # second parse and `$(...)` in an argument is still substituted.
+    # Measured with `just x 'nomatch$(echo INJECTED)'` against both forms:
+    # single quotes and double quotes both yield `nomatchINJECTED`. The
+    # single-quoted form is kept because it at least stops the RECIPE's own
+    # shell from expanding, so an argument can only affect the inner
+    # command's argv rather than the surrounding script — but this is a
+    # pre-existing property of just splicing `{{ args }}` in as raw text,
+    # identical in the recipe this replaced, and not something a quoting
+    # choice can fix. `*args` here is a developer convenience for `-t` and
+    # path filters, not a boundary against untrusted input.
+    run_leg packages/cli "{{test_leg_timeout_cli}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- env REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
+    run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
+    run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}'
+    run_leg just/check "{{test_leg_timeout_check}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- just check
+    run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" "{{test_fd_delta_budget_playwright}}" -- just e2e
 
 # Wall-clock budget per leg, in seconds. See note 3 on `test` above for
 # the measurements these come from.
 test_leg_timeout_cli := "540"
 test_leg_timeout_review_core := "180"
 test_leg_timeout_schemas := "180"
+test_leg_timeout_check := "300"
 test_leg_timeout_e2e := "720"
 
-# Per-test bun timeout. The 5s default is too tight for a slow daemon or
-# E2E-build test on a 2-core CI container; 30s still turns a hung `await`
-# into a named failure in seconds. See note 4 on `test` above for why this
-# cannot be the only stall guard.
-bun_test_timeout_ms := "30000"
+# Per-test bun timeout. Sized for the measured slow tail, not for hang
+# latency: the slowest single `packages/cli` test observed is 6067ms and 3 of
+# 1349 exceed the 5s default, so 10s is 1.65x the worst seen anywhere and
+# 2x the old default. The cost is that a hung `await` surfaces in 10s
+# instead of 5s, accepted because the default was already firing on
+# legitimate tests. See note 4 on `test` above.
+bun_test_timeout_ms := "10000"
 
-# Soft descriptor limit for the suite.
+# SOFT descriptor limit for the suite, applied with `ulimit -S` so the hard
+# limit is left alone.
 #
-# NOT a CI fix, and verified as such: the first CI run of this PR reported
-# `host default was 65535` against a 4687 peak, so `EMFILE` was never in
-# reach on that runner. This exists for the runner, container or shell that
-# DOES default low — 1024 is the classic unprivileged default, and this
-# suite peaks around 4.7k — where the run would otherwise die partway
-# through with a crash that names no cause. 65536 is ~14x the measured peak
-# and inside every host's hard limit.
+# Weak on purpose, and precisely bounded: this only helps when the soft limit
+# is low AND the hard limit already permits the raise. Under
+# `prlimit --nofile=1024:1024` the raise is refused, the recipe warns and
+# continues at 1024, and the suite — peaking near 4.7k — would still die of
+# `EMFILE`. It is a no-op on CI, whose default was already 65536.
 test_fd_limit := "65536"
 
-# Per-leg descriptor ceilings, checked by scripts/fd-budget.sh (peak = the
-# whole process TREE, so Playwright's workers and their daemons count).
-# Two values because the quantity behaves differently per leg.
+# Absolute descriptor ceiling per leg: a runaway backstop.
 #
-# Measured on `bun 1.3.13`:
+# Measured peak (peak = the whole process TREE, so Playwright's workers and
+# their daemons count):
 #
-#   packages/cli        4449   single process, so worker-count INDEPENDENT
-#                              and stable across runs — the number a leak
-#                              guard should be sized from (CI measured
-#                              4687 on the same bun, so the shape holds
-#                              across machines and only the constant
-#                              drifts a few percent)
-#   packages/review-core   98
-#   site/schemas          139
+#   packages/cli        4449 local / 4683 CI   single process, so
+#                              worker-count independent and stable
+#   packages/review-core   98 local / 82 CI
+#   site/schemas          139 local / 140 CI
+#   site/playwright      499 local at `workers: 1` / 509 CI, but
+#                      4683 / 6008 / 6481 local across ~44 workers, so
+#                              this leg scales with the worker count
 #
-# The Playwright leg is different: its peak scales with the worker count.
-#   site/playwright      499   at CI settings (`workers: 1`), and 505
-#                              measured on the CI runner itself — this is
-#                              what CI actually sees
-#                      4683 / 6008 / 6481   across ~44 workers on this
-#                              88-core host, varying run to run with how
-#                              many browsers launch at once
-#
-# So the bun legs get 8192 (~1.8x over the stable 4449) and the Playwright
-# leg gets 16384 (~2.5x over its worst observed 6481). Sizing the
-# Playwright budget off 4449 would red a busy workstation for no reason,
-# and a guard that cries wolf gets ignored — which is the one outcome
-# worse than having no guard. Both still fail well before the 65536 fd
-# `ulimit` above, so a real runaway is caught as a named assertion rather
-# than as `EMFILE`.
+# These ceilings are deliberately loose: the `packages/cli` one at 8192 sits
+# 1.75x over the worst observed, because tightening it toward 4449 would
+# red-line a busy workstation with many cores. That looseness is exactly why
+# the delta budget below exists — see it for why an absolute ceiling alone
+# cannot see the leak.
 test_fd_budget_stable := "8192"
 test_fd_budget_playwright := "16384"
+
+# Descriptor GROWTH budget per leg, measured after a warm-up so the ~3.4k of
+# module-load descriptors are excluded. This is the budget that can actually
+# see the leak, and it exists because of an arithmetic problem with the
+# absolute ceiling.
+#
+# The `packages/cli` leg breaks down as 3411 at the warm-up floor rising to a
+# 4449 peak, i.e. ~1038 of growth, and that ~1038 IS the leak: 2 per daemon
+# cycle across the suite. So the first DOUBLING of the leak lands at ~3411 +
+# 2076 = ~5487, comfortably UNDER the 8192 absolute ceiling. The ceiling
+# passes it. An absolute ceiling loose enough not to false-positive is
+# therefore blind to the first doubling, which is the most likely shape of
+# the regression it was added for. Measuring growth drops the constant term
+# and cannot hide it that way.
+#
+# 1800 therefore sits between the measured growth and a doubling of it:
+# 1.73x the measured 1038, and a doubling (2076) trips it. CI's peak runs
+# ~234 higher than local (4683 vs 4449) with the same module floor, so its
+# growth is expected around 1270 — still inside 1800, by 41%.
+#
+# The Playwright leg is a different shape and gets its own number. It starts
+# small (a `just build`) and grows into its workers, so its growth is
+# essentially its whole peak — measured 5033 against a 5059 peak. A budget
+# of 6000 would have false-positived on this host's own 6008 and 6481 runs.
+# 12000 keeps it above the worst observed (6481) by 1.85x, where the
+# absolute ceiling is still the primary guard and this is a second net.
+test_fd_delta_budget_stable := "1800"
+test_fd_delta_budget_playwright := "12000"
 
 # Regenerate the pipeline-digest fixture that
 # `packages/cli/test/build/own-build-unchanged.test.ts` compares
