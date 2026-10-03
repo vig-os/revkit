@@ -5,7 +5,12 @@
 // contract directly so a regression that only trips on one path (say,
 // import) still fails a targeted test.
 import { describe, expect, test } from "bun:test";
-import { emptyLogState, validateNext, type ReviewEvent } from "../src/index.ts";
+import {
+  cloneLogState,
+  emptyLogState,
+  validateNext,
+  type ReviewEvent,
+} from "../src/index.ts";
 
 const anchor = {
   path: "docs/adr/0006-comments-anchoring-event-log.md",
@@ -199,5 +204,42 @@ describe("validateNext — doc.published (M2 item 9)", () => {
       generation: "e".repeat(64),
     });
     expect(result.ok).toBe(true);
+  });
+});
+
+// Issue #35: `import` validates its archive against a shadow `cloneLogState`
+// and commits only on success, so a rejected event in a multi-event archive
+// must not leak into the caller's state. That guarantee rests on the clone
+// owning its mutable fields rather than sharing them. This pins one of the two:
+// `thread.commentIds`, which the dry-run reaches via `comment.replied` — the
+// shared-reference variant survives every other test in this repo.
+//
+// The second is `commentLinks[commentId]` (validator.ts adds a backend to it).
+// It is currently unobservable rather than safe: `comment.linked` only ever
+// carries "github", and any pre-existing set already contains it, so the add is
+// always a no-op. It is not pinned here — worth covering when a second backend
+// exists, since one would make the latent sharing observable.
+describe("cloneLogState — deep copy", () => {
+  test("does not share a thread's comment-id set with the source", () => {
+    const source = emptyLogState();
+    validateNext(source, created("th-1", "c-1", 1));
+
+    const shadow = cloneLogState(source);
+    const reply: ReviewEvent = {
+      seq: 2,
+      ts: t,
+      actor,
+      kind: "comment.replied",
+      threadId: "th-1",
+      commentId: "c-2",
+      parentId: "c-1",
+      body: "ok",
+    };
+    expect(validateNext(shadow, reply).ok).toBe(true);
+
+    // The shadow took the reply...
+    expect([...(shadow.threads.get("th-1")?.commentIds ?? [])]).toEqual(["c-1", "c-2"]);
+    // ...and the source did not. This last assertion is what a shared Set fails.
+    expect([...(source.threads.get("th-1")?.commentIds ?? [])]).toEqual(["c-1"]);
   });
 });

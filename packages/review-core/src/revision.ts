@@ -13,12 +13,6 @@
  * `handover.revision`) shares one definition and moves in one place. */
 export const SHA256_HEX_REGEX = /^[0-9a-f]{64}$/;
 
-/** Regex for a full-length git commit SHA (40 lowercase hex characters).
- * Used by tooling that only ever sees SHA-1 refs; `GIT_COMMIT_HEX_REGEX`
- * is preferred for a commit id field because git's SHA-256 transition
- * emits 64-hex commit ids and revkit must accept both. */
-export const GIT_SHA_HEX_REGEX = /^[0-9a-f]{40}$/;
-
 /** Regex for a git commit id in either SHA-1 (40 hex) or SHA-256 (64 hex)
  * form. Git's object-format = sha256 mode produces 64-hex ids for repos
  * that opted in; a revkit anchor made in such a repo must round-trip
