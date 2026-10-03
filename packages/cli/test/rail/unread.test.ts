@@ -78,6 +78,18 @@ function buildThread(patch: Partial<RailThread> & { id: string; updatedAt: strin
   } as RailThread;
 }
 
+/** The minimal `UnreadThread` the unread pill fires on: one
+ * agent-authored comment at `createdAt`, so the thread reads UNREAD
+ * unless `seen[id]` is at least that timestamp. */
+function agentTouchedThread(id: string, createdAt: string): UnreadThread {
+  return {
+    id,
+    status: "open",
+    updatedAt: createdAt,
+    comments: [{ author: agentAuthor, createdAt }],
+  };
+}
+
 describe("rail unread derivation (issue #60)", () => {
   test("a thread with an agent-authored last comment is unread when never seen", () => {
     const thread = buildThread({
@@ -385,34 +397,34 @@ describe("seen-map localStorage helpers (issue #60)", () => {
   });
 });
 
-describe("migrateSeenStorage (issue #60 round-3)", () => {
-  /** Minimal in-memory storage that satisfies `IterableStorage`. */
-  function inMemoryStorage(seed: Record<string, string> = {}): IterableStorage & {
-    readonly snapshot: () => Record<string, string>;
-  } {
-    const map = new Map<string, string>(Object.entries(seed));
-    return {
-      get length(): number {
-        return map.size;
-      },
-      key(index: number): string | null {
-        return Array.from(map.keys())[index] ?? null;
-      },
-      getItem(k: string): string | null {
-        return map.get(k) ?? null;
-      },
-      setItem(k: string, v: string): void {
-        map.set(k, v);
-      },
-      removeItem(k: string): void {
-        map.delete(k);
-      },
-      snapshot(): Record<string, string> {
-        return Object.fromEntries(map);
-      },
-    };
-  }
+/** Minimal in-memory storage that satisfies `IterableStorage`. */
+function inMemoryStorage(seed: Record<string, string> = {}): IterableStorage & {
+  readonly snapshot: () => Record<string, string>;
+} {
+  const map = new Map<string, string>(Object.entries(seed));
+  return {
+    get length(): number {
+      return map.size;
+    },
+    key(index: number): string | null {
+      return Array.from(map.keys())[index] ?? null;
+    },
+    getItem(k: string): string | null {
+      return map.get(k) ?? null;
+    },
+    setItem(k: string, v: string): void {
+      map.set(k, v);
+    },
+    removeItem(k: string): void {
+      map.delete(k);
+    },
+    snapshot(): Record<string, string> {
+      return Object.fromEntries(map);
+    },
+  };
+}
 
+describe("migrateSeenStorage (issue #60 round-3)", () => {
   test("moves the bare-key bucket under the target key on first repoId arrival", () => {
     // The reviewer marked something seen before /-/health
     // responded. That mark landed under the bare key. When
@@ -447,7 +459,17 @@ describe("migrateSeenStorage (issue #60 round-3)", () => {
     });
   });
 
-  test("deletes orphaned buckets from previous repos (the round-3 blocker's cleanup)", () => {
+  test("reclaims buckets the LRU index cannot vouch for (orphans from previous repos)", () => {
+    // Deliberately re-scoped by issue #63. The round-3 test this
+    // replaces seeded two foreign buckets and asserted BOTH were
+    // deleted; the mechanism it was protecting against — a growing
+    // pile of stale keys on one origin — is now served by the
+    // bounded index + LRU (see the `seen-state LRU` block below).
+    // The assertions are unchanged because these two keys are NOT in
+    // the index: a key nothing vouches for is still reclaimed. The
+    // round-3 test's own scenario (a repo whose bucket the index
+    // does list) is now asserted to SURVIVE below, which is the
+    // behaviour issue #63 changed.
     const target = seenStorageKeyFor("repo-current");
     const storage = inMemoryStorage({
       [seenStorageKeyFor("repo-old-1")]: JSON.stringify({ t: "2026-09-29T12:00:00Z" }),
@@ -471,13 +493,346 @@ describe("migrateSeenStorage (issue #60 round-3)", () => {
       [target]: JSON.stringify({ t1: "2026-09-30T12:00:00Z" }),
     });
     migrateSeenStorage(storage, target);
-    expect(storage.snapshot()).toEqual({
-      [target]: JSON.stringify({ t1: "2026-09-30T12:00:00Z" }),
-    });
+    // The bucket is untouched; only the index is (re)written.
+    expect(JSON.parse(storage.snapshot()[target]!)).toEqual({ t1: "2026-09-30T12:00:00Z" });
   });
 
   test("undefined storage returns without throwing", () => {
     expect(() => migrateSeenStorage(undefined, seenStorageKeyFor("r"))).not.toThrow();
+  });
+});
+
+// Issue #63: the round-3 migration deleted EVERY other
+// `revkit.rail.seen.v1*` bucket, so with two repos served one after
+// the other on the same fixed `--port` (same origin, same
+// localStorage), opening repo Y wiped repo X's seen marks. The
+// failure direction is fail-safe — the marks read as unread again —
+// but it is still a lost ack the reviewer has to redo.
+//
+// The buckets are now kept in a bounded LRU tracked by an explicit
+// index key, and only a key the index cannot vouch for (plus the bare
+// pre-`repoId` key) is reclaimed. The literals below pin the
+// localStorage key name, which is a wire format between this version
+// and the next: a rename that did not migrate would silently reset
+// every reviewer's ack state.
+const SEEN_INDEX_KEY = "revkit.rail.seen.index.v1";
+const LRU_LIMIT = 8;
+
+describe("seen-state LRU across repos on one origin (issue #63)", () => {
+  test("opening repo Y leaves repo X's bucket and its marks intact", () => {
+    const keyX = seenStorageKeyFor("repo-x");
+    const keyY = seenStorageKeyFor("repo-y");
+    const storage = inMemoryStorage();
+    // Repo X is served first on this origin and the reviewer acks a
+    // thread there.
+    storage.setItem(keyX, JSON.stringify({ tx: "2026-09-30T12:00:00Z" }));
+    migrateSeenStorage(storage, keyX);
+    // Repo Y is served next on the SAME fixed --port (same origin,
+    // same localStorage) and the reviewer acks a thread there.
+    storage.setItem(keyY, JSON.stringify({ ty: "2026-09-30T12:30:00Z" }));
+    migrateSeenStorage(storage, keyY);
+    const snap = storage.snapshot();
+    // X's bucket survives, byte for byte — no marks folded across the
+    // repo boundary either.
+    expect(JSON.parse(snap[keyX]!)).toEqual({ tx: "2026-09-30T12:00:00Z" });
+    expect(JSON.parse(snap[keyY]!)).toEqual({ ty: "2026-09-30T12:30:00Z" });
+    // And X still reads as SEEN, which is the whole point.
+    const xThread = agentTouchedThread("tx", "2026-09-30T12:00:00Z");
+    expect(isThreadUnread(xThread, readSeenMap(storage, keyX))).toBe(false);
+  });
+
+  test("the index records LRU order, oldest first, with the target touched last", () => {
+    const keyA = seenStorageKeyFor("repo-a");
+    const keyB = seenStorageKeyFor("repo-b");
+    const storage = inMemoryStorage({
+      [keyA]: JSON.stringify({ ta: "2026-09-30T12:00:00Z" }),
+      [keyB]: JSON.stringify({ tb: "2026-09-30T12:05:00Z" }),
+      [SEEN_INDEX_KEY]: JSON.stringify([keyA, keyB]),
+    });
+    migrateSeenStorage(storage, keyB);
+    expect(JSON.parse(storage.snapshot()[SEEN_INDEX_KEY]!)).toEqual([keyA, keyB]);
+    // Re-opening A touches it: A becomes the most recent, B the least.
+    migrateSeenStorage(storage, keyA);
+    expect(JSON.parse(storage.snapshot()[SEEN_INDEX_KEY]!)).toEqual([keyB, keyA]);
+  });
+
+  test("the bound evicts oldest-first past 8 buckets", () => {
+    const storage = inMemoryStorage();
+    const keys: string[] = [];
+    for (let i = 0; i < LRU_LIMIT + 3; i += 1) {
+      const key = seenStorageKeyFor(`repo-${i}`);
+      keys.push(key);
+      storage.setItem(key, JSON.stringify({ [`t${i}`]: "2026-09-30T12:00:00Z" }));
+      migrateSeenStorage(storage, key);
+    }
+    const snap = storage.snapshot();
+    const surviving = keys.filter((k) => snap[k] !== undefined);
+    // Exactly LRU_LIMIT buckets, the 3 oldest gone.
+    expect(surviving).toEqual(keys.slice(3));
+    expect(JSON.parse(snap[SEEN_INDEX_KEY]!)).toEqual(keys.slice(3));
+  });
+
+  test("an evicted bucket's marks read as unread again, never as read", () => {
+    const storage = inMemoryStorage();
+    const keys: string[] = [];
+    for (let i = 0; i < LRU_LIMIT + 1; i += 1) {
+      const key = seenStorageKeyFor(`repo-${i}`);
+      keys.push(key);
+      storage.setItem(key, JSON.stringify({ [`t${i}`]: "2026-09-30T12:00:00Z" }));
+      migrateSeenStorage(storage, key);
+    }
+    const evicted = keys[0]!;
+    const snapshot = storage.snapshot();
+    // The oldest bucket is evicted by the 9th visit.
+    expect(snapshot[evicted]).toBeUndefined();
+    // No surviving bucket absorbed its marks — eviction must never
+    // read as an ack, and must not smuggle one repo's ack into
+    // another's bucket either.
+    for (const key of keys.slice(1)) {
+      const marks = readSeenMap(storage, key);
+      expect(marks["t0"]).toBeUndefined();
+    }
+    // And the evicted repo's thread is back to unread when the
+    // reviewer returns to that repo (empty bucket ⇒ no ack).
+    const backAgain = seenStorageKeyFor("repo-0");
+    storage.setItem(backAgain, JSON.stringify({}));
+    expect(isThreadUnread(agentTouchedThread("t0", "2026-09-30T12:00:00Z"), readSeenMap(storage, backAgain))).toBe(
+      true,
+    );
+  });
+
+  test("a stale orphan bucket missing from the index is reclaimed", () => {
+    const target = seenStorageKeyFor("repo-current");
+    const orphan = seenStorageKeyFor("repo-orphan");
+    const indexed = seenStorageKeyFor("repo-indexed");
+    const storage = inMemoryStorage({
+      [orphan]: JSON.stringify({ t: "2026-09-29T12:00:00Z" }),
+      [indexed]: JSON.stringify({ t: "2026-09-28T12:00:00Z" }),
+      [SEEN_INDEX_KEY]: JSON.stringify([indexed]),
+    });
+    migrateSeenStorage(storage, target);
+    const snap = storage.snapshot();
+    expect(snap[orphan]).toBeUndefined();
+    // The indexed bucket — a live repo's — is untouched.
+    expect(JSON.parse(snap[indexed]!)).toEqual({ t: "2026-09-28T12:00:00Z" });
+    expect(JSON.parse(snap[SEEN_INDEX_KEY]!)).toEqual([indexed, target]);
+  });
+
+  test("an index entry whose bucket is already gone is dropped, not kept as a phantom", () => {
+    const target = seenStorageKeyFor("repo-current");
+    const phantom = seenStorageKeyFor("repo-deleted");
+    const storage = inMemoryStorage({
+      [target]: JSON.stringify({ t: "2026-09-30T12:00:00Z" }),
+      [SEEN_INDEX_KEY]: JSON.stringify([phantom]),
+    });
+    migrateSeenStorage(storage, target);
+    expect(JSON.parse(storage.snapshot()[SEEN_INDEX_KEY]!)).toEqual([target]);
+  });
+
+  test("a malformed index fails safe: marks read as unread, never as read", () => {
+    // An index we cannot parse vouches for nothing, so the buckets it
+    // named are reclaimed. That is the fail-safe direction — the
+    // marks read as unread again. What it must NEVER do is hand a
+    // mark this repo never acked into the current bucket, which
+    // would read as an ack for the wrong repo.
+    const target = seenStorageKeyFor("repo-current");
+    const foreign = seenStorageKeyFor("repo-foreign");
+    const storage = inMemoryStorage({
+      [SEEN_INDEX_KEY]: "{not json at all",
+      [foreign]: JSON.stringify({ tf: "2026-09-29T12:00:00Z" }),
+      [target]: JSON.stringify({ tc: "2026-09-30T12:00:00Z" }),
+    });
+    migrateSeenStorage(storage, target);
+    const snap = storage.snapshot();
+    expect(snap[foreign]).toBeUndefined();
+    // The index is replaced with a well-formed one naming only the
+    // target, so the next mount starts from a known-good state.
+    expect(JSON.parse(snap[SEEN_INDEX_KEY]!)).toEqual([target]);
+    // The current repo's own marks are NOT collateral damage.
+    expect(JSON.parse(snap[target]!)).toEqual({ tc: "2026-09-30T12:00:00Z" });
+    // And the reclaimed thread reads unread.
+    expect(
+      isThreadUnread(agentTouchedThread("tf", "2026-09-29T12:00:00Z"), readSeenMap(storage, target)),
+    ).toBe(true);
+  });
+
+  test("index entries that are not bucket keys are dropped (fail-safe)", () => {
+    const target = seenStorageKeyFor("repo-current");
+    const foreign = seenStorageKeyFor("repo-foreign");
+    const storage = inMemoryStorage({
+      [SEEN_INDEX_KEY]: JSON.stringify([42, null, "", SEEN_INDEX_KEY, "some-other-app.key", foreign]),
+      [foreign]: JSON.stringify({ tf: "2026-09-29T12:00:00Z" }),
+      [target]: JSON.stringify({ tc: "2026-09-30T12:00:00Z" }),
+    });
+    migrateSeenStorage(storage, target);
+    const snap = storage.snapshot();
+    // Only the one well-formed, live bucket survives.
+    expect(JSON.parse(snap[SEEN_INDEX_KEY]!)).toEqual([foreign, target]);
+    expect(JSON.parse(snap[foreign]!)).toEqual({ tf: "2026-09-29T12:00:00Z" });
+    // The index key did not eat its own bucket or any foreign key.
+    expect(snap[SEEN_INDEX_KEY]).toBeDefined();
+  });
+
+  test("a non-array index payload is treated as absent", () => {
+    const target = seenStorageKeyFor("repo-current");
+    const storage = inMemoryStorage({
+      [SEEN_INDEX_KEY]: JSON.stringify({ repo: target }),
+      [target]: JSON.stringify({ tc: "2026-09-30T12:00:00Z" }),
+    });
+    migrateSeenStorage(storage, target);
+    expect(JSON.parse(storage.snapshot()[SEEN_INDEX_KEY]!)).toEqual([target]);
+  });
+
+  test("the bare pre-repoId bucket is reclaimed and folded in, never indexed", () => {
+    const keyX = seenStorageKeyFor("repo-x");
+    const keyY = seenStorageKeyFor("repo-y");
+    const storage = inMemoryStorage({
+      [SEEN_STORAGE_KEY_PREFIX]: JSON.stringify({ early: "2026-09-30T12:00:00Z" }),
+      [keyX]: JSON.stringify({ tx: "2026-09-30T12:05:00Z" }),
+      [SEEN_INDEX_KEY]: JSON.stringify([keyX]),
+    });
+    migrateSeenStorage(storage, keyY);
+    const snap = storage.snapshot();
+    // The bare bucket is gone (it only ever served the pre-health
+    // window) and its mark moved into the resolved bucket.
+    expect(snap[SEEN_STORAGE_KEY_PREFIX]).toBeUndefined();
+    expect(JSON.parse(snap[keyY]!)).toEqual({ early: "2026-09-30T12:00:00Z" });
+    // It is not an LRU member — only real repoId buckets are.
+    expect(JSON.parse(snap[SEEN_INDEX_KEY]!)).toEqual([keyX, keyY]);
+  });
+
+  test("a bare target key (repoId unknown) is kept, not indexed", () => {
+    // `migrateSeenStorage` is only called once `/-/health` resolved a
+    // repoId, but the degenerate shape must not delete the very bucket
+    // the rail is reading from.
+    const storage = inMemoryStorage({
+      [SEEN_STORAGE_KEY_PREFIX]: JSON.stringify({ t: "2026-09-30T12:00:00Z" }),
+    });
+    migrateSeenStorage(storage, SEEN_STORAGE_KEY_PREFIX);
+    const snap = storage.snapshot();
+    expect(JSON.parse(snap[SEEN_STORAGE_KEY_PREFIX]!)).toEqual({ t: "2026-09-30T12:00:00Z" });
+    expect(JSON.parse(snap[SEEN_INDEX_KEY]!)).toEqual([]);
+  });
+
+  test("a throwing accessor never becomes a lost-ack or a crash", () => {
+    // Every branch is wrapped: a storage failure leaves the pill to
+    // re-fire rather than throwing out of mount().
+    const exploding = {
+      get length(): number {
+        throw new Error("blocked");
+      },
+      key(): string | null {
+        throw new Error("blocked");
+      },
+      getItem(): string | null {
+        throw new Error("blocked");
+      },
+      setItem(): void {
+        throw new Error("quota");
+      },
+      removeItem(): void {
+        throw new Error("blocked");
+      },
+    } as unknown as IterableStorage;
+    expect(() => migrateSeenStorage(exploding, seenStorageKeyFor("r"))).not.toThrow();
+  });
+
+  test("a full origin on the FIRST mount reclaims nothing (the index write is the gate)", () => {
+    // The ordering invariant, and the reason the index is written
+    // before the reclaim pass: the index is what makes a reclaim
+    // DECIDABLE. Reclaiming against a not-yet-written index means
+    // deciding from a record that does not exist — and when that
+    // write then fails, the deletion stands with nothing left to
+    // justify it and no index for the next mount to consult.
+    //
+    // Seed shape: a foreign bucket and NO index. That is both the
+    // upgrade path (a pre-#63 origin has no index) and the shape a
+    // nearly-full origin produces on its first mount, because the
+    // index key is NEW and so is the write most likely to hit the
+    // quota. `writeSeenMap` for the target has already succeeded by
+    // then, because the target bucket already existed.
+    //
+    // Swapping the two blocks in `migrateSeenStorage` makes this
+    // test fail with repo X's bucket deleted. Proven by mutation,
+    // not assumed — see the commit message.
+    const keyX = seenStorageKeyFor("repo-x");
+    const keyY = seenStorageKeyFor("repo-y");
+    const backing = inMemoryStorage({
+      [keyX]: JSON.stringify({ tx: "2026-09-30T12:00:00Z" }),
+      [keyY]: JSON.stringify({ ty: "2026-09-30T12:30:00Z" }),
+    });
+    const quotaOnIndexOnly: IterableStorage = {
+      get length(): number {
+        return backing.length;
+      },
+      key: (index: number): string | null => backing.key(index),
+      getItem: (k: string): string | null => backing.getItem(k),
+      setItem: (k: string, v: string): void => {
+        if (k === SEEN_INDEX_KEY) throw new Error("QuotaExceededError: index write refused");
+        backing.setItem(k, v);
+      },
+      removeItem: (k: string): void => {
+        backing.removeItem(k);
+      },
+    };
+
+    expect(() => migrateSeenStorage(quotaOnIndexOnly, keyY)).not.toThrow();
+
+    const snap = backing.snapshot();
+    // Repo X's bucket survives untouched — the reclaim pass never
+    // ran, so nothing was deleted on the strength of an index we
+    // could not write.
+    expect(JSON.parse(snap[keyX]!)).toEqual({ tx: "2026-09-30T12:00:00Z" });
+    // And X's mark was NOT folded into Y's bucket either.
+    expect(JSON.parse(snap[keyY]!)).toEqual({ ty: "2026-09-30T12:30:00Z" });
+    // No index was written, so the next mount decides again from
+    // scratch — and reaches the same no-loss answer.
+    expect(snap[SEEN_INDEX_KEY]).toBeUndefined();
+    // Documented degradation: while the index cannot be written the
+    // LRU keeps everything and reclaims nothing, so this origin's
+    // bucket count is bounded by the browser's quota rather than by
+    // SEEN_BUCKET_LIMIT. That is the safe direction — the pile is
+    // small JSON the browser is already refusing to grow — and it
+    // is strictly better than deleting marks we could not justify.
+    expect(Object.keys(snap).filter((k) => k.startsWith(`${SEEN_STORAGE_KEY_PREFIX}.`))).toHaveLength(2);
+  });
+
+  test("the reclaim pass runs only after the index write has landed", () => {
+    // The same invariant asserted on ORDER rather than on the end
+    // state: every removeItem comes after the index setItem. Seeded
+    // without an index so there IS a reclaim to order — with an
+    // index present nothing is ever reclaimed, so the
+    // `removes.length > 0` guard below fails loudly rather than
+    // letting the ordering assertion pass vacuously.
+    const order: string[] = [];
+    const keyX = seenStorageKeyFor("repo-x");
+    const keyY = seenStorageKeyFor("repo-y");
+    const backing = inMemoryStorage({
+      [keyX]: JSON.stringify({ tx: "2026-09-30T12:00:00Z" }),
+    });
+    const recording: IterableStorage = {
+      get length(): number {
+        return backing.length;
+      },
+      key: (index: number): string | null => backing.key(index),
+      getItem: (k: string): string | null => backing.getItem(k),
+      setItem: (k: string, v: string): void => {
+        order.push(`set:${k}`);
+        backing.setItem(k, v);
+      },
+      removeItem: (k: string): void => {
+        order.push(`remove:${k}`);
+        backing.removeItem(k);
+      },
+    };
+    migrateSeenStorage(recording, keyY);
+    const indexWrite = order.indexOf(`set:${SEEN_INDEX_KEY}`);
+    expect(indexWrite).toBeGreaterThanOrEqual(0);
+    const removes = order.filter((entry) => entry.startsWith("remove:"));
+    expect(removes.length).toBeGreaterThan(0);
+    for (const entry of removes) {
+      expect(order.indexOf(entry)).toBeGreaterThan(indexWrite);
+    }
   });
 });
 

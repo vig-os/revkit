@@ -91,7 +91,7 @@ import {
 import { buildAskPageBundle } from "../ask-page/bundle.ts";
 import { writeAskFile } from "./asks-file.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
-import { acquireAndPublish, ensureRevkitDir, readOrMintRepoId, type ServeState } from "./serve-state.ts";
+import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
 import {
   answerAskRequestSchema,
@@ -822,14 +822,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // confirm the port answers as THIS daemon, and required by
   // `serve.json`'s ownership check on shutdown.
   const instanceId = mintToken();
-  // Persistent per-repo tag, also echoed by `GET /-/health` as
-  // `repoId`. The rail keys its per-viewer "seen" localStorage
-  // bucket by this so a `revkit serve` restart on the same
-  // `--port` does not wipe the reviewer's ack state (issue #60
-  // PR #62 round-3 review). Random on first run — never derived
-  // from the repo path — so an unauthenticated `/-/health` cannot
-  // fingerprint the caller's filesystem layout.
-  const repoId = readOrMintRepoId(options.repoRoot);
   const state: ServeState = {
     pid: process.pid,
     port,
@@ -840,13 +832,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     instanceId,
   };
   // `acquireAndPublish` (serve-state.ts) tries to take the OS-held
-  // lock on `.revkit/daemon.lock` and, on success, atomically
-  // writes serve.json. The lock is the single source of truth for
-  // "is another daemon running" — it is fcntl-based and the kernel
-  // releases it only on process exit, so a SIGSTOPped or hung
-  // daemon still holds it. The returned `release()` cleans up the
-  // state file (only if the on-disk `instanceId` still matches
-  // ours) and drops the lock.
+  // lock on `.revkit/daemon.lock` and, on success, read-or-mints
+  // `.revkit/repo-id` and atomically writes serve.json. The lock is
+  // the single source of truth for "is another daemon running" — it
+  // is fcntl-based and the kernel releases it only on process exit,
+  // so a SIGSTOPped or hung daemon still holds it. The returned
+  // `release()` cleans up the state file (only if the on-disk
+  // `instanceId` still matches ours) and drops the lock.
+  //
+  // `repoId` is read from the handle, NOT minted here (issue #63):
+  // a mint before the lock is a check-then-write that two
+  // overlapping starts can both win, so the loser's id can end up on
+  // disk while the winner advertises a different one. Under the lock
+  // exactly one process writes it.
   const publish = acquireAndPublish(options.repoRoot, state);
   if (publish.kind === "already-running") {
     server.stop(true);
@@ -861,6 +859,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         `Stop it, then retry.`,
     );
   }
+  // Persistent per-repo tag, served on `GET /-/health` as `repoId`.
+  // The rail keys its per-viewer "seen" localStorage bucket by this
+  // so a `revkit serve` restart on the same `--port` does not wipe
+  // the reviewer's ack state (issue #60 PR #62 round-3 review).
+  // Random on first run — never derived from the repo path — so an
+  // unauthenticated `/-/health` cannot fingerprint the caller's
+  // filesystem layout.
+  const repoId = publish.repoId;
 
   // Emit repo-relative paths in structured logs and on stdout so the
   // caller's absolute filesystem layout does not leak into
