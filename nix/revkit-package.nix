@@ -223,7 +223,12 @@ let
       # Per-workspace `node_modules` — hoisted rarely creates them, but
       # when a dep pins a conflicting version bun does. Kept for parity;
       # a no-op with the current lockfile.
-      for pkg in packages/cli packages/review-core packages/components site; do
+      # `packages/worker` is here for completeness with `manifestOnlySrc`
+      # above, not because it has runtime deps today: it has none (only
+      # devDependencies, dropped by `--production`). Listing it means a
+      # future slice that DOES add a runtime dep cannot hoist lands its
+      # tree here instead of silently going missing from the output.
+      for pkg in packages/cli packages/review-core packages/components packages/worker site; do
         if [ -d "$pkg/node_modules" ]; then
           mkdir -p "$out/$pkg"
           cp -r "$pkg/node_modules" "$out/$pkg/node_modules"
