@@ -209,11 +209,16 @@ describe("validateNext — doc.published (M2 item 9)", () => {
 
 // Issue #35: `import` validates its archive against a shadow `cloneLogState`
 // and commits only on success, so a rejected event in a multi-event archive
-// must not leak into the caller's state. That guarantee rests on
-// `thread.commentIds` being a Set the clone owns rather than shares: it is the
-// only mutable field reachable from the dry-run (validator.ts adds a reply's id
-// on `comment.replied`), and the shared-reference variant passes every other
-// test in this repo. Pin the contract directly here.
+// must not leak into the caller's state. That guarantee rests on the clone
+// owning its mutable fields rather than sharing them. This pins one of the two:
+// `thread.commentIds`, which the dry-run reaches via `comment.replied` — the
+// shared-reference variant survives every other test in this repo.
+//
+// The second is `commentLinks[commentId]` (validator.ts adds a backend to it).
+// It is currently unobservable rather than safe: `comment.linked` only ever
+// carries "github", and any pre-existing set already contains it, so the add is
+// always a no-op. It is not pinned here — worth covering when a second backend
+// exists, since one would make the latent sharing observable.
 describe("cloneLogState — deep copy", () => {
   test("does not share a thread's comment-id set with the source", () => {
     const source = emptyLogState();
