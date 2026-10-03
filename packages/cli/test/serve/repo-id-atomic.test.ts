@@ -277,6 +277,9 @@ describe("concurrent starts agree on one repo id (issue #63)", () => {
 
     const outcomes: Array<{ kind: string; repoId?: string; message?: string }> = [];
     for (const child of children) {
+      if (child.stdout === null || typeof child.stdout === "number") {
+        throw new Error("repo-id race: a child was spawned without a stdout pipe");
+      }
       const stdout = await new Response(child.stdout).text();
       await child.exited;
       const line = stdout.split("\n").find((l) => l.startsWith("{"));

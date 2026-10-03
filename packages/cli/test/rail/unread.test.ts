@@ -581,7 +581,7 @@ describe("seen-state LRU across repos on one origin (issue #63)", () => {
       storage.setItem(key, JSON.stringify({ [`t${i}`]: "2026-09-30T12:00:00Z" }));
       migrateSeenStorage(storage, key);
     }
-    const evicted = keys[0];
+    const evicted = keys[0]!;
     const snapshot = storage.snapshot();
     // The oldest bucket is evicted by the 9th visit.
     expect(snapshot[evicted]).toBeUndefined();
@@ -589,7 +589,8 @@ describe("seen-state LRU across repos on one origin (issue #63)", () => {
     // read as an ack, and must not smuggle one repo's ack into
     // another's bucket either.
     for (const key of keys.slice(1)) {
-      expect(readSeenMap(storage, key)["t0"]).toBeUndefined();
+      const marks = readSeenMap(storage, key);
+      expect(marks["t0"]).toBeUndefined();
     }
     // And the evicted repo's thread is back to unread when the
     // reviewer returns to that repo (empty bucket ⇒ no ack).
