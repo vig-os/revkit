@@ -84,23 +84,30 @@ precommit:
 # Four instruments, each covering a gap the others cannot:
 #
 #   1. WHICH RUNTIME. Prints `bun --version` and its resolved path first.
-#      CI's toolchain jobs run inside the vig-os devcontainer image, so the
-#      suite is tested against THAT image's bun, not the flake's pinned
-#      1.3.13 that local development uses — two different runtimes under
-#      one recipe name. This repo already carries one behaviour that is
-#      specific to bun 1.3.13 (the #49 watcher re-arm bug), so "which bun
-#      ran this" is a question with a real answer, not a formality. One
-#      line of output makes it answerable from the log after the fact.
+#      This was added on the belief that CI tests a different bun than the
+#      dev shell does, and the first CI run of this PR DISPROVED that: the
+#      log shows the same `bun 1.3.13` at the same nix store path locally
+#      and on the runner. So the runtimes match today.
+#      The line stays because that is a fact worth having in the log rather
+#      than in someone's head — it is exactly the premise that had to be
+#      checked, this repo already carries behaviour pinned to 1.3.13 (the
+#      #49 watcher bug), and "the image was rebuilt" or "the pin moved" is
+#      one `flake.lock` bump away from being true again. Cheap to print,
+#      and it settles the question by observation instead of by argument.
 #
 #   2. FD BUDGET. Every `startDaemon` leaks 2 descriptors on bun 1.3.13
 #      (Bun's `fs.watch(...).close()` does not free the fd; cross-checked
 #      against node v24.21.0, which does not leak). Measured `packages/cli`
-#      peak: 4449. GitHub-hosted runners cap the soft `nofile` limit at
-#      1024, so `EMFILE` is a matter of time. `ulimit -n` is set to give the
-#      run headroom so it COMPLETES, and the peak is then checked against
-#      the per-leg `test_fd_budget_*` so the next leak is a NAMED failure
-#      instead of a crash. This is headroom plus a tripwire, NOT a fix — the
-#      fds are Bun's to leak and revkit's teardown is already correct.
+#      peak: 4449 local, 4687 on CI.
+#      The `ulimit -n` set below is belt-and-braces, NOT a CI fix, and the
+#      first CI run showed why: that runner's soft limit was ALREADY 65535
+#      against a 4687 peak, so `EMFILE` was never in reach there. It is
+#      here for the runner or container that does default low (1024 is the
+#      classic unprivileged default), where this suite would otherwise die
+#      partway through. What CI actually gets is the PEAK CHECK, which
+#      turns the next leak into a NAMED failure instead of a mystery.
+#      Neither of these fixes the leak — the fds are Bun's to leak and
+#      revkit's teardown is already correct.
 #
 #   3. WALL-CLOCK BOUNDS. `timeout --signal=ABRT` per leg, so a stall is
 #      a red leg that names itself instead of a cancelled job. Be precise
@@ -138,13 +145,12 @@ test *args:
     printf 'just test: bun %s at %s\n' "$(bun --version)" "$(command -v bun)"
 
     # --- 2. fd headroom (see note 2 above) ---
-    # `ulimit -n` is a soft limit. Set it unconditionally so the suite
-    # gets the SAME ceiling everywhere — an unbounded soft limit on a
-    # dev box masks the very exhaustion CI would hit. Raising it is the
-    # point; lowering a host that is already generous is harmless
-    # because the budget sits ~15x above the measured peak. A failure is
-    # NOT fatal (the hard limit may be lower), but the resulting value
-    # is printed either way so the log records what the run actually got.
+    # `ulimit -n` is a soft limit. Set it unconditionally so the suite gets
+    # the SAME ceiling everywhere, and so the log records what the run
+    # actually got rather than leaving it to be inferred. Lowering a host
+    # that is already generous is harmless because the budget sits ~14x
+    # above the measured peak. A failure is NOT fatal (the hard limit may
+    # be lower), but the resulting value is printed either way.
     ulimit_in="{{test_fd_limit}}"
     if ! ulimit -n "$ulimit_in" 2>/dev/null; then
       printf 'just test: WARNING could not set ulimit -n to %s (hard limit %s); continuing\n' \
@@ -232,9 +238,15 @@ test_leg_timeout_e2e := "720"
 # cannot be the only stall guard.
 bun_test_timeout_ms := "30000"
 
-# Soft descriptor limit for the suite. GitHub-hosted runners sit at 1024,
-# which the measured suite peak (~4.4k) blows through. 65536 is ~15x that
-# peak and inside every host's hard limit.
+# Soft descriptor limit for the suite.
+#
+# NOT a CI fix, and verified as such: the first CI run of this PR reported
+# `host default was 65535` against a 4687 peak, so `EMFILE` was never in
+# reach on that runner. This exists for the runner, container or shell that
+# DOES default low — 1024 is the classic unprivileged default, and this
+# suite peaks around 4.7k — where the run would otherwise die partway
+# through with a crash that names no cause. 65536 is ~14x the measured peak
+# and inside every host's hard limit.
 test_fd_limit := "65536"
 
 # Per-leg descriptor ceilings, checked by scripts/fd-budget.sh (peak = the
@@ -245,13 +257,17 @@ test_fd_limit := "65536"
 #
 #   packages/cli        4449   single process, so worker-count INDEPENDENT
 #                              and stable across runs — the number a leak
-#                              guard should be sized from
+#                              guard should be sized from (CI measured
+#                              4687 on the same bun, so the shape holds
+#                              across machines and only the constant
+#                              drifts a few percent)
 #   packages/review-core   98
 #   site/schemas          139
 #
 # The Playwright leg is different: its peak scales with the worker count.
-#   site/playwright      499   at CI settings (`workers: 1`) — this is what
-#                              CI will actually see
+#   site/playwright      499   at CI settings (`workers: 1`), and 505
+#                              measured on the CI runner itself — this is
+#                              what CI actually sees
 #                      4683 / 6008 / 6481   across ~44 workers on this
 #                              88-core host, varying run to run with how
 #                              many browsers launch at once

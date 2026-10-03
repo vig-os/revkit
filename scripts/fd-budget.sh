@@ -10,8 +10,11 @@
 # descriptors (at CI's `workers: 1` the Playwright leg peaks at 499; on an
 # 88-core host its ~44 workers push it to 4683).
 #
-# GitHub-hosted runners cap the soft `nofile` limit at 1024, so the suite
-# dies with `EMFILE` long before it finishes — and the crash names no cause.
+# The soft `nofile` limit is the constraint, and where it is low the suite
+# dies with `EMFILE` long before it finishes — with a crash that names no
+# cause. Measured scope: CI's runner defaults to 65535 against a 4687 peak,
+# so it was never at risk; a host on the classic unprivileged 1024 default
+# would be. Hence the `ulimit -n` in `justfile.project` AND this check.
 #
 # Two guards, deliberately: `justfile.project`'s `test` recipe raises
 # `ulimit -n` so the run survives, and this script fails it LOUDLY if

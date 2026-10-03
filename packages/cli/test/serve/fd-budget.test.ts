@@ -20,11 +20,19 @@
 //
 // WHY A GUARD IS NEEDED AT ALL. The suite boots hundreds of daemons,
 // so ~2 fds each accumulates into the thousands. Over a full
-// `packages/cli` run the peak is **4449** descriptors (polled at
-// 50 ms over the whole process tree; see `scripts/fd-budget.sh`, which
-// also enforces this as a hard recipe-level ceiling). A runner with a 1024-descriptor limit
-// dies with `EMFILE` partway through, and the resulting failure names
-// no cause — that is the failure mode this file exists to pre-empt.
+// `packages/cli` run the peak is **4449** descriptors locally and 4687
+// on CI, on the same bun — polled at 50 ms over the whole process tree,
+// and enforced as a hard recipe-level ceiling by
+// `scripts/fd-budget.sh`. A host with the classic unprivileged
+// 1024-descriptor limit dies with `EMFILE` partway through, and the
+// resulting failure names no cause — that is the failure mode this file
+// exists to pre-empt.
+//
+// SCOPE, measured rather than assumed: CI's runner turned out to default
+// to a 65535 soft limit, so `EMFILE` was never in reach THERE. The
+// `ulimit -n` in the `just test` recipe is belt-and-braces for a
+// low-defaulting host, not the fix for #74. What protects CI is the peak
+// check, which makes the next leak a named failure.
 //
 // WHAT EACH TEST COVERS, HONESTLY.
 //
