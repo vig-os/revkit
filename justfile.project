@@ -98,7 +98,7 @@ precommit:
 #   2. FD BUDGET. Every `startDaemon` leaks 2 descriptors on bun 1.3.13
 #      (Bun's `fs.watch(...).close()` does not free the fd; cross-checked
 #      against node v24.21.0, which does not leak). Measured `packages/cli`
-#      peak: 4449 local, 4683 on CI.
+#      peak: 4449 local, 4687 on CI (run 37117007176; 4682 in 37117515667).
 #
 #      The `ulimit -n` below is belt-and-braces and WEAK, and it is worth
 #      being exact about why, because the first version of this comment
@@ -112,10 +112,10 @@ precommit:
 #
 #      What actually protects CI is the fd check in instrument 3, and even
 #      that needs honest scope. See `test_fd_delta_budget_*` for why it is
-#      split into an absolute ceiling and a growth delta: the ~3.2k of
-#      module-load descriptors swamp the ~1.2k leak component, so a ceiling
-#      tight enough to catch the first doubling of the leak is impossible
-#      against the raw total. Neither of these fixes the leak — the fds are
+#      split into an absolute ceiling and a growth delta: the ~3.4k of
+#      fixed module-load descriptors swamp the ~1.1k leak component, so a
+#      ceiling tight enough to catch the first doubling of the leak is
+#      impossible against the raw total. Neither of these fixes the leak — the fds are
 #      Bun's to leak and revkit's teardown is already correct.
 #
 #   3. WALL-CLOCK AND FD BOUNDS. `timeout --signal=ABRT` per leg, so a stall
@@ -196,8 +196,8 @@ test *args:
     #
     # Both fd budgets are needed, and neither alone is sufficient; see
     # `test_fd_delta_budget_*` for the arithmetic. The ceiling catches a
-    # runaway; the delta catches the leak GROWTH that the ~3.2k of
-    # module-load descriptors would otherwise hide.
+    # runaway; the delta catches the leak GROWTH that the ~3.4k of
+    # fixed module-load descriptors would otherwise hide.
     #
     # The budgets differ per leg because the underlying quantity does: bun
     # test legs are a single process with a stable count, while the
@@ -268,21 +268,33 @@ test *args:
     # bare, which meant a hang there reproduced #74's symptom — an 18-minute
     # dead job — with neither a wall bound nor an fd check on it.
     #
-    # `{{ args }}` sits inside single quotes rather than double. That is
-    # NOT a safety fix, and it is worth being precise about why, because an
-    # earlier revision of this comment claimed it was. `bash -c 'SCRIPT'`
-    # has the OUTER shell strip the quotes and hand `SCRIPT` to a second
-    # shell, which parses it fresh — so `{{ args }}` lands unquoted in that
-    # second parse and `$(...)` in an argument is still substituted.
-    # Measured with `just x 'nomatch$(echo INJECTED)'` against both forms:
-    # single quotes and double quotes both yield `nomatchINJECTED`. The
-    # single-quoted form is kept because it at least stops the RECIPE's own
-    # shell from expanding, so an argument can only affect the inner
-    # command's argv rather than the surrounding script — but this is a
-    # pre-existing property of just splicing `{{ args }}` in as raw text,
-    # identical in the recipe this replaced, and not something a quoting
-    # choice can fix. `*args` here is a developer convenience for `-t` and
-    # path filters, not a boundary against untrusted input.
+    # `{{ args }}` sits inside single quotes. That buys NOTHING, and two
+    # successive revisions of this comment were wrong about why, so here is
+    # the measured position rather than another rationalisation.
+    #
+    # Quoting cannot help, because just splices `{{ args }}` into this file
+    # as raw TEXT and bash then parses the result. Two separate escapes were
+    # measured against both the single-quoted and double-quoted forms:
+    #
+    #   1. command substitution. `$(...)` in an argument is substituted
+    #      either way, because `bash -c 'SCRIPT'` has the outer shell strip
+    #      the quotes and hand SCRIPT to a second shell that re-parses it
+    #      with nothing quoted. Both forms yield `nomatchINJECTED` for the
+    #      argument `nomatch$(echo INJECTED)`.
+    #   2. breaking out of the recipe's own quoting. A `'` escapes a
+    #      single-quoted string exactly as a `"` escapes a double-quoted
+    #      one, so an argument closes the recipe's quotes either way. Both
+    #      forms ran `echo ESCAPED-RECIPE-SHELL` in the recipe's own shell,
+    #      with byte-identical output.
+    #
+    # So this is a real but LOW-SEVERITY, DEV-LOCAL latent injection
+    # surface, and it is NOT fixed. It is not fixed because it is not
+    # reachable from CI: ci.yml:282 calls bare `just test` with no
+    # arguments, and `*args` exists for a developer passing `-t` or a path
+    # filter. Fixing it properly means not splicing args as text at all
+    # (positional parameters, or an argv array), which just does not offer
+    # here — worth doing if this recipe ever grows a wrapper that forwards
+    # untrusted input.
     run_leg packages/cli "{{test_leg_timeout_cli}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- env REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}'
@@ -320,13 +332,17 @@ test_fd_limit := "65536"
 # Measured peak (peak = the whole process TREE, so Playwright's workers and
 # their daemons count):
 #
-#   packages/cli        4449 local / 4683 CI   single process, so
-#                              worker-count independent and stable
+#   packages/cli        4449 local / 4687 CI   single process, so
+#                              worker-count independent and stable. The CI
+#                              figure is the post-redesign run 37117007176;
+#                              37117515667 repeats it at 4682.
 #   packages/review-core   98 local / 82 CI
 #   site/schemas          139 local / 140 CI
-#   site/playwright      499 local at `workers: 1` / 509 CI, but
+#   site/playwright      499 local at `workers: 1` / 510 CI, but
 #                      4683 / 6008 / 6481 local across ~44 workers, so
-#                              this leg scales with the worker count
+#                              this leg scales with the worker count. The CI
+#                              figure is run 37117007176; 37117515667
+#                              repeats it at 503.
 #
 # These ceilings are deliberately loose: the `packages/cli` one at 8192 sits
 # 1.75x over the worst observed, because tightening it toward 4449 would
@@ -336,27 +352,46 @@ test_fd_limit := "65536"
 test_fd_budget_stable := "8192"
 test_fd_budget_playwright := "16384"
 
-# Descriptor GROWTH budget per leg, measured after a warm-up so the ~3.4k of
-# module-load descriptors are excluded. This is the budget that can actually
-# see the leak, and it exists because of an arithmetic problem with the
-# absolute ceiling.
+# Descriptor GROWTH budget per leg, measured after a warm-up so the FIXED
+# module-load cost is excluded. This is the budget that can actually see the
+# leak, and it exists because of an arithmetic problem with the absolute
+# ceiling.
 #
-# The `packages/cli` leg breaks down as 3411 at the warm-up floor rising to a
-# 4449 peak, i.e. ~1038 of growth, and that ~1038 IS the leak: 2 per daemon
-# cycle across the suite. So the first DOUBLING of the leak lands at ~3411 +
-# 2076 = ~5487, comfortably UNDER the 8192 absolute ceiling. The ceiling
-# passes it. An absolute ceiling loose enough not to false-positive is
-# therefore blind to the first doubling, which is the most likely shape of
-# the regression it was added for. Measuring growth drops the constant term
-# and cannot hide it that way.
+# THE FIXED COST, and which measurement each number is. Three distinct
+# quantities were previously conflated into one figure, so to be explicit:
+#
+#   52      a bare `bun test` file importing only `node:fs`.
+#   3268    a minimal probe whose only project import is `serve/daemon.ts`.
+#   ~3.4k   the real `packages/cli` leg's post-warm-up FLOOR — 3384 local
+#           and 3403 on CI, derived as peak minus measured growth.
+#
+# The first two are probes; only the third is the baseline the growth budget
+# actually subtracts, so the leak arithmetic below uses it.
+#
+# The `packages/cli` leg rises from that ~3384 floor to a 4449 peak, i.e.
+# ~1065 of growth, and that growth IS the leak: 2 per daemon cycle across the
+# suite. So the first DOUBLING of the leak lands at ~3384 + 2130 = ~5514,
+# comfortably UNDER the 8192 absolute ceiling. The ceiling passes it. An
+# absolute ceiling loose enough not to false-positive is therefore blind to
+# the first doubling, which is the most likely shape of the regression it
+# was added for. Measuring growth drops the constant term and cannot hide it
+# that way.
 #
 # 1800 therefore sits between the measured growth and a doubling of it.
 # Local growth is stable at 1038-1067 across four runs; the CI runner
-# measures 1284 (run 37117007176, same bun), about 20% higher. So 1800 is
-# ~1.4x the worst environment measured and a doubling trips it — 2568 on CI
-# against an 1800 budget, and 2130 locally. If CI growth ever drifts another
-# 40% the budget needs re-deriving; that is the number to watch in the log,
-# which is why the recipe prints it on every run.
+# measures 1284 (run 37117007176) and 1279 (run 37117515667), about 20%
+# higher. So 1800 is ~1.4x the worst environment measured and a doubling
+# trips it — 2568 on CI against an 1800 budget, and 2130 locally. If CI
+# growth ever drifts another 40% the budget needs re-deriving; that is the
+# number to watch in the log, which is why the recipe prints it every run.
+#
+# The ~20% CI/local growth gap is NOT the warm-up window. The hypothesis was
+# that CI samples more slowly, so its baseline sits lower and its growth
+# looks inflated — but the arithmetic refutes it: CI's floor is
+# peak-minus-growth = 4687-1284 = 3403, against local 4449-1065 = 3384. Those
+# floors agree to 19 descriptors, so CI really does accumulate ~220 more over
+# the run and the warm-up is not the cause. That residual is unexplained;
+# the budget holds either way, with 40% headroom on the larger number.
 #
 # The Playwright leg is a different shape and gets its own number. It starts
 # small (a `just build`) and grows into its workers, so on this host its

@@ -24,10 +24,18 @@
 #   --budget N        absolute peak. A runaway backstop.
 #   --delta-budget N  growth after a warm-up. The one that can SEE the leak.
 #
-# The `packages/cli` leg breaks down as roughly 3249 fixed plus ~1200 of
-# leak. That 3249 is a module-load cost, not a leak: a bare `bun test`
-# starts at 52 descriptors and importing `serve/daemon.ts` alone takes it
-# to 3249. So the first DOUBLING of the leak lands at ~3249 + 2400 = ~5650,
+# The `packages/cli` leg breaks down as ~3384 fixed plus ~1065 of leak, and
+# the fixed part is a module-load cost rather than a leak. Three separate
+# measurements were previously conflated into one number here, so each is
+# labelled with what it actually is:
+#
+#   52      a bare `bun test` file importing only `node:fs`.
+#   3268    a minimal probe whose only project import is `serve/daemon.ts`.
+#   ~3384   the real leg's post-warm-up FLOOR (4449 peak minus 1065 measured
+#           growth). 3403 on CI (4687 minus 1284, run 37117007176).
+#
+# Only the third is the baseline growth is measured from, so the arithmetic
+# uses it: the first DOUBLING of the leak lands at ~3384 + 2130 = ~5514,
 # comfortably UNDER any absolute ceiling loose enough not to false-positive
 # on a big workstation. An absolute ceiling alone is therefore blind to
 # precisely the regression it was added for.
@@ -145,24 +153,39 @@ fds_of_tree() {
   printf '%s\n' "$total"
 }
 
-# Interval the poller sleeps between samples. It is a TARGET, not a claim:
-# each iteration is one tree walk plus one `sleep`, so the achieved interval
-# depends on how wide the tree is. Measured 103-330 ms on an 88-core host
-# with ~44 workers, against ~55 ms for a single-process leg. Reported as
-# "target" below so the log does not assert a precision it does not have.
+# Interval the poller sleeps between samples. It is a TARGET, not a claim,
+# and the achieved figure is several times larger than it on a real leg:
+# each iteration is one whole-tree walk plus one `sleep`, and the walk gets
+# more expensive as the tree widens. Measured on the real `packages/cli` leg
+# (446 polls over 100.5s): mean 226ms, median 165ms, p90 358ms. On CI that
+# leg manages 959 polls over its ~131s, about 137ms. A trivial `sleep`
+# command polls at ~55ms, which is where an earlier version of this comment
+# got its number — it described nothing that runs in CI. The broad-tree
+# Playwright leg is slower still. Reported as a "target" below so the log
+# does not assert a precision the tool does not have.
 poll_interval="0.05"
 
 # The warm-up is WALL CLOCK, not a sample count, and that distinction is the
-# whole ballgame. The ~3.4k module-load ramp is a fixed DURATION — measured,
-# the process reaches 3374 by sample 15 and is flat by sample 20 — so a
+# whole ballgame. The module-load ramp is a fixed DURATION, so a
 # sample-count warm-up is wrong twice over. Too short and the ramp is
 # counted as leak, which fires the growth budget on a healthy run (a filtered
 # `bun test` measured 2974 of "growth" that was entirely module load). Too
-# long and a short leg is left unmeasured. With `workers` making the
-# achieved sampling interval 103-330 ms on a wide tree, 20 samples can span
-# 2-6s, so the count is not even stable.
+# long and a short leg is left unmeasured — and a count is not even stable,
+# since the achieved interval above varies 165-358ms on one leg.
 #
-# Two seconds of wall clock clears the ~0.7s ramp with margin on both ends.
+# MEASURED, stamped per sample on the real cli leg: the count reaches 3374 at
+# t+0.93s (3377, 3377, 3384, 3391, 3417, 3425 after that) and stays within
+# 1% of its plateau from t+1.1s onward. So the ramp is ~1s of WALL CLOCK,
+# and the earlier "flat by sample 20" was a sample index being read as a
+# duration — at 165ms that index would be 3.3s, which is how this came to be
+# flagged for review.
+#
+# Two seconds therefore clears the ~1s ramp with ~1s of margin, which is
+# why the warm-up stays at 2 and is NOT moved. Raising it would shrink the
+# sample count on short legs for no measured gain: on this leg the baseline
+# is already settled to within ~50 descriptors by 2s, ~5% of the 1065 of
+# growth being measured.
+#
 # Every positive sample goes to `raw` (so "did we ever poll?" stays
 # answerable) and only post-warm-up ones go to `samples` (so growth is
 # measured). That distinction is what lets a leg too SHORT to measure be

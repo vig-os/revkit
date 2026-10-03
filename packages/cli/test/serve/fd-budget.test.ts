@@ -20,19 +20,25 @@
 //
 // WHY A GUARD IS NEEDED AT ALL. The suite boots hundreds of daemons,
 // so ~2 fds each accumulates into the thousands. Over a full
-// `packages/cli` run the peak is **4449** descriptors locally and 4687
-// on CI, on the same bun — polled at 50 ms over the whole process tree,
-// and enforced as a hard recipe-level ceiling by
-// `scripts/fd-budget.sh`. A host with the classic unprivileged
-// 1024-descriptor limit dies with `EMFILE` partway through, and the
-// resulting failure names no cause — that is the failure mode this file
-// exists to pre-empt.
+// `packages/cli` run the peak is **4449** descriptors locally and 4687 on
+// CI (run 37117007176; 4682 in 37117515667), on the same bun. A host with
+// the classic unprivileged 1024-descriptor limit dies with `EMFILE`
+// partway through, and the resulting failure names no cause — that is the
+// failure mode this file exists to pre-empt.
 //
-// SCOPE, measured rather than assumed: CI's runner turned out to default
-// to a 65535 soft limit, so `EMFILE` was never in reach THERE. The
-// `ulimit -n` in the `just test` recipe is belt-and-braces for a
-// low-defaulting host, not the fix for #74. What protects CI is the peak
-// check, which makes the next leak a named failure.
+// SCOPE, measured rather than assumed. CI's runner defaults to a 65536 soft
+// limit — which is exactly the value `just test` sets with `ulimit -S -n`,
+// so on CI that line is a NO-OP, not a mitigation. And it is a weak
+// mitigation anywhere else: with `prlimit --nofile=1024:1024` the raise is
+// refused, the recipe warns and continues at 1024, and the suite would
+// still die of `EMFILE`. It only helps in the soft-low/hard-high case.
+//
+// WHAT ACTUALLY PROTECTS CI is `scripts/fd-budget.sh`'s GROWTH check — and
+// this file's own header previously claimed the absolute peak ceiling did
+// it, which was wrong. The leg is ~3384 fixed module-load descriptors plus
+// ~1065 of leak, so a doubling of the leak reaches only ~5514: under the
+// 8192 ceiling. The ceiling is a runaway backstop and is blind to the first
+// doubling; measuring growth across post-warm-up samples is what sees it.
 //
 // WHAT EACH TEST COVERS, HONESTLY.
 //
@@ -76,8 +82,10 @@ const hasProcFd = process.platform === "linux";
  * it" / "one or two more per watch does not"), which is what made the
  * number look chosen rather than derived.
  *
- * At 3 the sensitivity is: trips at >=1.5x the measured rate, so the
- * first doubling (2.0x) clears it by 33%. The 1.5x headroom over the
+ * At 3 the sensitivity is: trips at >1.5x the measured rate. At exactly
+ * 1.5x the delta is 30 against a ceiling of 30 and `<=` lets it pass, so
+ * the first rate that fails is 1.6x. The first doubling (2.0x) clears it by
+ * 33%, which is what this budget is for. The 1.5x headroom over the
  * measured 2.00 is deliberate and tight, because the measurement is
  * exact — three runs at N=5/10/20 gave 11/20/40 every time, i.e. 2.00
  * per cycle with no drift at all. If a future Bun changes the constant
@@ -92,11 +100,13 @@ const CYCLES = 10;
 /** Absolute ceiling on this process's descriptor count.
  *
  * MEASURED peak 4449 over a full `packages/cli` run on
- * `bun 1.3.13`. Of that, ~3268 is a one-time module-load cost (a
- * bare `bun test` starts at 52; importing `serve/daemon.ts` alone
- * takes it to 3268 — it is NOT a leak and does not grow), and the
- * remaining ~1160 is the watcher leak across the suite's daemon
- * cycles. Budgeted at 8192 so the constant dominates and the
+ * `bun 1.3.13`. Of that, ~3384 is a one-time module-load cost and the
+ * remaining ~1065 is the watcher leak across the suite's daemon cycles.
+ * The fixed cost is the leg's post-warm-up FLOOR (4449 minus the 1065 of
+ * growth that `scripts/fd-budget.sh` measures); two narrower probes give
+ * 52 for a bare `bun test` and 3268 for one importing only
+ * `serve/daemon.ts`. None of it grows, so none of it is a leak.
+ * Budgeted at 8192 so the constant dominates and the
  * assertion stays a backstop rather than a tripwire; test 1 is what
  * actually tracks the leak. */
 const SUITE_FD_CEILING = 8192;
