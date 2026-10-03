@@ -334,33 +334,54 @@ describe("the Worker's own log lines (end to end)", () => {
    * disagreement out of every call site. */
   type DispatchResult = Awaited<ReturnType<Harness["dispatch"]>>;
 
-  /** Capture what the Worker wrote while `run` executes. miniflare
-   * forwards workerd's `console.log` to the host console, so the swap is
-   * enough — and it is the real logger, not a stand-in. */
+  /** Capture what the Worker wrote while `run` executes, then WAIT for
+   * miniflare to finish forwarding.
+   *
+   * **The drain is load-bearing, not decoration.** miniflare forwards
+   * workerd's `console.log` over its own wire, so the log lines arrive on
+   * the HOST some time after the response resolves. Restoring
+   * `console.log` the instant `dispatchFetch` returns therefore truncates
+   * the capture at an unpredictable point, and `request.end` — logged in a
+   * `finally` with no `await` between it and the response — is usually
+   * still in flight. That was observed on CI as
+   * `Expected to contain: "request.end"` while the same test passed
+   * locally, and an earlier local "fix" that swapped the route for one with
+   * a database round trip only worked while the handler still had one.
+   *
+   * So: poll until the expected count arrives or a bounded budget expires.
+   * The assertion is NOT weakened — both lines are still required, with the
+   * same request id — and a line that never arrives still fails, just after
+   * a second instead of immediately. */
   async function captureWorkerLog(
     run: () => Promise<DispatchResult>,
+    options: { readonly expectLines?: number; readonly drainMs?: number } = {},
   ): Promise<{ response: DispatchResult; lines: string[] }> {
     const lines: string[] = [];
+    const want = options.expectLines ?? 1;
+    const budgetMs = options.drainMs ?? 2_000;
     const original = console.log;
     console.log = (...args: unknown[]) => {
       lines.push(args.map((arg) => String(arg)).join(" "));
     };
     try {
-      return { response: await run(), lines };
+      const response = await run();
+      const deadline = Date.now() + budgetMs;
+      while (lines.length < want && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return { response, lines };
     } finally {
       console.log = original;
     }
   }
 
   test("A23: the requestId in the log is the same one in the response header", async () => {
-    // `/api/threads`, not `/healthz`: miniflare forwards workerd's
-    // `console.log` over its own wire, so a route with no `await` in it can
-    // have its `request.end` line still in flight when `dispatchFetch`
-    // resolves and the swap is restored. The 501 branch puts two lines and
-    // a round trip between the pair, which is also the more useful
-    // evidence — it shows the closed state in the same capture.
-    const { response, lines } = await captureWorkerLog(() =>
-      harness.dispatch("http://localhost/api/threads"),
+    // `/api/threads`, not `/healthz`: the 501 branch emits a third line
+    // (`api.threads.read.disabled`) between the pair, so this capture also
+    // shows the closed state. Two lines are expected and waited for.
+    const { response, lines } = await captureWorkerLog(
+      () => harness.dispatch("http://localhost/api/threads"),
+      { expectLines: 3 },
     );
     const headerId = response.headers.get("x-revkit-request-id");
     expect(headerId).toMatch(/^[0-9a-f-]{36}$/);
@@ -371,10 +392,13 @@ describe("the Worker's own log lines (end to end)", () => {
     }
     expect(records.map((record) => record["msg"])).toContain("request.start");
     expect(records.map((record) => record["msg"])).toContain("request.end");
+    expect(records.map((record) => record["msg"])).toContain("api.threads.read.disabled");
   });
 
   test("A24: no real Worker log line carries a comment body or a credential", async () => {
-    const { lines } = await captureWorkerLog(() => harness.dispatch("http://localhost/nope"));
+    const { lines } = await captureWorkerLog(() => harness.dispatch("http://localhost/nope"), {
+      expectLines: 2,
+    });
     for (const line of lines) {
       expect(line).not.toMatch(/gh[pousr]_[A-Za-z0-9]{16,}/);
       expect(line).not.toMatch(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
@@ -384,8 +408,9 @@ describe("the Worker's own log lines (end to end)", () => {
   });
 
   test("the 501 branch logs that the READ is disabled, so the closed state is visible in production logs", async () => {
-    const { response, lines } = await captureWorkerLog(() =>
-      harness.dispatch("http://localhost/api/threads"),
+    const { response, lines } = await captureWorkerLog(
+      () => harness.dispatch("http://localhost/api/threads"),
+      { expectLines: 3 },
     );
     expect(response.status).toBe(501);
     expect(lines.map(parse).map((record) => record["msg"])).toContain("api.threads.read.disabled");
