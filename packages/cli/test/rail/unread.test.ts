@@ -736,6 +736,103 @@ describe("seen-state LRU across repos on one origin (issue #63)", () => {
     } as unknown as IterableStorage;
     expect(() => migrateSeenStorage(exploding, seenStorageKeyFor("r"))).not.toThrow();
   });
+
+  test("a full origin on the FIRST mount reclaims nothing (the index write is the gate)", () => {
+    // The ordering invariant, and the reason the index is written
+    // before the reclaim pass: the index is what makes a reclaim
+    // DECIDABLE. Reclaiming against a not-yet-written index means
+    // deciding from a record that does not exist — and when that
+    // write then fails, the deletion stands with nothing left to
+    // justify it and no index for the next mount to consult.
+    //
+    // Seed shape: a foreign bucket and NO index. That is both the
+    // upgrade path (a pre-#63 origin has no index) and the shape a
+    // nearly-full origin produces on its first mount, because the
+    // index key is NEW and so is the write most likely to hit the
+    // quota. `writeSeenMap` for the target has already succeeded by
+    // then, because the target bucket already existed.
+    //
+    // Swapping the two blocks in `migrateSeenStorage` makes this
+    // test fail with repo X's bucket deleted. Proven by mutation,
+    // not assumed — see the commit message.
+    const keyX = seenStorageKeyFor("repo-x");
+    const keyY = seenStorageKeyFor("repo-y");
+    const backing = inMemoryStorage({
+      [keyX]: JSON.stringify({ tx: "2026-09-30T12:00:00Z" }),
+      [keyY]: JSON.stringify({ ty: "2026-09-30T12:30:00Z" }),
+    });
+    const quotaOnIndexOnly: IterableStorage = {
+      get length(): number {
+        return backing.length;
+      },
+      key: (index: number): string | null => backing.key(index),
+      getItem: (k: string): string | null => backing.getItem(k),
+      setItem: (k: string, v: string): void => {
+        if (k === SEEN_INDEX_KEY) throw new Error("QuotaExceededError: index write refused");
+        backing.setItem(k, v);
+      },
+      removeItem: (k: string): void => {
+        backing.removeItem(k);
+      },
+    };
+
+    expect(() => migrateSeenStorage(quotaOnIndexOnly, keyY)).not.toThrow();
+
+    const snap = backing.snapshot();
+    // Repo X's bucket survives untouched — the reclaim pass never
+    // ran, so nothing was deleted on the strength of an index we
+    // could not write.
+    expect(JSON.parse(snap[keyX]!)).toEqual({ tx: "2026-09-30T12:00:00Z" });
+    // And X's mark was NOT folded into Y's bucket either.
+    expect(JSON.parse(snap[keyY]!)).toEqual({ ty: "2026-09-30T12:30:00Z" });
+    // No index was written, so the next mount decides again from
+    // scratch — and reaches the same no-loss answer.
+    expect(snap[SEEN_INDEX_KEY]).toBeUndefined();
+    // Documented degradation: while the index cannot be written the
+    // LRU keeps everything and reclaims nothing, so this origin's
+    // bucket count is bounded by the browser's quota rather than by
+    // SEEN_BUCKET_LIMIT. That is the safe direction — the pile is
+    // small JSON the browser is already refusing to grow — and it
+    // is strictly better than deleting marks we could not justify.
+    expect(Object.keys(snap).filter((k) => k.startsWith(`${SEEN_STORAGE_KEY_PREFIX}.`))).toHaveLength(2);
+  });
+
+  test("the reclaim pass runs only after the index write has landed", () => {
+    // The same invariant asserted on ORDER rather than on the end
+    // state: every removeItem comes after the index setItem. Seeded
+    // without an index so there IS a reclaim to order — with an
+    // index present nothing is ever reclaimed and the assertion
+    // would pass vacuously.
+    const order: string[] = [];
+    const keyX = seenStorageKeyFor("repo-x");
+    const keyY = seenStorageKeyFor("repo-y");
+    const backing = inMemoryStorage({
+      [keyX]: JSON.stringify({ tx: "2026-09-30T12:00:00Z" }),
+    });
+    const recording: IterableStorage = {
+      get length(): number {
+        return backing.length;
+      },
+      key: (index: number): string | null => backing.key(index),
+      getItem: (k: string): string | null => backing.getItem(k),
+      setItem: (k: string, v: string): void => {
+        order.push(`set:${k}`);
+        backing.setItem(k, v);
+      },
+      removeItem: (k: string): void => {
+        order.push(`remove:${k}`);
+        backing.removeItem(k);
+      },
+    };
+    migrateSeenStorage(recording, keyY);
+    const indexWrite = order.indexOf(`set:${SEEN_INDEX_KEY}`);
+    expect(indexWrite).toBeGreaterThanOrEqual(0);
+    const removes = order.filter((entry) => entry.startsWith("remove:"));
+    expect(removes.length).toBeGreaterThan(0);
+    for (const entry of removes) {
+      expect(order.indexOf(entry)).toBeGreaterThan(indexWrite);
+    }
+  });
 });
 
 describe("pruneSeenMap (issue #60 amendment)", () => {

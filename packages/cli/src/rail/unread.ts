@@ -322,6 +322,22 @@ function snapshotSeenBucketKeys(storage: IterableStorage): string[] {
  * only ever leave buckets un-reclaimed, never buckets deleted with no
  * index left to justify them.
  *
+ * **Documented degradation under a full origin.** The index key is
+ * NEW, so it is the write most likely to hit the quota, and a mount
+ * that cannot write it reclaims NOTHING for as long as the origin
+ * stays full — `SEEN_BUCKET_LIMIT` stops applying and the origin's
+ * bucket count is bounded by the browser's quota instead. That is
+ * deliberate, and it is the safe direction on all three counts: the
+ * accumulating bytes are a few KB per repo of `thread id → ISO
+ * timestamp` pairs that the browser is already refusing to grow; the
+ * alternative (reclaim anyway, from an index we could not record)
+ * is the cross-repo data loss this function exists to prevent; and
+ * the only "handle it" that avoids both would key eviction off
+ * `Storage`'s enumeration order, which the DOM spec does not
+ * guarantee. Under quota pressure the reviewer re-reads a few
+ * already-marked threads as unread; nothing is ever marked as read
+ * that was not.
+ *
  * Every branch is wrapped in try/catch — the reviewer's session is
  * never fatal on a storage failure; the pill just re-fires once, then
  * the seen map catches up on the next mark. */
