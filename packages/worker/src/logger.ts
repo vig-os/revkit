@@ -16,12 +16,14 @@
 //
 // ENFORCED, three mechanisms:
 //
-//   1. **The message is a closed vocabulary.** `msg` is an event NAME from a
-//      literal union (`request.start`, `api.threads.read.disabled`, …) and a
-//      runtime guard refuses anything else. This is the only mechanism that
-//      can stop a COMMENT BODY, because no regex distinguishes prose from a
-//      log line: the earlier version put a whole comment body in `msg` and
-//      every pattern passed it. Free text is now unrepresentable.
+//   1. **The message is a closed vocabulary.** `msg` must be one of the
+//      five names in `LOG_MESSAGES`, enforced in the TYPE (`LogMessage` is a
+//      literal union) and at RUNTIME (`KNOWN_MESSAGES.has(msg)`). This is the
+//      only mechanism that can stop a COMMENT BODY, because no regex
+//      distinguishes prose from a log line: the earlier version put a whole
+//      comment body in `msg` and every pattern passed it. Free text is now
+//      unrepresentable, including the interpolated-name shape that a
+//      form-only check accepted.
 //   2. **Key names.** A field whose name matches `SENSITIVE_KEY` has its
 //      value replaced entirely, so the shape does not matter — nested,
 //      arrayed, or a bare string.
@@ -100,9 +102,19 @@ export interface Logger {
  * cookie the bearer credential for a hosted request, and `sessions.id` is
  * the schema's own identifier for it: a session id in a log line is a
  * credential in a log line.
+ *
+ * **`cookie[s]?` rather than `cookie`.** The first alternative's
+ * non-letter guards are what stop `authorship` matching `auth`, and they also
+ * made `cookies` and `cookieJar` MISS — measured: both passed a session value
+ * through untouched, and ADR-0012 says no cookies in logs. The optional
+ * trailing `[a-z]` is the fix; the guards stay.
+ *
+ * `guest_?name` / `full_?name` are here for ADR-0015's exact datum: a guest's
+ * display name is personal data whether the field is called `name`,
+ * `guestName` or `fullName`.
  */
 const SENSITIVE_KEY =
-  /(^|[^a-z])(auth|authorization|cookie|set-cookie|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|bearer|csrf|csrftoken|x-api-key|session[_-]?id|sid|session)([^a-z]|$)|email|e-mail|display_?name|body|comment|text|content|message|prompt|quote|excerpt|summary|note|notes|detail|details|description|transcript|draft|patch|diff/i;
+  /(^|[^a-z])(auth|authorization|cookie|set-cookie|cookies|cookie_?jar|cookiejar|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|bearer|csrf|csrftoken|x-api-key|session[_-]?id|sid|session)([^a-z]|$)|email|e-mail|display_?name|guest_?name|full_?name|body|comment|text|content|message|prompt|quote|excerpt|summary|note|notes|detail|details|description|transcript|draft|patch|diff/i;
 
 /** Credential shapes, matched ANYWHERE in a string so a value that
  * embeds one ("retry failed with ghp_…") is caught even when the rest of
@@ -127,9 +139,19 @@ export const REDACTED = "[redacted]";
  * says only that the message was refused. */
 export const INVALID_MESSAGE = "invalid.log.message";
 
-/** The event-name shape. Redundant with the `LogMessage` union for
- * TypeScript callers, and the actual runtime control for everything else. */
+/** MEMBERSHIP, not shape. An earlier revision checked only that `msg`
+ * looked like `a.b.c`, and that is not a control: measured through the real
+ * logger, `not.a.real.event.name`, `because.the.reviewer.said.so` and an
+ * interpolated `` `api.threads.${kind}.disabled` `` all passed verbatim. The
+ * interpolated case is the realistic future bug, because it type-checks as a
+ * `string` at the call site and the shipped bundle is JavaScript, so
+ * TypeScript's help stops at the boundary.
+ *
+ * A shape check is therefore kept only as a cheap pre-filter, and the verdict
+ * is `LOG_MESSAGES.includes(msg)`. One known name is all five, so the cost of
+ * being exact is a five-element scan. */
 const EVENT_NAME = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
+const KNOWN_MESSAGES: ReadonlySet<string> = new Set<string>(LOG_MESSAGES);
 
 /** Redact one string: a credential shape or an email address anywhere in
  * it replaces the WHOLE value, so a partially-redacted address
@@ -166,10 +188,11 @@ export function createLogger(options: {
       const record: Record<string, unknown> = {
         ts: options.clock(),
         level,
-        // Mechanism 1: the message is an event name or nothing. `msg` also
-        // goes through the value pass, so a credential pasted into an
-        // event name is still caught even if the name check is bypassed.
-        msg: EVENT_NAME.test(msg) ? redactString(msg) : INVALID_MESSAGE,
+        // Mechanism 1: the message is a KNOWN event name or nothing.
+        // `msg` also goes through the value pass, so a credential pasted
+        // into an event name is still caught even if the membership check is
+        // bypassed.
+        msg: EVENT_NAME.test(msg) && KNOWN_MESSAGES.has(msg) ? redactString(msg) : INVALID_MESSAGE,
       };
       if (options.requestId !== undefined) record["requestId"] = options.requestId;
       for (const [key, value] of Object.entries(fields ?? {})) {

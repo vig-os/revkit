@@ -17,6 +17,7 @@
 // test that matters for the boundary is "a free-form `note` is NOT
 // detected" — it pins the limitation instead of hiding it.
 
+import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
   createLogger,
@@ -143,6 +144,41 @@ describe("structured logger", () => {
     expect(lines[0]).toContain(INVALID_MESSAGE);
   });
 
+  test("a WELL-FORMED name that is not a real event is still refused", () => {
+    // The gap the #76 round-2 review found: the guard used to check only
+    // the `a.b.c` SHAPE, so a dot-separated sentence passed. Measured
+    // through the real logger before the fix:
+    //   not.a.real.event.name        -> logged verbatim
+    //   because.the.reviewer.said.so -> logged verbatim
+    const shaped: [string, string][] = [
+      ["not.a.real.event.name", "not.a.real.event.name"],
+      ["because.the.reviewer.said.so", "because.the.reviewer.said.so"],
+      // The realistic future bug: an INTERPOLATED name. It is a `string` at
+      // the call site, so TypeScript cannot help, and the shipped bundle is
+      // JavaScript — so only a membership check can catch it.
+      ["api.threads.comment.disabled", "api.threads.comment.disabled"],
+    ];
+    for (const [candidate, forbidden] of shaped) {
+      const { logger, lines } = captureLogger("req-shape");
+      logger.log("info", candidate as LogMessage);
+      expect(parse(lines[0] as string)["msg"]).toBe(INVALID_MESSAGE);
+      expect(lines[0]).not.toContain(forbidden);
+    }
+  });
+
+  test("every name the Worker logs at runtime is in the vocabulary", () => {
+    // A call-site scan, so a new `logger.log(...)` with a name that is not
+    // registered fails here rather than being silently rewritten to
+    // `invalid.log.message` in production. Same shape as the allowlist
+    // import scan in `headers.test.ts`.
+    const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    const used = [...source.matchAll(/logger\.log\(\s*"[^"]*"\s*,\s*"([^"]+)"/g)].map((m) => m[1] ?? "");
+    expect(used.length).toBeGreaterThan(0);
+    for (const name of used) {
+      expect(LOG_MESSAGES as readonly string[], `${name} is logged but not in LOG_MESSAGES`).toContain(name);
+    }
+  });
+
   test("an email inside a refused message does not survive either", () => {
     const { logger, lines } = captureLogger("req-msg2");
     logger.log("info", `contacting ${REVIEWER_EMAIL} about the thread` as LogMessage);
@@ -212,6 +248,47 @@ describe("structured logger", () => {
     logger.log("info", "request.start", { upstream: FAKE_OPENAI_KEY });
     expect(lines[0]).not.toContain(FAKE_OPENAI_KEY);
     expect(parse(lines[0] as string)["upstream"]).toBe(REDACTED);
+  });
+
+  test("A24: a cookie under a PLURAL or compound key is redacted", () => {
+    // `cookies` and `cookieJar` both leaked: the key pattern required a
+    // non-letter on each side of `cookie`, so a trailing letter excluded
+    // them, and the value-shape pass does not match `s=1`. Under a plural
+    // key that is a session credential in a log line, which is exactly what
+    // ADR-0012 forbids.
+    const { logger, lines } = captureLogger("req-cookie");
+    logger.log("info", "request.start", {
+      Cookie: "a=b",
+      "set-cookie": "a=b",
+      cookies: "s=1",
+      cookieJar: "s=1",
+      COOKIE: "s=1",
+    });
+    const line = lines[0] as string;
+    for (const leaked of ["a=b", "s=1"]) {
+      expect(line).not.toContain(leaked);
+    }
+    const record = parse(line);
+    expect(record["cookies"]).toBe(REDACTED);
+    expect(record["cookieJar"]).toBe(REDACTED);
+    expect(record["Cookie"]).toBe(REDACTED);
+  });
+
+  test("A24: a guest display name is redacted under every spelling", () => {
+    // ADR-0015's exact datum. `name` alone is ambiguous — a bare `name` is
+    // redacted too, which errs toward safety — so these three are the ones
+    // a guest's name realistically arrives under.
+    const { logger, lines } = captureLogger("req-guest");
+    logger.log("info", "request.start", {
+      guestName: "Ada Lovelace",
+      fullName: "Ada Lovelace",
+      full_name: "Ada Lovelace",
+      // An opaque id must still survive: that is the field ADR-0020 wants.
+      guestId: "01HZY7QK3M9",
+    });
+    const line = lines[0] as string;
+    expect(line).not.toContain("Ada Lovelace");
+    expect(parse(line)["guestId"]).toBe("01HZY7QK3M9");
   });
 
   test("A24: an address under an INNOCENT key is redacted, nested and arrayed", () => {
@@ -304,7 +381,21 @@ describe("structured logger", () => {
     logger.log("info", "request.start", { arbitraryKey: "free-form prose that is not an address or a credential" });
     expect(lines[0]).toContain("free-form prose");
     // The keys that DO carry review content are all in `SENSITIVE_KEY`.
-    for (const key of ["body", "comment", "text", "content", "message", "quote", "note", "detail", "excerpt"]) {
+    for (const key of [
+      "body",
+      "comment",
+      "text",
+      "content",
+      "message",
+      "quote",
+      "note",
+      "detail",
+      "excerpt",
+      "cookies",
+      "cookieJar",
+      "guestName",
+      "fullName",
+    ]) {
       logger.log("info", "request.start", { [key]: "reviewer prose" });
       expect(lines[lines.length - 1]).not.toContain("reviewer prose");
     }

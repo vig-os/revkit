@@ -232,14 +232,20 @@ export class D1ThreadStore implements ThreadStore {
    * it had only ever asserted the EMPTY case.
    *
    * `SqliteThreadStore.head()` re-reads `max(seq)` at construction, so the
-   * two implementations were already going to disagree about a method with
-   * the same name. Reading the table here makes them agree by
-   * construction, and it costs one indexed query that a resume point needs
-   * anyway.
+   * two were already going to disagree about a method with the same name.
+   * Reading the table here makes the VALUES agree, and it costs one indexed
+   * query that a resume point needs anyway.
    *
-   * After `append`/`import` on THIS instance the two agree, because those
-   * are the only ways `#head` advances and both leave the table's `MAX(seq)`
-   * equal to it. */
+   * The SIGNATURES still differ — this one is `async`, the SQLite one
+   * returns `number` — and deliberately so: `head()` is not on the
+   * `ThreadStore` interface, so nothing breaks, and forcing this store to
+   * look synchronous would mean either caching a head that is stale by
+   * construction (the bug above) or blocking. A caller holding both types
+   * must `await` this one, and that is the honest cost of a remote store.
+   *
+   * After `append`/`import` on THIS instance the two VALUES agree, because
+   * those are the only ways `#head` advances and both leave the table's
+   * `MAX(seq)` equal to it. */
   async head(): Promise<number> {
     const row = await this.#db.prepare(HEAD_SQL).first<{ head?: number }>();
     return typeof row?.head === "number" ? row.head : 0;

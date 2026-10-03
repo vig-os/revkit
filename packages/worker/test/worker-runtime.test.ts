@@ -323,31 +323,62 @@ describe("ADR-0025 runtime gate", () => {
     }
   });
 
-  test("a 500 still carries ADR-0012 hygiene headers and the request id", async () => {
-    // Force the catch path by dropping the `REVKIT_VERSION` var the header
-    // context is built from — the shape a misconfigured deploy has. With
-    // `/api/threads` closed, no request path constructs a store, so this
-    // cannot be provoked by a missing table any more; a missing var is the
-    // cheapest failure that reaches the handler's own body.
-    const broken = await startWorker({
-      script: (await workerBundle()).replace(
-        "options.version,",
-        "options.version, revkitVersionThrows: undefined,",
-      ),
-    });
+  // ── the catch block, actually entered ─────────────────────────────────
+  test("a Worker deployed without REVKIT_VERSION returns a 500 that still carries ADR-0012 hygiene", async () => {
+    // The #76 round-2 review found the previous version of this test
+    // INERT: it built its broken Worker with
+    // `.replace("options.version,", …)`, and that string does not exist in
+    // the emitted bundle (verified: `includes("options.version,")` is
+    // false), so the script was byte-identical to the real one. It then
+    // claimed to reach the catch block via `/%` — but `new URL("http://
+    // localhost/%")` is a perfectly valid URL, so the request 404s — and
+    // asserted `expect([400, 404, 500]).toContain(status)`, which passes
+    // on the weakest member. A test named for a 500 asserted nothing about
+    // a 500.
+    //
+    // Now the condition is real and stated: `startWorker({ vars: null })`
+    // binds NOTHING, so `env.REVKIT_VERSION` is undefined and
+    // `revkitBundlePath(undefined)` throws on `version.length` while the
+    // header context is being built — before any route runs. That is a
+    // misconfigured deploy, which is worth keeping tested.
+    const broken = await startWorker({ vars: null });
     try {
-      // The bundle is unchanged; drive the real catch path by asking for a
-      // path whose handler throws on a malformed request line.
-      const response = await broken.dispatch("http://localhost/%");
-      expect([400, 404, 500]).toContain(response.status);
+      const response = await broken.dispatch("http://localhost/healthz");
+      // Exactly 500. Not a set containing 500.
+      expect(response.status).toBe(500);
+      // Exactly the generic body: an error string can carry a SQL fragment
+      // or a stack, and this response is readable by whoever reached it.
+      expect(await response.text()).toBe("internal error\n");
+      // ADR-0012 hygiene on the error path, not just the happy one.
       expect(response.headers.get("x-content-type-options")).toBe("nosniff");
       expect(response.headers.get("referrer-policy")).toBe("no-referrer");
       expect(response.headers.get("cross-origin-opener-policy")).toBe("same-origin");
       expect(response.headers.get("cross-origin-resource-policy")).toBe("same-origin");
       expect(response.headers.get("permissions-policy")).toContain("camera=()");
+      // ADR-0020: the id a reviewer quotes is in the response AND in the log.
       expect(response.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
     } finally {
       await broken.dispose();
+    }
+  });
+
+  test("the 500's cause is the missing var, not an unrelated fault", async () => {
+    // Proves the case above is not passing for some other reason: the SAME
+    // script with `REVKIT_VERSION` bound answers 200, so the only variable
+    // is the var. Without this, a future change that made `/healthz` throw
+    // unconditionally would keep both tests green and leave the catch block
+    // untested for the reason that matters.
+    const healthy = await startWorker();
+    try {
+      expect((await healthy.dispatch("http://localhost/healthz")).status).toBe(200);
+      const broken = await startWorker({ vars: null });
+      try {
+        expect((await broken.dispatch("http://localhost/healthz")).status).toBe(500);
+      } finally {
+        await broken.dispose();
+      }
+    } finally {
+      await healthy.dispose();
     }
   });
 });

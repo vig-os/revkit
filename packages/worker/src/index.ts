@@ -1,25 +1,41 @@
 // The hosted revkit Worker (ADR-0008; ADR-0025 surface (c)).
 //
-// One real `fetch` handler over one bound D1 database. Slice 1 ships:
+// One real `fetch` handler over one bound D1 database. The entire shipped
+// HTTP surface is:
 //
-//   GET  /healthz              liveness + the revkit version it runs
-//   GET  /api/threads          the thread projection (review-core's)
-//   GET  /api/threads?since=<n> the log since `n` (reconnect catch-up)
-//   POST /api/threads          DISABLED, 501 — see the handler
+//   GET  /healthz       200, liveness + the revkit version it runs
+//   ANY  /api/threads   501 — every verb, read and write (see below)
+//
+// plus a 404 for anything else and a 501 for a recognised preview path. So
+// the honest one-line description is: one JSON line, two 501s, a 404.
 //
 // Everything else ADR-0008/0012/0025 imagine — previews from R2, invites,
 // sessions, the GitHub App's `TokenSource`, Durable Object fan-out — is
 // out of this slice, and `packages/worker/README.md` says so.
 //
-// ── ADR-0025's runtime gate ─────────────────────────────────────────────────
+// ── ADR-0025's runtime gate, stated precisely ──────────────────────────────
 //
-// This module imports `@revkit/review-core` and nothing else. It builds and
-// runs inside workerd with `compatibility_flags: []` (no `nodejs_compat`),
-// which is what makes "the same core serves all three surfaces" a
-// measurement rather than an aspiration: `test/worker-runtime.test.ts`
-// bundles THIS file for the workers runtime, dispatches it through a real
-// workerd, and pins both `/healthz` and a `revisionOf()` evaluated inside
-// the runtime against a literal digest computed on a third one.
+// **This module does NOT import `@revkit/review-core`, and the shipped
+// bundle does not contain it.** Closing `/api/threads` removed the only code
+// path that reached `D1ThreadStore`, so the bundler tree-shook
+// `d1-store.ts` — and with it the whole core graph — out of this entry:
+// ~21 KB, against ~790 KB while that route was open. An earlier version of
+// this header claimed the opposite, and claimed A4's scan of this artefact
+// as evidence for it; the scan was clean because there was nothing in it to
+// find. Do not infer from this file that the hosted Worker runs the core
+// today. It does not, yet.
+//
+// What IS proven, and where: ADR-0025's "the same core serves all three
+// surfaces" is measured in `test/worker-runtime.test.ts` against the RUNTIME
+// PROBE (`test/fixtures/runtime-probe.ts`), which imports
+// `@revkit/review-core` and this package's `d1-store.ts` and is dispatched
+// through its own miniflare with the same empty `compatibility_flags`. It
+// pins `revisionOf()` evaluated INSIDE workerd against a literal digest, and
+// runs the full D1 -> `exportArchive` -> in-memory bridge there. That probe
+// is the same graph this entry would pull in the moment a route needs it.
+//
+// Both bundles are scanned for Node/Bun escape hatches, and the probe's is
+// additionally asserted to CONTAIN the core so the scan cannot be vacuous.
 //
 // ── ADR-0012 on day one ────────────────────────────────────────────────────
 //
@@ -45,13 +61,13 @@
 // never held for `wrangler dev --remote`. The authorization this Worker
 // actually performs is: none.
 
-import { D1ThreadStore } from "./d1-store.ts";
 import {
   applyJsonHeaders,
   applyTextHeaders,
   REQUEST_ID_HEADER,
   requestOrigin,
   workerHeaderContext,
+  type HeaderContext,
 } from "./headers.ts";
 import { createLogger, newRequestId, type Logger, type LogMessage } from "./logger.ts";
 import { isRevkitBundlePath, parsePreviewPath } from "./router.ts";
@@ -96,6 +112,37 @@ interface RequestScope {
   readonly headers: ReturnType<typeof workerHeaderContext>;
 }
 
+/** Header context for a response whose REAL context could not be built.
+ *
+ * `applyResponseHeaders` attaches only the hygiene quartet and
+ * `Permissions-Policy` to a `text` response — it reads no script path, no
+ * origin and no hash — so every field here is deliberately empty and none of
+ * it is consulted. It exists because building the real context is itself a
+ * fallible operation: `workerHeaderContext` throws on a missing
+ * `REVKIT_VERSION`, and before this existed that throw happened OUTSIDE the
+ * handler's `try`, so a misconfigured deploy answered with workerd's default
+ * error page — a stack trace and an absolute store path in the response body
+ * (measured). Now that failure is inside the boundary and gets the generic
+ * body plus full hygiene.
+ */
+const ERROR_HEADER_CONTEXT: HeaderContext = {
+  scriptOrigins: [],
+  scriptPaths: [],
+  workerPaths: [],
+  connectOrigins: [],
+  inlineScriptHashes: [],
+};
+
+/** A logger for a request whose scope could not be built. Same shape, no
+ * header context. */
+function fallbackLogger(requestId: string): Logger {
+  return createLogger({
+    sink: (line) => console.log(line), // guardrails-ok: see beginRequest
+    clock: () => new Date().toISOString(),
+    requestId,
+  });
+}
+
 function beginRequest(request: Request, env: Env): RequestScope {
   const requestId = newRequestId();
   const logger = createLogger({
@@ -117,9 +164,10 @@ function beginRequest(request: Request, env: Env): RequestScope {
   };
 }
 
-/** Stamp the request id on every response, whatever produced it. */
-function tag(response: Response, scope: RequestScope): Response {
-  response.headers.set(REQUEST_ID_HEADER, scope.requestId);
+/** Stamp a request id on every response, whatever produced it. Accepts an
+ * explicit id as well as a scope, because the error path may have no scope. */
+function tag(response: Response, requestId: string): Response {
+  response.headers.set(REQUEST_ID_HEADER, requestId);
   return response;
 }
 
@@ -129,18 +177,38 @@ function tag(response: Response, scope: RequestScope): Response {
  * arity, and a serialise-then-set sequence has no such disagreement. */
 function json(body: unknown, status: number, scope: RequestScope): Response {
   const response = new Response(`${JSON.stringify(body)}\n`, { status });
-  return tag(applyJsonHeaders(response, scope.headers), scope);
+  return tag(applyJsonHeaders(response, scope.headers), scope.requestId);
+}
+
+/** `request.url`'s pathname, or `"?"` if it cannot be derived. Total, and
+ * never throws — it exists so the log line in a failure path is safe. */
+function safePath(request: Request): string {
+  try {
+    return new URL(request.url).pathname;
+  } catch {
+    return "?";
+  }
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const scope = beginRequest(request, env);
-    const url = new URL(request.url);
+    // A path for logging, computed without throwing, so the catch and
+    // finally blocks can name the request even if `new URL` were the thing
+    // that failed.
+    const path = safePath(request);
     const method = request.method.toUpperCase();
+    let scope: RequestScope | undefined;
     try {
-      scope.logger.log("info", "request.start", { method, path: url.pathname });
+      // INSIDE the boundary. `beginRequest` builds the header context and
+      // throws on a missing `REVKIT_VERSION`; that used to happen before
+      // this `try`, so the catch never ran and workerd returned its own
+      // error page — a stack trace and a store path in the response body.
+      // `test/worker-runtime.test.ts` now drives exactly that deploy.
+      scope = beginRequest(request, env);
+      const url = new URL(request.url);
+      scope.logger.log("info", "request.start", { method, path });
 
-      if (url.pathname === "/healthz") {
+      if (path === "/healthz") {
         // `HEAD` is the same handler with the body dropped by the
         // platform; method-insensitivity here is deliberate so a health
         // probe written either way works.
@@ -150,8 +218,8 @@ export default {
         return json({ ok: true, revkitVersion: env.REVKIT_VERSION, requestId: scope.requestId }, 200, scope);
       }
 
-      if (url.pathname === "/api/threads") {
-        return handleThreads(request, method, env, scope);
+      if (path === "/api/threads") {
+        return handleThreads(method, scope);
       }
 
       // ADR-0012: `/_revkit/` NEVER redirects — a browser drops the path
@@ -160,7 +228,7 @@ export default {
       // R2), so the honest answer is a 404 rather than a redirect, and
       // this branch is what guarantees no future redirect can creep in
       // here by accident.
-      if (isRevkitBundlePath(url.pathname)) {
+      if (isRevkitBundlePath(path)) {
         return json({ error: "not-found", note: "revkit bundle serving lands in M4 slice 3" }, 404, scope);
       }
 
@@ -168,7 +236,7 @@ export default {
       // R2 (slice 5) and the ADR-0012 extension allowlist (slice 3). A
       // recognised preview path answers 501 so the routing is honest
       // about which slice owns it.
-      if (parsePreviewPath(url.pathname) !== undefined) {
+      if (parsePreviewPath(path) !== undefined) {
         return json({ error: "not-implemented", enabledIn: "M4 slice 5 (R2 preview serving)" }, 501, scope);
       }
 
@@ -176,21 +244,20 @@ export default {
     } catch (error) {
       // The request id is in the log line AND in the response, so a
       // reviewer can quote it (ADR-0020). The message stays generic: an
-      // error string can carry a SQL fragment or a path, and this
-      // response is readable by whoever reached the Worker.
-      scope.logger.log("error", "request.error", {
+      // error string can carry a SQL fragment, a stack or an absolute
+      // store path, and this response is readable by whoever reached the
+      // Worker.
+      const requestId = scope?.requestId ?? newRequestId();
+      (scope?.logger ?? fallbackLogger(requestId)).log("error", "request.error", {
         error: error instanceof Error ? error.name : typeof error,
-        path: url.pathname,
+        path,
       });
       return tag(
-        applyTextHeaders(
-          new Response("internal error\n", { status: 500 }),
-          scope.headers,
-        ),
-        scope,
+        applyTextHeaders(new Response("internal error\n", { status: 500 }), scope?.headers ?? ERROR_HEADER_CONTEXT),
+        requestId,
       );
     } finally {
-      scope.logger.log("info", "request.end", { path: url.pathname });
+      scope?.logger.log("info", "request.end", { path });
     }
   },
 } satisfies ExportedHandler<Env>;
@@ -233,12 +300,7 @@ function disabled(scope: RequestScope, msg: LogMessage, detail: string): Respons
   );
 }
 
-async function handleThreads(
-  request: Request,
-  method: string,
-  env: Env,
-  scope: RequestScope,
-): Promise<Response> {
+async function handleThreads(method: string, scope: RequestScope): Promise<Response> {
   if (method === "GET") {
     return disabled(
       scope,

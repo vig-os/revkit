@@ -21,6 +21,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import {
   CURRENT_SCHEMA_VERSION,
   InMemoryThreadStore,
+  ThreadStoreAppendError,
   exportArchive,
   isUnanchoredAnchor,
   revisionOf,
@@ -28,7 +29,7 @@ import {
   type ReviewEventInput,
   type ThreadArchive,
 } from "@revkit/review-core";
-import { D1ThreadStore } from "../src/d1-store.ts";
+import { APPEND_CAS_ATTEMPTS, D1ThreadStore, ThreadStoreContendedError } from "../src/d1-store.ts";
 import { fixedClock } from "../../review-core/test/store-conformance.ts";
 import { startWorker, type Harness } from "./harness.ts";
 
@@ -318,6 +319,78 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     expect(await new D1ThreadStore({ db: harness.db }).head()).toBe(0);
   });
 
+  // ── I5: the store's one bounded-failure path ─────────────────────────
+  test("I5: a permanently contended head raises ThreadStoreContendedError, not a ThreadStoreAppendError", async () => {
+    // `ThreadStoreContendedError` is the store's ONLY bounded-failure path
+    // and it had no test: the class, its `retryable` contract (the field a
+    // future handler branches on to answer 503 rather than 400) and the
+    // bound itself were all unverified, and the only other reference to it
+    // in the repo was a bundle substring check.
+    //
+    // The harness is a D1 proxy whose `batch` ALWAYS reports a moving head
+    // with a zero-change insert, which is exactly the condition the CAS
+    // retries on. With it, the store must give up — bounded, loud, and with
+    // no livelock.
+    const always = new D1ThreadStore({ db: foreverContended(harness.db), clock: fixedClock() });
+    let thrown: unknown;
+    try {
+      await always.append(createThread("th-contended", "c-contended"));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ThreadStoreContendedError);
+    // Deliberately NOT a ThreadStoreAppendError: every kind in
+    // `AppendRejection` is a statement about LOG SHAPE, so a caller
+    // branching on that rejection type would answer 400 — telling a
+    // reviewer their comment is malformed when it is fine.
+    expect(thrown).not.toBeInstanceOf(ThreadStoreAppendError);
+    const error = thrown as ThreadStoreContendedError;
+    expect(error.retryable).toBe(true);
+    expect(error.attempts).toBe(APPEND_CAS_ATTEMPTS);
+    expect(error.name).toBe("ThreadStoreContendedError");
+    expect(error.message).toContain(String(APPEND_CAS_ATTEMPTS));
+  });
+
+  test("I5: the contention bound is exactly APPEND_CAS_ATTEMPTS batches, then it stops", async () => {
+    // Pins the 64 as a BOUND rather than a hope: 16 concurrent appends
+    // across two stores needed 9 attempts (the measurement that chose it),
+    // and a permanently contended store must issue exactly that many and
+    // then throw — not retry forever, and not stop early.
+    const counter = contendedBatchCounter(harness.db);
+    const always = new D1ThreadStore({ db: counter.db, clock: fixedClock() });
+    await expect(always.append(createThread("th-bounded", "c-bounded"))).rejects.toThrow(
+      ThreadStoreContendedError,
+    );
+    expect(counter.batches()).toBe(APPEND_CAS_ATTEMPTS);
+    // Every one of those batches was a FAILED attempt, so the bound counts
+    // retries rather than being padded by a successful first try.
+    expect(counter.failedInserts()).toBe(APPEND_CAS_ATTEMPTS);
+  });
+
+  test("I5: no row is written when the head never settles", async () => {
+    const before = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
+    const always = new D1ThreadStore({ db: foreverContended(harness.db), clock: fixedClock() });
+    await expect(always.append(createThread("th-nowrite", "c-nowrite"))).rejects.toThrow();
+    const after = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
+    expect(after?.n).toBe(before?.n ?? 0);
+  });
+
+  test("I5: a TRANSIENTLY contended store still succeeds — the error is not the normal path", async () => {
+    // The other half of the contract: refuse only when contention PERSISTS.
+    // The proxy refuses the first two guarded inserts and then delegates to
+    // the real database, so the third attempt must land — with a real seq
+    // and a persisted row, not a swallowed error.
+    await harness.db.prepare("DELETE FROM events").run();
+    const proxy = flakyDb(harness.db, 2);
+    const flaky = new D1ThreadStore({ db: proxy, clock: fixedClock() });
+    const seq = await flaky.append(createThread("th-flaky", "c-flaky"));
+    expect(seq).toBe(1);
+    const rows = await harness.db.prepare("SELECT seq FROM events ORDER BY seq ASC").all<{ seq: number }>();
+    expect(rows.results?.map((r) => r.seq)).toEqual([1]);
+    // Two refused attempts, then success: the retry path ran and recovered.
+    expect(proxy.attempts()).toBe(3);
+  });
+
   // ── A13 ───────────────────────────────────────────────────────────────
   test("A13: export a D1 log and import it into a fresh in-memory store", async () => {
     const d1 = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
@@ -446,6 +519,111 @@ function countingDb(db: D1Database): { db: D1Database; casFailures: () => number
     },
   });
   return { db: proxy as D1Database, casFailures: () => failures, batches: () => count };
+}
+
+/** A `D1Database` proxy that reports a MOVING head forever: every batch
+ * reports a head greater than the one the caller validated against, and a
+ * zero-change insert. That is precisely the condition `append`'s CAS
+ * retries on, so the store must exhaust its budget and give up. */
+function foreverContended(db: D1Database): D1Database {
+  let head = 100;
+  return new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "batch") {
+        // Report a head one past whatever the caller validated against, and
+        // a zero-change insert. Those two facts are the whole CAS contract,
+        // so the rest of the batch result can be empty.
+        return async () => {
+          head += 1;
+          return contendedBatchResults(head, 0);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/** The table's real `MAX(seq)`, read outside the faked batch. */
+async function realMaxSeq(db: D1Database): Promise<number> {
+  const row = await db.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM events").first<{ head: number }>();
+  return row?.head ?? 0;
+}
+
+/** The three results `append`'s batch produces when the guarded insert
+ * writes nothing: the head, an empty catch-up, and `changes: 0`. */
+function contendedBatchResults(head: number, changes: number): D1Result[] {
+  return [
+    { results: [{ head }], success: true, meta: {} },
+    { results: [], success: true, meta: {} },
+    { results: [], success: true, meta: { changes } },
+  ] as unknown as D1Result[];
+}
+
+/** Same idea, but it COUNTS, so the bound can be asserted rather than
+ * described. */
+function contendedBatchCounter(db: D1Database): {
+  db: D1Database;
+  batches: () => number;
+  failedInserts: () => number;
+} {
+  let batches = 0;
+  let failed = 0;
+  let head = 100;
+  const proxy = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "batch") {
+        return async () => {
+          batches += 1;
+          failed += 1;
+          head += 1;
+          return contendedBatchResults(head, 0);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { db: proxy as D1Database, batches: () => batches, failedInserts: () => failed };
+}
+
+/** A D1 proxy that REPORTS the first `failures` guarded inserts as refused
+ * and then behaves normally — the transient-contention shape.
+ *
+ * It delegates to the real database and rewrites only the third result's
+ * `meta.changes`. An earlier version fabricated the head and catch-up rows
+ * too, which was wrong in an instructive way: a fabricated head of 101
+ * advanced the store's `#head` past the real table's 0, so every SUBSEQUENT
+ * attempt's guard (`MAX(seq) === #head`) could never be satisfied by the
+ * real database and the append failed 64 times. Contention has to be
+ * modelled as "the insert was refused", not as "the world moved", because
+ * the store reconciles the two independently.
+ */
+function flakyDb(db: D1Database, failures: number): D1Database & { attempts: () => number } {
+  let seen = 0;
+  const proxy = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "batch") {
+        return async (statements: unknown) => {
+          seen += 1;
+          if (seen <= failures) {
+            // Refused, and genuinely NOT written — but the reported head is
+            // the REAL one, so the store's `#head` stays consistent and a
+            // later attempt can satisfy its guard. Delegating to the real
+            // batch and lying only about `changes` does not work: the row
+            // is really written, and the retry then fails on
+            // `duplicate-thread` instead of landing.
+            return contendedBatchResults(await realMaxSeq(target), 0);
+          }
+          return (target.batch as (input: unknown) => Promise<D1Result[]>)(statements);
+        };
+      }
+      if (property === "attempts") return () => seen;
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return proxy as D1Database & { attempts: () => number };
 }
 
 /** A `D1Database` whose `batch` runs `onBatch` FIRST, then delegates.

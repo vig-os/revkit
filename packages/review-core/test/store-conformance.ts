@@ -18,9 +18,12 @@
 //   packages/worker/test/store-conformance.test.ts        -> D1ThreadStore
 //
 // It is a helper, not a `.test.ts`, so `bun test` does not run it directly
-// in whichever package it sits in. It is runtime-neutral — no `bun:` or
-// `node:` import, no I/O assumption — so the CLI can run it against
-// `bun:sqlite` without leaking a Bun-only API into the shared contract.
+// in whichever package it sits in. The CONTRACT it exercises is
+// runtime-neutral — nothing names a concrete store, there is no I/O
+// assumption, and nothing outside the factory imports `bun:` or `node:` — so
+// the CLI can run it against `bun:sqlite` without leaking a Bun-only API
+// into the shared rules. (`bun:test` is imported above, but that is the test
+// runner talking, not the contract.)
 //
 // **A previous revision of this header claimed the three-implementation
 // problem and shipped only two**, which is the same class of error the

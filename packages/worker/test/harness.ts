@@ -45,11 +45,12 @@ export const MIGRATION_SQL: string = readFileSync(
  *     refusal alongside it, by the "PLATFORM FACT" case in
  *     `test/schema.test.ts`. That test exists because this module's whole
  *     reason for splitting the file is that second bullet.
- *   - `wrangler d1 migrations apply --file=...` splits with its own
- *     `splitSqlIntoStatements`, which consumes `--` and block comments
- *     and then drops empty chunks. (Read from wrangler 4.93.0's
- *     `cli.js` in the nix store — a local read; no Cloudflare endpoint
- *     was contacted.)
+ *   - `wrangler d1 migrations apply <database>` splits the migrations
+ *     directory with its own `splitSqlIntoStatements`, which consumes `--`
+ *     and block comments and then drops empty chunks. (Read from wrangler
+ *     4.93.0's `cli.js` in the nix store — a local read; no Cloudflare
+ *     endpoint was contacted. Note it takes no `--file` flag; see the
+ *     corrected citation in `migrations/0001_init.sql`.)
  *
  * So the harness applies the migration ONE STATEMENT AT A TIME through
  * `prepare().run()`, with NO text transformation at all: the bytes the
@@ -321,18 +322,42 @@ function stripJsonComments(source: string): string {
  * request 500'd on a missing `REVKIT_VERSION` while `wrangler.jsonc`
  * looked fine. One source for both is the only version of this that
  * cannot drift. */
-export async function startWorker(options: { readonly script?: string } = {}): Promise<Harness> {
+export async function startWorker(
+  options: {
+    readonly script?: string;
+    /** Override the `vars` from `wrangler.jsonc`. `null` means bind
+     * NOTHING, which is how a test provokes the handler's catch block:
+     * `REVKIT_VERSION` is read while building the header context, so a
+     * Worker deployed without it throws before any route runs — the
+     * misconfigured-deploy shape, driven rather than described. */
+    readonly vars?: Record<string, string> | null;
+  } = {},
+): Promise<Harness> {
   const config = readWranglerConfig();
+  const vars = options.vars === undefined ? (config["vars"] as Record<string, string>) : options.vars;
   const mf = new Miniflare({
     modules: true,
     script: options.script ?? (await workerBundle()),
     compatibilityDate: config["compatibility_date"],
     compatibilityFlags: config["compatibility_flags"],
-    bindings: config["vars"],
+    bindings: vars ?? undefined,
     d1Databases: { DB: `revkit-test-${Math.random().toString(36).slice(2)}` },
   } as MiniflareOptions);
+  // Boot timing, on demand. `getD1Database` is where a miniflare instance
+  // actually starts workerd and opens its D1 session — measured at 102 ms
+  // median over 30 consecutive boots, with a 168 ms worst case and no spike
+  // above 1 s. That is the number to suspect when a whole worker-leg run is
+  // bimodal (observed: 5.9 s typical, 26 s and 38 s twice in 45 runs on a
+  // host at loadavg 30), so the harness prints the per-boot cost when
+  // REVKIT_WORKER_BOOT_LOG=1 is set rather than leaving it to be guessed at.
+  const bootStarted = performance.now();
   const db = await mf.getD1Database("DB");
+  const dbReady = performance.now();
   await applyMigration(db);
+  if (process.env["REVKIT_WORKER_BOOT_LOG"] === "1") {
+    const ms = (dbReady - bootStarted).toFixed(0);
+    process.stderr.write(`[harness] workerd+D1 ready in ${ms}ms (migrated by ${(performance.now() - dbReady).toFixed(0)}ms)\n`);
+  }
   return {
     mf,
     db,

@@ -318,7 +318,7 @@ test *args:
     run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}'
     run_leg just/check "{{test_leg_timeout_check}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- just check
-    run_leg packages/worker "{{test_leg_timeout_worker}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/worker && bun test --timeout {{bun_test_timeout_worker_ms}} {{ args }}'
+    run_leg packages/worker "{{test_leg_timeout_worker}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/worker && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" "{{test_fd_delta_budget_playwright}}" -- just e2e
 
 # Wall-clock budget per leg, in seconds. See note 3 on `test` above for
@@ -353,25 +353,39 @@ test_leg_timeout_e2e := "720"
 # (measured: 0 before and 0 after a full leg), so `dispose()` reaps.
 test_leg_timeout_worker := "180"
 
-# Per-test timeout for the worker leg, which is NOT the shared 10 s. The
-# reason is specific: this leg's slowest assertion is a D1 write, and the
-# latency it actually carries is PROCESS STARTUP — six `workerd` boots, one
-# per test file that needs a runtime. Measured, the whole leg runs in
-# 3.9-4.5 s when the host is quiet.
+# The worker leg runs on the SHARED `bun_test_timeout_ms` (10 s), and an
+# earlier revision gave it 30 s. That was wrong, and measuring it is what
+# showed why — see the two comments below. The short version: the raised
+# number was treating a symptom whose cause was never identified, and an
+# unbounded wait does not respond to a bigger ceiling anyway.
 #
-# On a loaded host that is not true: one run measured 16.9 s and produced
-# exactly one failure, `(fail) D1 schema > (unnamed) [10002.00ms]` — a
-# `beforeAll` hook, i.e. a `workerd` boot, hitting the shared 10 s ceiling.
-# The same leg passed standalone and on a re-run, so it was boot latency and
-# not a defect. Raising the GLOBAL timeout for that would slow every real
-# hang in the repo; giving the worker leg its own bounds boot latency
-# without touching any assertion, because no test in this leg takes more
-# than a few hundred ms.
+# WHAT WAS OBSERVED. This leg is bimodal on a loaded host: 45 runs gave
+# 5.4-6.1 s typically, with two outliers at 26 s and 38.4 s, and
+# `loadavg` above 30 throughout. Two separate runs produced exactly one
+# failure each, a `beforeAll` hook at `[10002.00ms]` and once at 30 s too.
 #
-# 30 s is ~7x the worst whole-leg time observed and ~3x the shared value. If
-# a worker test ever legitimately needs more than that, it is doing something
-# this leg should not be doing.
-bun_test_timeout_worker_ms := "30000"
+# WHAT WAS MEASURED, AND IT IS NOT THE BOOT. `getD1Database("DB")` is where
+# miniflare actually starts workerd and opens its D1 session, so the harness
+# times it (`REVKIT_WORKER_BOOT_LOG=1`, see `packages/worker/test/harness.ts`).
+# Over 70 runs of this leg the slowest boot was 312 ms, with no outlier above
+# it; in isolation over 30 consecutive boots it is 102 ms median / 168 ms
+# worst. So a boot is ~30x under the shared 10 s ceiling, and the 20-32 s
+# the slow runs add is NOT in the boot.
+#
+# WHAT COULD NOT BE SEPARATED. Where those 20-32 s actually go. They did not
+# reproduce in the 25 instrumented runs (loadavg was high for all of them),
+# and the instrumentation covers only the boot, so no slow run was ever
+# captured phase by phase. Candidates left open: bun's own module loading and
+# GC for the test graph, which are CPU-bound and therefore load-sensitive —
+# but that is a hypothesis, not a measurement, and it is not recorded as one.
+#
+# WHY 10 s IS STILL RIGHT. A leg that blocks for tens of seconds IS a stall,
+# and `test_leg_timeout_worker` above exists to name it: this repo's #74
+# lesson is that an unbounded wait must read as a stall with a label, not as a
+# slow green. Raising the ceiling bought a slower red, not a fix. If the
+# stall is ever caught, `REVKIT_WORKER_BOOT_LOG=1` plus a slow-run capture is
+# the next step — and the first thing to check is the host's loadavg and free
+# disk, both of which were degraded while this was measured.
 
 # Per-test bun timeout. Sized for the measured slow tail, not for hang
 # latency: the slowest single `packages/cli` test observed is 6067ms and 3 of
