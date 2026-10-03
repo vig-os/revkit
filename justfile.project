@@ -258,11 +258,30 @@ test *args:
 
     # Wall-clock budgets, from measured healthy local times on an 88-core
     # host (packages/cli 104s / review-core 2s / site schemas 1s / check 3s /
-    # build 8s / Playwright 228s) and the one known good CI run (7m33s for
-    # the whole job, so ~1.3x local). Each leg gets >=3x its measured time,
-    # and any single stalled leg still trips its bound before the workflow's
-    # 20-minute ceiling: worst case is a stalled Playwright leg at 241s of
-    # healthy work + 720s = 16 min, a stalled cli leg at 540s + 241s = 13 min.
+    # packages/worker 5s / build 8s / Playwright 228s) and the one known good
+    # CI run (7m33s for the whole job, so ~1.3x local). Each leg gets >=3x its
+    # measured time, and any single stalled leg still trips its bound before
+    # the workflow's 20-minute ceiling.
+    #
+    # CI BUDGET, restated with the worker leg in it (issue #9). Only one leg
+    # can be the stalled one; the rest contribute their healthy time. Taking
+    # CI's 1.3x local factor, the healthy total for every leg except Playwright
+    # is 104 + 2 + 1 + 3 + 5 = 115s locally, ~150s on CI:
+    #
+    #   Playwright stalls: 720 + 150                     = ~14.5 min
+    #   cli stalls:        540 + 2 + 1 + 3 + 5 + 228*1.3 = ~13.5 min
+    #   worker stalls:     180 + 104 + 2 + 1 + 3 + 296   = ~9.8 min
+    #   nothing stalls:                                      ~8.5 min
+    #
+    # So the worst case is ~14.5 min against the 20-minute `Tests` ceiling and
+    # the binding leg is still Playwright, which was true before this leg
+    # existed. That is the reason `packages/worker` went into the EXISTING leg
+    # list rather than a new CI job: it costs ~5 s of healthy budget, its own
+    # stall mode is bounded at 180 s, and a second workflow would have bought
+    # a duplicated toolchain setup to save nothing. If a future leg pushes
+    # the stalled-Playwright figure past ~17 min, move THAT leg out rather
+    # than raising a ceiling — `.github/workflows/revkit-flake.yml` shows the
+    # repo-owned-workflow shape if that becomes necessary.
     #
     # `just check` goes through `run_leg` too. An earlier revision ran it
     # bare, which meant a hang there reproduced #74's symptom — an 18-minute
@@ -299,6 +318,7 @@ test *args:
     run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}'
     run_leg just/check "{{test_leg_timeout_check}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- just check
+    run_leg packages/worker "{{test_leg_timeout_worker}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/worker && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" "{{test_fd_delta_budget_playwright}}" -- just e2e
 
 # Wall-clock budget per leg, in seconds. See note 3 on `test` above for
@@ -308,6 +328,26 @@ test_leg_timeout_review_core := "180"
 test_leg_timeout_schemas := "180"
 test_leg_timeout_check := "300"
 test_leg_timeout_e2e := "720"
+
+# `packages/worker` (M4 slice 1, issue #9): miniflare boots a real workerd
+# per test file, so this leg was expected to be expensive — 132 tests
+# measured at 5.0-5.5 s wall on an 88-core host, peak 157 open descriptors,
+# growth 67. It is the CHEAPEST new leg available: three workerd boots and a
+# ~790 KB bundle, against the cli leg's 104 s and 4449 descriptors.
+#
+# 180 s is 36x the measured time, the same floor the other sub-minute legs
+# (review-core, site/schemas) use. It is deliberately NOT tighter than that,
+# for the reason the CI-budget arithmetic above depends on: the interesting
+# failure here is workerd failing to START, and a budget tight enough to
+# notice a slow boot would also fire on a loaded CI runner.
+#
+# The descriptors are the shared `stable` budgets and they are nowhere near
+# binding (157 peak against 8192, 67 growth against 1800). That is the right
+# relationship for this leg: it holds a handful of long-lived sockets to
+# workerd and a module graph bun never reloads, so it has no daemon-cycle
+# leak to grow. If that ever changes the numbers here are the thing to watch,
+# not the ceiling.
+test_leg_timeout_worker := "180"
 
 # Per-test bun timeout. Sized for the measured slow tail, not for hang
 # latency: the slowest single `packages/cli` test observed is 6067ms and 3 of
@@ -439,7 +479,8 @@ test-cov *args:
     else \
       cd packages/cli && bun test --coverage {{ args }} && cd ../.. && \
       cd packages/review-core && bun test --coverage {{ args }} && cd ../.. && \
-      cd site && bun test --coverage src/content/schemas/ {{ args }}; \
+      cd site && bun test --coverage src/content/schemas/ {{ args }} && cd ../.. && \
+      cd packages/worker && bun test --coverage {{ args }}; \
     fi
 
 # Run the Playwright browser suite by itself (skips the bun unit tests).

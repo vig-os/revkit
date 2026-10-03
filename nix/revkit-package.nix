@@ -11,8 +11,8 @@
 # Reproducibility split:
 #
 # 1. `nodeModules` is a FIXED-OUTPUT derivation. Its inputs are ONLY
-#    `bun.lock` and the four `package.json`s that participate in the
-#    workspace (root + cli + review-core + components + site). The
+#    `bun.lock` and the `package.json`s that participate in the workspace
+#    (root + cli + review-core + components + worker + site). The
 #    lockfile + those manifests are what `bun install --frozen-lockfile`
 #    reads, so any source-only change leaves this derivation cached and
 #    the deps hash stable across PRs. Network is allowed inside the
@@ -30,7 +30,7 @@
 #     which fetch platform-specific binaries at unpredictable times and
 #     make the output hash system-dependent.
 #   - `--production` skips devDependencies (we do not need TypeScript,
-#     Playwright, @types/*, biome, etc. at CLI runtime).
+#     Playwright, @types/*, biome, miniflare/workerd, etc. at CLI runtime).
 #   - `--frozen-lockfile` refuses to mutate `bun.lock` if drift is
 #     detected; the build aborts loudly instead of silently updating.
 #   - `HOME=$TMPDIR` and `BUN_INSTALL_CACHE_DIR=$TMPDIR/bun-cache` keep
@@ -93,6 +93,14 @@ let
       (src + "/packages/cli/package.json")
       (src + "/packages/review-core/package.json")
       (src + "/packages/components/package.json")
+      # `packages/worker` is a workspace member, so `bun install
+      # --frozen-lockfile` reads its manifest too, and `--frozen-lockfile`
+      # FAILS on workspace drift if the manifest is missing from this set
+      # while present in the lockfile (issue #9). Its dependencies are
+      # devDependencies only — `miniflare` and the 124 MB native `workerd`
+      # binary behind it — and the FOD installs with `--production`, so they
+      # are dropped here and do NOT ship inside the `revkit` CLI.
+      (src + "/packages/worker/package.json")
       (src + "/site/package.json")
     ];
   };
