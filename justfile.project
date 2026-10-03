@@ -334,7 +334,9 @@ test_leg_timeout_e2e := "720"
 # tests in 5.0-5.5 s, and inside `run_leg` a peak of 159 open descriptors
 # with 44 of growth. It is the CHEAPEST new leg available — three workerd
 # boots and a ~790 KB bundle, against the cli leg's 104 s and 4449
-# descriptors.
+# descriptors. CI (run 37130703423, `Tests` job) measures the same leg at
+# 4.5 s, peak 166, growth 75, and the whole job at 7m33s of the 20-minute
+# ceiling — so the leg is ~0.6% of the budget it sits inside.
 #
 # 180 s is 36x the measured time, the same floor the other sub-minute legs
 # (review-core, site/schemas) use. It is deliberately NOT tighter than that,
