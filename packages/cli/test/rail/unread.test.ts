@@ -801,8 +801,9 @@ describe("seen-state LRU across repos on one origin (issue #63)", () => {
     // The same invariant asserted on ORDER rather than on the end
     // state: every removeItem comes after the index setItem. Seeded
     // without an index so there IS a reclaim to order — with an
-    // index present nothing is ever reclaimed and the assertion
-    // would pass vacuously.
+    // index present nothing is ever reclaimed, so the
+    // `removes.length > 0` guard below fails loudly rather than
+    // letting the ordering assertion pass vacuously.
     const order: string[] = [];
     const keyX = seenStorageKeyFor("repo-x");
     const keyY = seenStorageKeyFor("repo-y");
