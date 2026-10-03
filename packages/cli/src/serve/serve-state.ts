@@ -327,9 +327,6 @@ export interface AcquiredDaemon {
 export interface RefusedDaemon {
   readonly kind: "already-running";
   readonly state: ServeState | undefined;
-  /** The id already on disk, when there is one — the winner's. The
-   * refused start never mints, so this is never a value it wrote. */
-  readonly repoId: string | undefined;
   readonly reason: string;
 }
 
@@ -338,10 +335,18 @@ export function acquireAndPublish(repoRoot: string, state: ServeState): Acquired
   const lockPath = daemonLockPath(repoRoot);
   const lock = acquireDaemonLock(lockPath);
   if (lock === null) {
+    // Deliberately does NOT read `.revkit/repo-id` (issue #63
+    // review nit). It carried the winner's id on an earlier draft,
+    // but the lock is per repo root — so a refused start is by
+    // construction on the SAME repo, and the id is a file the caller
+    // already has on its own filesystem plus an unauthenticated
+    // `/-/health` field. It told the reader nothing they did not
+    // have, `daemon.ts` throws before reading it, and touching the
+    // file at all weakens the one invariant that matters here: a
+    // start that does not win the lock does not go near the id.
     return {
       kind: "already-running",
       state: readServeState(repoRoot),
-      repoId: readRepoIdFile(repoIdPath(repoRoot)),
       reason: "another revkit daemon holds .revkit/daemon.lock",
     };
   }
