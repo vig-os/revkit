@@ -143,3 +143,63 @@ The other milestones renumber only if the owner wants them to; the split above i
     unanchored)"; the thread stays orphaned on the local anchor axis.
   - The local reviewer explicitly re-anchors an orphaned imported thread → the LOCAL anchor gets a line-anchored
     revision; the `external.resolved` bit is preserved as historical metadata.
+
+## Amendment (2026-10-03, issue #9) — the header/CSP policy is part of the shared core
+
+**The gap this closes.** "One review core" above names three things the shared
+package holds: the thread model, the anchor→PR-line mapping, and the GitHub
+adapter. It does not say where **response-header and Content-Security-Policy
+policy** lives, and by omission the answer was "in each surface". That is
+tolerable for two surfaces and untenable for three, because ADR-0012's policy is
+security-relevant: a `script-src` that is tightened on the daemon and forgotten on
+the Worker is not a code smell, it is the bug this ADR exists to prevent.
+
+**Decision.** Response-header and CSP policy is **part of the shared core**, in
+`packages/review-core/src/http-headers.ts` (`@revkit/review-core/http-headers`).
+Every surface supplies coordinates and inherits the policy:
+
+| Surface | Module | Supplies |
+|---|---|---|
+| Local daemon | `packages/cli/src/serve/headers.ts` | loopback origins; `/-/rail.js`, `/_astro/`, `/pagefind/` |
+| Hosted Worker | `packages/worker/src/headers.ts` | the request's own origin; `/_revkit/<version>/` |
+| any future surface | its own adapter | its own origin and paths |
+
+What is **shared**: the directive set (`default-src 'none'`, `script-src`,
+`style-src`, `img-src`, `font-src`, `connect-src`, `worker-src`,
+`frame-ancestors`, `base-uri`, `form-action`, `object-src`); the hygiene quartet
+(`nosniff`, `Referrer-Policy: no-referrer`, `COOP`, `CORP`) plus
+`Permissions-Policy`; the `asset`-gets-no-CSP rule and the per-kind `Cache-Control`
+mapping; and the hex→base64 conversion a CSP hash source needs.
+
+What is **per surface**: which origin, and which paths. Those are the two things
+ADR-0012 itself draws differently per origin — `script-src` names loopback paths on
+the daemon (ADR-0013's documented exception) and `/_revkit/<version>/` on the
+hosted origin — so making them configuration rather than code is not a
+generalisation, it is the shape the ADR already had.
+
+**This is consistent with "one core, three surfaces", not an extension of it.** The
+alternative readings were both rejected:
+
+- **Copy it per surface.** The `duplication` guardrails gate fires, and more to the
+  point it creates the second and third implementations of one security policy.
+- **Import `@revkit/cli/serve/headers` from the Worker.** Functionally correct and
+  cheap to write, but it would pull the whole CLI — `bun:sqlite`, the MCP SDK,
+  Astro remark plugins — into the Worker bundle to reach 346 lines of pure
+  functions. ADR-0025's whole premise is that the Worker imports the CORE.
+
+**One consequence the move forced, and it is load-bearing.**
+`hexToBase64` previously used `Buffer.from(hex, "hex")`. It no longer can: measured
+on workerd 2026-05-18 with `compatibility_flags: []`, `typeof Buffer`,
+`typeof process` and `typeof require` are all `"undefined"`. The replacement is a
+hand-written encoder, differentially tested against `Buffer` over every digest
+length from 1 to 64 bytes, over both hex cases, and over every digest in the
+committed release allowlist — so "hand-written" cannot quietly mean "different".
+That test lives in review-core because the daemon runs in Bun, where `Buffer`
+exists, and can therefore still check against it.
+
+**What did NOT change.** The daemon's emitted CSP is byte-for-byte what it was:
+`buildCspHeader`'s output order is preserved by the adapter flattening
+`(rail, extras, astro, pagefind)` into one ordered `scriptPaths` list, and the
+existing BYTE-EXACT test in `packages/cli/test/serve/headers.test.ts` was not
+edited. The daemon's public module surface is unchanged too, so `daemon.ts` and its
+tests are untouched.

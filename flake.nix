@@ -61,9 +61,9 @@
       # other system fails at eval with a missing-attribute error rather
       # than a mismatched hash at build time.
       nodeModulesHashes = {
-        x86_64-linux = "sha256-raL8WRFsNe5HeX+nlh1PPUSWg9dutXAFPXwIruzIaCw=";
-        aarch64-linux = "sha256-p9H+EIRs6QBKm4iyC6p9EqFdvAbYR6zT0cgMns1W2m8=";
-        aarch64-darwin = "sha256-jhpEBgpR2FIOe/BtL5c+CcqjKcPWi8LAUnYHvlEHBqY=";
+        x86_64-linux = "sha256-ak1IyQPjQBKz/tfRc5VkUtEPRejmspc2xd9ZWizbcqY=";
+        aarch64-linux = "sha256-hq+xUcIqRHo0D++xwmnDMTSwntE5cqnKLOUZVIFd6CY=";
+        aarch64-darwin = "sha256-mbY6+iug2lGLmbL1az5Zuf5B7HWwoRiYRlfEmWtald4=";
       };
 
       # Systems `packages` / `apps` are exposed on. Kept in lockstep with

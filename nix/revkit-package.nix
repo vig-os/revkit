@@ -11,8 +11,8 @@
 # Reproducibility split:
 #
 # 1. `nodeModules` is a FIXED-OUTPUT derivation. Its inputs are ONLY
-#    `bun.lock` and the four `package.json`s that participate in the
-#    workspace (root + cli + review-core + components + site). The
+#    `bun.lock` and the `package.json`s that participate in the workspace
+#    (root + cli + review-core + components + worker + site). The
 #    lockfile + those manifests are what `bun install --frozen-lockfile`
 #    reads, so any source-only change leaves this derivation cached and
 #    the deps hash stable across PRs. Network is allowed inside the
@@ -30,7 +30,7 @@
 #     which fetch platform-specific binaries at unpredictable times and
 #     make the output hash system-dependent.
 #   - `--production` skips devDependencies (we do not need TypeScript,
-#     Playwright, @types/*, biome, etc. at CLI runtime).
+#     Playwright, @types/*, biome, miniflare/workerd, etc. at CLI runtime).
 #   - `--frozen-lockfile` refuses to mutate `bun.lock` if drift is
 #     detected; the build aborts loudly instead of silently updating.
 #   - `HOME=$TMPDIR` and `BUN_INSTALL_CACHE_DIR=$TMPDIR/bun-cache` keep
@@ -93,6 +93,14 @@ let
       (src + "/packages/cli/package.json")
       (src + "/packages/review-core/package.json")
       (src + "/packages/components/package.json")
+      # `packages/worker` is a workspace member, so `bun install
+      # --frozen-lockfile` reads its manifest too, and `--frozen-lockfile`
+      # FAILS on workspace drift if the manifest is missing from this set
+      # while present in the lockfile (issue #9). Its dependencies are
+      # devDependencies only — `miniflare` and the 124 MB native `workerd`
+      # binary behind it — and the FOD installs with `--production`, so they
+      # are dropped here and do NOT ship inside the `revkit` CLI.
+      (src + "/packages/worker/package.json")
       (src + "/site/package.json")
     ];
   };
@@ -215,7 +223,12 @@ let
       # Per-workspace `node_modules` — hoisted rarely creates them, but
       # when a dep pins a conflicting version bun does. Kept for parity;
       # a no-op with the current lockfile.
-      for pkg in packages/cli packages/review-core packages/components site; do
+      # `packages/worker` is here for completeness with `manifestOnlySrc`
+      # above, not because it has runtime deps today: it has none (only
+      # devDependencies, dropped by `--production`). Listing it means a
+      # future slice that DOES add a runtime dep cannot hoist lands its
+      # tree here instead of silently going missing from the output.
+      for pkg in packages/cli packages/review-core packages/components packages/worker site; do
         if [ -d "$pkg/node_modules" ]; then
           mkdir -p "$out/$pkg"
           cp -r "$pkg/node_modules" "$out/$pkg/node_modules"

@@ -1,0 +1,65 @@
+// wrangler configuration for the hosted revkit Worker (ADR-0008, M4
+// slice 1 / issue #9).
+//
+// This file is written to be DEPLOYABLE-READY and NOT-YET-DEPLOYED.
+// There is no `account_id`, no `routes`, no custom domain and no secret,
+// because every one of those is owner-gated (#34) and none of them is
+// needed to build, test or run the Worker. `packages/worker/test/`
+// asserts that absence rather than trusting this comment.
+//
+// **`compatibility_flags: []` is load-bearing.** With `nodejs_compat` OFF,
+// the platform itself refuses `node:*` imports and does not provide
+// `Buffer`, `process` or `require`. That turns ADR-0025's "no Node-only
+// deps in the shared core" from a lint into a runtime fact: a regression
+// goes red on the FIRST test that touches the affected path, in workerd,
+// rather than in production. Measured on miniflare 4.20260518.0 with an
+// empty flag list: `typeof Buffer === "undefined"`, same for `process`
+// and `require`. That measurement is also why
+// `@revkit/review-core/http-headers` encodes CSP hashes without `Buffer`.
+//
+// `workers_dev: false` is the other load-bearing line, and it is a
+// TRIPWIRE, NOT AN AUTHORIZATION CHECK.
+//
+// What it does: with no `routes` either, this Worker has no public URL, so
+// a mistake in the handler is not immediately reachable at
+// `*.workers.dev`.
+//
+// What it does NOT do, stated plainly because the first draft of this
+// comment implied otherwise:
+//
+//   - It is not authorization. The authorization this Worker performs is:
+//     none. `/api/threads` answers 501 for EVERY verb because ADR-0012
+//     requires authorization per request and slice 1 has no session — the
+//     route is closed by CODE in `src/index.ts`, and that 501 is asserted
+//     by `test/worker-runtime.test.ts` against a non-empty log.
+//   - It evaporates the moment slice 3 or slice 5 adds a `routes` entry.
+//   - It never applied to `wrangler dev --remote`, which ignores it.
+//
+// So treat flipping either line as a security-relevant change requiring a
+// fresh argument, not a config tidy-up.
+//
+// `d1_databases[].database_id` is a PLACEHOLDER. Provisioning is
+// `wrangler d1 create`, which needs an account, so `revkit deploy init`
+// replaces this value with the provisioned id. It is deliberately an
+// obvious placeholder rather than a plausible-looking UUID: a fake id
+// that reads like a real one would let a deploy fail confusingly later.
+// The BINDING NAME is not a placeholder — `env.DB` is what the code binds
+// and the test asserts the name.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "revkit-review",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-18",
+  "compatibility_flags": [],
+  "workers_dev": false,
+  "vars": {
+    "REVKIT_VERSION": "0.0.0"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "revkit-review",
+      "database_id": "PLACEHOLDER_REPLACED_BY_REVKIT_DEPLOY_INIT"
+    }
+  ]
+}
