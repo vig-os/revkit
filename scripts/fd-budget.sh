@@ -1,44 +1,65 @@
 #!/usr/bin/env bash
-# Run a command, watch its peak open-file-descriptor count, and fail if
-# the peak exceeds a budget. Issue #74.
+# Run a command, watch its open-file-descriptor count, and fail if either the
+# absolute peak or the post-warm-up GROWTH exceeds a budget. Issue #74.
 #
 # WHY THIS EXISTS, AND WHY IT IS A SEPARATE SCRIPT. Every `startDaemon`
 # leaks 2 descriptors on `bun 1.3.13` (`fs.watch(...).close()` does not
 # release the fd — see `packages/cli/test/serve/fd-budget.test.ts` for
 # the measurement and the `node v24.21.0` cross-check that clears the
-# kernel). Over a full `packages/cli` run the peak is 4449
-# descriptors (at CI's `workers: 1` the Playwright leg peaks at 499; on an
-# 88-core host its ~44 workers push it to 4683).
+# kernel). Over a full `packages/cli` run the peak is 4449 local / 4683 on
+# CI. At CI's `workers: 1` the Playwright leg peaks at 499 local / 509 CI;
+# across ~44 workers on an 88-core host it reaches 4683-6481.
 #
 # The soft `nofile` limit is the constraint, and where it is low the suite
-# dies with `EMFILE` long before it finishes — with a crash that names no
-# cause. Measured scope: CI's runner defaults to 65535 against a 4687 peak,
-# so it was never at risk; a host on the classic unprivileged 1024 default
-# would be. Hence the `ulimit -n` in `justfile.project` AND this check.
+# dies with `EMFILE` long before it finishes, with a crash that names no
+# cause. Measured scope, stated precisely because it is narrower than it
+# first looked: CI's runner already defaults to 65536 — exactly the value
+# `justfile.project` sets, so the `ulimit -S` there is a no-op on CI — and
+# it cannot help at all when the hard limit is also low (with
+# `prlimit --nofile=1024:1024` the raise is refused, the recipe warns, and
+# the suite would still die). It only rescues soft-low/hard-high.
 #
-# Two guards, deliberately: `justfile.project`'s `test` recipe raises
-# `ulimit -n` so the run survives, and this script fails it LOUDLY if
-# the peak ever exceeds the documented ceiling, so the next leak is a
-# named failure instead of an `EMFILE`. The in-process
-# `fd-budget.test.ts` catches the leak RATE (sensitive); this catches
-# the absolute total (the true suite-wide number no in-process test can
-# observe).
+# TWO BUDGETS, and why one is not enough.
 #
-# Usage: scripts/fd-budget.sh --budget N -- cmd args...
-# Exits with the command's own status unless the budget is exceeded,
-# in which case it exits 1 after printing the observed peak.
+#   --budget N        absolute peak. A runaway backstop.
+#   --delta-budget N  growth after a warm-up. The one that can SEE the leak.
 #
-# Linux-only (`/proc/<pid>/fd`): outside Linux the check is skipped
-# with a notice and the command runs unwatched, rather than pretending
-# to have measured something.
+# The `packages/cli` leg breaks down as roughly 3249 fixed plus ~1200 of
+# leak. That 3249 is a module-load cost, not a leak: a bare `bun test`
+# starts at 52 descriptors and importing `serve/daemon.ts` alone takes it
+# to 3249. So the first DOUBLING of the leak lands at ~3249 + 2400 = ~5650,
+# comfortably UNDER any absolute ceiling loose enough not to false-positive
+# on a big workstation. An absolute ceiling alone is therefore blind to
+# precisely the regression it was added for.
+#
+# Measuring growth after a warm-up drops the constant term, which is what
+# makes a doubling visible. The warm-up is discarded rather than the first
+# sample, because the first samples race the module graph being loaded.
+#
+# The in-process `fd-budget.test.ts` catches the leak RATE with far better
+# resolution (it sees a single daemon lifecycle). This script's job is the
+# cross-process total and the growth, which no in-process test can observe.
+#
+# Usage: scripts/fd-budget.sh --budget N [--delta-budget N] -- cmd args...
+# Exits with the command's own status if it failed, else 1 if a budget was
+# exceeded or the run could not be measured.
+#
+# Linux-only (`/proc/<pid>/fd`): outside Linux the check is skipped with a
+# notice and the command runs unwatched, rather than pretending to have
+# measured something.
 
 set -uo pipefail
 
 budget=""
+delta_budget=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --budget)
       budget="${2-}"
+      shift 2 || true
+      ;;
+    --delta-budget)
+      delta_budget="${2-}"
       shift 2 || true
       ;;
     --)
@@ -52,16 +73,25 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "$budget" ]; then
-  printf 'fd-budget: usage: %s --budget N -- cmd args...\n' "$0" >&2
+  printf 'fd-budget: usage: %s --budget N [--delta-budget N] -- cmd args...\n' "$0" >&2
   exit 64
 fi
-case "$budget" in
-  '' | *[!0-9]*) printf 'fd-budget: --budget must be a positive integer, got %s\n' "$budget" >&2; exit 64 ;;
-esac
-if [ "$budget" -lt 1 ]; then
-  printf 'fd-budget: --budget must be >= 1, got %s\n' "$budget" >&2
-  exit 64
-fi
+for pair in "budget:$budget" "delta-budget:$delta_budget"; do
+  name="${pair%%:*}"
+  value="${pair#*:}"
+  # `--delta-budget` is optional, so an absent one is not a bad value.
+  if [ "$name" = "delta-budget" ] && [ -z "$value" ]; then continue; fi
+  case "$value" in
+    '' | *[!0-9]*)
+      printf 'fd-budget: --%s must be a positive integer, got %s\n' "$name" "$value" >&2
+      exit 64
+      ;;
+  esac
+  if [ "$value" -lt 1 ]; then
+    printf 'fd-budget: --%s must be >= 1, got %s\n' "$name" "$value" >&2
+    exit 64
+  fi
+done
 if [ $# -eq 0 ]; then
   printf 'fd-budget: no command given\n' >&2
   exit 64
@@ -72,18 +102,20 @@ if [ "$(uname -s)" != "Linux" ]; then
 fi
 
 samples=$(mktemp)
-trap 'rm -f "$samples"' EXIT
+raw=$(mktemp)
+trap 'rm -f "$samples" "$raw"' EXIT
 
 "$@" &
 child=$!
+started=$SECONDS
 
-# Peak = descriptors held by the command AND every descendant.
+# Descriptors held by the command AND every descendant.
 #
 # The tree walk is load-bearing, not decoration. `just test`'s Playwright
 # leg runs `just e2e`, which spawns `bun run test:e2e`, which spawns a
 # Playwright worker per file, which spawns a `revkit serve` daemon per
 # spec — and it is those DAEMONS that leak. Measuring only the direct
-# child reports the shell's ~5 descriptors and sees nothing at all.
+# child reports the shell's ~3 descriptors and sees nothing at all.
 #
 # Descendants come from `/proc/<pid>/task/*/children` (procfs' own child
 # list) rather than a scan over `/proc`, which would cost one readdir plus
@@ -98,7 +130,7 @@ fds_of_tree() {
     d="/proc/$pid/fd"
     # A glob that matches nothing expands to the pattern itself, hence the
     # comparison rather than a count. Pure bash on purpose: this runs for
-    # every pid in the tree 20 times a second, and a `ls | wc -l` fork per
+    # every pid in the tree many times a second, and a `ls | wc -l` fork per
     # pid is the difference between cheap and noticeable on a 44-worker box.
     entries=("$d"/*)
     if [ "${entries[0]}" != "$d/*" ]; then total=$((total + ${#entries[@]})); fi
@@ -113,14 +145,56 @@ fds_of_tree() {
   printf '%s\n' "$total"
 }
 
-# Poll the process tree's /proc/<pid>/fd count. Started AFTER the child so
-# the pid is known, and torn down by the parent below — a poller that
-# waited on the child itself would spin forever on the zombie, since
-# `kill -0` keeps succeeding until the child is reaped.
+# Interval the poller sleeps between samples. It is a TARGET, not a claim:
+# each iteration is one tree walk plus one `sleep`, so the achieved interval
+# depends on how wide the tree is. Measured 103-330 ms on an 88-core host
+# with ~44 workers, against ~55 ms for a single-process leg. Reported as
+# "target" below so the log does not assert a precision it does not have.
+poll_interval="0.05"
+
+# The warm-up is WALL CLOCK, not a sample count, and that distinction is the
+# whole ballgame. The ~3.4k module-load ramp is a fixed DURATION — measured,
+# the process reaches 3374 by sample 15 and is flat by sample 20 — so a
+# sample-count warm-up is wrong twice over. Too short and the ramp is
+# counted as leak, which fires the growth budget on a healthy run (a filtered
+# `bun test` measured 2974 of "growth" that was entirely module load). Too
+# long and a short leg is left unmeasured. With `workers` making the
+# achieved sampling interval 103-330 ms on a wide tree, 20 samples can span
+# 2-6s, so the count is not even stable.
+#
+# Two seconds of wall clock clears the ~0.7s ramp with margin on both ends.
+# Every positive sample goes to `raw` (so "did we ever poll?" stays
+# answerable) and only post-warm-up ones go to `samples` (so growth is
+# measured). That distinction is what lets a leg too SHORT to measure be
+# reported honestly instead of either faking a number or failing.
+warmup_seconds=2
+
+# Poll the process tree's fd count. Started AFTER the child so the pid is
+# known, and torn down by the parent below — a poller that waited on the
+# child itself would spin forever on the zombie, since `kill -0` keeps
+# succeeding until the child is reaped.
+#
+# Two conditions in this loop are load-bearing:
+#
+#   [ -d "/proc/$child" ]  stop at exit. Without it the poller keeps
+#                          sampling a pid that no longer exists.
+#   [ "$n" -gt 0 ]          drop zeros. A live process always holds at
+#                          least fds 0/1/2, so a zero means "gone", and
+#                          letting one through poisons the MINIMUM that
+#                          growth is measured from: trailing zeros made
+#                          growth collapse onto the peak, silently
+#                          reducing the growth budget to a second copy of
+#                          the absolute ceiling.
 (
-  while :; do
-    fds_of_tree "$child" >>"$samples"
-    sleep 0.05
+  while [ -d "/proc/$child" ]; do
+    n=$(fds_of_tree "$child")
+    if [ "$n" -gt 0 ]; then
+      printf '%s\n' "$n" >>"$raw"
+      if [ $((SECONDS - started)) -ge "$warmup_seconds" ]; then
+        printf '%s\n' "$n" >>"$samples"
+      fi
+    fi
+    sleep "$poll_interval"
   done
 ) &
 poller=$!
@@ -131,33 +205,67 @@ status=$?
 kill "$poller" 2>/dev/null || true
 wait "$poller" 2>/dev/null || true
 
-peak=$(sort -n "$samples" 2>/dev/null | tail -1)
-peak="${peak:-0}"
+# Growth across the post-warm-up samples: highest minus lowest.
+polls=$(wc -l <"$raw")
 observed=$(wc -l <"$samples")
+peak=$(sort -n "$raw" 2>/dev/null | tail -1)
+peak="${peak:-0}"
 
-printf 'fd-budget: peak %s open fds (budget %s, %s samples at 50ms)\n' "$peak" "$budget" "$observed"
-if [ "$observed" -eq 0 ]; then
-  printf 'fd-budget: NOTE the command exited before one sample was taken, so this run was NOT measured.\n' >&2
+if [ "$observed" -gt 1 ]; then
+  delta=$(sort -n "$samples" | awk '
+    NR == 1 { lo = $1 }
+    { hi = $1 }
+    END { print hi - lo }
+  ')
+else
+  # The leg finished inside the warm-up window. That is a real "not
+  # measurable", not a pass and not a failure: the absolute ceiling above
+  # still applied to every sample in `raw`.
+  delta="unmeasured"
 fi
+
+# Cleanup of `$samples` and `$raw` is left to the EXIT trap. Doing it by hand
+# here would mean clearing the trap too (so the second file survives), or
+# removing one and leaving the other to a trap that a later `exit` may or may
+# not reach.
+if [ "$polls" -eq 0 ]; then
+  printf 'fd-budget: FAILED — no samples were taken, so this run was NOT measured.\n' >&2
+  printf 'fd-budget: the command exited before the first poll completed, and reporting "peak 0" would be a\n' >&2
+  printf 'fd-budget: silent pass, so this is an error rather than a success.\n' >&2
+  [ "$status" -ne 0 ] && exit "$status"
+  exit 1
+fi
+
+printf 'fd-budget: peak %s open fds (ceiling %s); growth over %s post-warm-up samples: %s (budget %s); %s polls, %ss warm-up, target %ss interval\n' \
+  "$peak" "$budget" "$observed" "$delta" "${delta_budget:-none}" "$polls" "$warmup_seconds" "$poll_interval"
 
 if [ "$status" -ne 0 ]; then
   exit "$status"
 fi
+
+failed=0
 if [ "$peak" -gt "$budget" ]; then
-  cat >&2 <<EOF
+  printf '\nfd-budget: FAILED — peak %s descriptors exceeds the ceiling of %s.\n' "$peak" "$budget" >&2
+  failed=1
+fi
+if [ -n "$delta_budget" ] && [ "$delta" != "unmeasured" ] && [ "$delta" -gt "$delta_budget" ]; then
+  printf '\nfd-budget: FAILED — descriptor growth of %s over the post-warm-up samples exceeds the budget of %s.\n' \
+    "$delta" "$delta_budget" >&2
+  failed=1
+fi
+if [ "$failed" -ne 0 ]; then
+  cat >&2 <<'EOF'
 
-fd-budget: FAILED — peak ${peak} descriptors exceeds the budget of ${budget}.
-
-This is the descriptor leak from issue #74, and it is a BUG, not a
-slow test. Each startDaemon/stop cycle leaks 2 on bun 1.3.13 (Bun's
+This is the descriptor leak from issue #74, and it is a BUG, not a slow
+test. Each startDaemon/stop cycle leaks 2 on bun 1.3.13 (Bun's
 fs.watch close() does not free the fd; node v24.21.0 does not leak).
-Re-measure with:
+Re-measure the rate with:
 
   cd packages/cli && bun test test/serve/fd-budget.test.ts
 
-If that per-cycle test still passes, the growth is coming from
-somewhere else — report it with the peak above rather than raising
-the budget.
+If that per-cycle test still passes, the growth is coming from somewhere
+else — report it with the numbers above rather than raising the budget.
 EOF
   exit 1
 fi
+exit 0
