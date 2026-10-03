@@ -14,6 +14,13 @@
 //
 // Chromium only (WebKit is #19). Loads the daemon on 127.0.0.1 to
 // avoid the localhost redirect for the events stream.
+//
+// ONE daemon is shared by every test here (`beforeAll`), which is why
+// each test mints its own launch code (`fixtures/launch-code.ts`)
+// rather than replaying the startup one — a launch code is single-use
+// and expires in 60 s. Under CI's `workers: 1` this file used to fail
+// 5 of 11 tests with a 403 from `/-/auth`; `retries: 2` masked every
+// one of them. See #74.
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -22,6 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
+import { mintLaunchUrl } from "./fixtures/launch-code";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
@@ -33,7 +41,6 @@ interface DaemonCtx {
   readonly url: string;
   readonly port: number;
   readonly agentToken: string;
-  readonly launchUrl: string;
 }
 
 /** Set of daemon child PIDs the process spawned but has not
@@ -111,18 +118,22 @@ async function bootDaemon(): Promise<DaemonCtx> {
     child.kill("SIGTERM");
     throw new Error(`daemon did not write serve.json within 15s`);
   }
+  // Readiness gate: the daemon prints its `launch:` line once it is
+  // bound and about to serve. We deliberately do NOT keep that URL —
+  // the code in it is single-use (see `fixtures/launch-code.ts`), so
+  // every test mints its own. Asserting the line appeared keeps the
+  // "daemon finished starting" signal the wait used to provide.
   const deadline2 = Date.now() + 3000;
-  let launchUrl: string | undefined;
+  let announcedLaunch = false;
   while (Date.now() < deadline2) {
-    const match = stdoutChunks.join("").match(/launch:\s+(\S+)/);
-    if (match !== null) { launchUrl = match[1]; break; }
+    if (stdoutChunks.join("").match(/launch:\s+(\S+)/) !== null) { announcedLaunch = true; break; }
     await new Promise((r) => setTimeout(r, 20));
   }
-  if (launchUrl === undefined) {
+  if (!announcedLaunch) {
     child.kill("SIGTERM");
     throw new Error(`daemon printed no launch: line`);
   }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken };
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
@@ -161,8 +172,11 @@ async function createAsk(ctx: DaemonCtx, spec: Record<string, unknown>): Promise
 }
 
 async function openAskPage(ctx: DaemonCtx, page: Page, id: string): Promise<void> {
-  // Land through the launch URL so the browser gets the session cookie.
-  const url = new URL(ctx.launchUrl);
+  // Land through a launch URL so the browser gets the session cookie.
+  // Minted per call (#74): the code is single-use and expires after
+  // 60 s, so replaying one startup URL across every test in this file
+  // only ever worked once.
+  const url = new URL(await mintLaunchUrl(ctx));
   url.searchParams.set("next", `/ask/${id}`);
   const response = await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
   if (response === null) throw new Error("goto returned null");
@@ -201,7 +215,8 @@ test.describe("/ask/<id> — CSP + shell", () => {
       title: "<script>window.__revkit_xss=true</script>Trust me?",
       multiline: false,
     });
-    const url = new URL(ctx.launchUrl);
+    // Fresh code per navigation, same reason as `openAskPage` (#74).
+    const url = new URL(await mintLaunchUrl(ctx));
     url.searchParams.set("next", `/ask/${id}`);
     const response = await page.goto(url.toString(), { waitUntil: "domcontentloaded" });
     expect(response!.status()).toBe(200);
