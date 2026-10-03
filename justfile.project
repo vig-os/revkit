@@ -350,17 +350,21 @@ test_fd_budget_playwright := "16384"
 # the regression it was added for. Measuring growth drops the constant term
 # and cannot hide it that way.
 #
-# 1800 therefore sits between the measured growth and a doubling of it:
-# 1.73x the measured 1038, and a doubling (2076) trips it. CI's peak runs
-# ~234 higher than local (4683 vs 4449) with the same module floor, so its
-# growth is expected around 1270 — still inside 1800, by 41%.
+# 1800 therefore sits between the measured growth and a doubling of it.
+# Local growth is stable at 1038-1067 across four runs; the CI runner
+# measures 1284 (run 37117007176, same bun), about 20% higher. So 1800 is
+# ~1.4x the worst environment measured and a doubling trips it — 2568 on CI
+# against an 1800 budget, and 2130 locally. If CI growth ever drifts another
+# 40% the budget needs re-deriving; that is the number to watch in the log,
+# which is why the recipe prints it on every run.
 #
 # The Playwright leg is a different shape and gets its own number. It starts
-# small (a `just build`) and grows into its workers, so its growth is
-# essentially its whole peak — measured 5033 against a 5059 peak. A budget
-# of 6000 would have false-positived on this host's own 6008 and 6481 runs.
-# 12000 keeps it above the worst observed (6481) by 1.85x, where the
-# absolute ceiling is still the primary guard and this is a second net.
+# small (a `just build`) and grows into its workers, so on this host its
+# growth is essentially its whole peak — measured 5457 against a 5469 peak,
+# and a budget of 6000 would have false-positived on this host's own 6008
+# and 6481 peaks. 12000 keeps it above the worst observed (6481) by 1.85x.
+# At CI's `workers: 1` the same leg measures peak 510 / growth 491, so this
+# budget is nowhere near binding in CI — the ceiling is the guard there.
 test_fd_delta_budget_stable := "1800"
 test_fd_delta_budget_playwright := "12000"
 
