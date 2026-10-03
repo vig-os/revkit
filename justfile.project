@@ -72,18 +72,184 @@ precommit:
 # `--online` when GITHUB_TOKEN is exported (CI test lane does not export
 # it today; the offline pass still validates every allow annotation's
 # shape).
+#
+# Every leg below is instrumented because of issue #74, which saw the CI
+# Tests job hang ~18 min in `test/serve/asks-http.test.ts` and die at the
+# 20-minute ceiling with nothing but a group header in the log — the single
+# most expensive possible failure mode, since it burns 20 minutes of a
+# runner to learn nothing. `.github/workflows/ci.yml` is devkit-managed and
+# calls `just test` (ci.yml:282), so every guard lives HERE, in a
+# consumer-owned file.
+#
+# Four instruments, each covering a gap the others cannot:
+#
+#   1. WHICH RUNTIME. Prints `bun --version` and its resolved path first.
+#      CI's toolchain jobs run inside the vig-os devcontainer image, so the
+#      suite is tested against THAT image's bun, not the flake's pinned
+#      1.3.13 that local development uses — two different runtimes under
+#      one recipe name. This repo already carries one behaviour that is
+#      specific to bun 1.3.13 (the #49 watcher re-arm bug), so "which bun
+#      ran this" is a question with a real answer, not a formality. One
+#      line of output makes it answerable from the log after the fact.
+#
+#   2. FD BUDGET. Every `startDaemon` leaks 2 descriptors on bun 1.3.13
+#      (Bun's `fs.watch(...).close()` does not free the fd; cross-checked
+#      against node v24.21.0, which does not leak). Measured `packages/cli`
+#      peak: 4449. GitHub-hosted runners cap the soft `nofile` limit at
+#      1024, so `EMFILE` is a matter of time. `ulimit -n` is set to give the
+#      run headroom so it COMPLETES, and the peak is then checked against
+#      `test_fd_budget` so the next leak is a NAMED failure instead of a
+#      crash. This is headroom plus a tripwire, NOT a fix — the fds are
+#      Bun's to leak and revkit's teardown is already correct.
+#
+#   3. WALL-CLOCK BOUNDS. `timeout --signal=ABRT` per leg, so a stall is
+#      a red leg that names itself instead of a cancelled job. Be precise
+#      about what that buys: bun emits NO JS stack for a blocked event loop
+#      (verified on 1.3.13 — ABRT just dumps core), so the bound does not
+#      produce a trace. What it does produce is the leg label, the budget
+#      it blew, and — on a runtime that emits them — the test file bun had
+#      reached. That is the difference between 20 wasted minutes and one
+#      red line.
+#      Budgets come from measurement (see the per-leg comment) with enough
+#      headroom for a healthy CI run (measured: 7m33s for the whole job)
+#      that the bound ALWAYS fires before the workflow's own 20-minute
+#      `timeout-minutes` — a bound that could lose the race to GitHub's
+#      cancellation would be worthless.
+#
+#   4. `bun --timeout`. The default is 5000ms per test, which is below
+#      what a legitimately slow daemon or E2E-build test needs on a 2-core
+#      CI container. Raised to 30s. NOTE this is NECESSARY BUT NOT
+#      SUFFICIENT, and both halves were verified on bun 1.3.13:
+#        - a hung `await` in `beforeEach` DOES trip it ("a
+#          beforeEach/afterEach hook timed out for this test");
+#        - an unbounded SYNC block does NOT. `--timeout` is detected only
+#          after the block returns, and a block that never returns blocks
+#          the event loop, so the timeout can never fire — the run prints
+#          its header and then nothing, which is exactly the #74 symptom.
+#      That second case is why instrument 3 is here and not optional.
 [group('test')]
 test *args:
-    @if [ ! -f package.json ]; then \
-      echo "just test: no package.json — skipping"; \
-    else \
-      .claude/skills/revkit_run/test-lib.sh && \
-      REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test {{ args }}' && \
-      cd packages/review-core && bun test {{ args }} && cd ../.. && \
-      cd site && bun test src/content/schemas/ {{ args }} && cd .. && \
-      just check && \
-      just e2e; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f package.json ]; then echo "just test: no package.json — skipping"; exit 0; fi
+    REVKIT_FD_ULIMIT_BEFORE="$(ulimit -n)"
+
+    # --- 1. record which runtime is under test (see note 1 above) ---
+    printf 'just test: bun %s at %s\n' "$(bun --version)" "$(command -v bun)"
+
+    # --- 2. fd headroom (see note 2 above) ---
+    # `ulimit -n` is a soft limit. Set it unconditionally so the suite
+    # gets the SAME ceiling everywhere — an unbounded soft limit on a
+    # dev box masks the very exhaustion CI would hit. Raising it is the
+    # point; lowering a host that is already generous is harmless
+    # because the budget sits ~15x above the measured peak. A failure is
+    # NOT fatal (the hard limit may be lower), but the resulting value
+    # is printed either way so the log records what the run actually got.
+    ulimit_in="{{test_fd_limit}}"
+    if ! ulimit -n "$ulimit_in" 2>/dev/null; then
+      printf 'just test: WARNING could not set ulimit -n to %s (hard limit %s); continuing\n' \
+        "$ulimit_in" "$(ulimit -Hn)"
     fi
+    printf 'just test: ulimit -n is now %s (host default was %s)\n' "$(ulimit -n)" "$REVKIT_FD_ULIMIT_BEFORE"
+
+    .claude/skills/revkit_run/test-lib.sh
+
+    # run_leg <label> <budget-seconds> <command...>
+    # Wraps one leg in BOTH the wall-clock bound and the fd peak check, so
+    # no leg can be added later that silently lacks them.
+    #
+    # On a stall, the leg's captured output is grepped for the test file bun
+    # was working on, when the runtime is one that says. Best-effort by
+    # design: bun 1.3.13 buffers its per-file headers when stdout is not a
+    # TTY, so on THAT runtime the stalling file is genuinely absent from the
+    # log and the message says so and hands over a bisect command instead. A
+    # CI runtime that does emit headers gets the file named for free — the
+    # reason the runtime line is printed first is precisely that these two
+    # runtimes differ.
+    run_leg() {
+      local label="$1" budget="$2"; shift 2
+      local log; log="$(mktemp)"
+      printf '\njust test: === %s (budget %ss) ===\n' "$label" "$budget"
+      set +e
+      timeout --signal=ABRT --kill-after=30s "${budget}s" \
+        ./scripts/fd-budget.sh --budget "{{test_fd_budget}}" -- "$@" 2>&1 | tee "$log"
+      local status="${PIPESTATUS[0]}"
+      set -e
+      if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+        {
+          printf '\njust test: STALL — leg %s exceeded its %ss wall-clock budget and was killed.\n' "$label" "$budget"
+          local last
+          last="$(grep -oE '[A-Za-z0-9_./-]+\.(test|spec)\.[cm]?[jt]sx?:' "$log" | tail -1 || true)"
+          if [ -n "$last" ]; then
+            printf 'just test: last test file named in the output was %s.\n' "$last"
+          else
+            printf 'just test: bun named no test file, so the hang cannot be pinned to one from the log.\n'
+            printf 'just test: bun %s buffers its per-file headers when stdout is not a TTY, so the file\n' "$(bun --version)"
+            printf 'just test: that stalled is invisible here. Re-run the leg with a path filter to bisect:\n'
+            printf 'just test:   just test test/serve/<file>.test.ts\n'
+          fi
+          printf 'just test: a leg that overruns this long is a STALL, not a slow test. bun --timeout\n'
+          printf 'just test: cannot catch a blocked event loop (verified on bun 1.3.13), which is why this\n'
+          printf 'just test: outer bound exists.\n'
+        } >&2
+      fi
+      rm -f "$log"
+      return "$status"
+    }
+
+    # Budgets, from measured healthy local times on an 88-core host
+    # (packages/cli 104s / review-core 2s / site schemas 1s / check 3s /
+    # build 8s / Playwright 228s) and the one known good CI run (7m33s
+    # for the whole job, so ~1.3x local). Each leg gets >=3x its measured
+    # time, and any single stalled leg still trips its bound before the
+    # workflow's 20-minute ceiling: worst case is a stalled Playwright leg
+    # at 241s of healthy work + 720s = 16 min, a stalled cli leg at
+    # 540s + 241s = 13 min.
+    run_leg packages/cli "{{test_leg_timeout_cli}}" env REVKIT_E2E_BUILD=1 bash -c "cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
+    run_leg packages/review-core "{{test_leg_timeout_review_core}}" bash -c "cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}"
+    run_leg site/schemas "{{test_leg_timeout_schemas}}" bash -c "cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}"
+    just check
+    run_leg site/playwright "{{test_leg_timeout_e2e}}" just e2e
+
+# Wall-clock budget per leg, in seconds. See note 3 on `test` above for
+# the measurements these come from.
+test_leg_timeout_cli := "540"
+test_leg_timeout_review_core := "180"
+test_leg_timeout_schemas := "180"
+test_leg_timeout_e2e := "720"
+
+# Per-test bun timeout. The 5s default is too tight for a slow daemon or
+# E2E-build test on a 2-core CI container; 30s still turns a hung `await`
+# into a named failure in seconds. See note 4 on `test` above for why this
+# cannot be the only stall guard.
+bun_test_timeout_ms := "30000"
+
+# Soft descriptor limit for the suite. GitHub-hosted runners sit at 1024,
+# which the measured suite peak (~4.4k) blows through. 65536 is ~15x that
+# peak and inside every host's hard limit.
+test_fd_limit := "65536"
+
+# Descriptor ceiling for one leg, checked by scripts/fd-budget.sh.
+#
+# Measured on `bun 1.3.13` (peak = the whole process TREE, so the
+# Playwright workers and their daemons are included):
+#
+#   packages/cli        4449   worker-count independent — bun test is a
+#                              single process; the stable number, and the
+#                              one the budget is sized from
+#   site/playwright      499   at CI settings (`workers: 1`)
+#                      4683   on an 88-core host, i.e. ~44 Playwright
+#                              workers — scales with worker count
+#   packages/review-core   98
+#   site/schemas          139
+#
+# 8192 clears the worst leg observed in either configuration (4683) by
+# ~1.75x while staying far below a runaway, so the guard fails on a leak
+# that got an order of magnitude worse rather than on ordinary drift.
+# It is deliberately NOT tightened to the 4449 figure: a dev box with
+# many cores legitimately runs more Playwright workers, and a budget that
+# red-lined on a big workstation would train everyone to ignore it.
+test_fd_budget := "8192"
 
 # Regenerate the pipeline-digest fixture that
 # `packages/cli/test/build/own-build-unchanged.test.ts` compares
