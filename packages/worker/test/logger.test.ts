@@ -275,9 +275,10 @@ describe("structured logger", () => {
   });
 
   test("A24: a guest display name is redacted under every spelling", () => {
-    // ADR-0015's exact datum. `name` alone is ambiguous — a bare `name` is
-    // redacted too, which errs toward safety — so these three are the ones
-    // a guest's name realistically arrives under.
+    // ADR-0015's exact datum. A bare `name` is deliberately NOT redacted —
+    // it would also catch `filename` and `name` on unrelated records — so
+    // these three are the spellings a guest's name realistically arrives
+    // under, and `name` alone is a declared gap, not an oversight.
     const { logger, lines } = captureLogger("req-guest");
     logger.log("info", "request.start", {
       guestName: "Ada Lovelace",
