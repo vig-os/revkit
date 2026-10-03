@@ -9,11 +9,28 @@
 // added to `append` has to be remembered three times, and the third
 // implementation is the one nobody tests against.
 //
-// So this file is ONE suite, parameterised over a factory, and it is run
-// against the in-memory reference AND the hosted D1 store in
-// `store-conformance.test.ts`. Cases here are the ones that hold for ANY
-// `ThreadStore` — the ones a new backing must pass to be a `ThreadStore`
-// at all.
+// So this file is ONE suite, parameterised over a factory, and it lives
+// HERE rather than in any one package because all three backings have to
+// run it:
+//
+//   packages/review-core/test/store-conformance.test.ts  -> InMemoryThreadStore
+//   packages/cli/test/serve/store-conformance-sqlite.test.ts -> SqliteThreadStore
+//   packages/worker/test/store-conformance.test.ts        -> D1ThreadStore
+//
+// It is a helper, not a `.test.ts`, so `bun test` does not run it directly
+// in whichever package it sits in. It is runtime-neutral — no `bun:` or
+// `node:` import, no I/O assumption — so the CLI can run it against
+// `bun:sqlite` without leaking a Bun-only API into the shared contract.
+//
+// **A previous revision of this header claimed the three-implementation
+// problem and shipped only two**, which is the same class of error the
+// suite exists to prevent: an argument for a property that is not
+// established. `SqliteThreadStore` — 455 shipped lines with its own
+// `BEGIN IMMEDIATE` allocator, i.e. the most likely place for a rule to
+// diverge — was not running any of this.
+//
+// Cases here are the ones that hold for ANY `ThreadStore` — the ones a new
+// backing must pass to be a `ThreadStore` at all.
 //
 // **Cases covered:** A5 (seq starts at 1, strictly increasing), A6
 // (`since(n)`), A7 (`threads()` ordering), A8 (invalid event refused, log

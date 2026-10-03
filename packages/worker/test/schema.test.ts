@@ -50,6 +50,42 @@ describe("D1 schema", () => {
     }
   });
 
+  test("PLATFORM FACT: prepare() accepts comments and multi-line statements; exec() does not", async () => {
+    // The claim `harness.ts` makes about WHY it splits the migration and
+    // runs it one statement at a time. Measured on workerd 2026-05-18:
+    //
+    //   `exec(sql)`      -> rejects a `--` comment ("SQL code did not
+    //                       contain a statement") and TRUNCATES a
+    //                       multi-line statement at the first newline
+    //                       ("incomplete input").
+    //   `prepare(s).run()` -> accepts a leading comment block, a trailing
+    //                       comment and a block comment, and a multi-line
+    //                       CREATE TABLE, unchanged.
+    //
+    // Both halves are asserted because the harness depends on the second
+    // one: it applies the SHIPPED file with no text transformation, and
+    // `test/harness.ts` would be relying on an unverified claim otherwise.
+    const commented = [
+      "-- a leading comment",
+      "/* a block comment */",
+      "CREATE TABLE IF NOT EXISTS comments_ok (",
+      "  id TEXT PRIMARY KEY,",
+      "  nm TEXT NOT NULL -- a trailing comment",
+      ")",
+    ].join("\n");
+    await expect(harness.db.prepare(commented).run()).resolves.toBeDefined();
+
+    // And `exec()` really does refuse the same text, so the difference is
+    // the entry point rather than the SQL.
+    await expect(harness.db.exec(commented)).rejects.toThrow(/SQL code did not contain a statement|error/i);
+
+    // The multi-line statement landed, comments and all.
+    const columns = await harness.db
+      .prepare("PRAGMA table_info(comments_ok)")
+      .all<{ name: string }>();
+    expect((columns.results ?? []).map((c) => c.name)).toEqual(["id", "nm"]);
+  });
+
   test("the splitter is not fooled by a `;` inside a string or a comment", () => {
     // A DEFAULT carrying a semicolon, or a `--` line mentioning one, must
     // not split the statement. A splitter that did would silently ship a

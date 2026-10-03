@@ -8,51 +8,63 @@
 //   ADR-0015 — no comment body, email, token or cookie in a log line, and
 //              identities appear as opaque ids only.
 //
-// The redaction is NOT "remember not to log the body". It is structural:
-// a log record is built from a fixed set of typed fields plus an
-// `extra` bag that is passed through a redactor first. A caller cannot
-// accidentally log a token without the redactor seeing it, because the
-// redactor runs on everything.
+// ── What this module actually enforces, and what it does not ──────────────
 //
-// **`requestId` is the join key, and it is generated once per request**
-// by the caller and carried in the returned context, so the line in the
-// log and the header in the response cannot disagree.
-
-/** Fields whose NAME marks the value as a credential or personal data.
- *
- * Case-INsensitive, and that is load-bearing rather than cosmetic: the
- * natural spellings are `displayName`, `arrayOfEmails` and
- * `Authorization`, and a case-sensitive pattern caught none of them — a
- * test with a guest's display name in it went green with the name still in
- * the line. The first alternative additionally requires a non-letter on
- * both sides so `authorship` is not caught by `auth`.
- *
- * The second alternative has no such guard because these are content
- * words: `body`, `comment`, `text`, `content`, `message`, `quote`,
- * `email`. They match anywhere in the key (`arrayOfEmails`,
- * `commentBody`), which is the intended bias — a false positive costs a
- * missing diagnostic, a false negative costs a reviewer's email in a log. */
-const SENSITIVE_KEY =
-  /(^|[^a-z])(auth|authorization|cookie|set-cookie|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|bearer|csrf|csrftoken|x-api-key)([^a-z]|$)|email|e-mail|display_?name|body|comment|text|content|message|prompt|quote/i;
-
-/** Value-shaped secrets that must never reach a log even under a
- * key that does not look sensitive. GitHub's classic PAT prefix is the
- * concrete case (ADR-0009/0014's token shapes). */
-const SECRET_VALUE = /(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{16,}=*)/;
-
-/** Anything that looked like a secret (or like an email) is replaced by
- * this, whatever the key was. Length is not preserved: leaking the
- * length of a token is a small, free side channel. */
-export const REDACTED = "[redacted]";
+// The #76 review measured real leaks through an earlier version of this
+// file, and the fix is worth stating precisely because "we redact" is
+// usually a stronger claim than the code supports.
+//
+// ENFORCED, three mechanisms:
+//
+//   1. **The message is a closed vocabulary.** `msg` is an event NAME from a
+//      literal union (`request.start`, `api.threads.read.disabled`, …) and a
+//      runtime guard refuses anything else. This is the only mechanism that
+//      can stop a COMMENT BODY, because no regex distinguishes prose from a
+//      log line: the earlier version put a whole comment body in `msg` and
+//      every pattern passed it. Free text is now unrepresentable.
+//   2. **Key names.** A field whose name matches `SENSITIVE_KEY` has its
+//      value replaced entirely, so the shape does not matter — nested,
+//      arrayed, or a bare string.
+//   3. **Value shapes.** Every remaining string — in any field, at any
+//      depth — is tested for a credential shape or an email address. This is
+//      what catches the leak under an INNOCENT key, which is how leaks
+//      actually happen.
+//
+// NOT ENFORCED, and stated so nobody relies on it:
+//
+//   **Free-form prose under a key the redactor does not recognise is not
+//   detected.** A field named `note` carrying a comment body would pass
+//   mechanisms 2 and 3 (no email, no credential shape). The control for that
+//   is the CALLER RULE — review content is never passed as a log field; the
+//   redactor is a backstop, not the primary control — plus mechanism 1,
+//   which removes the largest such surface. `SENSITIVE_KEY` names the
+//   content-ish fields that must never be logged, and the review-content key
+//   set is pinned by a test so a new one cannot be added without noticing.
+//
+// So the accurate claim is "a comment body cannot be logged as `msg`, cannot
+// be logged under a content-shaped key, and cannot leak an address or a
+// credential under any key" — NOT "nothing sensitive can reach a log".
 
 /** Severity of one line. Explicit rather than inferred so a log query
  * can filter without parsing the message. */
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/** Every log line's message is one of these. A literal union, so a new
+ * call site cannot invent a message without TypeScript objecting, AND a
+ * runtime guard for callers that are not TypeScript. */
+export const LOG_MESSAGES = [
+  "request.start",
+  "request.end",
+  "request.error",
+  "api.threads.read.disabled",
+  "api.threads.append.disabled",
+] as const;
+
+export type LogMessage = (typeof LOG_MESSAGES)[number];
+
 /** Free-form diagnostics attached to a line: numeric counters, HTTP
  * method, a pathname, an opaque identity id. Anything whose KEY matches
- * `SENSITIVE_KEY` is replaced before serialisation, so a caller cannot
- * turn a mistake into a leak by choosing a different shape. */
+ * `SENSITIVE_KEY` is replaced before serialisation. */
 export type LogFields = Record<string, unknown>;
 
 /** A logger bound to one sink. The Worker binds `console.log`; a test
@@ -61,7 +73,7 @@ export type LogFields = Record<string, unknown>;
 export interface Logger {
   /** Write one line. Never throws — a logging failure must not take down
    * a request. */
-  log(level: LogLevel, msg: string, fields?: LogFields): void;
+  log(level: LogLevel, msg: LogMessage, fields?: LogFields): void;
   /** A logger that stamps `requestId` on every line, so a call site
    * cannot forget it. This is how the Worker's per-request logger is
    * built, and it is what makes ADR-0020's "one request id per call"
@@ -69,14 +81,69 @@ export interface Logger {
   withRequestId(requestId: string): Logger;
 }
 
-/** Recursively redact one value. Depth-bounded so a cyclic object from
- * a caller cannot hang the logger — a log line that costs the request
- * its response is a worse bug than a truncated field. */
+/**
+ * Fields whose NAME marks the value as a credential or personal data.
+ *
+ * Case-INsensitive, and that is load-bearing rather than cosmetic: the
+ * natural spellings are `displayName`, `arrayOfEmails` and
+ * `Authorization`, and a case-sensitive pattern caught none of them — a test
+ * with a guest's display name in it went green with the name still in the
+ * line. The first alternative additionally requires a non-letter on both
+ * sides so `authorship` is not caught by `auth`.
+ *
+ * The second alternative has no such guard because these are content and
+ * credential words. They match anywhere in the key (`arrayOfEmails`,
+ * `commentBody`), which is the intended bias — a false positive costs a
+ * missing diagnostic, a false negative costs a reviewer's email in a log.
+ *
+ * `session`/`session_id`/`sid` are here because ADR-0012 makes the session
+ * cookie the bearer credential for a hosted request, and `sessions.id` is
+ * the schema's own identifier for it: a session id in a log line is a
+ * credential in a log line.
+ */
+const SENSITIVE_KEY =
+  /(^|[^a-z])(auth|authorization|cookie|set-cookie|token|access[_-]?token|refresh[_-]?token|secret|password|passwd|api[_-]?key|bearer|csrf|csrftoken|x-api-key|session[_-]?id|sid|session)([^a-z]|$)|email|e-mail|display_?name|body|comment|text|content|message|prompt|quote|excerpt|summary|note|notes|detail|details|description|transcript|draft|patch|diff/i;
+
+/** Credential shapes, matched ANYWHERE in a string so a value that
+ * embeds one ("retry failed with ghp_…") is caught even when the rest of
+ * it is prose. */
+const SECRET_VALUE =
+  /(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{16,}={0,2}|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})/;
+
+/** An email address. ADR-0015 and ADR-0020 both name emails explicitly,
+ * and an address is the single most likely personal datum to appear in a
+ * field whose NAME says nothing about it — `{ actor: "reviewer@example.com" }`
+ * was a measured leak through the earlier version of this file, under a key
+ * (`actor`) that is legitimate and must survive. */
+const EMAIL_ADDRESS = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+
+/** Anything that looked like a secret, or like an address, is replaced by
+ * this, whatever the key was. Length is not preserved: leaking the length
+ * of a token is a small, free side channel. */
+export const REDACTED = "[redacted]";
+
+/** Substituted for a `msg` that is not a known event name. The original
+ * is NOT logged anywhere — logging it would defeat the check — so the line
+ * says only that the message was refused. */
+export const INVALID_MESSAGE = "invalid.log.message";
+
+/** The event-name shape. Redundant with the `LogMessage` union for
+ * TypeScript callers, and the actual runtime control for everything else. */
+const EVENT_NAME = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
+
+/** Redact one string: a credential shape or an email address anywhere in
+ * it replaces the WHOLE value, so a partially-redacted address
+ * (`re***@example.com`) never appears. */
+function redactString(value: string): string {
+  return SECRET_VALUE.test(value) || EMAIL_ADDRESS.test(value) ? REDACTED : value;
+}
+
+/** Recursively redact one value. Depth-bounded so a cyclic object from a
+ * caller cannot hang the logger — a log line that costs the request its
+ * response is a worse bug than a truncated field. */
 function redact(value: unknown, depth: number): unknown {
   if (depth > 6) return REDACTED;
-  if (typeof value === "string") {
-    return SECRET_VALUE.test(value) ? REDACTED : value;
-  }
+  if (typeof value === "string") return redactString(value);
   if (value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map((item) => redact(item, depth + 1));
   const out: Record<string, unknown> = {};
@@ -96,13 +163,13 @@ export function createLogger(options: {
 }): Logger {
   const write = (level: LogLevel, msg: string, fields?: LogFields): void => {
     try {
-      // `msg` goes through the same redactor as every field: a message is
-      // a string a caller wrote by hand, and a hand-written string is
-      // exactly where a pasted token ends up.
       const record: Record<string, unknown> = {
         ts: options.clock(),
         level,
-        msg: SECRET_VALUE.test(msg) ? REDACTED : msg,
+        // Mechanism 1: the message is an event name or nothing. `msg` also
+        // goes through the value pass, so a credential pasted into an
+        // event name is still caught even if the name check is bypassed.
+        msg: EVENT_NAME.test(msg) ? redactString(msg) : INVALID_MESSAGE,
       };
       if (options.requestId !== undefined) record["requestId"] = options.requestId;
       for (const [key, value] of Object.entries(fields ?? {})) {
@@ -116,16 +183,15 @@ export function createLogger(options: {
     }
   };
   const logger: Logger = {
-    log: write,
+    log: (level, msg, fields) => write(level, msg, fields),
     withRequestId: (requestId: string) => createLogger({ ...options, requestId }),
   };
   return logger;
 }
 
 /** Generate an opaque request id. `crypto.randomUUID` exists in workerd
- * with no compatibility flags (measured) and in Bun; the counter suffix
- * is not needed and a UUID alone is not guessable, so nothing here is
- * an identity. */
+ * with no compatibility flags (measured) and in Bun; a UUID is not
+ * guessable, so nothing here is an identity. */
 export function newRequestId(): string {
   return crypto.randomUUID();
 }

@@ -1,22 +1,32 @@
 // `wrangler.jsonc` as a TESTED contract (A28), not a reviewed file.
 //
-// Everything this slice's safety rests on lives in two lines of config that
-// nothing else would catch:
+// One line here is load-bearing for ADR-0025: `compatibility_flags: []`.
+// With no `nodejs_compat` the platform refuses a Node-only import and
+// provides no `Buffer`/`process`/`require`, so a regression goes red on the
+// first affected request rather than in production. A lint can be bypassed
+// and a missing global cannot.
 //
-//   `compatibility_flags: []` — no `nodejs_compat`, so the platform refuses
-//   a Node-only import instead of a lint noticing it next quarter.
+// The other line, `workers_dev: false`, is a **TRIPWIRE AND NOTHING MORE**,
+// and the distinction is the whole point of this header:
 //
-//   `workers_dev: false` — with no `routes` either, this Worker has NO
-//   public URL until `revkit deploy init` provisions one. That is what
-//   makes slice 1's unauthenticated `GET /api/threads` unreachable rather
-//   than merely undocumented; slice 2's sessions land before provisioning
-//   does, so there is no window where an unauthorised read is live.
+//   - It is NOT an authorization check. The authorization this Worker
+//     performs is: none.
+//   - It evaporates the moment slice 3 or slice 5 adds a `routes` entry, or
+//     anyone runs `wrangler dev --remote`, which ignores it entirely.
+//   - It does NOT protect `/api/threads` today, because `/api/threads`
+//     answers 501 for every verb (see `src/index.ts`). The route is closed
+//     by CODE; this flag only means a mistake elsewhere has no public URL to
+//     be wrong on.
 //
-// Both are invisible to the type checker and to the test suite, which is
-// exactly why they are asserted here. The absence assertions matter just
-// as much as the presence ones: ADR-0014's rule is that no secret exists
-// in this repo, and "no secret-looking value in the config" is the part of
-// that a local test can enforce before any secret does.
+// So the absence assertions below are a tripwire against a careless deploy,
+// and must never be read as evidence that a request was authorized. The
+// test that a route is closed is in `worker-runtime.test.ts`, where the
+// handler's own 501 is asserted against a non-empty log.
+//
+// ADR-0014's absence assertions matter just as much as the compatibility
+// ones: no secret exists in this repo, and "no secret-shaped value in the
+// config or the package" is the part of that a local test can enforce before
+// any secret does.
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -51,11 +61,16 @@ describe("wrangler.jsonc", () => {
   });
 
   // ── the reachability gate ─────────────────────────────────────────────
-  test("workers_dev is FALSE — the Worker has no *.workers.dev URL", () => {
+  test("workers_dev is FALSE — a tripwire, so a mistaken deploy has no public URL", () => {
+    // Read the file's own comment before "fixing" this to true.
     expect(CONFIG["workers_dev"]).toBe(false);
   });
 
-  test("no routes, no custom domain, no account id", () => {
+  test("no routes and no custom domain — and this is what would void the tripwire", () => {
+    // If a future slice adds a `routes` entry for previews, `workers_dev:
+    // false` stops protecting anything, so the two have to be read together
+    // and the reason has to be re-argued at the time. Asserted separately
+    // from the flag above so flipping one without the other is visible.
     for (const key of ["routes", "account_id", "custom_domains", "dispatch_namespace"]) {
       expect(Object.keys(CONFIG)).not.toContain(key);
     }

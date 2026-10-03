@@ -98,6 +98,22 @@ const wallClock: Clock = () => new Date().toISOString();
  * permits gaps, so the fix if that ever matters is a block allocator
  * (claim K seqs atomically, then serve appends from the block) — not a
  * transaction, which D1 refuses.
+ *
+ * **Second known cost, and the one that bites first: the FIRST append on a
+ * fresh instance is O(N).** `#logState` starts empty, so a store that has
+ * never appended replays the entire log — one unbounded read plus one
+ * `validateNext` per event — inside its first `append`, and that append also
+ * pays its own batch. Today that is free: nothing appends over HTTP
+ * (`POST /api/threads` is a 501), the table is empty, and every Worker
+ * request builds its store lazily. From the bridge onward (`revkit threads
+ * import`, the GitHub adapter's writes) the same shape is a per-isolate
+ * warm-up cost proportional to the log, and the read it does is unbounded —
+ * see the "no scale evidence" note in `README.md`.
+ *
+ * The fix when it matters is NOT to cache `#logState` across isolates,
+ * which would mean trusting another isolate's writes; it is to make the
+ * catch-up read BOUNDED and paginated, so the replay is chunked, or to give
+ * the hosted surface a store instance per scope with a warm-up it controls.
  */
 export const APPEND_CAS_ATTEMPTS = 64;
 
@@ -128,6 +144,32 @@ const INSERT_SQL =
  * never assume contiguity, and A14 pins that), and a
  * `MAX(seq) = seq - 1` guard would skip exactly those rows. */
 const INSERT_ARCHIVE_SQL = "INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)";
+
+/** Thrown when `append` exhausts its compare-and-swap budget.
+ *
+ * **Deliberately NOT a `ThreadStoreAppendError`.** That class means "the
+ * event you handed me does not belong in this log", and every `kind` in its
+ * `AppendRejection` union is a statement about log shape — a caller that
+ * branches on the rejection type to answer 400 would turn a TRANSIENT
+ * server-side condition into a client error and tell a reviewer their
+ * comment is malformed when it is fine. Contention is a different class of
+ * event: the event is valid, the log is simply busy.
+ *
+ * `retryable: true` is the field a future handler branches on to answer
+ * **503 with `Retry-After`**, not 400. Nothing maps it in slice 1 because
+ * nothing calls `append` over HTTP — `POST /api/threads` is a 501 (see
+ * `src/index.ts`) — but the type exists so the first handler that does map
+ * it cannot invent a 400 by accident.
+ */
+export class ThreadStoreContendedError extends Error {
+  readonly retryable = true;
+  readonly attempts: number;
+  constructor(attempts: number, message: string) {
+    super(message);
+    this.name = "ThreadStoreContendedError";
+    this.attempts = attempts;
+  }
+}
 
 export interface D1ThreadStoreOptions {
   /** The bound D1 database. The schema is NOT created here — D1
@@ -179,9 +221,34 @@ export class D1ThreadStore implements ThreadStore {
     this.#clock = options.clock ?? wallClock;
   }
 
-  /** The highest seq this store has validated. A hosted page uses it to
-   * stamp a resume point, the same way the daemon's `/events` does. */
-  head(): number {
+  /** The log's current head, READ FROM D1.
+   *
+   * **Not `#head`.** `#head` is this instance's validated watermark, and
+   * `src/index.ts` builds a fresh store per request — so on a log this
+   * instance has never appended to, `#head` is 0 while the table holds
+   * seq 7, and every resume point the caller computed from it was wrong.
+   * That is not hypothetical: it is exactly what the #76 review measured
+   * against a log seeded with seqs 1, 2, 3 and 7, and the test that caught
+   * it had only ever asserted the EMPTY case.
+   *
+   * `SqliteThreadStore.head()` re-reads `max(seq)` at construction, so the
+   * two implementations were already going to disagree about a method with
+   * the same name. Reading the table here makes them agree by
+   * construction, and it costs one indexed query that a resume point needs
+   * anyway.
+   *
+   * After `append`/`import` on THIS instance the two agree, because those
+   * are the only ways `#head` advances and both leave the table's `MAX(seq)`
+   * equal to it. */
+  async head(): Promise<number> {
+    const row = await this.#db.prepare(HEAD_SQL).first<{ head?: number }>();
+    return typeof row?.head === "number" ? row.head : 0;
+  }
+
+  /** This instance's validated watermark, without a query. Diagnostics
+   * and the append path's bookkeeping only — a caller that wants the log's
+   * head wants `head()`. */
+  validatedHead(): number {
     return this.#head;
   }
 
@@ -234,10 +301,10 @@ export class D1ThreadStore implements ThreadStore {
         return seq;
       }
     }
-    throw new ThreadStoreAppendError({
-      kind: "invalid-shape",
-      message: `append: gave up after ${APPEND_CAS_ATTEMPTS} compare-and-swap retries; another writer kept moving the head.`,
-    });
+    throw new ThreadStoreContendedError(
+      APPEND_CAS_ATTEMPTS,
+      `append: gave up after ${APPEND_CAS_ATTEMPTS} compare-and-swap retries; another writer kept moving the head.`,
+    );
   }
 
   import(archive: ThreadArchive): Promise<void> {

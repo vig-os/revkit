@@ -41,8 +41,10 @@ export const MIGRATION_SQL: string = readFileSync(
  *     workerd's own SQLite binding, so this is the platform, not
  *     miniflare.
  *   - `D1Database.prepare(sql).run()` accepts BOTH multi-line statements
- *     and `--` / block comments unchanged. Verified for a leading
- *     comment block, a trailing comment, and a block comment.
+ *     and `--` / block comments unchanged — asserted, with the `exec()`
+ *     refusal alongside it, by the "PLATFORM FACT" case in
+ *     `test/schema.test.ts`. That test exists because this module's whole
+ *     reason for splitting the file is that second bullet.
  *   - `wrangler d1 migrations apply --file=...` splits with its own
  *     `splitSqlIntoStatements`, which consumes `--` and block comments
  *     and then drops empty chunks. (Read from wrangler 4.93.0's
@@ -122,6 +124,16 @@ export async function applyMigration(db: D1Database): Promise<number> {
  * `Unseekable reading file`). Both errors are Bun's, not revkit's; a
  * single build reads each file once and sidesteps both.
  *
+ * **Why the outputs are matched BY NAME and then size-checked.** With two
+ * entrypoints in one call, Bun's output order is NOT the entrypoint order,
+ * so `outputs[0]` is not "the first entry". Indexing by output position
+ * would have silently handed `workerBundle()` the PROBE's bundle (776 KB
+ * instead of 20 KB) or the reverse, and a forbidden-pattern scan over the
+ * wrong file passes just as green as one over the right file. `bundles()`
+ * therefore matches on the emitted name and `A4` asserts each artefact's
+ * expected magnitude, so a swapped or truncated bundle fails loudly rather
+ * than being scanned.
+ *
  * The flags are the ones proven to work for this graph: `browser` as the
  * target and `workerd`/`worker` as conditions. `nodejs_compat` is
  * deliberately NOT among them — `wrangler.jsonc` pins
@@ -133,6 +145,44 @@ const BUILD_OPTIONS = {
   format: "esm",
   conditions: ["workerd", "worker", "browser"],
 } as const;
+
+/** Node/Bun escape hatches that must not appear in ANY bundle we ship or
+ * test. Named here rather than inline so the scan has exactly one
+ * definition, and so the mutation guard in `worker-runtime.test.ts` can
+ * prove the scan is not vacuous by planting one. */
+export const FORBIDDEN_BUNDLE_PATTERNS: readonly { readonly pattern: RegExp; readonly what: string }[] = [
+  { pattern: /require\s*\(/, what: "require(" },
+  { pattern: /node:/, what: "node:" },
+  { pattern: /bun:/, what: "bun:" },
+  { pattern: /\bBuffer\b/, what: "Buffer" },
+  { pattern: /process\.env/, what: "process.env" },
+];
+
+/** Every forbidden hit in `text`, as `"what@offset"`, one per PATTERN
+ * (the first occurrence). Exported so a test can assert on the scan's own
+ * behaviour, not only on its verdict. */
+export function scanForForbidden(text: string): string[] {
+  const hits: string[] = [];
+  for (const { pattern, what } of FORBIDDEN_BUNDLE_PATTERNS) {
+    const match = pattern.exec(text);
+    if (match !== null) hits.push(`${what}@${match.index}`);
+  }
+  return hits;
+}
+
+/** Every occurrence of every forbidden pattern, as `"what@offset"`. Needed
+ * because the runtime probe legitimately CONTAINS one `Buffer` token — it is
+ * the line that measures `typeof globalThis.Buffer` to prove the global is
+ * absent — so a bundle that "must contain none" cannot be the assertion. */
+export function scanAllForbidden(text: string): string[] {
+  const hits: string[] = [];
+  for (const { pattern, what } of FORBIDDEN_BUNDLE_PATTERNS) {
+    for (const match of text.matchAll(new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`))) {
+      hits.push(`${what}@${match.index}`);
+    }
+  }
+  return hits;
+}
 
 /** The shipped Worker (`src/index.ts`) and the ADR-0025 runtime probe
  * (`test/fixtures/runtime-probe.ts`), bundled for the workers runtime. */
@@ -175,13 +225,25 @@ export function bundles(): Promise<Bundles> {
   return bundlesPromise;
 }
 
-/** The bundled Worker source. */
+/** The shipped Worker entry's bundle.
+ *
+ * **Small, and that is correct.** `GET /api/threads` is closed (ADR-0012
+ * authorization), so nothing reachable from `src/index.ts` constructs a
+ * `D1ThreadStore` any more and the bundler tree-shakes `d1-store.ts` — and
+ * with it the whole `@revkit/review-core` graph — out of this artefact.
+ * Measured: ~20 KB, against ~790 KB while the route was open. So this
+ * bundle is what the PLATFORM has to load, and ADR-0025's "the core runs in
+ * workerd" claim is proven against `probeBundle()` instead, which is the
+ * same graph reached through a route that is not part of the shipped
+ * surface. */
 export async function workerBundle(): Promise<string> {
   return (await bundles()).worker;
 }
 
 /** The runtime-probe bundle — ADR-0025's gate, dispatched through its own
- * miniflare so the probe never becomes a route on the shipped Worker. */
+ * miniflare so the probe never becomes a route on the shipped Worker. This
+ * is the artefact that CONTAINS `@revkit/review-core` and `d1-store.ts`,
+ * which is why the forbidden-pattern scan has to run over both. */
 export async function probeBundle(): Promise<string> {
   return (await bundles()).probe;
 }

@@ -318,7 +318,7 @@ test *args:
     run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
     run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}'
     run_leg just/check "{{test_leg_timeout_check}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- just check
-    run_leg packages/worker "{{test_leg_timeout_worker}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/worker && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
+    run_leg packages/worker "{{test_leg_timeout_worker}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/worker && bun test --timeout {{bun_test_timeout_worker_ms}} {{ args }}'
     run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" "{{test_fd_delta_budget_playwright}}" -- just e2e
 
 # Wall-clock budget per leg, in seconds. See note 3 on `test` above for
@@ -345,12 +345,33 @@ test_leg_timeout_e2e := "720"
 # notice a slow boot would also fire on a loaded CI runner.
 #
 # The descriptors are the shared `stable` budgets and they are nowhere near
-# binding (157 peak against 8192, 67 growth against 1800). That is the right
+# binding (159 peak against 8192, 56 growth against 1800). That is the right
 # relationship for this leg: it holds a handful of long-lived sockets to
 # workerd and a module graph bun never reloads, so it has no daemon-cycle
 # leak to grow. If that ever changes the numbers here are the thing to watch,
-# not the ceiling.
+# not the ceiling. A clean run also leaves ZERO `workerd` processes behind
+# (measured: 0 before and 0 after a full leg), so `dispose()` reaps.
 test_leg_timeout_worker := "180"
+
+# Per-test timeout for the worker leg, which is NOT the shared 10 s. The
+# reason is specific: this leg's slowest assertion is a D1 write, and the
+# latency it actually carries is PROCESS STARTUP — six `workerd` boots, one
+# per test file that needs a runtime. Measured, the whole leg runs in
+# 3.9-4.5 s when the host is quiet.
+#
+# On a loaded host that is not true: one run measured 16.9 s and produced
+# exactly one failure, `(fail) D1 schema > (unnamed) [10002.00ms]` — a
+# `beforeAll` hook, i.e. a `workerd` boot, hitting the shared 10 s ceiling.
+# The same leg passed standalone and on a re-run, so it was boot latency and
+# not a defect. Raising the GLOBAL timeout for that would slow every real
+# hang in the repo; giving the worker leg its own bounds boot latency
+# without touching any assertion, because no test in this leg takes more
+# than a few hundred ms.
+#
+# 30 s is ~7x the worst whole-leg time observed and ~3x the shared value. If
+# a worker test ever legitimately needs more than that, it is doing something
+# this leg should not be doing.
+bun_test_timeout_worker_ms := "30000"
 
 # Per-test bun timeout. Sized for the measured slow tail, not for hang
 # latency: the slowest single `packages/cli` test observed is 6067ms and 3 of

@@ -17,14 +17,26 @@
 // and `require`. That measurement is also why
 // `@revkit/review-core/http-headers` encodes CSP hashes without `Buffer`.
 //
-// `workers_dev: false` is the other load-bearing line, and it is what
-// makes slice 1 safe to ship without ADR-0012 authorization. A Worker
-// with `workers_dev` left at its default is reachable at
-// `*.workers.dev`, so an unauthenticated `GET /api/threads` would be on
-// the public internet. With it false and no `routes`, this Worker has NO
-// public URL at all until `revkit deploy init` provisions one — which is
-// owner-gated (#34) and lands after slice 2's sessions, so there is no
-// window in which an unauthorized read is reachable.
+// `workers_dev: false` is the other load-bearing line, and it is a
+// TRIPWIRE, NOT AN AUTHORIZATION CHECK.
+//
+// What it does: with no `routes` either, this Worker has no public URL, so
+// a mistake in the handler is not immediately reachable at
+// `*.workers.dev`.
+//
+// What it does NOT do, stated plainly because the first draft of this
+// comment implied otherwise:
+//
+//   - It is not authorization. The authorization this Worker performs is:
+//     none. `/api/threads` answers 501 for EVERY verb because ADR-0012
+//     requires authorization per request and slice 1 has no session — the
+//     route is closed by CODE in `src/index.ts`, and that 501 is asserted
+//     by `test/worker-runtime.test.ts` against a non-empty log.
+//   - It evaporates the moment slice 3 or slice 5 adds a `routes` entry.
+//   - It never applied to `wrangler dev --remote`, which ignores it.
+//
+// So treat flipping either line as a security-relevant change requiring a
+// fresh argument, not a config tidy-up.
 //
 // `d1_databases[].database_id` is a PLACEHOLDER. Provisioning is
 // `wrangler d1 create`, which needs an account, so `revkit deploy init`

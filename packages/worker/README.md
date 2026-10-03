@@ -15,7 +15,7 @@ it.
 | Hosted store | `src/d1-store.ts` | `D1ThreadStore implements ThreadStore` — ADR-0006's log on D1 |
 | D1 schema | `migrations/0001_init.sql` | the ONLY DDL for the hosted store, applied out of band |
 | Response headers | `src/headers.ts` | adapter over the **shared** policy in `@revkit/review-core/http-headers` |
-| Logging | `src/logger.ts` | structured JSON with a request id and structural redaction (ADR-0020, ADR-0015) |
+| Logging | `src/logger.ts` | structured JSON with a request id, and a redactor bounded to what it can actually detect (ADR-0020, ADR-0015 — see "What the redactor does and does not do") |
 | Path grammar | `src/router.ts` | ADR-0008's `<repo>/pr-<n>/`, as a pure function |
 | Config | `wrangler.jsonc` | binding, compatibility date, and two load-bearing flags |
 
@@ -43,15 +43,70 @@ the real committed allowlist, so it cannot quietly drift.
 `test/worker-runtime.test.ts` re-asserts both halves, so a future compatibility
 bump that re-enables the flag goes red.
 
-## Why `workers_dev: false` is load-bearing
+## `/api/threads` is closed — every verb, 501
 
-ADR-0012 requires authorization on every request. Slice 1 has no `TokenSource` and
-no session, so `GET /api/threads` is unauthenticated. That is only acceptable
-because this Worker has **no public URL**: `workers_dev: false` plus no `routes`
-means nothing routes to it until `revkit deploy init` provisions a domain — which is
-owner-gated (#34) and sequenced *after* slice 2's sessions. See the residual-risk
-note in the PR body; this is a config flag, not an authentication check, and it is
-asserted by a test so nobody flips it casually.
+`GET` and `POST` both answer **501** with the same body shape, naming M4 slice 2.
+ADR-0012 requires authorization on *every* request — a GitHub session must still
+have read access to the repo, an invite must be checked for scope, type and expiry
+— and slice 1 has neither a session nor a `TokenSource`. The read is the larger of
+the two exposures: an open `GET` needs no CSRF bypass, no browser and no user
+interaction, and it returns comment bodies, which is what ADR-0015 protects.
+
+Read and append stay fully proven, just not over HTTP:
+
+- `packages/review-core/test/store-conformance.ts` runs 19 cases against **all
+  three** `ThreadStore` implementations (in-memory, the daemon's `bun:sqlite`,
+  and this package's D1).
+- `test/d1-store.test.ts` proves the `?since=` log catch-up and the
+  `exportArchive`/`import` bridge between D1 and an in-memory store, both
+  directions.
+
+## Why `workers_dev: false` matters — and what it does NOT do
+
+It is a **tripwire, not an authorization check.**
+
+- **Does:** with no `routes` either, this Worker has no public URL, so a mistake
+  in the handler is not immediately reachable at `*.workers.dev`.
+- **Does not:** authorize anything. The authorization this Worker performs is
+  none — `/api/threads` is closed by code, and that 501 is asserted by
+  `test/worker-runtime.test.ts` against a **non-empty** log.
+- **Does not survive** slice 3 or slice 5 adding a `routes` entry.
+- **Never applied** to `wrangler dev --remote`.
+
+Treat flipping either line as security-relevant. `test/worker-config.test.ts`
+asserts both so neither is changed casually, and it says in its own header that it
+must not be read as evidence a request was authorized.
+
+## One cross-package import, on purpose
+
+`src/index.ts` imports `../../cli/src/dist-check-allowlist.json` — a relative path
+into the CLI package's **source** tree. That is deliberate: that file IS the
+release artefact ADR-0012 names ("the allowlist of the revkit version it runs,
+never hashes found in an artifact"), and a second copy would be a second
+`script-src` policy, which is the failure ADR-0025 exists to prevent. A test in
+`test/headers.test.ts` asserts it is the only allowlist import in the module.
+
+The cost, so it is not a surprise: **moving that file inside the CLI breaks the
+Worker build with an opaque unresolved-specifier error**, not a helpful one. If you
+relocate it, fix `src/index.ts` in the same commit.
+
+## What the redactor does and does not do
+
+`src/logger.ts`'s header is the authority. Three mechanisms are enforced:
+
+1. **The message is a closed vocabulary.** `msg` is one of five event names and a
+   runtime guard refuses anything else, which is the only mechanism that can stop a
+   **comment body** — no regex distinguishes prose from a log line.
+2. **Key names.** A field whose name matches the sensitive set has its value
+   replaced entirely, nested or arrayed.
+3. **Value shapes.** Every remaining string, at any depth, is tested for a
+   credential shape or an email address — which is what catches a leak under an
+   *innocent* key.
+
+**Not enforced:** free-form prose under a key the redactor does not recognise.
+The control for that is the caller rule — review content is never passed as a log
+field — plus mechanism 1. `test/logger.test.ts` pins the limitation with a test
+named for it, so the caveat cannot be quietly deleted.
 
 ## Running the tests
 
@@ -83,9 +138,15 @@ Stated here so nobody has to read the PR body to find out:
   extension→`Content-Type` allowlist. `parsePreviewPath` recognises a preview path
   and answers `501` naming the slice that serves it. ADR-0012's SVG-sandbox rule is
   implemented and tested as a header, against synthetic content only.
-- **No CSRF.** `POST /api/threads` is `501` with a pointer, because ADR-0012
-  requires a per-session CSRF token and slice 1 has no session. Append is proven
-  against the same `D1ThreadStore` in `test/store-conformance.test.ts` instead.
+- **No CSRF and no authorization.** Both verbs on `/api/threads` are `501`, so
+  **Q6 stays partial**. Neither read nor append is reachable over HTTP; both are
+  proven through the store suites instead.
+- **The shipped Worker bundle no longer contains `@revkit/review-core`.** Closing
+  `GET /api/threads` left nothing reachable from `src/index.ts` touching
+  `D1ThreadStore`, so the bundler tree-shook the core out: ~20 KB, where it was
+  ~790 KB. ADR-0025's "the core runs in workerd" claim is therefore proven against
+  the runtime probe bundle (which does contain the core, ~776 KB), not against the
+  shipped entry. Both are scanned by `test/worker-runtime.test.ts`.
 - **No rate limits, no Durable Objects.**
 - **No invite semantics.** `invites` has the ADR-0009 shape and a UNIQUE
   `token_hash`; nothing mints, verifies, revokes or redeems one.
@@ -94,10 +155,19 @@ Stated here so nobody has to read the PR body to find out:
   because there is nothing yet to leak).
 - **No deploy.** `wrangler deploy`, `wrangler d1 create` and `revkit deploy` are
   out of bounds; `d1_databases[].database_id` is an obvious placeholder.
-- **No scale evidence.** Throughput under a write burst is O(N) D1 round trips for N
-  concurrent writers, because the seq allocator is a compare-and-swap and only one
-  writer wins per round. Recorded in `d1-store.ts`; the fix if it matters is a block
-  allocator, not a transaction (D1 refuses interactive ones).
+- **No scale evidence.** Three specific costs, all recorded in `d1-store.ts` rather
+  than assumed away:
+  - Throughput under a write burst is O(N) D1 round trips for N concurrent writers,
+    because the seq allocator is a compare-and-swap and only one writer wins per
+    round. The fix is a block allocator, not a transaction (D1 refuses interactive
+    ones).
+  - `since()` and `threads()` read the WHOLE `events` table with no `LIMIT` and no
+    index beyond `seq` (the PK) and `ts`. Nothing breaks at slice-1 scale because
+    nothing writes over HTTP yet, and it will break on the first log large enough
+    for one round trip to stop being cheap.
+  - The FIRST `append` on a fresh store instance replays the whole log (one
+    unbounded read plus one `validateNext` per event). Harmless today; a per-isolate
+    warm-up cost proportional to the log from the bridge onward.
 
 ## Adding a slice
 

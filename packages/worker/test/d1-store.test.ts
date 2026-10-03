@@ -29,7 +29,7 @@ import {
   type ThreadArchive,
 } from "@revkit/review-core";
 import { D1ThreadStore } from "../src/d1-store.ts";
-import { fixedClock } from "./store-conformance.ts";
+import { fixedClock } from "../../review-core/test/store-conformance.ts";
 import { startWorker, type Harness } from "./harness.ts";
 
 const anchor = {
@@ -108,7 +108,19 @@ describe("D1ThreadStore — D1 concurrency model", () => {
   });
 
   // ── A10 ───────────────────────────────────────────────────────────────
-  test("A10: 20 concurrent appends give 20 distinct seqs and 20 rows", async () => {
+  //
+  // READ THIS BEFORE TRUSTING THE CASE BELOW. The 20 `append` calls are
+  // issued concurrently, but `D1ThreadStore.append` enters `#serialise`, so
+  // they execute STRICTLY ONE AT A TIME (measured: 0 CAS failures, so
+  // max-one-batch-in-flight). A naive read-then-write allocator would pass
+  // this test unchanged, which means it is NOT evidence that the CAS works.
+  //
+  // What it IS evidence of: seq assignment is strictly increasing and
+  // gap-free for a queued writer, and every assigned seq reaches the table
+  // with a payload that agrees with its column. The genuine concurrency
+  // evidence is the two cases below it — the hand-rolled naive collision,
+  // and the two-independent-stores case with its CAS-failure count.
+  test("A10 (queued): 20 appends issued concurrently execute serially, and give 20 distinct seqs and 20 rows", async () => {
     const store = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
     const results = await Promise.all(
       Array.from({ length: 20 }, (_unused, index) =>
@@ -132,18 +144,32 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     }
   });
 
-  test("A10: two INDEPENDENT store instances over one database stay consistent", async () => {
-    // Separate `D1ThreadStore` objects each carry their own `#logState`,
-    // which is what happens in production: two Worker isolates, or one
-    // isolate before and after a redeploy. Their appends must interleave
-    // without colliding and without either losing a validation.
-    const a = new D1ThreadStore({ db: harness.db, clock: fixedClock(0) });
-    const b = new D1ThreadStore({ db: harness.db, clock: fixedClock(30) });
+  test("A10 (contended): two INDEPENDENT store instances interleave, and the CAS is what makes it safe", async () => {
+    // This is the case that actually exercises the compare-and-swap.
+    // Separate `D1ThreadStore` objects each carry their own `#logState` AND
+    // their own `#queue`, so `#serialise` does NOT order them against each
+    // other — which is production: two Worker isolates, or one isolate
+    // before and after a redeploy.
+    //
+    // The count is the assertion. `casFailures` is incremented whenever a
+    // batch's guarded INSERT wrote zero rows, i.e. whenever the head moved
+    // between an attempt's read and its insert and the retry path ran. A
+    // positive count proves the CAS was hit and recovered from; zero would
+    // mean this test had degenerated into the queued case above.
+    const { db: raced, casFailures, batches } = countingDb(harness.db);
+    const a = new D1ThreadStore({ db: raced, clock: fixedClock(0) });
+    const b = new D1ThreadStore({ db: raced, clock: fixedClock(30) });
     const seqs = await Promise.all([
       ...Array.from({ length: 8 }, (_u, i) => a.append(createThread(`th-a-${i}`, `c-a-${i}`))),
       ...Array.from({ length: 8 }, (_u, i) => b.append(createThread(`th-b-${i}`, `c-b-${i}`))),
     ]);
     expect(new Set(seqs).size).toBe(16);
+    expect([...seqs].sort((x, y) => x - y)).toEqual(Array.from({ length: 16 }, (_u, i) => i + 1));
+    // The CAS was genuinely contended: at least one insert was refused and
+    // retried. Without this the test would pass just as happily against an
+    // allocator with no guard at all.
+    expect(casFailures()).toBeGreaterThan(0);
+    expect(batches()).toBeGreaterThan(16);
     const counted = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
     expect(counted?.n).toBe(16);
     // Both instances see the whole log, so a caller that reads through
@@ -234,6 +260,62 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // The winner's payloads are intact — the loser's batch overwrote none
     // of them, which a per-statement commit would have done.
     expect(JSON.parse((rows.results?.[0]?.payload ?? "{}").toString()).threadId).toBe("th-pub-1");
+  });
+
+  // ── head() on a NON-EMPTY log (the #76 review's I1) ──────────────────
+  test("head() reads MAX(seq) from D1, so it is right on a log this instance never appended to", async () => {
+    // The bug: `#head` started at 0 and only `append`/`import` moved it,
+    // while `src/index.ts` builds a fresh store per request — so a
+    // non-empty log reported `head: 0`. The test that missed it asserted
+    // only the EMPTY case, which is the one that was correct.
+    //
+    // Gapped on purpose (1, 2, 3, 7): the bridge imports archives that do
+    // not start at 1, and a `MAX`-based head has to be indifferent to the
+    // gap. `SqliteThreadStore` re-reads `max(seq)` at construction, so this
+    // also stops the two implementations of the same method name from
+    // disagreeing.
+    for (const seq of [1, 2, 3, 7]) {
+      await harness.db
+        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+        .bind(
+          seq,
+          `2026-10-03T12:00:0${seq}Z`,
+          JSON.stringify({
+            seq,
+            ts: `2026-10-03T12:00:0${seq}Z`,
+            actor: { kind: "gh-user", id: "gerchowl" },
+            kind: "comment.created",
+            threadId: `th-head-${seq}`,
+            commentId: `c-head-${seq}`,
+            anchor: {
+              path: "docs/a.mdx",
+              startLine: 1,
+              endLine: 1,
+              quote: { exact: "x", prefix: "", suffix: "" },
+              revision: "b".repeat(64),
+            },
+            body: "head probe",
+          }),
+        )
+        .run();
+    }
+
+    const fresh = new D1ThreadStore({ db: harness.db });
+    // The instance's own watermark is honestly still 0 — it has validated
+    // nothing — and `head()` must not be that number.
+    expect(fresh.validatedHead()).toBe(0);
+    expect(await fresh.head()).toBe(7);
+
+    // A store that HAS appended agrees with the table.
+    const appended = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+    const seq = await appended.append(createThread("th-head-new", "c-head-new"));
+    expect(seq).toBe(8);
+    expect(await appended.head()).toBe(8);
+    expect(appended.validatedHead()).toBe(8);
+
+    // And on an empty table it is still 0, so the empty case did not regress.
+    await harness.db.prepare("DELETE FROM events").run();
+    expect(await new D1ThreadStore({ db: harness.db }).head()).toBe(0);
   });
 
   // ── A13 ───────────────────────────────────────────────────────────────
@@ -327,6 +409,44 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     expect(after?.n).toBe(before?.n ?? 0);
   });
 });
+
+/** A `D1Database` proxy that COUNTS compare-and-swap failures.
+ *
+ * `D1ThreadStore`'s append batch is three statements, and the third is the
+ * guarded `INSERT ... WHERE MAX(seq) = <expected>`. So "the guarded insert
+ * wrote zero rows" is observable from the batch's own results: `meta.changes`
+ * of 0 on the LAST statement, while the batch as a whole succeeded. That is
+ * the CAS failing and the store about to retry, and counting it is what turns
+ * "the appends were issued concurrently" into "the CAS was exercised".
+ *
+ * Deliberately reads the SHAPE rather than reaching into the store: a test
+ * that had to import a counter the production code maintains for its own
+ * sake would be measuring the instrumentation as much as the behaviour. */
+function countingDb(db: D1Database): { db: D1Database; casFailures: () => number; batches: () => number } {
+  let failures = 0;
+  let count = 0;
+  const proxy = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "batch") {
+        return async (statements: unknown) => {
+          const results = (await (target.batch as (input: unknown) => Promise<D1Result[]>)(statements)) ?? [];
+          count += 1;
+          const last = results[results.length - 1];
+          const statements_ = statements as { length: number } | undefined;
+          // Only the append batch ends in a guarded INSERT, and it always
+          // has three statements; an import batch has one per event.
+          if (statements_?.length === 3 && (last?.meta?.changes ?? 0) === 0) {
+            failures += 1;
+          }
+          return results;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return { db: proxy as D1Database, casFailures: () => failures, batches: () => count };
+}
 
 /** A `D1Database` whose `batch` runs `onBatch` FIRST, then delegates.
  * Used only to open the read-then-insert window deterministically. */

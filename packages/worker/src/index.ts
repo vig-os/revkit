@@ -23,25 +23,27 @@
 //
 // ── ADR-0012 on day one ────────────────────────────────────────────────────
 //
-// The state-changing endpoint is DELIBERATELY DISABLED. ADR-0012 requires
-// a per-session CSRF token in a header on every state-changing call, and
-// slice 1 has no session — no invite has been minted, no cookie issued,
-// no CSRF token exists to check. Shipping `POST` anyway would put a
-// documented ADR-0012 violation in the first line of hosted code, in the
-// one ADR whose subject is "do not do this". Append is therefore proven
-// through `test/store-conformance.test.ts` against the same `D1ThreadStore`
-// object this handler constructs, which tests the code path without
-// opening an unauthorised one. **Slice 2 (invite links + session exchange,
-// which is where ADR-0012's CSRF token becomes real) removes the 501.**
+// `/api/threads` answers **501 for every verb**, read and write. ADR-0012
+// requires authorization on EVERY request — a GitHub session must still have
+// read access to the repo, a guest invite must be checked for scope, type and
+// expiry — and slice 1 has neither a session nor a `TokenSource` to
+// authorize with. Shipping either verb would put a documented ADR-0012
+// violation in the first line of hosted code, in the one ADR whose subject is
+// "do not do this". See `handleThreads`'s own header for why the READ is the
+// larger of the two exposures.
 //
-// Reading is `GET`, so ADR-0012's CSRF rule does not bite — but its
-// per-request AUTHORIZATION rule does, and slice 1 has no `TokenSource` to
-// authorise with. That gap is closed structurally rather than by a comment:
-// `wrangler.jsonc` sets `workers_dev: false` and declares no `routes`, so
-// this Worker has no public URL until `revkit deploy init` provisions one,
-// and provisioning is owner-gated (#34) and sequenced after slice 2's
-// sessions. See the residual-risk note in the PR body — the gap is real and
-// the mitigation is a config flag, not an authentication check.
+// Read and append are still fully proven — just not over HTTP. The shared
+// conformance suite (`packages/review-core/test/store-conformance.ts`) runs
+// the same 19 cases against all three `ThreadStore` implementations, and
+// `test/d1-store.test.ts` proves the `?since=` catch-up and the
+// `exportArchive`/`import` bridge between D1 and an in-memory store.
+//
+// `workers_dev: false` in `wrangler.jsonc` stays as DEFENCE IN DEPTH, and
+// nothing more: it means there is no `*.workers.dev` URL, so a mistake here
+// is not immediately public. It is a tripwire, NOT an authorization check —
+// it evaporates the moment slice 3 or slice 5 adds a `routes` entry, and it
+// never held for `wrangler dev --remote`. The authorization this Worker
+// actually performs is: none.
 
 import { D1ThreadStore } from "./d1-store.ts";
 import {
@@ -51,7 +53,7 @@ import {
   requestOrigin,
   workerHeaderContext,
 } from "./headers.ts";
-import { createLogger, newRequestId, type Logger } from "./logger.ts";
+import { createLogger, newRequestId, type Logger, type LogMessage } from "./logger.ts";
 import { isRevkitBundlePath, parsePreviewPath } from "./router.ts";
 
 // NOTE: this module exports its DEFAULT ONLY. A Worker entry may export
@@ -149,7 +151,7 @@ export default {
       }
 
       if (url.pathname === "/api/threads") {
-        return await handleThreads(request, method, url, env, scope);
+        return handleThreads(request, method, env, scope);
       }
 
       // ADR-0012: `/_revkit/` NEVER redirects — a browser drops the path
@@ -193,52 +195,63 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
+/** Everything under `/api/threads` is DISABLED in slice 1 — read AND
+ * write. Both verbs answer the same 501 with the same body shape, and both
+ * name the slice that enables them.
+ *
+ * **Why GET is closed too.** An earlier revision left `GET` open and argued
+ * that ADR-0012's CSRF rule does not bite a read. That argument was wrong
+ * twice over. ADR-0012 requires **"Authorization per request"** — a GitHub
+ * session must still have read access to the repo, an invite must be checked
+ * for scope/type/expiry — and that is unconditional, so it applies verbatim
+ * to `GET`. And the read is the LARGER exposure: a state-changing call at
+ * least has CSRF to stop a cross-origin forgery, whereas an open `GET` needs
+ * no browser, no user interaction and no bypass at all — and it returns
+ * comment bodies, which is exactly what ADR-0015 protects.
+ *
+ * **What is NOT lost.** Read and append stay fully proven, just not over
+ * HTTP: `packages/review-core/test/store-conformance.ts` runs the same 19
+ * cases against all three stores, and `test/d1-store.test.ts` proves the
+ * `?since=` log catch-up and the `exportArchive`/`import` bridge in both
+ * directions between D1 and an in-memory store.
+ *
+ * ENABLED BY: M4 slice 2 — invite links + session exchange, which is where
+ * ADR-0012's per-session authorization (and its CSRF token) becomes real.
+ * The `GET` branch then checks the caller's session and repo access before
+ * constructing a store; the `POST` branch additionally checks the CSRF
+ * token before touching `append`. */
+function disabled(scope: RequestScope, msg: LogMessage, detail: string): Response {
+  scope.logger.log("info", msg, {});
+  return json(
+    {
+      error: "not-implemented",
+      enabledIn: "M4 slice 2 (invite links, sessions + ADR-0012 per-request authorization)",
+      detail,
+    },
+    501,
+    scope,
+  );
+}
+
 async function handleThreads(
   request: Request,
   method: string,
-  url: URL,
   env: Env,
   scope: RequestScope,
 ): Promise<Response> {
   if (method === "GET") {
-    const store = new D1ThreadStore({ db: env.DB });
-    const sinceParam = url.searchParams.get("since");
-    if (sinceParam === null) {
-      // No `since`: the caller wants the derived view.
-      const threads = await store.threads();
-      return json({ head: store.head(), threads }, 200, scope);
-    }
-    // `since=<n>`: the caller is reconnecting and wants the log. The two
-    // shapes are separate on purpose — `since` is the store's own method
-    // name, and a response that mixed a projection into a log catch-up
-    // would force every client to know which half it wanted.
-    const parsed = Number.parseInt(sinceParam, 10);
-    if (!Number.isSafeInteger(parsed) || parsed < 0) {
-      return json({ error: "bad-request", detail: "since must be a non-negative integer" }, 400, scope);
-    }
-    const events = await store.since(parsed);
-    return json({ head: store.head(), events }, 200, scope);
+    return disabled(
+      scope,
+      "api.threads.read.disabled",
+      "ADR-0012 requires authorization on every request; slice 1 has no session, so the read is closed rather than exposed.",
+    );
   }
 
   if (method === "POST") {
-    // DISABLED — see the module header. ADR-0012 requires a per-session
-    // CSRF token on every state-changing call, and no session exists in
-    // slice 1. Append is proven against the same `D1ThreadStore` in
-    // `test/store-conformance.test.ts`.
-    //
-    // ENABLED BY: M4 slice 2 — invite links + session exchange, which is
-    // where ADR-0012's per-session CSRF token becomes real. This branch
-    // then checks the token and the session's identity before touching
-    // `append`.
-    scope.logger.log("info", "api.threads.append.disabled", {});
-    return json(
-      {
-        error: "not-implemented",
-        enabledIn: "M4 slice 2 (invite links + ADR-0012 per-session CSRF)",
-        detail: "ADR-0012 requires a per-session CSRF token on every state-changing call; slice 1 has no session.",
-      },
-      501,
+    return disabled(
       scope,
+      "api.threads.append.disabled",
+      "ADR-0012 requires a per-session CSRF token on every state-changing call; slice 1 has no session.",
     );
   }
 

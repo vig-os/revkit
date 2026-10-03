@@ -1,10 +1,17 @@
 -- M4 slice 1 initial schema for the hosted Worker (issue #9).
 --
--- Applied out of band with `wrangler d1 migrations apply` — the Worker
--- itself NEVER runs DDL on boot, so a request can never be the thing
--- that creates a table. Every statement is `IF NOT EXISTS`, so applying
--- this file twice is a no-op (acceptance A15) and a partially-applied
--- database converges rather than erroring.
+-- Applied OUT OF BAND by whoever provisions the database — the Worker
+-- itself NEVER runs DDL on boot, so a request can never be the thing that
+-- creates a table. ADR-0008 puts that step in `revkit deploy init`
+-- (owner-gated, #34); the wrangler verb that applies this directory is
+-- `wrangler d1 migrations apply <database>`, which reads `migrations_dir`
+-- (it does NOT take a `--file` flag — there is no such option on that
+-- subcommand). Until then the test harness applies it, one statement at a
+-- time, from THIS file.
+--
+-- Every statement is `IF NOT EXISTS`, so applying this file twice is a
+-- no-op (acceptance A15) and a partially-applied database converges rather
+-- than erroring.
 --
 -- There is deliberately ONE DDL file for the hosted store, not a second
 -- copy under `src/`: two copies of one migration drift, and the
@@ -21,6 +28,18 @@
 -- platform's problem, not the schema's. `D1ThreadStore` re-derives the
 -- concurrency discipline those pragmas used to provide — see the
 -- `db.batch([...])` note in `src/d1-store.ts`.
+--
+-- One note on the `--` comments in this file, since they are deliberate.
+-- Two facts, both read rather than assumed:
+--   - wrangler splits a migration file with its own `splitSqlIntoStatements`
+--     (wrangler 4.93.0, `pkgs.wrangler`, read in the nix store), which
+--     consumes `--` line comments and block comments and then drops empty
+--     chunks. So comments never reach D1 as statements.
+--   - wrangler's `trimSqlQuery` rejects a file containing a TRANSACTION
+--     wrapper, and its only test is for the literal `BEGIN TRANSACTION`.
+--     This file contains no such statement. It says `BEGIN IMMEDIATE` in
+--     the comment above, which is a different string and is not a
+--     transaction this file opens.
 
 -- ---------------------------------------------------------------------------
 -- The event log (ADR-0006). One row per appended event; `seq` is the
