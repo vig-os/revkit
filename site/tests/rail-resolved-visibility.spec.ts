@@ -787,3 +787,217 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #63: the seen-state bucket is keyed by the daemon's persistent
+// `.revkit/repo-id`, and an ORIGIN is `127.0.0.1:<port>` — so two repos
+// served one after the other on the same fixed `--port` share one
+// `localStorage`. Pre-fix, `migrateSeenStorage` merged every
+// `revkit.rail.seen.v1*` bucket into the current repo's and deleted the
+// rest, so opening repo Y wiped repo X's acks.
+//
+// The unit tests in `packages/cli/test/rail/unread.test.ts` pin the
+// storage contract against a Map stand-in. This block pins the WIRING
+// through the real daemon and the browser's real `Storage`: three daemon
+// boots on ONE port, two repo roots, two `.revkit/repo-id`s, one browser
+// profile. It is also the only coverage that runs against an actual
+// `Storage` implementation rather than a stand-in — `Object.keys` order,
+// `key(i)` enumeration and the quota surface are all browser behaviour a
+// Map cannot stand in for.
+//
+// Fast by construction: `--dir <built dist>` is passed, so `revkit serve`
+// never reaches its auto-build branch (see `serve/cli.ts`); the fixture
+// pages are written straight into the built dist; and the only cost is
+// three daemon boots, each of which compiles the rail bundle once.
+test.describe("rail seen-state across two repos on one origin (issue #63) @chromium-only", () => {
+  test.skip(({ browserName }) => browserName !== "chromium", "chromium-only");
+  test.setTimeout(120_000);
+
+  const SEEN_PREFIX = "revkit.rail.seen.v1";
+  const SEEN_INDEX_KEY = "revkit.rail.seen.index.v1";
+
+  /** A repo root with one source doc the daemon can resolve an
+   * anchor against. Two of these = two different `.revkit/repo-id`s. */
+  function seedRepoRoot(name: string, sourceRelPath: string): string {
+    const root = mkdtempSync(join(tmpdir(), `revkit-63-${name}-`));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+    writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
+    mkdirSync(join(root, dirname(sourceRelPath)), { recursive: true });
+    writeFileSync(
+      join(root, sourceRelPath),
+      "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+      "utf8",
+    );
+    return root;
+  }
+
+  /** A served page whose stamped block anchors at `sourceRelPath`, so
+   * repo X's page only ever lists repo X's threads. */
+  function writeRepoPage(sourceRelPath: string): { relPath: string; cleanup: () => void } {
+    fixtureCounter += 1;
+    const relPath = `rail-63-fixture-${process.pid}-${fixtureCounter}.html`;
+    const abs = join(DIST, relPath);
+    writeFileSync(
+      abs,
+      `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail 63 fixture</title></head>
+       <body>
+         <main>
+           <h1 data-src="${sourceRelPath}:1-1">Rail issue #63 fixture</h1>
+           <p id="target" data-src="${sourceRelPath}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
+         </main>
+       </body></html>`,
+      "utf8",
+    );
+    return {
+      relPath,
+      cleanup: (): void => {
+        try {
+          rmSync(abs, { force: true });
+        } catch {
+          // ignore
+        }
+      },
+    };
+  }
+
+  /** Every `revkit.rail.seen*` entry in the page's real
+   * `localStorage`, read through the DOM Storage API rather than a JS
+   * object literal so enumeration order and the key list are the
+   * browser's. */
+  async function readSeenStorage(page: Page): Promise<Record<string, string>> {
+    return page.evaluate(
+      ({ prefix, indexKey }): Record<string, string> => {
+        const out: Record<string, string> = {};
+        for (let i = 0; i < localStorage.length; i += 1) {
+          const key = localStorage.key(i);
+          if (key === null) continue;
+          if (key === prefix || key.startsWith(`${prefix}.`) || key === indexKey) {
+            out[key] = localStorage.getItem(key) ?? "";
+          }
+        }
+        return out;
+      },
+      { prefix: SEEN_PREFIX, indexKey: SEEN_INDEX_KEY },
+    );
+  }
+
+  function repoIdOf(root: string): string {
+    return readFileSync(join(root, ".revkit", "repo-id"), "utf8").trim();
+  }
+
+  /** Post an agent reply so the thread carries agent activity and the
+   * unread pill fires; the reviewer then acknowledges it. */
+  async function agentReply(daemon: DaemonCtx, threadId: string, parentId: string, body: string): Promise<void> {
+    const response = await fetch(
+      `${daemon.url}/api/threads/${encodeURIComponent(threadId)}/replies`,
+      {
+        method: "POST",
+        headers: {
+          host: `127.0.0.1:${daemon.port}`,
+          authorization: `Bearer ${daemon.agentToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId, body }),
+      },
+    );
+    expect(response.status).toBe(201);
+  }
+
+  async function firstThread(daemon: DaemonCtx): Promise<{ id: string; parentId: string }> {
+    const response = await fetch(`${daemon.url}/api/threads`, {
+      headers: {
+        host: `127.0.0.1:${daemon.port}`,
+        authorization: `Bearer ${daemon.agentToken}`,
+        accept: "application/json",
+      },
+    });
+    const list = (await response.json()) as {
+      threads: ReadonlyArray<{ id: string; comments: ReadonlyArray<{ id: string }> }>;
+    };
+    const thread = list.threads[0];
+    const comment = thread?.comments[0];
+    if (thread === undefined || comment === undefined) throw new Error("no thread on the daemon");
+    return { id: thread.id, parentId: comment.id };
+  }
+
+  test("repo X's seen marks survive opening repo Y on the same fixed --port", async ({ page }) => {
+    const sourceX = "docs/adr/9001-repo-x.md";
+    const sourceY = "docs/adr/9002-repo-y.md";
+    const rootX = seedRepoRoot("repo-x", sourceX);
+    const rootY = seedRepoRoot("repo-y", sourceY);
+    const pageX = writeRepoPage(sourceX);
+    const pageY = writeRepoPage(sourceY);
+    // Boot repo X on an ephemeral port, then reuse THAT number for the
+    // other two boots — same origin, therefore same localStorage.
+    let daemon = await bootDaemon({ root: rootX });
+    const port = daemon.port;
+    try {
+      const bucketX = `${SEEN_PREFIX}.${repoIdOf(rootX)}`;
+
+      // ── Repo X: raise a thread, let the agent answer, acknowledge ──
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${pageX.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      await page.getByTestId("revkit-rail-composer-input").fill("X: what should this say?");
+      await page.getByTestId("revkit-rail-submit").click();
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      const x = await firstThread(daemon);
+      await agentReply(daemon, x.id, x.parentId, "X: ack");
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeVisible({ timeout: 5_000 });
+      await page.getByTestId("revkit-rail-thread").click();
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+
+      const afterX = await readSeenStorage(page);
+      expect(Object.keys(JSON.parse(afterX[bucketX]!) as Record<string, string>)).toEqual([x.id]);
+
+      // ── Repo Y on the SAME port: a different repoId, same origin ──
+      await shutdown(daemon, { keepRoot: true });
+      daemon = await bootDaemon({ root: rootY, port });
+      const navY = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(navY?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${pageY.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+
+      // Y has now started, so it has minted its own repo id — the
+      // whole premise: two ids, one origin.
+      const bucketY = `${SEEN_PREFIX}.${repoIdOf(rootY)}`;
+      expect(repoIdOf(rootY)).not.toBe(repoIdOf(rootX));
+
+      const afterY = await readSeenStorage(page);
+      // Load-bearing: repo X's bucket is still there, byte for byte.
+      // Pre-fix this key was gone — `migrateSeenStorage` had merged it
+      // into Y's bucket and deleted it.
+      expect(afterY[bucketX]).toBe(afterX[bucketX]);
+      expect(Object.keys(JSON.parse(afterY[bucketX]!) as Record<string, string>)).toEqual([x.id]);
+      // Y's bucket exists in its own right…
+      expect(afterY[bucketY]).toBeDefined();
+      // …and X's mark was NOT folded across the repo boundary.
+      expect(JSON.parse(afterY[bucketY]!)).toEqual({});
+
+      // ── Back to repo X on the same port: the ack is still in force ──
+      await shutdown(daemon, { keepRoot: true });
+      daemon = await bootDaemon({ root: rootX, port });
+      const navBack = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(navBack?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${pageX.relPath}`);
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
+      // The user-visible claim of this whole fix: no re-ack needed.
+      await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
+      const afterBack = await readSeenStorage(page);
+      expect(afterBack[bucketX]).toBe(afterX[bucketX]);
+      // The index vouches for both repos, LRU order: this leg
+      // touched X again (mounts went X → Y → X), so Y is now the
+      // least-recently used and leads the oldest-first list.
+      expect(JSON.parse(afterBack[SEEN_INDEX_KEY]!)).toEqual([bucketY, bucketX]);
+    } finally {
+      pageX.cleanup();
+      pageY.cleanup();
+      await shutdown(daemon);
+      rmSync(rootX, { recursive: true, force: true });
+      rmSync(rootY, { recursive: true, force: true });
+    }
+  });
+});
