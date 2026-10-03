@@ -96,6 +96,7 @@ Wiring the re-anchoring engine (M2 item 5a) into the live daemon (`revkit serve`
 - **Channel notice.** The MCP channel server surfaces re-anchor and orphan events as short, escaped notifications
   to the agent — enough for the agent to update its own state or explain the transition to the human. The
   existing tag-forgery escape (`escapeContentFragment`) applies to every field before it lands in `content`.
+
 ## Amendment (PR-43 round-5): the `unanchored` anchor kind
 
 An imported thread whose source content cannot be fetched (blob deleted / binary / truncated / diffHunk verification
@@ -123,3 +124,79 @@ Round-5 replaces the placeholder with a **new anchor kind: `unanchored`**. Schem
 
 The existing line-anchor schema is unchanged — line anchors have no `kind` field on the wire. `anyAnchorSchema` is
 the discriminated union used by `comment.created.anchor` and `Thread.anchor`.
+
+## Amendment (2026-10-03, issue #49): watcher re-arm, and the orphan-check memo
+
+Trigger 2 above ("**File watcher on anchored source files** … `fs.watch` with a `stat`-poll fallback") is the
+mechanism this amendment pins down. Two corrections, both from #49.
+
+**1. A rebound directory is re-armed onto `fs.watch` once it is observably stable — where the runtime allows it.**
+The previous rule was blunt: after any rebind the daemon installed the `stat`-poll and the directory stayed on 2 s
+polling for the rest of its life. That was correct, but a rebound directory could never go back to `fs.watch`, so it
+paid the poll's 2 s worst-case detection latency indefinitely.
+
+**The re-arm is gated on runtime behaviour, and the gate is narrow.** `DirectoryWatcher.everWatched` records whether
+a `fs.watch` registration ever succeeded on that canonical path; the rebind probe re-arms **only** when it is false.
+So the re-arm fires for exactly two shapes:
+
+- the directory did not exist when the watcher was installed (so nothing was ever registered on that path), and
+- `watch()` threw before registering.
+
+**The common rename-swap and `rm -rf` shapes are NOT in that set.** A directory whose inode has been replaced has
+necessarily carried a registration, so `everWatched` is true and it keeps the `stat`-poll. The 2 s worst-case
+detection latency therefore remains in place for those directories; #49 narrowed the gap, it did not close it.
+
+**Why the gate exists, and what it is not.** The re-arm was withheld from swap-damaged paths because on
+`bun 1.3.13` a re-armed `fs.watch` on such a path receives **zero events**. That is a bug in **Bun's `fs.watch`
+implementation**, not a property of the kernel, of inotify, or of Node — established by re-running one identical
+probe script under three layers on the same kernel (`6.8.0-31-generic`), the same filesystem and the same directory
+shape:
+
+| layer | re-arm after `renameSync(dir, …)` + `mkdirSync(dir)` |
+|---|---|
+| raw `inotify_add_watch` via `ctypes`, bypassing every runtime wrapper | **signals** — allocates a NEW `wd` |
+| `node v24.21.0` `fs.watch` | **signals** |
+| `bun 1.3.13` `fs.watch` | **silent** |
+
+Under `bun 1.3.13` the re-arm is also silent via the `dir + "/."` spelling, after `rm -rf` + `mkdir`, and after a
+re-arm that is immediately followed by an atomic rename-save; a recursive watch on an ancestor never sees the
+recreated directory's writes. The same five shapes all **signal** under `node v24.21.0`. A control fresh watch
+signals under both. The claim is therefore **version-specific to Bun 1.3.13** and must be re-measured, not
+re-inherited, on any Bun bump.
+
+**What to do about it.** Report and track the Bun defect upstream, and cross-check this behaviour under Node before
+concluding anything about a watcher's viability on a given machine. It is explicitly **not** a reason to introduce a
+native inotify binding: inotify is demonstrably healthy, so a binding would add a dependency to route around a bug
+in one runtime. `node`'s `fs.watch` also does not show Bun's one-re-arm-per-path-spelling limit (a never-watched
+symlink path re-armed across three consecutive swaps signals under Node, but only on the first under Bun), which is
+further evidence that the ceiling is Bun's rather than the platform's.
+
+**"Stable" is derived from observable state, not slept.** A rebound directory is stable when `dirStableIntervals`
+consecutive probe ticks (`DEFAULT_DIR_STABLE_INTERVALS` = 3, on the existing `dirRebindIntervalMs` cadence) each find:
+no rebind performed, no watch error, and an unchanged `(dev, ino)`. Any of those resets the count to zero, as does
+every re-arm attempt. The count advances on the periodic probe only — `reconcileWatchers` runs the same routine, and
+letting a `POST /api/threads` advance it would make "N intervals" mean "N events". No new timer and no new sleep
+constant is introduced. `poll: true` (the `--poll` escape hatch for WSL / FUSE / bind mounts) is never re-armed: the
+caller asked for the poll.
+
+**Polling remains the fallback, and the switchover is quiet.** The poll carries the directory until the re-arm lands,
+and is torn down only once a watcher is *actually* live — a failed re-arm degrades to the previous behaviour, never
+to a blind directory, so the debounce-vs-poll race is not reintroduced. Because the poll was live right up to the
+swap, the poll→watch handover uses the poll's own `(mtime, size)` snapshot as its baseline and fires only the paths
+that actually moved, instead of the blind all-paths fan-out a fresh install needs (round-4 blocker G(b)). A watcher
+merely holding still therefore reads no files at all — the re-arm is not a rebuild trigger.
+
+**The gate is deliberately conservative, and that is its safe failure mode.** If a future Bun recovers, the daemon
+keeps the `stat`-poll on those directories: correct but 2 s slower, never blind. Relaxing the gate is then a
+deliberate act, gated on the runtime probe in
+`packages/cli/test/serve/watcher-rearm.test.ts` ("platform fact") re-reporting that a re-armed Bun watch signals —
+that probe is the signal to re-measure, not the daemon.
+
+**2. The orphan-check memo is pruned on `thread.reanchored`.** `orphanCheckRevision` memoises "this thread was
+already checked against revision R while orphaned" so a repeat refresh at the same revision can skip the pipeline.
+When a thread was un-orphaned the entry was left behind: inert, because the state-derived skip reads
+`anchor.revision` for an `open` thread, but stale until the next `reconcileWatchers`. It is now deleted the moment
+that thread's own `thread.reanchored` append lands. The prune is keyed on **that thread's** explicit re-anchor and is
+never a sweep, so a thread that is still orphaned always keeps the entry its skip test reads — including a sibling
+thread on the *same* file that the same `refresh` pass leaves orphaned. It fires only on a *successful* append,
+since a rejected event leaves the thread orphaned and still in need of its memo.
