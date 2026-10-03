@@ -330,10 +330,11 @@ test_leg_timeout_check := "300"
 test_leg_timeout_e2e := "720"
 
 # `packages/worker` (M4 slice 1, issue #9): miniflare boots a real workerd
-# per test file, so this leg was expected to be expensive — 132 tests
-# measured at 5.0-5.5 s wall on an 88-core host, peak 157 open descriptors,
-# growth 67. It is the CHEAPEST new leg available: three workerd boots and a
-# ~790 KB bundle, against the cli leg's 104 s and 4449 descriptors.
+# per test file, so this leg was expected to be expensive. Measured: 132
+# tests in 5.0-5.5 s, and inside `run_leg` a peak of 159 open descriptors
+# with 44 of growth. It is the CHEAPEST new leg available — three workerd
+# boots and a ~790 KB bundle, against the cli leg's 104 s and 4449
+# descriptors.
 #
 # 180 s is 36x the measured time, the same floor the other sub-minute legs
 # (review-core, site/schemas) use. It is deliberately NOT tighter than that,
