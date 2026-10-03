@@ -174,7 +174,7 @@ export {
   type SpanClass,
 } from "./reanchor.ts";
 export { reduce } from "./reducer.ts";
-export { GIT_COMMIT_HEX_REGEX, GIT_SHA_HEX_REGEX, SHA256_HEX_REGEX, revisionOf } from "./revision.ts";
+export { GIT_COMMIT_HEX_REGEX, SHA256_HEX_REGEX, revisionOf } from "./revision.ts";
 export {
   CURRENT_SCHEMA_VERSION,
   acceptedSchemaVersions,
