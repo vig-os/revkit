@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { mintLaunchUrl } from "./fixtures/launch-code";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
@@ -36,7 +37,6 @@ interface DaemonCtx {
   readonly child: ChildProcess;
   readonly root: string;
   readonly url: string;
-  readonly launchUrl: string;
   readonly agentToken: string;
   readonly port: number;
 }
@@ -76,17 +76,21 @@ async function bootDaemon(): Promise<DaemonCtx> {
     child.kill("SIGTERM");
     throw new Error("daemon never wrote serve.json");
   }
+  // Readiness gate only. The daemon's launch URL is deliberately NOT kept:
+  // the code in it is single-use, so the one field that caused #74's ask-page
+  // cluster has no reason to exist on a ctx at all. Each test mints its own
+  // via `mintLaunchUrl` — see `fixtures/launch-code.ts`.
   const deadline2 = Date.now() + 2000;
+  let announcedLaunch = false;
   while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
+    if (stdoutChunks.join("").match(/launch:\s+(\S+)/) !== null) { announcedLaunch = true; break; }
     await new Promise((r) => setTimeout(r, 20));
   }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
+  if (!announcedLaunch) {
     child.kill("SIGTERM");
     throw new Error("daemon never printed launch URL");
   }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken };
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
@@ -165,27 +169,11 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
     if (ctx !== undefined) await shutdown(ctx);
   });
 
-  /** Round-3: each test uses a FRESH launch URL because the code
-   * is single-use and Playwright creates a new browser context per
-   * test (no cookie carries over). Every test opens the daemon by
-   * minting a new code via `POST /-/launch-code` with the agent
-   * bearer, then navigates to the returned URL. */
-  const freshLaunchUrl = async (): Promise<string> => {
-    const response = await fetch(`${ctx.url}/-/launch-code`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${ctx.agentToken}`,
-        "content-type": "application/json",
-      },
-      body: "{}",
-    });
-    if (!response.ok) throw new Error(`launch mint: ${response.status}`);
-    const parsed = (await response.json()) as { launchUrl: string };
-    return parsed.launchUrl;
-  };
-
+  // Each test opens the daemon with a FRESHLY MINTED launch URL (round-3:
+  // the code is single-use and Playwright gives every test a fresh browser
+  // context, so no cookie carries over). See `fixtures/launch-code.ts`.
   test("mode switch renders and flipping to `live` reaches the daemon", async ({ page }) => {
-    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
+    await page.goto(await mintLaunchUrl(ctx), { waitUntil: "domcontentloaded" });
     await page.goto(`${ctx.url}/${fixture.path}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="revkit-rail"]');
     // Mode fieldset is present with all three options.
@@ -214,7 +202,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   });
 
   test("`@agent now` in a comment renders as an agent-now chip", async ({ page }) => {
-    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
+    await page.goto(await mintLaunchUrl(ctx), { waitUntil: "domcontentloaded" });
     // Force mode to live so posting a comment does not stay batched (the
     // rail's mention rendering is independent of mode, but the flow
     // through-the-daemon assertion is simpler when the comment shows up).
@@ -247,7 +235,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   test("handover flushes on 'Hand over' click (batched → 0)", async ({ page }) => {
     // Ensure mode is handover for this test — the previous test left it
     // in `live`, so reset explicitly.
-    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
+    await page.goto(await mintLaunchUrl(ctx), { waitUntil: "domcontentloaded" });
     await page.evaluate(async () => {
       await fetch("/api/delivery-mode", {
         method: "POST",
@@ -277,7 +265,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   });
 
   test("axe reports no violations with the mode UI + a mention chip on the page", async ({ page }) => {
-    await page.goto(await freshLaunchUrl(), { waitUntil: "domcontentloaded" });
+    await page.goto(await mintLaunchUrl(ctx), { waitUntil: "domcontentloaded" });
     await page.goto(`${ctx.url}/${fixture.path}`, { waitUntil: "domcontentloaded" });
     await page.waitForSelector('[data-testid="revkit-rail"]');
     // Round-2 fix: wait for the delivery-mode UI to be READY before
