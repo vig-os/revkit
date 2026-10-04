@@ -345,6 +345,18 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect((await db().prepare("SELECT COUNT(*) AS n FROM invites").first<{ n: number }>())?.n).toBe(0);
     });
 
+    test("U+212A is refused, because mintInvite VALIDATES before it canonicalises", async () => {
+      // The one input where the order in `mintInvite` changes the outcome:
+      // `canonicalRepoName` is a Unicode fold, so U+212A KELVIN SIGN becomes
+      // "k", which IS a servable repo name. Canonicalising first would mint an
+      // invite for a name the predicate rejects. Every other hostile input folds
+      // to itself, so without this case the swap passes the whole suite.
+      const result = await mintOk(db(), { repo: "\u212A" });
+      expect(result.ok, "the Kelvin sign must not become \"k\"").toBe(false);
+      if (!result.ok) expect(result.refusal).toBe("bad-repo");
+      expect((await db().prepare("SELECT COUNT(*) AS n FROM invites").first<{ n: number }>())?.n).toBe(0);
+    });
+
     test("a bad PR number is refused, and pr: null is not confused with a bad one", async () => {
       for (const pr of [0, -1, 1.5, 1_000_000_000, Number.NaN]) {
         const result = await mintOk(db(), { repo: REPO, pr });
@@ -1095,7 +1107,15 @@ describe("invite mechanics (ADR-0009) against D1", () => {
         // documents for the `"bad-request"` case.
         const code = stripTsComments(readFileSync(join(srcDir, file), "utf8"), { strings: true });
         // Any statement that could put a caller-supplied spelling into the column.
-        if (/\bINSERT\s+INTO\s+invites\b/i.test(code) || /\bUPDATE\s+invites\s+SET\b/i.test(code)) {
+        // `OR IGNORE` / `OR REPLACE` are the shapes a future "mint
+        // idempotently" refactor reaches for, and a bare `INSERT INTO` alternation
+        // misses both — measured: `INSERT OR REPLACE INTO invites` passed this
+        // sweep untouched while the plain form was caught. Match the verb and
+        // allow the conflict clauses rather than one literal spelling.
+        if (
+          /\bINSERT\s+(?:OR\s+(?:IGNORE|REPLACE|ABORT|FAIL|ROLLBACK)\s+)?INTO\s+invites\b/i.test(code) ||
+          /\bUPDATE\s+(?:OR\s+\w+\s+)?invites\s+SET\b/i.test(code)
+        ) {
           if (/\brepo\b/i.test(code)) writers.push(file);
         }
       }
@@ -1336,6 +1356,22 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect(
         scheduledEntryPoints,
         "this harness grew a scheduled-event entry point — see the comment below before touching this",
+      ).toEqual([]);
+      // The name filter above is a **sample**, not the bound: a per-name regex
+      // misses whatever it did not think of. Measured — `dispatchSchedule`,
+      // `dispatchScheduled`, `runScheduledHandlers` and `triggerSchedule` all
+      // land in it, while `dispatchEvent`, `getEntrypoint`, `listHandlers` and
+      // `getHandlers` all sail straight through, and `getEntrypoint` is the name
+      // miniflare's own proxy uses. So pin the two shapes that actually carry a
+      // second entry point: everything under `dispatch*` must be `dispatchFetch`
+      // and nothing may be named for an entrypoint or a handler. Neither asserts
+      // a total count, so an unrelated miniflare upgrade cannot break this.
+      expect([...members].filter((name) => /^dispatch/i.test(name)).sort(), "every dispatch* member").toEqual([
+        "dispatchFetch",
+      ]);
+      expect(
+        [...members].filter((name) => /entrypoint|handler/i.test(name)),
+        "a member named for an entrypoint or handler is a second way in",
       ).toEqual([]);
       // Named specifically as well, because a future miniflare would add it by
       // symmetry with `dispatchFetch` and the pattern above is a heuristic.

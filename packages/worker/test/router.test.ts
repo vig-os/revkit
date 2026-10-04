@@ -182,17 +182,27 @@ describe("canonicalRepoName — the ONE stored spelling of a repository name", (
     expect(canonicalRepoName("ACME")).toBe(canonicalRepoName("aCmE"));
   });
 
-  test("is a CANONICALISER, not a validator — it admits nothing `isRepoName` refuses", () => {
+  test("is a CANONICALISER, not a validator — and the ONE input where that matters is U+212A", () => {
     // Named so a caller does not reach for it as a filter. `mintInvite` calls
-    // `isRepoName` first and this second; the order is what makes folding inert
-    // on the refusal path, and this case is what would fail if someone swapped
-    // them.
+    // `isRepoName` first and `canonicalRepoName` second, and **that order is
+    // load-bearing for exactly one input**.
     for (const hostile of ["../etc", "a/b", "", "rev kit", "<script>", "x".repeat(101)]) {
       expect(isRepoName(hostile), hostile).toBe(false);
-      // Folding such a string does not make it servable — it only changes its
-      // case. The caller must still have refused it.
-      expect(canonicalRepoName(hostile)).toBe(hostile.toLowerCase());
+      expect(canonicalRepoName(hostile), hostile).toBe(hostile.toLowerCase());
     }
+  });
+
+  test("U+212A KELVIN SIGN is why the order is load-bearing, and it is a UNICODE fold", () => {
+    // `canonicalRepoName` is `String.prototype.toLowerCase`, which is a UNICODE
+    // fold, not the ASCII fold a reader would assume from "a repo name". U+212A
+    // folds to "k", and `isRepoName("k")` is TRUE. So folding FIRST would admit a
+    // repository name the predicate refuses — and U+212A is the *only* such code
+    // point up to U+2FFFF, which is why every other hostile input above folds to
+    // itself and cannot detect the swap.
+    const KELVIN = "\u212A";
+    expect(isRepoName(KELVIN), "the predicate refuses the Kelvin sign").toBe(false);
+    expect(canonicalRepoName(KELVIN), "a Unicode fold turns it into k").toBe("k");
+    expect(isRepoName("k"), "and k is servable — so order decides the outcome").toBe(true);
   });
 
   test("the ROUTE is untouched: a path's repo segment is still verbatim", () => {

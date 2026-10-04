@@ -195,12 +195,20 @@ one. That is fail-closed (a guest scoped to `revkit` is refused `403` there, and
 an `operator` reads an empty log), and it is a **deliberate choice rather than an
 oversight**: GitHub repository names are case-insensitive, so normalising here
 would mean guessing which spelling the operator minted an invite with, and a
-guess that is sometimes wrong is a scope decision made by the wrong party. The
-cost is real and worth stating: **an operator who mints `repo = "Revkit"` and
-serves `/revkit/` refuses that guest their own review.** The fix, when it is
-wanted, is to normalise at MINT time (`mintInvite` lowercases the repo into the
-row) so one spelling is canonical from the start — not to fold case at read time.
-`test/authorization.test.ts` asserts the fail-closed direction for both principals.
+guess that is sometimes wrong is a scope decision made by the wrong party.
+
+**The mint side is canonicalised, and the read side deliberately is not.** `mintInvite`
+stores `canonicalRepoName(input.repo)`, so an operator who mints `repo = "Revkit"`
+and serves `/revkit/` now resolves that guest's own review instead of refusing it.
+The **route** still compares exactly, so `/REVKIT/pr-7` continues to name a
+*different* review and continues to fail closed. The remaining cost is real and
+worth stating: **an invite minted `Revkit` now matches `/revkit/` and no longer
+matches `/Revkit/`.** Folding at read time instead would make `/REVKIT/` and
+`/revkit/` one review and would move the log key, which **is** the R2 partition.
+`test/authorization.test.ts` asserts the fail-closed direction for both principals;
+`test/router.test.ts` pins the fold's boundary (a Unicode fold is not an ASCII one —
+`U+212A KELVIN SIGN` folds to `k`, which `isRepoName` accepts, so callers must
+validate before folding).
 
 `?since=` accepts one canonical form: `0` or a decimal integer with no sign, no
 leading zero, no radix prefix, no exponent, no decimal point, no whitespace, and at
