@@ -13,7 +13,9 @@ mentions it.
 |---|---|---|
 | Worker entry | `src/index.ts` | `GET /healthz`, `GET /api/threads`, `POST /api/session/refresh`, `GET /invite/<token>`, `POST /invite/redeem`, `POST /api/threads` (**disabled**) |
 | Invites | `src/invites.ts` | ADR-0009's mint / redeem / revoke, the browser binding, and the per-call grant the gate checks |
-| Invite pages | `src/invite-page.ts` | the display-name form and the closed/rate-limited pages — no script, no reflected input |
+| Invite pages | `src/invite-page.ts` | the display-name form and the closed/rate-limited pages — one external script, no inline script, no reflected input |
+| Client script | `src/client-script.ts` | the ONE script the Worker serves: it rewrites the address bar to `/invite/` with `history.replaceState` so the invite token does not survive in history |
+| Client asset | `src/client-asset.ts` | `/_revkit/<version>/invite-<sha256>.js` — the content-addressed name, the digest it is derived from, and the exact-match rule everything else 404s against |
 | Abuse limits | `src/rate-limit.ts` | ADR-0012's per-invite and per-address counters (D1-backed; see the ADR amendment) |
 | Invite tokens | `src/invite-token.ts` | the HMAC-SHA-256 hasher and its no-fallback key rule (ADR-0012's "stored as HMAC") |
 | Retention | `src/retention.ts` | ADR-0015's 30-day guest anonymisation |
@@ -117,7 +119,7 @@ whose value does not resolve to a live row.
 ## The gate: ADR-0012's per-request authorization
 
 One function, `authorizeRequest` in `src/authz.ts`, in front of every route except
-`/healthz`, the `/_revkit/` bundle path and the 404s. It answers, in this order:
+`/healthz`, the `/_revkit/` client-asset path and the 404s. It answers, in this order:
 
 1. **Session.** The `__Host-revkit_session` cookie, base64url, 256 bits from
    `crypto.getRandomValues`. Resolved by `sha256(cookie)` against
@@ -169,10 +171,11 @@ written — not relaxing a `default`.
 | `/api/session/refresh` | POST | 200. Rotates the session id *and* the CSRF token, in one D1 batch, so a stolen cookie dies at the next refresh. |
 | `/api/session/refresh` | other verbs | 405, **behind the gate**, so route existence is not enumerable anonymously |
 | `/<repo>/pr-<n>/api/threads` | other verbs | 405, in the review's scope, **behind the gate** |
-| `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no script, no reflected input) plus the browser-binding cookie — **minted only when the browser has none**, so re-opening the mail link does not rotate the binding a live session depends on; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
+| `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no inline script, no reflected input, plus one external `<script src>` on the allowlisted path) plus the browser-binding cookie — **minted only when the browser has none**, so re-opening the mail link does not rotate the binding a live session depends on; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
 | `/invite/redeem` | **POST only** | 303 to a **token-free** path, with two `Set-Cookie`s (session + browser binding) and the CSRF token; 410 the same closed page; 429; 415 unless `application/json` **or `application/x-www-form-urlencoded`**; 400 for an unreadable body. The form encoding exists because the Worker SHIPS a form: `src/invite-page.ts` emits no `enctype`, so a browser submits `x-www-form-urlencoded` and a JSON-only route answers the shipped page with `415`. A repeated form field is refused outright (JSON's repeated-key "last wins" is left as-is and asserted separately). |
 | `/<repo>/pr-<n>/…` (not the API) | any | 501 — **behind the gate**, carrying the same **scope** as the API inside it. The R2 preview surface is the rest of slice 5. |
-| `/_revkit/…` | any | 404, never a redirect (ADR-0012) |
+| `/_revkit/<version>/invite-<sha256>.js` | any | **200, the one client script** (slice 5b). `text/javascript; charset=utf-8`, `nosniff`, `Cache-Control: public, max-age=31536000, immutable`, and **no CSP of its own** — the embedding document's `default-src 'none'` is the control, and a CSP here would deny the document's own load of it. Ungated: the bytes are a compile-time constant (`src/client-script.ts`), so there is nothing to authorize and no `env.DB` on this path. |
+| `/_revkit/…` (anything else) | any | 404, **never a redirect** (ADR-0012 — a browser drops the path part of a CSP source after a redirect, which would widen `script-src`). Every other version, an unhashed name, a mis-hashed name, a `.mjs`/`.html` spelling and the bare `/_revkit/` all miss, by exact string equality against the one name that resolves. |
 | anything else | any | 404 |
 
 **Why the scope is in the PATH and not a query parameter.** The obvious design is

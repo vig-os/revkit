@@ -86,6 +86,21 @@ export const LOG_MESSAGES = [
   "api.threads.append.disabled",
   "invite.denied",
   "invite.opened",
+  // Slice 5b: a `/_revkit/` path that is not the one content-addressed name.
+  // A distinct event because "someone is asking for an asset that does not
+  // exist" is worth seeing on its own — a stale digest after a redeploy, or
+  // probing for an unhashed alias — while `request.end` already records the
+  // 404 and its path. The fields are a CONSTANT: nothing caller-supplied
+  // reaches it, and the pathname itself is already on `request.end`.
+  //
+  // **No hyphen, and that cost a test to learn.** The first spelling was
+  // `asset.not-found`, which type-checks, is in `LOG_MESSAGES`, and was
+  // emitted by the real logger as **`invalid.log.message`** — `EVENT_NAME`
+  // above admits only `[a-z][a-z0-9]*` segments, so a hyphen fails the shape
+  // pre-filter and the name is silently replaced. `test/logger.test.ts`
+  // compared the array against a list and stayed green throughout, because
+  // nothing ran the names through the logger. There is now a case that does.
+  "asset.miss",
   "invite.redeem.ok",
   "invite.redeem.denied",
   "rate.limit.hit",

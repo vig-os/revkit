@@ -44,7 +44,10 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { authorizeRequest, classifyRoute, DENIAL_REASONS, INVITE_OPEN_PREFIX, INVITE_REDEEM_PATH, type Route } from "../src/authz.ts";
-import { FORM_MEDIA_TYPE } from "../src/invite-page.ts";
+import { clientAssetDigest, clientAssetPath } from "../src/client-asset.ts";
+import { INVITE_CLIENT_SCRIPT } from "../src/client-script.ts";
+import { revkitBundlePath } from "../src/headers.ts";
+import { FORM_MEDIA_TYPE, inviteClosedPage, rateLimitedPage, redeemFormPage } from "../src/invite-page.ts";
 import { MAX_REDEEM_BODY_BYTES } from "../src/invites.ts";
 import {
   DEFAULT_SHARE_TYPE,
@@ -88,6 +91,7 @@ import { previewScopePath, scopedThreadsPath } from "../src/router.ts";
 import {
   issueTestSession,
   JSON_HEADERS,
+  readWranglerConfig,
   resetInvites,
   seedLogEvents,
   setCookieValue,
@@ -96,6 +100,17 @@ import {
   testTokenHasher,
   type Harness,
 } from "./harness.ts";
+
+/** The revkit version the harness binds, READ from `wrangler.jsonc` rather than
+ * spelled out — the asset's URL is version-scoped, so a literal here would be a
+ * third copy of a value `test/worker-config.test.ts` already pins against
+ * `packages/cli/package.json`. Guarded, because an undefined version would
+ * quietly build a `/_revkit/undefined/…` URL and 404 for a reason that has
+ * nothing to do with the thing under test. */
+const TEST_REVKIT_VERSION = (readWranglerConfig()["vars"] as Record<string, string> | undefined)?.["REVKIT_VERSION"] ?? "";
+if (!/^\d+\.\d+\.\d+$/.test(TEST_REVKIT_VERSION)) {
+  throw new Error(`wrangler.jsonc must bind a plain REVKIT_VERSION; got ${JSON.stringify(TEST_REVKIT_VERSION)}`);
+}
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const VERBS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
@@ -1414,6 +1429,74 @@ function parseJson(raw: string): Record<string, unknown> {
   }
 }
 
+/** Every element name in a served page, lowercased and in document order.
+ *
+ * **Why a CLOSED SET rather than a denylist of dangerous tags.** The obvious
+ * shape here is a list of patterns for the ways script can run — `<script>`,
+ * `<iframe>`, `<object>`, `<embed>`, `<link>`, `<style>`, `on*=` — and that is
+ * what this file used. It is open-ended: it only catches the executions somebody
+ * thought of, and every pattern in it has to model HTML's tag syntax correctly
+ * or it silently under-matches. CodeQL's `js/bad-tag-filter` kept finding ways
+ * it under-matched (`<SCRIPT>`, `</script >`, `</script\n bar>`), one facet per
+ * run, and each fix narrowed the spelling rather than removing the problem.
+ *
+ * Extracting tag NAMES closes it. The pattern matches an OPENING tag's name and
+ * stops; it does not model attributes, spacing, or any closing tag, so no
+ * spelling of any tag can hide from it — and matching opening tags only is what
+ * makes the COUNT mean "elements" rather than "names seen twice per element".
+ * A page that carries an element nobody allowlisted fails, and the allowlist is
+ * finite and reviewable.
+ */
+function tagNames(html: string): string[] {
+  return [...html.matchAll(/<\s*([a-z][a-z0-9]*)/gi)].map((m) => (m[1] ?? "").toLowerCase());
+}
+
+/** The one `<script>` element's attributes, and whether its body is empty.
+ *
+ * **The body check never looks at the closing tag.** An inline body is anything
+ * between the end of the opening tag and the NEXT tag; if that span is empty or
+ * whitespace, there is no body. So: find the opening tag, then assert the run of
+ * characters up to the next `<` is blank. `script` elements are void-free so
+ * there is no ambiguity about what "next tag" means here, and the assertion does
+ * not become wrong when a browser or a serializer writes `</script >`.
+ *
+ * **This helper is individually insufficient and must never be used alone.**
+ * `<!-->` is a COMPLETE comment in HTML, not an opener, so for
+ * `<script><!--> <img src=x onerror=alert(1)>` the span up to the next `<` is a
+ * comment this regex happily eats and it reports `bodyIsEmpty = true` — while a
+ * browser parses that `img` as live markup. It is caught by the *element set*
+ * assertion, which sees `img` and fails. The two are jointly sound and
+ * individually unsound: a future page that drops the set assertion would inherit
+ * the hole, which is why both are asserted together in one test.
+ */
+function scriptElement(html: string): { attributes: string; bodyIsEmpty: boolean } | undefined {
+  const opening = /<\s*script\b([^>]*)>/i.exec(html);
+  if (opening === null) return undefined;
+  const afterTag = html.slice(opening.index + opening[0].length);
+  const bodyIsEmpty = /^\s*(?:<!--[\s\S]*?-->\s*)*</.test(afterTag);
+  return { attributes: opening[1] ?? "", bodyIsEmpty };
+}
+
+/** Every element name `src/invite-page.ts` is allowed to emit. A closed set, so
+ * an element nobody thought of is a red test rather than a silent widening. */
+const PAGE_ELEMENTS = [
+  "html",
+  "head",
+  "meta",
+  "title",
+  "script",
+  "body",
+  "main",
+  "h1",
+  "p",
+  "strong",
+  "form",
+  "input",
+  "label",
+  "br",
+  "button",
+] as const;
+
   // ── the same mechanics, over HTTP through real workerd ──────────────────
 
   // NO lifecycle hooks in this describe. It shares the file's ONE harness, and
@@ -1502,9 +1585,18 @@ function parseJson(raw: string): Record<string, unknown> {
         expect(response.headers.get("referrer-policy")).toBe("no-referrer");
         expect(response.headers.get("cache-control")).toBe("no-store");
         expect(response.headers.get("x-content-type-options")).toBe("nosniff");
-        // No script and no inline handler, so there is nothing for `script-src` to
-        // permit and nothing for an injected tag to run.
-        expect(html).not.toContain("<script");
+        // **Slice 5b changed this, and the change is the point.** The page used
+        // to carry no `<script` at all — "nothing for `script-src` to permit" —
+        // and that stopped being true when the Worker began serving the client
+        // script. What is still true, and is the invariant rather than the
+        // absence, is that the page permits exactly ONE script and it is an
+        // EXTERNAL `src` on the allowlisted path: an inline body would need
+        // `'unsafe-inline'` (or a nonce, or `strict-dynamic`) and `script-src`
+        // stays a pinned path with none of them.
+        const scripts = [...html.matchAll(/<\s*script\b([^>]*)>/gi)];
+        expect(scripts).toHaveLength(1);
+        expect(scripts[0]?.[1], "the one script is a src, not a body").toMatch(/\ssrc="[^"]+"/);
+        expect(scriptElement(html)?.bodyIsEmpty, "and it carries no inline body").toBe(true);
         expect(html).not.toContain("javascript:");
         expect(html).not.toContain("onclick");
         // The token appears in the form and nowhere else on the page.
@@ -1590,9 +1682,26 @@ function parseJson(raw: string): Record<string, unknown> {
           const { response } = await open(harness, token);
           const html = await response.text();
           expect([404, 410], token.slice(0, 20)).toContain(response.status);
-          expect(html, token.slice(0, 20)).not.toContain("<script");
           expect(html, token.slice(0, 20)).not.toContain("onerror");
           expect(html, token.slice(0, 20)).toContain("cannot be used");
+          // `not.toContain("<script")` was this case's proxy for "the payload is
+          // not reflected", and slice 5b retired the proxy: the page now
+          // legitimately carries one external `<script src>`. So the payload
+          // itself is asserted absent, and the page's one script is asserted to
+          // be that asset — an inline body here would BE the injection.
+          expect(html, token.slice(0, 20)).not.toContain("<script>alert");
+          expect(html, token.slice(0, 20)).not.toContain("<img src=x");
+          // Same closed-set and no-closing-tag helpers as the form page: the
+          // claim is about the page's ELEMENTS, not about one spelling of one
+          // tag. See `tagNames`.
+          expect(tagNames(html).filter((name) => name === "script"), token.slice(0, 20)).toHaveLength(1);
+          // A SUBSET of the allowlist, because the three pages differ and the
+          // allowlist is their union; "an element nobody allowlisted" is the
+          // failure this exists to catch, and a subset says exactly that.
+          for (const name of new Set(tagNames(html))) {
+            expect(PAGE_ELEMENTS as readonly string[], `the closed page emitted <${name}>`).toContain(name);
+          }
+          expect(scriptElement(html)?.bodyIsEmpty, token.slice(0, 20)).toBe(true);
         }
       });
 
@@ -1651,6 +1760,527 @@ function parseJson(raw: string): Record<string, unknown> {
         expect(browser.get(SESSION_COOKIE_NAME), "and it must set a session").toBeDefined();
         // The session the form produced is a working one.
         expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+      });
+
+      // ── M4 slice 5b: the client page ─────────────────────────────────────
+      //
+      // The Worker now serves ONE external, versioned, content-hashed script,
+      // and that script's single job is to take the invite token out of the
+      // address bar. Every case below is about that: the page names the asset
+      // the route actually serves, the shipped BYTES do the stripping (not a
+      // description of them), and the URL that survives in history carries no
+      // token — including after a Back-navigation and a reload.
+      describe("the client page: one external script, and the token leaves the URL", () => {
+        /** Run the SHIPPED script bytes against a stub `window` and report
+         * every history mutation it attempted.
+         *
+         * **The bytes, not a paraphrase of them.** `new Function` compiles the
+         * exact string the Worker serves, so a change to the script that broke
+         * the stripping fails here rather than in a browser nobody is driving.
+         * A real browser is not available on this leg (the Playwright specs
+         * boot `revkit serve`, not the Worker — see `site/playwright.config.ts`),
+         * so this is the honest substitute and its limit is recorded: it proves
+         * what the script DOES with a `window`, not how a browser's History
+         * Entry serialises it. The `replaceState`-not-`pushState` assertion
+         * below is what bridges that gap.
+         */
+        function runClientScript(pathname: string, extra: string = ""): string[] {
+          const applied: string[] = [];
+          const stub = {
+            location: { pathname, search: "?utm_source=mail", hash: "#top" },
+            history: {
+              replaceState: (_state: unknown, _title: string, url: string) => {
+                applied.push(url);
+              },
+              pushState: (_state: unknown, _title: string, url: string) => {
+                applied.push(`PUSHED:${url}`);
+              },
+              back: () => {
+                applied.push("BACK");
+              },
+            },
+            addEventListener: () => {},
+          };
+          (new Function("window", `${INVITE_CLIENT_SCRIPT}${extra}`) as (w: unknown) => void)(stub);
+          return applied;
+        }
+
+        test("the shipped BYTES rewrite the address bar to the token-free path", () => {
+          const token = "A".repeat(43);
+          const applied = runClientScript(`${INVITE_OPEN_PREFIX}${token}`);
+          expect(applied).toEqual([`${INVITE_OPEN_PREFIX}`]);
+          // The token is gone from the URL the browser will show, AND from the
+          // one it would put in a `Referer` — `referrer-policy: no-referrer` is
+          // belt-and-braces here, not the control.
+          expect(applied[0]).not.toContain(token);
+          // The query and the fragment are DROPPED rather than carried across.
+          // A query string is the most durable part of a URL — history,
+          // `Referer`, server logs, browser sync — which is the same argument
+          // `src/invite-page.ts` uses to keep `?name=` off the `GET`. Carrying
+          // one forward would carry a token forward too, the moment any client
+          // put one there.
+          expect(applied[0]).not.toContain("?");
+          expect(applied[0]).not.toContain("#");
+
+          // **Those two lines DOCUMENT the decision; they do not enforce it, and
+          // the mutation run is why that is written down.** Appending
+          // `window.location.search` to the path before slicing is an
+          // EQUIVALENT mutant: the rewrite cuts at `lastIndexOf("/")`, so
+          // anything after the token — query included — is discarded either
+          // way, and no input produces different behaviour. No test can kill it.
+          //
+          // So the control is structural rather than asserted: the script slices
+          // the path at its LAST slash, which is what makes "the query is not
+          // carried across" true for every URL rather than for the one the
+          // fixture happens to use. What the assertions above buy is that the
+          // INTENT stays visible — a future rewrite that reconstructs the URL
+          // from `location.href` instead of slicing `pathname` would pass a
+          // differently-written test, and these two lines are what would catch it.
+        });
+
+        test("a path segment AFTER the token is stripped too — the token leaves the URL either way", () => {
+          // **This case was a hole, and the review found it.** The rewrite used
+          // to cut at `path.lastIndexOf("/")`, so it cut at the LAST slash. On
+          // `/invite/<token>/` that last slash is the one AFTER the token, so
+          // the slice produced `/invite/<token>/` again — the rewrite was a
+          // NO-OP and the token stayed in the address bar. Measured against
+          // the served bytes and end to end through workerd, at the base
+          // commit:
+          //
+          //   /invite/<token>        ->  /invite/          stripped
+          //   /invite/<token>/       ->  /invite/<token>/   NO-OP, token kept
+          //   /invite/<token>/x      ->  /invite/<token>/   stripped
+          //   /invite/<token>/utm    ->  /invite/<token>/   LOOKS stripped
+          //
+          // The no-op is the reachable one, and it is reachable by ordinary
+          // means: some mail security products append a trailing slash to a URL
+          // on the way out, and a guest typing it is not a stretch. What made
+          // it worse is that both spellings LAND ON THE CLOSED PAGE — the token
+          // `/` resolves to no row, so 410 — and the 410 page does load the
+          // script. So the token survived in the address bar of precisely the
+          // visit the PR named as the one a guest most likely backs out of and
+          // screenshots.
+          //
+          // **The fix is the PREFIX, not a slice.** `replaceState` is given the
+          // prefix itself, which is a constant, so no input can produce a URL
+          // that still names the token — including a path deeper than the
+          // token, a double slash, a percent-encoded slash, or a token-shaped
+          // segment with an `utm` after it.
+          const token = "D".repeat(43);
+          for (const path of [
+            `${INVITE_OPEN_PREFIX}${token}/`,
+            `${INVITE_OPEN_PREFIX}${token}/utm`,
+            `${INVITE_OPEN_PREFIX}${token}/utm/`,
+            `${INVITE_OPEN_PREFIX}${token}/x/y`,
+            `${INVITE_OPEN_PREFIX}${token}/%2F`,
+          ]) {
+            const applied = runClientScript(path);
+            expect(applied, path).toEqual([INVITE_OPEN_PREFIX]);
+            expect(applied[0], path).not.toContain(token);
+          }
+        });
+
+        test("every interpolated value is ESCAPED — the backstop works with a value a validator should already have refused", () => {
+          // **This is the case whose absence made `text()` decorative.** The
+          // mutation run deleted `text()` from `scope`, from `kind` and from
+          // `rights` in turn and every run SURVIVED — 0 failures each — because
+          // every interpolated value is already shape-validated upstream into a
+          // character set containing none of `<`, `"`, `&` or `'`, so no input
+          // can reach these interpolations that escaping would have changed.
+          //
+          // Which means the claim "no user input is ever reflected into these
+          // pages" rested entirely on slice 3's INPUT validation, and the
+          // escaping half was an unexercised backstop — decorative at the moment
+          // it was written. The mutation run also showed the ONE uncovered sink
+          // is the one that can inject: `scriptSrc` went into the `src`
+          // attribute RAW, so a quote in `env.REVKIT_VERSION` broke out of it.
+          // Measured at the base commit:
+          //
+          //   REVKIT_VERSION = 1.0.0" onload="alert(1)" x="
+          //   → <script src="/_revkit/1.0.0" onload="alert(1)" x="/invite-<digest>.js">
+          //
+          // Not exploitable today (no `'unsafe-inline'` in the served
+          // `script-src`, and `REVKIT_VERSION` is a committed var whose only
+          // assertion is equality with `packages/cli/package.json`) — but a
+          // control that only works because of an assertion three files away is
+          // one assertion away from not working.
+          //
+          // **So this test drives the builders DIRECTLY with values their own
+          // doc comments say are pre-validated.** That is deliberate and it is
+          // what a backstop test has to do: the scenario `text()` exists for is
+          // "a future edit widened a validator's character set", and the only
+          // way to observe the widening is to hand the builder a widened value
+          // rather than to widen a validator to get one. The casts are the
+          // point — they assert the backstop independently of the type that
+          // claims the value cannot get here.
+          const MARKUP = `acme"><script>alert(1)</script>`;
+          const hostile = MARKUP as unknown as string;
+          const page = redeemFormPage({
+            token: hostile,
+            repo: hostile,
+            pr: 7,
+            kind: hostile as unknown as Parameters<typeof redeemFormPage>[0]["kind"],
+            canComment: true,
+            scriptSrc: hostile,
+          });
+          // Not one of the four positions produced an attribute or a tag the
+          // browser would parse as markup.
+          expect(page).not.toContain("<script>alert(1)</script>");
+          expect(page).not.toContain(`repo="${MARKUP}"`);
+          expect(page).not.toContain(`src="${MARKUP}"`);
+          // …and the escaped forms ARE present, so this is the escaping
+          // happening rather than the input simply having been dropped.
+          expect(page).toContain("acme&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
+          // `scope` is a COMPOSITE (`<repo> pull request #<pr>`), so the escaped
+          // repo proves `text()` ran on the whole string rather than on a
+          // substring of it.
+          expect(page).toContain("<strong>acme&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt; pull request #7</strong>");
+
+          // `rights` is a ternary of two CONSTANTS, so `text(rights)` cannot
+          // matter for any input — which is exactly why deleting it survived,
+          // and why the honest statement is that it is uniformity rather than a
+          // control. Asserted as such instead of left implied.
+          expect(rateLimitedPage(30, "/_revkit/0.0.0/invite.js")).toContain("Try again in 30 seconds.");
+          expect(inviteClosedPage("/_revkit/0.0.0/invite.js")).toContain("cannot be used");
+        });
+
+        test("a hostile REVKIT_VERSION fails LOUDLY on every route, rather than serving a page whose script silently 404s", () => {
+          // **The second-order effect, and the reason escaping alone was not
+          // the fix.** A quote in `env.REVKIT_VERSION` does not just inject: it
+          // BREAKS THE ASSET URL. The page still renders, `script-src` still
+          // names a path, the page still looks correct — and the script 404s, so
+          // the token stays in the address bar of every visit, with no signal
+          // anywhere. A control silently disabled by a configuration typo is
+          // worse than a missing control, because it is believed to be there.
+          //
+          // So the version segment is validated ONCE, at `revkitBundlePath`,
+          // which every consumer already goes through: `workerHeaderContext`
+          // builds `script-src` from it and `clientAssetPath` builds the asset
+          // URL from it. A shape it cannot express cannot reach either, and the
+          // throw happens inside the handler's `try`, so the deployment answers
+          // a 500 with full hygiene rather than a page that quietly does not
+          // strip anything.
+          const EVIL = `1.0.0" onload="alert(1)" x="`;
+          for (const version of [EVIL, `1.0.0/../evil`, `1.0.0\\evil`, `1.0.0 evil`, "..", ".", "1.0.0\x00", "<script>"]) {
+            expect(() => revkitBundlePath(version), JSON.stringify(version)).toThrow(/one path segment/);
+          }
+          // The shape that is legitimate still works, prerelease included —
+          // a version gate that refused `0.1.0-rc.1` would be its own outage.
+          expect(revkitBundlePath("0.0.0")).toBe("/_revkit/0.0.0/");
+          expect(revkitBundlePath("1.2.3-rc.1")).toBe("/_revkit/1.2.3-rc.1/");
+          // And so `scriptSrc` — the sink above — is now a constant-shaped
+          // string by construction rather than by configuration discipline.
+          expect(() => clientAssetPath(EVIL, "a".repeat(64))).toThrow(/one path segment/);
+        });
+
+        test("stripping uses replaceState, so the token does not survive in history", () => {
+          // **This is the load-bearing assertion for the whole decision.** A
+          // `pushState` of the clean URL would leave `/invite/<token>` as the
+          // PREVIOUS entry, reachable with one Back press and written to
+          // `session history` / disk. `replaceState` overwrites the current
+          // entry, so after it runs there is no history entry anywhere that
+          // names the token — including the one a reload would come back to.
+          const token = "B".repeat(43);
+          const applied = runClientScript(`${INVITE_OPEN_PREFIX}${token}`);
+          expect(applied.some((url) => url.startsWith("PUSHED:"))).toBe(false);
+          expect(applied).not.toContain("BACK");
+          // And nothing navigates: a navigation would put the token URL in the
+          // history of the page it navigated TO as its referrer entry.
+          expect(INVITE_CLIENT_SCRIPT).not.toMatch(/\b(?:location\s*\.\s*(?:assign|replace)|location\s*=|href\s*=)/);
+        });
+
+        test("already-stripped and non-invite paths are left alone", () => {
+          // Idempotent: a reload of the stripped URL runs the script again, and
+          // it must not rewrite `/invite/` into something else. And the script
+          // is scoped — if a future slice ever loads it on a preview page, the
+          // same "cut the last segment" logic would strip `/acme/pr-7/` down to
+          // `/acme/`, which is a different page entirely.
+          expect(runClientScript(INVITE_OPEN_PREFIX)).toEqual([INVITE_OPEN_PREFIX]);
+          expect(runClientScript("/acme/pr-7/")).toEqual([]);
+          expect(runClientScript(`/_revkit/0.0.0/invite.js`)).toEqual([]);
+          expect(runClientScript("/inviteish/token")).toEqual([]);
+        });
+
+        test("the page's <script src> is the content-addressed URL the route serves, and it is the ONLY script", async () => {
+          // Derived from the page the Worker actually returned for a REAL invite,
+          // and compared against the URL the asset route answers — so the two
+          // cannot drift. This is the pairing that makes `script-src`'s pinned
+          // path mean something: before this slice the path resolved to a 404.
+          const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { response } = await open(harness, minted.minted.token);
+          expect(response.status).toBe(200);
+          const html = await response.text();
+
+          const tags = [...html.matchAll(/<script\b([^>]*)>/gi)].map((m) => m[1] ?? "");
+          expect(tags.length, "exactly one script tag, and it carries a src").toBe(1);
+          const src = /\bsrc="([^"]*)"/.exec(tags[0] ?? "")?.[1];
+          expect(src).toBe(clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest()));
+
+          // …and that URL really serves the bytes the page's own script tag
+          // names. A `src` pointing at a 404 is the defect this slice replaces.
+          const asset = await harness.dispatch(`http://localhost${src ?? ""}`);
+          expect(asset.status).toBe(200);
+          expect(await asset.text()).toBe(INVITE_CLIENT_SCRIPT);
+        });
+
+        test("no inline script, no inline handler, no style and no external subresource — so script-src stays a pinned PATH", async () => {
+          // With no inline script, `script-src` needs no `'unsafe-inline'`, no
+          // nonce and no `'strict-dynamic'`: the strongest posture available,
+          // and it keeps ADR-0012's `default-src 'none'` intact rather than
+          // relaxing it.
+          const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { response } = await open(harness, minted.minted.token);
+          const html = await response.text();
+
+          // **The elements are a CLOSED SET, not a denylist of dangerous ones.**
+          // This list used to name the ways script can run — `<style>`,
+          // `<iframe>`, `<object>`, `<embed>`, `<link>`, `<script>` with a body
+          // — which only catches the executions somebody thought of, and which
+          // needed each pattern to model HTML's tag syntax correctly or it
+          // silently under-matched (CodeQL's `js/bad-tag-filter` found three
+          // separate ways, one per run: `<SCRIPT>`, `</script >`,
+          // `</script\n bar>`). Naming the elements the page is ALLOWED to carry
+          // closes that class: the pattern matches an opening tag's name and
+          // stops, so no spelling hides, and anything not on this list fails —
+          // including an element nobody has thought of yet.
+          expect([...new Set(tagNames(html))].sort()).toEqual([...PAGE_ELEMENTS].sort());
+          // The set above is a SET, so a second copy of an ALLOWED element is
+          // invisible to it; `script` is counted separately below because a
+          // second one is an execution primitive. A duplicate of anything else
+          // (a second `<form action=...>`, say) passes here by design — the
+          // actual controls for those are `form-action 'self'` in the served CSP
+          // and the fact that `action` is a builder constant, not input.
+          expect(tagNames(html).filter((name) => name === "script"), "exactly one script ELEMENT").toHaveLength(1);
+          expect(scriptElement(html)?.bodyIsEmpty, "and it has no inline body").toBe(true);
+
+          // What a tag allowlist cannot see is an ATTRIBUTE, so those stay
+          // patterns. None of them models tag syntax, so none of them can
+          // under-match a spelling.
+          for (const [what, pattern] of [
+            ["an inline event handler", /\son[a-z]+\s*=/i],
+            ["a javascript: URL", /javascript:/i],
+            ["a style attribute", /\sstyle\s*=/i],
+            ["an inline script nonce", /\bnonce\s*=/i],
+          ] as const) {
+            expect(html, what).not.toMatch(pattern);
+          }
+          // `<script src>` is the only external reference the page has.
+          const external = [...html.matchAll(/\b(?:src|href)\s*=\s*"([^"]*)"/g)].map((m) => m[1] ?? "");
+          expect(external).toEqual([clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest())]);
+        });
+
+        test("stripping happens BEFORE the exchange, and the form still redeems afterwards", async () => {
+          // **Why on load and not after the exchange** — the decision, with its
+          // cost. The token is in the BODY (a hidden field) and never in the URL
+          // after the document loads, so stripping on load costs nothing the
+          // redemption needs. Stripping after the exchange instead would leave
+          // the token in history for as long as the guest sat on the page, and
+          // for ever if they never submitted.
+          //
+          // The cost of on-load: a guest who RELOADS before submitting has lost
+          // the URL and must re-open the mail link. That is recoverable and the
+          // recovery is slice 3's conditional binding — a second open REUSES the
+          // cookie, so the binding is not rotated and a live session is not
+          // invalidated. The test proves it: the second open still redeems.
+          const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { browser, response } = await open(harness, minted.minted.token);
+          expect(response.status).toBe(200);
+          const html = await response.text();
+
+          // The script runs, the address bar becomes `/invite/`, and the form in
+          // the SAME document still carries the token in its hidden field.
+          expect(runClientScript(`${INVITE_OPEN_PREFIX}${minted.minted.token}`)).toEqual([INVITE_OPEN_PREFIX]);
+          const hidden = /<input type="hidden" name="token" value="([^"]*)">/.exec(html)?.[1];
+          expect(hidden, "the token lives in the body, not the URL").toBe(minted.minted.token);
+
+          // Submitting the form from the STRIPPED document redeems.
+          const submitted = await redeemUrlEncoded(harness, browser, minted.minted.token, { displayName: NAME });
+          expect(submitted.status).toBe(303);
+          browser.absorb(submitted);
+          expect(browser.get(SESSION_COOKIE_NAME)).toBeDefined();
+
+          // The recovery path: re-opening the link from the mail client, in the
+          // SAME browser, mints no new binding — so the session above survives.
+          const again = await reopen(harness, browser, minted.minted.token);
+          expect(again.status).toBe(200);
+          expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        });
+
+        test("the 429 carries the SAME content-addressed script as the form — the third page is not a special case", async () => {
+          // **The 429's script was entirely unasserted, and the PR names it as
+          // one of three pages that load it.** The mutation run deleted the 429
+          // page's `<script>` tag outright and SURVIVED, and so did repointing
+          // its `src` at a URL that 404s — so "every page at a token URL loads
+          // the asset" was true of two of the three.
+          //
+          // It matters more than the other two, not less. The 429 is the ONE of
+          // the three a guest comes straight back to: the limiter refuses the
+          // OPEN before reading anything, so the address bar still holds the
+          // token on the one visit where "come back in N seconds" is exactly
+          // what the guest is about to do, and where a Back press is one key
+          // away. A 429 page without the script is the token's best copy.
+          const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const address = "198.51.100.44";
+          await seedCounter(`ip:${address}`, REDEEM_IP_LIMIT, Date.now());
+
+          const limited = await open(harness, minted.minted.token, { headers: { [CLIENT_IP_HEADER]: address } });
+          expect(limited.response.status, "the ceiling refuses the open").toBe(429);
+          const html = await limited.response.text();
+          expect(html).toContain("Too many attempts");
+          expect(html).not.toContain(minted.minted.token);
+
+          // Exactly one script, and its src is the URL the asset route answers —
+          // asserted against the same derivation the form page uses, so "all
+          // three pages carry the asset" is a test rather than a comment.
+          const tags = [...html.matchAll(/<script\b([^>]*)>/gi)].map((m) => m[1] ?? "");
+          expect(tags.length, "one script tag").toBe(1);
+          expect(/\bsrc="([^"]*)"/.exec(tags[0] ?? "")?.[1]).toBe(
+            clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest()),
+          );
+          // …and it really resolves, rather than merely looking right.
+          const asset = await harness.dispatch(`http://localhost${clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest())}`);
+          expect(asset.status).toBe(200);
+
+          // And the stripping still happens on THIS page: the 429 is served at
+          // `pathname` that contains the token, which is the whole reason it
+          // loads the script at all.
+          expect(runClientScript(`${INVITE_OPEN_PREFIX}${minted.minted.token}`)).toEqual([INVITE_OPEN_PREFIX]);
+        });
+
+        test("a RELOAD of the stripped URL is the closed page, and that is the decision", async () => {
+          // After `replaceState` the address bar is `/invite/`, which classifies
+          // as `invite-open` with an EMPTY token, so `inviteTokenFrom` returns
+          // `undefined` and the caller gets the ONE closed page at 404.
+          //
+          // The token is not spent here — that is after the exchange, and the
+          // rate-limit ledger proves it: the slot is untouched by an open. What
+          // a reload cannot do is RECOVER the token, because it was only ever in
+          // the URL and the URL no longer has it.
+          //
+          // 404 rather than 410, because nothing was found — as against a token
+          // that was found and turned out to be dead. The page is identical
+          // either way, which is what keeps the closed page from becoming a
+          // "never existed" / "you are late" oracle.
+          const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { response } = await open(harness, minted.minted.token);
+          expect(response.status).toBe(200);
+          runClientScript(`${INVITE_OPEN_PREFIX}${minted.minted.token}`);
+
+          const reloaded = await harness.dispatch(`http://localhost${INVITE_OPEN_PREFIX}`);
+          expect(reloaded.status).toBe(404);
+          const html = await reloaded.text();
+          expect(html).toContain("cannot be used");
+          expect(html).not.toContain(minted.minted.token);
+          // Not a redirect, and not a bare 404 JSON body — it is the page.
+          expect(reloaded.headers.get("location")).toBeNull();
+          expect(reloaded.headers.get("content-type")).toBe("text/html; charset=utf-8");
+        });
+
+        test("the token reaches no page the guest can see or share — HTML, <meta>, or the script", async () => {
+          // The script is served from a path that names no invite, so it cannot
+          // carry a per-guest value even by accident. Asserted rather than
+          // assumed, because "the script is generic" is exactly the sort of
+          // claim that stops being true when someone adds one `data-` attribute.
+          const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { response } = await open(harness, minted.minted.token);
+          const html = await response.text();
+          expect(html).not.toContain(minted.minted.token.replace(/^(.{8}).*(.{4})$/, "$1…$2"));
+
+          const asset = await harness.dispatch(`http://localhost${clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest())}`);
+          const source = await asset.text();
+          expect(source).toBe(INVITE_CLIENT_SCRIPT);
+          // The closed and 429 pages are served at the SAME token URL, so they
+          // load the same script and get the same treatment.
+          const dead = await open(harness, "C".repeat(43));
+          expect(dead.response.status).toBe(410);
+          expect(await dead.response.text()).not.toContain("C".repeat(43));
+        });
+
+        test("the script can exfiltrate nothing: one global, no storage, no cookies, no network", async () => {
+          // What a hostile reader of this page could get: the display name the
+          // guest typed, and nothing else. These are the channels it could leave
+          // by. Each is pinned by NAME so adding one is a deliberate edit to
+          // this list rather than a silent widening of the script's reach.
+          for (const [what, pattern] of [
+            ["localStorage", /\blocalStorage\b/],
+            ["sessionStorage", /\bsessionStorage\b/],
+            ["document.cookie", /\bdocument\s*\.\s*cookie\b/],
+            ["cookies on window", /\bwindow\s*\.\s*cookie\b/],
+            ["fetch", /\bfetch\s*\(/],
+            ["XMLHttpRequest", /\bXMLHttpRequest\b/],
+            ["sendBeacon", /\bsendBeacon\b/],
+            ["WebSocket", /\bWebSocket\b/],
+            ["EventSource", /\bEventSource\b/],
+            ["a dynamic import", /\bimport\s*\(/],
+            ["eval", /\beval\s*\(/],
+            ["new Function", /\bnew\s+Function\b/],
+            ["innerHTML", /\.innerHTML\b/],
+            ["document.write", /\bdocument\s*\.\s*write\b/],
+            ["an image beacon", /new\s+Image\b/],
+            ["a form submit", /\.submit\s*\(/],
+            ["navigator", /\bnavigator\b/],
+          ] as const) {
+            expect(INVITE_CLIENT_SCRIPT, what).not.toMatch(pattern);
+          }
+          // `window` is the ONLY global it touches, so a stub with just that one
+          // is enough to run it — proven by `runClientScript` above, which
+          // passes an object with no `document`, no `location` and no `fetch`.
+          // If the script reached for anything else, `runClientScript` would
+          // throw a ReferenceError rather than quietly doing nothing.
+        });
+
+        test("the CSRF token reaches the page in a RESPONSE HEADER only, never in the markup", async () => {
+          // ADR-0012: "every state-changing call needs a per-session CSRF token
+          // in a header". The three forbidden carriers are pinned by name,
+          // because each is a WIDENING: a `<meta>` tag is readable by any
+          // injected script and lands in the HTML on disk and in every cache,
+          // and a cookie the script can read is readable by any injected script
+          // too. The header is readable ONLY by code that can already make a
+          // same-origin request.
+          const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { browser } = await open(harness, minted.minted.token);
+          const submitted = await redeemUrlEncoded(harness, browser, minted.minted.token, { displayName: NAME });
+          expect(submitted.status).toBe(303);
+
+          // It IS available, as a response header on the exchange — so a page
+          // that needs one can obtain it same-origin, which is the whole of the
+          // header-only mechanism.
+          const csrf = submitted.headers.get(CSRF_HEADER);
+          expect(csrf, "the redemption hands the token to a same-origin script").toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+          // And it is in no markup. The token is bound to the session the
+          // redemption minted, so it is the value a later state-changing call
+          // must present; no page in this build needs it yet (the preview
+          // surface is 501), so none carries it.
+          const page = await open(harness, minted.minted.token);
+          const html = await page.response.text();
+          expect(html).not.toMatch(new RegExp(csrf ?? "never-matches"));
+          // The `<meta>` tags that ARE there are the three static ones and
+          // carry no value — asserted as a SET rather than by counting, so
+          // adding a fourth `<meta>` to smuggle a token in is a red test.
+          const metas = [...html.matchAll(/<meta\b([^>]*)>/g)].map((m) => (m[1] ?? "").trim());
+          expect(metas).toEqual([
+            'charset="utf-8"',
+            'name="viewport" content="width=device-width, initial-scale=1"',
+            'name="robots" content="noindex, nofollow"',
+          ]);
+          // The session cookie the token belongs to is HttpOnly, so the script
+          // cannot read the credential the token authorises either.
+          const cookie = submitted.headers.getSetCookie().find((raw) => raw.startsWith(`${SESSION_COOKIE_NAME}=`));
+          expect(cookie, "the redemption sets a session cookie").toBeDefined();
+          expect(cookie).toContain("HttpOnly");
+          expect(cookie).toContain("Secure");
+          expect(cookie).toContain("SameSite=Lax");
+          expect(cookie).toContain("__Host-");
+          expect(cookie).not.toContain("Domain");
+        });
       });
 
       test("C1: the display name survives URLENCODING, not just JSON", async () => {
@@ -1754,7 +2384,16 @@ function parseJson(raw: string): Record<string, unknown> {
           }
           // Every log line the exchange produced, and the page the browser was
           // handed before it: none of them contains the token. ADR-0015/ADR-0020
-          // ("logs carry no … tokens") and ADR-0009's "stripped from the URL".
+          // ("logs carry no … tokens") and DESIGN-0001 §6's "stripped from the
+          // URL" — which is where that requirement lives, not ADR-0009.
+          //
+          // **Note what the next line asserts, because it is the precise
+          // version of a claim that was wrong elsewhere**: the form's body DOES
+          // contain the token, in its hidden field, and it has to — without it
+          // the guest cannot submit. So the honest statement is "no `Location`,
+          // no `Referer`, no log line, and in a body only as the redeem form's
+          // hidden field". Slice 5b's review found the feature matrix claiming
+          // the token reached no body at all.
           const formHtml = await (await open(harness, token)).response.text();
           expect(formHtml).toContain(token);
           for (const line of lines) expect(line, line.slice(0, 120)).not.toContain(token);

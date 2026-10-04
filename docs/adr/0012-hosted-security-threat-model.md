@@ -6,7 +6,11 @@
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Amended by: the 2026-10-04 (issue #9, slice 5) amendment at the end of this
   document — the guest half of "authorization per request" is implemented in
-  full, and the GitHub-read clause is the half that remains.
+  full, and the GitHub-read clause is the half that remains — and the
+  2026-10-04 (issue #9, slice 5b) amendment after it: the `/_revkit/` path
+  resolves content-addressed, the page-side CSRF mechanism is settled, and
+  "stripped from the URL" is recorded as unconditional server-side and
+  conditional client-side.
 
 ## Context
 
@@ -480,3 +484,129 @@ CSRF-protected review **write** ships and guests still cannot comment. The R2
 preview surface is still 501. Fork isolation remains. A repo-wide invite's holder
 is redirected to `/`, which is unrecognised — pre-existing, security-neutral, and
 recorded in the feature matrix.
+
+## Amendment (2026-10-04, issue #9, slice 5b) — the `/_revkit/` path resolves, the
+## page-side CSRF mechanism, and what "stripped from the URL" actually guarantees
+
+Slice 5b serves the first script this Worker has ever served, so two clauses above
+stop being aspirational, and one requirement this ADR never stated turns out to be
+**conditional in a way the design states unconditionally**. Three amendments; all
+three are additive, none rewrites standing text, and `- Status: Accepted` is
+untouched.
+
+### 1. The `/_revkit/` path now resolves, content-addressed
+
+The clause "**All scripts and stylesheets come from a revkit-owned path**,
+`/_revkit/<version>/`, deployed by revkit's own release" named a path that
+resolved to a 404. It now resolves to exactly one name,
+`/_revkit/<version>/invite-<sha256>.js`, and the properties above it are
+mechanisms rather than intentions:
+
+- **The digest is the full SHA-256 of the exact bytes served**, computed in the
+  same request from the same string that is written to the body. There is no
+  committed hash to fall out of step, so a page and the asset it names cannot
+  disagree, and "the name *is* the content address" is exactly true.
+- **The version segment is `env.REVKIT_VERSION` and nothing else**, so an older
+  bundle is **unreachable**, not merely unlisted.
+- **The version segment is shape-checked once, at `revkitBundlePath`**, the
+  chokepoint both `script-src` and the asset URL are built from. A segment that
+  cannot be one path segment cannot reach either, and the misconfiguration is a
+  loud 500 rather than a page whose script silently 404s.
+- **Matching is exact string equality against the NORMALISED pathname**, so there
+  is no pattern to widen. Almost every other spelling is a 404 and **none
+  redirects** — which is the clause's actual point, since a browser drops a CSP
+  source's path part after a redirect. Four spellings normalise *onto* the one
+  name (a dot segment, a `..` elsewhere, a backslash, and a `..` that re-enters
+  the version) and serve **byte-identical** content; that is why they are inert,
+  and it is asserted rather than argued.
+
+**"With no inline script, `script-src` remains a pinned path."** There is one
+external, versioned, content-addressed script and nothing else, so ADR-0012's
+policy module is **unchanged** by this slice and `default-src 'none'` survives
+rather than being relaxed. Each of `'unsafe-inline'`, a nonce and
+`'strict-dynamic'` is absent from the served `script-src`, asserted individually
+and as an exact source set.
+
+**Two divergences the exact-set assertion makes load-bearing, recorded here
+rather than left to rot:**
+
+1. **`'wasm-unsafe-eval'` IS in the served `script-src` and is NOT in the clause
+   above**, which writes `script-src https://review.exoma.org/_revkit/<version>/
+   'sha256-…'`. This is pre-existing — the shared policy has always emitted the
+   narrow WASM keyword and never `'unsafe-eval'` — but nothing asserted the whole
+   set before, so nothing would have caught it widening. It does not.
+2. **With one asset, "the Worker derives `Content-Type` from the file extension
+   against its own allowlist" is a CONSTANT, not a lookup.** One extension is in
+   the allowlist and one asset exists, and a request cannot reach a spelling
+   whose extension is not this one. `X-Content-Type-Options: nosniff` is what
+   makes it load-bearing rather than advisory.
+
+**And the honest state of "deployed by revkit's own release":** until
+`revkit deploy init` (slice 8, owner-gated #34) there is no R2 and no
+asset-release pipeline, so the bytes are **compiled into the Worker artefact**
+from a committed, reviewed source. That preserves the property this ADR actually
+cares about — the script comes from the **running version**, never from a PR
+artifact — while "deployed by revkit's own release" is not yet literally true of
+a separate upload step.
+
+### 2. How a browser PAGE obtains its CSRF token
+
+"Every state-changing call needs a per-session CSRF token in a header" is
+delivered, and the delivery is a **response header** (`x-revkit-csrf`). **How a
+page reads one was left open.** Answer: a page obtains it from the
+`x-revkit-csrf` response header of a **same-origin request**, and **never** from a
+`<meta>` tag or a script-readable cookie — both of which any injected script could
+read, and the second of which would also travel in every request.
+
+**No page in this build needs one yet, and the reason is worth stating precisely
+because it is easy to get wrong.** The only state-changing call the invite page
+can make is `POST /invite/redeem`, which **deliberately has no CSRF check**: a
+token binds a state change to an *existing* session, and a guest arriving from a
+mail client has none, so a check there would be a control that cannot fail. The
+page that *would* need a token — a guest rail posting a comment — **does not
+exist at all**. What is 501 is `POST <repo>/pr-<n>/api/threads`, a **write API**;
+a 501 is not a page, and there is no markup for the rail yet, not a stub. Whoever
+needs this mechanism will be looking for a page and will not find one. Shipping a
+`<meta>` or a readable cookie now would widen exposure for a token nothing
+consumes.
+
+### 3. "Stripped from the URL" is UNCONDITIONAL server-side and CONDITIONAL
+## client-side
+
+**This requirement is not in this ADR, and the phrase "stripped from the URL"
+appears exactly once in this repository — at DESIGN-0001 §6**, which says that on
+first open the token *"is exchanged for an HttpOnly session cookie and stripped
+from the URL"*. Slice 5b's PR cited this ADR for it; that was a mis-citation and
+is corrected at the three sites that made it.
+
+DESIGN-0001 §6 states the stripping **unconditionally**, and what ships is not
+unconditional. The two halves are different in kind, and **only one of them is a
+control**:
+
+- **Server-side it IS unconditional.** The redemption consumes the browser's slot
+  (single-use, inside one atomic D1 batch) and answers a `303` to a **token-free**
+  `Location`, so re-opening the mail link is refused as a replay. This holds
+  whatever the browser does, which is why it is the control and not the belt. The
+  exchange carries the token in no `Location`, no `Referer` and no log line.
+- **Client-side it happens ONLY when scripting is enabled.** The invite page
+  loads one external script that rewrites the address bar with
+  `history.replaceState` on load, so the token survives in no history entry —
+  not the one a reload returns to, not the one Back returns to. A guest with
+  scripting disabled **keeps the token in the address bar**. What such a guest
+  does not lose is the redemption: the form posts natively.
+
+**Recorded here rather than in a PR body, because a residual that lives only in a
+review thread is a residual nobody reads.** The client-side half is a
+belt-and-braces improvement on top of a server-side control that does not depend
+on a browser — before slice 5b, *everyone* kept the token in the URL, so this is a
+strict improvement for the scripting case and no change for the other.
+
+**One implementation detail is load-bearing and was a real defect.** The rewrite
+target is the `/invite/` **prefix** — a constant — rather than a slice of the
+current path. Cutting at the last slash made `/invite/<token>/` a **no-op** that
+reproduced the whole path, and a trailing slash is what some mail security
+products append; both that spelling and `/invite/<token>/utm` land on the closed
+page, which itself loads the script, so the token survived in the address bar of
+exactly the visit a guest is most likely to back out of and screenshot. A constant
+rewrite target has no such failure mode: no input can produce a URL naming the
+token.

@@ -103,6 +103,13 @@ describe("structured logger", () => {
     expect([...LOG_MESSAGES].sort()).toEqual([
       "api.session.refresh.ok",
       "api.threads.append.disabled",
+      // Slice 5b's one: a `/_revkit/` path that is not the content-addressed
+      // name. Constant fields only — the pathname is already on `request.end`,
+      // so this event says "an asset miss happened" without saying whose.
+      // No hyphen: `EVENT_NAME` admits only `[a-z][a-z0-9]*` segments, and a
+      // hyphen is silently replaced with `invalid.log.message` — see the case
+      // below that runs every name through the real logger.
+      "asset.miss",
       "auth.denied",
       "auth.granted",
       "csrf.rejected",
@@ -119,6 +126,30 @@ describe("structured logger", () => {
       "request.error",
       "request.start",
     ]);
+  });
+
+  test("EVERY name in the vocabulary survives the REAL logger — no `invalid.log.message`", () => {
+    // **This is the case whose absence let a hyphen ship.** Slice 5b's first
+    // event name was `asset.not-found`: it is in `LOG_MESSAGES`, so it
+    // type-checks, it is in the list asserted above, and the real logger emitted
+    // `invalid.log.message` for it — `EVENT_NAME` admits only `[a-z][a-z0-9]*`
+    // segments, so a hyphen fails the shape pre-filter and the name is silently
+    // REPLACED rather than refused. Nothing caught it, because every test
+    // compared the array to a list instead of running the names through the
+    // logger that consumes them.
+    //
+    // So this runs all of them, through the same `captureLogger` the rest of
+    // this file uses, and asserts each comes out verbatim. A future name with a
+    // hyphen, an underscore, an uppercase letter or a leading digit fails here.
+    const { logger, lines } = captureLogger();
+    for (const msg of LOG_MESSAGES) {
+      logger.log("info", msg);
+    }
+    expect(lines).toHaveLength(LOG_MESSAGES.length);
+    expect(lines.map((line) => parse(line)["msg"])).toEqual([...LOG_MESSAGES]);
+    // And the substituted spelling appears nowhere, which is the symptom that
+    // was invisible.
+    expect(lines.map((line) => parse(line)["msg"])).not.toContain(INVALID_MESSAGE);
   });
 
   test("a reason-shaped field still gets the VALUE pass, because there is no exemption", () => {
