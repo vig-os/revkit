@@ -2406,6 +2406,13 @@ function parseJson(raw: string): Record<string, unknown> {
         });
 
         test("the ceiling holds when there is NO content-length at all", async () => {
+          // Every other ceiling case is written in terms of the constant, so nothing
+          // referenced the number itself: raising it to 64 MiB left the suite green
+          // with the control effectively removed on an unauthenticated parse
+          // endpoint. Pin the magnitude in a band, so the value under test is
+          // falsifiable in the same place that exercises it.
+          expect(MAX_REDEEM_BODY_BYTES).toBeGreaterThan(1024);
+          expect(MAX_REDEEM_BODY_BYTES).toBeLessThanOrEqual(1024 * 1024);
           // The guarantee is the streaming cap, not the header, and the case that
           // proves it is a body with **no declared length** — chunked transfer,
           // which is what a client sends when it does not know the size, and what
