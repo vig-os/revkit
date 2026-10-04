@@ -24,29 +24,44 @@
 #   --budget N        absolute peak. A runaway backstop.
 #   --delta-budget N  growth after a warm-up. The one that can SEE the leak.
 #
-# The `packages/cli` leg breaks down as ~3384 fixed plus ~1065 of leak, and
+# The `packages/cli` leg breaks down as ~3433 fixed plus ~1020 of leak, and
 # the fixed part is a module-load cost rather than a leak. Three separate
 # measurements were previously conflated into one number here, so each is
 # labelled with what it actually is:
 #
 #   52      a bare `bun test` file importing only `node:fs`.
 #   3268    a minimal probe whose only project import is `serve/daemon.ts`.
-#   ~3384   the real leg's post-warm-up FLOOR (4449 peak minus 1065 measured
-#           growth). 3403 on CI (4687 minus 1284, run 37117007176).
+#   ~3433   the real leg's post-warm-up FLOOR, measured as the p10 of the
+#           post-warm-up window on a local run (412 samples, loadavg ~3).
+#           The older `min`-based figure was 3384 local / 3403 on CI; see
+#           "THE FLOOR STATISTIC" below for why the two differ and which is
+#           now the one growth is measured from.
 #
 # Only the third is the baseline growth is measured from, so the arithmetic
-# uses it: the first DOUBLING of the leak lands at ~3384 + 2130 = ~5514,
+# uses it: the first DOUBLING of the leak lands at ~3433 + 2040 = ~5473,
 # comfortably UNDER any absolute ceiling loose enough not to false-positive
 # on a big workstation. An absolute ceiling alone is therefore blind to
 # precisely the regression it was added for.
 #
 # Measuring growth after a warm-up drops the constant term, which is what
 # makes a doubling visible. The warm-up is discarded rather than the first
-# sample, because the first samples race the module graph being loaded.
+# sample, because the first samples race the module graph being loaded — and
+# one of them measured 3, against a settled plateau of 3433.
+#
+# THE FLOOR STATISTIC (issue #86). Growth used to be `max - min`, so ONE
+# sample defined the floor and any transient at the bottom of the window was
+# charged as leak. That mis-fired on healthy runs — CI run 37214081546
+# attempt 1 reported growth 4006 against a budget of 1800, with floor 689
+# against a plateau of 3403, on the same commit that measured 1632 when
+# re-run. The floor is now the p10 of the post-warm-up window, and a settled
+# baseline is a precondition for reporting a growth figure at all. The
+# arithmetic and the reason for each constant are in `fd-budget-verdict.sh`,
+# which is also where the honest `unmeasured` state is decided.
 #
 # The in-process `fd-budget.test.ts` catches the leak RATE with far better
 # resolution (it sees a single daemon lifecycle). This script's job is the
 # cross-process total and the growth, which no in-process test can observe.
+# Neither one can attribute growth to a cause; see the failure message.
 #
 # Usage: scripts/fd-budget.sh --budget N [--delta-budget N] -- cmd args...
 # Exits with the command's own status if it failed, else 1 if a budget was
@@ -57,6 +72,37 @@
 # measured something.
 
 set -uo pipefail
+
+# The verdict arithmetic lives in a sourceable sibling, so a test can call the
+# SAME function this script calls instead of re-implementing it (issue #86).
+# There is deliberately no flag and no environment variable for handing this
+# gate samples instead of measuring them — a gate that accepts injected numbers
+# on a settable input can be silenced, and this one cannot be. Resolved relative
+# to THIS file rather than the caller's cwd, so the script works from anywhere.
+fd_self="${BASH_SOURCE[0]}"
+case "$fd_self" in
+  */*) fd_libdir="${fd_self%/*}" ;;
+  *) fd_libdir="." ;;
+esac
+fd_lib="$fd_libdir/fd-budget-verdict.sh"
+if [ ! -r "$fd_lib" ]; then
+  printf 'fd-budget: cannot read the verdict arithmetic at %s\n' "$fd_lib" >&2
+  exit 70
+fi
+# shellcheck source=fd-budget-verdict.sh  # sibling in this directory; the hook
+# runs shellcheck per file without -x, so the follow cannot happen here.
+# shellcheck disable=SC1091
+. "$fd_lib"
+
+# Defaults for the verdict function's outputs, assigned before it is called.
+# These are load-bearing, not appeasing: when the growth is `unmeasured` the
+# function leaves fdv_floor/probe/growth/deficit UNSET, and this script reads
+# them under `set -u` in the summary and failure paths. It also happens to be
+# what makes shellcheck accept the cross-file reads, since it does not follow
+# the source above.
+: "${fdv_polls:=0}" "${fdv_n:=0}" "${fdv_peak:=0}" "${fdv_window_peak:=0}"
+: "${fdv_no_samples:=1}" "${fdv_measured:=0}" "${fdv_settled:=0}"
+: "${fdv_floor:=}" "${fdv_probe:=}" "${fdv_growth:=}" "${fdv_deficit:=}"
 
 budget=""
 delta_budget=""
@@ -180,11 +226,26 @@ poll_interval="0.05"
 # duration — at 165ms that index would be 3.3s, which is how this came to be
 # flagged for review.
 #
-# Two seconds therefore clears the ~1s ramp with ~1s of margin, which is
-# why the warm-up stays at 2 and is NOT moved. Raising it would shrink the
-# sample count on short legs for no measured gain: on this leg the baseline
-# is already settled to within ~50 descriptors by 2s, ~5% of the 1065 of
-# growth being measured.
+# Two seconds therefore clears the ~1s ramp with ~1s of margin.
+#
+# RE-MEASURED for #86, and it stays at 2. Instrumenting the poller to keep its
+# sample files, on a local `packages/cli` leg at loadavg ~3, the raw trace is
+# 3 at sample 1 and 3416-3433 by sample 11, holding 3433 flat through sample 50:
+# the whole ramp is inside the first TEN polls. Because the tree is narrow at
+# that point, the achieved interval there is the narrow-tree figure (~55ms) and
+# not the 226ms mean above, so ten polls is ~0.6-0.8s of wall clock — which
+# agrees with the ~1s measured by the per-sample stamps cited above. So 2s
+# carries ~1.2s of margin, not the ~1s previously claimed, and there is nothing
+# to gain by shortening it.
+#
+# Shortening would also be the wrong trade now. It used to be tempting because a
+# longer warm-up was the only defence against a ramp; after #86 the p10 floor and
+# the settledness test are that defence, so a longer warm-up buys nothing either.
+# But the ramp's FIRST sample is not near the plateau — it measured 3 against
+# 3433 — so a warm-up that expires before the ramp does does not merely lose
+# margin, it hands the floor a sample three orders of magnitude below the
+# baseline. A shorter warm-up trades a false negative for a blind one, and the
+# measurement says there is no false negative to trade away.
 #
 # Every positive sample goes to `raw` (so "did we ever poll?" stays
 # answerable) and only post-warm-up ones go to `samples` (so growth is
@@ -203,11 +264,26 @@ warmup_seconds=2
 #                          sampling a pid that no longer exists.
 #   [ "$n" -gt 0 ]          drop zeros. A live process always holds at
 #                          least fds 0/1/2, so a zero means "gone", and
-#                          letting one through poisons the MINIMUM that
+#                          letting one through poisons the floor that
 #                          growth is measured from: trailing zeros made
 #                          growth collapse onto the peak, silently
 #                          reducing the growth budget to a second copy of
 #                          the absolute ceiling.
+#
+#                          STILL LOAD-BEARING UNDER p10, and it is worth being
+#                          explicit about why, because the percentile looks
+#                          like it should have made the drop redundant. It has
+#                          not. p10 tolerates zeros in the lowest tenth of the
+#                          window, so a SINGLE trailing zero is now harmless —
+#                          but the floor is a percentile, not a minimum, so
+#                          enough zeros still poison it, just later: over 10%
+#                          of the window reads as zeros, the floor collapses
+#                          to 0 and growth collapses onto the peak again. The
+#                          threshold moved; the requirement did not.
+#                          `fd-budget-script.test.ts` asserts both halves of
+#                          that — that a trace containing >10% zeros floors at
+#                          0, and that a normal run's floor is strictly
+#                          positive.
 (
   while [ -d "/proc/$child" ]; do
     n=$(fds_of_tree "$child")
@@ -228,30 +304,12 @@ status=$?
 kill "$poller" 2>/dev/null || true
 wait "$poller" 2>/dev/null || true
 
-# Growth across the post-warm-up samples: highest minus lowest.
-polls=$(wc -l <"$raw")
-observed=$(wc -l <"$samples")
-peak=$(sort -n "$raw" 2>/dev/null | tail -1)
-peak="${peak:-0}"
+# The whole decision, delegated to one pure function of the two sample files.
+# The old inline version computed `growth = max - min`, where `min` was a single
+# sample and the module-load ramp therefore counted as leak (issue #86).
+fd_budget_verdict "$raw" "$samples"
 
-if [ "$observed" -gt 1 ]; then
-  delta=$(sort -n "$samples" | awk '
-    NR == 1 { lo = $1 }
-    { hi = $1 }
-    END { print hi - lo }
-  ')
-else
-  # The leg finished inside the warm-up window. That is a real "not
-  # measurable", not a pass and not a failure: the absolute ceiling above
-  # still applied to every sample in `raw`.
-  delta="unmeasured"
-fi
-
-# Cleanup of `$samples` and `$raw` is left to the EXIT trap. Doing it by hand
-# here would mean clearing the trap too (so the second file survives), or
-# removing one and leaving the other to a trap that a later `exit` may or may
-# not reach.
-if [ "$polls" -eq 0 ]; then
+if [ "$fdv_no_samples" -eq 1 ]; then
   printf 'fd-budget: FAILED — no samples were taken, so this run was NOT measured.\n' >&2
   printf 'fd-budget: the command exited before the first poll completed, and reporting "peak 0" would be a\n' >&2
   printf 'fd-budget: silent pass, so this is an error rather than a success.\n' >&2
@@ -259,36 +317,130 @@ if [ "$polls" -eq 0 ]; then
   exit 1
 fi
 
-printf 'fd-budget: peak %s open fds (ceiling %s); growth over %s post-warm-up samples: %s (budget %s); %s polls, %ss warm-up, target %ss interval\n' \
-  "$peak" "$budget" "$observed" "$delta" "${delta_budget:-none}" "$polls" "$warmup_seconds" "$poll_interval"
+# Verdicts, computed from the function's output. The growth budget applies only
+# when a growth figure can be defended; `unmeasured` is not a pass on the leak,
+# it is a declined measurement, and the ceiling above stands either way.
+fdv_peak_exceeded=0
+[ "$fdv_peak" -gt "$budget" ] && fdv_peak_exceeded=1
+
+fdv_growth_reported="unmeasured"
+fdv_growth_exceeded=0
+if [ "$fdv_measured" -eq 1 ] && [ "$fdv_settled" -eq 1 ]; then
+  fdv_growth_reported="$fdv_growth"
+  if [ -n "$delta_budget" ] && [ "$fdv_growth" -gt "$delta_budget" ]; then
+    fdv_growth_exceeded=1
+  fi
+fi
+
+if [ "$fdv_settled" -eq 1 ]; then
+  fdv_settled_word=yes
+else
+  fdv_settled_word=no
+fi
+
+# Cleanup of `$samples` and `$raw` is left to the EXIT trap. Doing it by hand
+# here would mean clearing the trap too (so the second file survives), or
+# removing one and leaving the other to a trap that a later `exit` may or may
+# not reach.
+if [ "$fdv_measured" -eq 1 ]; then
+  printf 'fd-budget: peak %s open fds (ceiling %s); post-warm-up window %s samples: floor %s (p%d), opening probe %s, deficit %s, baseline settled: %s, growth %s (budget %s); %s polls, %ss warm-up, target %ss interval\n' \
+    "$fdv_peak" "$budget" "$fdv_n" "$fdv_floor" "$FDV_FLOOR_PCTL" "$fdv_probe" "$fdv_deficit" \
+    "$fdv_settled_word" "$fdv_growth_reported" "${delta_budget:-none}" "$fdv_polls" "$warmup_seconds" "$poll_interval"
+else
+  printf 'fd-budget: peak %s open fds (ceiling %s); post-warm-up window %s samples: growth NOT MEASURED; %s polls, %ss warm-up, target %ss interval\n' \
+    "$fdv_peak" "$budget" "$fdv_n" "$fdv_polls" "$warmup_seconds" "$poll_interval"
+fi
 
 if [ "$status" -ne 0 ]; then
   exit "$status"
 fi
 
-failed=0
-if [ "$peak" -gt "$budget" ]; then
-  printf '\nfd-budget: FAILED — peak %s descriptors exceeds the ceiling of %s.\n' "$peak" "$budget" >&2
-  failed=1
+if [ "$fdv_measured" -eq 0 ] || [ "$fdv_settled" -eq 0 ]; then
+  if [ "$fdv_measured" -eq 0 ]; then
+    printf '\nfd-budget: growth NOT MEASURED, so the growth budget was NOT applied to this run.\n' >&2
+    printf 'fd-budget:   Only %s post-warm-up sample(s) were taken — the leg finished inside the %ss\n' \
+      "$fdv_n" "$warmup_seconds" >&2
+    printf 'fd-budget:   warm-up window. There is no window to measure growth across, and this gate\n' >&2
+    printf 'fd-budget:   declines rather than inventing one from too few samples to be meaningful.\n' >&2
+  else
+    printf '\nfd-budget: growth NOT MEASURED, so the growth budget was NOT applied to this run.\n' >&2
+    printf 'fd-budget:   The descriptor count had not settled when the window opened: floor %s against an\n' \
+      "$fdv_floor" >&2
+    printf 'fd-budget:   opening probe of %s, a deficit of %s against a measured spread of %s.\n' \
+      "$fdv_probe" "$fdv_deficit" "$fdv_growth" >&2
+    printf 'fd-budget:   Within one window, "the baseline had not finished settling" and "a leak is\n' >&2
+    printf 'fd-budget:   accumulating" are the same shape, and this gate counts descriptors rather than\n' >&2
+    printf 'fd-budget:   daemon cycles, so it declines to report a growth figure it cannot defend.\n' >&2
+  fi
+  if [ "$fdv_peak_exceeded" -eq 1 ]; then
+    printf 'fd-budget: The absolute ceiling (peak %s against %s) DID apply to every sample, and it failed.\n' \
+      "$fdv_peak" "$budget" >&2
+  else
+    printf 'fd-budget: The absolute ceiling (peak %s against %s) DID apply to every sample, and it passed.\n' \
+      "$fdv_peak" "$budget" >&2
+  fi
+  printf 'fd-budget: This is "could not measure", NOT a pass on the leak. Narrow it with the per-cycle\n' >&2
+  printf 'fd-budget: rate, which measures what this gate cannot:\n' >&2
+  printf 'fd-budget:   cd packages/cli && bun test test/serve/fd-budget.test.ts\n' >&2
 fi
-if [ -n "$delta_budget" ] && [ "$delta" != "unmeasured" ] && [ "$delta" -gt "$delta_budget" ]; then
-  printf '\nfd-budget: FAILED — descriptor growth of %s over the post-warm-up samples exceeds the budget of %s.\n' \
-    "$delta" "$delta_budget" >&2
-  failed=1
-fi
-if [ "$failed" -ne 0 ]; then
-  cat >&2 <<'EOF'
 
-This is the descriptor leak from issue #74, and it is a BUG, not a slow
-test. Each startDaemon/stop cycle leaks 2 on bun 1.3.13 (Bun's
-fs.watch close() does not free the fd; node v24.21.0 does not leak).
-Re-measure the rate with:
+if [ "$fdv_peak_exceeded" -ne 0 ] || [ "$fdv_growth_exceeded" -ne 0 ]; then
+  {
+    printf '\nfd-budget: FAILED'
+    if [ "$fdv_peak_exceeded" -ne 0 ] && [ "$fdv_growth_exceeded" -ne 0 ]; then
+      printf ' on both budgets.'
+    elif [ "$fdv_peak_exceeded" -ne 0 ]; then
+      printf ' — peak %s descriptors exceeds the ceiling of %s.\n' "$fdv_peak" "$budget"
+    else
+      printf ' — descriptor growth of %s exceeds the budget of %s.\n' "$fdv_growth" "$delta_budget"
+    fi
+    printf '\n'
+    [ "$fdv_peak_exceeded" -ne 0 ] &&
+      printf '  absolute:  peak %s against a ceiling of %s, over %s polls (warm-up %ss)\n' \
+        "$fdv_peak" "$budget" "$fdv_polls" "$warmup_seconds"
+    [ "$fdv_growth_exceeded" -ne 0 ] &&
+      printf '  growth:    %s over %s post-warm-up samples — floor %s (p%d), opening probe %s,\n' \
+        "$fdv_growth" "$fdv_n" "$fdv_floor" "$FDV_FLOOR_PCTL" "$fdv_probe"
+    [ "$fdv_growth_exceeded" -ne 0 ] &&
+      printf '             deficit %s, baseline settled: %s, against a budget of %s\n' \
+        "$fdv_deficit" "$fdv_settled_word" "$delta_budget"
+    cat <<'EOF'
+
+CAUSE NOT ESTABLISHED. This gate counts descriptors. It did not count daemon
+cycles and it does not know which code path is holding them, so nothing here
+attributes this to a bug.
+EOF
+    if [ "$fdv_growth_exceeded" -ne 0 ]; then
+      cat >&2 <<'EOF'
+
+For a growth failure there is a specific ambiguity worth naming: within one
+measurement window a genuine leak and a baseline that had not finished settling
+are the same shape — a monotone rise — and the growth figure above is the same
+either way.
+EOF
+    else
+      cat >&2 <<'EOF'
+
+For a peak failure the ambiguity is narrower: a high peak is either a runaway or
+one large legitimate allocation, and this gate cannot tell which. The growth
+figure on the summary line above is the narrower signal to read first.
+EOF
+    fi
+    cat >&2 <<'EOF'
+
+Issue #74 is a real bug with its own test — an fs.watch().close() leak of 2
+descriptors per daemon cycle on bun 1.3.13 — but whether THIS number is that
+bug is a question for the per-cycle rate, which measures exactly what this gate
+cannot:
 
   cd packages/cli && bun test test/serve/fd-budget.test.ts
 
-If that per-cycle test still passes, the growth is coming from somewhere
-else — report it with the numbers above rather than raising the budget.
+If that test passes at its budgeted rate, the growth above is not the #74
+watcher leak, and something else is holding descriptors — report it with the
+numbers above rather than raising the budget. If it fails, the leak rate has
+moved, and that is the finding to chase first.
 EOF
+  } >&2
   exit 1
 fi
 exit 0

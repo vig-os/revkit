@@ -465,28 +465,53 @@ test_fd_budget_playwright := "16384"
 #
 #   52      a bare `bun test` file importing only `node:fs`.
 #   3268    a minimal probe whose only project import is `serve/daemon.ts`.
-#   ~3.4k   the real `packages/cli` leg's post-warm-up FLOOR — 3384 local
-#           and 3403 on CI, derived as peak minus measured growth.
+#   ~3.5k   the real `packages/cli` leg's post-warm-up FLOOR, read as the p10
+#           of the post-warm-up window: 3491 local (581 samples). The older
+#           `min`-based reading of the same quantity was 3384 local / 3403 on
+#           CI; see #86 below for why the two differ.
 #
 # The first two are probes; only the third is the baseline the growth budget
 # actually subtracts, so the leak arithmetic below uses it.
 #
-# The `packages/cli` leg rises from that ~3384 floor to a 4449 peak, i.e.
-# ~1065 of growth, and that growth IS the leak: 2 per daemon cycle across the
-# suite. So the first DOUBLING of the leak lands at ~3384 + 2130 = ~5514,
+# The `packages/cli` leg rises from that ~3.5k floor to a ~4456 peak, i.e.
+# ~965 of growth, and that growth IS the leak: 2 per daemon cycle across the
+# suite. So the first DOUBLING of the leak lands at ~3491 + 1930 = ~5421,
 # comfortably UNDER the 8192 absolute ceiling. The ceiling passes it. An
 # absolute ceiling loose enough not to false-positive is therefore blind to
 # the first doubling, which is the most likely shape of the regression it
 # was added for. Measuring growth drops the constant term and cannot hide it
 # that way.
 #
-# 1800 therefore sits between the measured growth and a doubling of it.
-# Local growth is stable at 1038-1067 across four runs; the CI runner
-# measures 1284 (run 37117007176) and 1279 (run 37117515667), about 20%
-# higher. So 1800 is ~1.4x the worst environment measured and a doubling
-# trips it — 2568 on CI against an 1800 budget, and 2130 locally. If CI
-# growth ever drifts another 40% the budget needs re-deriving; that is the
-# number to watch in the log, which is why the recipe prints it every run.
+# 1800 therefore sits between the measured growth and a doubling of it. The
+# figure it is now measured against is RAMP-FREE, which is the point of #86.
+# Before #86 the script computed `growth = max - min`, so one module-load
+# sample defined the floor and a ramp was charged as leak; the same commit
+# reported 1632, 1856 and 4006 on three runs of it, and 4006 reddened a CI
+# build whose 1368 tests all passed. Nothing derived from that number was
+# trustworthy, including this budget's own margin.
+#
+# RE-DERIVED FROM RAMP-FREE MEASUREMENTS, and the number did not move. Local
+# `packages/cli` growth is 965 and 1021 on two runs of the p10 statistic
+# (loadavg 3-9); CI's clean runs measured 1284 (run 37117007176) and 1279 (run
+# 37117515667) under `min`, which OVERSTATES growth by up to 10%, so CI's
+# ramp-free figure is 1150-1284. So 1800 is ~1.4x the worst environment
+# measured and a doubling trips it — 2300-2570 on CI against an 1800 budget,
+# and 1930 locally. It is NOT raised: the honest reason to revisit it is a
+# measured shift, and none has occurred. Raising it on a ramp-contaminated
+# measurement is precisely what #86 exists to prevent.
+#
+# WHAT TO WATCH, AND WHY THE OLD NOTE WAS NOT ACTIONABLE. The old note here read
+# "if CI growth ever drifts another 40% the budget needs re-deriving", which
+# could not be acted on: a 40% drift and a ramp were indistinguishable when
+# both land in the same number, and one commit had already produced a 2.5x
+# spread. The replacement note is in `scripts/fd-budget.sh`, which prints
+# `baseline settled: yes|no` alongside floor, probe and deficit. `yes` means
+# the figure is ramp-free and is the number to compare against 1800. `no`, or
+# `growth NOT MEASURED`, means the leg declined to produce a figure at all —
+# that is NOT a growth regression and NOT a licence to raise the budget; it
+# means the run was blind, and the absolute ceiling is what judged it. A leg
+# that reports `unmeasured` repeatedly on CI, rather than occasionally, is the
+# signal worth acting on, and the fix is the warm-up window, not this number.
 #
 # The ~20% CI/local growth gap is NOT the warm-up window. The hypothesis was
 # that CI samples more slowly, so its baseline sits lower and its growth
@@ -496,9 +521,17 @@ test_fd_budget_playwright := "16384"
 # the run and the warm-up is not the cause. That residual is unexplained;
 # the budget holds either way, with 40% headroom on the larger number.
 #
+# LEGS THAT REPORT `NOT MEASURED`, and why that is expected. Three of the six
+# legs finish inside the 2s warm-up — `packages/review-core` (520ms),
+# `site/schemas` (117ms) and `just/check` (~2s) — so they have no post-warm-up
+# window and contribute nothing to the growth gate. That was equally true before
+# #86 (the old `observed <= 1` branch produced the same state) and is unchanged
+# by it; the absolute ceiling still judged all three. `packages/cli` is the leg
+# this budget is actually about, and it is the one whose growth the leak moves.
+#
 # The Playwright leg is a different shape and gets its own number. It starts
 # small (a `just build`) and grows into its workers, so on this host its
-# growth is essentially its whole peak — measured 5457 against a 5469 peak,
+# growth is essentially its whole peak — measured 5856 against a 5882 peak,
 # and a budget of 6000 would have false-positived on this host's own 6008
 # and 6481 peaks. 12000 keeps it above the worst observed (6481) by 1.85x.
 # At CI's `workers: 1` the same leg measures peak 510 / growth 491, so this
