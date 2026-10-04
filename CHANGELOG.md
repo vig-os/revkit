@@ -36,7 +36,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     authorization on every request and this slice has no session, so neither the
     read nor the write is reachable over HTTP. The read is the larger exposure —
     an open GET needs no CSRF bypass and returns comment bodies. Read and append
-    are proven through the store suites instead.
+    are proven through the store suites instead. (Slice 2 opens the read behind
+    the gate below.)
+
+- **Sessions, CSRF, and ADR-0012's per-request authorization gate**
+  ([#9](https://github.com/vig-os/revkit/issues/9),
+  [ADR-0012](docs/adr/0012-hosted-security-threat-model.md))
+  - `GET /api/threads` and `GET /api/threads?since=<n>` are **open**, behind one
+    gate every route but `/healthz` passes through. `POST /api/threads` stays
+    **501**; its hosted write shape is a later slice, and it now reaches that
+    answer only after the gate and the CSRF check have both passed.
+  - A session is a 256-bit `crypto.getRandomValues` value in an
+    `HttpOnly; Secure; SameSite=Lax; Path=/` cookie named
+    `__Host-revkit_session`, resolved per request by `sha256(cookie)` against
+    `sessions.id`. **Neither the session id nor the CSRF token is recoverable
+    from the database** — both are stored as digests — and expiry is enforced
+    on every read, with an unparsable `expires_at` failing closed.
+  - Every state-changing call needs `x-revkit-csrf`, satisfied only by that
+    session's own token, and declares `application/json`. `POST
+    /api/session/refresh` is the one state-changing route this slice opens, so
+    both rules have a reachable path to be load-bearing on; it rotates the id
+    and the token in one atomic D1 batch.
+  - An `identity_kind` the gate does not recognise is **refused**, not defaulted
+    to allowed, and a session is issued out of band by whoever holds D1 write
+    access (`revkit deploy init`) — there is deliberately no
+    `POST /api/session`. Slice 3's invite redemption is the first way a session
+    reaches a person.
+  - **Not** implemented, and recorded in the ADR-0012 amendment: ADR-0012's
+    *scope* clause. No `TokenSource`, no invite, and `events` has no `repo`
+    column, so a valid session currently receives the whole log.
 
 ### Changed
 

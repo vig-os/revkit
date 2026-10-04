@@ -3,15 +3,17 @@
 The hosted surface (ADR-0008 surface (c), ADR-0025). One Cloudflare Worker, one
 D1 database, and **the same review core** the local daemon and the browser use.
 
-M4 slice 1 / issue #9. This README is the slice's honest scope statement; read it
-before assuming a hosted feature exists because a file in this directory mentions
-it.
+M4 slices 1 and 2 / issue #9. This README is the slice's honest scope statement;
+read it before assuming a hosted feature exists because a file in this directory
+mentions it.
 
 ## What is here
 
 | Piece | File | Why it exists |
 |---|---|---|
-| Worker entry | `src/index.ts` | `GET /healthz`, `GET /api/threads`, `POST /api/threads` (**disabled**) |
+| Worker entry | `src/index.ts` | `GET /healthz`, `GET /api/threads`, `POST /api/session/refresh`, `POST /api/threads` (**disabled**) |
+| Sessions | `src/session.ts` | mint, hash, store, resolve, rotate; the cookie and the CSRF token |
+| The gate | `src/authz.ts` | ADR-0012's per-request authorization, and the route table that says which routes it applies to |
 | Hosted store | `src/d1-store.ts` | `D1ThreadStore implements ThreadStore` — ADR-0006's log on D1 |
 | D1 schema | `migrations/0001_init.sql` | the ONLY DDL for the hosted store, applied out of band |
 | Response headers | `src/headers.ts` | adapter over the **shared** policy in `@revkit/review-core/http-headers` |
@@ -43,23 +45,104 @@ the real committed allowlist, so it cannot quietly drift.
 `test/worker-runtime.test.ts` re-asserts both halves, so a future compatibility
 bump that re-enables the flag goes red.
 
-## `/api/threads` is closed — every verb, 501
+## Where a session comes from in this slice
 
-`GET` and `POST` both answer **501** with the same body shape, naming M4 slice 2.
-ADR-0012 requires authorization on *every* request — a GitHub session must still
-have read access to the repo, an invite must be checked for scope, type and expiry
-— and slice 1 has neither a session nor a `TokenSource`. The read is the larger of
-the two exposures: an open `GET` needs no CSRF bypass, no browser and no user
-interaction, and it returns comment bodies, which is what ADR-0015 protects.
+**`issueSession` has no HTTP caller, and that is the design, not an omission.**
+ADR-0012 authorizes on every request, so something has to issue a session. Slice 2
+has neither the GitHub App (owner-gated, #34) nor an invite (slice 3), so the
+only issuer available today is **out of band: whoever holds write access to the
+D1 database** — in production `revkit deploy init` (slice 8), in tests the
+harness. The identity kind it mints is `operator`.
 
-Read and append stay fully proven, just not over HTTP:
+Rejected alternative: a `POST /api/session` guarded by a deployment secret. It
+needs a Worker secret, so it cannot be built or tested offline (#34); it would add
+an unauthenticated endpoint to the shipped surface; and it would be the first
+thing a later refactor widens. An unbuildable, unreachable control is worse than
+an honest "the operator mints it".
 
-- `packages/review-core/test/store-conformance.ts` runs 19 cases against **all
-  three** `ThreadStore` implementations (in-memory, the daemon's `bun:sqlite`,
-  and this package's D1).
-- `test/d1-store.test.ts` proves the `?since=` log catch-up and the
-  `exportArchive`/`import` bridge between D1 and an in-memory store, both
-  directions.
+**Write access to D1 is therefore the credential in this model**, exactly as
+process memory is for the local daemon (ADR-0013). What is *not* the credential is
+anything a client can construct: `sessions.id` holds the **SHA-256** of the
+session id, so a database read is not a session, and the gate refuses every cookie
+whose value does not resolve to a live row.
+
+## The gate: ADR-0012's per-request authorization
+
+One function, `authorizeRequest` in `src/authz.ts`, in front of every route except
+`/healthz`, the `/_revkit/` bundle path and the 404s. It answers, in this order:
+
+1. **Session.** The `__Host-revkit_session` cookie, base64url, 256 bits from
+   `crypto.getRandomValues`. Resolved by `sha256(cookie)` against
+   `sessions.id`. Refused when the row is missing, expired (checked on **every**
+   read, and unparsable fails closed), blank in a load-bearing column, or carries
+   an `identity_kind` outside `RECOGNISEN_IDENTITY_KINDS`.
+2. **CSRF**, on a state-changing verb only. `x-revkit-csrf` must hash to *that
+   session's* `csrf_hash`. Bound per session by construction — another session's
+   token, the session id itself, and a rotated-away token all fail.
+3. **`application/json`**, on a state-changing verb only. No parameter-suffixed
+   type, no `text/json`, no `+json`, and no header at all.
+
+What it does **not** yet decide is ADR-0012's *scope* clause — "a GitHub session
+must still have read access to the repo" and "a guest invite is checked for scope,
+type and expiry" — because there is no `TokenSource`, no invite, and no `repo`
+axis in `events(seq, ts, payload)` for a scope check to select on. That is recorded
+in the ADR-0012 amendment dated 2026-10-04. "Authorized" here means exactly: *a
+session this build issued is presenting, unexpired*. A necessary condition, and
+calling it sufficient would be the same overclaim slice 1 corrected twice.
+
+`RECOGNISED_IDENTITY_KINDS` is closed in the gate and open in the schema. Adding
+the GitHub App or an invite means adding an arm there, where the scope rules get
+written — not relaxing a `default`.
+
+## The surface
+
+| Route | Verbs | Answer |
+|---|---|---|
+| `/healthz` | GET, HEAD | 200 `{ok, revkitVersion, requestId}`. The only open route: it reads no database and returns no review content. |
+| `/healthz` | other | 405 |
+| `/api/threads` | GET, HEAD | 200 `{head, threads}` behind the gate |
+| `/api/threads` | GET `?since=<n>` | 200 `{head, events}` — exactly the events with `seq > n` |
+| `/api/threads` | POST | **501.** Passes the gate and the CSRF check, then: the hosted write is slice 4. |
+| `/api/session/refresh` | POST | 200. Rotates the session id *and* the CSRF token, in one D1 batch, so a stolen cookie dies at the next refresh. |
+| `/api/*` | other verbs | 405, **behind the gate**, so route existence is not enumerable anonymously |
+| `/<repo>/pr-<n>/…` | any | 501 naming slice 5 — **behind the gate**, so slice 5 inherits the gate from the route table instead of remembering it |
+| `/_revkit/…` | any | 404, never a redirect (ADR-0012) |
+| anything else | any | 404 |
+
+`?since=` accepts one canonical form: `0` or a decimal integer with no sign, no
+leading zero, no radix prefix, no exponent, no decimal point, no whitespace, and at
+most 16 digits. Every other spelling — and every parameter that is not `since` —
+is a 400 with a closed reason and the parameter **name** echoed, never its value.
+Authorization runs first, so an anonymous caller gets 401 rather than a 400 that
+would describe the request's shape to someone who has proved nothing.
+
+`POST /api/session/refresh` exists because ADR-0012's CSRF and `application/json`
+rules are only testable end to end if some state-changing call is reachable, and it
+is the smallest such route: it writes nothing but the caller's own `sessions` row.
+
+## Session storage, and why it is hashed
+
+| | in the cookie / header | in `sessions` |
+|---|---|---|
+| session id | 256-bit base64url | `sha256(id)`, hex |
+| CSRF token | 256-bit base64url | `sha256(token)`, hex |
+
+Neither plaintext is recoverable from the database, and neither is ever logged.
+Two tests say so at two levels: `test/logger.test.ts` drives genuinely minted
+values through the redactor under innocent and credential-shaped keys, and its
+end-to-end group captures the Worker's *own* log lines for an **authorized**
+request and searches them for the session id, the CSRF token and both digests —
+that capture needs miniflare's `console.log` forwarding, so it lives beside the
+other log captures rather than in the gate's file.
+
+A stolen-but-unexpired cookie is **bounded, not prevented**: `SESSION_TTL_MS`
+(12 h) caps the initial life, `expires_at` is re-checked on every request, a
+refresh rotates the credential away from a stolen copy, and a 7-day hard cap from
+the original `created_at` stops a refresh loop. That cap is **unconditional**:
+`created_at` is its only input, so a row whose `created_at` does not parse is
+refused at the gate, and the rotation fails closed independently (`no cap`
+becomes `expire now`, never `no limit`). Not present: logout-all-sessions, a
+revocation list, device tracking, and any way to tell the thief from the owner.
 
 ## Why `workers_dev: false` matters — and what it does NOT do
 
@@ -67,9 +150,8 @@ It is a **tripwire, not an authorization check.**
 
 - **Does:** with no `routes` either, this Worker has no public URL, so a mistake
   in the handler is not immediately reachable at `*.workers.dev`.
-- **Does not:** authorize anything. The authorization this Worker performs is
-  none — `/api/threads` is closed by code, and that 501 is asserted by
-  `test/worker-runtime.test.ts` against a **non-empty** log.
+- **Does not:** authorize anything, and it never did. Slice 2 added the
+  authorization — the gate above — and this line had no part in it.
 - **Does not survive** slice 3 or slice 5 adding a `routes` entry.
 - **Never applied** to `wrangler dev --remote`.
 
@@ -94,14 +176,19 @@ relocate it, fix `src/index.ts` in the same commit.
 
 `src/logger.ts`'s header is the authority. Three mechanisms are enforced:
 
-1. **The message is a closed vocabulary.** `msg` is one of five event names and a
+1. **The message is a closed vocabulary.** `msg` is one of eight event names and a
    runtime guard refuses anything else, which is the only mechanism that can stop a
    **comment body** — no regex distinguishes prose from a log line.
 2. **Key names.** A field whose name matches the sensitive set has its value
-   replaced entirely, nested or arrayed.
+   replaced entirely, nested or arrayed. `session`, `sid` and `csrf` are in that
+   set, which matters from slice 2 on because a session id and a CSRF token are
+   now real values in real requests.
 3. **Value shapes.** Every remaining string, at any depth, is tested for a
-   credential shape or an email address — which is what catches a leak under an
-   *innocent* key.
+   credential shape, an email address, **or revkit's own token shape** — the
+   last was added in slice 2 after MEASURING that a genuinely minted session id
+   logged under the innocuous key `seen` came out verbatim, because the shape
+   pass knew six credential families and none of them was the one this repo
+   mints.
 
 **Not enforced:** free-form prose under a key the redactor does not recognise.
 The control for that is the caller rule — review content is never passed as a log
@@ -117,7 +204,7 @@ dev`, no Cloudflare API call, no DNS.
 nix develop            # or: direnv allow
 bun install
 cd packages/worker
-bun test               # ~5 s
+bun test               # ~10 s over 10 files
 bun run typecheck
 ```
 
@@ -127,30 +214,41 @@ The harness (`test/harness.ts`) starts one `miniflare` per test file, applies th
 are read from that file rather than duplicated in the harness, so the test runtime
 cannot drift from the shipped config.
 
-## What slice 1 does NOT do
+## What slices 1 and 2 do NOT do
 
 Stated here so nobody has to read the PR body to find out:
 
 - **No GitHub App.** No registration, manifest, OAuth or webhook. `TokenSource`
   stays unimplemented, so hosted **B2** (comment as the reviewer) and **B3**
-  (submit review) do not move.
+  (submit review) do not move — and the gate has no repo-access check to make,
+  because there is nothing to check it against.
 - **No preview serving.** No R2, no `<repo>/pr-<n>/` object, no
   extension→`Content-Type` allowlist. `parsePreviewPath` recognises a preview path
   and answers `501` naming the slice that serves it. ADR-0012's SVG-sandbox rule is
   implemented and tested as a header, against synthetic content only.
-- **No CSRF and no authorization.** Both verbs on `/api/threads` are `501`, so
-  **Q6 stays partial**. Neither read nor append is reachable over HTTP; both are
-  proven through the store suites instead.
-- **The shipped Worker bundle no longer contains `@revkit/review-core`.** Closing
-  `GET /api/threads` left nothing reachable from `src/index.ts` touching
-  `D1ThreadStore`, so the bundler tree-shook the core out: ~20 KB, where it was
-  ~790 KB. ADR-0025's "the core runs in workerd" claim is therefore proven against
-  the runtime probe bundle (which does contain the core, ~776 KB), not against the
-  shipped entry. Both are scanned by `test/worker-runtime.test.ts`.
+- **No scope authorization.** See "The gate" above. `GET /api/threads` returns the
+  **whole** log to any valid session, because `events` has no `repo` column to
+  scope by. **Q6 stays partial.**
+- **`POST /api/threads` is still 501.** CSRF is load-bearing on a reachable route
+  (`POST /api/session/refresh`), but no CSRF-protected *review write* ships, so
+  "CSRF-protected writes" is not proven.
+- **The 409 mapping for a lost refresh race is unexercised over HTTP.** The typed
+  error and its "no second row" behaviour are proven in `test/session.test.ts`; the
+  window between the gate's read and the rotation is one statement pair that a test
+  cannot open from outside the request.
+- **`POST /api/session/refresh` has no client.** The CSRF token is delivered by the
+  issuance path and by this route's response header; no page reads it yet.
+- **The shipped Worker bundle grew to ~807 KB.** Re-opening `GET /api/threads`
+  brought `@revkit/review-core` back into the deployed entry, so ADR-0025's "the
+  core runs in workerd" is now a claim about the artefact that ships — asserted
+  positively (named core exports must be present) and negatively (no Node/Bun
+  escape hatches) in `test/worker-runtime.test.ts`.
 - **No rate limits, no Durable Objects.**
 - **No invite semantics.** `invites` has the ADR-0009 shape and a UNIQUE
   `token_hash`; nothing mints, verifies, revokes or redeems one.
-- **No retention.** Tables have the columns; nothing deletes anything.
+- **No retention.** Tables have the columns; nothing deletes anything — including
+  `sessions` rows, which now exist and accumulate. Recorded in ADR-0015's
+  2026-10-04 amendment.
 - **No secrets, therefore no secret handling** (ADR-0014's substance is untested
   because there is nothing yet to leak).
 - **No deploy.** `wrangler deploy`, `wrangler d1 create` and `revkit deploy` are
@@ -171,7 +269,11 @@ Stated here so nobody has to read the PR body to find out:
 
 ## Adding a slice
 
-- New hosted state goes in `migrations/0002_*.sql`, never by editing `0001`.
+- Slice 2 added **no migration**, on purpose: hashing the session id, storing the
+  CSRF digest and rotating both fit `0001_init.sql`'s existing columns, and a
+  migration that added a column nothing reads would be a migration that lies.
+  When a real one is needed it goes in `migrations/0002_*.sql`, never by editing
+  `0001`.
   Every statement stays `IF NOT EXISTS`-idempotent or the idempotence test
   (`test/schema.test.ts`, A15) is the thing you broke.
 - New response headers go through `@revkit/review-core/http-headers`, not through a
