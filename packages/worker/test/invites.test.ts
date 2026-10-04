@@ -42,6 +42,9 @@
 //   revoked after minting             ALREADY-MINTED, UNEXPIRED session on its
 //                                     next request"
 
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { authorizeRequest, classifyRoute, DENIAL_REASONS, INVITE_OPEN_PREFIX, INVITE_REDEEM_PATH, type Route } from "../src/authz.ts";
 import { clientAssetDigest, clientAssetPath } from "../src/client-asset.ts";
@@ -87,7 +90,7 @@ import {
   type RateBucket,
 } from "../src/rate-limit.ts";
 import { CSRF_HEADER, SESSION_COOKIE_NAME, isTokenShaped, mintToken, sha256Hex } from "../src/session.ts";
-import { previewScopePath, scopedThreadsPath } from "../src/router.ts";
+import { parseScopedThreadsPath, previewScopePath, scopedThreadsPath } from "../src/router.ts";
 import {
   issueTestSession,
   JSON_HEADERS,
@@ -96,6 +99,7 @@ import {
   seedLogEvents,
   setCookieValue,
   startWorker,
+  stripTsComments,
   TEST_INVITE_TOKEN_HMAC_KEY,
   testTokenHasher,
   type Harness,
@@ -338,6 +342,18 @@ describe("invite mechanics (ADR-0009) against D1", () => {
         expect(result.ok, repo).toBe(false);
         if (!result.ok) expect(result.refusal).toBe("bad-repo");
       }
+      expect((await db().prepare("SELECT COUNT(*) AS n FROM invites").first<{ n: number }>())?.n).toBe(0);
+    });
+
+    test("U+212A is refused, because mintInvite VALIDATES before it canonicalises", async () => {
+      // The one input where the order in `mintInvite` changes the outcome:
+      // `canonicalRepoName` is a Unicode fold, so U+212A KELVIN SIGN becomes
+      // "k", which IS a servable repo name. Canonicalising first would mint an
+      // invite for a name the predicate rejects. Every other hostile input folds
+      // to itself, so without this case the swap passes the whole suite.
+      const result = await mintOk(db(), { repo: "\u212A" });
+      expect(result.ok, "the Kelvin sign must not become \"k\"").toBe(false);
+      if (!result.ok) expect(result.refusal).toBe("bad-repo");
       expect((await db().prepare("SELECT COUNT(*) AS n FROM invites").first<{ n: number }>())?.n).toBe(0);
     });
 
@@ -871,6 +887,260 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     });
   });
 
+  // ── L4: the repo name is canonicalised at MINT, and at no other layer ───
+  //
+  // GitHub repository names are case-INSENSITIVE; a revkit repo segment is
+  // case-SENSITIVE. So an operator who mints `repo = "Revkit"` and serves the
+  // canonical `/revkit/` spelling refuses that guest their own review. Before
+  // this normalisation that was fail-closed and pinned (see
+  // `test/authorization.test.ts`'s "or path case" case, which asserts
+  // `/REVKIT/pr-7/api/threads` answers a DIFFERENT, empty log), so it was an
+  // inconvenience rather than a hole. Slice 5b located the fix at mint time and
+  // this is that fix.
+  //
+  // **The URL side is deliberately NOT normalised, and that is the whole
+  // argument rather than an omission.** `inviteCovers` still compares with
+  // `!==`, so a mixed-case path still names a different review and still fails
+  // closed against a canonical invite. What moves is the STORED side, from
+  // whatever the operator typed to the one canonical spelling — which means
+  // exactly ONE spelling of a URL grants, before and after. The set of admitted
+  // URLs has the same cardinality; only its member changed. A case-fold on both
+  // sides would have made `/REVKIT/` and `/revkit/` name ONE log, which is the
+  // two-spellings-of-one-path aliasing `parsePreviewPath` exists to forbid.
+  describe("the repo name is canonicalised at mint", () => {
+    /** What `Acme`/`acme` both store, so the case-difference cases below assert
+     * one canonical value without re-spelling it at each site. */
+    const CANONICAL = "acme";
+
+    test("the operator's own case: mint `Revkit`, serve `/revkit/`, and the guest is admitted", async () => {
+      // THE reported defect, end to end through real workerd and the real gate.
+      // `onboard` mints `Revkit` verbatim, redeems, and hands back a browser
+      // holding a live session; the read is at the canonical lowercase path.
+      const { browser } = await onboard(harness, { repo: "Revkit", kind: "team" });
+      const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, {
+        headers: authedHeaders(browser, null),
+      });
+      expect(response.status, await response.clone().text()).toBe(200);
+    });
+
+    test("the STORED repo is the canonical form, and the returned invite says so", async () => {
+      // Both halves, because they are different objects: the row is what every
+      // later scope check reads, and the RETURNED record is what a caller
+      // (`revkit invite`, #81) would print. A mint that stored the canonical
+      // form but returned the input would hand the operator a link for `"Revkit"`
+      // that the gate will refuse — the same defect, one layer up.
+      const result = await mintOk(db(), { repo: "Revkit", pr: PR });
+      if (!result.ok) throw new Error("mint failed");
+      expect(result.minted.invite.repo).toBe(REPO);
+      const row = await db()
+        .prepare("SELECT repo FROM invites WHERE id = ?")
+        .bind(result.minted.invite.id)
+        .first<{ repo: string }>();
+      expect(row?.repo).toBe(REPO);
+      // And `loadInviteById` reads the same canonical value back, so the two
+      // paths into an `InviteRecord` cannot disagree.
+      expect((await loadInviteById(db(), result.minted.invite.id))?.repo).toBe(REPO);
+    });
+
+    test("a refusal is still a refusal, and it happens on the INPUT, before anything is folded", async () => {
+      // Folding must not become a way to ADMIT a name `isRepoName` rejects. Every
+      // hostile spelling below is refused identically to its un-folded self, and
+      // the count proves nothing was written.
+      for (const repo of ["../etc", "rev kit", "a/b", "", ".", "..", "x".repeat(101)]) {
+        const result = await mintOk(db(), { repo });
+        expect(result.ok, repo).toBe(false);
+        if (!result.ok) expect(result.refusal).toBe("bad-repo");
+      }
+      expect((await db().prepare("SELECT COUNT(*) AS n FROM invites").first<{ n: number }>())?.n).toBe(0);
+    });
+
+    test("the URL side is NOT normalised: a mixed-case path is still a different review", async () => {
+      // The security half, and the reason the fix is at mint rather than at read.
+      // With the invite canonical, every one of these is refused — the route
+      // names a repo the invite does not hold, verbatim.
+      const result = await mintOk(db(), { repo: "Revkit", pr: PR });
+      if (!result.ok) throw new Error("mint failed");
+      const invite = result.minted.invite;
+      for (const shouted of ["Revkit", "REVKIT", "rEvKiT"]) {
+        expect(inviteCovers(invite, { repo: shouted, pr: PR }), shouted).toBe(false);
+      }
+      // The canonical spelling is the one that works, and it works for the SAME
+      // PR the invite names and no other.
+      expect(inviteCovers(invite, { repo: REPO, pr: PR })).toBe(true);
+      expect(inviteCovers(invite, { repo: REPO, pr: PR + 1 })).toBe(false);
+    });
+
+    test("the trade: a mixed-case URL that USED to work now does not", async () => {
+      // Recorded rather than hidden, because it is the cost and not a detail.
+      // Before normalisation an invite minted `Revkit` matched `/Revkit/`; now it
+      // matches only `/revkit/`. The count of admitted spellings is one either
+      // way — which one it is, changed. An operator who serves a mixed-case path
+      // must mint in that case no longer; the alternative (folding both sides)
+      // would alias two spellings of one path onto one log.
+      const result = await mintOk(db(), { repo: "Revkit", pr: PR });
+      if (!result.ok) throw new Error("mint failed");
+      const invite = result.minted.invite;
+      const admitted = [REPO, "Revkit", "REVKIT"].filter((repo) => inviteCovers(invite, { repo, pr: PR }));
+      expect(admitted).toEqual([REPO]);
+    });
+
+    test("two case-variant mints stay TWO invites — a case difference merges nothing", async () => {
+      // `Acme` and `acme` are the same repository ON GITHUB, so making their
+      // stored `repo` equal is correct. What must not happen is the two invites
+      // becoming ONE grant: a guest's scope comes from
+      // `sessions.identity_id -> invite_redemptions.guest_id -> invites.id`, so it
+      // is resolved BY ID and there is no lookup of the form `WHERE repo = ?`
+      // anywhere — asserted structurally below and behaviourally here.
+      const first = await mintOk(db(), { repo: "Acme", pr: PR });
+      const second = await mintOk(db(), { repo: "acme", pr: PR });
+      if (!first.ok || !second.ok) throw new Error("mint failed");
+      expect(first.minted.invite.repo).toBe(second.minted.invite.repo);
+      expect(first.minted.invite.id).not.toBe(second.minted.invite.id);
+      expect(first.minted.token).not.toBe(second.minted.token);
+      // Two rows, one canonical `repo`, distinct identities — and no UNIQUE
+      // violation. Measured: the shipped schema's ten UNIQUE/PK constraints are
+      // on `invites.id`, `invites.token_hash`, `guests.id`, `sessions.id`,
+      // `invite_redemptions(invite_id, binding_hash)`, `rate_limit_counters.bucket`,
+      // `events.seq`, `snapshots.revision`, `events_unscoped_legacy.seq` and
+      // `review_logs(log_key, seq)` — NONE of them is keyed on `invites.repo`,
+      // which `PRAGMA table_info(invites)` reports as NOT NULL and unindexed. So
+      // there is no repo-scoped key for folding to collide.
+      const rows = await db()
+        .prepare("SELECT id, repo FROM invites WHERE pr = ?")
+        .bind(PR)
+        .all<{ id: string; repo: string }>();
+      expect(rows.results?.map((r) => r.id).sort()).toEqual(
+        [first.minted.invite.id, second.minted.invite.id].sort(),
+      );
+      expect(rows.results?.every((r) => r.repo === CANONICAL)).toBe(true);
+    });
+
+    test("a guest resolves to ITS OWN invite, so two case-variant mints cannot cross", async () => {
+      // The behavioural half of the case above, through the real ledger. Two
+      // guests, two mints differing only in case, two sessions: each one's grant
+      // names the invite IT redeemed and never the other.
+      const shouty = await onboard(harness, { repo: "Acme", kind: "team" });
+      const quiet = await onboard(harness, { repo: "acme", kind: "team" });
+      expect(shouty.inviteId).not.toBe(quiet.inviteId);
+      expect(shouty.sessionId).not.toBe(quiet.sessionId);
+      // The guest id is resolved from the SESSION rather than read off
+      // `sessions`, because `onboard` is written for one onboarding per test and
+      // its `SELECT identity_id … first()` would hand back the FIRST session in
+      // the table — which after a second onboarding is the wrong guest's, and
+      // would make this case assert that two guests are one. The lookup is by
+      // `sha256Hex(cookie value)` because `sessions.id` stores the DIGEST: the
+      // cookie carries the plaintext session id and the row carries its hash, so
+      // a lookup by the cookie value would find no row and this case would fail
+      // for a reason that has nothing to do with case.
+      const guestOf = async (sessionId: string): Promise<string> => {
+        const row = await db()
+          .prepare("SELECT identity_id FROM sessions WHERE id = ?")
+          .bind(await sha256Hex(sessionId))
+          .first<{ identity_id: string }>();
+        if (row?.identity_id === undefined) throw new Error(`no guest for session ${sessionId}`);
+        return row.identity_id;
+      };
+      const grants = await Promise.all(
+        [shouty, quiet].map(async (g) => {
+          const guestId = await guestOf(g.sessionId);
+          const resolved = await loadInviteGrant(db(), { guestId, binding: g.browser.get(BROWSER_COOKIE_NAME) ?? null }, { now: at() });
+          return resolved.ok ? resolved.grant.invite.id : null;
+        }),
+      );
+      expect(grants).toEqual([shouty.inviteId, quiet.inviteId]);
+    });
+
+    test("a guest stays confined to its own scope — normalisation does not widen the grant", async () => {
+      // Not a case-difference case: the ordinary isolation property, asserted
+      // after the change so a reviewer can see the fold did not soften it. All
+      // three refusals come from the GATE (`invite-scope-mismatch`), not a
+      // handler. The invite is PR-scoped, so the wrong-PR refusal below is a real
+      // one — a repo-wide invite covers every PR and would have made it vacuous.
+      const { browser } = await onboard(harness, { repo: "Revkit", pr: PR, kind: "team" });
+      expect(
+        (await harness.dispatch(`http://localhost${scopedThreadsPath(REPO, PR + 1)}`, {
+          headers: authedHeaders(browser, null),
+        })).status,
+      ).toBe(403);
+      expect(
+        (await harness.dispatch(`http://localhost${scopedThreadsPath("other-repo", PR)}`, {
+          headers: authedHeaders(browser, null),
+        })).status,
+      ).toBe(403);
+      // And the mixed-case path for ITS OWN review is refused too — the fold did
+      // not make the comparison case-insensitive.
+      const shouted = await harness.dispatch(`http://localhost${scopedThreadsPath("REVKIT", PR)}`, {
+        headers: authedHeaders(browser, null),
+      });
+      expect(shouted.status).toBe(403);
+      expect(await json(shouted)).toMatchObject({ error: "forbidden", reason: "invite-scope-mismatch" });
+    });
+
+    test("the stored repo never reaches a log key — the key is derived from the PATH alone", async () => {
+      // Why folding the stored side cannot move which review a URL names, and so
+      // cannot re-point an R2 key: `PreviewRef.logKey` is
+      // `previewScopePath(parsePreviewPath(path).repo, pr)`. The invite's column
+      // is not an input to it. Asserted through the grammar, which is where both
+      // halves come from.
+      const canonical = parseScopedThreadsPath(scopedThreadsPath(REPO, PR));
+      expect(canonical?.logKey).toBe(`/${REPO}/pr-${PR}`);
+      // The one spelling an invite cannot buy: `/REVKIT/` is its own review.
+      const shouted = parseScopedThreadsPath(scopedThreadsPath("REVKIT", PR));
+      expect(shouted?.logKey).toBe("/REVKIT/pr-7");
+      expect(shouted?.logKey).not.toBe(canonical?.logKey);
+    });
+
+    test("normalisation is FORWARD-ONLY, and the schema says a migration has nothing to converge", async () => {
+      // The decision this file records, with the measurement behind it: no
+      // migration ships, because there is no repo-scoped key to converge (above)
+      // AND no mixed-case row can exist in a database this build produces.
+      // `mintInvite` is the only writer of `invites.repo`, and it now writes the
+      // canonical form — swept over the whole `src/` directory below rather than
+      // asserted, so a second writer added later fails here instead of making the
+      // no-migration decision quietly false.
+      const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
+      const writers: string[] = [];
+      for (const file of readdirSync(srcDir).filter((f) => f.endsWith(".ts")).sort()) {
+        // `strings: true`, and it is load-bearing: the statement is a string
+        // literal, so the default strip would blank it and the sweep would find
+        // no writer at all — which is the failure mode `stripTsComments`
+        // documents for the `"bad-request"` case.
+        const code = stripTsComments(readFileSync(join(srcDir, file), "utf8"), { strings: true });
+        // Any statement that could put a caller-supplied spelling into the column.
+        // `OR IGNORE` / `OR REPLACE` are the shapes a future "mint
+        // idempotently" refactor reaches for, and a bare `INSERT INTO` alternation
+        // misses both — measured: `INSERT OR REPLACE INTO invites` passed this
+        // sweep untouched while the plain form was caught. Match the verb and
+        // allow the conflict clauses rather than one literal spelling.
+        if (
+          /\bINSERT\s+(?:OR\s+(?:IGNORE|REPLACE|ABORT|FAIL|ROLLBACK)\s+)?INTO\s+invites\b/i.test(code) ||
+          /\bUPDATE\s+(?:OR\s+\w+\s+)?invites\s+SET\b/i.test(code)
+        ) {
+          if (/\brepo\b/i.test(code)) writers.push(file);
+        }
+      }
+      expect(writers).toEqual(["invites.ts"]);
+      // And the invariant that makes it a decision rather than a hope: whatever
+      // spelling is handed in, the stored column is already canonical, so there
+      // is no row a later migration would have to fix.
+      for (const spelling of ["revkit", "Revkit", "REVKIT", "rEvKiT", "vig-os.revkit", "Vig-OS.Revkit"]) {
+        const result = await mintOk(db(), { repo: spelling });
+        if (!result.ok) throw new Error(`mint failed for ${spelling}`);
+        const row = await db()
+          .prepare("SELECT repo FROM invites WHERE id = ?")
+          .bind(result.minted.invite.id)
+          .first<{ repo: string }>();
+        expect(row?.repo, spelling).toBe(spelling.toLowerCase());
+      }
+      // Nothing to converge, stated as a count rather than as prose: every row
+      // this build can write is already in canonical form.
+      const strays = await db()
+        .prepare("SELECT COUNT(*) AS n FROM invites WHERE repo <> lower(repo)")
+        .first<{ n: number }>();
+      expect(strays?.n).toBe(0);
+    });
+  });
+
   // ── revocation ─────────────────────────────────────────────────────────
 
   describe("revocation", () => {
@@ -1025,6 +1295,122 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect(after.ok).toBe(false);
       if (!after.ok) expect(after.refusal).toBe("invite-revoked");
       expect(bindingRow?.binding_hash).toBeTruthy();
+    });
+
+    // ── the platform fact ADR-0015's deferral rests on, PINNED ────────────
+    //
+    // **Read this before "fixing" it.** ADR-0015's slice-3 amendment says the
+    // cron trigger is deliberately NOT wired, and gives the reason: miniflare
+    // dispatches `fetch`, a `scheduled` event is a separate entry point, and a
+    // `triggers.crons` line would therefore be a claim NO TEST IN THIS REPO COULD
+    // CHECK. Until now that reason was an ASSERTION in a comment. This is the
+    // measurement, and it is a test, so the deferral becomes VISIBLY STALE the
+    // day miniflare grows the capability instead of quietly staying wrong.
+    //
+    // The repo's own standard for this, verbatim from its durable lessons:
+    // "A gate that refuses an action regardless of whether it would work cannot
+    // fail loudly when the underlying problem is fixed. Pin the platform fact
+    // itself in its own test, or drop the claim."
+    //
+    // **IT LIVES IN THIS FILE, not a new one, and that is a budget decision.**
+    // `test/harness.ts` documents a measured workerd-instance cliff on this host,
+    // so a twelfth test file would be a twelfth `new Miniflare(...)`. This
+    // describe is the one that owns ADR-0015's retention clock — the thing the
+    // deferral is about — so the fact sits next to the decision it justifies.
+    test("PLATFORM FACT: this harness cannot dispatch a `scheduled` event, and that is why ADR-0015's cron is unwired", async () => {
+      // ── 1. NON-VACUITY ───────────────────────────────────────────────────
+      // A harness that is simply broken also has no `dispatchScheduled`, so
+      // "there is no such method" means nothing until the fetch path is shown
+      // WORKING. Measured, not assumed: a real request through real workerd.
+      expect((await harness.dispatch("http://localhost/healthz")).status).toBe(200);
+
+      // ── 2. THE FACT, on the harness's OWN live instance ──────────────────
+      // Every callable member of the object `startWorker` built — own
+      // properties AND the whole prototype chain — so this is the instance's real
+      // capability surface rather than a string match on the package's files.
+      // Measured on miniflare 4.20260518.0: 35 callable members, of which
+      // `dispatchFetch` is the ONLY one that delivers an event to the Worker.
+      const instance = harness.mf as unknown as Record<string, unknown>;
+      const members = new Set<string>();
+      for (let cursor: object | null = harness.mf; cursor !== null; cursor = Object.getPrototypeOf(cursor)) {
+        for (const name of Object.getOwnPropertyNames(cursor)) {
+          if (members.has(name)) continue;
+          // A getter that throws is not a capability this harness can call, and
+          // touching it must not fail the test for an unrelated reason.
+          try {
+            if (typeof instance[name] === "function") members.add(name);
+          } catch {
+            /* not callable */
+          }
+        }
+      }
+      expect([...members].sort()).toContain("dispatchFetch");
+      // Scoped to SCHEDULED/CRON delivery, which is what ADR-0015 defers.
+      // `scheduled?` so both `schedule` and `scheduled` match, which is what
+      // makes `dispatchScheduled` and a hypothetical `dispatchSchedule` both
+      // land here rather than only one spelling of the same capability.
+      // `getQueueProducer` is deliberately NOT matched: it produces messages for
+      // a queue and is not a scheduled-event entry point, so counting it would
+      // make this test fail for a capability that does not bear on the deferral.
+      const scheduledEntryPoints = [...members].filter((name) => /scheduled?|cron|timer|alarm/i.test(name));
+      expect(
+        scheduledEntryPoints,
+        "this harness grew a scheduled-event entry point — see the comment below before touching this",
+      ).toEqual([]);
+      // The name filter above is a **sample**, not the bound: a per-name regex
+      // misses whatever it did not think of. Measured — `dispatchSchedule`,
+      // `dispatchScheduled`, `runScheduledHandlers` and `triggerSchedule` all
+      // land in it, while `dispatchEvent`, `getEntrypoint`, `listHandlers` and
+      // `getHandlers` all sail straight through, and `getEntrypoint` is the name
+      // miniflare's own proxy uses. So pin the two shapes that actually carry a
+      // second entry point: everything under `dispatch*` must be `dispatchFetch`
+      // and nothing may be named for an entrypoint or a handler. Neither asserts
+      // a total count, so an unrelated miniflare upgrade cannot break this.
+      expect([...members].filter((name) => /^dispatch/i.test(name)).sort(), "every dispatch* member").toEqual([
+        "dispatchFetch",
+      ]);
+      expect(
+        [...members].filter((name) => /entrypoint|handler/i.test(name)),
+        "a member named for an entrypoint or handler is a second way in",
+      ).toEqual([]);
+      // Named specifically as well, because a future miniflare would add it by
+      // symmetry with `dispatchFetch` and the pattern above is a heuristic.
+      expect(instance["dispatchScheduled"]).toBeUndefined();
+      // And there is no back door either: `getWorker()` hands back a proxy with
+      // no own properties, and reading `getEntrypoint` off it THROWS rather than
+      // returning an entrypoint — measured, "The RPC receiver does not implement
+      // the method". So the harness cannot even enumerate the Worker's handler
+      // table, let alone invoke a non-`fetch` entry. Without this, "no method
+      // matched" would leave open a way to reach `scheduled` that is not a method.
+      const worker = (await (instance["getWorker"] as () => Promise<object>)()) as Record<string, unknown>;
+      expect(Object.getOwnPropertyNames(worker)).toEqual([]);
+      let entryPointReadable = true;
+      try {
+        void worker["getEntrypoint"];
+      } catch {
+        entryPointReadable = false;
+      }
+      // Asserted as a THROW and not on the message text: the claim is "there is
+      // no way in", not "miniflare words its refusal this way". A wording change
+      // must not be able to fail this case, and a capability appearing must.
+      expect(entryPointReadable).toBe(false);
+
+      // ── WHAT A READER SHOULD DO WHEN THIS CASE FAILS ─────────────────────
+      // Nothing here needs a timeout raised or a workaround: the capability
+      // arrived. ADR-0015's deferral is then REVISITABLE, and in this order:
+      //   1. Add `scheduled(event, env, ctx)` to the Worker, calling
+      //      `purgeStaleGuests(env.DB)` — that is the whole handler.
+      //   2. Replace this case with one that DRIVES `scheduled` and asserts a
+      //      guest past the window is anonymised. A cron line without that is
+      //      the untestable claim this deferral exists to prevent.
+      //   3. Only then declare `triggers.crons` in `wrangler.jsonc` — and note
+      //      that `test/worker-config.test.ts` asserts that key is ABSENT, so it
+      //      goes red at the same moment and names the same reason.
+      //   4. Amend ADR-0015 (propose it in the PR body; never silently) to
+      //      record that the premise this deferral cited has changed.
+      // Until step 2 exists, do NOT add the trigger line: that is precisely the
+      // "the ADR says it happens" claim the 2026-10-04 slice-2 amendment
+      // exists to prevent.
     });
   });
 

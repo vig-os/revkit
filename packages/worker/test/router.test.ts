@@ -15,6 +15,8 @@ import {
   REVKIT_BUNDLE_ROOT,
   REVKIT_SEGMENT,
   SCOPED_THREADS_SUFFIX,
+  canonicalRepoName,
+  isRepoName,
   isRevkitBundlePath,
   parsePreviewPath,
   parseScopedThreadsPath,
@@ -118,6 +120,102 @@ describe("parsePreviewPath — refused", () => {
   test("a path with no leading slash is not a path", () => {
     expect(parsePreviewPath("revkit/pr-1")).toBeUndefined();
     expect(parsePreviewPath("")).toBeUndefined();
+  });
+});
+
+describe("canonicalRepoName — the ONE stored spelling of a repository name", () => {
+  test("folds case and leaves the rest of the admitted class alone", () => {
+    expect(canonicalRepoName("revkit")).toBe("revkit");
+    expect(canonicalRepoName("Revkit")).toBe("revkit");
+    expect(canonicalRepoName("REVKIT")).toBe("revkit");
+    expect(canonicalRepoName("rEvKiT")).toBe("revkit");
+    // The non-letter members of `REPO_SEGMENT` are not case, so they must survive
+    // untouched — including the `.` a repo like `vig-os.revkit` carries.
+    expect(canonicalRepoName("Vig-OS.Revkit")).toBe("vig-os.revkit");
+    expect(canonicalRepoName("a_b-c.d0")).toBe("a_b-c.d0");
+  });
+
+  test("is a LOCALE-INDEPENDENT fold: no dotless i, no locale-sensitive letter", () => {
+    // The reason this is `toLowerCase` and not `toLocaleLowerCase`. Under a
+    // Turkish locale the latter folds `"I"` to `ı` (U+0131), which `REPO_SEGMENT`
+    // does not admit — so the canonical form of an accepted name could be a
+    // rejected one, and the stored value would depend on the runtime's locale
+    // rather than on the input. Asserted on the CHARACTER, not on a locale
+    // setting, because there is no locale switch to make here: what has to hold
+    // is that the output is confined to the class the predicate accepts.
+    const turkishI = "I".toLocaleLowerCase("tr");
+    expect(turkishI).not.toBe(canonicalRepoName("I"));
+    expect(turkishI).not.toBe("i");
+    expect(canonicalRepoName("I")).toBe("i");
+    // And the sweep below is the general form of that: the fold cannot produce a
+    // character `REPO_SEGMENT` rejects.
+  });
+
+  test("cannot change a REFUSAL, over the whole admitted character class", () => {
+    // The property `mintInvite` relies on when it validates BEFORE folding:
+    // `isRepoName(canonicalRepoName(x)) === isRepoName(x)` for every input, so a
+    // fold can neither admit a name the predicate rejects nor rescue one it
+    // rejects. Swept rather than asserted on examples, because the claim is
+    // about a character class.
+    //
+    // Swept in TWO directions, which is the part a single list would miss:
+    //   - every string of length 1 over the whole admitted alphabet must keep its
+    //     verdict (66 characters: 52 letters + digits + `.` `_` `-`)
+    //   - every string of length 2 over the LETTERS must keep its verdict, which
+    //     is where a fold that produced an outside character would show up
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+    for (const a of alphabet) {
+      for (const b of ["", ...alphabet]) {
+        const name = `${a}${b}`;
+        expect(isRepoName(canonicalRepoName(name)), name).toBe(isRepoName(name));
+      }
+    }
+    // Idempotence, over the same class: folding twice is folding once, which is
+    // what makes the stored value stable if a caller ever folds twice.
+    for (const a of alphabet) {
+      const once = canonicalRepoName(a);
+      expect(canonicalRepoName(once)).toBe(once);
+    }
+    // A case difference always collapses: that is the whole point, and it is why
+    // `Acme` and `acme` are the same repository on GitHub.
+    expect(canonicalRepoName("Acme")).toBe(canonicalRepoName("acme"));
+    expect(canonicalRepoName("ACME")).toBe(canonicalRepoName("aCmE"));
+  });
+
+  test("is a CANONICALISER, not a validator — and the ONE input where that matters is U+212A", () => {
+    // Named so a caller does not reach for it as a filter. `mintInvite` calls
+    // `isRepoName` first and `canonicalRepoName` second, and **that order is
+    // load-bearing for exactly one input**.
+    for (const hostile of ["../etc", "a/b", "", "rev kit", "<script>", "x".repeat(101)]) {
+      expect(isRepoName(hostile), hostile).toBe(false);
+      expect(canonicalRepoName(hostile), hostile).toBe(hostile.toLowerCase());
+    }
+  });
+
+  test("U+212A KELVIN SIGN is why the order is load-bearing, and it is a UNICODE fold", () => {
+    // `canonicalRepoName` is `String.prototype.toLowerCase`, which is a UNICODE
+    // fold, not the ASCII fold a reader would assume from "a repo name". U+212A
+    // folds to "k", and `isRepoName("k")` is TRUE. So folding FIRST would admit a
+    // repository name the predicate refuses — and U+212A is the *only* such code
+    // point up to U+2FFFF, which is why every other hostile input above folds to
+    // itself and cannot detect the swap.
+    const KELVIN = "\u212A";
+    expect(isRepoName(KELVIN), "the predicate refuses the Kelvin sign").toBe(false);
+    expect(canonicalRepoName(KELVIN), "a Unicode fold turns it into k").toBe("k");
+    expect(isRepoName("k"), "and k is servable — so order decides the outcome").toBe(true);
+  });
+
+  test("the ROUTE is untouched: a path's repo segment is still verbatim", () => {
+    // The half of the fix that must NOT exist. `parsePreviewPath` returns
+    // `segments[1]` as it appeared, so two spellings of one path stay two
+    // reviews — and folding the read side would have collapsed them.
+    expect(parsePreviewPath("/Revkit/pr-7")?.repo).toBe("Revkit");
+    expect(parsePreviewPath("/REVKIT/pr-7")?.repo).toBe("REVKIT");
+    expect(parsePreviewPath("/Revkit/pr-7")?.logKey).toBe("/Revkit/pr-7");
+    // The canonical form is the one `canonicalRepoName` agrees with, and it is
+    // reachable — so a mint and a canonical URL do meet.
+    expect(canonicalRepoName(parsePreviewPath("/Revkit/pr-7")?.repo ?? "")).toBe("revkit");
+    expect(parsePreviewPath(`/revkit/pr-7`)?.logKey).toBe(canonicalRepoName("/Revkit/pr-7"));
   });
 });
 

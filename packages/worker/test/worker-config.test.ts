@@ -76,12 +76,35 @@ describe("wrangler.jsonc", () => {
     }
   });
 
+  test("no `triggers` — ADR-0015's cron is deferred BECAUSE this harness cannot exercise one", () => {
+    // **This is the config half of a platform fact, and the two halves are one
+    // decision.** A Cloudflare Cron Trigger is declared here and nowhere else, so
+    // a `triggers.crons` line in this file would be a claim no test in this repo
+    // could check: miniflare dispatches `fetch`, and a `scheduled` event is a
+    // separate entry point. That is ADR-0015's stated reason for not wiring the
+    // schedule, and it is measured — not asserted — by `test/invites.test.ts`'s
+    // "PLATFORM FACT: this harness cannot dispatch a `scheduled` event" case,
+    // which fails the day miniflare grows the capability.
+    //
+    // So this case and that one go red at the SAME moment, from the same cause,
+    // and between them they say what to do: add the handler, drive it in a test,
+    // and only then declare the trigger. Adding the line first is the untestable
+    // claim, which is exactly what the deferral declines to ship.
+    //
+    // Until then the gap is real and stated in ADR-0015: **guests are retained
+    // indefinitely** — the wrong direction for a privacy clock. `revkit deploy
+    // status` (slice 7) is where an operator learns no sweep is running.
+    expect(Object.keys(CONFIG)).not.toContain("triggers");
+  });
+
   test("the raw file declares none of them either, so a commented-out key cannot ship", () => {
     // Matched as JSON KEYS, not as bare words: this file's own comment
     // legitimately names every one of them to explain why it is absent,
     // and a test that failed on the explanation would push the next author
-    // to delete the explanation instead of the key.
-    for (const key of ["account_id", "routes", "custom_domains", "dispatch_namespace"]) {
+    // to delete the explanation instead of the key. `triggers` is in the list
+    // for the reason above; the RAW check is what stops
+    // `"triggers": { /* … */ }` from shipping while the parsed form is clean.
+    for (const key of ["account_id", "routes", "custom_domains", "dispatch_namespace", "triggers"]) {
       expect(RAW).not.toContain(`"${key}"`);
     }
     expect(RAW).not.toContain('"workers_dev": true');

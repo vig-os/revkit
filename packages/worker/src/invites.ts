@@ -198,7 +198,7 @@ import {
   type MsClock,
 } from "./session.ts";
 import type { InviteTokenHasher } from "./invite-token.ts";
-import { isRepoName } from "./router.ts";
+import { isRepoName, canonicalRepoName } from "./router.ts";
 import { GUEST_RETENTION_MS, GUEST_DELETED_NAME } from "./retention.ts";
 
 // ── share types (ADR-0009's Acceptance) ───────────────────────────────────
@@ -292,6 +292,12 @@ export interface InviteRecord {
   readonly id: string;
   /** SHA-256 hex of the token. Never the token. */
   readonly tokenHash: string;
+  /**
+   * The repository this invite is scoped to, in the CANONICAL spelling —
+   * `canonicalRepoName(input.repo)` as `mintInvite` wrote it. Never the spelling
+   * the operator typed, so a caller reading this value cannot believe it holds
+   * an invite for a URL the gate will refuse.
+   */
   readonly repo: string;
   /** `null` covers every PR of the repo; a number covers exactly that PR. */
   readonly pr: number | null;
@@ -429,6 +435,41 @@ export interface MintInviteInput {
  * the two sides would make that comparison wrong for inputs only one side can
  * produce.
  *
+ * ── The repo name is CANONICALISED here, and this is the only layer that is ──
+ *
+ * Validation and canonicalisation are deliberately separate calls, in that
+ * order. `isRepoName` decides whether the name is servable; `canonicalRepoName`
+ * (`src/router.ts`) decides which of its case spellings gets STORED. Measured
+ * property of doing it in that order: `isRepoName(canonicalRepoName(x))` and
+ * `isRepoName(x)` agree for every input, because `REPO_SEGMENT` admits only
+ * ASCII and an ASCII case-fold is a bijection inside that class — so folding
+ * cannot turn a refusal into a grant. `test/router.test.ts` sweeps the class.
+ *
+ * **Why here and not at read time** (the full argument is on
+ * `canonicalRepoName`): the other side of `inviteCovers`' comparison is the URL,
+ * and folding that would make `/REVKIT/` and `/revkit/` name ONE review — two
+ * spellings of one path resolving, which `parsePreviewPath` forbids — and would
+ * move the log key, which is the R2 partition. So the stored side moves to the
+ * canonical form and the route keeps comparing exactly.
+ *
+ * **What that changes, measured.** Before: an invite minted `Revkit` matched
+ * `/Revkit/` and refused `/revkit/`. After: it matches `/revkit/` and refuses
+ * `/Revkit/`. The number of URL spellings an invite admits is ONE either way —
+ * which one it is, changed. The reported defect (an operator minting `Revkit`
+ * and serving `/revkit/`) is fixed; the inverse (minting `Revkit` and serving
+ * `/Revkit/`) is now broken, and that trade is recorded rather than hidden by
+ * `test/invites.test.ts`.
+ *
+ * **It cannot widen a grant**, and the two halves are asserted separately. The
+ * stored value only ever moves TOWARD the canonical spelling, and the target is
+ * still compared exactly, so the admitted URL set changes membership without
+ * changing size. And no case difference lets two invites match each other,
+ * because nothing looks an invite up BY REPO at all: a guest's grant is resolved
+ * `sessions.identity_id → invite_redemptions.guest_id → invites.id`, i.e. BY ID.
+ * `invites.repo` is `NOT NULL` and carries no index and no UNIQUE constraint —
+ * measured over the whole shipped schema — so there is no repo-scoped key for
+ * the fold to collide either.
+ *
  * `expires_at` is computed from the share type and the injected clock, never
  * taken from the caller — a caller-supplied expiry is how an invite outlives
  * the retention story ADR-0015 starts from it.
@@ -439,6 +480,7 @@ export async function mintInvite(
   options: { readonly now?: MsClock; readonly keys: InviteTokenHasher },
 ): Promise<MintResult> {
   if (!isRepoName(input.repo)) return { ok: false, refusal: "bad-repo" };
+  const repo = canonicalRepoName(input.repo);
   const pr = input.pr ?? null;
   if (pr !== null && !isPullNumber(pr)) return { ok: false, refusal: "bad-pr" };
   const kind = input.kind ?? DEFAULT_SHARE_TYPE;
@@ -455,12 +497,15 @@ export async function mintInvite(
       "INSERT INTO invites (id, token_hash, repo, pr, kind, can_comment, revocable, max_browsers, expires_at, created_at, revoked_at) " +
         "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, NULL)",
     )
-    .bind(id, tokenHash, input.repo, pr, kind, canComment ? 1 : 0, INVITE_MAX_BROWSERS[kind], expiresAt, createdAt)
+    // `repo`, NOT `input.repo`: the column and the returned record must hold the
+    // same value, or `revkit invite` (#81) would print a link for a spelling the
+    // gate then refuses — the same defect one layer up.
+    .bind(id, tokenHash, repo, pr, kind, canComment ? 1 : 0, INVITE_MAX_BROWSERS[kind], expiresAt, createdAt)
     .run();
   const invite: InviteRecord = {
     id,
     tokenHash,
-    repo: input.repo,
+    repo,
     pr,
     kind,
     canComment,
@@ -909,6 +954,23 @@ export interface InviteScope {
  * exactly PR 42. A DIFFERENT repo is never covered, whatever the PR — that is
  * the whole isolation property, and it is why the comparison is on the repo
  * first and not on a normalised composite key.
+ *
+ * ── `!==` here is load-bearing, and mint-time canonicalisation did not change it ──
+ *
+ * **`target.repo` comes from the URL and is NEVER folded.** A case-differing
+ * path names a different review — its own log key, its own R2 prefix — and it is
+ * refused here, exactly as it was before `mintInvite` began storing the
+ * canonical spelling. The two halves are canonical on ONE side only, and this
+ * function is the reason that is sufficient: the invite's stored value is the
+ * canonical form (`mintInvite`), so an invite admits the one canonical URL and
+ * no other, and the comparison itself is a plain exact match.
+ *
+ * **So the admitted set has one member, not two.** Folding the target as well
+ * would make `/REVKIT/` and `/revkit/` both cover the same invite — two
+ * spellings of one path resolving to one review, which `parsePreviewPath`
+ * refuses for doubled slashes and for `%2e` and which would move the log key.
+ * Refusing here is also the fail-closed direction: an unrecognised spelling
+ * denies rather than admits.
  *
  * ── The target is REQUIRED, and that is slice 5's fix ────────────────────
  *
