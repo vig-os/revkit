@@ -38,13 +38,22 @@
 //   - "a GitHub session must still have read access to the repo (cached ≤ 5
 //     min)". There is no `TokenSource` — the App is owner-gated (#34) — and
 //     nothing to check repo access against. **This is the axis still missing
-//     after slice 5**, and it is missing in a specific place: a `github`-kind
-//     session is confined to no repository, so any of them reads any
-//     `(repo, PR)` this deployment serves. Slice 5 added the guest axis and
-//     deliberately did not narrow or widen this one — a guest is confined to
-//     its invite's scope, and a GitHub session stays org-wide until the
-//     provider can prove repo access. Narrowing it to "deny everything" would
-//     break the operator; widening it further is not possible.
+//     after slice 5**, and it is missing in a specific, nameable place:
+//
+//     **`github` is ABSENT from `RECOGNISED_IDENTITY_KINDS`**, deliberately
+//     (`src/session.ts`): there is no App to honour it, so a session row naming
+//     `github` is refused `401 unrecognised-identity-kind` rather than guessed at.
+//     **The kind that is org-wide today is therefore `operator`** — and the gate
+//     does not scope-check it: the whole scope block below is under
+//     `if (resolved.principal.kind === "invite")`, so an `operator` session reads
+//     whatever `(repo, PR)` the path names, across every review in this
+//     deployment. That is the class to audit, and it is one line of this file.
+//
+//     Slice 5 narrowed the GUEST side and deliberately did not touch this one. A
+//     guest is confined to its invite's scope; `operator` stays unscoped until the
+//     provider can prove repo access. Narrowing it to "deny everything" would lock
+//     the operator out of their own deployment, which is the failure mode
+//     `issueSession`'s operator identity exists to avoid.
 //
 // So "authorized" in this slice means: **a session this build issued is
 // presenting, unexpired; and if it is a guest session, its invite still exists,
@@ -120,17 +129,143 @@ export const INVITE_REDEEM_PATH = "/invite/redeem";
 /** Every route kind. `method-not-allowed` is its own kind rather than a flag
  * on a real one so the classification table below reads the way the dispatch
  * does, and so a test can enumerate it exhaustively. */
-export type RouteKind =
-  | "health"
-  | "method-not-allowed"
-  | "threads-read"
-  | "threads-append"
-  | "session-refresh"
-  | "invite-open"
-  | "invite-redeem"
-  | "preview"
-  | "revkit-bundle"
-  | "unknown";
+/**
+ * Every kind `classifyRoute` can return, as DATA, and `RouteKind` derived from it.
+ *
+ * **Why the union is now derived rather than written (slice 5 review).** A
+ * hand-written `type RouteKind = "a" | "b" | …` is invisible at runtime, so a new
+ * kind added to the union but never wired into `classifyPath` is **unreachable and
+ * untested**: the route-table probes iterate classifications, so they never see a
+ * kind nothing classifies as. Measured on this branch: adding a tenth member to the
+ * union, gated and `guestScopeExempt: true`, produced **0 red across 53 cases** —
+ * because the kind was never produced, the probes had nothing to say about it, and
+ * `tsc` has no opinion (the field is required, so an arm compiles, and every
+ * `switch` over `RouteKind` has a `default`).
+ *
+ * Deriving the type from a frozen array makes the set a runtime value, so
+ * `test/authorization.test.ts` can assert it against what the classifier actually
+ * produces in BOTH directions: no declared kind is unproducible, and no produced
+ * kind is undeclared. `tsc` still gets its exhaustiveness — the switches still
+ * narrow over a union of literals — and now the declaration and the wiring cannot
+ * drift without a test failing.
+ *
+ * Order is the dispatcher's reading order and is asserted by the test that pins
+ * the classification table.
+ */
+export const ROUTE_KINDS = [
+  "health",
+  "method-not-allowed",
+  "threads-read",
+  "threads-append",
+  "session-refresh",
+  "invite-open",
+  "invite-redeem",
+  "preview",
+  "revkit-bundle",
+  "unknown",
+] as const;
+
+export type RouteKind = (typeof ROUTE_KINDS)[number];
+
+/**
+ * The table's PARTITION: which kinds are gated, which are not, and which is
+ * BOTH — as data, in the module that owns the table.
+ *
+ * `classifyRoute` is total over `RouteKind`, so the partition is a claim about
+ * every kind that exists — and until slice 5's review it was a claim written only
+ * in `test/authorization.test.ts`, over a probe list that could not see a kind
+ * nothing produced. Two consequences followed, both measured on this branch:
+ *
+ *   - a hard-coded arm that is gated, names no scope and sets
+ *     `guestScopeExempt: true` left the suite **green**, because the derived
+ *     probes iterate grammar-shaped paths and cannot enumerate a function's
+ *     domain;
+ *   - flipping `path()`'s fail-closed `guestScopeExempt` default to `?? true`
+ *     also left it **green**.
+ *
+ * So the partition lives HERE, in three arrays whose union is checked against
+ * `RouteKind` **at compile time** by the assertions below. `tsc` is the backstop
+ * the runtime `default:` arm defeats: a `switch` with a `default` cannot be
+ * exhaustive-checked, and every `switch` over `RouteKind` here has one — by
+ * design, because `unreachable()` turning a missing case into a loud 500 is worth
+ * more than a compile error. These type-level set differences get both.
+ *
+ * **`method-not-allowed` is on BOTH sides, and that is not a hedge.** It is the
+ * relabelled kind of whichever path carried the wrong verb, and it INHERITS that
+ * path's `requiresSession` — a wrong verb on `/healthz` is ungated, a wrong verb
+ * on `<repo>/pr-<n>/api/threads` is gated and in scope. Two lists would have had
+ * to lie about one of those cases; measured, the lie is what a two-sided
+ * partition produces: `method-not-allowed` showed up in the ungated set and the
+ * comparison failed until the third list existed.
+ */
+export const GATED_ROUTE_KINDS = ["threads-read", "threads-append", "session-refresh", "preview"] as const;
+
+export const UNGATED_ROUTE_KINDS = ["health", "invite-open", "invite-redeem", "revkit-bundle", "unknown"] as const;
+
+/** Reachable on either side of the gate, depending on the path it shadows. */
+export const BOTH_SIDES_ROUTE_KINDS = ["method-not-allowed"] as const;
+
+export type GatedRouteKind = (typeof GATED_ROUTE_KINDS)[number] | (typeof BOTH_SIDES_ROUTE_KINDS)[number];
+export type UngatedRouteKind = (typeof UNGATED_ROUTE_KINDS)[number] | (typeof BOTH_SIDES_ROUTE_KINDS)[number];
+
+/**
+ * Is this kind reachable on the GATED side of the partition?
+ *
+ * **A runtime check, not a cast.** `handleAuthorized` takes
+ * `Route & { kind: GatedRouteKind }`, and the gate's call site cannot derive that
+ * from `route.requiresSession` alone (`Route` is an interface, not a union, so
+ * TypeScript does not connect the two). The alternative was a cast, and a cast
+ * is an assertion where this codebase insists on a check — so this predicate is
+ * the check, it runs on every authorized request, and a partition mistake becomes
+ * `unreachable()` and a loud 500 rather than a dispatcher `case` that silently
+ * does not exist.
+ */
+export function isGatedRouteKind(kind: RouteKind): kind is GatedRouteKind {
+  return (GATED_ROUTE_KINDS as readonly string[]).includes(kind) ||
+    (BOTH_SIDES_ROUTE_KINDS as readonly string[]).includes(kind);
+}
+
+/** Compile-time: the partition is TOTAL — every `RouteKind` is on at least one
+ * side. Declared bindings rather than bare `type`s so a failure names a line and
+ * lists the unaccounted members. */
+type PartitionIsTotal = Exclude<RouteKind, GatedRouteKind | UngatedRouteKind> extends never
+  ? true
+  : ["a RouteKind is on neither side of the partition", Exclude<RouteKind, GatedRouteKind | UngatedRouteKind>];
+const _partitionIsTotal: PartitionIsTotal = true;
+
+/** Compile-time: the three lists are DISJOINT, so a kind cannot be claimed twice
+ * and quietly satisfy two dispatchers. (`GatedRouteKind` and `UngatedRouteKind`
+ * deliberately OVERLAP on `BOTH_SIDES_ROUTE_KINDS`, so the check is over the raw
+ * lists, not the widened types.)
+ *
+ * **`Extract`, not `Exclude` — the polarity is the whole check.** "These lists do
+ * not overlap" is `Extract<A, B> is never` (nothing of A is in B). `Exclude<A, B>
+ * is never` says the opposite: that EVERY member of A is in B. Three separate
+ * aliases, because a conditional over a tuple does not distribute the way a
+ * reader would assume. */
+type GatedOnlyIsAlone = Extract<
+  (typeof GATED_ROUTE_KINDS)[number],
+  (typeof UNGATED_ROUTE_KINDS)[number] | (typeof BOTH_SIDES_ROUTE_KINDS)[number]
+> extends never
+  ? true
+  : ["a kind is in GATED_ROUTE_KINDS and another list", never];
+type UngatedOnlyIsAlone = Extract<
+  (typeof UNGATED_ROUTE_KINDS)[number],
+  (typeof GATED_ROUTE_KINDS)[number] | (typeof BOTH_SIDES_ROUTE_KINDS)[number]
+> extends never
+  ? true
+  : ["a kind is in UNGATED_ROUTE_KINDS and another list", never];
+type BothSidesIsAlone = Extract<
+  (typeof BOTH_SIDES_ROUTE_KINDS)[number],
+  (typeof GATED_ROUTE_KINDS)[number] | (typeof UNGATED_ROUTE_KINDS)[number]
+> extends never
+  ? true
+  : ["a kind is in BOTH_SIDES_ROUTE_KINDS and another list", never];
+const _gatedOnlyIsAlone: GatedOnlyIsAlone = true;
+const _ungatedOnlyIsAlone: UngatedOnlyIsAlone = true;
+const _bothSidesIsAlone: BothSidesIsAlone = true;
+
+void [_partitionIsTotal, _gatedOnlyIsAlone, _ungatedOnlyIsAlone, _bothSidesIsAlone];
 
 export interface Route {
   readonly kind: RouteKind;
@@ -665,6 +800,15 @@ export async function authorizeRequest(
     // whose scope is absent, so the branch is proven live against a route the
     // table does not contain. A control proven only by the table can be
     // deleted with the table; a control proven by both cannot.
+    //    A mutation run recorded this branch as an EQUIVALENT mutant: narrowing it
+    //    to `if (route.guestScopeExempt) return …` changed 0 tests over HTTP,
+    //    because `classifyRoute` cannot produce a gated, unscoped, non-exempt
+    //    route — that is the invariant `test/authorization.test.ts` now pins over
+    //    a DERIVED probe product and `authz.ts`'s three-way partition asserts at
+    //    compile time. So the branch is unreachable-with-the-table-as-shipped, and
+    //    its teeth are proven by driving `authorizeRequest` with a hand-built
+    //    `Route` (see `test/invites.test.ts`). Three mechanisms, no assertion
+    //    standing in for a check.
     const scope = route.scope;
     if (scope === undefined) {
       if (!route.guestScopeExempt) return refused(403, "forbidden", "invite-scope-unbounded");

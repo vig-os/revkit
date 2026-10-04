@@ -9,9 +9,9 @@
 // that the HOSTED table holds many logs — ADR-0008 is one Worker, one D1 and one
 // deployment per org, and an org has many `(repo, PR)` reviews — so the hosted
 // store needed to say WHICH one it is, and `migrations/0003_scoped_logs.sql`
-// gave `events` a key to be partitioned by. The shared 19-case conformance
-// suite still passes on all three backings, which is the point of it being in
-// `review-core`.
+// partitioned it: the flat `events` table became `review_logs(log_key, seq, …)`
+// and `events` was emptied and retired. The shared 19-case conformance suite still
+// passes on all three backings, which is the point of it being in `review-core`.
 //
 // This is a PORT of the daemon's `SqliteThreadStore` (455 lines,
 // `packages/cli/src/serve/sqlite-store.ts`) — of its *shape*, not its code.

@@ -74,11 +74,17 @@
 // it is a guest, its invite is unrevoked, unexpired, in scope, permitted to do
 // what the route writes, and bound to this browser. It does NOT yet mean "has
 // GitHub read access to the repo" — there is no `TokenSource` (the App is
-// owner-gated, #34) — and **that is the axis slice 5 deliberately left open**: a
-// `github`-kind session may read any review in this deployment, because nothing
-// can yet prove it has access to any of them. A guest is confined to its invite's
-// scope; a GitHub session stays org-wide until the provider arrives. Neither
-// half was quietly changed.
+// owner-gated, #34) — and **that is the axis slice 5 deliberately left open**.
+//
+// **Named precisely, because the obvious name is WRONG.** `github` is ABSENT from
+// `RECOGNISED_IDENTITY_KINDS` (`src/session.ts`), so there is no `github` session
+// to be narrow or wide: one re-pointed at that kind is refused
+// `401 unrecognised-identity-kind`. **The unscoped kind is `operator`** — the
+// gate's scope block is under `if (resolved.principal.kind === "invite")`, so an
+// `operator` session reads whatever review the path names, across the whole
+// deployment, because nothing can yet prove it has access to any of them. Slice 5
+// confined the guest and left `operator` exactly as it found it; neither half was
+// quietly changed.
 //
 // ── Slice 5, the scope axis ───────────────────────────────────────────────
 //
@@ -123,6 +129,7 @@ import {
   denialLogMessage,
   INVITE_OPEN_PREFIX,
   INVITE_REDEEM_PATH,
+  isGatedRouteKind,
   type AuthorizedSession,
   type Route,
 } from "./authz.ts";
@@ -436,6 +443,16 @@ export default {
         return response;
       }
 
+      // The gate admitted this request, so `route.requiresSession` is true — and
+      // `classifyPath` cannot produce a gated route carrying an ungated kind. The
+      // predicate is a CHECK rather than a cast because `handleAuthorized`'s
+      // narrowed parameter type is only worth anything with a check behind it: a
+      // partition mistake becomes `unreachable()` and a loud 500, which is this
+      // codebase's standing answer, instead of a dispatcher `case` that silently
+      // does not exist. It cannot fire with the table as shipped —
+      // `test/authorization.test.ts` asserts the partition against behaviour over
+      // the derived probe product.
+      if (!isGatedRouteKind(route.kind)) return unreachable(route);
       const response = await handleAuthorized(route, decision.authorized, request, env, keys, scope, url);
       status = response.status;
       return response;

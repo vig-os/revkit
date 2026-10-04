@@ -140,10 +140,14 @@ selecting nothing.
 What the gate still does **not** decide is ADR-0012's *other* scope clause —
 "a GitHub session must still have read access to the repo (cached ≤ 5 min)" —
 because there is no `TokenSource` (the App is owner-gated, #34). **That is the
-named missing axis:** a `github`-kind session is confined to no repository, so it
-reads any review in this deployment. A guest is confined to its invite's scope;
-the GitHub side stays org-wide until the provider can prove repo access. Neither
-was quietly changed. "Authorized" here means exactly: *a session this build
+named missing axis**, and it is worth naming **precisely, because the obvious name
+is wrong**: `github` is ABSENT from `RECOGNISED_IDENTITY_KINDS`, so there is no
+`github` session — one re-pointed at that kind is refused
+`401 unrecognised-identity-kind`. **The unscoped kind is `operator`**: the gate's
+scope block is under `if (resolved.principal.kind === "invite")`, so an
+`operator` session reads whatever review the path names, across the whole
+deployment. A guest is confined to its invite's scope; `operator` stays unscoped
+until the provider can prove repo access. Neither was quietly changed. "Authorized" here means exactly: *a session this build
 issued is presenting, unexpired; and if it is a guest, its invite is unrevoked,
 unexpired, in scope, permitted to do what the route writes, and bound to this
 browser*.
@@ -181,6 +185,19 @@ by `previewScopePath` from the same `(repo, pr)` the scope check compares — so
 there is no function in this package that turns caller input into a log key. The
 base must be exactly two segments: `<repo>/pr-<n>/docs/api/threads` is a path
 INSIDE a built site that happens to end in the suffix, and it is a preview.
+
+**Repository names are CASE-SENSITIVE, deliberately.** `/REVKIT/pr-7/api/threads`
+is a *different* review from `/revkit/pr-7/…` — a distinct `log_key`, and an empty
+one. That is fail-closed (a guest scoped to `revkit` is refused `403` there, and
+an `operator` reads an empty log), and it is a **deliberate choice rather than an
+oversight**: GitHub repository names are case-insensitive, so normalising here
+would mean guessing which spelling the operator minted an invite with, and a
+guess that is sometimes wrong is a scope decision made by the wrong party. The
+cost is real and worth stating: **an operator who mints `repo = "Revkit"` and
+serves `/revkit/` refuses that guest their own review.** The fix, when it is
+wanted, is to normalise at MINT time (`mintInvite` lowercases the repo into the
+row) so one spelling is canonical from the start — not to fold case at read time.
+`test/authorization.test.ts` asserts the fail-closed direction for both principals.
 
 `?since=` accepts one canonical form: `0` or a decimal integer with no sign, no
 leading zero, no radix prefix, no exponent, no decimal point, no whitespace, and at
@@ -352,9 +369,11 @@ Stated here so nobody has to read the PR body to find out:
   read is served from that review's own log, and a guest on a gated route that
   names no scope is refused rather than admitted (`invite-scope-unbounded`).
   What is still missing is ADR-0012's *other* clause — "a GitHub session must
-  still have read access to the repo" — so a `github`-kind session is confined to
-  no repository and reads any review in the deployment. That is the **named
-  missing axis**; slice 5 neither widened nor narrowed it.
+  still have read access to the repo". `github` is absent from
+  `RECOGNISED_IDENTITY_KINDS`, so the class that is org-wide **today is
+  `operator`**, which the gate does not scope-check: it reads whatever review the
+  path names. That is the **named missing axis**, and the class to audit; slice 5
+  neither widened nor narrowed it.
 - **The org-wide read is GONE, not narrowed.** An operator session reads one review
   per request, by URL. That is what a path-addressed surface means and it is the
   safe direction, but it means nothing in this build can *enumerate* a

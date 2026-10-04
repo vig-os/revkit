@@ -4,6 +4,9 @@
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: A2, A6, A7, A8, B2, B4
+- Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
+  schema carries a hosted-only `log_key`, and there is no `revkit threads
+  export|import` CLI command.
 
 ## Context
 
@@ -200,3 +203,58 @@ that thread's own `thread.reanchored` append lands. The prune is keyed on **that
 never a sweep, so a thread that is still orphaned always keeps the entry its skip test reads — including a sibling
 thread on the *same* file that the same `refresh` pass leaves orphaned. It fires only on a *successful* append,
 since a rejected event leaves the thread orphaned and still in need of its memo.
+
+## Amendment (2026-10-04, issue #9, M4 slice 5) — the hosted log is keyed by review, and there is no `revkit threads export|import`
+
+**This supersedes one clause of the Decision above, and corrects an over-claim in
+its own wording.** The clause is left standing as written because an accepted
+decision is a record, not a variable; what changed is the scope of the contract,
+and the correction is stated here rather than by editing the line.
+
+### 1. "with the same schema" → **the INTERFACE is the contract; the hosted schema adds one hosted-only column**
+
+The Decision says local threads "export/import to D1 with the same schema". Since
+slice 5 that is **false of the physical schema**, and the true statement is
+narrower and more useful:
+
+- **`ThreadStore` is unchanged.** `append` / `import` / `since` / `threads` /
+  `thread` / `asks` / `ask`, exactly as before. It remains the contract the
+  bridge crosses, and it remains ADR-0025's "one core, three surfaces" —
+  **this amendment does not weaken that**, it names what "one core" means: one
+  *interface*, three *backings*.
+- **All three backings still pass the shared 19-case conformance suite** in
+  `packages/review-core/test/store-conformance.ts` — `InMemoryThreadStore` (the
+  reference), `SqliteThreadStore` (the daemon's `bun:sqlite`) and
+  `D1ThreadStore` (the hosted D1). A5 (`seq` starts at 1), A6 (`since`), A7
+  (`threads()` ordering), A8, A9, A12 and A14 are unchanged requirements.
+- **The hosted table gained a key the other two do not have.** ADR-0008 puts one
+  Worker and one D1 per org and an org has many `(repo, PR)` reviews, so the
+  hosted log holds one log **per review**, keyed
+  `review_logs(log_key, seq, ts, payload)` with `PRIMARY KEY (log_key, seq)`.
+  `log_key` is `previewScopePath(repo, pr)` — ADR-0008's own `/<repo>/pr-<n>`
+  spelling — and `D1ThreadStore` takes it as a **required** option, with no
+  default. `seq` is therefore per review, which is what `ThreadStore` has always
+  meant by a fresh store's head.
+- **Why that is not a divergence of the log format.** An archive carries `seq`,
+  `ts` and the event; it does not and cannot carry "which review", because
+  `ThreadArchive` is the log, and on the hosted surface a deployment holds many.
+  `D1ThreadStore.import` writes the archive into **its own** log, so importing a
+  local review publishes it to the target review and to no other.
+- **Migration:** `migrations/0003_scoped_logs.sql`. Pre-existing rows, which
+  name no review, are **quarantined** into `events_unscoped_legacy` — kept,
+  unreachable, and given no scope — and the flat `events` table is emptied
+  rather than dropped.
+
+### 2. `revkit threads export|import` is not a command
+
+The clause names `revkit threads export|import` in backticks, which reads as a
+CLI command. **There is no such command.** What exists is the library API —
+`exportArchive(store)` in review-core and `ThreadStore.import` — which is what
+`D1ThreadStore` implements and what the conformance suite exercises.
+
+So the clause over-claims in two directions at once: the schema half (above) and
+the interface half. The corrected claim is: *a local review's log can be
+exported with `exportArchive` and imported by a hosted `ThreadStore` — the
+library API, not a CLI verb — so a local review can be published to a hosted PR.
+No user-facing command is claimed, and none should be inferred from this ADR
+until one ships and this line is amended again.*

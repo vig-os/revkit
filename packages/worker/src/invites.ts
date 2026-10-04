@@ -456,6 +456,21 @@ export async function loadInviteByToken(
   options: { readonly keys: InviteTokenHasher },
 ): Promise<InviteRecord | undefined> {
   if (!isTokenShaped(token)) return undefined;
+  // **No fallback key, and the mutation run is why that sentence is here.**
+  // ADR-0012 says invite tokens are "stored as HMAC"; slice 3 amended the bare
+  // `sha256` proposal *back* to HMAC. Adding `?? sha256Hex(token)` here — a
+  // fallback so a row minted under the old scheme would still be found — is
+  // **behaviourally equivalent today and measured as such**: the mutation run
+  // recorded 0 red, because `mintInvite` is the only writer of `token_hash` and it
+  // always writes the HMAC, so a `sha256` probe finds no row on any database this
+  // build produces.
+  //
+  // It is recorded rather than left implicit because "HMAC-keyed `token_hash`
+  // with no fallback key" is a real control with nothing behind it, and a future
+  // migration that DID write a bare digest would find this function silently
+  // unable to see its own rows. The fallback, if one is ever needed, belongs in
+  // that migration — which knows the rows are legacy — and not in the lookup every
+  // redemption goes through.
   return readInvite(
     await db.prepare(SELECT_INVITE_BY_TOKEN_SQL).bind(await options.keys.hash(token)).first<InviteRow>(),
   );

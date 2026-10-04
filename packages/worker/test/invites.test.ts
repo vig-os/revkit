@@ -187,14 +187,42 @@ beforeEach(async () => {
    * "killed 1 dangling process" failure cascade in the first draft of this
    * file. Seeding `count = limit - 1` and taking two attempts asserts the
    * boundary is EXACTLY at `limit`, in two round trips.
+   *
+   * ── The window is the WALL CLOCK's, not this file's `NOW` ────────────────
+   *
+   * **This default used to be `NOW`, and that made every rate-limit case here
+   * TIME-OF-DAY DEPENDENT.** Slice 5's review caught it as "3–4 failures that are
+   * not the known flake"; the mechanism is that there are TWO clocks in this file
+   * and they had been mixed:
+   *
+   *   - `NOW` (2026-10-04T12:00:00Z) is injected into the D1-level calls —
+   *     `mintInvite`, `revokeInvite`, `loadInviteGrant` — which take a clock.
+   *   - the HTTP-level cases go through `harness.dispatch` into real workerd, and
+   *     `spendAttempts` there is called WITHOUT `options.now`, so it reads
+   *     `Date.now()`.
+   *
+   * `RATE_LIMIT_WINDOW_MS` is 15 minutes and the limiter rolls a window whose
+   * stored `window_start` is `<= now - 15min`. Seeding `window_start` at 12:00:00
+   * therefore works for exactly as long as the real clock is inside
+   * 12:00:00–12:15:00 **UTC** — measured: those cases passed at 12:0x UTC and
+   * began failing at 12:23 UTC, with the seeded row silently rolled over to
+   * `count = 1` and the expected 429 becoming a 303.
+   *
+   * So the clock is now a REQUIRED argument rather than a default: every call
+   * site passes the clock its code under test actually reads — `NOW` for the
+   * D1-level cases, which inject `{ now: NOW }` into `spendAttempts` directly,
+   * and `Date.now()` for the HTTP-level cases, which go through real workerd.
+   * A default would have been a guess, and the guess is what this bug was.
+   * Still ONE write per seed, and the boundary is still asserted exactly.
    */
-  async function seedCounter(bucket: string, count: number, windowStartMs = NOW): Promise<void> {
+  async function seedCounter(bucket: string, count: number, windowStartMs: number): Promise<void> {
+    const windowStart = new Date(windowStartMs).toISOString();
     await harness.db
       .prepare(
         "INSERT INTO rate_limit_counters (bucket, count, window_start) VALUES (?, ?, ?) " +
           "ON CONFLICT(bucket) DO UPDATE SET count = ?, window_start = ?",
       )
-      .bind(bucket, count, new Date(windowStartMs).toISOString(), count, new Date(windowStartMs).toISOString())
+      .bind(bucket, count, windowStart, count, windowStart)
       .run();
   }
 
@@ -1026,7 +1054,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect(buckets[0]?.kind).toBe("invite");
       expect(buckets[0]?.limit).toBe(REDEEM_TOKEN_LIMIT);
       // count = limit - 1 in the CURRENT window: one more is still allowed.
-      await seedCounter(buckets[0]?.name ?? "", REDEEM_TOKEN_LIMIT - 1);
+      await seedCounter(buckets[0]?.name ?? "", REDEEM_TOKEN_LIMIT - 1, NOW);
       const allowed = await spendAttempts(db(), buckets, { now: NOW });
       expect(allowed.ok).toBe(true);
       // That attempt took the count to exactly the limit, so the next is refused.
@@ -1108,7 +1136,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       const addressOnly = (): RateBucket[] => addressBucket("203.0.113.9");
       const bucket = addressOnly()[0];
       expect(bucket?.limit).toBe(REDEEM_IP_LIMIT);
-      await seedCounter(bucket?.name ?? "", REDEEM_IP_LIMIT - 1);
+      await seedCounter(bucket?.name ?? "", REDEEM_IP_LIMIT - 1, NOW);
       expect((await spendAttempts(db(), addressOnly(), { now: NOW })).ok).toBe(true);
       const refused = await spendAttempts(db(), addressOnly(), { now: NOW });
       expect(refused.ok).toBe(false);
@@ -2526,6 +2554,53 @@ function parseJson(raw: string): Record<string, unknown> {
         expect((await redeem(harness, browser, token, { displayName: NAME })).status).toBe(303);
       });
 
+      test("the OPEN route is metered on its own bucket, and it REFUSES at the ceiling", async () => {
+        // ADR-0012's abuse limit covers invite redemption AND the open route that
+        // feeds it, and slice 5's review found the second half had a rate-limit
+        // case that only ever checked the open route **spending** — the case above
+        // proves it does NOT spend the per-token bucket. Nothing asserted that it
+        // ever refuses.
+        //
+        // It does refuse, and this is the evidence: the open route builds its
+        // buckets through `openBuckets`, which is the ADDRESS bucket when the edge
+        // set an address, so a guest over `REDEEM_IP_LIMIT` opens are answered
+        // `429` with `Retry-After` and never see the form. Verified by hand during
+        // review; pinned here so it cannot rot.
+        const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+        if (!minted.ok) throw new Error("mint failed");
+        const token = minted.minted.token;
+        const address = "198.51.100.77";
+        const bucket = `ip:${address}`;
+
+        // Below the ceiling the open route serves the form, and the counter is
+        // spent — so the refusal below is the LIMIT and not an unrelated fault.
+        await seedCounter(bucket, REDEEM_IP_LIMIT - 1, Date.now());
+        const under = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: address } });
+        expect(under.response.status).toBe(200);
+        const spent = await harness.db
+          .prepare("SELECT count FROM rate_limit_counters WHERE bucket = ?")
+          .bind(bucket)
+          .first<{ count: number }>();
+        expect(spent?.count).toBe(REDEEM_IP_LIMIT);
+
+        // At the ceiling: 429, with a usable `Retry-After`, and NOT the form.
+        const over = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: address } });
+        expect(over.response.status).toBe(429);
+        expect(Number(over.response.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+        expect(over.response.headers.get("cache-control")).toBe("no-store");
+        const html = await over.response.text();
+        expect(html).not.toContain(token);
+        expect(html).not.toContain(NAME);
+        // And the refusal names the bucket KIND, never the bucket.
+        expect(html).not.toContain(bucket);
+        expect(html).not.toContain(address);
+
+        // A DIFFERENT address is unaffected: the limit is per address, so one
+        // noisy client cannot lock out an entire office NAT.
+        const elsewhere = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: "203.0.113.9" } });
+        expect(elsewhere.response.status).toBe(200);
+      });
+
       test("a token over its REDEMPTION limit gets 429 with Retry-After", async () => {
         const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
         if (!minted.ok) throw new Error("mint failed");
@@ -2537,7 +2612,7 @@ function parseJson(raw: string): Record<string, unknown> {
         // counting to the limit costs `limit + 1` sequential D1 round trips, and
         // at 40 that once ran a case past bun's 5 s per-test timeout. It also
         // asserts the boundary EXACTLY rather than "at some point it refused".
-        await seedCounter(`invite:${digest}`, REDEEM_TOKEN_LIMIT);
+        await seedCounter(`invite:${digest}`, REDEEM_TOKEN_LIMIT, Date.now());
         const { browser } = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
         const limited = await redeem(harness, browser, token, { displayName: NAME }, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
         expect(limited.status).toBe(429);
@@ -2773,7 +2848,7 @@ function parseJson(raw: string): Record<string, unknown> {
           // The order, asserted through the counter rather than by reading the
           // source: at the ceiling, a request whose body would otherwise be a 400
           // is a 429. If the limiter moved back below the parse, this flips.
-          await seedCounter("ip:198.51.100.78", REDEEM_IP_LIMIT);
+          await seedCounter("ip:198.51.100.78", REDEEM_IP_LIMIT, Date.now());
           const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
             method: "POST",
             ...NO_FOLLOW,
