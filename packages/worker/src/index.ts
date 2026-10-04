@@ -307,13 +307,6 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /**
- * Routes that need no session. `/healthz` (a liveness probe that reads no
- * database and returns no review content), the `/_revkit/` bundle path
- * (ADR-0012: never a preview, never a redirect), and the 404 for everything
- * else. Nothing here can return review data, which is the whole reason these
- * three are exempt rather than an oversight.
- */
-/**
  * The ungated routes, and they are ungated because none of them can return
  * review data: `/healthz` is a liveness probe that reads no database,
  * `/_revkit/` is ADR-0012's never-redirecting bundle path, `unknown` is not a

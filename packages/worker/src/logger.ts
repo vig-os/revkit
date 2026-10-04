@@ -188,7 +188,10 @@ const SECRET_VALUE =
  *
  * One consequence stated rather than left to be discovered: a credential glued
  * to further base64url characters on either side (`x` + 43 + `x`) is one run of
- * 45 and survives. That is indistinguishable from a longer opaque string by
+ * 45 and survives — and so does any run whose length is not exactly 43,
+ * including two valid tokens concatenated with no separator (86), which is the
+ * most plausible member of that family. That is indistinguishable from a
+ * longer opaque string by
  * shape alone, and it is the boundary the cost of not eating SHA-256 digests
  * buys. The caller rule — never pass a credential as a log field — is what
  * covers it, which is the boundary this module's header already draws.

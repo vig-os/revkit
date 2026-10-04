@@ -422,9 +422,11 @@ export type SessionResolution =
  * "I cannot tell whether this row is still valid" is "no":
  *
  *   - `expires_at` in the past.
- *   - `expires_at` that does not parse at all (an operator wrote it by hand,
- *     a future migration changed the format). `Date.parse` returning `NaN`
- *     fails CLOSED here; a `>=` comparison against `NaN` would not.
+ *   - `expires_at` that cannot be read at all (an operator wrote it by hand,
+ *     a future migration changed the format). That is now reported as
+ *     `incomplete-row` rather than EXPIRED, so an unreadable column can never
+ *     be told apart from a readable one; an earlier revision claimed the `NaN`
+ *     reached a comparison here, and it does not.
  *
  * `created_at` is held to the same standard for a different reason — it is the
  * only input to the refresh cap, so an unparsable one must not produce a
