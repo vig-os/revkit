@@ -39,10 +39,12 @@ const PKG_ROOT = new URL("../", import.meta.url);
  * `MIGRATION_SQL` stays exported because `test/schema.test.ts` asserts things
  * about that one file's bytes (A15 idempotence, A16/A17's constraints, and
  * that the statement splitter loses nothing). It is `MIGRATIONS[0]` by
- * construction, so the two cannot drift.
+ * construction, so the two cannot drift. **`MIGRATIONS[2]` is the scope axis**
+ * (`0003_scoped_logs.sql`, slice 5) and it is in this list, which is why a test
+ * that seeds the event log cannot seed the table slice 3 shipped any more.
  */
 export const MIGRATIONS: readonly string[] = Object.freeze(
-  ["0001_init.sql", "0002_invites.sql"]
+  ["0001_init.sql", "0002_invites.sql", "0003_scoped_logs.sql"]
     .map((name) => readFileSync(fileURLToPath(new URL(`migrations/${name}`, PKG_ROOT)), "utf8"))
     .map((sql) => sql.toString()),
 );
@@ -314,11 +316,36 @@ export const JSON_HEADERS: Readonly<Record<string, string>> = { "content-type": 
 
 // ── invite helpers ────────────────────────────────────────────────────────
 
-/** Every table the invite surface touches, cleared. The per-test reset, so a
- * case cannot pass because a previous case left a redemption, a guest or a
- * rate-limit counter behind — and `sessions` for the same reason: a guest
- * session from case N must not authorize case N+1. */
+/**
+ * Every table a case can leave state in, cleared. The per-test reset, so a case
+ * cannot pass because a previous case left a redemption, a guest, a rate-limit
+ * counter or a comment behind — and `sessions` for the same reason: a guest
+ * session from case N must not authorize case N+1.
+ *
+ * **`review_logs` IS cleared here, and that is the sixth statement.** Slice 5
+ * first wrote a comment here saying the log was deliberately NOT wiped, on the
+ * reasoning that the log is partitioned by scope since `0003_scoped_logs.sql` so
+ * a case should clear exactly its own key — and then added the wipe four lines
+ * below the comment, because a whole-table wipe is what the OTHER files' fixtures
+ * (`test/d1-store.test.ts`, `test/worker-runtime.test.ts`, this file's own scope
+ * cases) actually need. Two adjacent comments claiming opposite things is worse
+ * than either alone: it would have misled whoever next weighed a seventh
+ * statement.
+ *
+ * **So, the settled rule, stated once:** `resetInvites` clears every table a case
+ * may write, INCLUDING `review_logs`, wholesale. A case that wants to touch only
+ * one review's log — which is what a scope-isolation case is FOR, since a
+ * neighbouring review's rows are the thing it is asserting about — clears its own
+ * key with a scoped `DELETE` (see `seedLog` in `test/authorization.test.ts` and
+ * `seedReview` in `test/invites.test.ts`). Both are correct at their own scope;
+ * neither contradicts the other, and this paragraph says which is which.
+ *
+ * The cost is real and measured: six statements in the `beforeEach` of a
+ * 120-test file, on a host where that file's timing is already close to bun's
+ * per-test timeout (see the workerd-instance note at the top of this file).
+ */
 export async function resetInvites(db: D1Database): Promise<void> {
+  await db.prepare("DELETE FROM review_logs").run();
   await db.prepare("DELETE FROM invite_redemptions").run();
   await db.prepare("DELETE FROM rate_limit_counters").run();
   await db.prepare("DELETE FROM invites").run();
@@ -328,6 +355,87 @@ export async function resetInvites(db: D1Database): Promise<void> {
 
 /** The name/value pair out of a `Set-Cookie` header value, so a test can build
  * the `Cookie` header a browser would send without a browser. */
+/**
+ * One stored `comment.created` event, as the JSON blob `review_logs.payload`
+ * holds.
+ *
+ * **This exists because four test files were each spelling the same eight-line
+ * object literal.** `guardrails/duplication` measured that literal at exactly
+ * four sites once slice 5 added `invites.test.ts`'s scope fixture, three of them
+ * since slice 1. A hand-written payload is also a place for the schema to drift:
+ * `reviewEventSchema.parse` is what reads it, so a fixture that quietly stopped
+ * being a valid event would fail as a store error rather than as a fixture error.
+ * Building it here means one shape, one anchor, one actor.
+ *
+ * **What it did NOT fix, stated so the number is not over-read.** `duplication`
+ * still reports **four clone groups** in this package, and slice 5 reduced that
+ * from **six at the base commit** — it did not reach zero. Two of the four are in
+ * `test/invites.test.ts` and are a DIFFERENT duplication from the one this
+ * extraction fixed: a ~71-line test case that appears twice in that file (in the
+ * D1 half and the HTTP half), and a six-line pair in its `invite scope` describe.
+ * Both pre-date slice 5 and neither is about event payloads. The gate is advisory
+ * (exit 0) and nothing is blessed with `guardrails-ok`; this paragraph is here so
+ * the next reader counts the gate's output against a claim that matches it.
+ *
+ * The `ts` is derived from `seq`, so a multi-event log's timestamps increase —
+ * which is what ADR-0015's retention sweep reads.
+ */
+export function seedReviewEvent(options: {
+  readonly seq: number;
+  readonly threadId: string;
+  readonly commentId: string;
+  readonly body?: string;
+}): { readonly ts: string; readonly payload: string } {
+  const ts = `2026-10-04T12:00:${String(options.seq).padStart(2, "0")}Z`;
+  return {
+    ts,
+    payload: JSON.stringify({
+      seq: options.seq,
+      ts,
+      actor: { kind: "gh-user", id: "gerchowl" },
+      kind: "comment.created",
+      threadId: options.threadId,
+      commentId: options.commentId,
+      anchor: {
+        path: "docs/a.mdx",
+        startLine: 1,
+        endLine: 1,
+        quote: { exact: "x", prefix: "", suffix: "" },
+        revision: "b".repeat(64),
+      },
+      body: options.body ?? "seeded review comment",
+    }),
+  };
+}
+
+/**
+ * Insert `count` events into ONE review's log, at consecutive seqs.
+ *
+ * `logKey` is the store's own key, so a fixture cannot seed a log the store is
+ * not pointed at — which is the point of slice 5: a fixture that writes somebody
+ * else's log is how a scope test passes for the wrong reason.
+ */
+export async function seedLogEvents(
+  db: D1Database,
+  logKey: string,
+  count: number,
+  options: { readonly prefix?: string; readonly body?: string; readonly from?: number } = {},
+): Promise<void> {
+  const from = options.from ?? 1;
+  for (const seq of Array.from({ length: count }, (_unused, index) => from + index)) {
+    const event = seedReviewEvent({
+      seq,
+      threadId: `${options.prefix ?? "th-seed"}-${seq}`,
+      commentId: `c-${options.prefix ?? "th-seed"}-${seq}`,
+      ...(options.body === undefined ? {} : { body: options.body }),
+    });
+    await db
+      .prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+      .bind(logKey, seq, event.ts, event.payload)
+      .run();
+  }
+}
+
 export function cookieValue(setCookie: string): string {
   const first = (setCookie.split(";")[0] ?? "").trim();
   const equals = first.indexOf("=");

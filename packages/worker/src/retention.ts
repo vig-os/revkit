@@ -33,11 +33,18 @@
 //      looks up the author by id. There has to be something to resolve to.
 //
 // What is NOT in scope here, and named so the next slice does not assume it:
-// rewriting guest attribution INSIDE `events.payload`. `POST /api/threads` is
-// still 501, so no guest-authored event exists in any database this code has
-// touched, and the payload's shape for a guest author is the hosted write's to
-// define (slice 4). A test asserts the clock is applied to the `guests` table
-// and says nothing about payloads, because there is nothing to say yet.
+// rewriting guest attribution INSIDE `review_logs.payload`. **That table name is
+// the one since slice 5** — `migrations/0003_scoped_logs.sql` partitioned the
+// hosted log per `(repo, PR)` as `review_logs(log_key, seq, ts, payload)` and
+// retired the flat `events` table — and this comment named the retired one until the
+// review caught it, which is the failure mode a stale comment has: it reads as a
+// fact about the schema.
+//
+// `POST <repo>/pr-<n>/api/threads` is still 501, so no guest-authored event exists
+// in any database this code has touched, and the payload's shape for a guest author
+// is the hosted write's to define (slice 4). A test asserts the clock is applied to
+// the `guests` table and says nothing about payloads, because there is nothing to
+// say yet.
 //
 // ── Why the trigger is not wired, and what is missing ─────────────────────
 //

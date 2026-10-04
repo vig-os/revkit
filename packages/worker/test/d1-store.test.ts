@@ -30,8 +30,9 @@ import {
   type ThreadArchive,
 } from "@revkit/review-core";
 import { APPEND_CAS_ATTEMPTS, D1ThreadStore, ThreadStoreContendedError } from "../src/d1-store.ts";
+import { previewScopePath } from "../src/router.ts";
 import { fixedClock } from "../../review-core/test/store-conformance.ts";
-import { startWorker, type Harness } from "./harness.ts";
+import { seedLogEvents, startWorker, type Harness } from "./harness.ts";
 
 const anchor = {
   path: "docs/adr/0006-comments-anchoring-event-log.md",
@@ -40,6 +41,39 @@ const anchor = {
   quote: { exact: "text-quote selector", prefix: "carries a ", suffix: " and the revision" },
   revision: "b".repeat(64),
 } as const;
+
+/**
+ * Two reviews' log keys, built by the SAME function `Route.scope.logKey` comes
+ * from — so these tests exercise the real key rather than a hand-written string
+ * that happens to agree with it. Slice 5 made `logKey` REQUIRED on every store,
+ * so every `new D1ThreadStore` below names one.
+ */
+const LOG = previewScopePath("revkit", 7);
+const OTHER_LOG = previewScopePath("revkit", 8);
+const THIRD_LOG = previewScopePath("other-repo", 7);
+
+/** `ReviewEvent` is a union whose arms do not share one identifier — the rows
+ * seeded here are identified by their `commentId` because it is the field every
+ * arm has, and it is narrow rather than cast. */
+function commentIdOf(event: ReviewEvent): string {
+  if (!("commentId" in event)) throw new Error(`no commentId on ${event.kind}`);
+  return event.commentId;
+}
+
+/** A minimal stored event payload for a hand-written row. */
+function seedPayload(threadId: string, seq: number): string {
+  const ts = `2026-10-03T12:00:0${seq}Z`;
+  return JSON.stringify({
+    seq,
+    ts,
+    actor: { kind: "gh-user", id: "gerchowl" },
+    kind: "comment.created",
+    threadId,
+    commentId: `c-${threadId}`,
+    anchor: { path: "docs/a.mdx", startLine: 1, endLine: 1, quote: { exact: "x", prefix: "", suffix: "" }, revision: "b".repeat(64) },
+    body: `seeded ${threadId}`,
+  });
+}
 
 function createThread(threadId: string, commentId: string): ReviewEventInput {
   return {
@@ -64,7 +98,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
   });
 
   beforeEach(async () => {
-    await harness.db.prepare("DELETE FROM events").run();
+    await harness.db.prepare("DELETE FROM review_logs").run();
   });
 
   // ── the mutation guard for A10 ────────────────────────────────────────
@@ -75,7 +109,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // that happened before it — so this is the shape A10 exists to rule
     // out, executed here so the rule is not a comment.
     async function naiveAppend(db: D1Database, index: number): Promise<number | null> {
-      const head = await db.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM events").first<{ head: number }>();
+      const head = await db.prepare(HEAD_FOR).bind(LOG).first<{ head: number }>();
       const seq = (head?.head ?? 0) + 1;
       const event: ReviewEvent = {
         seq,
@@ -89,8 +123,8 @@ describe("D1ThreadStore — D1 concurrency model", () => {
       };
       try {
         await db
-          .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-          .bind(seq, event.ts, JSON.stringify(event))
+          .prepare(INSERT_FOR)
+          .bind(LOG, seq, event.ts, JSON.stringify(event))
           .run();
         return seq;
       } catch {
@@ -122,7 +156,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
   // evidence is the two cases below it — the hand-rolled naive collision,
   // and the two-independent-stores case with its CAS-failure count.
   test("A10 (queued): 20 appends issued concurrently execute serially, and give 20 distinct seqs and 20 rows", async () => {
-    const store = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+    const store = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
     const results = await Promise.all(
       Array.from({ length: 20 }, (_unused, index) =>
         store.append(createThread(`th-conc-${index}`, `c-conc-${index}`)),
@@ -131,16 +165,12 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     expect(new Set(results).size).toBe(20);
     expect([...results].sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_u, i) => i + 1));
 
-    const counted = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
-    expect(counted?.n).toBe(20);
+    expect(await countIn(harness.db, LOG)).toBe(20);
     // Every persisted row parses and carries the seq its column claims:
     // the payload blob and the query key cannot disagree.
-    const rows = await harness.db.prepare("SELECT seq, payload FROM events ORDER BY seq ASC").all<{
-      seq: number;
-      payload: string;
-    }>();
-    expect(rows.results).toHaveLength(20);
-    for (const row of rows.results ?? []) {
+    const rows = await rowsIn(harness.db, LOG);
+    expect(rows).toHaveLength(20);
+    for (const row of rows) {
       expect(JSON.parse(row.payload).seq).toBe(row.seq);
     }
   });
@@ -158,8 +188,8 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // positive count proves the CAS was hit and recovered from; zero would
     // mean this test had degenerated into the queued case above.
     const { db: raced, casFailures, batches } = countingDb(harness.db);
-    const a = new D1ThreadStore({ db: raced, clock: fixedClock(0) });
-    const b = new D1ThreadStore({ db: raced, clock: fixedClock(30) });
+    const a = new D1ThreadStore({ db: raced, logKey: LOG, clock: fixedClock(0) });
+    const b = new D1ThreadStore({ db: raced, logKey: LOG, clock: fixedClock(30) });
     const seqs = await Promise.all([
       ...Array.from({ length: 8 }, (_u, i) => a.append(createThread(`th-a-${i}`, `c-a-${i}`))),
       ...Array.from({ length: 8 }, (_u, i) => b.append(createThread(`th-b-${i}`, `c-b-${i}`))),
@@ -171,8 +201,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // allocator with no guard at all.
     expect(casFailures()).toBeGreaterThan(0);
     expect(batches()).toBeGreaterThan(16);
-    const counted = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
-    expect(counted?.n).toBe(16);
+    expect(await countIn(harness.db, LOG)).toBe(16);
     // Both instances see the whole log, so a caller that reads through
     // either store gets all sixteen threads.
     expect(await a.threads()).toHaveLength(16);
@@ -197,47 +226,192 @@ describe("D1ThreadStore — D1 concurrency model", () => {
       if (raced) return;
       raced = true;
       await harness.db
-        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-        .bind(1, competitorEvent.ts, JSON.stringify(competitorEvent))
+        .prepare(INSERT_FOR)
+        .bind(LOG, 1, competitorEvent.ts, JSON.stringify(competitorEvent))
         .run();
     });
 
-    const store = new D1ThreadStore({ db: racingDb, clock: fixedClock() });
+    const store = new D1ThreadStore({ db: racingDb, logKey: LOG, clock: fixedClock() });
     const seq = await store.append(createThread("th-mine", "c-mine"));
     expect(raced).toBe(true);
     // The competitor kept seq 1; our event lands at 2. The store read the
     // competitor's row in the same batch that refused our insert, so it
     // validated against the state the competitor actually left behind.
     expect(seq).toBe(2);
-    const rows = await harness.db.prepare("SELECT seq FROM events ORDER BY seq ASC").all<{ seq: number }>();
-    expect(rows.results?.map((r) => r.seq)).toEqual([1, 2]);
+    expect(await seqsIn(harness.db, LOG)).toEqual([1, 2]);
     // Both threads are visible, so the catch-up really did replay.
     expect((await store.threads()).map((t) => t.id)).toEqual(["th-competitor", "th-mine"]);
+  });
+
+  // ── slice 5: the partition ────────────────────────────────────────────
+  //
+  // The cases above all write one log. These write two or three and assert that
+  // they cannot see each other — because the defect slice 5 removes was not a
+  // missing check but an ABSENT AXIS: `events(seq, ts, payload)` held one log
+  // for a whole org, so a scope check had nothing to select on and every
+  // authorized caller read everything.
+
+  test("two (repo, pr) pairs do not see each other's events", async () => {
+    const a = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
+    const b = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock() });
+    const c = new D1ThreadStore({ db: harness.db, logKey: THIRD_LOG, clock: fixedClock() });
+    await a.append(createThread("th-in-a", "c-in-a"));
+    await a.append(createThread("th-in-a-2", "c-in-a-2"));
+    await b.append(createThread("th-in-b", "c-in-b"));
+    await c.append(createThread("th-in-c", "c-in-c"));
+
+    // Each store sees its own events and NOTHING else — not another PR of the
+    // same repo, and not another repo.
+    expect((await a.threads()).map((t) => t.id)).toEqual(["th-in-a", "th-in-a-2"]);
+    expect((await b.threads()).map((t) => t.id)).toEqual(["th-in-b"]);
+    expect((await c.threads()).map((t) => t.id)).toEqual(["th-in-c"]);
+    // The reads do not merely filter the answer: the ROWS are separate, so a
+    // `head` computed over the whole table would be a shared counter.
+    expect(await countIn(harness.db, LOG)).toBe(2);
+    expect(await countIn(harness.db, OTHER_LOG)).toBe(1);
+    expect(await countIn(harness.db, THIRD_LOG)).toBe(1);
+    // And a `thread()` lookup cannot cross the key either.
+    expect(await a.thread("th-in-b")).toBeUndefined();
+    expect(await b.thread("th-in-a")).toBeUndefined();
+    expect(await b.thread("th-in-b")).toBeDefined();
+  });
+
+  test("`seq` is per log, so each store starts at 1", async () => {
+    // What `ThreadStore` has always meant by a fresh store's head — and what
+    // the shared conformance suite's A5 asserts for a store with no context at
+    // all. Three logs, one event each, all at `seq = 1`: with a global counter
+    // the second would be 2, and `since(0)` would return somebody else's
+    // event.
+    const a = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
+    const b = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock() });
+    expect(await a.append(createThread("th-seq-a", "c-seq-a"))).toBe(1);
+    expect(await b.append(createThread("th-seq-b", "c-seq-b"))).toBe(1);
+    expect(await a.head()).toBe(1);
+    expect(await b.head()).toBe(1);
+    expect(await seqsIn(harness.db, LOG)).toEqual([1]);
+    expect(await seqsIn(harness.db, OTHER_LOG)).toEqual([1]);
+  });
+
+  test("since() does not leak across keys — a resume point is per review", async () => {
+    // The bug this closes is subtle and worth stating: with a flat table, a
+    // client holding `head = 3` from review A and polling review B's `?since=3`
+    // would silently skip B's events 1–3. `since` is a LOG-LOCAL cursor.
+    await harness.db
+      .prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+      .bind(LOG, 1, "2026-10-03T12:00:01Z", seedPayload("th-since-a-1", 1))
+      .run();
+    await harness.db
+      .prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+      .bind(LOG, 2, "2026-10-03T12:00:02Z", seedPayload("th-since-a-2", 2))
+      .run();
+    for (const seq of [1, 2, 3, 4]) {
+      await harness.db
+        .prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+        .bind(OTHER_LOG, seq, `2026-10-03T12:00:0${seq}Z`, seedPayload(`th-since-b-${seq}`, seq))
+        .run();
+    }
+    const a = new D1ThreadStore({ db: harness.db, logKey: LOG });
+    const b = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG });
+    expect((await a.since(0)).map((e) => commentIdOf(e))).toEqual(["c-th-since-a-1", "c-th-since-a-2"]);
+    expect((await b.since(0)).map((e) => commentIdOf(e))).toEqual([
+      "c-th-since-b-1",
+      "c-th-since-b-2",
+      "c-th-since-b-3",
+      "c-th-since-b-4",
+    ]);
+    // A cursor from one review is meaningless in the other, and the direction
+    // that matters is the one that loses data: `since(3)` on the short log
+    // returns NOTHING rather than the other log's tail.
+    expect(await a.since(3)).toEqual([]);
+    expect((await b.since(3)).map((e) => commentIdOf(e))).toEqual(["c-th-since-b-4"]);
+    // And the heads differ, which is what makes those cursors different.
+    expect(await a.head()).toBe(2);
+    expect(await b.head()).toBe(4);
+  });
+
+  test("two logs appended CONCURRENTLY do not contend — the CAS is per log", async () => {
+    // Before the partition this could not be written: one global `seq` and one
+    // global CAS meant two reviews writing at the same moment computed the same
+    // next `seq`, and the loser retried having absorbed the winner's events
+    // through `validateNext`. Now each takes `seq = 1` of its own log.
+    const { db: raced, casFailures } = countingDb(harness.db);
+    const a = new D1ThreadStore({ db: raced, logKey: LOG, clock: fixedClock(0) });
+    const b = new D1ThreadStore({ db: raced, logKey: OTHER_LOG, clock: fixedClock(30) });
+    const seqs = await Promise.all([
+      ...Array.from({ length: 6 }, (_u, i) => a.append(createThread(`th-par-a-${i}`, `c-par-a-${i}`))),
+      ...Array.from({ length: 6 }, (_u, i) => b.append(createThread(`th-par-b-${i}`, `c-par-b-${i}`))),
+    ]);
+    // Six each, and both sets are 1..6 — `Promise.all` preserves input order and
+    // the first six calls are store A's.
+    const six = [1, 2, 3, 4, 5, 6];
+    expect(seqs.slice(0, 6).sort((x, y) => x - y)).toEqual(six);
+    expect(seqs.slice(6).sort((x, y) => x - y)).toEqual(six);
+    expect(await countIn(harness.db, LOG)).toBe(6);
+    expect(await countIn(harness.db, OTHER_LOG)).toBe(6);
+    // The claim is about CONTENTION, so it is asserted: zero CAS failures means
+    // neither writer ever saw the other's head. (Not a fluke — the assertion
+    // would fail on an implementation with a global head, which is what this
+    // replaced.)
+    expect(casFailures()).toBe(0);
+    // And each store's own log is whole. (`Thread.id`, which is what the
+    // assertions above used — `ReviewEvent` is a union and most arms have no
+    // `threadId`.)
+    expect((await a.threads()).map((t) => t.id)).toEqual(Array.from({ length: 6 }, (_u, i) => `th-par-a-${i}`));
+    expect((await b.threads()).map((t) => t.id)).toEqual(Array.from({ length: 6 }, (_u, i) => `th-par-b-${i}`));
+  });
+
+  test("an import lands in THIS store's log and no other", async () => {
+    const source = new InMemoryThreadStore({ clock: fixedClock() });
+    await source.append(createThread("th-imp-1", "c-imp-1"));
+    await source.append(createThread("th-imp-2", "c-imp-2"));
+    const target = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock() });
+    await target.import(await exportArchive(source));
+    expect(await countIn(harness.db, OTHER_LOG)).toBe(2);
+    expect(await countIn(harness.db, LOG)).toBe(0);
+    // Reading the OTHER log is empty, not the imported one.
+    expect(await new D1ThreadStore({ db: harness.db, logKey: LOG }).threads()).toEqual([]);
+    expect((await target.threads()).map((t) => t.id)).toEqual(["th-imp-1", "th-imp-2"]);
+  });
+
+  test("a log key is not forgeable from a hand-written row, because log_key is NOT NULL", async () => {
+    // The schema half of "the key comes from the authenticated path": a row
+    // with no key cannot be written at all, so there is no unscoped event for a
+    // query to find even if a statement forgot its predicate.
+    await expect(
+      harness.db
+        .prepare("INSERT INTO review_logs (seq, ts, payload) VALUES (?, ?, ?)")
+        .bind(1, "2026-10-03T12:00:00Z", "{}")
+        .run(),
+    ).rejects.toThrow(/NOT NULL/i);
+    // And a row whose payload claims a different review than its key is not
+    // possible to create by accident either: the key is a column, not something
+    // read out of the payload.
+    const row = await rowsIn(harness.db, LOG);
+    for (const one of row) {
+      const parsed = JSON.parse(one.payload) as { threadId: string };
+      expect(parsed.threadId).toContain(String(one.seq));
+    }
   });
 
   // ── A11 ───────────────────────────────────────────────────────────────
   test("A11: a batch whose second statement violates the PK writes NOTHING", async () => {
     await harness.db
-      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-      .bind(900, "2026-10-03T12:00:00Z", JSON.stringify({ seq: 900, ts: "2026-10-03T12:00:00Z" }))
+      .prepare(INSERT_FOR)
+      .bind(LOG, 900, "2026-10-03T12:00:00Z", JSON.stringify({ seq: 900, ts: "2026-10-03T12:00:00Z" }))
       .run();
 
     const attempted = harness.db.batch([
-      harness.db
-        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-        .bind(901, "2026-10-03T12:00:01Z", "{}"),
-      // Collides with the row above, so the WHOLE batch must roll back.
-      harness.db
-        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-        .bind(900, "2026-10-03T12:00:02Z", "{}"),
+      harness.db.prepare(INSERT_FOR).bind(LOG, 901, "2026-10-03T12:00:01Z", "{}"),
+      // Collides with the row above — same log, same seq — so the WHOLE batch
+      // must roll back. `log_key` is part of the key, so the collision is a
+      // PRIMARY KEY violation and not a second row.
+      harness.db.prepare(INSERT_FOR).bind(LOG, 900, "2026-10-03T12:00:02Z", "{}"),
     ]);
     await expect(attempted).rejects.toThrow();
 
-    const present = await harness.db.prepare("SELECT seq FROM events WHERE seq = 901").first<{ seq: number }>();
-    expect(present).toBeNull();
+    expect(await seqsIn(harness.db, LOG)).not.toContain(901);
     // And the pre-existing row is untouched.
-    const kept = await harness.db.prepare("SELECT seq FROM events WHERE seq = 900").first<{ seq: number }>();
-    expect(kept?.seq).toBe(900);
+    expect(await seqsIn(harness.db, LOG)).toContain(900);
   });
 
   test("A11(b): two stores importing the SAME archive — the loser writes nothing", async () => {
@@ -246,21 +420,19 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // second import's head-monotone rule passes (its own head is 0) and
     // its batch then collides on the PK, which must roll the WHOLE batch
     // back rather than half-apply it.
-    const publisher = new D1ThreadStore({ db: harness.db, clock: fixedClock(0) });
+    const publisher = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock(0) });
     await publisher.append(createThread("th-pub-1", "c-pub-1"));
     await publisher.append(createThread("th-pub-2", "c-pub-2"));
     const archive = await exportArchive(publisher);
 
-    const second = new D1ThreadStore({ db: harness.db, clock: fixedClock(30) });
+    const second = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock(30) });
     await expect(second.import(archive)).rejects.toThrow();
 
-    const rows = await harness.db
-      .prepare("SELECT seq, payload FROM events ORDER BY seq ASC")
-      .all<{ seq: number; payload: string }>();
-    expect(rows.results?.map((r) => r.seq)).toEqual([1, 2]);
+    const rows = await rowsIn(harness.db, LOG);
+    expect(rows.map((r) => r.seq)).toEqual([1, 2]);
     // The winner's payloads are intact — the loser's batch overwrote none
     // of them, which a per-statement commit would have done.
-    expect(JSON.parse((rows.results?.[0]?.payload ?? "{}").toString()).threadId).toBe("th-pub-1");
+    expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-pub-1");
   });
 
   // ── head() on a NON-EMPTY log (the #76 review's I1) ──────────────────
@@ -275,48 +447,25 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // gap. `SqliteThreadStore` re-reads `max(seq)` at construction, so this
     // also stops the two implementations of the same method name from
     // disagreeing.
-    for (const seq of [1, 2, 3, 7]) {
-      await harness.db
-        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-        .bind(
-          seq,
-          `2026-10-03T12:00:0${seq}Z`,
-          JSON.stringify({
-            seq,
-            ts: `2026-10-03T12:00:0${seq}Z`,
-            actor: { kind: "gh-user", id: "gerchowl" },
-            kind: "comment.created",
-            threadId: `th-head-${seq}`,
-            commentId: `c-head-${seq}`,
-            anchor: {
-              path: "docs/a.mdx",
-              startLine: 1,
-              endLine: 1,
-              quote: { exact: "x", prefix: "", suffix: "" },
-              revision: "b".repeat(64),
-            },
-            body: "head probe",
-          }),
-        )
-        .run();
-    }
+    await seedLogEvents(harness.db, LOG, 3, { prefix: "th-head", from: 1 });
+    await seedLogEvents(harness.db, LOG, 1, { prefix: "th-head", from: 7 });
 
-    const fresh = new D1ThreadStore({ db: harness.db });
+    const fresh = new D1ThreadStore({ db: harness.db, logKey: LOG });
     // The instance's own watermark is honestly still 0 — it has validated
     // nothing — and `head()` must not be that number.
     expect(fresh.validatedHead()).toBe(0);
     expect(await fresh.head()).toBe(7);
 
     // A store that HAS appended agrees with the table.
-    const appended = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+    const appended = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
     const seq = await appended.append(createThread("th-head-new", "c-head-new"));
     expect(seq).toBe(8);
     expect(await appended.head()).toBe(8);
     expect(appended.validatedHead()).toBe(8);
 
     // And on an empty table it is still 0, so the empty case did not regress.
-    await harness.db.prepare("DELETE FROM events").run();
-    expect(await new D1ThreadStore({ db: harness.db }).head()).toBe(0);
+    await harness.db.prepare("DELETE FROM review_logs").run();
+    expect(await new D1ThreadStore({ db: harness.db, logKey: LOG }).head()).toBe(0);
   });
 
   // ── I5: the store's one bounded-failure path ─────────────────────────
@@ -331,7 +480,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // with a zero-change insert, which is exactly the condition the CAS
     // retries on. With it, the store must give up — bounded, loud, and with
     // no livelock.
-    const always = new D1ThreadStore({ db: foreverContended(harness.db), clock: fixedClock() });
+    const always = new D1ThreadStore({ db: foreverContended(harness.db), logKey: LOG, clock: fixedClock() });
     let thrown: unknown;
     try {
       await always.append(createThread("th-contended", "c-contended"));
@@ -357,7 +506,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // and a permanently contended store must issue exactly that many and
     // then throw — not retry forever, and not stop early.
     const counter = contendedBatchCounter(harness.db);
-    const always = new D1ThreadStore({ db: counter.db, clock: fixedClock() });
+    const always = new D1ThreadStore({ db: counter.db, logKey: LOG, clock: fixedClock() });
     await expect(always.append(createThread("th-bounded", "c-bounded"))).rejects.toThrow(
       ThreadStoreContendedError,
     );
@@ -368,11 +517,10 @@ describe("D1ThreadStore — D1 concurrency model", () => {
   });
 
   test("I5: no row is written when the head never settles", async () => {
-    const before = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
-    const always = new D1ThreadStore({ db: foreverContended(harness.db), clock: fixedClock() });
+    const before = await countIn(harness.db, LOG);
+    const always = new D1ThreadStore({ db: foreverContended(harness.db), logKey: LOG, clock: fixedClock() });
     await expect(always.append(createThread("th-nowrite", "c-nowrite"))).rejects.toThrow();
-    const after = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
-    expect(after?.n).toBe(before?.n ?? 0);
+    expect(await countIn(harness.db, LOG)).toBe(before);
   });
 
   test("I5: a TRANSIENTLY contended store still succeeds — the error is not the normal path", async () => {
@@ -380,20 +528,19 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // The proxy refuses the first two guarded inserts and then delegates to
     // the real database, so the third attempt must land — with a real seq
     // and a persisted row, not a swallowed error.
-    await harness.db.prepare("DELETE FROM events").run();
+    await harness.db.prepare("DELETE FROM review_logs").run();
     const proxy = flakyDb(harness.db, 2);
-    const flaky = new D1ThreadStore({ db: proxy, clock: fixedClock() });
+    const flaky = new D1ThreadStore({ db: proxy, logKey: LOG, clock: fixedClock() });
     const seq = await flaky.append(createThread("th-flaky", "c-flaky"));
     expect(seq).toBe(1);
-    const rows = await harness.db.prepare("SELECT seq FROM events ORDER BY seq ASC").all<{ seq: number }>();
-    expect(rows.results?.map((r) => r.seq)).toEqual([1]);
+    expect(await seqsIn(harness.db, LOG)).toEqual([1]);
     // Two refused attempts, then success: the retry path ran and recovered.
     expect(proxy.attempts()).toBe(3);
   });
 
   // ── A13 ───────────────────────────────────────────────────────────────
   test("A13: export a D1 log and import it into a fresh in-memory store", async () => {
-    const d1 = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+    const d1 = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
     await d1.append(createThread("th-bridge-1", "c-bridge-1"));
     await d1.append(createThread("th-bridge-2", "c-bridge-2"));
 
@@ -408,11 +555,10 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     const local = new InMemoryThreadStore({ clock: fixedClock() });
     await local.append(createThread("th-up-1", "c-up-1"));
     await local.append(createThread("th-up-2", "c-up-2"));
-    const d1 = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+    const d1 = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
     await d1.import(await exportArchive(local));
     expect(await d1.threads()).toEqual(await local.threads());
-    const counted = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
-    expect(counted?.n).toBe(2);
+    expect(await countIn(harness.db, LOG)).toBe(2);
   });
 
   test("A13: a round trip preserves each anchor's revision, which is what re-anchoring trusts", async () => {
@@ -429,7 +575,7 @@ describe("D1ThreadStore — D1 concurrency model", () => {
       anchor: { ...anchor, revision },
       body: "anchored",
     });
-    const d1 = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+    const d1 = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
     await d1.import(await exportArchive(local));
     const threads = await d1.threads();
     const thread = threads[0];
@@ -443,8 +589,8 @@ describe("D1ThreadStore — D1 concurrency model", () => {
   });
 
   test("A13: an import whose FIRST event is fine and whose SECOND is not leaves no rows", async () => {
-    const store = new D1ThreadStore({ db: harness.db, clock: fixedClock() });
-    const before = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
+    const store = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
+    const before = await countIn(harness.db, LOG);
     // Reply to a parent that does not exist — individually Zod-valid,
     // rejected only on the second event.
     const broken = {
@@ -478,10 +624,39 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // so the refusal happens INSIDE `import`, which is the behaviour
     // under test.
     await expect(store.import(broken as ThreadArchive)).rejects.toThrow();
-    const after = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
-    expect(after?.n).toBe(before?.n ?? 0);
+    expect(await countIn(harness.db, LOG)).toBe(before);
   });
 });
+
+/** The three direct-SQL shapes these tests use against `review_logs`, named so
+ * the file has one spelling of "this log's head" and cannot drift into an
+ * unscoped query by accident. Every one of them carries `log_key`; there is no
+ * unscoped statement in this file. */
+const HEAD_FOR = "SELECT COALESCE(MAX(seq), 0) AS head FROM review_logs WHERE log_key = ?";
+const INSERT_FOR = "INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)";
+
+/** `countIn(logKey)`, `seqsIn(logKey)`, `rowsIn(logKey)` — the three reads the
+ * cases below assert on. */
+async function countIn(db: D1Database, logKey: string): Promise<number> {
+  const row = await db.prepare(HEAD_FOR.replace("COALESCE(MAX(seq), 0) AS head", "COUNT(*) AS n")).bind(logKey).first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+async function seqsIn(db: D1Database, logKey: string): Promise<number[]> {
+  const rows = await db
+    .prepare("SELECT seq FROM review_logs WHERE log_key = ? ORDER BY seq ASC")
+    .bind(logKey)
+    .all<{ seq: number }>();
+  return (rows.results ?? []).map((r) => r.seq);
+}
+
+async function rowsIn(db: D1Database, logKey: string): Promise<{ seq: number; payload: string }[]> {
+  const rows = await db
+    .prepare("SELECT seq, payload FROM review_logs WHERE log_key = ? ORDER BY seq ASC")
+    .bind(logKey)
+    .all<{ seq: number; payload: string }>();
+  return (rows.results ?? []).map((r) => ({ seq: r.seq, payload: r.payload }));
+}
 
 /** A `D1Database` proxy that COUNTS compare-and-swap failures.
  *
@@ -545,8 +720,8 @@ function foreverContended(db: D1Database): D1Database {
 }
 
 /** The table's real `MAX(seq)`, read outside the faked batch. */
-async function realMaxSeq(db: D1Database): Promise<number> {
-  const row = await db.prepare("SELECT COALESCE(MAX(seq), 0) AS head FROM events").first<{ head: number }>();
+async function realMaxSeq(db: D1Database, logKey: string = LOG): Promise<number> {
+  const row = await db.prepare(HEAD_FOR).bind(logKey).first<{ head: number }>();
   return row?.head ?? 0;
 }
 

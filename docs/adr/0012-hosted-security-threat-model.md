@@ -4,6 +4,9 @@
 - Date: 2026-09-29
 - Stories: B1–B5
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
+- Amended by: the 2026-10-04 (issue #9, slice 5) amendment at the end of this
+  document — the guest half of "authorization per request" is implemented in
+  full, and the GitHub-read clause is the half that remains.
 
 ## Context
 
@@ -392,3 +395,88 @@ the invariant is restated rather than dropped: the gate is still the only path t
 the **thread store** and to `sessions` for authorized requests, and the invite
 handlers touch only `invites`, `invite_redemptions`, `guests` and
 `rate_limit_counters`. `D1ThreadStore` is not constructible from them.
+
+## Amendment (2026-10-04, issue #9, slice 5) — the guest half is implemented, and
+## the GitHub-read clause is what remains
+
+Slice 5 makes ADR-0012's per-call scope check **select something**. Three passages
+above now state the opposite of shipped behaviour, and this amendment supersedes
+them. They are left standing rather than edited, because each is a dated record of
+what a slice could and could not do, and a record that is quietly rewritten stops
+being evidence of anything.
+
+**Which passages this supersedes:**
+
+1. The 2026-10-04 amendment's **"Explicitly NOT satisfied"** list — its second
+   bullet, *"a guest invite is checked for scope, type and expiry on each call —
+   **not implemented.**"* That is now **implemented**, and the bullet's own
+   prediction ("the repo axis arrives with the preview surface (slice 5)") is what
+   happened. The first bullet, the GitHub-read clause, is **still not implemented**.
+2. The same amendment's *"So the honest reading of 'authorized' in M4 slice 2 is: …
+   A valid session **currently receives the whole log**, because there is nothing
+   yet to scope it by."* — **no longer true.**
+3. The slice-3 amendment's §3 *"What 'on each call' does not yet cover"* — *"so a
+   guest with a valid invite **currently reads the whole log, exactly as an operator
+   does**"* — **no longer true.**
+
+### What "authorized" means now
+
+For a **guest** (`identity_kind = "invite"`), on every authorized request:
+
+1. the session resolves by digest, is unexpired, and its kind is recognised;
+2. on a state-changing verb, that session's own CSRF token and
+   `application/json`;
+3. the invite still exists, is unrevoked, unexpired, and was redeemed in **this**
+   browser;
+4. **the route NAMES a review, or the request is refused** — `403
+   invite-scope-unbounded`. "No scope" is not "no restriction": the absence of a
+   scope is now a refusal, never a permission. This is the clause that used to
+   run and select nothing;
+5. the invite's `repo` and optional `pr` **cover** that review — `403
+   invite-scope-mismatch`;
+6. the invite's `can_comment` permits what the route writes — `403
+   invite-read-only`.
+
+The mechanism: the scope is **in the path** — `<repo>/pr-<n>/api/threads` — so
+there is no unscoped spelling to forget and no parameter to tamper with.
+`GET /api/threads`, which named no review and could therefore only ever answer
+org-wide, is **removed**, not narrowed: it is not a route. The hosted log is
+partitioned by that same review (`review_logs(log_key, seq, …)`, required
+`D1ThreadStoreOptions.logKey`), so a read cannot cross a review even if the gate
+were removed.
+
+**One exemption, named.** `POST /api/session/refresh` names no review because it is
+not about one: it rotates the caller's own credential and touches nothing else. It
+carries `Route.guestScopeExempt`, the only path that does.
+
+### What is still missing, and where
+
+**The GitHub-read clause.** There is no `TokenSource`; the App is owner-gated
+(#34). Slice 4.
+
+**The asymmetry, stated precisely rather than by naming a class that cannot
+exist.** `RECOGNISED_IDENTITY_KINDS` is `["operator", "invite"]` — **`github` is
+absent from it on purpose** (`src/session.ts`), and a session row re-pointed at
+`github` is refused `401 unrecognised-identity-kind`, so the guest path cannot be
+reached by asking for a GitHub identity. The scope check runs only under
+`if (resolved.principal.kind === "invite")`. **The identity kind that is
+org-wide today is therefore `operator`**, which the gate does not scope-check: it
+reads whatever `(repo, PR)` the path names, and this build has nothing to check
+repo access against. Slice 5 narrowed the **guest** side and deliberately did not
+narrow or widen this one — a guest is confined to its invite's scope, and
+`operator` remains unscoped until the provider can prove repo access.
+
+**One consequence, stated rather than glossed.** Making the read path-scoped
+**removed** the org-wide read rather than narrowing it: an `operator` session now
+reads one review per request, by URL. That is the safe direction and it is what a
+path-addressed surface means, but nothing in this build can *enumerate* a
+deployment's reviews. The GitHub bridge (slice 4) is what will want to, and this
+clause — the unimplemented one — is what would authorise it.
+
+### Still deferred
+
+`POST <repo>/pr-<n>/api/threads` is a 501 (the hosted write is slice 4), so no
+CSRF-protected review **write** ships and guests still cannot comment. The R2
+preview surface is still 501. Fork isolation remains. A repo-wide invite's holder
+is redirected to `/`, which is unrecognised — pre-existing, security-neutral, and
+recorded in the feature matrix.

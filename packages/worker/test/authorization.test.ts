@@ -19,6 +19,9 @@
 // Every request goes through `miniflare.dispatchFetch`, i.e. the same workerd
 // the platform runs, with the same empty `compatibility_flags`.
 
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
   classifyRoute,
@@ -26,10 +29,14 @@ import {
   DENIAL_REASONS,
   HEALTH_PATH,
   SESSION_REFRESH_PATH,
-  THREADS_PATH,
+  BOTH_SIDES_ROUTE_KINDS,
+  GATED_ROUTE_KINDS,
+  ROUTE_KINDS,
+  UNGATED_ROUTE_KINDS,
   type DenialReason,
   type RouteKind,
 } from "../src/authz.ts";
+import { D1ThreadStore } from "../src/d1-store.ts";
 import {
   CSRF_HEADER,
   SESSION_COOKIE_NAME,
@@ -37,15 +44,40 @@ import {
   sha256Hex,
   SessionAlreadyRotatedError,
 } from "../src/session.ts";
-import { parsePreviewPath, parseThreadsQuery } from "../src/router.ts";
+import {
+  SCOPED_THREADS_SUFFIX,
+  parsePreviewPath,
+  parseScopedThreadsPath,
+  parseThreadsQuery,
+  previewScopePath,
+  scopedThreadsPath,
+} from "../src/router.ts";
 import {
   authHeaders,
   cookieHeader,
   issueTestSession,
+  seedLogEvents,
   JSON_HEADERS,
   startWorker,
   type Harness,
 } from "./harness.ts";
+
+/**
+ * The review these cases are about, and the ONE path that reads it.
+ *
+ * **Slice 5 moved the read.** It was `GET /api/threads`, which named no
+ * repository, so ADR-0012's per-call scope check had nothing to select on and
+ * every authorized caller read the whole org's log. It is now
+ * `<repo>/pr-<n>/api/threads` — the scope is IN THE PATH, so a caller cannot
+ * forget it, cannot choose it, and has no parameter to tamper with. The removed
+ * spelling is `REMOVED_THREADS_PATH` below, and it is not a route at all.
+ */
+const REVIEW = { repo: "revkit", pr: 7 } as const;
+const THREADS_PATH = scopedThreadsPath(REVIEW.repo, REVIEW.pr);
+const LOG_KEY = previewScopePath(REVIEW.repo, REVIEW.pr);
+
+/** What `GET /api/threads` was. Asserted NOT to be a route, by several cases. */
+const REMOVED_THREADS_PATH = "/api/threads";
 
 /** The body every seeded comment carries. A refusal must never contain it, and
  * an admitted read must — so both halves assert against the SAME string
@@ -54,41 +86,137 @@ const SEED_BODY = "this comment body must only reach a caller with a session";
 
 /** A four-event log with a gap at seq 4..6 (seqs 1, 2, 3, 7). ADR-0006
  * blesses gaps in a D1-backed store, so a hosted read that renumbered them
- * would be wrong in a way a contiguous fixture cannot detect. */
-async function seedLog(db: D1Database): Promise<void> {
-  await db.prepare("DELETE FROM events").run();
-  for (const seq of [1, 2, 3, 7]) {
-    await db
-      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-      .bind(
-        seq,
-        `2026-10-04T12:00:0${seq}Z`,
-        JSON.stringify({
-          seq,
-          ts: `2026-10-04T12:00:0${seq}Z`,
-          actor: { kind: "gh-user", id: "gerchowl" },
-          kind: "comment.created",
-          threadId: `th-seed-${seq}`,
-          commentId: `c-seed-${seq}`,
-          anchor: {
-            path: "docs/a.mdx",
-            startLine: 1,
-            endLine: 1,
-            quote: { exact: "x", prefix: "", suffix: "" },
-            revision: "b".repeat(64),
-          },
-          body: SEED_BODY,
-        }),
-      )
-      .run();
-  }
+ * would be wrong in a way a contiguous fixture cannot detect.
+ *
+ * **Into `REVIEW`'s log and no other** (slice 5), which is why the seed is
+ * parameterized by log key at all: a flat table would have made "this review's
+ * events" and "the deployment's events" the same rows, and every assertion
+ * below about isolation would have been asserting about a table that no longer
+ * has that shape. */
+async function seedLog(db: D1Database, logKey: string = LOG_KEY, prefix = "th-seed"): Promise<void> {
+  await seedLogEvents(db, logKey, 4, { prefix, from: 1, body: SEED_BODY });
+  // The GAP is the fixture: seqs 1, 2, 3 and 7, because ADR-0006 blesses gaps
+  // in a D1-backed store and a hosted read that renumbered 7 to 4 would be wrong
+  // in a way a contiguous fixture cannot detect. The #76 review found exactly
+  // that bug through this seed.
+  await db
+    .prepare("DELETE FROM review_logs WHERE log_key = ? AND seq BETWEEN 4 AND 6")
+    .bind(logKey)
+    .run();
+  await seedLogEvents(db, logKey, 1, { prefix, from: 7, body: SEED_BODY });
 }
 
 const VERBS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
 
+/**
+ * The probe set for the route-table invariants, DERIVED from the grammar rather
+ * than written out.
+ *
+ * **This replaces a hand-written `probes` array whose comment claimed to be
+ * "an exhaustive expectation, not a sample".** It was exhaustive *over the list*,
+ * and the list was the weak part: a new `RouteKind` that is gated, names no
+ * scope and carries `guestScopeExempt: true` was not in any list, so the
+ * invariant meant to defend against exactly that produced 0 red. `tsc` is no
+ * backstop either — the field is required, so a new arm compiles, and every
+ * `switch` over `RouteKind` has a `default`.
+ *
+ * So the set is the PRODUCT of the grammar: repository shapes × PR spellings ×
+ * path suffixes × verbs. A spelling nobody thought of is now covered because it
+ * is generated, and the shapes are the ones the grammar itself distinguishes —
+ * including the ones it REFUSES (`api`, `_revkit`, `pr-0`, `pr-07`), which is
+ * where the near-miss classifications live.
+ *
+ * The product is asserted non-trivial below, so a generator that silently
+ * returned one path could not make these invariants pass over nothing.
+ */
+const REPO_SHAPES = [
+  "revkit",
+  "vig-os.revkit",
+  "other-repo",
+  "a",
+  "API", // the reserved segment, in the case a caller would try
+  "_revkit",
+  "-leading-dash",
+  "with space",
+  "x".repeat(120), // over the 100-char segment cap
+] as const;
+
+const PR_SHAPES = ["pr-7", "pr-42", "pr-1", "pr-0", "pr-07", "pr-999999999", "pr-1e3", "notapr"] as const;
+
+const PATH_SUFFIXES = [
+  "", // the bare scope path — a preview
+  "/",
+  "/index.html",
+  SCOPED_THREADS_SUFFIX,
+  `${SCOPED_THREADS_SUFFIX}/`,
+  "/docs/api/threads", // a built site that happens to end in the API suffix
+  "/a/b/c",
+] as const;
+
+/**
+ * Every `(pathname, verb)` the preview grammar can produce — 9 × 8 × 7 × 7.
+ *
+ * `classifyRoute` is a pure function of `(pathname, method)`, so the whole
+ * product is cheap; the count is asserted so a generator that returned one path
+ * could not make the invariants below pass over nothing.
+ */
+const DERIVED_PROBES: readonly (readonly [string, string])[] = REPO_SHAPES.flatMap((repo) =>
+  PR_SHAPES.flatMap((pr) =>
+    PATH_SUFFIXES.flatMap((suffix) => VERBS.map((verb) => [`/${repo}/${pr}${suffix}`, verb] as const)),
+  ),
+);
+
+/** The paths that are NOT `<repo>/pr-<n>/…` — the fixed half of the surface,
+ * which no product generates because they are exact paths, not grammar. */
+const FIXED_PATHS = [
+  HEALTH_PATH,
+  SESSION_REFRESH_PATH,
+  "/invite/redeem",
+  "/invite/abc",
+  "/invite/",
+  "/_revkit/0.0.0/rail.js",
+  "/_revkit",
+  REMOVED_THREADS_PATH,
+  `${REMOVED_THREADS_PATH}/`,
+  "/api/threads.json",
+  "/API/threads",
+  "/api//threads",
+  "/api/session/refresh/",
+  "/",
+  "//",
+  "/nope",
+] as const;
+
+/** The whole probe set: the derived product plus the fixed paths, every verb. */
+const ALL_PROBES: readonly (readonly [string, string])[] = [
+  ...DERIVED_PROBES,
+  ...FIXED_PATHS.flatMap((pathname) => VERBS.map((verb) => [pathname, verb] as const)),
+];
+
 /** Paths the surface answers, plus the alias spellings that must NOT be one. */
+/**
+ * The kinds this file's expectations are written against.
+ *
+ * **`GATED_ROUTE_KINDS` from `src/authz.ts` is the source of truth, not a copy.**
+ * It used to be a hand-written `Set` here, which is the review's complaint in
+ * miniature: two lists of the same fact, one of them checked and one of them
+ * load-bearing. Now there is one declaration, `authz.ts` proves at COMPILE time
+ * that its two sides partition `RouteKind` (so `tsc` is the backstop the
+ * `default:` arms defeat), and the cases below verify that declaration against
+ * BEHAVIOUR over the derived probe product — which is what catches a declared
+ * partition that does not describe the code.
+ */
+const HANDLED_GATED_KINDS: ReadonlySet<RouteKind> = new Set<RouteKind>([
+  ...GATED_ROUTE_KINDS,
+  ...BOTH_SIDES_ROUTE_KINDS,
+]);
+
 const GATED_PATHS = [THREADS_PATH, SESSION_REFRESH_PATH, "/revkit/pr-7/index.html"] as const;
-const UNGATED_PATHS = [HEALTH_PATH, "/_revkit/0.0.0/rail.js", "/nope", `${THREADS_PATH}/`] as const;
+// The REMOVED unscoped read replaced the trailing-slash spelling slice 2 used
+// to probe with: `/api/threads/` is no longer "a near miss of the read" but an
+// unrecognised path, and `/revkit/pr-7/api/threads/` — which IS a preview path —
+// is gated, so it cannot stand in for an ungated probe.
+const UNGATED_PATHS = [HEALTH_PATH, "/_revkit/0.0.0/rail.js", "/nope", REMOVED_THREADS_PATH] as const;
 
 /** What `harness.dispatch` actually resolves to. Not the DOM `Response`: bun's
  * and `@cloudflare/workers-types`' declarations of that type disagree (one has
@@ -158,8 +286,32 @@ describe("ADR-0012's per-request gate", () => {
     await harness.dispose();
   });
 
-  beforeEach(async () => {
+  /**
+   * The seeded log is created ONCE, not per test — and that is a change with a
+   * measurement behind it.
+   *
+   * This `beforeEach` used to re-seed it, which is six D1 round trips (one
+   * `DELETE`, four `INSERT`s, one session wipe) before each of ~48 cases, all
+   * inside bun's 5 s per-hook timeout, with eleven test files' workerd
+   * instances competing for the same host. It was the single most reliable
+   * failure in the file and it is STILL the most reliable failure here at the
+   * base commit — measured: four consecutive `bun test` runs at `5cb60a9d`,
+   * three of them failing this hook. Slice 5 does not get to fix that by
+   * raising a timeout, so it fixed it by not doing the work 48 times.
+   *
+   * It is sound because **no case in this file writes to `review_logs`** — the
+   * one case that adds a second review's log (the `?scope=`-parameter case)
+   * adds its OWN key, and it deletes that key afterwards. And every refusal
+   * assertion in this file is read-only, so there is nothing to roll back.
+   */
+  beforeAll(async () => {
+    await harness.db.prepare("DELETE FROM review_logs").run();
     await seedLog(harness.db);
+  });
+
+  beforeEach(async () => {
+    // Sessions ARE mutated: `POST /api/session/refresh` rotates the caller's row
+    // and a forged-cookie case issues one, so this wipe stays per-test.
     await harness.db.prepare("DELETE FROM sessions").run();
   });
 
@@ -190,7 +342,15 @@ describe("ADR-0012's per-request gate", () => {
         ["/revkit/pr-7/index.html GET"]: "preview",
         ["/revkit/pr-7/index.html POST"]: "preview",
         ["/_revkit/0.0.0/rail.js GET"]: "revkit-bundle",
-        [`${THREADS_PATH}/ GET`]: "unknown",
+        ["/revkit/pr-7/api/threads GET"]: "threads-read",
+        ["/revkit/pr-7/api/threads POST"]: "threads-append",
+        ["/revkit/pr-7/api/threads PUT"]: "method-not-allowed",
+        ["/revkit/pr-7/docs/api/threads GET"]: "preview",
+        ["/revkit/pr-7/api/threads/ GET"]: "preview",
+        ["/revkit/pr-8/api/threads GET"]: "threads-read",
+        ["/other-repo/pr-7/api/threads GET"]: "threads-read",
+        [`${REMOVED_THREADS_PATH} GET`]: "unknown",
+        [`${REMOVED_THREADS_PATH} POST`]: "unknown",
         ["/nope GET"]: "unknown",
         ["/nope POST"]: "unknown",
       };
@@ -215,56 +375,24 @@ describe("ADR-0012's per-request gate", () => {
       // depending on which path produced it — which is itself the reason the
       // gate consults `requiresSession` rather than the kind.
       const isGatedPath = (pathname: string): boolean =>
-        pathname === THREADS_PATH || pathname === SESSION_REFRESH_PATH || parsePreviewPath(pathname) !== undefined;
-      const probes = [
-        ...GATED_PATHS,
-        ...UNGATED_PATHS,
-        "/",
-        "//",
-        "/api",
-        "/api/",
-        "/api/threads.json",
-        "/api/session",
-        "/api/session/",
-        "/revkit/pr-0/",
-        "/revkit/pr-7",
-        "/_revkit",
-        "/_revkit/",
-        "/not-a-preview/pr-7/",
-      ];
-      for (const pathname of probes) {
-        for (const method of VERBS) {
-          expect(classifyRoute(pathname, method).requiresSession, `${pathname} ${method}`).toBe(isGatedPath(pathname));
-        }
+        pathname === SESSION_REFRESH_PATH ||
+        parseScopedThreadsPath(pathname) !== undefined ||
+        parsePreviewPath(pathname) !== undefined;
+      // Over the DERIVED product. The hand-written list this replaced was
+      // exhaustive only over itself, which is how a ninth gated kind escaped a
+      // case named for the invariant that forbids one.
+      for (const [pathname, method] of ALL_PROBES) {
+        expect(classifyRoute(pathname, method).requiresSession, `${pathname} ${method}`).toBe(isGatedPath(pathname));
       }
-      // And the kind-level cross-check, in the direction that can actually
-      // fail: a route that requires a session is answered by
-      // `handleAuthorized`, and every kind that handler switches over is one
-      // `requiresSession` can be true for. A fifth gated kind without a
-      // handler would reach `unreachable()` and 500.
-      const HANDLED_GATED_KINDS: ReadonlySet<RouteKind> = new Set<RouteKind>([
-        "method-not-allowed",
-        "threads-read",
-        "threads-append",
-        "session-refresh",
-        "preview",
-      ]);
-      for (const pathname of probes) {
-        for (const method of VERBS) {
-          const route = classifyRoute(pathname, method);
-          if (route.requiresSession) {
-            expect(HANDLED_GATED_KINDS.has(route.kind), `${pathname} ${method} is ${route.kind}`).toBe(true);
-          }
-        }
-      }
-      // And the reverse: a handler that exists is reachable, or its route can
-      // never satisfy `requiresSession` and the handler is dead code.
-      for (const pathname of probes) {
-        for (const method of VERBS) {
-          const route = classifyRoute(pathname, method);
-          if (HANDLED_GATED_KINDS.has(route.kind)) {
-            expect(route.requiresSession || route.kind === "method-not-allowed", `${pathname} ${method}`).toBe(true);
-          }
+      // The kind-level cross-check now runs over the DERIVED product, and its
+      // converse lives in its own case ("HANDLED_GATED_KINDS is exactly the set of
+      // kinds reachable with requiresSession") so a missing handler `case` — the
+      // direction that reaches `unreachable()` and a 500 — has a case of its own
+      // rather than being folded into a test named for something else.
+      for (const [pathname, method] of ALL_PROBES) {
+        const route = classifyRoute(pathname, method);
+        if (route.requiresSession) {
+          expect(HANDLED_GATED_KINDS.has(route.kind), `${pathname} ${method} is ${route.kind}`).toBe(true);
         }
       }
     });
@@ -275,6 +403,247 @@ describe("ADR-0012's per-request gate", () => {
       const route = classifyRoute("/revkit/pr-7/index.html", "GET");
       expect(route.requiresSession).toBe(true);
       expect(route.stateChanging).toBe(false);
+    });
+
+    // ── slice 5: the scope invariant, and the read it moved ───────────────
+    test("every gated route either names a scope or is the ONE exempt classification", () => {
+      // **This is the invariant `invite-scope-unbounded` defends.** The gate
+      // refuses a guest on a gated route that names no scope, so a route table
+      // with a gated, unscoped, non-exempt arm would be a guest reading
+      // something whose review it never named.
+      //
+      // **Over the DERIVED product, not a written-out list.** A new `RouteKind`
+      // that is gated, names no scope and sets `guestScopeExempt: true` was in no
+      // hand-written list, so this case produced 0 red for exactly the shape it
+      // exists to catch. The product covers the spellings nobody thought of
+      // because it generates them.
+      //
+      // Three assertions, in the order that can fail: the set is non-trivial, the
+      // invariant holds, and the set is not vacuous — it must actually CONTAIN a
+      // gated scoped route and a gated exempt one, or "every gated route names a
+      // scope" would be true of an empty set.
+      expect(DERIVED_PROBES.length).toBeGreaterThan(3000);
+      expect(ALL_PROBES.length).toBeGreaterThan(DERIVED_PROBES.length);
+      let gatedScoped = 0;
+      let gatedExempt = 0;
+      for (const [pathname, method] of ALL_PROBES) {
+        const route = classifyRoute(pathname, method);
+        if (!route.requiresSession) continue;
+        const label = `${pathname} ${method} is ${route.kind}`;
+        if (route.scope !== undefined) {
+          gatedScoped += 1;
+          // A scope must be INTERNAL: a present-but-empty scope would pass a
+          // truthiness check and select nothing, which is the defect again.
+          expect(route.scope.repo.length, label).toBeGreaterThan(0);
+          expect(route.scope.pr, label).toBeGreaterThan(0);
+          expect(route.scope.logKey, label).toBe(`/${route.scope.repo}/pr-${String(route.scope.pr)}`);
+        } else if (route.guestScopeExempt) {
+          gatedExempt += 1;
+        } else {
+          expect(false, `${label} is gated, names no scope, and is not exempt`).toBe(true);
+        }
+      }
+      // Non-vacuity: the product really does reach both halves.
+      expect(gatedScoped).toBeGreaterThan(100);
+      expect(gatedExempt).toBeGreaterThan(1);
+    });
+
+    test("exactly ONE arm in `classifyPath` may pass `guestScopeExempt: true`", () => {
+      // **The half of H3 the derived product cannot reach.** The probes iterate
+      // *classifications of grammar-shaped paths*, so a new HARD-CODED path arm is
+      // invisible to them however it is spelled. Measured on this branch: adding
+      // `/rogue` — gated, no scope, `guestScopeExempt: true`, i.e. the shape the
+      // hand-written probe list missed — left the suite **green**.
+      //
+      // The derivation cannot enumerate a function's domain, so this asserts over
+      // the arms themselves: the flag is set in exactly one place, and that place
+      // is the session refresh. It is a one-token, whole-file scan of a small
+      // closed region, and it is the only assertion here that does not depend on
+      // knowing the paths in advance — which is what makes it the one that catches
+      // a path nobody has heard of.
+      //
+      // The BEHAVIOURAL consequence is proved separately, over HTTP, by the
+      // `invite-scope-unbounded` case in `test/invites.test.ts`; this is the
+      // structural claim underneath it.
+      const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
+      // Strings KEPT here: the arms are identified by their `kind`, which is a
+      // string literal, and this check is about WHICH arm — not about identifiers.
+      const code = stripTsComments(readFileSync(join(srcDir, "authz.ts"), "utf8"), { strings: true });
+      const arms = [...code.matchAll(/guestScopeExempt:\s*(true|false)/g)];
+      // EXACTLY ONE occurrence in the whole module, and it is `true`. The
+      // `path()` helper's default is spelled `?? false` rather than
+      // `guestScopeExempt: false`, so it does not match — and it is asserted
+      // separately below so the default cannot be flipped either.
+      expect(arms).toHaveLength(1);
+      expect(arms[0]?.[1]).toBe("true");
+      // And it is inside the `session-refresh` arm — checked by SLICE rather than
+      // a brace-balanced regex, because a regex that has to match an object's
+      // closing brace is a regex that breaks when the object is reformatted, and
+      // this test must not be the thing that makes an arm hard to edit.
+      const at = arms[0]?.index ?? -1;
+      expect(at).toBeGreaterThan(0);
+      const around = code.slice(Math.max(0, at - 200), at + 200);
+      expect(around).toContain('kind: "session-refresh"');
+      // The default stays FAIL-CLOSED, which is what makes a new arm safe by
+      // default rather than by remembering: a flipped `?? true` is 0 red below,
+      // so it is asserted here directly.
+      expect(code).toContain("guestScopeExempt: arm.guestScopeExempt ?? false");
+      expect(code).toContain("requiresSession: arm.requiresSession ?? true");
+    });
+
+    test("every DECLARED RouteKind is PRODUCIBLE, and every produced kind is declared", () => {
+      // **The other half of H3, and the one that was silently open.** The probes
+      // iterate *classifications*, so a kind added to the union and never wired
+      // into `classifyPath` is invisible to them: measured on this branch, a tenth
+      // `RouteKind` — gated, no scope, `guestScopeExempt: true` — produced
+      // **0 red across 53 cases**. `ROUTE_KINDS` exists so the declared set is a
+      // runtime value and can be compared against what the classifier emits.
+      //
+      // Both directions, because either half alone is satisfiable by a lie: a
+      // declared-but-unproducible kind is dead code nobody tests, and a
+      // produced-but-undeclared kind cannot typecheck but shows the table and the
+      // array disagreeing about the grammar.
+      const produced = new Set<RouteKind>();
+      for (const [pathname, method] of ALL_PROBES) produced.add(classifyRoute(pathname, method).kind);
+      expect(produced.size).toBeGreaterThan(5);
+      for (const kind of ROUTE_KINDS) {
+        expect(produced.has(kind), `${kind} is declared in ROUTE_KINDS but classifyRoute never produces it`).toBe(true);
+      }
+      for (const kind of produced) {
+        expect((ROUTE_KINDS as readonly string[]).includes(kind), `${kind} is produced but not declared`).toBe(true);
+      }
+      // Stated as a set, so a reordering cannot fail here — the dispatcher's
+      // reading order is pinned by the classification table instead.
+      expect([...ROUTE_KINDS].sort()).toEqual([...produced].sort());
+      // And every one of them is named by the gate's own log-event mapping or by
+      // the dispatchers, which is what makes a declared kind a real one.
+      expect(ROUTE_KINDS.length).toBe(10);
+    });
+
+    test("the DECLARED partition matches BEHAVIOUR: gated, ungated, and both-sides", () => {
+      // The compile-time half lives in `src/authz.ts` (`GatedIsTotal` /
+      // `UngatedIsTotal` / `ListsAreDisjoint`), and it fires — measured: declaring
+      // an eleventh `RouteKind` produces `tsc` errors naming the unaccounted
+      // members. This is the other half, because a partition can be type-correct
+      // and still not describe the code: a kind listed as gated that nothing
+      // classifies as gated is a dispatcher `case` for a route that cannot exist.
+      //
+      // So the declared sets are compared against what the DERIVED product
+      // actually produces. **`method-not-allowed` is expected on BOTH sides** —
+      // it inherits `requiresSession` from the path whose verb was wrong, so a
+      // two-sided partition would have had to lie about one of its two cases.
+      const gated = new Set<RouteKind>();
+      const ungated = new Set<RouteKind>();
+      for (const [pathname, method] of ALL_PROBES) {
+        const route = classifyRoute(pathname, method);
+        (route.requiresSession ? gated : ungated).add(route.kind);
+      }
+      expect([...gated].sort()).toEqual([...HANDLED_GATED_KINDS].sort());
+      expect([...ungated].sort()).toEqual([...UNGATED_ROUTE_KINDS, ...BOTH_SIDES_ROUTE_KINDS].sort());
+      // And `method-not-allowed` really is produced on both sides, so the
+      // three-way partition is describing the code rather than accommodating it.
+      expect(gated.has("method-not-allowed")).toBe(true);
+      expect(ungated.has("method-not-allowed")).toBe(true);
+      // The three lists partition `RouteKind`, disjointly.
+      const declared: RouteKind[] = [...GATED_ROUTE_KINDS, ...UNGATED_ROUTE_KINDS, ...BOTH_SIDES_ROUTE_KINDS];
+      expect(declared.sort()).toEqual([...ROUTE_KINDS].sort());
+      expect(new Set(declared).size).toBe(declared.length);
+    });
+
+    test("HANDLED_GATED_KINDS is exactly the set of kinds reachable with requiresSession", () => {
+      // The second half of the same hole. `handleAuthorized` switches over the
+      // gated kinds and throws `unreachable()` on anything else, so a NEW gated
+      // kind that no handler case covers answers **500** at runtime — and every
+      // `switch` over `RouteKind` has a `default`, so `tsc` cannot catch it. The
+      // old check asserted each handled kind was reachable; it did NOT assert the
+      // converse, which is the direction that finds a missing `case`.
+      const reachable = new Set<RouteKind>();
+      for (const [pathname, method] of ALL_PROBES) {
+        const route = classifyRoute(pathname, method);
+        if (route.requiresSession) reachable.add(route.kind);
+      }
+      expect(reachable.size).toBeGreaterThan(3);
+      // The converse, which is what was missing: nothing gated is unhandled.
+      for (const kind of reachable) {
+        expect(HANDLED_GATED_KINDS.has(kind), `${kind} is gated but handleAuthorized has no case`).toBe(true);
+      }
+      // And nothing is handled that cannot be gated, or its case is dead code.
+      for (const kind of HANDLED_GATED_KINDS) {
+        expect(reachable.has(kind), `${kind} has a handler but is never gated`).toBe(true);
+      }
+      // Spelled out, so a new kind has to be added in two places on purpose.
+      expect([...reachable].sort()).toEqual([...HANDLED_GATED_KINDS].sort());
+    });
+
+    test("guestScopeExempt is a property of exactly ONE path, and only that path's", () => {
+      // A SECOND exempt path would be a second hole, and nobody would notice it
+      // being added — so the set is pinned here rather than left to review.
+      // The one that exists is `/api/session/refresh`, which rotates the
+      // caller's own credential and names no review because it is not about one.
+      //
+      // It is asserted as a property of the PATH, so every classification of
+      // that path carries it — including the wrong verbs, which inherit it
+      // precisely because a wrong verb on the session route is still the session
+      // route and must still answer 405 to a guest rather than a misleading
+      // `invite-scope-unbounded`.
+      // Over the derived product: a new exempt PATH is caught here whatever its
+      // shape, which a written-out list could not do.
+      const exemptPaths = new Set<string>();
+      for (const [pathname, method] of ALL_PROBES) {
+        if (classifyRoute(pathname, method).guestScopeExempt) exemptPaths.add(pathname);
+      }
+      expect([...exemptPaths]).toEqual([SESSION_REFRESH_PATH]);
+      // And nothing on the review surface is exempt, on any verb, whatever the
+      // wrong verb does to the kind — asserted over the product rather than four
+      // paths, so a new preview-shaped route cannot slip in.
+      let reviewSurfaceExempt = 0;
+      for (const [pathname, method] of ALL_PROBES) {
+        if (!pathname.startsWith("/") || pathname === SESSION_REFRESH_PATH) continue;
+        const route = classifyRoute(pathname, method);
+        // The invite routes and `/healthz` are ungated, so "exempt" is meaningless
+        // there; the claim is about GATED routes only.
+        if (!route.requiresSession) continue;
+        if (route.guestScopeExempt) reviewSurfaceExempt += 1;
+      }
+      expect(reviewSurfaceExempt).toBe(0);
+    });
+
+    test("the read is scoped to ONE review, and the removed unscoped read is not a route", () => {
+      // `GET /api/threads` named no repository, so it could only ever answer
+      // org-wide — and ADR-0012's per-call scope check has nothing to select on
+      // when a route names nothing. The scope moved INTO the path, and the old
+      // spelling is now `unknown` for every verb: not a 403, not a 405, not a
+      // gated 501. A path that is not a route cannot leak a review, so there
+      // was no reason to leave it gated.
+      for (const method of VERBS) {
+        expect(classifyRoute(REMOVED_THREADS_PATH, method).kind, method).toBe("unknown");
+        expect(classifyRoute(REMOVED_THREADS_PATH, method).requiresSession, method).toBe(false);
+      }
+      // And the one that replaced it names its review, on both the read and the
+      // write arm, with the log key derived by the same grammar.
+      for (const method of ["GET", "HEAD", "POST", "PUT"] as const) {
+        expect(classifyRoute(THREADS_PATH, method).scope, method).toEqual({
+          repo: REVIEW.repo,
+          pr: REVIEW.pr,
+          logKey: LOG_KEY,
+        });
+      }
+    });
+
+    test("the scope is a function of the PATH and of nothing a caller can set", () => {
+      // The three spellings a caller would reach for if the scope were a
+      // parameter. They are refused by `parseThreadsQuery`, so the log key is
+      // not attacker-chosen — and this also pins that the two spellings of a
+      // scope that ARE in the path cannot be mixed: `pr-07` is not `pr-7`.
+      for (const [pathname, expected] of [
+        ["/revkit/pr-7/api/threads", { repo: "revkit", pr: 7 }],
+        ["/revkit/pr-08/api/threads", undefined],
+        ["/other-repo/pr-7/api/threads", { repo: "other-repo", pr: 7 }],
+        ["/api/threads", undefined],
+      ] as const) {
+        const scope = classifyRoute(pathname, "GET").scope;
+        expect(scope === undefined ? undefined : { repo: scope.repo, pr: scope.pr }, pathname).toEqual(expected);
+      }
     });
 
     test("only the two state-changing routes carry the CSRF obligation", () => {
@@ -317,6 +686,7 @@ describe("ADR-0012's per-request gate", () => {
         "invite-read-only",
         "invite-revoked",
         "invite-scope-mismatch",
+        "invite-scope-unbounded",
         "malformed-session-cookie",
         "no-session-cookie",
         // Default JS string order: "unknown-s" < "unrecognised" because `k` <
@@ -559,7 +929,14 @@ describe("ADR-0012's per-request gate", () => {
         const known = await harness.dispatch(`http://localhost${alias}`, {
           headers: { cookie: cookieHeader(issued.sessionId) },
         });
-        expect([200, 404], alias).toContain(known.status);
+        // 200, 404, or 501 — and 501 is the honest answer for the two
+        // spellings that are still PREVIEW paths (`<repo>/pr-<n>/api/threads/`
+        // and the `%20` variant): slice 5 moved the read out of the preview's
+        // own path space, so those resolve to the R2 preview route, which is
+        // gated and not yet served. None of the three carries review content,
+        // and none is a refusal — which is what proves the anonymous 401 above
+        // was the GATE and not the router.
+        expect([200, 404, 501], alias).toContain(known.status);
       }
     });
 
@@ -598,7 +975,10 @@ describe("ADR-0012's per-request gate", () => {
     });
 
     test("the ungated 404 and the bundle 404 leak nothing either", async () => {
-      for (const pathname of ["/nope", "/_revkit/0.0.0/rail.js", `${THREADS_PATH}/`]) {
+      // The REMOVED unscoped read is here rather than a near-miss spelling of
+      // the new one: `/revkit/pr-7/api/threads/` is a preview path (gated, 501)
+      // and cannot stand in for an ungated 404.
+      for (const pathname of ["/nope", "/_revkit/0.0.0/rail.js", REMOVED_THREADS_PATH, `${REMOVED_THREADS_PATH}/`]) {
         const refusal = await refusalOf(await harness.dispatch(`http://localhost${pathname}`));
         expect(refusal.status).toBe(404);
         expect(refusal.raw).not.toContain(SEED_BODY);
@@ -609,7 +989,7 @@ describe("ADR-0012's per-request gate", () => {
 
   // ── 3. the gate admits ─────────────────────────────────────────────────
   describe("a session this build issued is admitted", () => {
-    test("GET /api/threads answers 200 with the projection, and only with a session", async () => {
+    test("the scoped read answers 200 with the projection, and only with a session", async () => {
       const issued = await issueTestSession(harness.db);
       const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
         headers: { cookie: cookieHeader(issued.sessionId) },
@@ -997,10 +1377,312 @@ describe("ADR-0012's per-request gate", () => {
       }
     });
 
+    test("?repo=, ?scope= and ?log_key= are REFUSED — the scope is in the path, not in a parameter", async () => {
+      // The spellings a caller would reach for if the scope were a query
+      // parameter, and the reason `parseThreadsQuery`'s unknown-parameter
+      // refusal became load-bearing in slice 5 rather than prophylactic. If any
+      // of these were accepted-and-ignored, a client could be told nothing and
+      // ship believing it was scoped when it was not; if any were honoured, a
+      // caller would be able to CHOOSE which review's log it reads.
+      const issued = await issueTestSession(harness.db);
+      for (const query of ["?repo=other-repo", "?scope=admin", "?log_key=/other-repo/pr-7", "?pr=9", "?scope="]) {
+        const response = await harness.dispatch(`http://localhost${THREADS_PATH}${query}`, {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        expect(response.status, query).toBe(400);
+        const body = JSON.parse(await response.text()) as { reason: string; parameter: string };
+        expect(body.reason, query).toBe("unknown-parameter");
+        // The NAME is echoed; the value never is. A reflected value in a body
+        // is a reflected-XSS vector the moment anything renders it.
+        expect(body.parameter, query).not.toContain("/");
+        expect(body.parameter, query).toMatch(/^[A-Za-z][A-Za-z0-9_-]*$/);
+      }
+    });
+
+    test("the query is validated BEFORE a log key is chosen, so no parameter can name a log", async () => {
+      // **This case exists because a mutant survived, and its scope is what
+      // makes it interesting.** Reading the log key as
+      // `url.searchParams.get("log_key") ?? route.scope?.logKey` leaves the suite
+      // fully green — in BOTH statement orders — because `parseThreadsQuery` is
+      // TOTAL over the parameter set: a query naming a log is refused above, and
+      // an accepted query has no `log_key` for the fallback to read. The mutant
+      // is equivalent, not merely uncovered (see `readThreads`).
+      //
+      // What is NOT guaranteed by that argument is the parser staying total, and
+      // that is what this case pins: a caller-supplied key is refused with the
+      // generic reason, and the named log's `head` and events are absent from
+      // the answer rather than merely alongside a 400. Two reviews with
+      // DIFFERENT heads, so a key honoured anywhere in this handler would be
+      // visible in the body.
+      // `beforeAll` seeded THIS review's log; add a second one whose threads
+      // and `head` are distinguishable from it.
+      // `try`/`finally` because this file's fixture is seeded ONCE in `beforeAll`
+      // and the SECOND key is this case's to clean up. Without it, an assertion
+      // failing above leaks `/revkit/pr-99` into every later case and the next
+      // `seedLog` dies with `UNIQUE constraint failed: review_logs.log_key,
+      // review_logs.seq` — a cascade that hides the real failure. Its sibling case
+      // below already used `finally`; this one did not, and now does.
+      const otherKey = previewScopePath(REVIEW.repo, 99);
+      try {
+        await seedLog(harness.db, otherKey, "th-other");
+        const issued = await issueTestSession(harness.db);
+        const response = await harness.dispatch(
+          `http://localhost${THREADS_PATH}?log_key=${encodeURIComponent(otherKey)}`,
+          { headers: { cookie: cookieHeader(issued.sessionId) } },
+        );
+        expect(response.status).toBe(400);
+        const raw = await response.text();
+        expect(JSON.parse(raw) as Record<string, unknown>).toMatchObject({
+          error: "bad-request",
+          reason: "unknown-parameter",
+          parameter: "log_key",
+        });
+        // Neither log's head appears, and no event does. A key honoured anywhere
+        // in this handler would put one of these two numbers in the body.
+        expect(raw).not.toContain("th-other");
+        expect(raw).not.toContain("th-seed");
+        expect(raw).not.toContain(`"head"`);
+        // And the same request WITHOUT the parameter reads this review normally,
+        // so the refusal above is about the parameter and nothing else.
+        const clean = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        expect(clean.status).toBe(200);
+        expect(JSON.parse(await clean.text()) as { head: number }).toMatchObject({ head: 7 });
+      } finally {
+        await harness.db
+          .prepare("DELETE FROM review_logs WHERE log_key = ?")
+          .bind(otherKey)
+          .run();
+      }
+    });
+
+    test("a scope parameter cannot move the read to another review's log", async () => {
+      // The same refusals from the other end: TWO reviews, both populated, and
+      // no spelling of a query string that reaches the wrong one. With the scope
+      // in the path the only way to name a review is to BE at its URL — so this
+      // asserts both halves: the parameterised spellings are 400s, and the bare
+      // spelling reads THIS review and not the other.
+      // `beforeEach` has already seeded THIS review's log; add the second one.
+      const otherKey = previewScopePath(REVIEW.repo, 99);
+      await seedLog(harness.db, otherKey, "th-other");
+      try {
+        await scopeParameterAssertions(otherKey, await issueTestSession(harness.db));
+      } finally {
+        // Its own key only — `beforeAll` owns this review's log and the rest of
+        // the file reads it.
+        await harness.db
+          .prepare("DELETE FROM review_logs WHERE log_key = ?")
+          .bind(otherKey)
+          .run();
+      }
+    });
+
+    /** The body of the case above, factored so the `try`/`finally` above can
+     * wrap it without a nested closure in every assertion. */
+    async function scopeParameterAssertions(otherKey: string, issued: { sessionId: string }): Promise<void> {
+      const read = async (pathname: string): Promise<{ status: number; raw: string }> => {
+        const response = await harness.dispatch(`http://localhost${pathname}`, {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        return { status: response.status, raw: await response.text() };
+      };
+      for (const query of ["?repo=revkit&pr=99", "?log_key=/revkit/pr-99", "?scope=/revkit/pr-99"]) {
+        expect((await read(`${THREADS_PATH}${query}`)).status, query).toBe(400);
+      }
+      const mine = await read(THREADS_PATH);
+      expect(mine.status).toBe(200);
+      expect(mine.raw).toContain("th-seed-1");
+      expect(mine.raw).not.toContain("th-other");
+      // The other review's own URL reads the other log, and only that one.
+      const theirs = await read(scopedThreadsPath(REVIEW.repo, 99));
+      expect(theirs.status).toBe(200);
+      expect(theirs.raw).toContain("th-other-1");
+      expect(theirs.raw).not.toContain("th-seed");
+      // `head` is per log, and both logs are four events long with a gap — so
+      // the two reads agree on `head` here and that is the POINT: a shared
+      // `head` would be a shared counter. Asserting it separately below keeps
+      // this case about content.
+      expect(JSON.parse(mine.raw) as { head: number }).toMatchObject({ head: 7 });
+      expect(JSON.parse(theirs.raw) as { head: number }).toMatchObject({ head: 7 });
+    }
+
+    // ── H2: the log key is STRUCTURAL, and that is asserted, not asserted-to ──
+    test("MUTATION GUARD: a header-SUPPLIED log key handed to the store DOES cross reviews — so the store is not the control", async () => {
+      // **The forbidden shape, executed.** `d1-store.test.ts`'s A10 guard runs the
+      // naive allocator that A10 forbids and asserts it collides, so a passing A10
+      // is a real result. This is the same discipline for the scope axis, and it
+      // is the case that makes the rest of H2 non-vacuous.
+      //
+      // The fact it establishes: `D1ThreadStore` does exactly what it is told. A
+      // log key read out of a caller-supplied header, handed straight to the
+      // constructor, returns ANOTHER REVIEW'S THREADS — no refusal, no warning,
+      // 200-shaped data. So the partition is faithful and the store is not a
+      // boundary; **the only control is that nothing caller-influenceable ever
+      // becomes a log key**, and that is a property of the HANDLER, not of the
+      // store. The review found the same thing by mutating `src/index.ts` to
+      // `request.headers.get("x-revkit-log-key") ?? route.scope?.logKey` and
+      // getting `200 {"head":1,"threads":[{ … "THEIRS-ONLY-MARKER" … }]}`.
+      const otherKey = previewScopePath(REVIEW.repo, 99);
+      await seedLog(harness.db, otherKey, "theirs");
+      try {
+        // Read the key out of a header, exactly as the mutant did.
+        const fromHeader = new Headers({ "x-revkit-log-key": otherKey }).get("x-revkit-log-key");
+        expect(fromHeader).toBe(otherKey);
+        const crossed = new D1ThreadStore({ db: harness.db, logKey: fromHeader ?? LOG_KEY });
+        // It really does cross: another review's threads, in full.
+        expect((await crossed.threads()).map((t) => t.id)).toEqual(["theirs-1", "theirs-2", "theirs-3", "theirs-7"]);
+        expect((await crossed.since(0)).length).toBe(4);
+        expect(await crossed.head()).toBe(7);
+        // And the faithful store, pointed at THIS review, does not — so the two
+        // differ ONLY by the key, which is the whole claim.
+        const faithful = new D1ThreadStore({ db: harness.db, logKey: LOG_KEY });
+        expect((await faithful.threads()).map((t) => t.id)).toEqual(["th-seed-1", "th-seed-2", "th-seed-3", "th-seed-7"]);
+      } finally {
+        await harness.db.prepare("DELETE FROM review_logs WHERE log_key = ?").bind(otherKey).run();
+      }
+    });
+
+    test("MUTATION GUARD: `readThreads` cannot see the request at all, so no header can become a log key", async () => {
+      // **The structural half of H2, and the reason the case above matters.**
+      // The behavioural battery that follows proves headers are ignored; on its
+      // own that is unfalsifiable, because "ignored" and "not readable" look the
+      // same from outside. This asserts the property directly, over the shipped
+      // source, in the same idiom as `schema.test.ts`'s scan for the retired
+      // `events` table.
+      //
+      // The claim: inside `readThreads`, the binding that names the log is derived
+      // from `route` — and the function has no access to `request`, `env`, or the
+      // URL's query, so there is nothing for a caller to influence. The reviewer's
+      // mutant had to *add* `request` to reach a header; this fails if anyone
+      // does.
+      const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
+      const index = readFileSync(join(srcDir, "index.ts"), "utf8");
+      const start = index.indexOf("async function readThreads(");
+      expect(start, "readThreads is declared").toBeGreaterThan(-1);
+      // The whole declaration, up to its closing brace at column 0.
+      const body = stripTsComments(index.slice(start, index.indexOf("\n}\n", start) + 3));
+      expect(body.length).toBeGreaterThan(200);
+
+      // 1. Its PARAMETER NAMES are exactly the five it is called with — no
+      //    `request`, which is what the review's mutant had to add.
+      const params = /async function readThreads\(([\s\S]*?)\): Promise<Response> \{/.exec(body)?.[1] ?? "";
+      const names = params
+        .split(",")
+        .map((one) => (one.split(":")[0] ?? "").trim())
+        .filter((one) => one.length > 0);
+      expect(names).toEqual(["authorized", "env", "scope", "url", "route"]);
+
+      // 2. Comments are stripped before the scan, and that is deliberate: the
+      //    function's own comment block NAMES the mutant (it has to, to document
+      //    the survivor), so scanning the raw text would fail on the
+      //    documentation of the very thing being guarded. The claim is about CODE.
+      // `url.search` is ALLOWED and is the point: it is handed whole to
+      // `parseThreadsQuery`, which is total over the parameter set. What is
+      // forbidden is reading it as a KEY (`searchParams.get`), which is the
+      // shape this PR's own equivalence argument covers.
+      for (const forbidden of ["request", "headers", "getCookie", "searchParams", "process", "fetch(", "getAll("]) {
+        expect(body.includes(forbidden), `readThreads' code mentions ${forbidden}`).toBe(false);
+      }
+      // `env` is legitimate — it is the database handle — but nothing else may be
+      // read off it either.
+      expect([...body.matchAll(/env\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1])).toEqual(["DB"]);
+
+      // 3. The binding itself is the scope's, with no fallback chain: exactly one
+      //    assignment, off `route`. This is the line the review mutated.
+      const bindings = [...body.matchAll(/const logKey = ([^;]+);/g)].map((m) => (m[1] ?? "").trim());
+      expect(bindings).toEqual(["route.scope?.logKey"]);
+
+      // 4. And no OTHER statement in `src/` reads a `log_key` out of a request.
+      //    Belt-and-braces over the one function, because the claim is about the
+      //    package: a second reader elsewhere would be the same hole.
+      for (const file of readdirSync(srcDir).filter((f) => f.endsWith(".ts"))) {
+        const code = stripTsComments(readFileSync(join(srcDir, file), "utf8"));
+        expect(/log_key/.test(code), `${file} reads a log_key`).toBe(false);
+        expect(/logKey\s*[:=]/.test(code) && !/route\.scope/.test(code) && file === "index.ts", `${file} assigns logKey off-route`).toBe(false);
+      }
+    });
+
+    test("no caller-influenceable channel can name a log — header, Referer, cookie, query, or path case", async () => {
+      // **The behavioural half of H2.** Every channel a caller controls that could
+      // plausibly carry a log key is sent at a scoped read, and the answer must be
+      // THIS review's content every time. Two reviews are populated with
+      // DISTINGUISHABLE markers, so a single honoured channel would show up in the
+      // body.
+      const otherKey = previewScopePath(REVIEW.repo, 99);
+      await seedLog(harness.db, otherKey, "theirs");
+      try {
+        const issued = await issueTestSession(harness.db);
+        const session = cookieHeader(issued.sessionId);
+        const channels: [string, Readonly<Record<string, string>>][] = [
+          ["custom header", { "x-revkit-log-key": otherKey }],
+          ["Referer", { referer: `http://localhost${scopedThreadsPath("other-repo", 7)}` }],
+          // APPENDED to the session cookie rather than replacing it: a channel that
+          // dropped the credential would answer 401 and prove nothing about logs.
+          ["cookie", { cookie: `${session}; log_key=${encodeURIComponent(otherKey)}` }],
+          ["query", {}],
+          ["X-Forwarded-Host", { "x-forwarded-host": "other-repo" }],
+          ["Host", { host: "other-repo" }],
+          ["Origin", { origin: `https://${encodeURIComponent(otherKey)}` }],
+          ["prefixed header", { "x-revkit-scope": otherKey, "x-log-key": otherKey, "scope": otherKey }],
+        ];
+        for (const [label, extra] of channels) {
+          const suffix = label === "query" ? `?log_key=${encodeURIComponent(otherKey)}` : "";
+          const response = await harness.dispatch(`http://localhost${THREADS_PATH}${suffix}`, {
+            headers: label === "cookie" ? extra : { cookie: session, ...extra },
+          });
+          const raw = await response.text();
+          if (label === "query") {
+            // The one channel with a real answer: an unknown parameter is a 400,
+            // and the body is the refusal shape.
+            expect(response.status, label).toBe(400);
+            expect(JSON.parse(raw) as Record<string, unknown>).toMatchObject({
+              error: "bad-request",
+              reason: "unknown-parameter",
+            });
+          } else {
+            expect(response.status, `${label}: ${raw.slice(0, 120)}`).toBe(200);
+            expect(raw, label).toContain("th-seed-1");
+            expect(raw, label).not.toContain("theirs-");
+          }
+        }
+        // The PATH is case-SENSITIVE, so `/REVKIT/pr-7/api/threads` names a
+        // DIFFERENT review — the empty log `/REVKIT/pr-7` — and this session is an
+        // `operator`, which the gate does not scope-check (see `authz.ts`: the only
+        // unscoped kind in `RECOGNISED_IDENTITY_KINDS` today is `operator`). So the
+        // answer is 200 on an EMPTY log, and the assertions are about CONTENT:
+        // neither this review's threads nor the other populated one.
+        const shouty = await harness.dispatch("http://localhost/REVKIT/pr-7/api/threads", {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        expect(shouty.status).toBe(200);
+        const shoutyRaw = await shouty.text();
+        expect(shoutyRaw).not.toContain("theirs-");
+        expect(shoutyRaw).not.toContain("th-seed");
+        expect(JSON.parse(shoutyRaw) as { head: number; threads: unknown[] }).toMatchObject({ head: 0, threads: [] });
+      } finally {
+        await harness.db.prepare("DELETE FROM review_logs WHERE log_key = ?").bind(otherKey).run();
+      }
+    });
+
     test("the largest accepted ?since= is bounded, so a path cannot carry an unbounded integer into a query", async () => {
       const issued = await issueTestSession(harness.db);
-      // 16 digits, so the largest value is under 2^53 and `Number.parseInt`
-      // is exact. One more digit is refused rather than silently truncated.
+      // 16 digits is the CEILING, and it is deliberately not claimed to be exact.
+      // It is not: `9999999999999999 > Number.MAX_SAFE_INTEGER` (measured), so
+      // `Number.parseInt("9999999999999999")` is `10000000000000000`. An earlier
+      // version of this comment said "under 2^53, so `parseInt` is exact", which
+      // was false, and the case below is what now pins the actual behaviour rather
+      // than the intent.
+      //
+      // Why the imprecision is harmless, and why it is still worth stating: `since`
+      // becomes `WHERE seq > ?`, and `seq` is a per-review counter that cannot
+      // reach 10^16 in any deployment this build has (a review with 10^16
+      // comments is not a review, it is a number). Rounding UP can only
+      // under-read — a client resumes slightly later and re-receives at most one
+      // event — and it cannot cross a log boundary, because the log key is
+      // selected from the PATH and not from this number. One more digit IS refused
+      // rather than silently truncated, which is the property that matters: the
+      // bound is enforced.
       const ok = await harness.dispatch(`http://localhost${THREADS_PATH}?since=9999999999999999`, {
         headers: { cookie: cookieHeader(issued.sessionId) },
       });
@@ -1009,6 +1691,11 @@ describe("ADR-0012's per-request gate", () => {
         headers: { cookie: cookieHeader(issued.sessionId) },
       });
       expect(tooBig.status).toBe(400);
+      // The imprecision itself, measured rather than described: 16 digits is past
+      // 2^53, and the accepted value rounds UP.
+      expect(9999999999999999 > Number.MAX_SAFE_INTEGER).toBe(true);
+      expect(Number.parseInt("9999999999999999", 10)).toBe(10000000000000000);
+      expect(JSON.parse(await ok.text()) as { events: unknown[] }).toMatchObject({ events: [] });
     });
   });
 
@@ -1159,3 +1846,40 @@ describe("ADR-0012's per-request gate", () => {
  * the closed union is exactly what `expectRefused`'s reason assertion relies
  * on, and an unused import would hide that from the next reader. */
 export type { DenialReason };
+
+/** `src/index.ts` reduced to CODE: comments and string literals removed, so a
+ * source scan asserts about identifiers rather than about the prose and the
+ * literals around them.
+ *
+ * Both strippers are needed, and each was added because the scan failed on the
+ * thing it was meant to ignore:
+ *   - COMMENTS, because `readThreads` documents the very mutation it guards
+ *     against by name — a gate that could only pass by deleting that
+ *     documentation is a gate that gets the documentation deleted.
+ *   - STRING LITERALS, because the function's own refusal reason is
+ *     `"bad-request"`, whose text contains `request`. A bare substring scan is
+ *     therefore not an identifier scan.
+ *
+ * `strings: true` keeps string LITERALS, for the checks that need to identify an
+ * ARM by its `kind` — which is a string. Stripping them would make
+ * `kind: "session-refresh"` unfindable, so the two uses are separated rather than
+ * one compromise.
+ *
+ * Both replace with a SPACE rather than deleting, so two tokens cannot be joined
+ * into one identifier that was never in the source. A false strip can only
+ * REMOVE text, and every assertion this feeds is an assertion of ABSENCE — so
+ * the failure mode is a missed detection, never a manufactured one. */
+function stripTsComments(source: string, options: { readonly strings?: boolean } = {}): string {
+  const withoutStrings =
+    options.strings === true
+      ? source
+      : source.replace(/("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, " ");
+  return withoutStrings
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map((line) => {
+      const at = line.indexOf("//");
+      return at === -1 ? line : line.slice(0, at);
+    })
+    .join("\n");
+}

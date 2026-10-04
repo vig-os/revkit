@@ -10,11 +10,25 @@
 // directly as the accepted ones.
 
 import { describe, expect, test } from "bun:test";
-import { API_SEGMENT, REVKIT_BUNDLE_ROOT, REVKIT_SEGMENT, isRevkitBundlePath, parsePreviewPath } from "../src/router.ts";
+import {
+  API_SEGMENT,
+  REVKIT_BUNDLE_ROOT,
+  REVKIT_SEGMENT,
+  SCOPED_THREADS_SUFFIX,
+  isRevkitBundlePath,
+  parsePreviewPath,
+  parseScopedThreadsPath,
+  previewScopePath,
+} from "../src/router.ts";
 
 describe("parsePreviewPath — accepted", () => {
   test("the canonical shape", () => {
-    expect(parsePreviewPath("/revkit/pr-7")).toEqual({ repo: "revkit", pr: 7, pathname: "/revkit/pr-7" });
+    expect(parsePreviewPath("/revkit/pr-7")).toEqual({
+      repo: "revkit",
+      pr: 7,
+      pathname: "/revkit/pr-7",
+      logKey: "/revkit/pr-7",
+    });
   });
 
   test("a trailing path — the built site inside the preview", () => {
@@ -120,5 +134,103 @@ describe("isRevkitBundlePath", () => {
     // A prefix match, not a string prefix: `/_revkitfoo` is not revkit's.
     expect(isRevkitBundlePath("/_revkitfoo/bar.js")).toBe(false);
     expect(REVKIT_BUNDLE_ROOT).toBe("/_revkit/");
+  });
+});
+
+// ── the scope axis (slice 5) ─────────────────────────────────────────────
+//
+// These two functions are how "which review is this request for" gets its
+// answer, and the answer reaches a D1 partition key. So the cases below are
+// about INJECTIVITY and about the shapes that must not be mistaken for the
+// API — a wrong answer here is another review's comments.
+
+describe("previewScopePath — the one spelling of a review's identity", () => {
+  test("is ADR-0008's preview address without a trailing slash", () => {
+    expect(previewScopePath("revkit", 7)).toBe("/revkit/pr-7");
+    expect(previewScopePath("vig-os.revkit", 102)).toBe("/vig-os.revkit/pr-102");
+  });
+
+  test("is INJECTIVE over (repo, pr), which is what makes it a partition key", () => {
+    // If two pairs shared a key they would share a log, so two reviews would
+    // read each other's comments. The repo grammar admits no `/`, and `pr` is
+    // a decimal integer, so the two halves cannot be confused — and this
+    // asserts it rather than trusting the argument.
+    const pairs: [string, number][] = [
+      ["revkit", 7],
+      ["revkit", 8],
+      ["revkit", 70],
+      ["revkit-7", 1],
+      ["revkit", 1],
+      ["a", 1],
+      ["a.pr", 1],
+      ["revkit.pr-7", 1],
+      ["revkit", 999999999],
+    ];
+    const keys = pairs.map(([repo, pr]) => previewScopePath(repo, pr));
+    expect(new Set(keys).size).toBe(pairs.length);
+  });
+
+  test("is what `parsePreviewPath` puts in `logKey`, for every path it accepts", () => {
+    // One derivation, so a route's scope and its log key cannot disagree — the
+    // disagreement would be a cross-review read.
+    for (const path of ["/revkit/pr-7", "/revkit/pr-7/index.html", "/vig-os.revkit/pr-102/", "/a1/pr-999999999"]) {
+      const parsed = parsePreviewPath(path);
+      expect(parsed?.logKey).toBe(previewScopePath(parsed?.repo ?? "", parsed?.pr ?? 0));
+    }
+  });
+});
+
+describe("parseScopedThreadsPath — the ONLY spelling of the thread read", () => {
+  test("accepts `<repo>/pr-<n>` + the API suffix, and reports the review", () => {
+    const parsed = parseScopedThreadsPath("/revkit/pr-7/api/threads");
+    expect(parsed?.repo).toBe("revkit");
+    expect(parsed?.pr).toBe(7);
+    expect(parsed?.logKey).toBe("/revkit/pr-7");
+    expect(SCOPED_THREADS_SUFFIX).toBe("/api/threads");
+  });
+
+  test("the query string is not part of the path, so `?repo=` cannot move the scope", () => {
+    // `parseScopedThreadsPath` takes a PATHNAME. A scope in the query string
+    // would be exactly the caller-chosen axis slice 5 removed.
+    expect(parseScopedThreadsPath("/revkit/pr-7/api/threads?repo=other-repo")).toBeUndefined();
+  });
+
+  test("the REMOVED unscoped path is not the API", () => {
+    // `GET /api/threads` named no review, so it could only ever answer
+    // org-wide. It is gone; this is the half of that which is pure grammar.
+    expect(parseScopedThreadsPath("/api/threads")).toBeUndefined();
+    expect(parseScopedThreadsPath("/api/threads/")).toBeUndefined();
+  });
+
+  test("a DEEPER base is a built site that happens to end in the suffix, not the API", () => {
+    // The bug this refusal prevents: `parsePreviewPath` ignores everything
+    // after the PR segment, so a preview of a document called `api/threads`
+    // would otherwise answer the review's thread log.
+    expect(parseScopedThreadsPath("/revkit/pr-7/docs/api/threads")).toBeUndefined();
+    expect(parseScopedThreadsPath("/revkit/pr-7/api/threads/nested")).toBeUndefined();
+    expect(parseScopedThreadsPath("/revkit/pr-7/xapi/threads")).toBeUndefined();
+  });
+
+  test("traversal and doubling are refused through the same rules as a preview", () => {
+    for (const path of [
+      "/revkit/pr-7/../api/threads",
+      "/../revkit/pr-7/api/threads",
+      "/revkit/pr-7//api/threads",
+      "/revkit/pr-7/%2e%2e/api/threads",
+      "/api/pr-7/api/threads",
+      "/_revkit/pr-7/api/threads",
+      "/revkit/pr-07/api/threads",
+      "/revkit/pr-0/api/threads",
+      "/revkit/pr-7/Api/threads",
+    ]) {
+      expect(parseScopedThreadsPath(path), path).toBeUndefined();
+    }
+  });
+
+  test("a preview path that is not the API is not this function's business", () => {
+    // Still a preview — the route table serves it from R2 — but NOT the read.
+    expect(parseScopedThreadsPath("/revkit/pr-7")).toBeUndefined();
+    expect(parseScopedThreadsPath("/revkit/pr-7/index.html")).toBeUndefined();
+    expect(parsePreviewPath("/revkit/pr-7/api/threads")?.logKey).toBe("/revkit/pr-7");
   });
 });

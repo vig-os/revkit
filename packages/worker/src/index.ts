@@ -5,15 +5,19 @@
 //
 //   GET|HEAD /healthz               200 — liveness + the version it runs
 //   ANY    /healthz (other verbs)   405  (kind `method-not-allowed`, ungated)
-//   GET|HEAD /api/threads           200 — behind ADR-0012's per-request gate
-//   GET    /api/threads?since=<n>   200 — the delta since the caller's head
+//   GET|HEAD <repo>/pr-<n>/api/threads  200 — behind ADR-0012's per-request
+//                                      gate, scoped to THAT review (slice 5)
+//   GET|HEAD …/api/threads?since=<n>   200 — the delta since the caller's head
+//   POST   <repo>/pr-<n>/api/threads  501 — see below
 //   POST   /api/session/refresh     200 — rotate the caller's own session
-//   POST   /api/threads             501 — see below
 //   GET    /invite/<token>          200 — the display-name form (slice 3)
 //   POST   /invite/redeem           303 — exchange the token for a session
-//   ANY    /api/* (other verbs)     405, behind the gate
+//   GET    /api/threads             404 — REMOVED in slice 5; it named no
+//                                      review, so it could only answer org-wide
+//   ANY    /api/* (other verbs)     404
 //   ANY    /_revkit/…               404 — never a redirect (ADR-0012)
-//   ANY    <repo>/pr-<n>/…          501 — behind the gate; slice 5 serves it
+//   ANY    <repo>/pr-<n>/…          501 — behind the gate; R2 serving is slice 5's
+//                                      other half
 //   ANY    anything else            404
 //
 // ── Two ungated readers of `env.DB`, and what that means for the invariant ──
@@ -70,9 +74,33 @@
 // it is a guest, its invite is unrevoked, unexpired, in scope, permitted to do
 // what the route writes, and bound to this browser. It does NOT yet mean "has
 // GitHub read access to the repo" — there is no `TokenSource` (the App is
-// owner-gated, #34) — and it does not scope `GET /api/threads`, because
-// `events(seq, ts, payload)` has no `repo` column to scope by (slice 5). Both
-// halves are in ADR-0012's 2026-10-04 amendment.
+// owner-gated, #34) — and **that is the axis slice 5 deliberately left open**.
+//
+// **Named precisely, because the obvious name is WRONG.** `github` is ABSENT from
+// `RECOGNISED_IDENTITY_KINDS` (`src/session.ts`), so there is no `github` session
+// to be narrow or wide: one re-pointed at that kind is refused
+// `401 unrecognised-identity-kind`. **The unscoped kind is `operator`** — the
+// gate's scope block is under `if (resolved.principal.kind === "invite")`, so an
+// `operator` session reads whatever review the path names, across the whole
+// deployment, because nothing can yet prove it has access to any of them. Slice 5
+// confined the guest and left `operator` exactly as it found it; neither half was
+// quietly changed.
+//
+// ── Slice 5, the scope axis ───────────────────────────────────────────────
+//
+// `GET /api/threads` is gone and `<repo>/pr-<n>/api/threads` replaced it, for
+// one reason: the flat read named no repository, so ADR-0012's per-call scope
+// check had nothing to select on and a guest in scope for one review read the
+// whole org's log. The route is path-scoped, the store is per-log
+// (`D1ThreadStore`'s required `logKey`), and the gate refuses a GUEST on any
+// gated route that names no scope rather than reading the absence as a
+// permission.
+//
+// **The org-wide read is GONE, not narrowed.** An operator session reads one
+// review per request now, by URL. That is what a path-addressed surface means,
+// and it is the safe direction; the cost is that nothing in this build can
+// enumerate a deployment's reviews, which the GitHub bridge (slice 4) will want
+// and which ADR-0012's other, unimplemented clause is what would authorise.
 //
 // ── Where a session comes from ─────────────────────────────────────────────
 //
@@ -86,14 +114,14 @@
 // requires write access", so `mintInvite` is out of band too, like the
 // operator session.
 //
-// ── `POST /api/threads` is still 501, on purpose ──────────────────────────
+// ── `POST <repo>/pr-<n>/api/threads` is still 501, on purpose ─────────────
 //
 // ADR-0012's CSRF and `application/json` rules are only meaningful if a
 // state-changing call is reachable, and `POST /api/session/refresh` is the
-// smallest route that gives them a real end-to-end path. `POST /api/threads`
-// needs the bridge and the hosted write shape (slice 4), so it stays 501 — and
-// a `view` guest's attempt at it is refused by the GATE, not by the 501, which
-// is how ADR-0009's read-only rule is proven while the write does not exist.
+// smallest route that gives them a real end-to-end path. The append needs the
+// bridge and the hosted write shape (slice 4), so it stays 501 — and a `view`
+// guest's attempt at it is refused by the GATE, not by the 501, which is how
+// ADR-0009's read-only rule is proven while the write does not exist.
 
 import {
   authorizeRequest,
@@ -101,6 +129,7 @@ import {
   denialLogMessage,
   INVITE_OPEN_PREFIX,
   INVITE_REDEEM_PATH,
+  isGatedRouteKind,
   type AuthorizedSession,
   type Route,
 } from "./authz.ts";
@@ -131,7 +160,7 @@ import {
   redeemInvite,
 } from "./invites.ts";
 import { createLogger, newRequestId, type Logger } from "./logger.ts";
-import { parseThreadsQuery } from "./router.ts";
+import { parseThreadsQuery, previewScopePath } from "./router.ts";
 import {
   INVITE_TOKEN_HMAC_KEY,
   MissingInviteTokenKeyError,
@@ -414,6 +443,16 @@ export default {
         return response;
       }
 
+      // The gate admitted this request, so `route.requiresSession` is true — and
+      // `classifyPath` cannot produce a gated route carrying an ungated kind. The
+      // predicate is a CHECK rather than a cast because `handleAuthorized`'s
+      // narrowed parameter type is only worth anything with a check behind it: a
+      // partition mistake becomes `unreachable()` and a loud 500, which is this
+      // codebase's standing answer, instead of a dispatcher `case` that silently
+      // does not exist. It cannot fire with the table as shipped —
+      // `test/authorization.test.ts` asserts the partition against behaviour over
+      // the derived probe product.
+      if (!isGatedRouteKind(route.kind)) return unreachable(route);
       const response = await handleAuthorized(route, decision.authorized, request, env, keys, scope, url);
       status = response.status;
       return response;
@@ -736,7 +775,7 @@ async function redeemFromRequest(
   // response header, and the two candidates are slice 5's to choose between — a
   // meta tag in the preview document (whose hash then joins the committed
   // allowlist) or a second, non-HttpOnly cookie. Shipping neither is the honest
-  // position, because `POST /api/threads` is a 501 and no guest page exists to
+  // position, because `POST <repo>/pr-<n>/api/threads` is a 501 and no guest page exists
   // need one; what ships is that the token EXISTS and is bound to the session.
   return seeOther(previewPath(result.invite.repo, result.invite.pr), scope, [result.issued.cookie, result.browserCookie], {
     [CSRF_HEADER]: result.issued.csrfToken,
@@ -746,9 +785,16 @@ async function redeemFromRequest(
 /** The token-free path the redemption redirects to. `/` when the invite covers
  * a whole repo and there is no PR to name — a repo-scoped invite's holder has
  * no single review to land on, and sending them to a PR the invite never named
- * would be a scope leak in the redirect. */
+ * would be a scope leak in the redirect.
+ *
+ * The `/` is **itself a residual gap, unchanged by slice 5**: `classifyRoute("/")`
+ * is `unknown`, so a repo-wide invite's holder is redirected to a 404. There is
+ * no repo-wide index page in this build, and inventing one is a product
+ * decision rather than a security fix. It is security-neutral (a 404 leaks
+ * nothing) and recorded in the PR rather than fixed here. The PR case uses
+ * `previewScopePath`, so the scoped spellings cannot drift apart. */
 function previewPath(repo: string, pr: number | null): string {
-  return pr === null ? "/" : `/${repo}/pr-${pr}/`;
+  return pr === null ? "/" : `${previewScopePath(repo, pr)}/`;
 }
 
 /** A 429 in whichever shape the caller can use: HTML for the navigation the
@@ -956,7 +1002,7 @@ async function handleAuthorized(
   scope.logger.log("info", "auth.granted", { identityKind: authorized.principal.kind });
   switch (route.kind) {
     case "threads-read":
-      return readThreads(authorized, env, scope, url);
+      return readThreads(authorized, env, scope, url, route);
     case "threads-append":
       return appendDisabled(scope);
     case "session-refresh":
@@ -972,41 +1018,81 @@ async function handleAuthorized(
 }
 
 /**
- * `GET /api/threads` — the read slice 1 closed, now behind the gate.
+ * `GET <repo>/pr-<n>/api/threads` — the scoped read slice 1 closed, slice 2
+ * opened and slice 5 SCOPED.
  *
- *   no `since`     -> { head, threads }   the whole projection, via
+ *   no `since`     -> { head, threads }   THIS review's projection, via
  *                      `D1ThreadStore.threads()` (review-core's `reduce` +
  *                      `selectThreads`, not a local reimplementation)
- *   `?since=<n>`   -> { head, events }    exactly the events with `seq > n`,
+ *   `?since=<n>`   -> { head, events }    this review's events with `seq > n`,
  *                      via `since(n)`, which is the resume point the hosted
  *                      rail needs (ADR-0006: consumers use `since(lastSeen)`
  *                      and never assume `seq` is contiguous)
  *
- * `head` is `MAX(seq)` read from D1, not this store's validated watermark:
- * the store is built per request, so its own `#head` starts at 0 and would
- * hand a client a resume point that silently skips the log.
+ * `head` is this LOG's `MAX(seq)` read from D1, not this store's validated
+ * watermark: the store is built per request, so its own `#head` starts at 0 and
+ * would hand a client a resume point that silently skips the log.
  *
- * `request` is not a parameter: nothing about the request reaches this
- * handler except the query already parsed by the caller. That is deliberate —
- * it is not possible to read this comment's data path without a cookie that
- * the gate resolved.
+ * ── `route.scope` is the ONLY source of the log key ──────────────────────
+ *
+ * `route.scope.logKey` came out of `parseScopedThreadsPath`, i.e. out of the
+ * PATH this request presented, and the gate compared that path's `(repo, pr)`
+ * against the caller's invite before this function was reached. This handler
+ * reads no header, no query parameter and no body field, and it derives nothing:
+ * a log key is not something a caller can name. `route` is a parameter rather
+ * than the scope alone so the `unreachable` below can prove the scope is present
+ * — a `threads-read` classification with no scope cannot happen, and if one ever
+ * did it is a 500 rather than an org-wide read.
+ *
+ * `authorized` is not otherwise used: it is what makes the gate structural
+ * rather than a convention. `AuthorizedSession`'s brand symbol is private to
+ * `src/authz.ts`, so `tsc` refuses this call from anywhere the gate does not run
+ * first. Nothing in the body needs it.
  */
 async function readThreads(
   authorized: AuthorizedSession,
   env: Env,
   scope: RequestScope,
   url: URL,
+  route: Route,
 ): Promise<Response> {
-  // The parameter is what makes the gate structural rather than a
-  // convention: `AuthorizedSession`'s brand symbol is private to
-  // `src/authz.ts`, so `tsc` refuses this call from anywhere the gate does
-  // not run first. Nothing in the body needs it.
   void authorized;
+  // ── The ORDER of these two blocks is what makes the mutation equivalent ──
+  //
+  // The query is validated BEFORE a log key is chosen. `parseThreadsQuery`
+  // refuses every parameter but `since`, so a request naming a log in its query
+  // string is refused here and the key below is the only one that can reach a
+  // store.
+  //
+  // **A mutation run put a number on this, and the number is 0.** Changing
+  // `route.scope?.logKey` to
+  // `url.searchParams.get("log_key") ?? route.scope?.logKey` — a
+  // caller-supplied log key — leaves the suite **fully green**, and it is worth
+  // being precise about WHY rather than recording it as an untested risk:
+  //
+  //   - It was tried in BOTH orders. Before this reorder it was safe only by
+  //     accident of ordering; after it, the mutated line is **unreachable** for
+  //     any query carrying a parameter, because the refusal returned 400 above.
+  //   - For every query the parser ACCEPTS — none, or `?since=<canonical>` —
+  //     `searchParams.get("log_key")` is `null`, so the fallback yields the
+  //     same key. Every input, therefore, produces identical behaviour: the
+  //     mutant is **equivalent**, and no test can kill it.
+  //
+  // So the control is not "a test asserts this", because there is none to
+  // write. It is structural: the key comes from `route.scope`, which
+  // `classifyRoute` derives from the path by a pure function of
+  // `(pathname, method)`, and the query parser is **total** over the parameter
+  // set. `test/authorization.test.ts` pins both halves — the refusal, and the
+  // absence of any log's `head` from the answer — so a future edit that made
+  // the parser accept a parameter would be caught, which is the case that
+  // would actually open the hole.
   const query = parseThreadsQuery(url.search);
   if (query.kind === "invalid") {
     return json({ error: "bad-request", reason: query.reason, parameter: query.parameter }, 400, scope);
   }
-  const store = new D1ThreadStore({ db: env.DB });
+  const logKey = route.scope?.logKey;
+  if (logKey === undefined) return unreachable(route);
+  const store = new D1ThreadStore({ db: env.DB, logKey });
   if (query.kind === "delta") {
     return json({ head: await store.head(), events: await store.since(query.since) }, 200, scope);
   }
@@ -1053,7 +1139,7 @@ async function refreshSession(authorized: AuthorizedSession, env: Env, scope: Re
 }
 
 /**
- * `POST /api/threads` — still 501, and now for a narrower and stated reason.
+ * `POST <repo>/pr-<n>/api/threads` — still 501, for a narrower and stated reason.
  *
  * It has passed the gate (a valid session, a valid CSRF token, JSON) and is
  * refused because the WRITE does not exist yet: the hosted bridge and the

@@ -29,6 +29,13 @@ import {
   type Logger,
 } from "../src/logger.ts";
 import { mintToken, issueSession, sha256Hex, SESSION_COOKIE_NAME } from "../src/session.ts";
+import { scopedThreadsPath } from "../src/router.ts";
+
+/** The scoped read — the path this file dispatches to assert that a refusal
+ * emits a third log line. It was `/api/threads` until slice 5 removed that
+ * spelling (it named no review, so it could only answer org-wide) and moved the
+ * read to `<repo>/pr-<n>/api/threads`. */
+const SCOPED_READ = scopedThreadsPath("revkit", 7);
 import { startWorker, type Harness } from "./harness.ts";
 
 /** Credential-SHAPED fixtures, assembled from parts.
@@ -207,7 +214,7 @@ describe("structured logger", () => {
       ["short sha1 / git object id", "c".repeat(40)],
       ["request id (uuid)", "82948424-946e-4b78-9572-37c4a8b75edc"],
       ["iso timestamp", "2026-10-04T09:00:00.000Z"],
-      ["api path", "/api/threads"],
+      ["api path", SCOPED_READ],
       ["http verb", "GET"],
       ["status code", 401],
       ["identity kind", "operator"],
@@ -220,7 +227,7 @@ describe("structured logger", () => {
     ];
     for (const [label, value] of survives) {
       const { logger, lines } = captureLogger(`survive-${label}`);
-      logger.log("info", "request.start", { method: "GET", path: "/api/threads", observed: value });
+      logger.log("info", "request.start", { method: "GET", path: SCOPED_READ, observed: value });
       expect(lines[0], label).toContain(String(value));
     }
   });
@@ -481,7 +488,7 @@ describe("structured logger", () => {
     const { logger, lines } = captureLogger("req-9");
     logger.log("info", "request.start", {
       method: "GET",
-      path: "/api/threads",
+      path: SCOPED_READ,
       status: 200,
       durationMs: 3,
       // A GitHub login is an opaque identity, not personal data — ADR-0020
@@ -490,7 +497,7 @@ describe("structured logger", () => {
     });
     const record = parse(lines[0] as string);
     expect(record["method"]).toBe("GET");
-    expect(record["path"]).toBe("/api/threads");
+    expect(record["path"]).toBe(SCOPED_READ);
     expect(record["status"]).toBe(200);
     expect(record["durationMs"]).toBe(3);
     expect(record["actor"]).toBe("gerchowl");
@@ -600,12 +607,12 @@ describe("the Worker's own log lines (end to end)", () => {
   }
 
   test("A23: the requestId in the log is the same one in the response header", async () => {
-    // `/api/threads`, not `/healthz`: a refused request emits a third line
+    // The SCOPED read, not `/healthz`: a refused request emits a third line
     // (`auth.denied`) between the pair, so this capture also shows the gate
     // running inside the real Worker. Three lines are expected and waited
     // for.
     const { response, lines } = await captureWorkerLog(
-      () => harness.dispatch("http://localhost/api/threads"),
+      () => harness.dispatch(`http://localhost${SCOPED_READ}`),
       { expectLines: 3 },
     );
     const headerId = response.headers.get("x-revkit-request-id");
@@ -658,7 +665,7 @@ describe("the Worker's own log lines (end to end)", () => {
     const issued = await issueSession(harness.db, { kind: "operator", id: "operator" });
     const { response, lines } = await captureWorkerLog(
       () =>
-        harness.dispatch("http://localhost/api/threads", {
+        harness.dispatch(`http://localhost${SCOPED_READ}`, {
           headers: { cookie: `${SESSION_COOKIE_NAME}=${issued.sessionId}` },
         }),
       { expectLines: 3 },
@@ -679,7 +686,7 @@ describe("the Worker's own log lines (end to end)", () => {
 
   test("the refusal line says why, so a 401 spike is diagnosable", async () => {
     const { response, lines } = await captureWorkerLog(
-      () => harness.dispatch("http://localhost/api/threads"),
+      () => harness.dispatch(`http://localhost${SCOPED_READ}`),
       { expectLines: 3 },
     );
     expect(response.status).toBe(401);

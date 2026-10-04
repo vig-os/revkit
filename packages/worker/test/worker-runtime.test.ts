@@ -18,7 +18,8 @@
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { revisionOf } from "@revkit/review-core";
-import { TEST_INVITE_TOKEN_HMAC_KEY } from "./harness.ts";
+import { previewScopePath, scopedThreadsPath } from "../src/router.ts";
+import { TEST_INVITE_TOKEN_HMAC_KEY, seedLogEvents } from "./harness.ts";
 import {
   authHeaders,
   cookieHeader,
@@ -72,6 +73,18 @@ const WORKER_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 const BUNDLE_CEILING_BYTES = 2 * 1024 * 1024;
 
 /**
+ * The review the seeded log belongs to, and the ONE URL that reads it.
+ *
+ * **Slice 5:** the read moved from `/api/threads` — which named no repository,
+ * so ADR-0012's per-call scope check had nothing to select on — to
+ * `<repo>/pr-<n>/api/threads`, with the scope in the PATH. The log key is
+ * built by the same `previewScopePath` a route's scope uses, so this file and
+ * the router cannot disagree about which log a URL names.
+ */
+const LOG_KEY = previewScopePath("revkit", 7);
+const READ_PATH = scopedThreadsPath("revkit", 7);
+
+/**
  * A four-event log with a GAP: seqs 1, 2, 3 and 7.
  *
  * The gap is the point and it is slice 1's fixture, kept deliberately.
@@ -82,32 +95,13 @@ const BUNDLE_CEILING_BYTES = 2 * 1024 * 1024;
  * that bug through this seed.
  */
 async function seedClosedLog(db: D1Database): Promise<void> {
-  await db.prepare("DELETE FROM events").run();
-  for (const seq of [1, 2, 3, 7]) {
-    await db
-      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-      .bind(
-        seq,
-        `2026-10-03T12:00:0${seq}Z`,
-        JSON.stringify({
-          seq,
-          ts: `2026-10-03T12:00:0${seq}Z`,
-          actor: { kind: "gh-user", id: "gerchowl" },
-          kind: "comment.created",
-          threadId: `th-closed-${seq}`,
-          commentId: `c-closed-${seq}`,
-          anchor: {
-            path: "docs/a.mdx",
-            startLine: 1,
-            endLine: 1,
-            quote: { exact: "x", prefix: "", suffix: "" },
-            revision: "b".repeat(64),
-          },
-          body: SEED_BODY,
-        }),
-      )
-      .run();
-  }
+  // 1, 2, 3 and then 7: the GAP is the point and it is slice 1's fixture, kept
+  // deliberately (ADR-0006 blesses gaps; consumers use `since(lastSeen)` and
+  // never assume contiguity), so a hosted read that renumbered 7 to 4, or that
+  // served `since=2` as two events, would be wrong in a way a contiguous
+  // fixture cannot detect. The #76 review found exactly that bug through here.
+  await seedLogEvents(db, LOG_KEY, 3, { prefix: "th-closed", from: 1, body: SEED_BODY });
+  await seedLogEvents(db, LOG_KEY, 1, { prefix: "th-closed", from: 7, body: SEED_BODY });
 }
 
 describe("ADR-0025 runtime gate", () => {
@@ -262,7 +256,7 @@ describe("ADR-0025 runtime gate", () => {
   test("A4: the SHIPPED Worker entry bundle has no Node or Bun escape hatches", async () => {
     const bundle = await workerBundle();
     // Magnitude guards FIRST, and they are load-bearing in both directions.
-    // Slice 2 re-opened `GET /api/threads`, so this artefact went from ~20 KB
+    // Slice 2 re-opened the thread read, so this artefact went from ~20 KB
     // (tree-shaken, because nothing reachable touched the store) back to
     // ~807 KB — and the floor moves with it. A FLOOR alone would be
     // satisfied by a bundle that lost a chunk; an earlier revision of this
@@ -365,7 +359,7 @@ describe("ADR-0025 runtime gate", () => {
   // of `?since=` — lives in `test/authorization.test.ts`. What is here is the
   // runtime gate's own territory: that the re-opened routes answer what they
   // claim to, through real workerd, against a real log.
-  test("GET /api/threads answers 200 with a session and the real projection", async () => {
+  test("the scoped read answers 200 with a session and the real projection", async () => {
     // The transition slice 1 existed for. Slice 1 answered 501 for every
     // verb because ADR-0012 requires authorization per request and there was
     // no session; this is the same route with a session, reading the SAME
@@ -373,7 +367,7 @@ describe("ADR-0025 runtime gate", () => {
     // reducer must survive).
     await seedClosedLog(harness.db);
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/api/threads", {
+    const response = await harness.dispatch(`http://localhost${READ_PATH}`, {
       headers: { cookie: cookieHeader(issued.sessionId) },
     });
     expect(response.status).toBe(200);
@@ -391,13 +385,16 @@ describe("ADR-0025 runtime gate", () => {
     ]);
     // And the data the projection is built from really is served to a
     // session that has one — the negative half is `authorization.test.ts`.
-    const raw = await harness.db.prepare("SELECT payload FROM events WHERE seq = 1").first<{ payload: string }>();
+    const raw = await harness.db
+      .prepare("SELECT payload FROM review_logs WHERE log_key = ? AND seq = 1")
+      .bind(LOG_KEY)
+      .first<{ payload: string }>();
     expect(JSON.parse(raw?.payload ?? "{}")).toMatchObject({ body: SEED_BODY });
   });
 
-  test("GET /api/threads?since=2 returns exactly the events after 2, over the gap", async () => {
+  test("the scoped read with ?since=2 returns exactly the events after 2, over the gap", async () => {
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/api/threads?since=2", {
+    const response = await harness.dispatch(`http://localhost${READ_PATH}?since=2`, {
       headers: { cookie: cookieHeader(issued.sessionId) },
     });
     expect(response.status).toBe(200);
@@ -411,7 +408,7 @@ describe("ADR-0025 runtime gate", () => {
 
   test("?since=<head> is empty, so a caught-up client polls for nothing", async () => {
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/api/threads?since=7", {
+    const response = await harness.dispatch(`http://localhost${READ_PATH}?since=7`, {
       headers: { cookie: cookieHeader(issued.sessionId) },
     });
     expect(response.status).toBe(200);
@@ -420,28 +417,37 @@ describe("ADR-0025 runtime gate", () => {
     expect(body.events).toEqual([]);
   });
 
-  test("a trailing-slash variant is a DISTINCT path and 404s — no alias", async () => {
-    // `/api/threads/` is not `/api/threads`, and it must not be: the same
-    // rule ADR-0012 states for `/_revkit/` is that a trailing-slash alias is
-    // a second spelling of one resource, and aliases are how a gated route
-    // quietly reopens. It 404s even WITH a valid session, so no alias can be
-    // reached by any credential at all.
+  test("the removed unscoped read, and a trailing-slash variant, are DISTINCT paths and 404 — no alias", async () => {
+    // The same rule ADR-0012 states for `/_revkit/`: a trailing-slash alias is a
+    // second spelling of one resource, and aliases are how a gated route quietly
+    // reopens. Both 404 even WITH a valid session, so no alias can be reached by
+    // any credential at all — and `/api/threads` itself 404s because slice 5
+    // removed it (it named no review, so it could only ever answer org-wide).
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/api/threads/", {
+    for (const spelling of ["/api/threads", "/api/threads/", "/API/threads", "/api//threads"]) {
+      const response = await harness.dispatch(`http://localhost${spelling}`, {
+        headers: { cookie: cookieHeader(issued.sessionId) },
+      });
+      expect(response.status, spelling).toBe(404);
+      expect(response.headers.get("location"), spelling).toBeNull();
+      expect(await response.text(), spelling).not.toContain("th-closed");
+    }
+    // The scoped read itself is unaffected, and carries no `Location` either.
+    const scoped = await harness.dispatch(`http://localhost${READ_PATH}`, {
       headers: { cookie: cookieHeader(issued.sessionId) },
     });
-    expect(response.status).toBe(404);
-    expect(response.headers.get("location")).toBeNull();
+    expect(scoped.status).toBe(200);
+    expect(scoped.headers.get("location")).toBeNull();
   });
 
-  test("POST /api/threads is still 501 — and it gets past the gate to say so", async () => {
+  test("POST on the scoped read is still 501 — and it gets past the gate to say so", async () => {
     // The status is unchanged from slice 1 and the REASON is not: this call
     // now carries a valid session, a valid per-session CSRF token and
     // `application/json`, so ADR-0012's three state-changing checks all PASS
     // before the route answers. That is the honest distinction — the write is
     // missing (slice 4), the authorization is not.
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/api/threads", {
+    const response = await harness.dispatch(`http://localhost${READ_PATH}`, {
       method: "POST",
       headers: { ...authHeaders(issued), ...JSON_HEADERS },
       body: JSON.stringify({ kind: "comment.created" }),
@@ -452,17 +458,20 @@ describe("ADR-0025 runtime gate", () => {
     expect(body.enabledIn).toContain("slice 4");
     expect(body.detail).toContain("CSRF");
     // And nothing was written.
-    const counted = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
+    const counted = await harness.db
+      .prepare("SELECT COUNT(*) AS n FROM review_logs WHERE log_key = ?")
+      .bind(LOG_KEY)
+      .first<{ n: number }>();
     expect(counted?.n).toBe(4);
   });
 
-  test("PUT /api/threads is 405, not 401 — a session is present, the verb is wrong", async () => {
+  test("PUT on the scoped read is 405, not 401 — a session is present, the verb is wrong", async () => {
     // Order matters and is asserted: authorization first (unconditionally),
     // then the verb. Without a session the SAME request is 401, which
     // `authorization.test.ts` drives — so a 405 here is evidence the gate
     // let a known caller through, not evidence the route ignores verbs.
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/api/threads", {
+    const response = await harness.dispatch(`http://localhost${READ_PATH}`, {
       method: "PUT",
       headers: { cookie: cookieHeader(issued.sessionId) },
     });
@@ -501,8 +510,8 @@ describe("ADR-0025 runtime gate", () => {
     for (const [path, method] of [
       ["/healthz", "GET"],
       ["/nope", "GET"],
-      ["/api/threads", "GET"],
-      ["/api/threads", "POST"],
+      [READ_PATH, "GET"],
+      [READ_PATH, "POST"],
       ["/api/session/refresh", "POST"],
       ["/_revkit/0.0.0/x.js", "GET"],
       ["/revkit/pr-1/", "GET"],
@@ -515,7 +524,7 @@ describe("ADR-0025 runtime gate", () => {
     }
     // And the refusal branch, with NO credential at all, which is the one a
     // reviewer will hit first when something is misconfigured.
-    const refused = await harness.dispatch("http://localhost/api/threads");
+    const refused = await harness.dispatch(`http://localhost${READ_PATH}`);
     expect(refused.status).toBe(401);
     expect(refused.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
   });
@@ -569,7 +578,7 @@ describe("ADR-0025 runtime gate", () => {
     // which to refuse and why this first-line check is the equivalent.
     for (const [path, method] of [
       ["/healthz", "GET"],
-      ["/api/threads", "GET"],
+      [READ_PATH, "GET"],
       ["/invite/redeem", "POST"],
       [`/invite/${"A".repeat(43)}`, "GET"],
       ["/nope", "GET"],

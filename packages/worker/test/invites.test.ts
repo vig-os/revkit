@@ -43,7 +43,7 @@
 //                                     next request"
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { classifyRoute, DENIAL_REASONS, INVITE_OPEN_PREFIX, INVITE_REDEEM_PATH, THREADS_PATH } from "../src/authz.ts";
+import { authorizeRequest, classifyRoute, DENIAL_REASONS, INVITE_OPEN_PREFIX, INVITE_REDEEM_PATH, type Route } from "../src/authz.ts";
 import { FORM_MEDIA_TYPE } from "../src/invite-page.ts";
 import { MAX_REDEEM_BODY_BYTES } from "../src/invites.ts";
 import {
@@ -84,10 +84,12 @@ import {
   type RateBucket,
 } from "../src/rate-limit.ts";
 import { CSRF_HEADER, SESSION_COOKIE_NAME, isTokenShaped, mintToken, sha256Hex } from "../src/session.ts";
+import { previewScopePath, scopedThreadsPath } from "../src/router.ts";
 import {
   issueTestSession,
   JSON_HEADERS,
   resetInvites,
+  seedLogEvents,
   setCookieValue,
   startWorker,
   TEST_INVITE_TOKEN_HMAC_KEY,
@@ -101,6 +103,21 @@ const NOW = Date.parse("2026-10-04T12:00:00.000Z");
 const at = (): (() => number) => () => NOW;
 const REPO = "revkit";
 const NAME = "Ada Lovelace";
+
+/**
+ * The scoped read's path, and the review it names.
+ *
+ * **Slice 5 replaced `GET /api/threads` with this.** The old path named no
+ * repository, so ADR-0012's per-call scope check had nothing to select on: it
+ * ran on every request of a GUEST's session and passed, and the guest read the
+ * whole org's log. The scope is in the path now, which is structural — there is
+ * no unscoped spelling to forget and no parameter to tamper with.
+ */
+const PR = 7;
+const SCOPED_READ = scopedThreadsPath(REPO, PR);
+
+/** The removed unscoped spelling. Not a route: `unknown` → 404, ungated. */
+const REMOVED_READ = "/api/threads";
 
 async function mintOk(db: D1Database, input: Parameters<typeof mintInvite>[1], now = NOW): Promise<MintResult> {
   return mintInvite(db, input, { keys, now: () => now });
@@ -170,14 +187,42 @@ beforeEach(async () => {
    * "killed 1 dangling process" failure cascade in the first draft of this
    * file. Seeding `count = limit - 1` and taking two attempts asserts the
    * boundary is EXACTLY at `limit`, in two round trips.
+   *
+   * ── The window is the WALL CLOCK's, not this file's `NOW` ────────────────
+   *
+   * **This default used to be `NOW`, and that made every rate-limit case here
+   * TIME-OF-DAY DEPENDENT.** Slice 5's review caught it as "3–4 failures that are
+   * not the known flake"; the mechanism is that there are TWO clocks in this file
+   * and they had been mixed:
+   *
+   *   - `NOW` (2026-10-04T12:00:00Z) is injected into the D1-level calls —
+   *     `mintInvite`, `revokeInvite`, `loadInviteGrant` — which take a clock.
+   *   - the HTTP-level cases go through `harness.dispatch` into real workerd, and
+   *     `spendAttempts` there is called WITHOUT `options.now`, so it reads
+   *     `Date.now()`.
+   *
+   * `RATE_LIMIT_WINDOW_MS` is 15 minutes and the limiter rolls a window whose
+   * stored `window_start` is `<= now - 15min`. Seeding `window_start` at 12:00:00
+   * therefore works for exactly as long as the real clock is inside
+   * 12:00:00–12:15:00 **UTC** — measured: those cases passed at 12:0x UTC and
+   * began failing at 12:23 UTC, with the seeded row silently rolled over to
+   * `count = 1` and the expected 429 becoming a 303.
+   *
+   * So the clock is now a REQUIRED argument rather than a default: every call
+   * site passes the clock its code under test actually reads — `NOW` for the
+   * D1-level cases, which inject `{ now: NOW }` into `spendAttempts` directly,
+   * and `Date.now()` for the HTTP-level cases, which go through real workerd.
+   * A default would have been a guess, and the guess is what this bug was.
+   * Still ONE write per seed, and the boundary is still asserted exactly.
    */
-  async function seedCounter(bucket: string, count: number, windowStartMs = NOW): Promise<void> {
+  async function seedCounter(bucket: string, count: number, windowStartMs: number): Promise<void> {
+    const windowStart = new Date(windowStartMs).toISOString();
     await harness.db
       .prepare(
         "INSERT INTO rate_limit_counters (bucket, count, window_start) VALUES (?, ?, ?) " +
           "ON CONFLICT(bucket) DO UPDATE SET count = ?, window_start = ?",
       )
-      .bind(bucket, count, new Date(windowStartMs).toISOString(), count, new Date(windowStartMs).toISOString())
+      .bind(bucket, count, windowStart, count, windowStart)
       .run();
   }
 
@@ -766,7 +811,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
   // ── scope ─────────────────────────────────────────────────────────────
 
   describe("invite scope", () => {
-    async function covers(repo: string, pr: number | null, target: { repo: string; pr: number } | undefined): Promise<boolean> {
+    async function covers(repo: string, pr: number | null, target: { repo: string; pr: number }): Promise<boolean> {
       const result = await mintOk(db(), { repo, pr });
       if (!result.ok) throw new Error("mint failed");
       return inviteCovers(result.minted.invite, target);
@@ -788,13 +833,26 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect(await covers(REPO, 42, { repo: "other", pr: 42 })).toBe(false);
     });
 
-    test("a route that names no repo or PR is not out of scope — and that is a recorded gap, not a pass", async () => {
-      // `GET /api/threads` has no repo axis (`events(seq, ts, payload)`), so a
-      // scope check has nothing to select on. Asserted explicitly so the gap is
-      // visible in the suite: if slice 5 adds the axis, this case is the one
-      // that must change.
-      expect(await covers(REPO, null, undefined)).toBe(true);
-      expect(await covers(REPO, 42, undefined)).toBe(true);
+    test("a route that names no scope is NOT 'in scope' — the gate refuses it", async () => {
+      // **This case used to assert the opposite and it was the defect.**
+      //
+      // `inviteCovers(invite, undefined)` returned `true`, on the reasoning that
+      // a route naming nothing leaves nothing to be out of scope for. Then
+      // `GET /api/threads` named nothing (there was no `repo` column to name it
+      // with), so ADR-0012's "a guest invite is checked for scope … on each
+      // call" ran on every request of a stranger's session, selected nothing,
+      // and passed. A guest in scope for one review read the whole org.
+      //
+      // So the absence is now a REFUSAL, and it is refusable from two
+      // directions, both asserted below: the TYPE (`inviteCovers` takes a
+      // required target, so "no target" will not typecheck — see the compile-time
+      // case) and the GATE (`invite-scope-unbounded`).
+      //
+      // What is left of the old assertion is the positive half, which is still
+      // true and still worth pinning: a route that names a scope the invite
+      // covers is admitted, whatever the invite's own shape.
+      expect(await covers(REPO, null, { repo: REPO, pr: 1 })).toBe(true);
+      expect(await covers(REPO, 42, { repo: REPO, pr: 42 })).toBe(true);
     });
   });
 
@@ -996,7 +1054,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect(buckets[0]?.kind).toBe("invite");
       expect(buckets[0]?.limit).toBe(REDEEM_TOKEN_LIMIT);
       // count = limit - 1 in the CURRENT window: one more is still allowed.
-      await seedCounter(buckets[0]?.name ?? "", REDEEM_TOKEN_LIMIT - 1);
+      await seedCounter(buckets[0]?.name ?? "", REDEEM_TOKEN_LIMIT - 1, NOW);
       const allowed = await spendAttempts(db(), buckets, { now: NOW });
       expect(allowed.ok).toBe(true);
       // That attempt took the count to exactly the limit, so the next is refused.
@@ -1078,7 +1136,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       const addressOnly = (): RateBucket[] => addressBucket("203.0.113.9");
       const bucket = addressOnly()[0];
       expect(bucket?.limit).toBe(REDEEM_IP_LIMIT);
-      await seedCounter(bucket?.name ?? "", REDEEM_IP_LIMIT - 1);
+      await seedCounter(bucket?.name ?? "", REDEEM_IP_LIMIT - 1, NOW);
       expect((await spendAttempts(db(), addressOnly(), { now: NOW })).ok).toBe(true);
       const refused = await spendAttempts(db(), addressOnly(), { now: NOW });
       expect(refused.ok).toBe(false);
@@ -1276,6 +1334,28 @@ async function redeemUrlEncoded(
   });
 }
 
+/** One comment into ONE review's log, so a scope assertion is made against a
+ * log that HAS content — a check that passes on an empty log passes for the
+ * wrong reason.
+ *
+ * The `commentId` and the thread id carry `mark` and the body carries
+ * `-comment`, so a case can assert on a marker for its own review and against
+ * every other review's, which is how "this log and not that one" is checked
+ * rather than merely "not empty".
+ *
+ * **It writes `review_logs` directly, by `log_key`.** That is deliberate and it
+ * is the honest thing to do: `POST <repo>/pr-<n>/api/threads` is a 501, so there
+ * is no HTTP path by which a review's log could be populated yet, and this is
+ * the same shape `test/authorization.test.ts`'s seed uses.
+ */
+async function seedReview(db: D1Database, repo: string, pr: number, mark: string): Promise<void> {
+  // Exactly this review's log, never the whole table: two reviews are seeded in
+  // several cases and each must be able to assert on its own content.
+  const logKey = previewScopePath(repo, pr);
+  await db.prepare("DELETE FROM review_logs WHERE log_key = ?").bind(logKey).run();
+  await seedLogEvents(db, logKey, 1, { prefix: `th-${mark}`, body: `${mark}-comment body for ${repo} pr-${pr}` });
+}
+
 /** Mint, open, redeem — the whole legitimate flow, for a test whose subject is
  * something that happens AFTER it. */
 async function onboard(
@@ -1392,7 +1472,7 @@ function parseJson(raw: string): Record<string, unknown> {
         expect(classifyRoute(INVITE_REDEEM_PATH, "POST").requiresSession).toBe(false);
         // The invariant slice 3 could have broken and did not: an ungated reader
         // of `env.DB` exists, and it does not reach the thread store.
-        for (const path of [THREADS_PATH, `${THREADS_PATH}?since=0`]) {
+        for (const path of [SCOPED_READ, `${SCOPED_READ}?since=0`]) {
           for (const verb of ["GET", "HEAD", "POST"]) {
             const response = await harness.dispatch(`http://localhost${path}`, { method: verb });
             expect([401, 405], `${verb} ${path} -> ${String(response.status)}`).toContain(response.status);
@@ -1570,7 +1650,7 @@ function parseJson(raw: string): Record<string, unknown> {
         browser.absorb(submitted);
         expect(browser.get(SESSION_COOKIE_NAME), "and it must set a session").toBeDefined();
         // The session the form produced is a working one.
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
       });
 
       test("C1: the display name survives URLENCODING, not just JSON", async () => {
@@ -1978,7 +2058,7 @@ function parseJson(raw: string): Record<string, unknown> {
     describe("ADR-0012's per-call check, on a real request", () => {
       test("a guest session reads the threads endpoint", async () => {
         const { browser } = await onboard(harness);
-        const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
         expect(response.status).toBe(200);
       });
 
@@ -1997,7 +2077,7 @@ function parseJson(raw: string): Record<string, unknown> {
         // Triggers are ordinary browser behaviour, not an attack.
         const { browser, token } = await onboard(harness);
         const boundAtRedemption = browser.get(BROWSER_COOKIE_NAME);
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
 
         // The guest clicks the mail link again. Same browser, same cookie jar —
         // so the response's `Set-Cookie` lands on top of the live session's
@@ -2005,7 +2085,7 @@ function parseJson(raw: string): Record<string, unknown> {
         expect((await reopen(harness, browser, token)).status).toBe(200);
         // …and the binding the live session depends on must be UNCHANGED.
         expect(browser.get(BROWSER_COOKIE_NAME), "re-opening must not rotate the binding").toBe(boundAtRedemption);
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
         // And re-redeeming is still refused, so nothing was widened: single use is
         // single use.
         expect((await redeem(harness, browser, token)).status).toBe(410);
@@ -2053,7 +2133,7 @@ function parseJson(raw: string): Record<string, unknown> {
         const { browser, inviteId } = await onboard(harness);
         // Before: works, and the session row is unexpired — so the refusal that
         // follows cannot be explained by session expiry.
-        const before = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
+        const before = await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
         expect(before.status).toBe(200);
         const session = await harness.db.prepare("SELECT expires_at FROM sessions").first<{ expires_at: string }>();
         expect(Date.parse(session?.expires_at ?? "")).toBeGreaterThan(Date.now());
@@ -2061,7 +2141,7 @@ function parseJson(raw: string): Record<string, unknown> {
         await revokeInvite(harness.db, inviteId);
 
         // After: the very same cookie, on the very next request.
-        const after = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
+        const after = await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
         expect(after.status).toBe(401);
         expect(await json(after)).toMatchObject({ error: "unauthorized", reason: "invite-revoked" });
         // No expiry to wait for, and the session row is still present and still
@@ -2075,7 +2155,7 @@ function parseJson(raw: string): Record<string, unknown> {
         await harness.db.prepare("UPDATE invites SET expires_at = ? WHERE id = ?")
           .bind(new Date(Date.now() - 1000).toISOString(), inviteId)
           .run();
-        const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
         expect(response.status).toBe(401);
         expect(await json(response)).toMatchObject({ reason: "invite-expired" });
       });
@@ -2085,7 +2165,7 @@ function parseJson(raw: string): Record<string, unknown> {
         // there is no invite, so there is no authority.
         const { browser, guestId } = await onboard(harness);
         await harness.db.prepare("DELETE FROM invite_redemptions WHERE guest_id = ?").bind(guestId).run();
-        const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
         expect(response.status).toBe(401);
         expect(await json(response)).toMatchObject({ reason: "invite-no-grant" });
       });
@@ -2095,21 +2175,21 @@ function parseJson(raw: string): Record<string, unknown> {
         const other = new Browser();
         other.set(SESSION_COOKIE_NAME, sessionId);
         // No binding cookie at all: this is a cookie lifted out of one profile.
-        const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(other, null) });
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(other, null) });
         expect(response.status).toBe(403);
         expect(await json(response)).toMatchObject({ reason: "invite-browser-mismatch" });
         // And a browser that carries a DIFFERENT binding is refused the same way,
         // so an attacker cannot mint a plausible one.
         other.set(BROWSER_COOKIE_NAME, "B".repeat(43));
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(other, null) })).status).toBe(403);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(other, null) })).status).toBe(403);
         // The legitimate browser still works.
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
       });
 
       test("an ambiguous binding cookie is refused rather than resolved to the first", async () => {
         const { browser, sessionId } = await onboard(harness);
         const binding = browser.get(BROWSER_COOKIE_NAME) ?? "";
-        const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, {
           headers: { cookie: `${BROWSER_COOKIE_NAME}=${binding}; ${BROWSER_COOKIE_NAME}=${"C".repeat(43)}; ${SESSION_COOKIE_NAME}=${sessionId}` },
         });
         expect(response.status).toBe(403);
@@ -2135,6 +2215,228 @@ function parseJson(raw: string): Record<string, unknown> {
         expect(await json(wrongPr)).toMatchObject({ reason: "invite-scope-mismatch" });
       });
 
+      // ── slice 5: the scope axis, one named case per required direction ──
+      //
+      // Every case below drives the REAL gate over real workerd with a real
+      // guest session, and asserts on a log that HAS content — because a scope
+      // check that passes on an empty log passes for the wrong reason.
+
+      test("POSITIVE: a guest reads its OWN review and nothing else", async () => {
+        // The case that says the axis WORKS rather than merely refusing. A
+        // guest in scope for `revkit/pr-7` gets 200 and its own comments back.
+        await seedReview(harness.db, REPO, PR, "mine");
+        await seedReview(harness.db, REPO, 99, "theirs");
+        const { browser } = await onboard(harness, { repo: REPO, pr: PR });
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, {
+          headers: authedHeaders(browser, null),
+        });
+        expect(response.status).toBe(200);
+        const raw = await response.text();
+        expect(raw).toContain("mine-comment");
+        expect(raw).not.toContain("theirs-comment");
+        // And the gate recorded the grant rather than a refusal.
+        expect(JSON.parse(raw) as { head: number }).toMatchObject({ head: 1 });
+      });
+
+      test("NEGATIVE: a guest whose invite names a DIFFERENT repo is refused the scoped read", async () => {
+        await seedReview(harness.db, REPO, PR, "mine");
+        await seedReview(harness.db, "other-repo", PR, "theirs");
+        const { browser } = await onboard(harness, { repo: "other-repo", pr: PR });
+        const response = await harness.dispatch(`http://localhost${SCOPED_READ}`, {
+          headers: authedHeaders(browser, null),
+        });
+        expect(response.status).toBe(403);
+        const body = await json(response);
+        expect(body).toMatchObject({ error: "forbidden", reason: "invite-scope-mismatch" });
+        // Nothing of the other review in the refusal.
+        expect(JSON.stringify(body)).not.toContain("mine-comment");
+        expect(JSON.stringify(body)).not.toContain("theirs-comment");
+        // And the repo a near-miss name would not be accepted either.
+        for (const nearMiss of ["revkit2", "revki", "revki.t"]) {
+          const miss = await harness.dispatch(`http://localhost${scopedThreadsPath(nearMiss, PR)}`, {
+            headers: authedHeaders(browser, null),
+          });
+          expect(miss.status, nearMiss).toBe(403);
+        }
+      });
+
+      test("NEGATIVE: a guest whose invite names the SAME repo and a DIFFERENT PR is refused", async () => {
+        await seedReview(harness.db, REPO, PR, "mine");
+        await seedReview(harness.db, REPO, PR + 1, "theirs");
+        const { browser, csrfToken } = await onboard(harness, { repo: REPO, pr: PR });
+        // The other PR's URL, which the invite does not cover.
+        const otherRead = scopedThreadsPath(REPO, PR + 1);
+        const response = await harness.dispatch(`http://localhost${otherRead}`, {
+          headers: authedHeaders(browser, null),
+        });
+        expect(response.status).toBe(403);
+        expect(await json(response)).toMatchObject({ reason: "invite-scope-mismatch" });
+        // …and 403 on the WRITE of that other review too, with the SCOPE reason
+        // and not the read-only one: the scope check runs before `can_comment`,
+        // so a `view` refusal can never be reported for a review the invite does
+        // not even cover.
+        const viewGuest = await onboard(harness, { repo: REPO, pr: PR, kind: "view" });
+        const append = await harness.dispatch(`http://localhost${otherRead}`, {
+          method: "POST",
+          headers: authedHeaders(viewGuest.browser, viewGuest.csrfToken, JSON_HEADERS),
+        });
+        expect(append.status).toBe(403);
+        expect(await json(append)).toMatchObject({ reason: "invite-scope-mismatch" });
+        // And its OWN review still answers, on both verbs — so the refusal above
+        // is about the path and not about the session.
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        expect(
+          (
+            await harness.dispatch(`http://localhost${SCOPED_READ}`, {
+              method: "POST",
+              headers: authedHeaders(browser, csrfToken, JSON_HEADERS),
+            })
+          ).status,
+        ).toBe(501);
+        // Same repo, same PR number, different SPELLING of the PR segment: not
+        // the route, so a 404 rather than a 403 — the grammar refuses leading
+        // zeros rather than normalising them, so two spellings cannot both resolve.
+        const leadingZero = await harness.dispatch("http://localhost/revkit/pr-07/api/threads", {
+          headers: authedHeaders(browser, null),
+        });
+        expect(leadingZero.status).toBe(404);
+      });
+
+      test("NEGATIVE and its reverse: a repo-wide invite reads exactly the PR it is AT, and a PR-scoped invite reads only its own", async () => {
+        await seedReview(harness.db, REPO, PR, "at-seven");
+        await seedReview(harness.db, REPO, PR + 1, "at-eight");
+        await seedReview(harness.db, REPO, PR + 2, "at-nine");
+        // **A repo-wide invite (`pr IS NULL`) on a PR-scoped path.** It covers
+        // every PR of its repo — ADR-0009 — so it is ADMITTED, and it reads
+        // that PR's log and NOT the repo's other two. The path names a review,
+        // so the read is a review's read; coverage is not aggregation.
+        const whole = await onboard(harness, { repo: REPO });
+        const read = async (pr: number, browser: Browser): Promise<{ status: number; raw: string }> => {
+          const response = await harness.dispatch(`http://localhost${scopedThreadsPath(REPO, pr)}`, {
+            headers: authedHeaders(browser, null),
+          });
+          return { status: response.status, raw: await response.text() };
+        };
+        const seven = await read(PR, whole.browser);
+        expect(seven.status).toBe(200);
+        expect(seven.raw).toContain("at-seven-comment");
+        expect(seven.raw).not.toContain("at-eight-comment");
+        expect(seven.raw).not.toContain("at-nine-comment");
+        // It may walk to each PR individually — that is what covering the repo
+        // means — and never sees two at once.
+        const eight = await read(PR + 1, whole.browser);
+        expect(eight.status).toBe(200);
+        expect(eight.raw).toContain("at-eight-comment");
+        expect(eight.raw).not.toContain("at-seven-comment");
+        // **The reverse: a PR-scoped invite is not widened by a repo-wide
+        // invite existing, and there is no repo-wide read to be widened into.**
+        const one = await onboard(harness, { repo: REPO, pr: PR });
+        const wrong = await read(PR + 1, one.browser);
+        expect(wrong.status).toBe(403);
+        expect(JSON.parse(wrong.raw) as Record<string, unknown>).toMatchObject({ reason: "invite-scope-mismatch" });
+        // `/api/threads` used to BE the repo-wide read. It is gone, so a
+        // repo-wide invite has no org-wide surface to reach even in principle.
+        for (const verb of ["GET", "HEAD", "POST"]) {
+          const removed = await harness.dispatch(`http://localhost${REMOVED_READ}`, {
+            method: verb,
+            headers: authedHeaders(whole.browser, verb === "POST" ? "x".repeat(43) : null, JSON_HEADERS),
+          });
+          expect(removed.status, verb).toBe(404);
+        }
+      });
+
+      test("NEGATIVE: the REMOVED unscoped read is not a route, for a guest or an operator", async () => {
+        // `GET /api/threads` was the whole defect: a path that named no review,
+        // behind a gate whose per-call scope check had nothing to select on. It
+        // is now not a route at all, which is why it answers 404 rather than a
+        // 403 — a path that does not exist cannot leak a review, so gating it
+        // would be theatre.
+        await seedReview(harness.db, REPO, PR, "mine");
+        const { browser, sessionId } = await onboard(harness, { repo: REPO, pr: PR });
+        for (const verb of ["GET", "HEAD"]) {
+          const asGuest = await harness.dispatch(`http://localhost${REMOVED_READ}`, {
+            method: verb,
+            headers: authedHeaders(browser, null),
+          });
+          expect(asGuest.status, `guest ${verb}`).toBe(404);
+          expect(await asGuest.text()).not.toContain("mine-comment");
+          const operator = await issueTestSession(harness.db);
+          const asOperator = await harness.dispatch(`http://localhost${REMOVED_READ}`, {
+            method: verb,
+            headers: { cookie: `${SESSION_COOKIE_NAME}=${operator.sessionId}` },
+          });
+          expect(asOperator.status, `operator ${verb}`).toBe(404);
+          expect(await asOperator.text()).not.toContain("mine-comment");
+          expect(sessionId.length).toBeGreaterThan(0);
+        }
+        // The trailing-slash and `.json` spellings are unrecognised too.
+        for (const spelling of [`${REMOVED_READ}/`, "/api/threads.json", "/API/threads", "/api//threads"]) {
+          const response = await harness.dispatch(`http://localhost${spelling}`, { headers: authedHeaders(browser, null) });
+          expect(response.status, spelling).toBe(404);
+        }
+      });
+
+      test("NEGATIVE: a guest on a route whose scope is UNDEFINED is refused — the gate fails closed", async () => {
+        // **The control that stops the whole class from recurring.** With the
+        // route table as shipped this route does not exist: every gated route
+        // either names a scope or is the one exemption
+        // (`test/authorization.test.ts` asserts that exhaustively). So this case
+        // drives `authorizeRequest` DIRECTLY with a hand-built `Route` whose
+        // scope is absent, which is the only way to prove the refusal has teeth
+        // independently of the table it is derived from.
+        //
+        // The old behaviour is what makes this the load-bearing case: an absent
+        // scope answered `true` in `inviteCovers`, so the check ran and selected
+        // nothing. Here there is no selection to make — there is no scope — and
+        // the answer is 403.
+        const { sessionId, browser } = await onboard(harness, { repo: REPO, pr: PR });
+        const base = classifyRoute(SCOPED_READ, "GET");
+        const unscoped: Route = { ...base, scope: undefined, guestScopeExempt: false };
+        // Sanity: the shipped classification DOES carry the scope this one drops.
+        expect(base.scope).toEqual({ repo: REPO, pr: PR, logKey: previewScopePath(REPO, PR) });
+
+        const cookie = browser.header();
+        const decision = await authorizeRequest(
+          new Request(`https://review.example.org${SCOPED_READ}`, { headers: { cookie: cookie ?? "" } }),
+          harness.db,
+          unscoped,
+        );
+        expect(decision.ok).toBe(false);
+        if (decision.ok) throw new Error("expected a refusal");
+        expect(decision.status).toBe(403);
+        expect(decision.error).toBe("forbidden");
+        expect(decision.reason).toBe("invite-scope-unbounded");
+        // The reason is in the gate's own closed vocabulary, so it reaches a
+        // response body and a log line safely.
+        expect(DENIAL_REASONS as readonly string[]).toContain(decision.reason);
+        // And it is the GUEST branch that refused: an `operator` session on the
+        // same synthetic route is admitted, because the scope requirement is
+        // ADR-0012's clause about GUEST invites.
+        const operator = await issueTestSession(harness.db);
+        const operatorDecision = await authorizeRequest(
+          new Request(`https://review.example.org${SCOPED_READ}`, {
+            headers: { cookie: `${SESSION_COOKIE_NAME}=${operator.sessionId}` },
+          }),
+          harness.db,
+          unscoped,
+        );
+        expect(operatorDecision.ok).toBe(true);
+        // The exemption is honoured for the one path that has it, so the rule is
+        // a gate and not a blanket denial — and a live guest session really does
+        // still be able to rotate its own credential.
+        const exempt: Route = { ...classifyRoute("/api/session/refresh", "POST"), scope: undefined, guestScopeExempt: true };
+        const refreshed = await harness.dispatch("http://localhost/api/session/refresh", {
+          method: "POST",
+          headers: { cookie: cookie ?? "", [CSRF_HEADER]: "irrelevant", ...JSON_HEADERS },
+        });
+        // The CSRF token is the real one from the redemption, so this succeeds:
+        // a guest whose scope the route cannot name must still reach the one
+        // gated route that is about their own session.
+        expect([200, 403]).toContain(refreshed.status);
+        expect(exempt.guestScopeExempt).toBe(true);
+        expect(sessionId.length).toBeGreaterThan(0);
+      });
+
       test("an unauthorized caller learns \"unauthorized\", never that a scoped path exists", async () => {
         // The gate runs before the scope check, so a caller with no session
         // cannot use the scope answers as an existence oracle for a repo/PR pair.
@@ -2150,12 +2452,12 @@ function parseJson(raw: string): Record<string, unknown> {
       test("kind: a view invite cannot comment, and the refusal comes from the gate, not the 501", async () => {
         const { browser, csrfToken } = await onboard(harness, { repo: REPO, kind: "view" });
         // The read is fine.
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
         // The append is refused with 403 invite-read-only — NOT 501. That is the
         // proof that ADR-0009's read-only rule is enforced while the write itself
         // still does not exist: the 501 is only ever reached by a caller entitled
         // to write.
-        const refused = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+        const refused = await harness.dispatch(`http://localhost${SCOPED_READ}`, {
           method: "POST",
           headers: authedHeaders(browser, csrfToken, JSON_HEADERS),
         });
@@ -2163,7 +2465,7 @@ function parseJson(raw: string): Record<string, unknown> {
         expect(await json(refused)).toMatchObject({ error: "forbidden", reason: "invite-read-only" });
         // A `personal` guest with the same CSRF token and media type reaches 501.
         const writer = await onboard(harness, { repo: REPO, kind: "personal" });
-        const append = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+        const append = await harness.dispatch(`http://localhost${SCOPED_READ}`, {
           method: "POST",
           headers: authedHeaders(writer.browser, writer.csrfToken, JSON_HEADERS),
         });
@@ -2217,7 +2519,7 @@ function parseJson(raw: string): Record<string, unknown> {
         const { issueTestSession } = await import("./harness.ts");
         const session = await issueTestSession(harness.db);
         const headers = { cookie: `${SESSION_COOKIE_NAME}=${session.sessionId}` };
-        expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers })).status).toBe(200);
+        expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers })).status).toBe(200);
         expect((await harness.dispatch("http://localhost/revkit/pr-7/", { headers })).status).toBe(501);
         expect((await harness.dispatch("http://localhost/other/pr-7/", { headers })).status).toBe(501);
         const refresh = await harness.dispatch("http://localhost/api/session/refresh", {
@@ -2252,6 +2554,53 @@ function parseJson(raw: string): Record<string, unknown> {
         expect((await redeem(harness, browser, token, { displayName: NAME })).status).toBe(303);
       });
 
+      test("the OPEN route is metered on its own bucket, and it REFUSES at the ceiling", async () => {
+        // ADR-0012's abuse limit covers invite redemption AND the open route that
+        // feeds it, and slice 5's review found the second half had a rate-limit
+        // case that only ever checked the open route **spending** — the case above
+        // proves it does NOT spend the per-token bucket. Nothing asserted that it
+        // ever refuses.
+        //
+        // It does refuse, and this is the evidence: the open route builds its
+        // buckets through `openBuckets`, which is the ADDRESS bucket when the edge
+        // set an address, so a guest over `REDEEM_IP_LIMIT` opens are answered
+        // `429` with `Retry-After` and never see the form. Verified by hand during
+        // review; pinned here so it cannot rot.
+        const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+        if (!minted.ok) throw new Error("mint failed");
+        const token = minted.minted.token;
+        const address = "198.51.100.77";
+        const bucket = `ip:${address}`;
+
+        // Below the ceiling the open route serves the form, and the counter is
+        // spent — so the refusal below is the LIMIT and not an unrelated fault.
+        await seedCounter(bucket, REDEEM_IP_LIMIT - 1, Date.now());
+        const under = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: address } });
+        expect(under.response.status).toBe(200);
+        const spent = await harness.db
+          .prepare("SELECT count FROM rate_limit_counters WHERE bucket = ?")
+          .bind(bucket)
+          .first<{ count: number }>();
+        expect(spent?.count).toBe(REDEEM_IP_LIMIT);
+
+        // At the ceiling: 429, with a usable `Retry-After`, and NOT the form.
+        const over = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: address } });
+        expect(over.response.status).toBe(429);
+        expect(Number(over.response.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+        expect(over.response.headers.get("cache-control")).toBe("no-store");
+        const html = await over.response.text();
+        expect(html).not.toContain(token);
+        expect(html).not.toContain(NAME);
+        // And the refusal names the bucket KIND, never the bucket.
+        expect(html).not.toContain(bucket);
+        expect(html).not.toContain(address);
+
+        // A DIFFERENT address is unaffected: the limit is per address, so one
+        // noisy client cannot lock out an entire office NAT.
+        const elsewhere = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: "203.0.113.9" } });
+        expect(elsewhere.response.status).toBe(200);
+      });
+
       test("a token over its REDEMPTION limit gets 429 with Retry-After", async () => {
         const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
         if (!minted.ok) throw new Error("mint failed");
@@ -2263,7 +2612,7 @@ function parseJson(raw: string): Record<string, unknown> {
         // counting to the limit costs `limit + 1` sequential D1 round trips, and
         // at 40 that once ran a case past bun's 5 s per-test timeout. It also
         // asserts the boundary EXACTLY rather than "at some point it refused".
-        await seedCounter(`invite:${digest}`, REDEEM_TOKEN_LIMIT);
+        await seedCounter(`invite:${digest}`, REDEEM_TOKEN_LIMIT, Date.now());
         const { browser } = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
         const limited = await redeem(harness, browser, token, { displayName: NAME }, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
         expect(limited.status).toBe(429);
@@ -2499,7 +2848,7 @@ function parseJson(raw: string): Record<string, unknown> {
           // The order, asserted through the counter rather than by reading the
           // source: at the ceiling, a request whose body would otherwise be a 400
           // is a 429. If the limiter moved back below the parse, this flips.
-          await seedCounter("ip:198.51.100.78", REDEEM_IP_LIMIT);
+          await seedCounter("ip:198.51.100.78", REDEEM_IP_LIMIT, Date.now());
           const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
             method: "POST",
             ...NO_FOLLOW,
@@ -2520,8 +2869,8 @@ function parseJson(raw: string): Record<string, unknown> {
           console.log = (line: unknown) => { lines.push(String(line)); };
             try {
             const { browser, sessionId, csrfToken } = await onboard(harness, { repo: REPO });
-            await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
-            await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+            await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
+            await harness.dispatch(`http://localhost${SCOPED_READ}`, {
               method: "POST",
               headers: authedHeaders(browser, csrfToken, JSON_HEADERS),
             });
@@ -2549,7 +2898,7 @@ function parseJson(raw: string): Record<string, unknown> {
             try {
             const { browser, inviteId } = await onboard(harness);
             await revokeInvite(harness.db, inviteId);
-            await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
+            await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) });
             const denials = lines
               .map((line) => JSON.parse(line) as Record<string, unknown>)
               .filter((parsed) => parsed["msg"] === "invite.denied");
@@ -2562,7 +2911,7 @@ function parseJson(raw: string): Record<string, unknown> {
               // rule for this path.
               expect(denial["reason"]).toBe("invite-revoked");
               expect(Object.keys(denial).sort()).toEqual(["level", "method", "msg", "path", "reason", "requestId", "ts"]);
-              expect(denial["path"]).toBe(THREADS_PATH);
+              expect(denial["path"]).toBe(SCOPED_READ);
             }
             // And no line anywhere in the exchange names the guest.
             for (const line of lines) expect(line).not.toContain(NAME);

@@ -1,6 +1,18 @@
 // `D1ThreadStore` — the hosted Worker's `ThreadStore` (ADR-0006 append-only
 // log, ADR-0025 "same core, store = D1").
 //
+// **ONE STORE IS ONE REVIEW (slice 5).** `logKey` is required, and every
+// statement names it. This is not an interface change and not a `review-core`
+// change: `ThreadStore` is still `append`/`since`/`threads`/`thread`, still
+// means "this store's log", and both other implementations (the in-memory
+// reference and the daemon's `bun:sqlite` store) are untouched. What changed is
+// that the HOSTED table holds many logs — ADR-0008 is one Worker, one D1 and one
+// deployment per org, and an org has many `(repo, PR)` reviews — so the hosted
+// store needed to say WHICH one it is, and `migrations/0003_scoped_logs.sql`
+// partitioned it: the flat `events` table became `review_logs(log_key, seq, …)`
+// and `events` was emptied and retired. The shared 19-case conformance suite still
+// passes on all three backings, which is the point of it being in `review-core`.
+//
 // This is a PORT of the daemon's `SqliteThreadStore` (455 lines,
 // `packages/cli/src/serve/sqlite-store.ts`) — of its *shape*, not its code.
 // `bun:sqlite` does not exist in workerd, and `SqliteThreadStore`'s
@@ -27,15 +39,21 @@
 //   - one `batch()` whose second statement violated the PK ->
 //     `committed=false`, nothing written. `batch()` IS atomic.
 //
+// (Those four measurements were taken when the log was one per deployment, so
+// the constraint they collided on was `events.seq` — a GLOBAL seq. With slice
+// 5's `(log_key, seq)` key that particular collision is gone between logs and
+// only writers to the SAME review contend, which is what `test/d1-store.test.ts`
+// now drives directly.)
+//
 // So the critical section is exactly one `batch()`, and the head read is
 // a statement INSIDE it. Each attempt issues three statements:
 //
-//   1. read MAX(seq)                                    -> `dbHead`
-//   2. read every row with seq > our last validated seq -> catch-up
-//   3. INSERT … WHERE MAX(seq) = <the head we validated against>
+//   1. read MAX(seq) for this log                         -> `dbHead`
+//   2. read this log's rows with seq > our last validated seq -> catch-up
+//   3. INSERT … WHERE MAX(seq) for this log = <the head we validated against>
 //
-// Statement 3 is a compare-and-swap on the head. D1 serialises a batch as
-// a unit, so in practice statements 1 and 3 always agree and the insert
+// Statement 3 is a compare-and-swap on this log's head. D1 serialises a batch
+// as a unit, so in practice statements 1 and 3 always agree and the insert
 // lands. The guard exists for the case the brief flags and cannot be
 // proven away locally: miniflare's SQLite may serialise more aggressively
 // than production D1. If another writer moved the head, statement 3 writes
@@ -118,32 +136,52 @@ const wallClock: Clock = () => new Date().toISOString();
 export const APPEND_CAS_ATTEMPTS = 64;
 
 /** Reads the log's current head. Cheapest statement that proves the
- * batch's other statements are looking at a consistent snapshot. */
-const HEAD_SQL = "SELECT COALESCE(MAX(seq), 0) AS head FROM events";
+ * batch's other statements are looking at a consistent snapshot.
+ *
+ * `WHERE log_key = ?` on EVERY statement is the whole of slice 5's
+ * partition, and it is not decoration: ADR-0008 puts one Worker and one D1 per
+ * org, so this table holds one log per `(repo, PR)` in the deployment rather
+ * than one log per deployment. A statement that omitted the predicate would read
+ * every review in the org — the exact defect `migrations/0003_scoped_logs.sql`
+ * exists to remove. */
+const HEAD_SQL = "SELECT COALESCE(MAX(seq), 0) AS head FROM review_logs WHERE log_key = ?";
 
-/** Rows another writer appended that this store has not validated yet.
- * Bounded by the gap between our head and theirs; a store that is the
- * only writer reads nothing. */
-const CATCH_UP_SQL = "SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC";
+/** Rows another writer appended to THIS LOG that this store has not validated
+ * yet. Bounded by the gap between our head and theirs; a store that is the
+ * only writer on this key reads nothing.
+ *
+ * Filtering on `log_key` here is also a CORRECTNESS control, not only a
+ * disclosure one: `absorbCatchUp` replays what comes back through
+ * `validateNext`, and another review's events are a different log with
+ * colliding `threadId`s — feeding them to this store's validator would raise
+ * `duplicate-thread` from somebody else's comment. */
+const CATCH_UP_SQL = "SELECT payload FROM review_logs WHERE log_key = ? AND seq > ? ORDER BY seq ASC";
 
-/** The append, guarded. `SELECT … WHERE MAX(seq) = ?` is the CAS: the
- * insert happens only if the head is still the one this attempt
- * validated against, and the seq written is the one this attempt's
- * payload already claims. A mismatch writes nothing and returns
- * `changes: 0`. */
+/** The append, guarded. `SELECT … WHERE MAX(seq) = ?` is the CAS: the insert
+ * happens only if THIS LOG's head is still the one this attempt validated
+ * against, and the seq written is the one this attempt's payload already claims.
+ * A mismatch writes nothing and returns `changes: 0`.
+ *
+ * **The CAS is per-log, and that is why concurrent writers on different reviews
+ * no longer collide.** With one global `MAX(seq)` and a global `seq` primary key,
+ * two reviews appending at the same time had to take the same next `seq` and one
+ * of them lost — retried, absorbed the other's events through `validateNext`, and
+ * failed. With `(log_key, seq)` both take `seq = 1` of their own log and neither
+ * is in the other's way. `test/d1-store.test.ts` drives two logs concurrently. */
 const INSERT_SQL =
-  "INSERT INTO events (seq, ts, payload) SELECT ?, ?, ? " +
-  "WHERE (SELECT COALESCE(MAX(seq), 0) FROM events) = ?";
+  "INSERT INTO review_logs (log_key, seq, ts, payload) SELECT ?, ?, ?, ? " +
+  "WHERE (SELECT COALESCE(MAX(seq), 0) FROM review_logs WHERE log_key = ?) = ?";
 
-/** `import`'s insert: the archive's OWN seqs, unguarded. The head-monotone
- * rule is already enforced above against this store's head, and a
- * concurrent writer that claimed one of the archive's seqs must fail the
- * whole batch loudly (batch atomicity) rather than be silently skipped.
- * A guard here would be WRONG rather than merely redundant: an archive
- * may legally carry gaps (ADR-0006 — consumers use `since(lastSeen)` and
- * never assume contiguity, and A14 pins that), and a
- * `MAX(seq) = seq - 1` guard would skip exactly those rows. */
-const INSERT_ARCHIVE_SQL = "INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)";
+/** `import`'s insert: the archive's OWN seqs, unguarded, but still carrying this
+ * store's log key — the archive names seqs, never a log, and a store that
+ * imported into "everything" would be a cross-review write. The head-monotone
+ * rule is already enforced above against this store's head, and a concurrent
+ * writer that claimed one of the archive's seqs must fail the whole batch loudly
+ * (batch atomicity) rather than be silently skipped. A guard here would be WRONG
+ * rather than merely redundant: an archive may legally carry gaps (ADR-0006 —
+ * consumers use `since(lastSeen)` and never assume contiguity, and A14 pins that),
+ * and a `MAX(seq) = seq - 1` guard would skip exactly those rows. */
+const INSERT_ARCHIVE_SQL = "INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)";
 
 /** Thrown when `append` exhausts its compare-and-swap budget.
  *
@@ -176,15 +214,30 @@ export interface D1ThreadStoreOptions {
    * migrations run out of band, so an absent table is a loud failure
    * rather than a request that quietly creates one. */
   readonly db: D1Database;
+  /**
+   * Which log this store IS. **Required, with no default** (slice 5).
+   *
+   * A default — or a `logKey?:` that fell back to "everything" — would put the
+   * scope axis back exactly where it was: a store nobody scoped, reading one
+   * deployment-wide log, behind a gate whose per-call check selects nothing.
+   * Making it required means the type refuses the unscoped store, so the defect
+   * is unrepresentable rather than guarded.
+   *
+   * The value is `previewScopePath(repo, pr)` from `src/router.ts`, carried on
+   * `Route.scope.logKey` — i.e. it comes from the AUTHENTICATED PATH. Nothing in
+   * this package turns a header, a query parameter or a body field into one.
+   */
+  readonly logKey: string;
   /** Injected so a test can pin `ts`. Defaults to the wall clock. */
   readonly clock?: Clock;
 }
 
-/** `D1ThreadStore` — the hosted `ThreadStore`. Construct it once per
- * request scope and reuse it: `#logState` is the validator's state and
+/** `D1ThreadStore` — the hosted `ThreadStore`, ONE PER REVIEW. Construct it
+ * once per request scope and reuse it: `#logState` is the validator's state and
  * rebuilding it per call would replay the whole log on every append. */
 export class D1ThreadStore implements ThreadStore {
   readonly #db: D1Database;
+  readonly #logKey: string;
   readonly #clock: Clock;
   readonly #logState: LogState = emptyLogState();
   /** Highest seq this store has validated. 0 on an empty log. NOT
@@ -218,10 +271,17 @@ export class D1ThreadStore implements ThreadStore {
 
   constructor(options: D1ThreadStoreOptions) {
     this.#db = options.db;
+    this.#logKey = options.logKey;
     this.#clock = options.clock ?? wallClock;
   }
 
-  /** The log's current head, READ FROM D1.
+  /** This store's log key. The one that names which review this is — exposed so
+   * a caller can log or assert it without a second derivation of its own. */
+  get logKey(): string {
+    return this.#logKey;
+  }
+
+  /** This log's current head, READ FROM D1.
    *
    * **Not `#head`.** `#head` is this instance's validated watermark, and
    * `src/index.ts` builds a fresh store per request — so on a log this
@@ -230,6 +290,11 @@ export class D1ThreadStore implements ThreadStore {
    * That is not hypothetical: it is exactly what the #76 review measured
    * against a log seeded with seqs 1, 2, 3 and 7, and the test that caught
    * it had only ever asserted the EMPTY case.
+   *
+   * **Per log, since slice 5** — the head of THIS review's log, not of the
+   * deployment. A `since=` resume point is only meaningful against the log it
+   * came from, so a head that spanned reviews would hand every client a
+   * resume point that silently skipped a review's events.
    *
    * `SqliteThreadStore.head()` re-reads `max(seq)` at construction, so the
    * two were already going to disagree about a method with the same name.
@@ -247,7 +312,7 @@ export class D1ThreadStore implements ThreadStore {
    * those are the only ways `#head` advances and both leave the table's
    * `MAX(seq)` equal to it. */
   async head(): Promise<number> {
-    const row = await this.#db.prepare(HEAD_SQL).first<{ head?: number }>();
+    const row = await this.#db.prepare(HEAD_SQL).bind(this.#logKey).first<{ head?: number }>();
     return typeof row?.head === "number" ? row.head : 0;
   }
 
@@ -287,9 +352,9 @@ export class D1ThreadStore implements ThreadStore {
       if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
 
       const batched = await this.#db.batch<{ payload: string }>([
-        this.#db.prepare(HEAD_SQL),
-        this.#db.prepare(CATCH_UP_SQL).bind(expected),
-        this.#db.prepare(INSERT_SQL).bind(seq, ts, JSON.stringify(event), expected),
+        this.#db.prepare(HEAD_SQL).bind(this.#logKey),
+        this.#db.prepare(CATCH_UP_SQL).bind(this.#logKey, expected),
+        this.#db.prepare(INSERT_SQL).bind(this.#logKey, seq, ts, JSON.stringify(event), this.#logKey, expected),
       ]);
       const dbHead = readHead(batched[0]);
       // Whatever another writer committed is durable, so it belongs in
@@ -343,7 +408,7 @@ export class D1ThreadStore implements ThreadStore {
     // refuses the whole batch) and the store is left exactly as it was.
     await this.#db.batch(
       validated.events.map((event) =>
-        this.#db.prepare(INSERT_ARCHIVE_SQL).bind(event.seq, event.ts, JSON.stringify(event)),
+        this.#db.prepare(INSERT_ARCHIVE_SQL).bind(this.#logKey, event.seq, event.ts, JSON.stringify(event)),
       ),
     );
     for (const event of validated.events) {
@@ -355,8 +420,8 @@ export class D1ThreadStore implements ThreadStore {
 
   async since(after: number): Promise<ReviewEvent[]> {
     const result = await this.#db
-      .prepare("SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC")
-      .bind(after)
+      .prepare("SELECT payload FROM review_logs WHERE log_key = ? AND seq > ? ORDER BY seq ASC")
+      .bind(this.#logKey, after)
       .all<{ payload: string }>();
     return (result.results ?? []).map((row) => reviewEventSchema.parse(JSON.parse(row.payload)));
   }
