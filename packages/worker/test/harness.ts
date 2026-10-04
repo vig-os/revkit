@@ -196,6 +196,50 @@ export function scanForForbidden(text: string): string[] {
   return hits;
 }
 
+/** `src/*.ts` reduced to CODE: comments and string literals removed, so a source
+ * scan asserts about IDENTIFIERS rather than about the prose and the literals
+ * around them.
+ *
+ * **It lives here, not in one test file, because two files now sweep `src/`.**
+ * It was private to `test/authorization.test.ts`, and the second sweep (the
+ * `invites.repo`-writer check in `test/invites.test.ts`) needed the identical
+ * function — a second copy would be a second thing to keep in step with the
+ * first, and the two copies would drift into disagreeing about what "code"
+ * means. `harness.ts` is the shared test module, so this is its home.
+ *
+ * Both strippers are needed, and each was added because the scan failed on the
+ * thing it was meant to ignore:
+ *   - COMMENTS, because the prose in `src/` names the very constructs a sweep
+ *     guards against — a gate that could only pass by deleting that
+ *     documentation is a gate that gets the documentation deleted.
+ *   - STRING LITERALS, because the functions' own refusal reasons are things
+ *     like `"bad-request"`, whose text contains `request`. A bare substring scan
+ *     is therefore not an identifier scan.
+ *
+ * `strings: true` keeps string LITERALS, for the checks that need to identify an
+ * ARM by its `kind` — which is a string. Stripping them would make
+ * `kind: "session-refresh"` unfindable, so the two uses are separated rather than
+ * one compromise.
+ *
+ * Both replace with a SPACE rather than deleting, so two tokens cannot be joined
+ * into one identifier that was never in the source. A false strip can only
+ * REMOVE text, and every assertion this feeds is an assertion of ABSENCE — so
+ * the failure mode is a missed detection, never a manufactured one. */
+export function stripTsComments(source: string, options: { readonly strings?: boolean } = {}): string {
+  const withoutStrings =
+    options.strings === true
+      ? source
+      : source.replace(/("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, " ");
+  return withoutStrings
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map((line) => {
+      const at = line.indexOf("//");
+      return at === -1 ? line : line.slice(0, at);
+    })
+    .join("\n");
+}
+
 /** Every occurrence of every forbidden pattern, as `"what@offset"`. Needed
  * because the runtime probe legitimately CONTAINS one `Buffer` token — it is
  * the line that measures `typeof globalThis.Buffer` to prove the global is

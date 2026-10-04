@@ -57,6 +57,7 @@ import {
   cookieHeader,
   issueTestSession,
   seedLogEvents,
+  stripTsComments,
   JSON_HEADERS,
   startWorker,
   type Harness,
@@ -1846,40 +1847,3 @@ describe("ADR-0012's per-request gate", () => {
  * the closed union is exactly what `expectRefused`'s reason assertion relies
  * on, and an unused import would hide that from the next reader. */
 export type { DenialReason };
-
-/** `src/index.ts` reduced to CODE: comments and string literals removed, so a
- * source scan asserts about identifiers rather than about the prose and the
- * literals around them.
- *
- * Both strippers are needed, and each was added because the scan failed on the
- * thing it was meant to ignore:
- *   - COMMENTS, because `readThreads` documents the very mutation it guards
- *     against by name — a gate that could only pass by deleting that
- *     documentation is a gate that gets the documentation deleted.
- *   - STRING LITERALS, because the function's own refusal reason is
- *     `"bad-request"`, whose text contains `request`. A bare substring scan is
- *     therefore not an identifier scan.
- *
- * `strings: true` keeps string LITERALS, for the checks that need to identify an
- * ARM by its `kind` — which is a string. Stripping them would make
- * `kind: "session-refresh"` unfindable, so the two uses are separated rather than
- * one compromise.
- *
- * Both replace with a SPACE rather than deleting, so two tokens cannot be joined
- * into one identifier that was never in the source. A false strip can only
- * REMOVE text, and every assertion this feeds is an assertion of ABSENCE — so
- * the failure mode is a missed detection, never a manufactured one. */
-function stripTsComments(source: string, options: { readonly strings?: boolean } = {}): string {
-  const withoutStrings =
-    options.strings === true
-      ? source
-      : source.replace(/("(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|`(?:[^`\\]|\\.)*`)/g, " ");
-  return withoutStrings
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n")
-    .map((line) => {
-      const at = line.indexOf("//");
-      return at === -1 ? line : line.slice(0, at);
-    })
-    .join("\n");
-}

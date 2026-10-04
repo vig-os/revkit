@@ -89,6 +89,63 @@ export function isRepoName(value: string): boolean {
   return REPO_SEGMENT.test(value);
 }
 
+/**
+ * The ONE canonical spelling of a repository name: ASCII case-folded.
+ *
+ * ── The seam this closes ──────────────────────────────────────────────────
+ *
+ * **A GitHub repository name is case-INSENSITIVE; a revkit repo segment is
+ * case-SENSITIVE.** So an operator who mints `repo = "Revkit"` and serves the
+ * canonical `/revkit/` spelling fails the scope check on every call and refuses
+ * that guest their own review. Before this function existed the failure was
+ * fail-closed and pinned by a test (`test/authorization.test.ts`'s "or path
+ * case" case asserts `/REVKIT/pr-7/api/threads` reaches a DIFFERENT, empty log),
+ * so it was an inconvenience rather than a hole — but it is the operator's own
+ * review, and they cannot serve it.
+ *
+ * ── Why it is applied at MINT and never at READ ──────────────────────────
+ *
+ * The other side of the comparison is the URL, and folding that would be the
+ * actual defect. `parsePreviewPath` returns `segments[1]` verbatim, so today
+ * `/REVKIT/pr-7` and `/revkit/pr-7` are two reviews with two log keys and two
+ * R2 prefixes. Folding the read side would collapse them into one — the
+ * "two spellings of one path must not both resolve" rule this file already
+ * enforces for doubled slashes and for `%2e` — and it would MOVE the log key,
+ * which is the R2 partition. So the stored side moves to the canonical form and
+ * the URL side stays exact.
+ *
+ * **That makes the comparison's semantics unchanged and its arithmetic
+ * different.** `inviteCovers` still compares with `!==`; what changes is that
+ * the stored value is now the canonical spelling. So the set of URLs an invite
+ * admits still has exactly ONE member — before it was `{typed}`, now it is
+ * `{canonical}`. A fold on both sides would have made that set have one member
+ * too, but the WRONG one, shared by two spellings.
+ *
+ * ── Why `toLowerCase` and not `toLocaleLowerCase` ────────────────────────
+ *
+ * `toLocaleLowerCase` is locale-sensitive: under a Turkish locale `"I"` folds
+ * to a dotless `ı` (U+0131), which is not in `REPO_SEGMENT` at all, so the
+ * canonical form of a name this function accepts could be a name
+ * `isRepoName` rejects — and the stored value would depend on the runtime's
+ * locale rather than on the input. `toLowerCase` is locale-independent.
+ *
+ * ── Total and idempotent over the admitted class ─────────────────────────
+ *
+ * `REPO_SEGMENT` is `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, so the only characters
+ * that fold are ASCII letters and the fold is a bijection inside the class:
+ * `canonicalRepoName(canonicalRepoName(x)) === canonicalRepoName(x)`, and
+ * `isRepoName(canonicalRepoName(x)) === isRepoName(x)`. So folding can neither
+ * ADMIT a name the predicate rejects nor change a refusal, which is what makes
+ * it safe to apply after validation. `test/router.test.ts` sweeps the whole
+ * admitted character class to keep that a measurement rather than a claim.
+ *
+ * **It is a canonicaliser, not a validator.** Callers still apply
+ * `isRepoName`; this function says nothing about whether a name is servable.
+ */
+export function canonicalRepoName(value: string): string {
+  return value.toLowerCase();
+}
+
 /** The `pr-<n>` segment. `\d{1,9}` caps the number at nine digits so a
  * path cannot carry an unbounded integer into a key, and the bound is
  * far above any real PR number. Leading zeros are REFUSED rather than
