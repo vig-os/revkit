@@ -296,6 +296,52 @@ describe("D1 schema", () => {
     }
   });
 
+  test("0003: a PARTIALLY applied database converges — the copy is where `OR IGNORE` earns its place", async () => {
+    // The case above re-applies the whole file twice, which never exercises
+    // `INSERT OR IGNORE`: by the second pass `events` is already empty, so the
+    // copy selects ZERO rows and the clause is decorative. Removing it was 0 red
+    // across the whole suite.
+    //
+    // The state this pins is the one the file's own rationale is about — "a
+    // partially-applied database converges", which is exactly why `DELETE FROM`
+    // was chosen over `DROP TABLE`. Concretely: rows are already in the
+    // quarantine AND still in `events`, i.e. the copy statement is about to meet
+    // rows whose `seq` it has seen before. With a plain `INSERT` that is a
+    // UNIQUE violation and the migration ERRORS at deploy time; with `OR IGNORE`
+    // it converges. Measured: removing the clause leaves this one test red.
+    await harness.db.prepare("DELETE FROM review_logs").run();
+    await harness.db.prepare("DELETE FROM events_unscoped_legacy").run();
+    try {
+      const row = (seq: number) => ({
+        seq,
+        ts: `2026-10-01T12:00:0${seq}Z`,
+        payload: JSON.stringify({ seq, ts: `2026-10-01T12:00:0${seq}Z` }),
+      });
+      for (const r of [row(1), row(2)]) {
+        await harness.db
+          .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+          .bind(r.seq, r.ts, r.payload)
+          .run();
+        // The interruption: the copy already ran for these rows.
+        await harness.db
+          .prepare("INSERT INTO events_unscoped_legacy (seq, ts, payload) VALUES (?, ?, ?)")
+          .bind(r.seq, r.ts, r.payload)
+          .run();
+      }
+      // Re-running the file's statements must not throw...
+      for (const statement of sqlStatements(MIGRATIONS[2] as string)) {
+        await harness.db.prepare(statement).run();
+      }
+      // ...nor duplicate the rows the interrupted copy had already placed.
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM events_unscoped_legacy").first<{ n: number }>())?.n).toBe(2);
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>())?.n).toBe(0);
+    } finally {
+      await harness.db.prepare("DELETE FROM review_logs").run();
+      await harness.db.prepare("DELETE FROM events_unscoped_legacy").run();
+      await harness.db.prepare("DELETE FROM events").run();
+    }
+  });
+
   test("0003: pre-existing rows are QUARANTINED, not discarded and not given a scope", async () => {
     // The question the migration has to answer rather than assume. It empties
     // `events`, copies every row into `events_unscoped_legacy`, and gives
