@@ -33,7 +33,10 @@
 //      actually happen. Slice 2 added revkit's own token shape to this set
 //      after MEASURING that a minted session id logged under the key `seen`
 //      came out verbatim: the shape pass knew six credential families and
-//      none of them was the one this repo mints.
+//      none of them was the one this repo mints. That rule was then measured
+//      AGAIN and found anchored-and-therefore-weak, so it is now
+//      boundary-aware and `test/logger.test.ts` pins both directions: nine
+//      embeddings redacted, and the values this module logs surviving.
 //
 // NOT ENFORCED, and stated so nobody relies on it:
 //
@@ -153,29 +156,47 @@ const SECRET_VALUE =
   /(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{16,}={0,2}|sk-[A-Za-z0-9_-]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})/;
 
 /**
- * Revkit's OWN credential shape: a `TOKEN_CHARS`-long base64url string.
+ * Revkit's OWN credential shape: a run of exactly `TOKEN_CHARS` base64url
+ * characters, **bounded on both sides**.
  *
  * **Measured, not hypothesised.** M4 slice 2 added a session id and a CSRF
- * token, both `mintToken()` output, and the test below logs a minted one under
- * the key `seen` — an innocent name, exactly the shape of leak the value pass
- * exists to catch. Before this pattern that test FAILED: the line came out
- * with 256 bits of CSPRNG output verbatim, because `ghp_`-prefix matching does
- * not cover a credential this repo mints itself. So the gap was real, the
- * fix is to state the shape, and it is stated rather than generalised because
- * a broader "looks like a token" rule would start eating git object ids.
+ * token, both `mintToken()` output, and a test logs a minted one under the key
+ * `seen` — an innocent name, exactly the shape of leak the value pass exists to
+ * catch. Before this pattern that test FAILED: the line came out with 256 bits
+ * of CSPRNG output verbatim, because `ghp_`-prefix matching does not cover a
+ * credential this repo mints itself.
  *
- * The false-positive cost here is zero and is a property of what gets logged,
- * not luck: this module's own values are timestamps, HTTP verbs, pathnames,
- * status codes, closed-vocabulary reasons and UUID request ids (36 chars,
- * dashed — not 43 undashed), so nothing legitimate in a line is this shape.
- * If a future field starts logging base64url of some other length, this rule
- * will not cover it and the caller rule is what it will rely on — which is
- * the boundary this module's header already draws.
+ * **Boundary-aware, because the first version of it was not.** It was anchored
+ * (`^(?:…)$`), which is strictly WEAKER than the mechanism it extends:
+ * `SECRET_VALUE` above is deliberately unanchored — "matched ANYWHERE in a
+ * string" — and an anchored rule only catches a credential that IS the whole
+ * value. Measured with the anchored form: all eight embeddings below came out
+ * verbatim (`retry failed with <id>`, `id=<id>`,
+ * `cookie: __Host-revkit_session=<id>`, and with a trailing space, newline,
+ * quote or `=`). No shipped call site embeds a credential, so this was never
+ * live — but it is the backstop added *after a measured leak*, and a backstop
+ * that only works for one of the two shapes a credential appears in is not the
+ * control its comment claims. `test/logger.test.ts` pins both directions: nine
+ * embeddings redacted, and the values this module actually logs surviving.
  *
- * The length comes from `session.ts` rather than being written here, so the
- * rule cannot drift away from the mints it is describing.
+ * The boundary is a maximal run rather than a lookahead, because a run is the
+ * honest unit: `A-Za-z0-9_-` is exactly the alphabet, so "a maximal run of
+ * exactly `TOKEN_CHARS`" is well defined and needs no flag-literal regex. A
+ * 64-char hex digest is one run of 64 and is NOT matched — which is the
+ * difference between this and a plain unanchored `{43}`, which would eat every
+ * SHA-256 in the codebase.
+ *
+ * One consequence stated rather than left to be discovered: a credential glued
+ * to further base64url characters on either side (`x` + 43 + `x`) is one run of
+ * 45 and survives. That is indistinguishable from a longer opaque string by
+ * shape alone, and it is the boundary the cost of not eating SHA-256 digests
+ * buys. The caller rule — never pass a credential as a log field — is what
+ * covers it, which is the boundary this module's header already draws.
+ *
+ * The length comes from `session.ts` rather than being written here, so the rule
+ * cannot drift away from the mints it is describing.
  */
-const REVKIT_TOKEN_VALUE = new RegExp(`^(?:[A-Za-z0-9_-]{${TOKEN_CHARS}})$`);
+const BASE64URL_RUN = /[A-Za-z0-9_-]+/g;
 
 /** An email address. ADR-0015 and ADR-0020 both name emails explicitly,
  * and an address is the single most likely personal datum to appear in a
@@ -208,13 +229,22 @@ export const INVALID_MESSAGE = "invalid.log.message";
 const EVENT_NAME = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
 const KNOWN_MESSAGES: ReadonlySet<string> = new Set<string>(LOG_MESSAGES);
 
+/** True when `value` contains a maximal run of exactly `TOKEN_CHARS`
+ * base64url characters. Splitting on the alphabet's complement and measuring
+ * each run is what makes the rule boundary-aware in both directions — see
+ * `BASE64URL_RUN`. */
+function hasRevkitTokenRun(value: string): boolean {
+  for (const run of value.matchAll(BASE64URL_RUN)) {
+    if (run[0].length === TOKEN_CHARS) return true;
+  }
+  return false;
+}
+
 /** Redact one string: a credential shape or an email address anywhere in
  * it replaces the WHOLE value, so a partially-redacted address
  * (`re***@example.com`) never appears. */
 function redactString(value: string): string {
-  return SECRET_VALUE.test(value) || EMAIL_ADDRESS.test(value) || REVKIT_TOKEN_VALUE.test(value)
-    ? REDACTED
-    : value;
+  return SECRET_VALUE.test(value) || EMAIL_ADDRESS.test(value) || hasRevkitTokenRun(value) ? REDACTED : value;
 }
 
 /** Recursively redact one value. Depth-bounded so a cyclic object from a

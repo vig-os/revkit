@@ -146,6 +146,76 @@ describe("structured logger", () => {
     expect(lines[0]).toContain(REDACTED);
   });
 
+  test("a minted token is redacted however it is EMBEDDED in a value", async () => {
+    // The scope of the revkit-token shape, pinned in the direction that
+    // matters. `SECRET_VALUE` is deliberately unanchored — "matched ANYWHERE
+    // in a string" — and the revkit shape was added anchored
+    // (`^(?:[A-Za-z0-9_-]{43})$`), which is STRICTLY WEAKER than the mechanism
+    // it extends: every embedding leaked. Measured before the fix, all eight
+    // of these came out verbatim:
+    //
+    //   `retry failed with <id>`   `id=<id>`   `cookie: __Host-…=<id>`
+    //   `<id> ` (trailing space)   `<id>\n`   `"<id>"`   `<id>=`   `x<id>x`
+    //
+    // No shipped call site embeds a credential, so this was never live — but it
+    // is the backstop added *after a measured leak*, and a backstop that only
+    // works for the whole-string case is not the control its comment claims.
+    // The field name is `upstream`, not `note` or `detail`, and that is the
+    // whole point: those ARE on the sensitive-key list, so a case using them
+    // would be redacted by mechanism 2 and would pass whether or not the value
+    // pass worked. Only an INNOCENT key measures the value pass.
+    const id = mintToken();
+    const embeddings: [string, string][] = [
+      ["bare", id],
+      ["prefixed prose", `retry failed with ${id}`],
+      ["key=value", `id=${id}`],
+      ["inside a cookie", `cookie: ${SESSION_COOKIE_NAME}=${id}`],
+      ["trailing space", `${id} `],
+      ["trailing newline", `${id}\n`],
+      ["quoted", `"${id}"`],
+      ["equals padded", `${id}=`],
+      ["leading punctuation", `:${id};`],
+    ];
+    for (const [label, value] of embeddings) {
+      const { logger, lines } = captureLogger(`embed-${label}`);
+      logger.log("info", "auth.granted", { identityKind: "operator", upstream: value });
+      expect(lines.join(""), label).not.toContain(id);
+      expect(lines[0], label).toContain(REDACTED);
+    }
+  });
+
+  test("the values this module actually logs SURVIVE the revkit-token shape", () => {
+    // M2's correction, as a test rather than an argument. The comment used to
+    // claim "the false-positive cost here is zero", which is a claim about
+    // every string anyone could ever log. The true and testable claim is
+    // narrower: zero for the values this module logs today. Here they are, one
+    // by one — and note that a 43-character unpadded base64url blob is NOT on
+    // the list, because it is indistinguishable from a credential by design.
+    // `observed`, not `note` — see the case above for why the key name is
+    // part of what is being measured.
+    const survives: [string, unknown][] = [
+      ["sha256 hex digest", "b".repeat(64)],
+      ["short sha1 / git object id", "c".repeat(40)],
+      ["request id (uuid)", "82948424-946e-4b78-9572-37c4a8b75edc"],
+      ["iso timestamp", "2026-10-04T09:00:00.000Z"],
+      ["api path", "/api/threads"],
+      ["http verb", "GET"],
+      ["status code", 401],
+      ["identity kind", "operator"],
+      ["denial reason", "expired-session"],
+      ["event name", "auth.denied"],
+      ["identity id", "operator"],
+      ["a 42-char base64url run", "a".repeat(42)],
+      ["a 44-char base64url run", "a".repeat(44)],
+      ["a path segment", "th-closed-1"],
+    ];
+    for (const [label, value] of survives) {
+      const { logger, lines } = captureLogger(`survive-${label}`);
+      logger.log("info", "request.start", { method: "GET", path: "/api/threads", observed: value });
+      expect(lines[0], label).toContain(String(value));
+    }
+  });
+
   test("a throwing sink never takes down the caller", () => {
     const logger = createLogger({
       sink: () => {

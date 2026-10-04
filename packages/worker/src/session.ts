@@ -426,6 +426,10 @@ export type SessionResolution =
  *     a future migration changed the format). `Date.parse` returning `NaN`
  *     fails CLOSED here; a `>=` comparison against `NaN` would not.
  *
+ * `created_at` is held to the same standard for a different reason — it is the
+ * only input to the refresh cap, so an unparsable one must not produce a
+ * principal at all. `isParsableTimestamp` has the measurement.
+ *
  * A row whose `identity_kind` is not in `RECOGNISED_IDENTITY_KINDS` is
  * refused too, and for the same reason: this build cannot know what that
  * provider's scope, expiry and revocation rules are, so honouring it would be
@@ -442,8 +446,19 @@ export async function resolveSession(
   const identity = readPrincipal(row);
   if (identity === undefined) return { outcome: isRowComplete(row) ? "unrecognised-identity-kind" : "incomplete-row" };
   const now = (options.now ?? wallClock)();
+  // Only the ORDERING is decided here. Whether `expires_at` can be read at all
+  // is `isParsableTimestamp`'s job, and it now covers BOTH timestamp columns —
+  // so a NaN expiry is refused before this line, as `incomplete-row`.
+  //
+  // The `!Number.isFinite` half of this condition was deleted, and the mutation
+  // run is why: with `isParsableTimestamp` in place it was **0 tests red**. Two
+  // guards for one fact is worse than one, because the second one is the one a
+  // reader trusts. The property it protected did not regress — it moved, and
+  // `test/session.test.ts` pins it from the new home in both directions
+  // (`created_at` blank-only-again and `expires_at` blank-only-again are each
+  // one mutation, each RED).
   const expiresAt = Date.parse(String(row.expires_at));
-  if (!Number.isFinite(expiresAt) || expiresAt <= now) return { outcome: "expired" };
+  if (expiresAt <= now) return { outcome: "expired" };
   return {
     outcome: "resolved",
     principal: {
@@ -462,11 +477,41 @@ export async function resolveSession(
  * operator's hand edit, a future migration with a default — so blankness is
  * what has to be refused, and each column checked here is load-bearing:
  * `identity_id` says who the caller is, `csrf_hash` is what the CSRF
- * comparison is measured against, `created_at` is what the refresh lifetime
- * cap is measured from. Refusing beats defaulting: a partial row must not
- * authorise a partial request. */
+ * comparison is measured against. Refusing beats defaulting: a partial row
+ * must not authorise a partial request. */
 function isPresent(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+/** A timestamp this module can do arithmetic on. `expires_at` and
+ * `created_at` both have to clear this, and NOT for tidiness:
+ *
+ *   - `expires_at` IS the expiry decision, so an unparsable one must fail
+ *     closed or the session lives forever.
+ *   - `created_at` is the ONLY input to the refresh lifetime cap, so an
+ *     unparsable one makes the cap uncomputable — and "cannot compute the cap"
+ *     has to mean "no refresh", never "no limit".
+ *
+ * The second one was a measured fail-open. `isRowComplete` tested blankness
+ * only, so `"not a date"` produced a principal, and `rotateSession` then read
+ * `Date.parse(created_at) + SESSION_MAX_LIFETIME_MS` as `NaN`, found it
+ * non-finite, and took the no-cap branch: 720 hourly refreshes over 30
+ * simulated days slid the expiry out by the full 30 days with `created_at` of
+ * `"not a date"` and of `"9999-99-99"`, where the well-formed value correctly
+ * died at the 7-day cap. It needs D1 write access, which this model already
+ * treats as the credential, so it was not an escalation — it was a fail-open
+ * on one field while the ADJACENT field in the SAME resolver failed closed with
+ * a comment and a test. That asymmetry is the bug.
+ *
+ * `Date.parse` is deliberately permissive (`"0"` parses as 2000-01-01, `"2026"`
+ * as 2026-01-01), which is safe here: a wrong-but-finite instant makes the cap
+ * land in the past, so the session expires rather than extending. Only NaN is
+ * dangerous, and NaN is what this rejects. The "harmless" cases are pinned in
+ * `test/session.test.ts` so the direction of the permissiveness is not left to
+ * a reader's assumption.
+ */
+function isParsableTimestamp(value: unknown): value is string {
+  return isPresent(value) && Number.isFinite(Date.parse(value));
 }
 
 /** Every field a principal is built from is present. Kept separate from
@@ -478,8 +523,8 @@ function isRowComplete(row: SessionRow): boolean {
     isPresent(row.identity_kind) &&
     isPresent(row.identity_id) &&
     isPresent(row.csrf_hash) &&
-    isPresent(row.created_at) &&
-    isPresent(row.expires_at)
+    isParsableTimestamp(row.created_at) &&
+    isParsableTimestamp(row.expires_at)
   );
 }
 
@@ -549,8 +594,11 @@ export class SessionAlreadyRotatedError extends Error {
  * cookie.
  *
  * The new expiry SLIDES to `now + ttlMs` but is capped at
- * `SESSION_MAX_LIFETIME_MS` after the ORIGINAL `created_at`, so a refresh
- * loop cannot keep one credential alive indefinitely.
+ * `SESSION_MAX_LIFETIME_MS` after the ORIGINAL `created_at`, so a refresh loop
+ * cannot keep one credential alive indefinitely. The cap is unconditional: if
+ * `created_at` cannot be parsed the expiry is `now`, so "the cap could not be
+ * computed" resolves to "no time at all" and never to "no limit". See
+ * `isParsableTimestamp` for the measurement that made this explicit.
  */
 export async function rotateSession(
   db: D1Database,
@@ -564,8 +612,18 @@ export async function rotateSession(
   const csrfToken = mintToken();
   const createdAt = principal.createdAt;
   const slidingExpiry = now + ttlMs;
+  // FAIL CLOSED. `resolveSession` refuses a row whose `created_at` does not
+  // parse, so this branch is unreachable through the gate — and the whole point
+  // is that "unreachable" must not be the same as "no limit". The earlier
+  // fallback was `slidingExpiry`, i.e. a full TTL with no cap, and it was
+  // reachable (see `isParsableTimestamp`). Now an uncomputable cap yields an
+  // expiry of `now`: the rotation still happens, the row is born already
+  // expired, and the caller gets `Max-Age=0` — logged out rather than
+  // indefinitely extended. `rotateSession` is exported and takes a
+  // `RotationInput` the type system does not tie to a resolver result, so this
+  // layer is what makes the guarantee independent of the gate's callers.
   const hardCap = Date.parse(createdAt) + SESSION_MAX_LIFETIME_MS;
-  const expiresAtMs = Number.isFinite(hardCap) ? Math.min(slidingExpiry, hardCap) : slidingExpiry;
+  const expiresAtMs = Number.isFinite(hardCap) ? Math.min(slidingExpiry, hardCap) : now;
   const expiresAt = isoAt(expiresAtMs);
   // Named once, used twice. The old row's digest is the DELETE's key and the
   // INSERT's `EXISTS` probe; it is derived from the cookie, never stored in
@@ -621,7 +679,9 @@ function isoAt(ms: number): string {
  * `sessions.csrf_hash` from the caller's own row, and the presented value is
  * hashed before comparison, so:
  *
- *   - a missing or empty header is refused;
+ *   - a missing header is refused by the `null` guard, and an EMPTY one by the
+ *     digest comparison (there is no empty-string shortcut — see the note on
+ *     `csrfSatisfied`);
  *   - a constant is refused (there is no constant — the expected side is a
  *     per-row digest);
  *   - a token minted for a DIFFERENT session hashes differently and is
@@ -644,6 +704,13 @@ function isoAt(ms: number): string {
  * malformed header) is bounded by the platform's own request-header limit.
  */
 export async function csrfSatisfied(expectedHash: string, presented: string | null): Promise<boolean> {
-  if (presented === null || presented.length === 0) return false;
+  // The `null` guard is load-bearing — `sha256Hex(null)` is not a call this
+  // makes — and the EMPTY-STRING guard is NOT: `sha256Hex("")` hashes fine and
+  // compares false. An earlier revision had both, and the doc bullet "a missing
+  // or empty header is refused" credited the line for it. Deleting the empty
+  // check scored 0 tests red, which is what identified it; the bullet below now
+  // says the digest comparison is what refuses an empty value, because that is
+  // where the refusal actually comes from.
+  if (presented === null) return false;
   return constantTimeEquals(await sha256Hex(presented), expectedHash);
 }

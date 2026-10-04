@@ -4,7 +4,7 @@
 // surface is:
 //
 //   GET|HEAD /healthz               200 — liveness + the version it runs
-//   ANY    /healthz (other verbs)   405
+//   ANY    /healthz (other verbs)   405  (kind `method-not-allowed`, ungated)
 //   GET|HEAD /api/threads           200 — behind ADR-0012's per-request gate
 //   GET    /api/threads?since=<n>   200 — the delta since the caller's head
 //   POST   /api/session/refresh     200 — rotate the caller's own session
@@ -313,15 +313,35 @@ export default {
  * else. Nothing here can return review data, which is the whole reason these
  * three are exempt rather than an oversight.
  */
+/**
+ * The ungated routes, and they are ungated because none of them can return
+ * review data: `/healthz` is a liveness probe that reads no database,
+ * `/_revkit/` is ADR-0012's never-redirecting bundle path, `unknown` is not a
+ * route at all, and `method-not-allowed` carries no data either.
+ *
+ * `test/authorization.test.ts` asserts that the GATED paths are exactly the
+ * three that can carry data, so "these four kinds are the exception" is a claim
+ * about the route table rather than about this function — and it is what turns a
+ * missing `case` here into a caught 500 rather than a quiet gap.
+ */
 function handleOpen(route: Route, env: Env, scope: RequestScope): Response {
   switch (route.kind) {
-    case "health": {
-      // A `HEAD` probe takes this same branch; the platform drops the body
-      // afterwards. The method check below is deliberate, so a health probe
-      // written either way works.
-      if (route.unsupportedMethod) return json({ error: "method-not-allowed" }, 405, scope);
+    case "health":
+      // A `HEAD` probe takes this same branch and the platform drops the body
+      // afterwards. `classifyRoute` already answered the verb question — a
+      // wrong verb is its own kind now — so there is no method check here to
+      // forget, which is the point of the case below.
       return json({ ok: true, revkitVersion: env.REVKIT_VERSION, requestId: scope.requestId }, 200, scope);
-    }
+    // `method-not-allowed` appears on BOTH sides of the gate: gated for the API
+    // paths, ungated for `/healthz`. It is therefore the one kind a dispatcher
+    // written per-side can handle on one side and DROP on the other — and it was
+    // dropped here, so `POST /healthz` fell through to `unreachable()`, threw
+    // into the error boundary, and answered **500 `internal error`** with no
+    // `Cache-Control` and a `request.error` log line. Base `7a7bb652` answered
+    // 405. Measured before the fix: GET/HEAD 200, and POST / PUT / DELETE /
+    // OPTIONS / PATCH all 500. `test/authorization.test.ts` now drives every one.
+    case "method-not-allowed":
+      return json({ error: "method-not-allowed" }, 405, scope);
     case "revkit-bundle":
       return json({ error: "not-found", note: "revkit bundle serving lands in M4 slice 3" }, 404, scope);
     case "unknown":
@@ -332,13 +352,6 @@ function handleOpen(route: Route, env: Env, scope: RequestScope): Response {
 }
 
 /**
- * The three routes that touch no data, and therefore need no session. `/healthz`
- * is a liveness probe that reads no database and returns no review content,
- * `/_revkit/` is ADR-0012's never-redirecting bundle path, and `unknown` is not a
- * route at all. Every one of those is asserted in
- * `test/authorization.test.ts`, so "these three are the exception" is a claim
- * about a table rather than about this function.
- *
  * Every route that requires a session, reached only with a
  * `decision.authorized` in hand. `authorized` is not used here except to log
  * the identity kind — and it is not LOGGED AS AN ID: `identity_kind` is a
@@ -478,13 +491,28 @@ function appendDisabled(scope: RequestScope): Response {
 }
 
 /**
- * A gated route kind this dispatcher does not handle. Unreachable by
- * construction — `classifyRoute` returns `requiresSession: true` only for
- * the five kinds `handleAuthorized` switches over — so reaching it is a bug
- * in `classifyRoute`, not a caller error. It throws rather than returning
- * something plausible: the error boundary turns it into a 500 with full ADR-
- * 0012 hygiene, which is the correct outcome for "the router and the
- * dispatcher disagree".
+ * A route kind this dispatcher does not handle. Unreachable by construction:
+ * `classifyRoute`'s eight kinds partition across `handleOpen` and
+ * `handleAuthorized` on `requiresSession`, and between them they switch over
+ * all of them.
+ *
+ * **This doc used to claim unreachability for the GATED dispatcher only, and
+ * that was false** — which is how a dropped `case` became a 500 nobody noticed.
+ * `method-not-allowed` is reachable from the UNGATED side (`/healthz` with a
+ * wrong verb classifies to it with `requiresSession: false`), and `handleOpen`
+ * had no case for it, so `POST /healthz` answered 500 `internal error` where
+ * base `7a7bb652` answered 405.
+ *
+ * Two tests keep it honest now, and both are stronger than this comment: the
+ * route-table case in `test/authorization.test.ts` asserts the gated paths are
+ * exactly the three that carry data AND that every kind `handleAuthorized`
+ * switches over is one `requiresSession` can be true for; and the hygiene matrix
+ * drives a wrong verb on `/healthz` through real workerd, which fails if the
+ * case is ever dropped again.
+ *
+ * It throws rather than returning something plausible: the error boundary turns
+ * it into a 500 with full ADR-0012 hygiene, which is the right outcome for "the
+ * router and the dispatcher disagree".
  */
 function unreachable(route: Route): never {
   throw new Error(`unreachable route kind: ${route.kind} (requiresSession=${String(route.requiresSession)})`);

@@ -44,6 +44,32 @@ const PINNED_REVISION = "2751a3a2f303ad21752038085e2b8c5f98ecff61a2e4ebbd43506a9
  * drift apart. */
 const SEED_BODY = "a comment body that must never be served to an unauthorized caller";
 
+/** Cloudflare's documented per-Worker size limit, uncompressed: 64 MiB on
+ * both the Free and Paid plans (developers.cloudflare.com/workers/platform/
+ * limits/, read 2026-10-04). Only the uncompressed size counts. Held as a
+ * named constant so the test can show the distance between revkit's own budget
+ * and the platform's limit rather than asserting a number nobody can trace. */
+const WORKER_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
+
+/** revkit's own budget for the shipped entry, as a CEILING.
+ *
+ * Why 2 MiB and not the platform's 64 MiB: this is not a "will Cloudflare
+ * accept it" check — at 64 MiB the answer is yes and the Worker is unusable.
+ * The binding platform limit for a large graph is the **1-second startup**
+ * limit (error 10021: a Worker must parse and execute its global scope within
+ * one second), and the honest position is that this number cannot be measured
+ * here: the only tool that reports startup time is `wrangler deploy
+ * --dry-run`, which is out of bounds for this task. So the ceiling is a growth
+ * budget, not a proxy for a limit somebody measured.
+ *
+ * The number is derived rather than chosen: `toBeGreaterThan(2)` in the case
+ * below asserts today's graph is at most half of it, so raising it is a
+ * deliberate act with a visible ratio, and lowering it below today's size fails
+ * the floor. Measured today: ~807 KB, so 2 MiB is ~2.6x headroom. Crossing it
+ * means the shared core roughly doubled and someone should look at what went
+ * in before it reaches a ceiling nobody would notice. */
+const BUNDLE_CEILING_BYTES = 2 * 1024 * 1024;
+
 /**
  * A four-event log with a GAP: seqs 1, 2, 3 and 7.
  *
@@ -177,6 +203,30 @@ describe("ADR-0025 runtime gate", () => {
       expect(hits[0]).toContain(expected);
     }
     expect(scanForForbidden("const x = 1; export default x;")).toEqual([]);
+  });
+
+  test("A4: the bundle has a CEILING as well as a floor — a floor cannot catch unbounded growth", async () => {
+    // The floor exists because slice 1's scan was vacuous over a tree-shaken
+    // 20 KB artefact. The ceiling is its counterpart, and its absence was a real
+    // gap: a floor is a LOWER bound, so a future dependency that doubled or
+    // tripled the graph would sail past it and the only signal would be
+    // `wrangler deploy` failing on someone else's machine.
+    const bundle = await workerBundle();
+    const bytes = Buffer.byteLength(bundle, "utf8");
+    expect(bytes).toBeLessThan(BUNDLE_CEILING_BYTES);
+    // And the ceiling is stated as a budget with its headroom, so the number is
+    // a decision rather than a vibe: how many times today's graph it allows.
+    expect(BUNDLE_CEILING_BYTES / bytes).toBeGreaterThan(2);
+    // The documented platform limit, so the gap between "our budget" and "the
+    // platform's limit" is visible in one place. 64 MiB uncompressed, both
+    // plans (developers.cloudflare.com/workers/platform/limits/, read
+    // 2026-10-04); only the uncompressed size counts and there is no compressed
+    // limit. NOTE the ceiling that actually bites first is the 1-SECOND
+    // STARTUP limit (error 10021) — larger bundles take longer to parse — and
+    // this test deliberately does NOT claim to measure startup time, because
+    // the only tool that reports it is `wrangler deploy --dry-run`, which is
+    // out of bounds for this task.
+    expect(BUNDLE_CEILING_BYTES).toBeLessThan(WORKER_SIZE_LIMIT_BYTES / 16);
   });
 
   test("A4: the SHIPPED Worker entry bundle has no Node or Bun escape hatches", async () => {

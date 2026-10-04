@@ -367,10 +367,26 @@ describe("resolution — the checks, and the order they run in", () => {
     // through the real resolver.
     const clock = pinnedClock(PINNED_MS);
     const issued = await issueSession(harness.db, OPERATOR, { now: clock.now });
-    for (const garbage of ["not a date", "0", "99999999999999999999", "2026-13-45T99:99:99Z", "  "]) {
+    // Asserted as the SPECIFIC reason, and the reason is not the same for every
+    // value here — which is itself the finding. `Date.parse` is PERMISSIVE, so
+    // `"0"` parses (to 2000-01-01) and is caught by the explicit expiry check as
+    // `expired`, while the rest are genuinely NaN and are caught by the
+    // completeness check as `incomplete-row`. Both refuse. Blurring them into
+    // one "not resolved" would have hidden the split, and the split is what
+    // tells an operator whether a row is unreadable or merely old.
+    const unparsable = ["not a date", "99999999999999999999", "2026-13-45T99:99:99Z", "  ", "tomorrow"];
+    for (const garbage of unparsable) {
       await harness.db.prepare("UPDATE sessions SET expires_at = ?").bind(garbage).run();
       const resolved = await resolveSession(harness.db, issued.sessionId, { now: clock.now });
-      expect(resolved.outcome, JSON.stringify(garbage)).not.toBe("resolved");
+      expect(resolved.outcome, `unparsable ${JSON.stringify(garbage)}`).toBe("incomplete-row");
+    }
+    // And the permissive-but-finite ones land on the OTHER refusal, which is
+    // where the comment's "harmless" claim lives — asserted here rather than
+    // asserted nowhere.
+    for (const parsesButAncient of ["0", "2026"]) {
+      await harness.db.prepare("UPDATE sessions SET expires_at = ?").bind(parsesButAncient).run();
+      const resolved = await resolveSession(harness.db, issued.sessionId, { now: clock.now });
+      expect(resolved.outcome, `finite but ancient ${parsesButAncient}`).toBe("expired");
     }
     // A blank expiry is caught one step earlier, by the completeness check —
     // which is why the assertion above is "not resolved" rather than
@@ -389,6 +405,158 @@ describe("resolution — the checks, and the order they run in", () => {
     const issued = await issueSession(harness.db, OPERATOR, { now: clock.now });
     await harness.db.prepare("UPDATE sessions SET expires_at = ?").bind("2026-10-04T10:00:00Z").run();
     expect((await resolveSession(harness.db, issued.sessionId, { now: clock.now })).outcome).toBe("resolved");
+  });
+
+  test("Date.parse's PERMISSIVE cases are the safe direction, and both are pinned", async () => {
+    // `isParsableTimestamp`'s comment claims that a wrong-but-finite instant is
+    // harmless because it puts the cap (or the expiry) in the PAST, so the
+    // session dies rather than extending. That is a claim about which way
+    // `Date.parse`'s leniency fails, and it is worth a test in both
+    // directions — a reader should not have to take the direction on faith.
+    const clock = pinnedClock(PINNED_MS);
+    // These two DO parse, and both land in 2000 — long past `now`, so the
+    // session is refused. Permissive, and safe.
+    expect(Number.isFinite(Date.parse("0"))).toBe(true);
+    expect(Number.isFinite(Date.parse("2026"))).toBe(true);
+    for (const stamp of ["0", "2026"]) {
+      await harness.db.prepare("DELETE FROM sessions").run();
+      const issued = await issueSession(harness.db, OPERATOR, { now: clock.now });
+      await harness.db.prepare("UPDATE sessions SET expires_at = ?").bind(stamp).run();
+      expect((await resolveSession(harness.db, issued.sessionId, { now: clock.now })).outcome, stamp).toBe("expired");
+      await harness.db.prepare("UPDATE sessions SET expires_at = ?").bind(issued.expiresAt).run();
+      await harness.db.prepare("UPDATE sessions SET created_at = ?").bind(stamp).run();
+      // `created_at` in 2000 is finite, so it resolves — and the ROTATION it
+      // enables is capped to a moment long past, which is the safe direction.
+      const resolved = await resolveSession(harness.db, issued.sessionId, { now: clock.now });
+      expect(resolved.outcome, stamp).toBe("resolved");
+      if (resolved.outcome !== "resolved") throw new Error("unreachable");
+      const rotated = await rotateSession(
+        harness.db,
+        { principal: resolved.principal, sessionId: issued.sessionId },
+        { now: clock.now },
+      );
+      // The cap computed from 2000 lands in 2000, so the new row is born
+      // already expired. Asserting the DIRECTION rather than the instant is the
+      // point: what must hold is that no reading of `created_at` yields a LIVE
+      // session beyond the cap, and where it lands depends on the value.
+      expect(Date.parse(rotated.expiresAt), stamp).toBeLessThanOrEqual(PINNED_MS);
+      expect((await resolveSession(harness.db, rotated.sessionId, { now: clock.now })).outcome, stamp).toBe("expired");
+    }
+  });
+
+  test("a created_at that does not PARSE is refused, not merely a blank one", async () => {
+    // The companion to the blank-field case, and the one that was a fail-open.
+    //
+    // `isRowComplete` tested blankness, so a NON-BLANK but unparsable
+    // `created_at` produced a principal — and `rotateSession` then computed
+    // `Date.parse(created_at) + SESSION_MAX_LIFETIME_MS` as `NaN`, found it
+    // non-finite, and took the "no cap" branch. Measured before the fix: 720
+    // hourly refreshes over 30 simulated days slid the expiry to +30 days with
+    // `created_at` of `"not a date"` and of `"9999-99-99"`, while the
+    // well-formed value correctly died at the 7-day cap.
+    //
+    // `expires_at` already failed closed on exactly this shape, two lines
+    // above, with a comment and a test. `created_at` now does too — and the
+    // reason it must is sharper than tidiness: `created_at` is the only input
+    // to the refresh lifetime cap, so a row whose `created_at` cannot be read
+    // is a row whose cap cannot be computed, and "cannot compute the cap" has
+    // to mean "no refresh", not "no limit".
+    const clock = pinnedClock(PINNED_MS);
+    for (const garbage of ["not a date", "9999-99-99", "1e400", "  ", "tomorrow"]) {
+      await harness.db.prepare("DELETE FROM sessions").run();
+      const issued = await issueSession(harness.db, OPERATOR, { now: clock.now });
+      await harness.db.prepare("UPDATE sessions SET created_at = ?").bind(garbage).run();
+      const resolved = await resolveSession(harness.db, issued.sessionId, { now: clock.now });
+      expect(resolved.outcome, JSON.stringify(garbage)).toBe("incomplete-row");
+    }
+    // The complement, so this cannot become refuse-everything: a valid instant
+    // in a different but parseable FORM is honoured, exactly as `expires_at` is.
+    await harness.db.prepare("DELETE FROM sessions").run();
+    const ok = await issueSession(harness.db, OPERATOR, { now: clock.now });
+    await harness.db.prepare("UPDATE sessions SET created_at = ?").bind("2026-10-04T09:00:00Z").run();
+    expect((await resolveSession(harness.db, ok.sessionId, { now: clock.now })).outcome).toBe("resolved");
+  });
+
+  test("a refresh loop cannot outlive the 7-day cap, whatever created_at says", async () => {
+    // The property the ADR-0012 amendment claims in a sentence — "a 7-day hard
+    // cap from the original `created_at` prevents a refresh loop from keeping
+    // one credential alive" — asserted over a LOOP rather than a single
+    // rotation, because one rotation cannot distinguish "capped" from "not
+    // capped yet".
+    //
+    // **Coarse steps on purpose.** Hourly steps to the 7-day cap is ~170
+    // rotations, and that measured 5.1 s — over half the project's 10 s
+    // per-test ceiling for one assertion, i.e. a test whose cost depends on how
+    // busy the host is. Twelve-hour steps reach the cap in 14 rotations (~4x
+    // cheaper) and still WALK the boundary rather than jumping over it, which is
+    // what makes "the cap binds" different from "the cap was never near".
+    //
+    // **Each spelling gets its own expected outcome, and they differ.** The
+    // first attempt asserted one shape for all four and was wrong twice: `"0"`
+    // and `"2026"` DO parse (`Date.parse` is permissive), so they are capped
+    // rather than refused, while `"not a date"` and `"9999-99-99"` are refused
+    // at step 1. A permissive-but-finite `created_at` lands the cap in the past,
+    // so the session dies on the next read — the safe direction, and a different
+    // one from "never got a principal at all".
+    const HOUR = 60 * 60 * 1000;
+    const STEP = 12 * HOUR;
+    const cases: [string | undefined, "expired" | "incomplete-row", number][] = [
+      // A well-formed instant: the walk must APPROACH the cap and end expired.
+      // With 12-hour steps, 14 steps is 7 days, so fewer than 10 rotations means
+      // the boundary was never approached and the case proved nothing.
+      [undefined, "expired", 10],
+      // Parses to a moment in 2000, so the cap is already behind us: the first
+      // rotation is over the limit and the next read is refused. One rotation.
+      ["0", "expired", 1],
+      ["2026", "expired", 1],
+      // Genuinely unreadable: refused by the gate on the FIRST step, so there
+      // is no walk at all. Zero rotations is the pass condition, and it is the
+      // sharper half — the failure being fixed slid for 720 refreshes, so
+      // "refused at step 1" is exactly the new behaviour.
+      ["not a date", "incomplete-row", 0],
+      ["9999-99-99", "incomplete-row", 0],
+    ];
+    for (const [createdAt, expectedOutcome, minRotations] of cases) {
+      await harness.db.prepare("DELETE FROM sessions").run();
+      const clock = pinnedClock(PINNED_MS);
+      let sessionId = (
+        await issueSession(harness.db, OPERATOR, { now: clock.now, ttlMs: SESSION_MAX_LIFETIME_MS + HOUR })
+      ).sessionId;
+      if (createdAt !== undefined) {
+        await harness.db.prepare("UPDATE sessions SET created_at = ?").bind(createdAt).run();
+      }
+      // The only anchor available for every spelling, so it is the one the
+      // invariant is stated against: no rotation may produce an expiry later
+      // than ISSUE + the cap, whatever the row's own `created_at` says.
+      const capMs = PINNED_MS + SESSION_MAX_LIFETIME_MS;
+      let rotations = 0;
+      let stoppedBecause = "step-limit";
+      for (let step = 1; step <= 20; step++) {
+        clock.advance(STEP);
+        const resolved = await resolveSession(harness.db, sessionId, { now: clock.now });
+        if (resolved.outcome !== "resolved") {
+          stoppedBecause = resolved.outcome;
+          break;
+        }
+        const rotated = await rotateSession(
+          harness.db,
+          { principal: resolved.principal, sessionId },
+          { now: clock.now, ttlMs: SESSION_MAX_LIFETIME_MS + HOUR },
+        );
+        rotations += 1;
+        expect(
+          Date.parse(rotated.expiresAt),
+          `created_at=${String(createdAt)} rotation ${rotations}: expiry must never exceed the cap`,
+        ).toBeLessThanOrEqual(capMs);
+        sessionId = rotated.sessionId;
+      }
+      const label = `created_at=${JSON.stringify(createdAt)}`;
+      expect(stoppedBecause, `${label}: ended ${rotations} rotations in`).toBe(expectedOutcome);
+      expect(rotations, `${label}: the cap was never approached`).toBeGreaterThanOrEqual(minRotations);
+      // And no spelling may end by running out of steps with a live session —
+      // that is the unbounded case both shapes must avoid.
+      expect(stoppedBecause, `${label}: ran out of steps still live`).not.toBe("step-limit");
+    }
   });
 
   test("an identity kind this build does not know is REFUSED, not defaulted to allowed", async () => {
@@ -574,6 +742,43 @@ describe("rotation", () => {
     expect(Date.parse(rotated.expiresAt)).toBe(Date.parse(issued.createdAt) + SESSION_MAX_LIFETIME_MS);
     // Uncapped it would have been a day further out, so the cap is doing work.
     expect(Date.parse(rotated.expiresAt)).toBeLessThan(clock.now() + 24 * 60 * 60 * 1000);
+  });
+
+  test("rotateSession fails CLOSED on its own, without relying on the resolver", async () => {
+    // The gate refuses a row whose `created_at` does not parse, so the
+    // fallback in `rotateSession` is defence in depth — and defence in depth
+    // that no test reaches is exactly the kind of line this repo removes. So
+    // it is driven directly, with a hand-built principal the way a future
+    // caller outside the gate could: `rotateSession` is exported and its
+    // `RotationInput` is not tied by the type system to a resolver result.
+    //
+    // The assertion is the FAIL-CLOSED direction, which is the one that
+    // matters: an uncomputable cap must yield "expire now", never "no limit".
+    const clock = pinnedClock(PINNED_MS);
+    const issued = await issueSession(harness.db, OPERATOR, { now: clock.now });
+    const principal = {
+      kind: OPERATOR.kind,
+      id: OPERATOR.id,
+      csrfHash: await sha256Hex(issued.csrfToken),
+      createdAt: "not a date",
+      expiresAt: issued.expiresAt,
+    } as const;
+    const rotated = await rotateSession(
+      harness.db,
+      { principal, sessionId: issued.sessionId },
+      { now: clock.now, ttlMs: 24 * 60 * 60 * 1000 },
+    );
+    // Expired on arrival: the expiry is `now`, not `now + ttlMs`, so there is no
+    // time at all rather than an uncapped TTL.
+    expect(rotated.expiresAt).toBe(new Date(PINNED_MS).toISOString());
+    expect(rotated.maxAgeSeconds).toBe(0);
+    expect(rotated.cookie).toContain("Max-Age=0");
+    // And the row it wrote does not resolve. Which of the two refusals fires is
+    // itself worth naming: the rotation copies `created_at` forward VERBATIM, so
+    // the new row is unreadable for the same reason the old one was —
+    // `incomplete-row`, not `expired`. A rotation cannot repair a row it is
+    // only permitted to re-key, and it does not pretend to.
+    expect((await resolveSession(harness.db, rotated.sessionId, { now: clock.now })).outcome).toBe("incomplete-row");
   });
 
   test("rotation's Max-Age never goes negative when the cap is already behind the clock", async () => {

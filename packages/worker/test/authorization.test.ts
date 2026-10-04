@@ -805,6 +805,42 @@ describe("ADR-0012's per-request gate", () => {
       ).toBe(200);
     });
 
+    test("the token is read from `x-revkit-csrf` and from nowhere else", async () => {
+      // The header's NAME was unpinned: nothing asserted which header the token
+      // comes from, so reading it from `x-revkit-csrf-alt` first scored 0 tests
+      // red. A header name is part of the protocol a client has to implement,
+      // so it needs a test the way the token's value does. Measured against
+      // the mutations: this case is RED for "read the wrong header first" and
+      // for "read a second header as a fallback".
+      const issued = await issueTestSession(harness.db);
+      const altNames = ["x-revkit-csrf-alt", "x-csrf-token", "x-xsrf-token", "csrf-token", "x-revkit-xsrf"];
+      for (const name of altNames) {
+        const response = await harness.dispatch(`http://localhost${SESSION_REFRESH_PATH}`, {
+          method: "POST",
+          // The cookie but NOT `authHeaders`, which would carry the real
+          // header too and make every case a 200 — the point is the right
+          // token arriving in the WRONG header.
+          headers: { cookie: cookieHeader(issued.sessionId), [name]: issued.csrfToken, ...JSON_HEADERS },
+        });
+        const refusal = await refusalOf(response);
+        // 403 with the SPECIFIC reason, so this is "the right token in the
+        // wrong header", not "no token at all".
+        expect(refusal.status, name).toBe(403);
+        expect(refusal.body, name).toEqual({ error: "csrf", reason: "csrf-header-missing" });
+        // Nothing rotated, so the loop cannot mutate `issued` under itself.
+        expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>())?.n, name).toBe(1);
+      }
+      // And the real header, in the same shape, is accepted.
+      expect(
+        (
+          await harness.dispatch(`http://localhost${SESSION_REFRESH_PATH}`, {
+            method: "POST",
+            headers: { ...authHeaders(issued), ...JSON_HEADERS },
+          })
+        ).status,
+      ).toBe(200);
+    });
+
     test("CSRF is checked AFTER authorization, so a missing token is not a session oracle", async () => {
       // No cookie AND no token: 401, not 403. The other order would tell an
       // anonymous caller whether their CSRF token was right.
@@ -961,6 +997,15 @@ describe("ADR-0012's per-request gate", () => {
       };
       const steps: Step[] = [
         { label: "health 200", path: HEALTH_PATH, expected: 200 },
+        // A wrong verb on the probe. This is the case that caught a REAL
+        // regression: `classifyRoute` sends a wrong-verb `/healthz` to
+        // `method-not-allowed`, which is UNGATED, and the ungated dispatcher
+        // had no case for it — so it fell through to `unreachable()`, threw,
+        // and answered 500 with `internal error` and no `Cache-Control`. Base
+        // `7a7bb652` answered 405. A dropped `case` in a route refactor turned
+        // a documented 405 into a server error, which is the shape of bug that
+        // only an exhaustive route table catches.
+        { label: "health 405 (wrong verb)", path: HEALTH_PATH, init: () => ({ method: "POST" }), expected: 405 },
         { label: "unknown 404", path: "/nope", expected: 404 },
         { label: "threads 401 (no cookie)", path: THREADS_PATH, expected: 401 },
         { label: "bundle 404", path: "/_revkit/0.0.0/rail.js", expected: 404 },
@@ -1003,6 +1048,15 @@ describe("ADR-0012's per-request gate", () => {
             String(body.reason),
           );
           expect(["since", "repo", "scope"]).toContain(String(body.parameter));
+        } else if (step.expected === 405) {
+          // A 405 is JSON like every other answer on this surface, so it goes
+          // through `applyJsonHeaders` and gets `Cache-Control: no-store` —
+          // which the regression lost, because the 500 it became went through
+          // the text boundary instead. `await response.json()` alone would not
+          // catch that: `cache-control` is asserted above for every step, and
+          // this asserts the body is not an error page.
+          const body = (await response.json()) as { error?: string };
+          expect(body.error, step.label).toBe("method-not-allowed");
         } else {
           await response.text();
         }
@@ -1018,6 +1072,48 @@ describe("ADR-0012's per-request gate", () => {
       expect(await response.text()).toBe("");
       expect(response.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
       expect(response.headers.get("cache-control")).toBe("no-store");
+    });
+
+    test("every wrong verb on /healthz is 405 — the ungated dispatcher handles method-not-allowed", async () => {
+      // The regression, stated as a matrix so no single verb can be forgotten.
+      // `method-not-allowed` is the one kind that appears on BOTH sides of the
+      // gate — gated for the API paths, ungated for `/healthz` — which is
+      // exactly why a dispatcher written per-side can handle it on one and drop
+      // it on the other.
+      for (const method of ["POST", "PUT", "DELETE", "OPTIONS", "PATCH"] as const) {
+        const response = await harness.dispatch(`http://localhost${HEALTH_PATH}`, { method });
+        const raw = await response.text();
+        expect(response.status, method).toBe(405);
+        expect(JSON.parse(raw) as { error: string }, method).toEqual({ error: "method-not-allowed" });
+        // A 405 must not look like a server error, and must not be cacheable.
+        expect(raw, method).not.toContain("internal error");
+        expect(response.headers.get("cache-control"), method).toBe("no-store");
+        expect(response.headers.get("content-type"), method).toContain("application/json");
+        expect(response.headers.get("x-revkit-request-id"), method).toMatch(/^[0-9a-f-]{36}$/);
+      }
+      // And the two that are supposed to work, in the same matrix.
+      for (const method of ["GET", "HEAD"] as const) {
+        expect((await harness.dispatch(`http://localhost${HEALTH_PATH}`, { method })).status, method).toBe(200);
+      }
+    });
+
+    test("a client error is not logged as a server error (ADR-0020's error signal)", async () => {
+      // Measured, not asserted in the abstract: before the 405 was restored,
+      // `POST /healthz` threw into the boundary and emitted `request.error`,
+      // so a probe written with the wrong verb put a line into the same stream
+      // a genuine 500 uses. The end-to-end capture of that is in
+      // `test/logger.test.ts`; what belongs here is the invariant that a
+      // non-2xx the Worker CHOSE never reaches the error boundary.
+      for (const [pathname, init] of [
+        [HEALTH_PATH, { method: "POST" }],
+        ["/nope", undefined],
+        [THREADS_PATH, undefined],
+        [THREADS_PATH, { method: "PUT" }],
+      ] as [string, { method?: string } | undefined][]) {
+        const response = await harness.dispatch(`http://localhost${pathname}`, init);
+        expect(response.status).not.toBe(500);
+        await response.text();
+      }
     });
 
     test("a refusal never carries a WWW-Authenticate challenge — this is a cookie scheme", async () => {

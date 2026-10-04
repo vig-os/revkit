@@ -127,15 +127,21 @@ is the smallest such route: it writes nothing but the caller's own `sessions` ro
 | session id | 256-bit base64url | `sha256(id)`, hex |
 | CSRF token | 256-bit base64url | `sha256(token)`, hex |
 
-Neither plaintext is recoverable from the database, and neither is ever logged —
-`test/logger.test.ts` drives genuinely minted values through the redactor, and
-`test/authorization.test.ts` captures the Worker's *own* log lines for an authorized
-request and searches them for the session id, the CSRF token, and both digests.
+Neither plaintext is recoverable from the database, and neither is ever logged.
+Two tests say so at two levels: `test/logger.test.ts` drives genuinely minted
+values through the redactor under innocent and credential-shaped keys, and its
+end-to-end group captures the Worker's *own* log lines for an **authorized**
+request and searches them for the session id, the CSRF token and both digests —
+that capture needs miniflare's `console.log` forwarding, so it lives beside the
+other log captures rather than in the gate's file.
 
 A stolen-but-unexpired cookie is **bounded, not prevented**: `SESSION_TTL_MS`
 (12 h) caps the initial life, `expires_at` is re-checked on every request, a
 refresh rotates the credential away from a stolen copy, and a 7-day hard cap from
-the original `created_at` stops a refresh loop. Not present: logout-all-sessions, a
+the original `created_at` stops a refresh loop. That cap is **unconditional**:
+`created_at` is its only input, so a row whose `created_at` does not parse is
+refused at the gate, and the rotation fails closed independently (`no cap`
+becomes `expire now`, never `no limit`). Not present: logout-all-sessions, a
 revocation list, device tracking, and any way to tell the thief from the owner.
 
 ## Why `workers_dev: false` matters — and what it does NOT do

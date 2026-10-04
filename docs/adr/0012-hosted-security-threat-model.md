@@ -147,6 +147,20 @@ the credential is anything a client can construct.
 expiry re-checked per request, `POST /api/session/refresh` rotates both the id
 and the CSRF token in one D1 batch so the legitimate browser can invalidate a
 stolen copy, and a 7-day hard cap from the original `created_at` prevents a
-refresh loop from keeping one credential alive. There is no logout-all-sessions,
-no revocation list and no device tracking; ADR-0009's invite revocation (slice 3)
-is the first mechanism that closes any of those.
+refresh loop from keeping one credential alive.
+
+**That cap is unconditional, and an earlier version of this sentence was not
+true as written.** `created_at` is the only input to the cap, and the resolver
+originally refused a *blank* one while accepting a *non-parsable* one — so a row
+saying `not a date` produced a principal, the cap computed as `NaN`, and the
+rotation took a no-cap branch: measured, 720 hourly refreshes over 30 simulated
+days slid the expiry out by the full 30 days where a well-formed `created_at`
+correctly died at the cap. A row whose `created_at` cannot be read is now
+refused outright, and the rotation independently fails closed (`no cap` resolves
+to `expire now`, never to `no limit`) so the guarantee does not depend on the
+gate's callers. `expires_at` already failed closed on the same shape; the
+asymmetry was the defect. Both are pinned in `test/session.test.ts`.
+
+There is no logout-all-sessions, no revocation list and no device tracking;
+ADR-0009's invite revocation (slice 3) is the first mechanism that closes any of
+those.

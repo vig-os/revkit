@@ -69,7 +69,6 @@
 import { parsePreviewPath, isRevkitBundlePath } from "./router.ts";
 import {
   csrfSatisfied,
-  isTokenShaped,
   readSessionCookie,
   resolveSession,
   CSRF_HEADER,
@@ -304,13 +303,14 @@ export async function authorizeRequest(
   if (cookie.kind === "absent") {
     return refused(401, "unauthorized", "no-session-cookie");
   }
-  if (!isTokenShaped(cookie.value)) {
-    // An input filter, not the control. A correctly-shaped forgery reaches
-    // the lookup below and is refused there; this branch only skips a
-    // database round trip for a cookie that cannot be a minted token.
-    return refused(401, "unauthorized", "malformed-session-cookie");
-  }
-
+  // No shape pre-check here, and that is a measured decision rather than an
+  // oversight. An earlier revision had one, commented as "an input filter, not
+  // the control" — but it duplicated `resolveSession`'s own first line, which is
+  // the SAME predicate on the SAME value. Replacing this block with nothing
+  // scored **0 tests red**, and the cost it claimed to avoid does not exist:
+  // `resolveSession` returns `malformed` before it touches the database, so a
+  // malformed cookie still costs zero round trips and still produces the
+  // identical `malformed-session-cookie` reason. One predicate, one place.
   const resolved = await resolveSession(db, cookie.value, options);
   if (resolved.outcome === "malformed") return refused(401, "unauthorized", "malformed-session-cookie");
   if (resolved.outcome === "unknown") return refused(401, "unauthorized", "unknown-session");
