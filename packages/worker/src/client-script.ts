@@ -29,15 +29,29 @@
 //
 // **Correction to what this comment used to say, found while filing #84.** It
 // claimed rolldown 1.0.0-beta.44 "is what wrangler 4.93.0 bundles a Worker
-// with". That is wrong: wrangler 4.93.0's own `package.json` declares
-// `esbuild` and no rolldown, its shipped code contains no reference to rolldown
-// at all, and its `node_modules` carries esbuild only. So today's deploy bundler
-// would honour the attribute, and the divergence above is a hazard against a
-// bundler Cloudflare may move to rather than the one in use. **A load-bearing
-// claim sat in this file unverified for a whole slice precisely because nothing
-// in this repo bundles the Worker with a second bundler** — that is issue #84,
-// and it is the reason to distrust this paragraph rather than the reason to
-// trust it.
+// with", which is wrong — wrangler 4.93.0 declares `esbuild` and no rolldown,
+// and its shipped code never references rolldown. **But the correction that
+// replaced it was wrong in the opposite direction**: it concluded that "today's
+// deploy bundler would honour the attribute". Measured against the bundler that
+// actually deploys, using wrangler's own `COMMON_ESBUILD_OPTIONS`:
+//
+//   Bun.build (esbuild 0.28.2, the TEST path)   with { type: "text" }  HONOURED
+//   esbuild 0.27.3 (wrangler 4.93.0's DEPLOY)  with { type: "text" }  REJECTED
+//     ✘ [ERROR] Importing with a type attribute of "text" is not supported
+//   esbuild 0.27.3                              with { type: "json" }  OK
+//
+// So the hazard above is **present, not hypothetical**, and the `String.raw`
+// choice below defends against the bundler that ships today. Getting this
+// backwards matters beyond tidiness: a future edit that "simplifies" the
+// version gate or reintroduces a text import would be made on the false premise
+// that the divergence is a maybe.
+//
+// **A load-bearing claim sat in this file unverified for a whole slice precisely
+// because nothing in this repo bundles the Worker with a second bundler** — that
+// is issue #84, and it is the reason to distrust this paragraph rather than the
+// reason to trust it. Note the hazard is not rolldown-specific: the general form
+// is any attribute or resolution difference between `Bun.build` and the deploy
+// bundler, and the 415 defect was hidden by the same gap.
 //
 // So the source lives here, in a template literal. There is no build step, no
 // generated artefact and no second copy of the bytes: the string below IS what

@@ -1459,6 +1459,15 @@ function tagNames(html: string): string[] {
  * characters up to the next `<` is blank. `script` elements are void-free so
  * there is no ambiguity about what "next tag" means here, and the assertion does
  * not become wrong when a browser or a serializer writes `</script >`.
+ *
+ * **This helper is individually insufficient and must never be used alone.**
+ * `<!-->` is a COMPLETE comment in HTML, not an opener, so for
+ * `<script><!--> <img src=x onerror=alert(1)>` the span up to the next `<` is a
+ * comment this regex happily eats and it reports `bodyIsEmpty = true` — while a
+ * browser parses that `img` as live markup. It is caught by the *element set*
+ * assertion, which sees `img` and fails. The two are jointly sound and
+ * individually unsound: a future page that drops the set assertion would inherit
+ * the hole, which is why both are asserted together in one test.
  */
 function scriptElement(html: string): { attributes: string; bodyIsEmpty: boolean } | undefined {
   const opening = /<\s*script\b([^>]*)>/i.exec(html);
@@ -2037,6 +2046,12 @@ const PAGE_ELEMENTS = [
           // stops, so no spelling hides, and anything not on this list fails —
           // including an element nobody has thought of yet.
           expect([...new Set(tagNames(html))].sort()).toEqual([...PAGE_ELEMENTS].sort());
+          // The set above is a SET, so a second copy of an ALLOWED element is
+          // invisible to it; `script` is counted separately below because a
+          // second one is an execution primitive. A duplicate of anything else
+          // (a second `<form action=...>`, say) passes here by design — the
+          // actual controls for those are `form-action 'self'` in the served CSP
+          // and the fact that `action` is a builder constant, not input.
           expect(tagNames(html).filter((name) => name === "script"), "exactly one script ELEMENT").toHaveLength(1);
           expect(scriptElement(html)?.bodyIsEmpty, "and it has no inline body").toBe(true);
 
