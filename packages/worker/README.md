@@ -11,11 +11,16 @@ mentions it.
 
 | Piece | File | Why it exists |
 |---|---|---|
-| Worker entry | `src/index.ts` | `GET /healthz`, `GET /api/threads`, `POST /api/session/refresh`, `POST /api/threads` (**disabled**) |
+| Worker entry | `src/index.ts` | `GET /healthz`, `GET /api/threads`, `POST /api/session/refresh`, `GET /invite/<token>`, `POST /invite/redeem`, `POST /api/threads` (**disabled**) |
+| Invites | `src/invites.ts` | ADR-0009's mint / redeem / revoke, the browser binding, and the per-call grant the gate checks |
+| Invite pages | `src/invite-page.ts` | the display-name form and the closed/rate-limited pages — no script, no reflected input |
+| Abuse limits | `src/rate-limit.ts` | ADR-0012's per-invite and per-address counters (D1-backed; see the ADR amendment) |
+| Invite tokens | `src/invite-token.ts` | the HMAC-SHA-256 hasher and its no-fallback key rule (ADR-0012's "stored as HMAC") |
+| Retention | `src/retention.ts` | ADR-0015's 30-day guest anonymisation |
 | Sessions | `src/session.ts` | mint, hash, store, resolve, rotate; the cookie and the CSRF token |
 | The gate | `src/authz.ts` | ADR-0012's per-request authorization, and the route table that says which routes it applies to |
 | Hosted store | `src/d1-store.ts` | `D1ThreadStore implements ThreadStore` — ADR-0006's log on D1 |
-| D1 schema | `migrations/0001_init.sql` | the ONLY DDL for the hosted store, applied out of band |
+| D1 schema | `migrations/0001_init.sql`, `migrations/0002_invites.sql` | the ONLY DDL for the hosted store, applied out of band, in filename order |
 | Response headers | `src/headers.ts` | adapter over the **shared** policy in `@revkit/review-core/http-headers` |
 | Logging | `src/logger.ts` | structured JSON with a request id, and a redactor bounded to what it can actually detect (ADR-0020, ADR-0015 — see "What the redactor does and does not do") |
 | Path grammar | `src/router.ts` | ADR-0008's `<repo>/pr-<n>/`, as a pure function |
@@ -45,14 +50,57 @@ the real committed allowlist, so it cannot quietly drift.
 `test/worker-runtime.test.ts` re-asserts both halves, so a future compatibility
 bump that re-enables the flag goes red.
 
-## Where a session comes from in this slice
+## Where a session comes from — and where an invite comes from
 
-**`issueSession` has no HTTP caller, and that is the design, not an omission.**
-ADR-0012 authorizes on every request, so something has to issue a session. Slice 2
-has neither the GitHub App (owner-gated, #34) nor an invite (slice 3), so the
-only issuer available today is **out of band: whoever holds write access to the
-D1 database** — in production `revkit deploy init` (slice 8), in tests the
-harness. The identity kind it mints is `operator`.
+**There are exactly two issuers, and one of them is a route.**
+
+1. **Out of band, by whoever holds write access to the D1 database** — in
+   production `revkit deploy init` (slice 8), in tests the harness. The identity
+   kind is `operator`. **`issueSession` has no HTTP caller, and that is the
+   design, not an omission.**
+2. **`redeemInvite`** (`src/invites.ts`), exchanging an ADR-0009 invite link. It
+   is the legitimate caller ADR-0009 asks for and it is reachable **by design** —
+   a guest arriving from a mail client has no session. Its credential is the
+   invite token, its abuse limit is `src/rate-limit.ts`, and its single-use
+   property is the redemption ledger. It goes through the SAME `mintSession` +
+   `sessionInsertStatement` internals, so there is **one** issuance path rather
+   than two; only the `INSERT` differs, because the redemption's write has to be
+   atomic with the redemption that authorises it.
+
+**The invite token is stored as `HMAC-SHA-256(token)`, not a bare digest**, under
+the `INVITE_TOKEN_HMAC_KEY` Worker secret (`wrangler secret put
+INVITE_TOKEN_HMAC_KEY`, at least 32 characters). There is **no fallback key**:
+`inviteTokenHasher` has no overload that returns a hasher without one, so a
+deployment missing the secret throws on every route — `/healthz` included,
+because a deployment that cannot hash an invite token is not healthy. The key is
+deliberately absent from `wrangler.jsonc`, and `test/worker-config.test.ts`
+asserts it stays absent. Rotating it invalidates every outstanding invite. The
+full argument, including the withdrawn plain-SHA-256 proposal, is in the ADR-0012
+amendment.
+
+**The limiter runs BEFORE the body is read, and it charges the address bucket
+first.** Every path through the redeem handler is metered: malformed JSON, a
+wrong media type, an over-long body, and both malformed spellings of the open
+route all cost exactly one row write. The limiter bounds how MANY requests there
+are and not how big each one is, so the body has its own ceiling:
+`MAX_REDEEM_BODY_BYTES` (64 KiB, in `src/invites.ts` beside
+`MAX_DISPLAY_NAME_CHARS`). A body over it is `413 body-too-large`, refused by a
+**streaming** cap that cancels the reader past the ceiling rather than by
+`request.text()` and a check afterwards — `content-length` is consulted first
+because it is free, but it is attacker-controlled and never the guarantee. That ordering is load bearing rather than
+tidy — the parse used to run first, so a 5 MB body was an unmetered
+`request.text()` on an unauthenticated route. The **per-token** bucket, whose key
+is `invite:<hmac(whatever the caller presented)>` and is therefore
+attacker-chosen, is charged only *after* the token resolves to a real invite;
+charging it earlier would make every guessed token a fresh row and no invite's
+real budget ever touched.
+
+**MINTING an invite has no HTTP route at all.** ADR-0009's only stated
+consequence is "Invite minting requires write access", so `mintInvite` is out of
+band too. An endpoint that mints invites is an endpoint that hands out review
+access, and gating it on anything weaker than write access is a worse defect than
+"the operator mints it" — the same reasoning that keeps `POST /api/session` from
+existing.
 
 Rejected alternative: a `POST /api/session` guarded by a deployment secret. It
 needs a Worker secret, so it cannot be built or tested offline (#34); it would add
@@ -105,7 +153,9 @@ written — not relaxing a `default`.
 | `/api/threads` | POST | **501.** Passes the gate and the CSRF check, then: the hosted write is slice 4. |
 | `/api/session/refresh` | POST | 200. Rotates the session id *and* the CSRF token, in one D1 batch, so a stolen cookie dies at the next refresh. |
 | `/api/*` | other verbs | 405, **behind the gate**, so route existence is not enumerable anonymously |
-| `/<repo>/pr-<n>/…` | any | 501 naming slice 5 — **behind the gate**, so slice 5 inherits the gate from the route table instead of remembering it |
+| `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no script, no reflected input) plus the browser-binding cookie — **minted only when the browser has none**, so re-opening the mail link does not rotate the binding a live session depends on; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
+| `/invite/redeem` | **POST only** | 303 to a **token-free** path, with two `Set-Cookie`s (session + browser binding) and the CSRF token; 410 the same closed page; 429; 415 unless `application/json` **or `application/x-www-form-urlencoded`**; 400 for an unreadable body. The form encoding exists because the Worker SHIPS a form: `src/invite-page.ts` emits no `enctype`, so a browser submits `x-www-form-urlencoded` and a JSON-only route answers the shipped page with `415`. A repeated form field is refused outright (JSON's repeated-key "last wins" is left as-is and asserted separately). |
+| `/<repo>/pr-<n>/…` | any | 501 naming slice 5 — **behind the gate**, and now carrying a **scope**, which is what a guest invite is checked against |
 | `/_revkit/…` | any | 404, never a redirect (ADR-0012) |
 | anything else | any | 404 |
 
@@ -119,6 +169,42 @@ would describe the request's shape to someone who has proved nothing.
 `POST /api/session/refresh` exists because ADR-0012's CSRF and `application/json`
 rules are only testable end to end if some state-changing call is reachable, and it
 is the smallest such route: it writes nothing but the caller's own `sessions` row.
+
+### A GUEST session is a session plus four more checks
+
+Slice 3 added `identity_kind = "invite"` to the gate's closed set, which is the
+arm ADR-0012's slice-2 amendment predicted would arrive "where the scope rules
+get written". A guest session is not authorized by being a session: its authority
+belongs to its invite, and the invite moves AFTER the session exists. So
+`authorizeRequest` re-reads the invite on every request and decides, in this
+order:
+
+| # | Check | Refusal | Status |
+|---|---|---|---|
+| 1 | the request presents the browser the invite was redeemed in | `invite-browser-mismatch` | 403 |
+| 2 | the invite is not revoked | `invite-revoked` | 401 |
+| 2 | the invite has not expired (an unreadable expiry fails closed) | `invite-expired` | 401 |
+| 3 | the invite's `repo` + optional `pr` covers what the route names | `invite-scope-mismatch` | 403 |
+| 4 | `can_comment` permits what the route writes | `invite-read-only` | 403 |
+
+**Why revocation here is immediate rather than eventual:** it is a property of
+*where* the check lives, not of how fast it runs. A session already sitting in a
+browser's cookie jar is refused on its next request — no expiry to wait for, no
+revocation list, no cache. `test/invites.test.ts` drives exactly that, and
+asserts the session row is still present and still unexpired while it is refused.
+
+**A `view` guest's attempt to comment is refused by the GATE, not by the 501.**
+That is deliberate: `POST /api/threads` answers 501 because the hosted write is
+slice 4's, but the *authorization* rule is ADR-0009's and it is testable now, so
+the read-only refusal happens in front of the handler and the 501 is only ever
+reached by a caller entitled to write.
+
+**What the browser binding is, and is not.** A `__Host-` cookie, 256 bits, stored
+only as a digest, minted by the response to `GET /invite/<token>` — so "bound to
+the first browser that opens it" is literal. It stops a forwarded link and a
+session cookie replayed from another profile. It does **not** stop an attacker who
+steals the profile, an XSS on any same-origin page, or a guest handing over their
+own unlocked device: it bounds *sharing*, it does not authenticate anybody.
 
 ## Session storage, and why it is hashed
 
@@ -214,7 +300,7 @@ The harness (`test/harness.ts`) starts one `miniflare` per test file, applies th
 are read from that file rather than duplicated in the harness, so the test runtime
 cannot drift from the shipped config.
 
-## What slices 1 and 2 do NOT do
+## What slices 1–3 do NOT do
 
 Stated here so nobody has to read the PR body to find out:
 
@@ -226,9 +312,12 @@ Stated here so nobody has to read the PR body to find out:
   extension→`Content-Type` allowlist. `parsePreviewPath` recognises a preview path
   and answers `501` naming the slice that serves it. ADR-0012's SVG-sandbox rule is
   implemented and tested as a header, against synthetic content only.
-- **No scope authorization.** See "The gate" above. `GET /api/threads` returns the
-  **whole** log to any valid session, because `events` has no `repo` column to
-  scope by. **Q6 stays partial.**
+- **Scope authorization is half-done, by construction.** A guest invite's scope IS
+  checked on every call — against the routes that NAME a repo and PR, which today
+  means `<repo>/pr-<n>/`. `GET /api/threads` names none, because `events` has no
+  `repo` column, so a guest in scope for one repo still reads the **whole** log,
+  exactly as an operator does. The preview surface (slice 5) adds the axis.
+  **Q6 stays partial.**
 - **`POST /api/threads` is still 501.** CSRF is load-bearing on a reachable route
   (`POST /api/session/refresh`), but no CSRF-protected *review write* ships, so
   "CSRF-protected writes" is not proven.
@@ -243,12 +332,30 @@ Stated here so nobody has to read the PR body to find out:
   core runs in workerd" is now a claim about the artefact that ships — asserted
   positively (named core exports must be present) and negatively (no Node/Bun
   escape hatches) in `test/worker-runtime.test.ts`.
-- **No rate limits, no Durable Objects.**
-- **No invite semantics.** `invites` has the ADR-0009 shape and a UNIQUE
-  `token_hash`; nothing mints, verifies, revokes or redeems one.
-- **No retention.** Tables have the columns; nothing deletes anything — including
-  `sessions` rows, which now exist and accumulate. Recorded in ADR-0015's
-  2026-10-04 amendment.
+- **Rate limits exist but are D1 counters, not Durable Objects.** ADR-0012 names
+  the DO; slice 3 amends it (with the concurrency measurement) and leaves the DO
+  for slice 6. Cost: one row write per limited attempt against D1's daily quota,
+  so a sustained flood spends a deployment's quota.
+- **Invite mechanics are real; the PRODUCT around them is not.** What is missing:
+  the `"Name (guest)"` GitHub mirror (needs the App, #34 / slice 4); the
+  `revkit invite --type` CLI, because minting is out of band by design; and
+  **any way for a guest to comment**, because `POST /api/threads` is still 501 —
+  so `view`'s read-only rule is enforced by the gate rather than observed in the
+  product.
+- **The redeem `303` does not solve how a browser PAGE gets its CSRF token.** The
+  token is minted and returned as a response header, exactly as
+  `POST /api/session/refresh` does, but a navigation cannot read a response
+  header. A meta tag in the preview document (whose hash then joins the committed
+  allowlist) or a second non-HttpOnly cookie is slice 5's choice. Shipping
+  neither is honest: no guest page exists to need one.
+- **No guest-purge SCHEDULE.** `purgeStaleGuests` is the whole deletion and is
+  tested; nothing CALLS it on a cron, because a Cron Trigger cannot be exercised
+  offline. Until `revkit deploy init` wires one, **guests are retained
+  indefinitely** — the wrong direction for a privacy clock, and recorded as such
+  in ADR-0015's 2026-10-04 amendment.
+- **`sessions` rows are still never deleted**, and now name a guest, so deleting
+  one is a personal-data decision ADR-0015 has not made. Expiry is a decision the
+  gate makes per request, not a deletion.
 - **No secrets, therefore no secret handling** (ADR-0014's substance is untested
   because there is nothing yet to leak).
 - **No deploy.** `wrangler deploy`, `wrangler d1 create` and `revkit deploy` are

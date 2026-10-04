@@ -19,15 +19,36 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Miniflare, type MiniflareOptions } from "miniflare";
 import { JSON_MEDIA_TYPE } from "../src/authz.ts";
+import { INVITE_TOKEN_HMAC_KEY, MIN_INVITE_TOKEN_HMAC_KEY_CHARS, inviteTokenHasher } from "../src/invite-token.ts";
 import { CSRF_HEADER, SESSION_COOKIE_NAME, issueSession, type IssuedSession } from "../src/session.ts";
 
 const PKG_ROOT = new URL("../", import.meta.url);
 
-/** The shipped D1 migration, verbatim — comments and all. */
-export const MIGRATION_SQL: string = readFileSync(
-  fileURLToPath(new URL("migrations/0001_init.sql", PKG_ROOT)),
-  "utf8",
+/**
+ * Every shipped D1 migration, in filename order — which is the order
+ * `wrangler d1 migrations apply` walks the directory in, so the schema the
+ * tests exercise is the schema a provisioned database gets.
+ *
+ * **Why this is a LIST and not one file.** Slice 1 shipped `0001_init.sql`
+ * with an `invites` table whose columns nothing used, and slice 3 is the code
+ * that uses them plus the two tables they need (`invite_redemptions`,
+ * `rate_limit_counters`). Reading `0001_init.sql` alone would have made the
+ * harness apply a schema the Worker cannot run against, which is the exact
+ * failure the single-file version was written to prevent.
+ *
+ * `MIGRATION_SQL` stays exported because `test/schema.test.ts` asserts things
+ * about that one file's bytes (A15 idempotence, A16/A17's constraints, and
+ * that the statement splitter loses nothing). It is `MIGRATIONS[0]` by
+ * construction, so the two cannot drift.
+ */
+export const MIGRATIONS: readonly string[] = Object.freeze(
+  ["0001_init.sql", "0002_invites.sql"]
+    .map((name) => readFileSync(fileURLToPath(new URL(`migrations/${name}`, PKG_ROOT)), "utf8"))
+    .map((sql) => sql.toString()),
 );
+
+/** The first migration, verbatim — comments and all. */
+export const MIGRATION_SQL: string = MIGRATIONS[0] as string;
 
 /**
  * Split a SQL file into single statements.
@@ -107,11 +128,11 @@ export function sqlStatements(sql: string): string[] {
   return statements;
 }
 
-/** Apply the shipped migration to a D1 database, one statement at a
- * time. Idempotent by construction — every statement is
- * `IF NOT EXISTS` — so calling it twice is a no-op (A15). */
+/** Apply every shipped migration to a D1 database, one statement at a time.
+ * Idempotent by construction — every statement is `IF NOT EXISTS` — so
+ * calling it twice is a no-op (A15). */
 export async function applyMigration(db: D1Database): Promise<number> {
-  const statements = sqlStatements(MIGRATION_SQL);
+  const statements = MIGRATIONS.flatMap((sql) => sqlStatements(sql));
   for (const statement of statements) {
     await db.prepare(statement).run();
   }
@@ -291,6 +312,58 @@ export function authHeaders(issued: IssuedSession): Record<string, string> {
  * `application/json`, so even a body-less POST has to declare it. */
 export const JSON_HEADERS: Readonly<Record<string, string>> = { "content-type": JSON_MEDIA_TYPE };
 
+// ── invite helpers ────────────────────────────────────────────────────────
+
+/** Every table the invite surface touches, cleared. The per-test reset, so a
+ * case cannot pass because a previous case left a redemption, a guest or a
+ * rate-limit counter behind — and `sessions` for the same reason: a guest
+ * session from case N must not authorize case N+1. */
+export async function resetInvites(db: D1Database): Promise<void> {
+  await db.prepare("DELETE FROM invite_redemptions").run();
+  await db.prepare("DELETE FROM rate_limit_counters").run();
+  await db.prepare("DELETE FROM invites").run();
+  await db.prepare("DELETE FROM guests").run();
+  await db.prepare("DELETE FROM sessions").run();
+}
+
+/** The name/value pair out of a `Set-Cookie` header value, so a test can build
+ * the `Cookie` header a browser would send without a browser. */
+export function cookieValue(setCookie: string): string {
+  const first = (setCookie.split(";")[0] ?? "").trim();
+  const equals = first.indexOf("=");
+  return equals === -1 ? "" : first.slice(0, equals);
+}
+
+/** The value out of a `Set-Cookie`, by cookie NAME — which is what a test
+ * asserting "the redeem response set the browser cookie" actually wants, and
+ * it cannot be satisfied by the session cookie by accident. */
+export function setCookieValue(setCookie: string, name: string): string | undefined {
+  for (const part of setCookie.split(/,\s*(?=[A-Za-z0-9_-]+=)/)) {
+    const pair = (part.split(";")[0] ?? "").trim();
+    if (!pair.startsWith(`${name}=`)) continue;
+    return pair.slice(name.length + 1);
+  }
+  return undefined;
+}
+
+/**
+ * The HMAC key the offline harness binds. A FIXED literal, not a random one,
+ * because a test that asserts "this token hashes to that digest" needs the key
+ * to be knowable; nothing here depends on the key being secret, and the real one
+ * is a Worker secret provisioned by `revkit deploy init` (slice 8, #34).
+ *
+ * It is long enough to clear `MIN_INVITE_TOKEN_HMAC_KEY_CHARS`, and it is
+ * visibly not a production value — the point of a fixed literal is that a reader
+ * can see it is a test input.
+ */
+export const TEST_INVITE_TOKEN_HMAC_KEY = "revkit-offline-test-invite-token-hmac-key-000000000000";
+
+/** The same key as a hasher, for the D1-level cases that call `mintInvite`,
+ * `loadInviteByToken` and `redeemInvite` directly rather than over HTTP. */
+export async function testTokenHasher(): Promise<ReturnType<typeof inviteTokenHasher>> {
+  return inviteTokenHasher(TEST_INVITE_TOKEN_HMAC_KEY);
+}
+
 /** A running miniflare plus its D1 handle. */
 export interface Harness {
   readonly mf: Miniflare;
@@ -373,16 +446,30 @@ export async function startWorker(
      * Worker deployed without it throws before any route runs — the
      * misconfigured-deploy shape, driven rather than described. */
     readonly vars?: Record<string, string> | null;
+    /** Override `INVITE_TOKEN_HMAC_KEY`, the invite-token HMAC key. `null`
+     * means bind NOTHING for it, which is how the missing-secret shape is
+     * driven rather than described. */
+    readonly inviteTokenKey?: string | null;
   } = {},
 ): Promise<Harness> {
   const config = readWranglerConfig();
   const vars = options.vars === undefined ? (config["vars"] as Record<string, string>) : options.vars;
+  // The key arrives through `bindings`, NOT through miniflare's `secrets`
+  // option — miniflare 4.20260518.0 IGNORES `secrets` (measured:
+  // `env.INVITE_TOKEN_HMAC_KEY` came back `undefined` with
+  // `secrets: { … }`, and the same value through `bindings` came back as the
+  // string). Slice 3's first cut read that measurement as "a keyed hash is
+  // verified nowhere"; the correct reading is "the harness was wrong", because
+  // `wrangler secret put` also lands in `env` and from inside the Worker the two
+  // are indistinguishable. `REVKIT_VERSION` was already supplied this way.
+  const key = options.inviteTokenKey === undefined ? TEST_INVITE_TOKEN_HMAC_KEY : options.inviteTokenKey;
+  const bindings = { ...(vars ?? {}), ...(key === null ? {} : { [INVITE_TOKEN_HMAC_KEY]: key }) };
   const mf = new Miniflare({
     modules: true,
     script: options.script ?? (await workerBundle()),
     compatibilityDate: config["compatibility_date"],
     compatibilityFlags: config["compatibility_flags"],
-    bindings: vars ?? undefined,
+    bindings: Object.keys(bindings).length === 0 ? undefined : bindings,
     d1Databases: { DB: `revkit-test-${Math.random().toString(36).slice(2)}` },
   } as MiniflareOptions);
   // Boot timing, on demand. `getD1Database` is where a miniflare instance

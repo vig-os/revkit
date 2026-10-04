@@ -157,6 +157,28 @@ describe("wrangler.jsonc", () => {
   });
 
   // ── ADR-0021: one version ─────────────────────────────────────────────
+  test("the invite-token HMAC key is NAMED but never DECLARED", async () => {
+    // ADR-0012's "stored as HMAC" needs a key, and ADR-0014 says no secret goes
+    // in a tracked file. Those two only reconcile if the binding is named here
+    // and its VALUE is not — a Worker secret reaches `env` by name, so the name
+    // is public and the value never is. Asserting both halves: a deploy that
+    // forgot the secret must fail loudly (asserted in `test/invites.test.ts`),
+    // and this file must never become where someone pastes the secret to make
+    // that go away.
+    const { INVITE_TOKEN_HMAC_KEY, MIN_INVITE_TOKEN_HMAC_KEY_CHARS } = await import("../src/invite-token.ts");
+    const vars = (CONFIG["vars"] ?? {}) as Record<string, string>;
+    expect(Object.keys(vars)).not.toContain(INVITE_TOKEN_HMAC_KEY);
+    expect(RAW).toContain(INVITE_TOKEN_HMAC_KEY); // the comment says why
+    // And no `vars` value is long enough to BE a key, which is the shape a
+    // pasted secret would take.
+    for (const value of Object.values(vars)) {
+      expect(value.length, "a vars value this long is a pasted secret").toBeLessThan(MIN_INVITE_TOKEN_HMAC_KEY_CHARS);
+    }
+    // `secrets_store` would put the secret's *name* in this file as well; it is
+    // not used, and asserting its absence keeps that a decision.
+    expect(Object.keys(CONFIG)).not.toContain("secrets_store");
+  });
+
   test("REVKIT_VERSION matches the CLI's version, so the release train cannot drift them apart", () => {
     const vars = (CONFIG["vars"] ?? {}) as Record<string, string>;
     expect(vars["REVKIT_VERSION"]).toBe(CLI_VERSION);

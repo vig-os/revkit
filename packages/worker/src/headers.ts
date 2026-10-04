@@ -105,6 +105,26 @@ export function applyTextHeaders(response: Response, ctx: HeaderContext): Respon
   return applyResponseHeaders(response, "text", "text/plain; charset=utf-8", ctx);
 }
 
+/**
+ * Attach ADR-0012 headers to a CREDENTIAL-BEARING redirect — the invite
+ * redemption's `303`, which sets a session cookie and points the browser
+ * somewhere else.
+ *
+ * `kind: "auth"` is the shared policy's own category for "an auth exchange
+ * response (session cookie or launch code)", and it is the one that carries
+ * `Cache-Control: no-store`. That header is the control here, not tidiness:
+ * ADR-0012's amendment names it for exactly this case ("API JSON,
+ * launch-code responses, and the `/-/auth` 302 carry `Cache-Control:
+ * no-store`"), and a 303 that set a session cookie without it would let an
+ * intermediary store the answer to a request whose URL no longer identifies
+ * anything.
+ *
+ * No CSP, because a redirect has no document to constrain.
+ */
+export function applyAuthHeaders(response: Response, ctx: HeaderContext): Response {
+  return applyResponseHeaders(response, "auth", undefined, ctx);
+}
+
 /** Attach the minimal CSP plus `Content-Disposition: inline` to an SVG.
  *
  * ADR-0012: "SVG is served with `Content-Security-Policy: sandbox` and

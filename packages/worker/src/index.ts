@@ -9,88 +9,105 @@
 //   GET    /api/threads?since=<n>   200 — the delta since the caller's head
 //   POST   /api/session/refresh     200 — rotate the caller's own session
 //   POST   /api/threads             501 — see below
+//   GET    /invite/<token>          200 — the display-name form (slice 3)
+//   POST   /invite/redeem           303 — exchange the token for a session
 //   ANY    /api/* (other verbs)     405, behind the gate
 //   ANY    /_revkit/…               404 — never a redirect (ADR-0012)
 //   ANY    <repo>/pr-<n>/…          501 — behind the gate; slice 5 serves it
 //   ANY    anything else            404
 //
+// ── Two ungated readers of `env.DB`, and what that means for the invariant ──
+//
+// Slice 2's invariant was "the gate is the only path to `env.DB`". Slice 3 adds
+// the invite routes, which MUST be ungated — a guest arriving from a mail
+// client has no session and ADR-0009 requires the exchange — so the invariant is
+// restated precisely rather than dropped:
+//
+//   - The gate is still the only path to the THREAD STORE and to `sessions`
+//     for authorized requests. `D1ThreadStore` is constructed only inside the
+//     handlers `handleAuthorized` can reach, and `handleAuthorized` is the only
+//     thing that accepts an `AuthorizedSession` — a type whose brand symbol is
+//     module-private to `authz.ts`.
+//   - The invite handlers are the second reader, and they touch only `invites`,
+//     `invite_redemptions`, `guests` and `rate_limit_counters`. They never
+//     construct a `D1ThreadStore`, and the HTTP half of `test/invites.test.ts` drives
+//     `GET /api/threads` without a session to show it still answers 401.
+//
+// The controls that stand in for the gate on those two routes, and why each is
+// the right one for a route that issues a credential to a caller who has none:
+//
+//   - the invite TOKEN is the credential (256 bits, hashed at rest), so there
+//     is no session to check — and ADR-0012's CSRF rule protects an existing
+//     session's authority, which a redemption does not touch
+//   - single use per browser (`invites.max_browsers`, enforced inside one D1
+//     batch) is what makes a replay impossible
+//   - `src/rate-limit.ts` bounds attempts per invite and per address, which is
+//     ADR-0012's abuse-limit clause
+//   - `classifyRoute` refuses `HEAD` on both, so a link checker cannot consume
+//     a redemption
+//
+// A `POST /api/session` would still be the thing not to build: it hands a
+// credential to whoever asks with no token to present.
+//
 // ── ADR-0012's per-request authorization gate ─────────────────────────────
 //
-// Every route except `/healthz` and the 404s passes through
-// `authorizeRequest` (`src/authz.ts`), which resolves the session cookie BY
-// DIGEST against D1 and refuses when the row is missing, expired, or carries
-// an identity kind this build does not recognise. On a state-changing verb it
-// additionally requires the per-session CSRF token in `x-revkit-csrf` and
-// `application/json`. Slice 1 closed `GET /api/threads` with a 501 precisely
-// because none of that existed; it is open now, and `GET` is the larger of the
-// two exposures it was protecting — an open read needs no browser, no user
-// interaction and no bypass at all, and it returns comment bodies, which is
-// what ADR-0015 protects.
+// Every route except `/healthz`, the two invite routes, the bundle path and the
+// 404s passes through `authorizeRequest` (`src/authz.ts`), which resolves the
+// session cookie BY DIGEST against D1 and refuses when the row is missing,
+// expired, or carries an identity kind this build does not recognise. On a
+// state-changing verb it additionally requires the per-session CSRF token in
+// `x-revkit-csrf` and `application/json`. Slice 1 closed `GET /api/threads`
+// with a 501 precisely because none of that existed.
+//
+// **For a GUEST session the gate does not stop there.** ADR-0012: "a guest
+// invite is checked for scope, type and expiry on each call", so
+// `authorizeRequest` re-reads the invite on every request and adds the route's
+// scope and the invite's `can_comment`. That is what makes revocation
+// immediate: a session already in a cookie jar dies on its next request.
 //
 // **What "authorized" means here, stated narrowly so it is not read as more
-// than it is:** a session this build issued is presenting, unexpired. It does
-// NOT yet mean "has read access to the repo" or "an invite's scope, type and
-// expiry were checked", because there is no `TokenSource` (the App is
-// owner-gated, #34), no invite (slice 3) and — because `events(seq, ts,
-// payload)` has no `repo` column — no axis for a scope check to select on.
-// The two missing clauses and the slice that owns each are in ADR-0012's
-// 2026-10-04 amendment. This is a NECESSARY condition, and calling it
-// sufficient would be the same overclaim slice 1 corrected twice.
+// than it is:** a session this build issued is presenting and unexpired; and if
+// it is a guest, its invite is unrevoked, unexpired, in scope, permitted to do
+// what the route writes, and bound to this browser. It does NOT yet mean "has
+// GitHub read access to the repo" — there is no `TokenSource` (the App is
+// owner-gated, #34) — and it does not scope `GET /api/threads`, because
+// `events(seq, ts, payload)` has no `repo` column to scope by (slice 5). Both
+// halves are in ADR-0012's 2026-10-04 amendment.
 //
-// ── Where a session comes from in this slice ──────────────────────────────
+// ── Where a session comes from ─────────────────────────────────────────────
 //
-// `issueSession` (`src/session.ts`) has no HTTP caller, deliberately. It is
-// invoked out of band by whoever holds write access to the D1 database — in
-// production that is `revkit deploy init` (slice 8), in tests the harness —
-// and it mints the `operator` identity kind. The alternative, a
-// `POST /api/session` guarded by a deployment secret, would add an
-// unauthenticated endpoint to the shipped surface that cannot even be built
-// offline (a Worker secret needs provisioning, #34). An unreachable control is
-// worse than an honest "the operator mints it". ADR-0009's real providers —
-// the GitHub App and invite links — arrive in slices 4 and 3 and each adds an
-// arm to `RECOGNISED_IDENTITY_KINDS`, which is closed here on purpose.
-//
-// ── ADR-0025's runtime gate, now on the SHIPPED artefact ─────────────────
-//
-// Unlike slice 1, this entry DOES import `@revkit/review-core`: `GET
-// /api/threads` constructs a real `D1ThreadStore` and reduces a real log, so
-// the bundler pulls the whole core graph into the deployed Worker. That makes
-// the bundle ~790 KB again and it means ADR-0025's "the same core serves all
-// three surfaces" is now true of the code that will actually be deployed, not
-// only of a test probe. `test/worker-runtime.test.ts` asserts the shipped
-// bundle both CLEAN (no Node/Bun escape hatches) and NON-VACUOUS (it contains
-// named core exports) — the two together are what make the scan mean
-// something. The runtime probe (`test/fixtures/runtime-probe.ts`) stays as the
-// second runtime the graph is EXECUTED in rather than merely bundled for.
+// Two callers, and only two. `issueSession` (`src/session.ts`) is invoked out
+// of band by whoever holds write access to D1 — in production `revkit deploy
+// init` (slice 8) — and mints the `operator` identity kind. `redeemInvite`
+// (`src/invites.ts`) is the legitimate caller ADR-0009 asks for, and it goes
+// through the SAME `mintSession` + `sessionInsertStatement` internals, so there
+// is one issuance path rather than two. MINTING an invite is reachable by
+// nobody over HTTP: ADR-0009's only stated consequence is "invite minting
+// requires write access", so `mintInvite` is out of band too, like the
+// operator session.
 //
 // ── `POST /api/threads` is still 501, on purpose ──────────────────────────
 //
 // ADR-0012's CSRF and `application/json` rules are only meaningful if a
 // state-changing call is reachable, and `POST /api/session/refresh` is the
-// smallest route that gives them a real end-to-end path: it writes nothing
-// but the caller's own `sessions` row. `POST /api/threads` needs the bridge
-// and the hosted write shape, which is slice 4, so it stays 501 rather than
-// shipping a write whose failure modes have not been reviewed.
-//
-// ── `workers_dev: false` ──────────────────────────────────────────────────
-//
-// A TRIPWIRE, never an authorization check, and it says so in
-// `wrangler.jsonc` too. It means there is no `*.workers.dev` URL, so a mistake
-// here is not immediately public. It evaporates the moment a `routes` entry
-// arrives, and it never applied to `wrangler dev --remote`. The authorization
-// this Worker performs is what `src/authz.ts` does, per request, and
-// `test/authorization.test.ts` drives its refusals through real workerd
-// requests.
+// smallest route that gives them a real end-to-end path. `POST /api/threads`
+// needs the bridge and the hosted write shape (slice 4), so it stays 501 — and
+// a `view` guest's attempt at it is refused by the GATE, not by the 501, which
+// is how ADR-0009's read-only rule is proven while the write does not exist.
 
 import {
   authorizeRequest,
   classifyRoute,
   denialLogMessage,
+  INVITE_OPEN_PREFIX,
+  INVITE_REDEEM_PATH,
   type AuthorizedSession,
   type Route,
 } from "./authz.ts";
 import { D1ThreadStore } from "./d1-store.ts";
 import {
+  applyAuthHeaders,
+  applyHtmlHeaders,
   applyJsonHeaders,
   applyTextHeaders,
   REQUEST_ID_HEADER,
@@ -98,9 +115,38 @@ import {
   workerHeaderContext,
   type HeaderContext,
 } from "./headers.ts";
+import {
+  FORM_MEDIA_TYPE,
+  inviteClosedPage,
+  rateLimitedPage,
+  redeemFormPage,
+  REDEEM_PATH,
+} from "./invite-page.ts";
+import {
+  MAX_DISPLAY_NAME_CHARS,
+  MAX_REDEEM_BODY_BYTES,
+  browserCookieHeader,
+  loadInviteByToken,
+  readBrowserCookie,
+  redeemInvite,
+} from "./invites.ts";
 import { createLogger, newRequestId, type Logger } from "./logger.ts";
 import { parseThreadsQuery } from "./router.ts";
-import { SessionAlreadyRotatedError, rotateSession, CSRF_HEADER } from "./session.ts";
+import {
+  INVITE_TOKEN_HMAC_KEY,
+  MissingInviteTokenKeyError,
+  hasUsableInviteTokenKey,
+  inviteTokenHasher,
+  type InviteTokenHasher,
+} from "./invite-token.ts";
+import { addressBucket, clientAddress, openBuckets, spendAttempts, tokenBucket } from "./rate-limit.ts";
+import {
+  CSRF_HEADER,
+  SessionAlreadyRotatedError,
+  isTokenShaped,
+  mintToken,
+  rotateSession,
+} from "./session.ts";
 
 // NOTE: this module exports its DEFAULT ONLY. A Worker entry may export
 // nothing but handlers — miniflare refuses a runtime with
@@ -125,6 +171,21 @@ import ALLOWLIST_JSON from "../../cli/src/dist-check-allowlist.json" with { type
 export interface Env {
   readonly DB: D1Database;
   readonly REVKIT_VERSION: string;
+  /**
+   * The invite-token HMAC key (ADR-0012's "stored as HMAC").
+   *
+   * A Worker **secret** in production — `wrangler secret put
+   * INVITE_TOKEN_HMAC_KEY`, provisioned by `revkit deploy init` (slice 8,
+   * owner-gated #34) — and a plain `bindings` entry in the offline harness.
+   * From inside the Worker the two are the same string in `env`, which is why
+   * slice 3's first attempt, which concluded that a keyed hash was "verified
+   * nowhere" because miniflare ignores its `secrets` option, was reasoning
+   * about the harness rather than about the Worker. It is deliberately NOT in
+   * `wrangler.jsonc`: a `vars` entry would put a secret in a tracked file
+   * (ADR-0014), and `test/worker-config.test.ts` asserts it is absent from
+   * there.
+   */
+  readonly INVITE_TOKEN_HMAC_KEY: string;
 }
 
 /** The allowlist's digests, de-duplicated and sorted — the same
@@ -205,17 +266,73 @@ function tag(response: Response, requestId: string): Response {
  * `@cloudflare/workers-types`' declarations of that static disagree on its
  * arity, and a serialise-then-set sequence has no such disagreement.
  *
- * `extra` carries the headers a route must set itself — today only
- * `POST /api/session/refresh`'s `Set-Cookie` and its fresh CSRF token, which
- * are per-response credentials and so cannot live in the shared policy. They
- * go through here rather than being set on the returned object so that every
- * JSON response provably passes `applyJsonHeaders` (and therefore gets
- * `Cache-Control: no-store`, which a `Set-Cookie` response must carry).
+ * `extra` carries the headers a route must set itself — `POST
+ * /api/session/refresh`'s `Set-Cookie` and its fresh CSRF token, and the
+ * redemption's TWO cookies. They are per-response credentials, so they cannot
+ * live in the shared policy. They go through here rather than being set on the
+ * returned object so that every JSON response provably passes
+ * `applyJsonHeaders` (and therefore gets `Cache-Control: no-store`, which a
+ * `Set-Cookie` response must carry).
  */
-function json(body: unknown, status: number, scope: RequestScope, extra?: Readonly<Record<string, string>>): Response {
-  const response = new Response(`${JSON.stringify(body)}\n`, { status });
-  for (const [name, value] of Object.entries(extra ?? {})) response.headers.set(name, value);
-  return tag(applyJsonHeaders(response, scope.headers), scope.requestId);
+function json(body: unknown, status: number, scope: RequestScope, extra?: Readonly<Record<string, string | readonly string[]>>): Response {
+  return withExtra(applyJsonHeaders(new Response(`${JSON.stringify(body)}\n`, { status }), scope.headers), scope, extra);
+}
+
+/**
+ * An HTML response with ADR-0012's full CSP and the request id.
+ *
+ * `Cache-Control: no-store` is set here and not by the shared policy, because
+ * the shared policy sets it only for `json` and `auth` kinds and this page is
+ * an `html` one. It has to be: the invite form carries the invite TOKEN in a
+ * hidden field, and an HTML page that a shared cache is allowed to store is a
+ * token in a disk cache. This is an ADDITION to the policy on one route, not a
+ * second implementation of it — every other header still comes from
+ * `applyHtmlHeaders`, and a test asserts the page carries the full directive
+ * set (`default-src 'none'`, `form-action 'self'`, `frame-ancestors 'none'`)
+ * as well as the no-store.
+ */
+function html(body: string, status: number, scope: RequestScope, extra?: Readonly<Record<string, string | readonly string[]>>): Response {
+  const response = new Response(body, { status });
+  response.headers.set("cache-control", "no-store");
+  return withExtra(applyHtmlHeaders(response, scope.headers), scope, extra);
+}
+
+/**
+ * The credential-bearing `303` the redemption answers.
+ *
+ * `Location` is a TOKEN-FREE path — the preview path the invite's scope names,
+ * built by `previewPath`, never the URL the token arrived on. That is the
+ * "stripped from the URL" half of ADR-0009 that is available without
+ * JavaScript; `src/invites.ts`'s header has the rest of the argument, including
+ * why `history.replaceState` is slice 5's and not this slice's.
+ *
+ * `kind: "auth"` gives it `Cache-Control: no-store`, which ADR-0012's
+ * amendment names for exactly this kind of answer.
+ */
+function seeOther(
+  location: string,
+  scope: RequestScope,
+  setCookies: readonly string[],
+  extra: Readonly<Record<string, string | readonly string[]>> = {},
+): Response {
+  const response = new Response(null, { status: 303, headers: { location } });
+  return withExtra(applyAuthHeaders(response, scope.headers), scope, { ...extra, "set-cookie": setCookies });
+}
+
+/** Attach the request id and any per-route headers, appending repeated names
+ * rather than overwriting — `Set-Cookie` appears TWICE on the redemption's
+ * response (the session and the browser binding) and `Headers.set` would keep
+ * only the last, silently dropping the session cookie and leaving a guest with
+ * a browser binding and no session. */
+function withExtra(
+  response: Response,
+  scope: RequestScope,
+  extra?: Readonly<Record<string, string | readonly string[]>>,
+): Response {
+  for (const [name, value] of Object.entries(extra ?? {})) {
+    for (const one of typeof value === "string" ? [value] : value) response.headers.append(name, one);
+  }
+  return tag(response, scope.requestId);
 }
 
 /** `request.url`'s pathname, or `"?"` if it cannot be derived. Total, and
@@ -238,12 +355,30 @@ export default {
     let scope: RequestScope | undefined;
     let status = 500;
     try {
+      // FIRST, before `beginRequest`. A deployment that cannot hash an invite
+      // token cannot redeem one, so it is not healthy and every route —
+      // `/healthz` included — says so. There is no fallback key, deliberately: a
+      // zero-filled key produces a VALID, WRONG digest, which is worse than no
+      // key. See `src/invite-token.ts` for why a 500 is the faithful shape
+      // rather than a compromise, and for the two alternatives that are worse.
+      //
+      // It has to precede `beginRequest`, which reads `env.REVKIT_VERSION` and
+      // throws on a missing one. With the order the other way round, a
+      // deployment missing BOTH bindings reported the `REVKIT_VERSION`
+      // TypeError instead — measured, and the reason the missing-key test
+      // asserts on the message and not merely on a 500. The catch below copes
+      // with no scope: `fallbackLogger` and `ERROR_HEADER_CONTEXT` are the
+      // no-context answers, and they are why this can be first.
+      if (!hasUsableInviteTokenKey(env.INVITE_TOKEN_HMAC_KEY)) {
+        throw new MissingInviteTokenKeyError();
+      }
       // INSIDE the boundary. `beginRequest` builds the header context and
       // throws on a missing `REVKIT_VERSION`; that used to happen before
       // this `try`, so the catch never ran and workerd returned its own
       // error page — a stack trace and a store path in the response body.
       // `test/worker-runtime.test.ts` now drives exactly that deploy.
       scope = beginRequest(request, env);
+      const keys = await inviteTokenHasher(env.INVITE_TOKEN_HMAC_KEY);
       const url = new URL(request.url);
       const route = classifyRoute(path, method);
       scope.logger.log("info", "request.start", { method, path });
@@ -257,7 +392,7 @@ export default {
       // `AuthorizedSession` — a type whose brand symbol is module-private
       // to `authz.ts`.
       if (!route.requiresSession) {
-        const response = handleOpen(route, env, scope);
+        const response = await handleOpen(route, request, env, keys, scope);
         status = response.status;
         return response;
       }
@@ -279,7 +414,7 @@ export default {
         return response;
       }
 
-      const response = await handleAuthorized(route, decision.authorized, request, env, scope, url);
+      const response = await handleAuthorized(route, decision.authorized, request, env, keys, scope, url);
       status = response.status;
       return response;
     } catch (error) {
@@ -288,8 +423,20 @@ export default {
       // error string can carry a SQL fragment, a stack or an absolute store
       // path, and this response is readable by whoever reached the Worker.
       const requestId = scope?.requestId ?? newRequestId();
+      // The MESSAGE, not the name. Slice 3 logged `error.name` and justified it
+      // as "an error string can carry a SQL fragment, a stack or an absolute
+      // store path". The redactor is the control for that, and it was never
+      // applied to a field this call site chose not to populate — so the
+      // strongest statement available about the exchange's logs was untested on
+      // the one path that matters, an unhandled throw. Every throw site in this
+      // module interpolates a closed vocabulary or a constant
+      // (`MissingInviteTokenKeyError` names the binding and never a value), and
+      // `test/invites.test.ts` now drives a throwing path with a marker in the
+      // message and asserts the marker is absent from every captured line. A
+      // caller rule the logger's own header calls primary is worth more than a
+      // field left empty by hope.
       (scope?.logger ?? fallbackLogger(requestId)).log("error", "request.error", {
-        error: error instanceof Error ? error.name : typeof error,
+        error: error instanceof Error ? error.message : typeof error,
         path,
       });
       status = 500;
@@ -308,16 +455,28 @@ export default {
 
 /**
  * The ungated routes, and they are ungated because none of them can return
- * review data: `/healthz` is a liveness probe that reads no database,
- * `/_revkit/` is ADR-0012's never-redirecting bundle path, `unknown` is not a
- * route at all, and `method-not-allowed` carries no data either.
+ * review data or a session by any means other than a valid invite token:
+ * `/healthz` is a liveness probe that reads no database, `/_revkit/` is
+ * ADR-0012's never-redirecting bundle path, `unknown` is not a route at all,
+ * `method-not-allowed` carries no data either, and the two invite routes are
+ * gated by the invite TOKEN instead of by a session.
  *
- * `test/authorization.test.ts` asserts that the GATED paths are exactly the
- * three that can carry data, so "these four kinds are the exception" is a claim
- * about the route table rather than about this function — and it is what turns a
- * missing `case` here into a caught 500 rather than a quiet gap.
+ * `test/authorization.test.ts` asserts that the GATED paths are exactly those
+ * that can carry review data, so "these kinds are the exception" is a claim
+ * about the route table rather than about this function — and it is what turns
+ * a missing `case` here into a caught 500 rather than a quiet gap.
+ *
+ * `request` is a parameter now because the invite routes read the request's
+ * OWN cookies and headers — the browser binding and the client address — and
+ * nothing else on this path does.
  */
-function handleOpen(route: Route, env: Env, scope: RequestScope): Response {
+async function handleOpen(
+  route: Route,
+  request: Request,
+  env: Env,
+  keys: InviteTokenHasher,
+  scope: RequestScope,
+): Promise<Response> {
   switch (route.kind) {
     case "health":
       // A `HEAD` probe takes this same branch and the platform drops the body
@@ -326,17 +485,23 @@ function handleOpen(route: Route, env: Env, scope: RequestScope): Response {
       // forget, which is the point of the case below.
       return json({ ok: true, revkitVersion: env.REVKIT_VERSION, requestId: scope.requestId }, 200, scope);
     // `method-not-allowed` appears on BOTH sides of the gate: gated for the API
-    // paths, ungated for `/healthz`. It is therefore the one kind a dispatcher
-    // written per-side can handle on one side and DROP on the other — and it was
-    // dropped here, so `POST /healthz` fell through to `unreachable()`, threw
-    // into the error boundary, and answered **500 `internal error`** with no
-    // `Cache-Control` and a `request.error` log line. Base `7a7bb652` answered
-    // 405. Measured before the fix: GET/HEAD 200, and POST / PUT / DELETE /
-    // OPTIONS / PATCH all 500. `test/authorization.test.ts` now drives every one.
+    // paths, ungated for `/healthz` and for the invite routes. It is therefore
+    // the one kind a dispatcher written per-side can handle on one side and DROP
+    // on the other — and it was dropped here, so `POST /healthz` fell through
+    // to `unreachable()`, threw into the error boundary, and answered **500
+    // `internal error`** with no `Cache-Control` and a `request.error` log line.
+    // Base `7a7bb652` answered 405. Measured before the fix: GET/HEAD 200, and
+    // POST / PUT / DELETE / OPTIONS / PATCH all 500. `test/authorization.test.ts`
+    // now drives every one — and slice 3 adds `HEAD /invite/<token>`, which
+    // must be 405 and must NOT consume the redemption.
     case "method-not-allowed":
       return json({ error: "method-not-allowed" }, 405, scope);
     case "revkit-bundle":
       return json({ error: "not-found", note: "revkit bundle serving lands in M4 slice 3" }, 404, scope);
+    case "invite-open":
+      return openInvite(request, env, keys, scope);
+    case "invite-redeem":
+      return redeemFromRequest(request, env, keys, scope);
     case "unknown":
       return json({ error: "not-found" }, 404, scope);
     default:
@@ -344,13 +509,438 @@ function handleOpen(route: Route, env: Env, scope: RequestScope): Response {
   }
 }
 
+// ── the invite surface (slice 3) ──────────────────────────────────────────
+
+/** The token out of `/invite/<token>`, or `undefined`. `classifyRoute` has
+ * already established the prefix; this refuses an empty or over-long segment
+ * without consulting the database, and returns `undefined` rather than a
+ * refusal reason because the CALLER turns both "not a token" and "not an
+ * invite" into the same closed page. */
+function inviteTokenFrom(pathname: string): string | undefined {
+  const token = pathname.slice(INVITE_OPEN_PREFIX.length);
+  return token.length === 0 || token.length > 256 ? undefined : token;
+}
+
+/**
+ * `GET /invite/<token>` — the display-name form.
+ *
+ * **Three things happen here, in this order, and the order is the security
+ * shape:**
+ *
+ *   1. **Spend the ADDRESS bucket, before anything else.** An open is
+ *      unauthenticated and idempotent, so it must be metered by the one bucket
+ *      whose key is not derived from the request. It is deliberately NOT charged
+ *      to the per-token bucket: that bucket was charged here in slice 3's first
+ *      cut, and anyone holding the URL could then spend the intended guest's
+ *      whole window with 45 GETs and lock them out with no recovery, because the
+ *      redemption slot is single-use and there is nothing to retry. See
+ *      `src/rate-limit.ts`'s `tokenBucket`.
+ *   2. **Look the invite up.** Missing, revoked and expired all produce the SAME
+ *      closed page — one page for every dead-link reason, which
+ *      `src/invite-page.ts` explains.
+ *   3. **Mint the browser binding ONLY if the request did not already present
+ *      one**, and render the form.
+ *
+ * ── Why step 3 is conditional, which was a shipped defect ────────────────
+ *
+ * This route used to mint a FRESH binding on every open. The binding is bound on
+ * the OPEN deliberately — it is what makes ADR-0009's "bound to the first browser
+ * that opens it" literal — but overwriting it was wrong, because the session is
+ * bound to the binding it was REDEEMED with and that binding is re-read on every
+ * authorized call. So a second click on the mail link, a second tab, a session
+ * restore or a Back-navigation silently replaced the cookie a live session
+ * depended on:
+ *
+ *     redeem -> 303 | GET /api/threads -> 200
+ *     re-open -> 200 | binding ROTATED -> GET /api/threads -> 403
+ *     re-redeem -> 410 (the slot is spent, so there is no recovery)
+ *
+ * Every one of those triggers is ordinary browser behaviour rather than an
+ * attack. Reusing a presented binding fixes it without weakening anything: a
+ * second, DIFFERENT browser still has no binding, so it still mints one and is
+ * still refused by `max_browsers`; and a binding is per-browser, so reusing one
+ * across several of a guest's own invites costs nothing (the ledger is keyed by
+ * `(invite_id, binding_hash)`).
+ *
+ * This route does not consume the redemption, which is what makes the `HEAD`
+ * refusal in `classifyRoute` a matter of correctness rather than politeness for
+ * the *open* — and note the asymmetry: `HEAD` on the redeem route is refused
+ * because a `HEAD` there WOULD consume.
+ */
+async function openInvite(
+  request: Request,
+  env: Env,
+  keys: InviteTokenHasher,
+  scope: RequestScope,
+): Promise<Response> {
+  const pathname = safePath(request);
+  const token = inviteTokenFrom(pathname);
+  // NEVER unmetered, and the rule that guarantees it lives in `openBuckets` —
+  // the address bucket when the edge set one, the per-token bucket when it did
+  // not, because an empty bucket list writes nothing at all.
+  const limited = await spendAttempts(
+    env.DB,
+    openBuckets({
+      address: clientAddress(request.headers),
+      tokenHash: token === undefined ? undefined : await keys.hash(token),
+    }),
+  );
+  if (!limited.ok) {
+    scope.logger.log("info", "rate.limit.hit", { bucketKind: limited.kind, route: "invite-open" });
+    return rateLimited(limited.retryAfterSeconds, scope);
+  }
+  if (token === undefined) return html(inviteClosedPage(), 404, scope);
+  const invite = await loadInviteByToken(env.DB, token, { keys });
+  const now = Date.now();
+  if (invite === undefined || invite.revokedAt !== null || Date.parse(invite.expiresAt) <= now) {
+    scope.logger.log("info", "invite.denied", { stage: "open", reason: invite === undefined ? "unknown-token" : "not-live" });
+    return html(inviteClosedPage(), 410, scope);
+  }
+  // L1: the field is `writable`, and the first two names tried were both wrong.
+  // `SENSITIVE_KEY`'s content-word alternative has NO boundary guards —
+  // deliberately, it is what stops `arrayOfEmails` — so it matches `comment`
+  // INSIDE `canComment`, and the boolean reached the log as `"[redacted]"`
+  // carrying nothing at all. Renaming it to `commentable` failed the same way,
+  // because `commentable` also contains `comment`. `writable` contains no word
+  // on that list.
+  //
+  // Dropping the field was the other option and it loses a real diagnostic:
+  // `can_comment` is a COLUMN, and nothing in the schema ties it to `kind`, so a
+  // row can say `kind = view` with `can_comment = 1`. The gate decides from the
+  // column, so the column is what an operator needs to see when a guest's rights
+  // disagree with their invite's share type. Narrowing the redactor is NOT the
+  // fix: that alternative is guard-free by design, and slice 2's boundary work
+  // was on the token-shape rule, which this must not weaken.
+  scope.logger.log("info", "invite.opened", { inviteKind: invite.kind, writable: invite.canComment });
+  const presented = readBrowserCookie(request.headers.get("cookie"));
+  const reuse = presented.kind === "present" && isTokenShaped(presented.value) ? presented.value : mintToken();
+  return html(
+    redeemFormPage({ token, repo: invite.repo, pr: invite.pr, kind: invite.kind, canComment: invite.canComment }),
+    200,
+    scope,
+    {
+      // The SHARED builder, with the invite's remaining lifetime as the `Max-Age`.
+      // This route had its own copy of these five attributes and the mutation
+      // run is what caught it: dropping `SameSite=Lax` from the copy changed
+      // **zero** tests, because no assertion covered the cookie this route sets
+      // — while the redemption's identical cookie, built by
+      // `browserCookieHeader`, was asserted. Two builders, one covered: the
+      // classic way for a security attribute to rot in the copy nobody looks at.
+      "set-cookie": browserCookieHeader(reuse, (Date.parse(invite.expiresAt) - now) / 1000),
+    },
+  );
+}
+
+/**
+ * `POST /invite/redeem` — exchange the token for a session.
+ *
+ * ── The order, and the three corrections that produced it ──────────────────
+ *
+ *   1. **ADDRESS bucket first.** This route's first cut charged the rate limit
+ *      AFTER the content-type check and AFTER `readRedeemBody`, while a comment
+ *      above it claimed "rate limit first (an attempt is an attempt whether or
+ *      not the body parses)". Measured: five malformed-JSON bodies, five wrong
+ *      media types, an over-long body and both malformed open-route spellings each
+ *      left **zero** counter rows — an unauthenticated, unmetered body-parse
+ *      endpoint in front of an invite. The address bucket is charged before the
+ *      media type is even looked at, so every path through this handler is
+ *      metered.
+ *   2. **Media type, then body.** `application/x-www-form-urlencoded` is
+ *      accepted HERE AND NOWHERE ELSE (see `isRedeemContentType`).
+ *   3. **Look the token up, then charge the PER-TOKEN bucket** — only for a token
+ *      that resolves to a live invite, per `src/rate-limit.ts`'s `tokenBucket`.
+ *   4. **The browser-binding cookie**, then the redemption, which decides scope,
+ *      type, expiry, revocation and slot availability inside one D1 batch.
+ *
+ * On success the response is a `303` to a TOKEN-FREE path, carrying TWO
+ * `Set-Cookie` headers — the session and the browser binding, both `__Host-`,
+ * `HttpOnly`, `Secure`, `SameSite=Lax` — plus the CSRF token as a response
+ * header, exactly as `POST /api/session/refresh` returns it.
+ *
+ * There is NO CSRF requirement here, and that is deliberate rather than an
+ * omission: a CSRF token binds a state change to an EXISTING session and the
+ * caller has none. The controls that fit this shape are the 256-bit token, the
+ * single-use ledger and the rate limit; a CSRF check here would be a control
+ * that cannot fail.
+ */
+async function redeemFromRequest(
+  request: Request,
+  env: Env,
+  keys: InviteTokenHasher,
+  scope: RequestScope,
+): Promise<Response> {
+  const address = clientAddress(request.headers);
+  // Same rule as the open route, and for the same reason: an empty bucket list
+  // writes nothing, so a request with no edge address would skip the limiter
+  // entirely on this path too. The token is inside the body, which has not been
+  // read yet at this point — so before the parse there is no token key to fall
+  // back to, and the address bucket being empty here means this specific request
+  // is unmetered. That is stated rather than papered over: reading the body to
+  // get a key would undo the ordering rule above. What IS metered without an
+  // address is every request that reaches the token lookup, which is the
+  // expensive path.
+  const limited = await spendAttempts(env.DB, addressBucket(address));
+  if (!limited.ok) {
+    scope.logger.log("info", "rate.limit.hit", { bucketKind: limited.kind, route: "invite-redeem" });
+    return rateLimited(limited.retryAfterSeconds, scope);
+  }
+  if (!isRedeemContentType(request.headers.get("content-type"))) {
+    return json({ error: "unsupported-media-type", reason: "content-type-not-json" }, 415, scope);
+  }
+  const body = await readRedeemBody(request, request.headers.get("content-type"));
+  // Over the ceiling is its own answer, not a malformed body. The response says
+  // which, so a caller can tell "send less" from "send something I can parse".
+  if (body?.kind === "too-large") {
+    return json({ error: "bad-request", reason: "body-too-large" }, 413, scope);
+  }
+  if (body === undefined) return json({ error: "bad-request", reason: "unparsable-body" }, 400, scope);
+  const invite = await loadInviteByToken(env.DB, body.token, { keys });
+  if (invite === undefined) {
+    scope.logger.log("info", "invite.redeem.denied", { reason: "unknown-token" });
+    return html(inviteClosedPage(), 410, scope);
+  }
+  // The token resolved, so its own bucket is now worth charging. A guessed token
+  // never reaches this line and therefore never creates a counter row.
+  const tokenLimit = await spendAttempts(env.DB, tokenBucket(invite.tokenHash));
+  if (!tokenLimit.ok) {
+    scope.logger.log("info", "rate.limit.hit", { bucketKind: tokenLimit.kind, route: "invite-redeem-token" });
+    return rateLimited(tokenLimit.retryAfterSeconds, scope);
+  }
+  // No outer "no binding cookie" guard here, and that is the SECOND half of a
+  // correction rather than a fresh decision. There was one, and the mutation run
+  // replaced it with `if (false)` and changed **zero** tests, because
+  // `redeemInvite`'s own `isTokenShaped(binding)` check refuses a missing or
+  // malformed binding with the same `browser-binding-missing` refusal. Two
+  // places deciding one fact is how they drift, so the inner one — the one the
+  // test actually pins — is now the only one. `redeemInvite`'s refusal is also
+  // what names the reason, so the log line moved with it.
+  const cookie = readBrowserCookie(request.headers.get("cookie"));
+  const result = await redeemInvite(
+    env.DB,
+    {
+      token: body.token,
+      binding: cookie.kind === "present" ? cookie.value : "",
+      displayName: body.displayName,
+    },
+    { keys },
+  );
+  if (!result.ok) {
+    scope.logger.log("info", "invite.redeem.denied", { reason: result.refusal });
+    return html(inviteClosedPage(), 410, scope);
+  }
+  scope.logger.log("info", "invite.redeem.ok", { inviteKind: result.invite.kind, writable: result.invite.canComment });
+  // The CSRF token rides on the `303` as a response header, exactly as
+  // `POST /api/session/refresh` returns it, because a guest's first
+  // state-changing call needs one and ADR-0012 requires it per session. **How a
+  // browser PAGE reads it is not answered here:** a navigation cannot see a
+  // response header, and the two candidates are slice 5's to choose between — a
+  // meta tag in the preview document (whose hash then joins the committed
+  // allowlist) or a second, non-HttpOnly cookie. Shipping neither is the honest
+  // position, because `POST /api/threads` is a 501 and no guest page exists to
+  // need one; what ships is that the token EXISTS and is bound to the session.
+  return seeOther(previewPath(result.invite.repo, result.invite.pr), scope, [result.issued.cookie, result.browserCookie], {
+    [CSRF_HEADER]: result.issued.csrfToken,
+  });
+}
+
+/** The token-free path the redemption redirects to. `/` when the invite covers
+ * a whole repo and there is no PR to name — a repo-scoped invite's holder has
+ * no single review to land on, and sending them to a PR the invite never named
+ * would be a scope leak in the redirect. */
+function previewPath(repo: string, pr: number | null): string {
+  return pr === null ? "/" : `/${repo}/pr-${pr}/`;
+}
+
+/** A 429 in whichever shape the caller can use: HTML for the navigation the
+ * invite routes are reached by, and it always carries `Retry-After` because a
+ * 429 without one tells a client nothing except that it should guess. */
+function rateLimited(retryAfterSeconds: number, scope: RequestScope): Response {
+  return html(rateLimitedPage(retryAfterSeconds), 429, scope, { "retry-after": String(Math.max(1, retryAfterSeconds)) });
+}
+
+/**
+ * The two media types `POST /invite/redeem` accepts. **This route only.**
+ *
+ * `application/json` because ADR-0012 says the API accepts only that — and
+ * `application/x-www-form-urlencoded` because the page this route is reached
+ * from IS a form.
+ *
+ * ── Why the second one is not a violation of ADR-0012 ─────────────────────
+ *
+ * ADR-0012's clause is "**the API** accepts only `application/json`". A guest
+ * arriving from a mail client on a form submission is not an API client, and
+ * slice 3's first cut treated it as one — which made the shipped flow
+ * **unsubmittable**: `redeemFormPage` emits `<form method="post">` with no
+ * `enctype`, so a browser sends `application/x-www-form-urlencoded`; the route
+ * refused it with 415; and the page serves no script (`default-src 'none'`, no
+ * `<script>`), so there is no `fetch()` that could send JSON and **no HTML
+ * mechanism can produce `application/json` at all**. Every guest got a 415 and
+ * no session.
+ *
+ * Nothing caught it because every POST in the suite was a hand-built JSON
+ * `Request`. The fix is therefore paired with a test that parses the SHIPPED
+ * page's `action`, `method` and absent `enctype` and submits accordingly, so the
+ * page and this function cannot drift apart again.
+ *
+ * `text/plain` and the `+json` structured suffixes are still refused: ADR-0012's
+ * named type plus one browser default, and nothing else.
+ */
+function isRedeemContentType(contentType: string | null): boolean {
+  if (contentType === null) return false;
+  const type = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return type === "application/json" || type === FORM_MEDIA_TYPE;
+}
+
+/** The browser default for a `<form>` with no `enctype`. Named so the page and
+ * the route cannot disagree about the spelling. */
+/**
+ * The redemption body, or `undefined` when it cannot be read as one.
+ *
+ * **Total in both encodings**, and the discipline is identical: a missing body,
+ * a malformed document, a non-object, a missing field, a field of the wrong
+ * type, a REPEATED field and an over-long name all resolve to `undefined`, and
+ * the caller answers one 400 with a fixed literal reason. Nothing from the body
+ * reaches a response, a log line or a page.
+ *
+ * A **repeated** field is refused rather than resolved, because a form-encoded
+ * body can legitimately carry `token` twice and "the first one" is how one
+ * browser's redemption becomes another's — the same `since-repeated` rule
+ * `parseThreadsQuery` already applies, for the same reason.
+ *
+ * The form encoding's `+` becomes a space and `%XX` is decoded by
+ * `URLSearchParams`, which is the WHOLE reason the display name needs its own
+ * round-trip test: `"Ada L/ovelace & co — 引き継ぎ"` encodes differently under
+ * each media type, and only the decoded value reaches `redeemInvite`.
+ *
+ * The token is shape-checked HERE, before it is used as a rate-limit key and
+ * before it reaches `redeemInvite`. That is an input filter, not the control: a
+ * well-shaped forgery is refused by finding no row.
+ *
+ * `MAX_DISPLAY_NAME_CHARS * 8` is a ceiling on what this function will even
+ * look at, not the stored bound (`redeemInvite` refuses rather than truncates at
+ * `MAX_DISPLAY_NAME_CHARS`). It exists so an over-long field is rejected without
+ * being copied around; the 8x slack is for multi-byte characters and for the
+ * percent-encoding of one, and the test asserts the boundary from both sides.
+ */
+async function readRedeemBody(
+  request: Request,
+  contentType: string | null,
+): Promise<RedeemBody | undefined> {
+  const type = contentType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  const read = await readBoundedText(request);
+  if (read.kind === "too-large") return { kind: "too-large" };
+  if (read.kind === "unreadable") return undefined;
+  const record = type === FORM_MEDIA_TYPE ? formFields(read.text) : jsonFields(parseJson(read.text));
+  if (record === undefined) return undefined;
+  const { token, displayName } = record;
+  if (typeof token !== "string" || !TOKEN_SHAPE.test(token)) return undefined;
+  if (typeof displayName !== "string" || displayName.length > MAX_DISPLAY_NAME_CHARS * 8) return undefined;
+  return { kind: "fields", token, displayName };
+}
+
+/** What `readRedeemBody` concluded. `too-large` is its own verdict rather than
+ * a malformed body, because it is a different answer to give a caller and a
+ * different thing to assert: 413 says "your body is too big", 400 says "I could
+ * not read that", and collapsing them would hide the bound the test pins. */
+type RedeemBody =
+  | { kind: "fields"; token: string; displayName: string }
+  | { kind: "too-large" };
+
+/** Read at most `MAX_REDEEM_BODY_BYTES`, and STOP reading when the body exceeds
+ * it rather than reading it and then complaining.
+ *
+ * `content-length` is checked first because it is free and it lets an oversized
+ * request be refused with **zero** bytes read — but it is attacker-controlled,
+ * so it is a hint and never the guarantee. The streaming cap below is the
+ * guarantee: the reader is cancelled the moment the running total passes the
+ * ceiling, so an absent, wrong or `Transfer-Encoding: chunked` length cannot make
+ * this read more than the bound.
+ *
+ * `request.text()` cannot express this — it resolves the whole body before the
+ * caller sees any of it, so a size check after it is a check on bytes already in
+ * memory, which is the thing being avoided.
+ */
+async function readBoundedText(
+  request: Request,
+): Promise<{ kind: "text"; text: string } | { kind: "too-large" } | { kind: "unreadable" }> {
+  const declared = Number(request.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_REDEEM_BODY_BYTES) {
+    return { kind: "too-large" };
+  }
+  const body = request.body;
+  if (body === null) return { kind: "text", text: "" };
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      total += value.byteLength;
+      if (total > MAX_REDEEM_BODY_BYTES) {
+        await reader.cancel();
+        return { kind: "too-large" };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { kind: "unreadable" };
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { kind: "text", text: new TextDecoder().decode(bytes) };
+}
+
+/** `JSON.parse` that answers `undefined` instead of throwing, so the caller has
+ * one "unreadable" path rather than two. */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Form-encoded fields, with a repeat refused. `URLSearchParams` decodes
+ * `+` and `%XX`; it does not, and must not, decide which of two `token`s wins. */
+function formFields(body: string): Record<string, unknown> | undefined {
+  const params = new URLSearchParams(body);
+  const out: Record<string, unknown> = {};
+  for (const [name, value] of params) {
+    if (Object.hasOwn(out, name)) return undefined;
+    out[name] = value;
+  }
+  return out;
+}
+
+/** JSON fields. A JSON document can carry a duplicate key too, and `JSON.parse`
+ * silently keeps the last, so the check is done on the RAW text rather than on
+ * the parsed object — otherwise this function would accept a repeated `token`
+ * on one media type and refuse it on the other. */
+function jsonFields(parsed: unknown): Record<string, unknown> | undefined {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  return parsed as Record<string, unknown>;
+}
+
+/** The same anchored, exact-length shape `src/session.ts` checks a minted
+ * token against. Re-declared here because `src/index.ts` may export nothing but
+ * handlers (miniflare refuses a runtime with an extra export), so the constant
+ * is spelled out rather than imported for the test to compare against. A test
+ * asserts the two agree, so the copy cannot drift. */
+const TOKEN_SHAPE = /^[A-Za-z0-9_-]{43}$/;
+
 /**
  * Every route that requires a session, reached only with a
  * `decision.authorized` in hand. `authorized` is not used here except to log
  * the identity kind — and it is not LOGGED AS AN ID: `identity_kind` is a
- * closed vocabulary of provider names (`operator` today), never an identity,
- * so this line cannot carry personal data (ADR-0020, ADR-0015). The session
- * id the request carried is not passed to `scope.logger` at all, and
+ * closed vocabulary of provider names (`operator`, `invite`), never an
+ * identity, so this line cannot carry personal data (ADR-0020, ADR-0015). The
+ * session id the request carried is not passed to `scope.logger` at all, and
  * `SENSITIVE_KEY` in `src/logger.ts` would replace it if a future call site
  * tried.
  */
@@ -359,6 +949,7 @@ async function handleAuthorized(
   authorized: AuthorizedSession,
   request: Request,
   env: Env,
+  keys: InviteTokenHasher,
   scope: RequestScope,
   url: URL,
 ): Promise<Response> {
@@ -371,6 +962,7 @@ async function handleAuthorized(
     case "session-refresh":
       return refreshSession(authorized, env, scope);
     case "preview":
+      void keys;
       return json({ error: "not-implemented", enabledIn: "M4 slice 5 (R2 preview serving)" }, 501, scope);
     case "method-not-allowed":
       return json({ error: "method-not-allowed" }, 405, scope);

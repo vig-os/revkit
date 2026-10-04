@@ -97,7 +97,10 @@ the 404s, and it runs in this order:
    read is not a credential.
 2. **CSRF**, on state-changing verbs only: `x-revkit-csrf` must hash to that
    session's own `sessions.csrf_hash`.
-3. **`application/json`**, on state-changing verbs only.
+3. **`application/json`**, on state-changing verbs only — **with exactly one
+   documented exception, `POST /invite/redeem`**, which also accepts
+   `application/x-www-form-urlencoded`. See the amendment at the end of this
+   document for why that is not a second API media type.
 
 **Satisfied by this amendment:**
 
@@ -105,7 +108,7 @@ the 404s, and it runs in this order:
   and load-bearing on a reachable route (`POST /api/session/refresh`), with the
   token bound per session rather than being a constant.
 - "the API accepts only `application/json`" — real, including a body-less POST,
-  which must still declare it.
+  which must still declare it, and with the **one exception below**.
 - Sessions are HttpOnly / Secure / SameSite=Lax, and additionally `__Host-`,
   which the browser only accepts without a `Domain` attribute — so a sibling
   subdomain cannot set a cookie this origin will send.
@@ -164,3 +167,228 @@ asymmetry was the defect. Both are pinned in `test/session.test.ts`.
 There is no logout-all-sessions, no revocation list and no device tracking;
 ADR-0009's invite revocation (slice 3) is the first mechanism that closes any of
 those.
+
+## Amendment (2026-10-04, issue #9, slice 3) — invite tokens, rate limits, and
+## the per-call guest check
+
+Slice 3 implements ADR-0009's invite mechanics. Two of this ADR's lines are
+**amended rather than implemented as written**, and both amendments are
+recorded here with the measurements behind them, because a divergence from an
+accepted ADR that lives only in a commit message is the failure mode this ADR
+exists to prevent.
+
+### 1. "stored as HMAC" → **kept** as HMAC, and the first proposal is withdrawn
+
+The abuse-limits bullet above ends *"invite tokens are 256-bit random, stored as
+HMAC"*. Slice 3 **implements it as written**:
+`packages/worker/src/invite-token.ts` stores `HMAC-SHA-256(token)` under the
+`INVITE_TOKEN_HMAC_KEY` Worker secret.
+
+**The withdrawn proposal.** An earlier draft of this slice proposed amending the
+bullet to plain `SHA-256`, on two grounds: that HMAC's advantage is for
+low-entropy secrets and a 256-bit CSPRNG token has no dictionary, and that the
+harness could not supply a key. **Both grounds were measured and both were
+answered, and the amendment is withdrawn rather than left standing:**
+
+- **The entropy argument does not decide this.** At 256 bits of
+  `crypto.getRandomValues` there is no dictionary, so the *marginal* protection
+  today is small — the ADR does not claim otherwise. What the keyed form buys
+  is that the lookup key's safety stops depending on an unstated invariant
+  about a function in another file: HMAC's safety rests on a key, a bare
+  digest's rests entirely on "nobody ever derives a token instead of drawing
+  it". `invites.token_hash` is the row's identity, so that invariant is load
+  bearing and unversioned. The narrow claim is the property worth having.
+- **"The harness cannot supply a key" was a misdiagnosis.** **Measured:**
+  miniflare 4.20260518.0 ignores its `secrets` option, so
+  `env.INVITE_TOKEN_HMAC_KEY` came back `undefined` when passed there — and the
+  same value passed through `bindings` came back as the string. `wrangler
+  secret put` also lands in `env`, and from inside the Worker the two are
+  indistinguishable, so nothing about the *deployed* shape was untestable. The
+  harness was wrong, not the design. `test/harness.ts` binds through
+  `bindings` and says why.
+- **The fallback-key worry was real and is answered by construction.**
+  `inviteTokenHasher(key)` has no overload that returns a working hasher without
+  a key, and `test/worker-config.test.ts` asserts the key is named but never
+  declared in `wrangler.jsonc`'s `vars` or `secrets_store`. A missing secret
+  throws rather than defaulting.
+
+**Cost, stated rather than hidden.** One deployment secret to provision
+(`wrangler secret put INVITE_TOKEN_HMAC_KEY`, ≥ 32 characters) and to rotate.
+Rotation invalidates every outstanding invite, which is a deliberate, documented
+cost rather than an accident.
+
+**Migration:** none. Both forms are 64 hex characters and `invites.token_hash`
+is `TEXT`, so `migrations/0001_init.sql` needs no `ALTER`. That is what made
+the original amendment cheap, and it is also what made reversing it cheap.
+
+**A missing key is a 500 on every route, `/healthz` included, and that is
+deliberate.** A Workers *module* worker has no module-scope initialiser — `env`
+does not exist until a handler runs — so there is no "start" at which to refuse.
+The equivalent is a first-line check in `fetch`, and `/healthz` is included
+because a deployment that cannot hash an invite token is not healthy and a probe
+that says otherwise is a probe nobody should trust. The alternatives were worse:
+a per-call throw alone reports `/healthz` 200 while every invite route 500s, and
+refusing to start is not expressible. The check is **first**, before
+`beginRequest`, because a deployment missing both bindings would otherwise
+report the `REVKIT_VERSION` fault instead of the one an operator has to fix
+(`test/worker-runtime.test.ts` measures exactly that, which is why it asserts on
+the message and not merely on a 500).
+
+### 2. "rate limits … (Durable Object counters)" → a D1-backed counter
+
+The same bullet names the mechanism. Slice 3 ships
+`packages/worker/src/rate-limit.ts` on D1 and records the Durable Object as the
+end state (M4 slice 6, with the rest of the DO work).
+
+- **A D1 counter is a real counter, not an approximation. Measured on workerd
+  2026-05-18:** `INSERT … ON CONFLICT(bucket) DO UPDATE SET count = count + 1
+  RETURNING count`, issued **20 times concurrently** against one bucket,
+  produced 20 distinct counts (1…20) — no lost updates. The increment and the
+  window rollover happen in one statement, so the whole check is a single round
+  trip with no read-then-write window. (Slice 1 measured what that window costs:
+  six concurrent read-then-write appends produced three distinct `seq` values.)
+- **"We could not test a Durable Object here" would be false. Measured:** a
+  Durable Object namespace bound in miniflare with an exported `DurableObject`
+  subclass answers 200 offline, with no account. The argument for D1 is
+  therefore **scope**, not tooling, and saying otherwise would be the
+  plausible-mechanism story this repo keeps warning about.
+- Shipping redemption with **no** limit while this ADR claims one was not an
+  option, and shipping a limit that is honestly D1 is.
+
+Cost, stated rather than hidden: **one row write per limited attempt** against
+D1's daily row-write quota, so a sustained flood spends that deployment's quota.
+The quota is **100,000 rows written per day per database** on D1's Free plan
+(Cloudflare's published limit); the paid plan's ceiling is orders of magnitude
+higher. Every metered attempt is one `INSERT … ON CONFLICT … DO UPDATE`, and the
+increment and the window rollover are in that same statement, so one attempt is
+one write and not two.
+
+The quota is what makes the ordering rule below load bearing rather than
+cosmetic: the address bucket is charged **first, on every path**, so an
+unresolvable or malformed request still costs exactly one write.
+
+The **per-token bucket key is attacker-chosen** — it is
+`invite:<hmac(whatever the caller presented)>`, and an attacker chooses what to
+present. So it is charged only *after* the token resolves to a real invite.
+Charging it before the lookup would make **every guessed token a fresh row** —
+one write per guess, and no invite's real budget touched, so a limit that cannot
+defend against guessing is not defending against guessing
+(`test/invites.test.ts`, "a token that does NOT resolve creates no counter row at
+all"). Because the address bucket's key is the edge-set address, the number of
+rows an attacker can mint is bounded by how many source addresses they hold
+rather than by how much they can guess.
+
+A Durable Object trades the row-write cost for per-isolate consistency at a
+per-request cost. The limit's purpose here is to make a 256-bit token
+unguessable *by volume*; a quota exhaustion is a louder failure than a leaked
+invite. Residual risk, in the ADR rather than only in a PR.
+
+Two further properties of the shipped limit, both measured by test rather than
+asserted: `X-Forwarded-For` is **never** read (every hop appends to it, so it is
+forgeable and a forgeable identity half would make the whole limit forgeable);
+and the **per-token limit is enforced by a test against `max_browsers`**, because
+a limit below `2 × max_browsers` makes a legitimate multi-browser invite
+unusable — it was 10 against `team`'s `max_browsers = 10`, and each browser used
+to cost two attempts against that budget (open, then redeem), so the tenth
+browser was rate-limited rather than admitted. **It costs one now**: the open
+route no longer spends the per-token bucket, because charging a budget to a GET
+on a URL anyone holding the link can replay was a denial of service in its own
+right. The `2 ×` in the relationship is therefore slack rather than a tight fit,
+which is the safe direction. The relationship is **asserted, not derived**: `REDEEM_TOKEN_LIMIT`
+is the constant `40` and the test
+("the per-token limit is above 2 x the largest max_browsers") is what fails if
+someone edits one without the other. No code computes the limit from
+`max_browsers`, so there is no derivation to keep in step.
+
+### 3. "a guest invite is checked for scope, type and expiry on each call" — now
+### implemented, in two halves
+
+ADR-0009's invitation revocation is implemented. A session whose
+`identity_id` is a guest id is re-checked **on every authorized request**:
+
+1. **revocation** — `invites.revoked_at`, from the row as it stands now;
+2. **expiry** — `invites.expires_at`, with an unreadable value failing closed;
+3. **scope** — the invite's `repo` and optional `pr` against the repo/PR the
+   route names;
+4. **type** — `invites.can_comment` against whether the route writes review
+   content.
+
+Plus one property this ADR did not name and ADR-0009 implies: the session must
+present the **same browser** the invite was redeemed in
+(`__Host-revkit_browser`, stored as a digest, checked on every call). The
+mechanism and the attacks it does *not* stop are in `src/invites.ts`'s header;
+the short version is that a cookie binds a browser *profile*, so it bounds
+sharing and does not authenticate anybody.
+
+**What "on each call" does not yet cover, and this is the honest half.** The
+scope check selects on routes that NAME a repo and PR, which today means
+ADR-0008's `<repo>/pr-<n>/` preview paths. `GET /api/threads` names none,
+because `events(seq, ts, payload)` has no `repo` column for a scope check to
+select on — so a guest with a valid invite currently reads the whole log, exactly
+as an operator does. The preview surface (slice 5) adds the axis; until then a
+revoked, expired or wrong-browser guest is refused everywhere, and an in-scope
+guest is refused on out-of-scope paths.
+
+The `view`-is-read-only half is enforced **by the gate, before the handler**,
+which is how it is testable while `POST /api/threads` is still a 501: a
+read-only guest's attempt at the append is refused `403 invite-read-only`, and
+the 501 is only ever reached by a caller entitled to write.
+
+### 4. "`application/json` only" — and the one route that also accepts a form
+
+**The JSON-only clause above is about the API, and `POST /invite/redeem` is not
+one.** Its caller is a person who followed a link in a mail client and is
+standing in front of the display-name form this Worker itself rendered; a
+browser submits that form as `application/x-www-form-urlencoded`, because the
+page declares no `enctype`. Refusing it means the shipped page cannot be
+submitted by the thing it was built for — which is what happened: the route
+accepted only JSON, so every redemption through the shipped form answered `415`
+while the test suite was green, because the tests posted JSON the way a *program*
+would rather than the way a *browser* does. **This is the only route in the
+Worker with the exception**, and it stays that way deliberately: every other
+body-carrying route is consumed by revkit's own client code and has no browser
+in the loop, so a second media type there would widen the surface for nothing.
+
+What the exception does **not** do is relax the rules. `text/plain`,
+`application/ld+json` and every other type are still refused with `415`, a
+parameterised type of either (`application/json; charset=utf-8`) is accepted as
+the type it names, and the two encodings are held to the **same** limits:
+a repeated form field is refused outright rather than resolved, the display-name
+bound is `redeemInvite`'s on both paths, and the token shape is one predicate
+(`TOKEN_SHAPE`) for both. The encoding is named once, in `src/invite-page.ts`,
+and imported by the route — so the page and the route cannot disagree about it
+without a type error, and a test derives its request from the page's own markup
+(`action`, `method`, the absent `enctype` and the field names) rather than from a
+hand-written copy of what the page emits.
+
+
+### 5. Sessions are issued to a guest by an unauthenticated route — and why that
+### is not `POST /api/session`
+
+Slice 3 adds the first route in this Worker that hands a session to a caller who
+has none, and it is worth saying precisely what stands in for the gate there:
+
+- the credential is the **invite token** (256 bits, hashed at rest, `UNIQUE`),
+  not an absent session;
+- ADR-0012's **CSRF rule is deliberately not applied** to it, because a CSRF
+  token binds a state change to an *existing* session and there is none. The
+  controls that fit this shape are single use and a rate limit; a CSRF check
+  here would be a control that cannot fail.
+- **single use** is per browser and bounded by `max_browsers`, enforced inside
+  one D1 batch so a lost race leaves nothing behind. This is the precise reading
+  of ADR-0009's three share types — see the ADR-0009 amendment dated
+  2026-10-04.
+- `HEAD` is refused on both invite routes, so a link checker cannot consume a
+  guest's single redemption.
+- **Minting** an invite has no HTTP route at all, for the same reason
+  `POST /api/session` does not exist: an endpoint that hands out review access
+  is worse than "whoever holds write access to D1 mints it".
+
+### 6. Two ungated readers of `env.DB`, and the restated invariant
+
+Slice 2's invariant was "the gate is the only path to `env.DB`". The invite
+routes must be ungated — a guest arriving from a mail client has no session — so
+the invariant is restated rather than dropped: the gate is still the only path to
+the **thread store** and to `sessions` for authorized requests, and the invite
+handlers touch only `invites`, `invite_redemptions`, `guests` and
+`rate_limit_counters`. `D1ThreadStore` is not constructible from them.

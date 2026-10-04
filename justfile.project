@@ -379,6 +379,31 @@ test_leg_timeout_worker := "180"
 # GC for the test graph, which are CPU-bound and therefore load-sensitive —
 # but that is a hypothesis, not a measurement, and it is not recorded as one.
 #
+# PARTIALLY ANSWERED (issue #9, slice 3, 2026-10-04). The hypothesis above is
+# the right one, and the symptom has a second shape that was measured: this leg
+# fails, not merely slows, when the host cannot give the process the CPU. Two
+# signatures, both from workerd rather than from an assertion: miniflare reports
+# `Unable to connect. Is the computer able to access the url?`, and its D1
+# control channel returns a non-JSON line at `parseSyncResponse`
+# (`SyntaxError: JSON Parse error: Unexpected identifier "ERROR"`). Either one
+# cascades through the rest of the file, so one dead instance reads as dozens of
+# unrelated failures. Measured on a host with `loadavg` ~37 from 6 users, memory
+# and file descriptors NOT the constraint (1.5 TB free, peak 90 fds against a
+# 1048576 limit, and no leaked `workerd` processes between runs):
+#
+#   - `bun test test/<file>.test.ts`, one file per process: 11/11 files green,
+#     repeatedly, every file.
+#   - `bun test` for all 11 files in ONE process: between 1 and 19 failures,
+#     varying run to run on identical bytes.
+#   - The same one-process run is clean when the host has capacity.
+#
+# So the variable is process-wide contention across the eleven workerd instances
+# this leg holds, not any one test. It is recorded here rather than fixed by
+# raising a ceiling, for the reason below: `--isolate` was tried and is worse
+# (it breaks the `beforeAll` lifecycle — 98 of 332 tests ran), and a per-file
+# invocation would change what `just test` means for every package. The honest
+# statement is that this leg needs headroom, and CI has it.
+#
 # WHY 10 s IS STILL RIGHT. A leg that blocks for tens of seconds IS a stall,
 # and `test_leg_timeout_worker` above exists to name it: this repo's #74
 # lesson is that an unbounded wait must read as a stall with a label, not as a
