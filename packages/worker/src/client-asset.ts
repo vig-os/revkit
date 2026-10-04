@@ -58,10 +58,9 @@
 //
 // ── Every other spelling is a 404, and never a redirect ────────────────────
 //
-// Matching is exact string equality against the one name that resolves, so
-// there is no pattern to widen and no directory to traverse: an unhashed name, a
-// mis-hashed name, a `.mjs` spelling, the version as a directory, and the bare
-// `/_revkit/` all miss. In particular:
+// Matching is exact string equality, so there is no pattern to widen and no
+// directory to traverse: an unhashed name, a mis-hashed name, a `.mjs` spelling,
+// the version as a directory, and the bare `/_revkit/` all miss. In particular:
 //
 //   - **No unhashed alias.** A stable URL is what browsers and every
 //     intermediary cache key on, so an unhashed name would make the digest
@@ -71,6 +70,37 @@
 //     widen `script-src` from one pinned directory to whatever the `Location`
 //     names. `revkitBundlePath` already refuses to construct a redirecting
 //     version alias, and this module adds no second way to produce one.
+//
+// ── …against the NORMALISED pathname, which is the honest qualifier ─────────
+//
+// "Everything else is a 404 by string equality" was literally false, and the
+// review found the four spellings that make it so. The comparison is against
+// `new URL(request.url).pathname` (`src/index.ts`'s `safePath`), and WHATWG
+// normalisation has already rewritten the path before the comparison sees it:
+// `.` and `..` segments are resolved away, and `\` is a separator on a special
+// scheme. Measured through workerd, these four all answer **200**:
+//
+//     /_revkit/<v>/./invite-<digest>.js
+//     /_revkit/<v>/x/../invite-<digest>.js
+//     /_revkit/<v>\invite-<digest>.js
+//     /_revkit/<v>/../<v>/invite-<digest>.js
+//
+// They are **inert**, and the reason is structural rather than lucky:
+//
+//   - the expected name is built from `env.REVKIT_VERSION` — which
+//     `revkitBundlePath` now shape-checks to be one path segment, so it cannot
+//     itself be a dot segment, a traversal or a separator — plus a digest of a
+//     compile-time constant. Every alias therefore resolves to the SAME BYTES,
+//     so an alias cannot reach a different or older script, which is the only
+//     thing an alias would be worth having.
+//   - because the bytes are identical, `immutable` stays true: there is nothing
+//     a revalidation could return differently.
+//   - `isClientAssetPath` is still equality against ONE name, and the version
+//     half of that name cannot be spelled two ways.
+//
+// `test/headers.test.ts` pins all of it: the refused list asserts 404 and no
+// `Location`, and a separate case walks these four asserting 200 with
+// byte-identical bodies, identical `Cache-Control` and no CSP.
 
 import { revkitBundlePath } from "./headers.ts";
 import { INVITE_CLIENT_SCRIPT } from "./client-script.ts";
@@ -179,6 +209,12 @@ export function clientScriptSrc(version: string): Promise<string> {
  * that is not the one name is a 404, which is what makes "an old bundle is
  * unreachable", "there is no unhashed alias" and "`/_revkit/` never redirects"
  * three consequences of one comparison instead of three rules.
+ *
+ * **The equality is against the NORMALISED pathname the caller passes in, not
+ * against the bytes on the wire** — `src/index.ts` derives it with
+ * `new URL(request.url).pathname`, so dot segments and backslashes are already
+ * resolved. Four spellings therefore resolve rather than miss, and the header
+ * comment above lists them with the reason they are inert.
  */
 export function isClientAssetPath(pathname: string, version: string, digest: string): boolean {
   return pathname === clientAssetPath(version, digest);

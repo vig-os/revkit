@@ -273,6 +273,28 @@ describe("ADR-0012 headers on the hosted surface", () => {
         `/_revkit/${VERSION}`,
         "/_revkit",
         "/_revkit/",
+        // `latest`, and a version that is not one path segment.
+        `/_revkit/latest/invite-${digest}.js`,
+        `/_revkit/${VERSION}/../${VERSION}/../invite-${digest}.js`,
+        // Normalisation that does NOT land on the one name: a trailing `.` or
+        // `..` leaves the version DIRECTORY, which serves nothing.
+        `/_revkit/${VERSION}/invite-${digest}.js/..`,
+        `/_revkit/${VERSION}/invite-${digest}.js/.`,
+        `/_revkit/${VERSION}/invite-${digest}.js/`,
+        // Encodings. A percent-encoded separator is not decoded into a
+        // separator before the comparison, and a fullwidth solidus is not a
+        // solidus at all.
+        `/_revkit/${VERSION}/invite-${digest}%2Ejs`,
+        `/_revkit/${VERSION}／invite-${digest}.js`,
+        `/_revkit/${VERSION}/invite-${digest}.js%00`,
+        `/_revkit/${VERSION}/invite-${digest}.js%0a`,
+        // Case: the digest is compared as the lowercase hex it is.
+        `/_revkit/${VERSION}/invite-${digest.toUpperCase()}.js`,
+        // A path PARAMETER: `;a=b` is part of a segment, not a parameter the
+        // Worker strips.
+        `/_revkit/${VERSION}/invite-${digest}.js;a=b`,
+        // An empty segment.
+        `/_revkit/${VERSION}//invite-${digest}.js`,
       ];
       for (const path of refused) {
         const response = await harness.dispatch(`http://localhost${path}`);
@@ -282,6 +304,127 @@ describe("ADR-0012 headers on the hosted surface", () => {
         expect(response.status, path).toBe(404);
         expect(response.headers.get("location"), path).toBeNull();
       }
+    });
+
+    test("the four NORMALISED aliases resolve to the IDENTICAL bytes, which is why they are inert", async () => {
+      // **These four are the correction to "everything else under `/_revkit/`
+      // is a 404, by string equality" — which was literally false.** The
+      // comparison IS string equality, but against `new URL(request.url)
+      // .pathname`, and WHATWG normalisation has already rewritten `.`, `..`
+      // and `\` (a separator on a special scheme) before the comparison sees
+      // them. Measured through workerd, all four answering 200 with the exact
+      // served bytes:
+      //
+      //   /_revkit/<v>/./invite-<digest>.js
+      //   /_revkit/<v>/x/../invite-<digest>.js
+      //   /_revkit/<v>\invite-<digest>.js
+      //   /_revkit/<v>/../<v>/invite-<digest>.js
+      //
+      // So the honest statement is "exact equality against the NORMALISED
+      // pathname", and this test is where that becomes checkable.
+      //
+      // **Inert, and asserted rather than argued.** The expected name is built
+      // from `env.REVKIT_VERSION` plus a digest of a compile-time constant, so
+      // every alias resolves to the same BYTES — an alias cannot serve a
+      // different or older script, which is the only thing an alias would be
+      // worth having. And because the response is byte-identical, `immutable`
+      // stays true: there is nothing a revalidation could return differently.
+      const digest = await clientAssetDigest();
+      const exact = clientAssetPath(VERSION, digest);
+      const canonical = await harness.dispatch(`http://localhost${exact}`);
+      expect(canonical.status).toBe(200);
+      const canonicalBody = await canonical.text();
+      const canonicalCache = canonical.headers.get("cache-control");
+
+      for (const path of [
+        `/_revkit/${VERSION}/./invite-${digest}.js`,
+        `/_revkit/${VERSION}/x/../invite-${digest}.js`,
+        `/_revkit/${VERSION}\\invite-${digest}.js`,
+        `/_revkit/${VERSION}/../${VERSION}/invite-${digest}.js`,
+      ]) {
+        const response = await harness.dispatch(`http://localhost${path}`);
+        expect(response.status, path).toBe(200);
+        expect(response.headers.get("location"), path).toBeNull();
+        expect(await response.text(), path).toBe(canonicalBody);
+        expect(response.headers.get("cache-control"), path).toBe(canonicalCache);
+        expect(response.headers.get("content-type"), path).toBe(CLIENT_ASSET_MEDIA_TYPE);
+        expect(response.headers.get("content-security-policy"), path).toBeNull();
+      }
+      // The reason this is safe rather than lucky: the version segment is now
+      // shape-checked at `revkitBundlePath`, so it cannot itself be a dot
+      // segment, a traversal or a separator. `isClientAssetPath` compares
+      // against a name built from that validated value — a normalisation alias
+      // has to be spelled in the REQUEST, and none of them widens what the name
+      // can denote.
+      expect(() => revkitBundlePath("..")).toThrow();
+      expect(() => revkitBundlePath(`../${VERSION}`)).toThrow();
+      expect(() => revkitBundlePath(`${VERSION}\\evil`)).toThrow();
+    });
+
+    test("a miss on /_revkit/ emits `asset.miss` — an emitted event with no observer is not an observation", async () => {
+      // **The one `LOG_MESSAGES` member with no emitter was this one.** The
+      // review audited all fourteen names and found every other one has a real
+      // call site; deleting this log line SURVIVED (183 tests, 0 failures), so
+      // `asset.miss` was a name in a vocabulary rather than an event anything
+      // produced. The existing "every name survives the REAL logger" case in
+      // `test/logger.test.ts` is the right shape but a different claim: it
+      // closes "a name the logger mangles" (which is how `asset.not-found`
+      // shipped), not "an event nothing observes".
+      //
+      // So this drives a REAL miss through the route and reads the line the
+      // Worker's own logger wrote. Same capture shape as
+      // `test/worker-runtime.test.ts`'s error-boundary case, and for the same
+      // reason: miniflare forwards the line over its own wire, so it reaches the
+      // HOST after the response resolves — restoring `console.log` the moment
+      // `dispatch` returns truncates the capture at an unpredictable point.
+      const lines: string[] = [];
+      const original = console.log;
+      console.log = (line: unknown) => {
+        lines.push(String(line));
+      };
+      // The status is recorded rather than the response, because the response
+      // type here is the WORKERS `Response` and an annotation would collide
+      // with the DOM one this file also sees.
+      let status = 0;
+      try {
+        status = (await harness.dispatch(`http://localhost/_revkit/${VERSION}/${CLIENT_ASSET_FILE}`)).status;
+        const deadline = Date.now() + 2_000;
+        while (!lines.some((line) => line.includes('"asset.miss"')) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      } finally {
+        console.log = original;
+      }
+      expect(status, "the unhashed spelling is still a miss").toBe(404);
+
+      const misses = lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((parsed) => parsed["msg"] === "asset.miss");
+      expect(misses.length, "exactly one asset.miss line per miss").toBe(1);
+      expect(misses[0]?.["level"]).toBe("info");
+      expect(misses[0]?.["pathKind"]).toBe("revkit-bundle");
+      // The fields are CONSTANTS, and the pathname is already on `request.end`,
+      // so the line cannot carry a caller-supplied value — asserted rather than
+      // assumed, because "constant fields only" is a claim about a widening.
+      expect(Object.keys(misses[0] ?? {}).sort()).toEqual(["level", "msg", "pathKind", "requestId", "ts"]);
+      // And the 200 path does NOT emit it: an event that fires on success would
+      // be worse than one that never fires, because it trains the reader to
+      // ignore it.
+      const hits: string[] = [];
+      const restore = console.log;
+      console.log = (line: unknown) => {
+        hits.push(String(line));
+      };
+      try {
+        await harness.dispatch(`http://localhost${clientAssetPath(VERSION, await clientAssetDigest())}`);
+        const deadline = Date.now() + 1_000;
+        while (!hits.some((line) => line.includes('"request.end"')) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      } finally {
+        console.log = restore;
+      }
+      expect(hits.filter((line) => line.includes('"asset.miss"'))).toEqual([]);
     });
 
     test("every verb on the asset is the same bytes or a 404, and nothing leaks review data", async () => {

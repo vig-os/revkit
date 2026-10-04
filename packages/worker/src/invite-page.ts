@@ -32,8 +32,15 @@
 // all three from `openInvite`, at `pathname` that still contains the token.
 //
 // The redemption's own 410 (`POST /invite/redeem`) is at a token-FREE path, so
-// its page loads the script too and the script finds nothing to strip — a
-// harmless no-op, and one of the idempotence cases in `test/invites.test.ts`.
+// its page loads the script too. **This comment used to claim the script finds
+// nothing to strip there, and that was false** — the script does not care what
+// is after the token, it rewrites any `/invite/`-prefixed path to `/invite/`, so
+// on `/invite/redeem` it strips `redeem`. The review caught it. It is harmless
+// either way: `/invite/` classifies as an invite-open with an EMPTY token, which
+// is the reload case below, and one of the idempotence cases in
+// `test/invites.test.ts`. It is recorded rather than quietly deleted because the
+// rewrite became prefix-based in this slice, and that is what makes the claim
+// true BY CONSTRUCTION rather than by accident.
 //
 // ── No user input is ever reflected into these pages ──────────────────────
 //
@@ -92,8 +99,12 @@
 //     and it deliberately has NO CSRF check (`src/index.ts`): a CSRF token binds
 //     a state change to an EXISTING session, and a guest arriving from a mail
 //     client has none. A check there would be a control that cannot fail.
-//   - The page that WOULD need one — a guest rail posting a comment — does not
-//     exist: the preview surface is 501 and the append is slice 4.
+//   - **The page that WOULD need one does not exist at all.** Not "it is behind
+//     a 501": what is 501 is `POST <repo>/pr-<n>/api/threads`, a WRITE API, and
+//     a 501 is not a page. The guest rail that would post a comment from the
+//     browser is slice 4's surface, and there is no markup for it yet — not a
+//     stub, not a disabled button. So the person who eventually needs the
+//     mechanism will be looking for a page, and there is not one to find.
 //
 // So the page does not read the token, and this module carries no `<meta>` for
 // it and no cookie the script could read. Shipping either would widen exposure to
@@ -113,11 +124,26 @@ export const FORM_MEDIA_TYPE = "application/x-www-form-urlencoded";
 /** HTML-escape a value on its way into the markup.
  *
  * Applied to EVERY interpolated value in this module — `scope`, `kind`,
- * `rights` and the hidden `token` — and not only to fixed strings, because two
- * of those four are caller-supplied. It is the **backstop**, not the control:
- * each is also shape-validated upstream into a character set containing none of
- * `<`, `"`, `&` or `'`, which is what makes the page safe, and which is why no
- * input can exercise this function today.
+ * `rights`, the hidden `token` and `scriptSrc` — and not only to fixed
+ * strings, because two of those five are caller-supplied and a third
+ * (`scriptSrc`) is built from configuration. It is the **backstop**, not the
+ * control: the first four are also shape-validated upstream into a character
+ * set containing none of `<`, `"`, `&` or `'`, which is what makes the page
+ * safe.
+ *
+ * **`scriptSrc` is what made this load-bearing rather than decorative, and the
+ * review is what found it.** It was interpolated RAW, and it is built from
+ * `env.REVKIT_VERSION` (`src/client-asset.ts`), so a quote in that value
+ * produced a `script` tag whose `src` attribute was broken out of and carried
+ * an `onload` handler. Not exploitable today — the served `script-src` has no
+ * `'unsafe-inline'`, and `REVKIT_VERSION` is a committed var whose only
+ * assertion is equality with `packages/cli/package.json` — but the mutation run
+ * showed deleting `text()` from `scope`, from `kind` and from `rights` changed
+ * **zero** tests, so three of the four call sites were decorative and the fourth
+ * was the only one that could inject. It escapes now, and
+ * `test/invites.test.ts` pins that by driving the builders with a value their
+ * own doc comments say is already pre-validated: the only way to observe a
+ * backstop is to hand it the input the validator was supposed to prevent.
  *
  * It exists so that a future edit widening a validator's character set degrades
  * to a visibly wrong page instead of markup execution, and so that a value
@@ -165,7 +191,7 @@ function document_(options: {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>revkit — ${options.title}</title>
-<script src="${options.scriptSrc}"></script>
+<script src="${text(options.scriptSrc)}"></script>
 </head>
 <body>
 <main>

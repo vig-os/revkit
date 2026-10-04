@@ -40,12 +40,41 @@ import { REVKIT_BUNDLE_ROOT } from "./router.ts";
 
 export { REVKIT_BUNDLE_ROOT };
 
+/** A version segment: alphanumerics, and the `.`, `+` and `-` a semver
+ * prerelease/build uses. **No `/`, no `\`, no quote, no angle bracket, no
+ * whitespace, no NUL, and it may not be `.` or `..`** — the first character
+ * being alphanumeric rules out the two dot segments on its own.
+ *
+ * A WHATWG path treats `\` as a separator on a special scheme, so a backslash
+ * here is a second spelling of the same traversal, and `.`/`..` are removed by
+ * normalisation before any comparison happens — which is why `isClientAssetPath`
+ * can see a path it did not receive. */
+const VERSION_SEGMENT = /^[0-9A-Za-z][0-9A-Za-z.+-]*$/;
+
 /** Path prefix revkit's own release serves scripts and styles from, for
  * one exact version. `revkitBundlePath("1.4.0")` ->
- * `/_revkit/1.4.0/`. */
+ * `/_revkit/1.4.0/`.
+ *
+ * **This is the chokepoint every consumer of the version goes through** —
+ * `workerHeaderContext` builds `script-src` from it and `clientAssetPath` builds
+ * the asset URL from it — so a version segment that cannot be expressed here
+ * cannot reach either. The review found that a value it accepted anyway (`1.0.0"
+ * onload="alert(1)" x="`) reached the `<script src>` attribute RAW and broke out
+ * of it; the escaping backstop in `src/invite-page.ts` now covers that sink too,
+ * but escaping alone would have left the SECOND-ORDER effect standing, which is
+ * the worse half: the malformed segment also makes the asset URL unresolvable,
+ * so the page rendered, `script-src` still named a path, the script 404'd, and
+ * the invite token stayed in the address bar of every visit **with no signal
+ * anywhere**. A control silently disabled by a configuration typo is worse than
+ * a missing one, because it is believed to be there. Refusing the segment makes
+ * the misconfiguration a loud 500 on every route instead (the throw is inside
+ * the handler's `try`). */
 export function revkitBundlePath(version: string): string {
   if (version.length === 0 || version === "latest" || version.endsWith("/")) {
     throw new Error(`revkitBundlePath: refusing a non-version or redirecting alias: ${JSON.stringify(version)}`);
+  }
+  if (!VERSION_SEGMENT.test(version)) {
+    throw new Error(`revkitBundlePath: refusing a version that is not one path segment: ${JSON.stringify(version)}`);
   }
   return `${REVKIT_BUNDLE_ROOT}${version}/`;
 }

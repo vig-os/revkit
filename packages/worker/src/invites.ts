@@ -137,29 +137,46 @@
 //     redemption consumed the browser's slot, so re-opening the mail link is
 //     refused as a replay
 //
+// One correction to the first bullet, because the feature matrix said it more
+// strongly than it is true: the FORM's body does carry the token, in its hidden
+// field, and it must — without it the guest cannot submit. The precise claim is
+// "no `Location`, no `Referer`, no log line, and in a body only as the redeem
+// form's hidden field". Slice 5b's review caught the looser version.
+//
 // That last point is the honest statement of what "stripped from the URL"
-// achieves, and it remains true without any script: single-use plus a
-// token-free redirect retires the token on the SERVER, and it is the control
-// that does not depend on a browser.
+// achieves — **a phrase that appears exactly once in this repo, at DESIGN-0001
+// §6, and not in ADR-0009**, which is where this and `src/index.ts` used to
+// cite it. It remains true without any script: single-use plus a token-free
+// redirect retires the token on the SERVER, and it is the control that does not
+// depend on a browser.
 //
 // **The client-side belt arrived in slice 5b, and this paragraph was its
 // holding statement until then.** `GET /invite/<token>` now loads one external
 // script (`src/client-script.ts`) which rewrites the address bar to `/invite/`
-// with `history.replaceState`, so the token does not survive in the current tab's
-// history, in a Back-navigation, or in a reload — and it does so **on load**,
-// before the exchange, because the token is in the form's hidden field and the
-// URL is not needed for anything once the document has loaded.
+// with `history.replaceState`, so the token does not survive in the current
+// tab's history, in a Back-navigation, or in a reload — and it does so **on
+// load**, before the exchange, because the token is in the form's hidden field
+// and the URL is not needed for anything once the document has loaded.
 //
 // Three things about that belt are properties rather than good intentions, and
 // each is pinned in `test/invites.test.ts`:
 //
 //   - `replaceState`, never `pushState`: pushing the clean URL would leave
 //     `/invite/<token>` as the PREVIOUS entry, one Back press away.
-//   - it needs JavaScript, so a guest with scripting disabled keeps the token in
-//     the URL — recorded as a residual risk rather than papered over. What such
-//     a guest does NOT lose is the redemption: the form posts natively.
+//   - **the rewrite target is the PREFIX, a constant**, so no input produces a
+//     URL that still names the token. The review found the first version cut at
+//     the LAST slash, which made `/invite/<token>/` — a trailing slash some mail
+//     products append — a no-op that left the token in the address bar of the
+//     very visit a guest is most likely to back out of.
 //   - it drops the query string and the fragment rather than carrying them
 //     across, because a query string is the most durable part of a URL.
+//
+// **And the belt is CONDITIONAL, which DESIGN-0001 §6 does not say.** It needs
+// JavaScript, so a guest with scripting disabled keeps the token in the URL —
+// recorded as a residual risk rather than papered over, and now recorded in the
+// ADR-0012 amendment as well as here. What such a guest does NOT lose is the
+// redemption: the form posts natively, and the server-side control above does
+// not depend on a browser at all.
 //
 // The display name is collected on the POST rather than through `?name=` on the
 // GET for the same reason the token is: **a guest's display name is personal

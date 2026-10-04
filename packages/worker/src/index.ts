@@ -344,13 +344,17 @@ function html(body: string, status: number, scope: RequestScope, extra?: Readonl
  * `Location` is a TOKEN-FREE path — the preview path the invite's scope names,
  * built by `previewPath`, never the URL the token arrived on.
  *
- * **This is the half of ADR-0009's "stripped from the URL" that needs no
- * JavaScript, and it is the control.** The other half arrived in slice 5b: the
- * invite page now loads one external script that rewrites the address bar with
- * `history.replaceState` on load, so the token does not survive in this tab's
- * history either. That is a belt; this is the pair of braces. `src/invites.ts`'s
- * header has the full argument, including what a guest with scripting disabled
- * keeps and does not lose.
+ * **This is the half of DESIGN-0001 §6's "stripped from the URL" that needs no
+ * JavaScript, and it is the control.** (The phrase appears exactly once in the
+ * repo, and it is there — not in ADR-0009, which is where this used to cite
+ * it, and which says nothing about the URL at all.) The other half arrived in
+ * slice 5b: the invite page now loads one external script that rewrites the
+ * address bar with `history.replaceState` on load, so the token does not survive
+ * in this tab's history either — but only when scripting is enabled, which is a
+ * conditional the design states unconditionally and the third ADR-0012
+ * amendment in this slice now records. That is a belt; this is the pair of
+ * braces. `src/invites.ts`'s header has the full argument, including what a
+ * guest with scripting disabled keeps and does not lose.
  *
  * `kind: "auth"` gives it `Cache-Control: no-store`, which ADR-0012's
  * amendment names for exactly this kind of answer.

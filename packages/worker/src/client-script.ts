@@ -8,29 +8,42 @@
 //
 // The obvious shape is a committed `client/invite.js` imported for its text. It
 // is the shape this codebase would reach for, and it does not survive contact
-// with the deploy bundler. Measured on this box, both bundlers the Worker is
-// built by, no Cloudflare endpoint contacted:
+// with every bundler the Worker might be built by. Measured on this box, no
+// Cloudflare endpoint contacted and `wrangler` not invoked:
 //
 //   - `Bun.build` (what `test/harness.ts` uses to build the artefact the tests
 //     run) — esbuild 0.28.2 — DOES support `with { type: "text" }` and inlines
 //     the file.
-//   - `rolldown` 1.0.0-beta.44, which is what wrangler 4.93.0 bundles a Worker
-//     with — does NOT. It resolves the `.js` as a JavaScript module and fails
-//     with `MISSING_EXPORT: "default" is not exported by "client/invite.js"`.
+//   - rolldown 1.2.11 does NOT. It resolves the `.js` as a JavaScript module and
+//     never reads the attribute: a payload that is valid text but invalid JS
+//     fails with `[PARSE_ERROR]`, and one that is valid JS without a default
+//     export fails with `MISSING_EXPORT: "default" is not exported`. Same root
+//     cause, different payload.
 //
-// So the text import is a mechanism that is green under `bun test` and broken
-// under `wrangler deploy`, which is the exact shape of the shipped 415 defect
-// this file's neighbours document: the page rendered, every test passed, and the
-// flow was unusable in a browser. `with { type: "json" }` — the mechanism the
-// inline-script allowlist already uses at `src/index.ts` — works in BOTH, and
-// a `.json` carrier would mean a committed, JSON-escaped blob of hand-maintained
-// JavaScript, which is unreviewable.
+// That is the same shape as the shipped 415 defect this file's neighbours
+// document — green under `bun test`, unusable in a browser — except that one
+// reached production and this one is being headed off. The general form is the
+// hazard: a mechanism the test bundler honours and a deploy bundler does not is
+// invisible here, because #84 — nothing bundles this Worker with a second
+// bundler — is not fixed.
 //
-// So the source lives here, in a template literal, and that is the whole reason.
-// There is no build step, no generated artefact and no second copy of the bytes:
-// the string below IS what the Worker serves, IS what the content hash is taken
-// over, and IS what the tests execute. Drift is not possible because there is
-// nothing to drift between.
+// **Correction to what this comment used to say, found while filing #84.** It
+// claimed rolldown 1.0.0-beta.44 "is what wrangler 4.93.0 bundles a Worker
+// with". That is wrong: wrangler 4.93.0's own `package.json` declares
+// `esbuild` and no rolldown, its shipped code contains no reference to rolldown
+// at all, and its `node_modules` carries esbuild only. So today's deploy bundler
+// would honour the attribute, and the divergence above is a hazard against a
+// bundler Cloudflare may move to rather than the one in use. **A load-bearing
+// claim sat in this file unverified for a whole slice precisely because nothing
+// in this repo bundles the Worker with a second bundler** — that is issue #84,
+// and it is the reason to distrust this paragraph rather than the reason to
+// trust it.
+//
+// So the source lives here, in a template literal. There is no build step, no
+// generated artefact and no second copy of the bytes: the string below IS what
+// the Worker serves, IS what the content hash is taken over, and IS what the
+// tests execute. Drift is not possible because there is nothing to drift
+// between.
 //
 // ── Why `String.raw`, and what that buys ───────────────────────────────────
 //
@@ -95,26 +108,50 @@ import { INVITE_OPEN_PREFIX } from "./authz.ts";
  * entry anywhere names the token — not the one a reload returns to, and not the
  * one a Back press returns to.
  *
+ * **The rewrite target is the PREFIX, not a slice of the path, and that is the
+ * one line the review changed.** This used to cut at `path.lastIndexOf("/")`
+ * and rewrite to `path.slice(0, cut + 1)`, which is "cut the LAST path
+ * segment". On `/invite/<token>/` the last slash is the one AFTER the token, so
+ * the slice reproduced the whole path and the rewrite was a NO-OP — measured,
+ * before the fix:
+ *
+ *     /invite/<token>       ->  /invite/            stripped
+ *     /invite/<token>/      ->  /invite/<token>/     NO-OP, token kept
+ *     /invite/<token>/x     ->  /invite/<token>/     stripped
+ *     /invite/<token>/utm   ->  /invite/<token>/     looks stripped, is not
+ *
+ * and a trailing slash is not exotic — mail security products append one, and a
+ * guest typing it is not a stretch. Both spellings land on the closed page,
+ * whose 410 still loads this script, so the token survived in the address bar of
+ * exactly the visit a guest is most likely to back out of and screenshot.
+ *
+ * `replaceState(null, "", prefix)` cannot have that failure mode: the target is
+ * a CONSTANT, so no input produces a URL naming the token, whatever follows it.
+ * The `cut` guard that went with the slice was dead — with the prefix check
+ * below passed, the path already begins with `/invite/`, so a `/` exists at
+ * `prefix.length - 1` and `cut < prefix.length - 1` is never true — so it is
+ * gone rather than left in as a no-op that reads like a control.
+ *
  * **The query string and the fragment are dropped, not carried across.** A query
  * string is the most durable part of a URL — history, `Referer`, server logs,
  * browser sync — which is the same argument `src/invite-page.ts` uses to keep
  * `?name=` off the `GET`. Preserving one would preserve a token in it the moment
- * any mail client or analytics wrapper put one there.
+ * any mail client or analytics wrapper put one there. Dropping them is now a
+ * property of the rewrite target rather than of a slice: `prefix` contains no
+ * `?` and no `#` by construction.
  *
- * **The guard is load-bearing, not politeness.** "Cut the last path segment" is
- * only correct under `/invite/`. Loaded on a preview path it would rewrite
- * `/acme/pr-7/` to `/acme/`, which is a different page; the prefix check is what
- * makes the script safe to reference from a second page later. `indexOf(prefix)
- * !== 0` rather than `startsWith` is deliberate only in that it is ES1 and
- * cannot itself be the thing that is missing.
+ * **The prefix check is load-bearing, not politeness.** Rewriting to the prefix
+ * is only correct ON an invite-open URL. Loaded on a preview path it would send
+ * `/acme/pr-7/` to `/invite/`, which is a different page; the prefix check is
+ * what makes the script safe to reference from a second page later.
+ * `indexOf(prefix) !== 0` rather than `startsWith` is deliberate only in that it
+ * is ES1 and cannot itself be the thing that is missing.
  */
 export const INVITE_CLIENT_SCRIPT = String.raw`(function () {
   "use strict";
   var prefix = "${INVITE_OPEN_PREFIX}";
   var path = window.location.pathname;
   if (path.indexOf(prefix) !== 0) return;
-  var cut = path.lastIndexOf("/");
-  if (cut < prefix.length - 1) return;
-  window.history.replaceState(null, "", path.slice(0, cut + 1));
+  window.history.replaceState(null, "", prefix);
 })();
 `;

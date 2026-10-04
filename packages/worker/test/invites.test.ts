@@ -46,7 +46,8 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { authorizeRequest, classifyRoute, DENIAL_REASONS, INVITE_OPEN_PREFIX, INVITE_REDEEM_PATH, type Route } from "../src/authz.ts";
 import { clientAssetDigest, clientAssetPath } from "../src/client-asset.ts";
 import { INVITE_CLIENT_SCRIPT } from "../src/client-script.ts";
-import { FORM_MEDIA_TYPE } from "../src/invite-page.ts";
+import { revkitBundlePath } from "../src/headers.ts";
+import { FORM_MEDIA_TYPE, inviteClosedPage, rateLimitedPage, redeemFormPage } from "../src/invite-page.ts";
 import { MAX_REDEEM_BODY_BYTES } from "../src/invites.ts";
 import {
   DEFAULT_SHARE_TYPE,
@@ -1761,6 +1762,141 @@ function parseJson(raw: string): Record<string, unknown> {
           // differently-written test, and these two lines are what would catch it.
         });
 
+        test("a path segment AFTER the token is stripped too — the token leaves the URL either way", () => {
+          // **This case was a hole, and the review found it.** The rewrite used
+          // to cut at `path.lastIndexOf("/")`, so it cut at the LAST slash. On
+          // `/invite/<token>/` that last slash is the one AFTER the token, so
+          // the slice produced `/invite/<token>/` again — the rewrite was a
+          // NO-OP and the token stayed in the address bar. Measured against
+          // the served bytes and end to end through workerd, at the base
+          // commit:
+          //
+          //   /invite/<token>        ->  /invite/          stripped
+          //   /invite/<token>/       ->  /invite/<token>/   NO-OP, token kept
+          //   /invite/<token>/x      ->  /invite/<token>/   stripped
+          //   /invite/<token>/utm    ->  /invite/<token>/   LOOKS stripped
+          //
+          // The no-op is the reachable one, and it is reachable by ordinary
+          // means: some mail security products append a trailing slash to a URL
+          // on the way out, and a guest typing it is not a stretch. What made
+          // it worse is that both spellings LAND ON THE CLOSED PAGE — the token
+          // `/` resolves to no row, so 410 — and the 410 page does load the
+          // script. So the token survived in the address bar of precisely the
+          // visit the PR named as the one a guest most likely backs out of and
+          // screenshots.
+          //
+          // **The fix is the PREFIX, not a slice.** `replaceState` is given the
+          // prefix itself, which is a constant, so no input can produce a URL
+          // that still names the token — including a path deeper than the
+          // token, a double slash, a percent-encoded slash, or a token-shaped
+          // segment with an `utm` after it.
+          const token = "D".repeat(43);
+          for (const path of [
+            `${INVITE_OPEN_PREFIX}${token}/`,
+            `${INVITE_OPEN_PREFIX}${token}/utm`,
+            `${INVITE_OPEN_PREFIX}${token}/utm/`,
+            `${INVITE_OPEN_PREFIX}${token}/x/y`,
+            `${INVITE_OPEN_PREFIX}${token}/%2F`,
+          ]) {
+            const applied = runClientScript(path);
+            expect(applied, path).toEqual([INVITE_OPEN_PREFIX]);
+            expect(applied[0], path).not.toContain(token);
+          }
+        });
+
+        test("every interpolated value is ESCAPED — the backstop works with a value a validator should already have refused", () => {
+          // **This is the case whose absence made `text()` decorative.** The
+          // mutation run deleted `text()` from `scope`, from `kind` and from
+          // `rights` in turn and every run SURVIVED — 0 failures each — because
+          // every interpolated value is already shape-validated upstream into a
+          // character set containing none of `<`, `"`, `&` or `'`, so no input
+          // can reach these interpolations that escaping would have changed.
+          //
+          // Which means the claim "no user input is ever reflected into these
+          // pages" rested entirely on slice 3's INPUT validation, and the
+          // escaping half was an unexercised backstop — decorative at the moment
+          // it was written. The mutation run also showed the ONE uncovered sink
+          // is the one that can inject: `scriptSrc` went into the `src`
+          // attribute RAW, so a quote in `env.REVKIT_VERSION` broke out of it.
+          // Measured at the base commit:
+          //
+          //   REVKIT_VERSION = 1.0.0" onload="alert(1)" x="
+          //   → <script src="/_revkit/1.0.0" onload="alert(1)" x="/invite-<digest>.js">
+          //
+          // Not exploitable today (no `'unsafe-inline'` in the served
+          // `script-src`, and `REVKIT_VERSION` is a committed var whose only
+          // assertion is equality with `packages/cli/package.json`) — but a
+          // control that only works because of an assertion three files away is
+          // one assertion away from not working.
+          //
+          // **So this test drives the builders DIRECTLY with values their own
+          // doc comments say are pre-validated.** That is deliberate and it is
+          // what a backstop test has to do: the scenario `text()` exists for is
+          // "a future edit widened a validator's character set", and the only
+          // way to observe the widening is to hand the builder a widened value
+          // rather than to widen a validator to get one. The casts are the
+          // point — they assert the backstop independently of the type that
+          // claims the value cannot get here.
+          const MARKUP = `acme"><script>alert(1)</script>`;
+          const hostile = MARKUP as unknown as string;
+          const page = redeemFormPage({
+            token: hostile,
+            repo: hostile,
+            pr: 7,
+            kind: hostile as unknown as Parameters<typeof redeemFormPage>[0]["kind"],
+            canComment: true,
+            scriptSrc: hostile,
+          });
+          // Not one of the four positions produced an attribute or a tag the
+          // browser would parse as markup.
+          expect(page).not.toContain("<script>alert(1)</script>");
+          expect(page).not.toContain(`repo="${MARKUP}"`);
+          expect(page).not.toContain(`src="${MARKUP}"`);
+          // …and the escaped forms ARE present, so this is the escaping
+          // happening rather than the input simply having been dropped.
+          expect(page).toContain("acme&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;");
+          // `scope` is a COMPOSITE (`<repo> pull request #<pr>`), so the escaped
+          // repo proves `text()` ran on the whole string rather than on a
+          // substring of it.
+          expect(page).toContain("<strong>acme&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt; pull request #7</strong>");
+
+          // `rights` is a ternary of two CONSTANTS, so `text(rights)` cannot
+          // matter for any input — which is exactly why deleting it survived,
+          // and why the honest statement is that it is uniformity rather than a
+          // control. Asserted as such instead of left implied.
+          expect(rateLimitedPage(30, "/_revkit/0.0.0/invite.js")).toContain("Try again in 30 seconds.");
+          expect(inviteClosedPage("/_revkit/0.0.0/invite.js")).toContain("cannot be used");
+        });
+
+        test("a hostile REVKIT_VERSION fails LOUDLY on every route, rather than serving a page whose script silently 404s", () => {
+          // **The second-order effect, and the reason escaping alone was not
+          // the fix.** A quote in `env.REVKIT_VERSION` does not just inject: it
+          // BREAKS THE ASSET URL. The page still renders, `script-src` still
+          // names a path, the page still looks correct — and the script 404s, so
+          // the token stays in the address bar of every visit, with no signal
+          // anywhere. A control silently disabled by a configuration typo is
+          // worse than a missing control, because it is believed to be there.
+          //
+          // So the version segment is validated ONCE, at `revkitBundlePath`,
+          // which every consumer already goes through: `workerHeaderContext`
+          // builds `script-src` from it and `clientAssetPath` builds the asset
+          // URL from it. A shape it cannot express cannot reach either, and the
+          // throw happens inside the handler's `try`, so the deployment answers
+          // a 500 with full hygiene rather than a page that quietly does not
+          // strip anything.
+          const EVIL = `1.0.0" onload="alert(1)" x="`;
+          for (const version of [EVIL, `1.0.0/../evil`, `1.0.0\\evil`, `1.0.0 evil`, "..", ".", "1.0.0\x00", "<script>"]) {
+            expect(() => revkitBundlePath(version), JSON.stringify(version)).toThrow(/one path segment/);
+          }
+          // The shape that is legitimate still works, prerelease included —
+          // a version gate that refused `0.1.0-rc.1` would be its own outage.
+          expect(revkitBundlePath("0.0.0")).toBe("/_revkit/0.0.0/");
+          expect(revkitBundlePath("1.2.3-rc.1")).toBe("/_revkit/1.2.3-rc.1/");
+          // And so `scriptSrc` — the sink above — is now a constant-shaped
+          // string by construction rather than by configuration discipline.
+          expect(() => clientAssetPath(EVIL, "a".repeat(64))).toThrow(/one path segment/);
+        });
+
         test("stripping uses replaceState, so the token does not survive in history", () => {
           // **This is the load-bearing assertion for the whole decision.** A
           // `pushState` of the clean URL would leave `/invite/<token>` as the
@@ -1876,6 +2012,48 @@ function parseJson(raw: string): Record<string, unknown> {
           const again = await reopen(harness, browser, minted.minted.token);
           expect(again.status).toBe(200);
           expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+        });
+
+        test("the 429 carries the SAME content-addressed script as the form — the third page is not a special case", async () => {
+          // **The 429's script was entirely unasserted, and the PR names it as
+          // one of three pages that load it.** The mutation run deleted the 429
+          // page's `<script>` tag outright and SURVIVED, and so did repointing
+          // its `src` at a URL that 404s — so "every page at a token URL loads
+          // the asset" was true of two of the three.
+          //
+          // It matters more than the other two, not less. The 429 is the ONE of
+          // the three a guest comes straight back to: the limiter refuses the
+          // OPEN before reading anything, so the address bar still holds the
+          // token on the one visit where "come back in N seconds" is exactly
+          // what the guest is about to do, and where a Back press is one key
+          // away. A 429 page without the script is the token's best copy.
+          const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const address = "198.51.100.44";
+          await seedCounter(`ip:${address}`, REDEEM_IP_LIMIT, Date.now());
+
+          const limited = await open(harness, minted.minted.token, { headers: { [CLIENT_IP_HEADER]: address } });
+          expect(limited.response.status, "the ceiling refuses the open").toBe(429);
+          const html = await limited.response.text();
+          expect(html).toContain("Too many attempts");
+          expect(html).not.toContain(minted.minted.token);
+
+          // Exactly one script, and its src is the URL the asset route answers —
+          // asserted against the same derivation the form page uses, so "all
+          // three pages carry the asset" is a test rather than a comment.
+          const tags = [...html.matchAll(/<script\b([^>]*)>/g)].map((m) => m[1] ?? "");
+          expect(tags.length, "one script tag").toBe(1);
+          expect(/\bsrc="([^"]*)"/.exec(tags[0] ?? "")?.[1]).toBe(
+            clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest()),
+          );
+          // …and it really resolves, rather than merely looking right.
+          const asset = await harness.dispatch(`http://localhost${clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest())}`);
+          expect(asset.status).toBe(200);
+
+          // And the stripping still happens on THIS page: the 429 is served at
+          // `pathname` that contains the token, which is the whole reason it
+          // loads the script at all.
+          expect(runClientScript(`${INVITE_OPEN_PREFIX}${minted.minted.token}`)).toEqual([INVITE_OPEN_PREFIX]);
         });
 
         test("a RELOAD of the stripped URL is the closed page, and that is the decision", async () => {
@@ -2111,7 +2289,16 @@ function parseJson(raw: string): Record<string, unknown> {
           }
           // Every log line the exchange produced, and the page the browser was
           // handed before it: none of them contains the token. ADR-0015/ADR-0020
-          // ("logs carry no … tokens") and ADR-0009's "stripped from the URL".
+          // ("logs carry no … tokens") and DESIGN-0001 §6's "stripped from the
+          // URL" — which is where that requirement lives, not ADR-0009.
+          //
+          // **Note what the next line asserts, because it is the precise
+          // version of a claim that was wrong elsewhere**: the form's body DOES
+          // contain the token, in its hidden field, and it has to — without it
+          // the guest cannot submit. So the honest statement is "no `Location`,
+          // no `Referer`, no log line, and in a body only as the redeem form's
+          // hidden field". Slice 5b's review found the feature matrix claiming
+          // the token reached no body at all.
           const formHtml = await (await open(harness, token)).response.text();
           expect(formHtml).toContain(token);
           for (const line of lines) expect(line, line.slice(0, 120)).not.toContain(token);
