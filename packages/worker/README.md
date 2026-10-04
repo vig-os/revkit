@@ -130,13 +130,23 @@ One function, `authorizeRequest` in `src/authz.ts`, in front of every route exce
 3. **`application/json`**, on a state-changing verb only. No parameter-suffixed
    type, no `text/json`, no `+json`, and no header at all.
 
-What it does **not** yet decide is ADR-0012's *scope* clause — "a GitHub session
-must still have read access to the repo" and "a guest invite is checked for scope,
-type and expiry" — because there is no `TokenSource`, no invite, and no `repo`
-axis in `events(seq, ts, payload)` for a scope check to select on. That is recorded
-in the ADR-0012 amendment dated 2026-10-04. "Authorized" here means exactly: *a
-session this build issued is presenting, unexpired*. A necessary condition, and
-calling it sufficient would be the same overclaim slice 1 corrected twice.
+For a **GUEST** session the gate adds four more (below), and slice 5 added the
+fifth: the route must NAME a review, or the guest is refused
+`invite-scope-unbounded`. "No scope" is not "no restriction" — before slice 5
+the thread read named no repository, `inviteCovers` answered "in scope" for an
+absent target, and the check ran on every request of a stranger's session while
+selecting nothing.
+
+What the gate still does **not** decide is ADR-0012's *other* scope clause —
+"a GitHub session must still have read access to the repo (cached ≤ 5 min)" —
+because there is no `TokenSource` (the App is owner-gated, #34). **That is the
+named missing axis:** a `github`-kind session is confined to no repository, so it
+reads any review in this deployment. A guest is confined to its invite's scope;
+the GitHub side stays org-wide until the provider can prove repo access. Neither
+was quietly changed. "Authorized" here means exactly: *a session this build
+issued is presenting, unexpired; and if it is a guest, its invite is unrevoked,
+unexpired, in scope, permitted to do what the route writes, and bound to this
+browser*.
 
 `RECOGNISED_IDENTITY_KINDS` is closed in the gate and open in the schema. Adding
 the GitHub App or an invite means adding an arm there, where the scope rules get
@@ -148,23 +158,37 @@ written — not relaxing a `default`.
 |---|---|---|
 | `/healthz` | GET, HEAD | 200 `{ok, revkitVersion, requestId}`. The only open route: it reads no database and returns no review content. |
 | `/healthz` | other | 405 |
-| `/api/threads` | GET, HEAD | 200 `{head, threads}` behind the gate |
-| `/api/threads` | GET `?since=<n>` | 200 `{head, events}` — exactly the events with `seq > n` |
-| `/api/threads` | POST | **501.** Passes the gate and the CSRF check, then: the hosted write is slice 4. |
+| `/api/threads` | any | **404 — removed in slice 5.** It named no review, so it could only ever answer org-wide and ADR-0012's per-call scope check had nothing to select on. Not a 403 and not a gated 501: a path that is not a route cannot leak a review, so gating it would be theatre. |
+| `/<repo>/pr-<n>/api/threads` | GET, HEAD | 200 `{head, threads}` — **that review's** projection, behind the gate |
+| `/<repo>/pr-<n>/api/threads` | GET `?since=<n>` | 200 `{head, events}` — that review's events with `seq > n`; `head` and the cursor are per review |
+| `/<repo>/pr-<n>/api/threads` | POST | **501.** Passes the gate and the CSRF check, then: the hosted write is slice 4. |
 | `/api/session/refresh` | POST | 200. Rotates the session id *and* the CSRF token, in one D1 batch, so a stolen cookie dies at the next refresh. |
-| `/api/*` | other verbs | 405, **behind the gate**, so route existence is not enumerable anonymously |
+| `/api/session/refresh` | other verbs | 405, **behind the gate**, so route existence is not enumerable anonymously |
+| `/<repo>/pr-<n>/api/threads` | other verbs | 405, in the review's scope, **behind the gate** |
 | `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no script, no reflected input) plus the browser-binding cookie — **minted only when the browser has none**, so re-opening the mail link does not rotate the binding a live session depends on; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
 | `/invite/redeem` | **POST only** | 303 to a **token-free** path, with two `Set-Cookie`s (session + browser binding) and the CSRF token; 410 the same closed page; 429; 415 unless `application/json` **or `application/x-www-form-urlencoded`**; 400 for an unreadable body. The form encoding exists because the Worker SHIPS a form: `src/invite-page.ts` emits no `enctype`, so a browser submits `x-www-form-urlencoded` and a JSON-only route answers the shipped page with `415`. A repeated form field is refused outright (JSON's repeated-key "last wins" is left as-is and asserted separately). |
-| `/<repo>/pr-<n>/…` | any | 501 naming slice 5 — **behind the gate**, and now carrying a **scope**, which is what a guest invite is checked against |
+| `/<repo>/pr-<n>/…` (not the API) | any | 501 — **behind the gate**, carrying the same **scope** as the API inside it. The R2 preview surface is the rest of slice 5. |
 | `/_revkit/…` | any | 404, never a redirect (ADR-0012) |
 | anything else | any | 404 |
 
+**Why the scope is in the PATH and not a query parameter.** The obvious design is
+`GET /api/threads?repo=…&pr=…`. It is worse on every axis: a parameter is
+something a caller can forget to send, and something that can be tampered with in
+transit; there is no unscoped spelling to fall back to, which is exactly how
+`/api/threads` shipped. `<repo>/pr-<n>/api/threads` reuses ADR-0008's own address
+rather than inventing a second convention, and the log key it selects is derived
+by `previewScopePath` from the same `(repo, pr)` the scope check compares — so
+there is no function in this package that turns caller input into a log key. The
+base must be exactly two segments: `<repo>/pr-<n>/docs/api/threads` is a path
+INSIDE a built site that happens to end in the suffix, and it is a preview.
+
 `?since=` accepts one canonical form: `0` or a decimal integer with no sign, no
 leading zero, no radix prefix, no exponent, no decimal point, no whitespace, and at
-most 16 digits. Every other spelling — and every parameter that is not `since` —
-is a 400 with a closed reason and the parameter **name** echoed, never its value.
-Authorization runs first, so an anonymous caller gets 401 rather than a 400 that
-would describe the request's shape to someone who has proved nothing.
+most 16 digits. Every other spelling — and every parameter that is not `since`,
+which includes `?repo=`, `?scope=` and `?log_key=` — is a 400 with a closed reason
+and the parameter **name** echoed, never its value. Authorization runs first, so
+an anonymous caller gets 401 rather than a 400 that would describe the request's
+shape to someone who has proved nothing.
 
 `POST /api/session/refresh` exists because ADR-0012's CSRF and `application/json`
 rules are only testable end to end if some state-changing call is reachable, and it
@@ -184,7 +208,8 @@ order:
 | 1 | the request presents the browser the invite was redeemed in | `invite-browser-mismatch` | 403 |
 | 2 | the invite is not revoked | `invite-revoked` | 401 |
 | 2 | the invite has not expired (an unreadable expiry fails closed) | `invite-expired` | 401 |
-| 3 | the invite's `repo` + optional `pr` covers what the route names | `invite-scope-mismatch` | 403 |
+| 3 | the route **names a review at all** — a guest is not admitted to a gated route with no scope | `invite-scope-unbounded` | 403 |
+| 3 | the invite's `repo` + optional `pr` covers the review the route names | `invite-scope-mismatch` | 403 |
 | 4 | `can_comment` permits what the route writes | `invite-read-only` | 403 |
 
 **Why revocation here is immediate rather than eventual:** it is a property of
@@ -194,10 +219,20 @@ revocation list, no cache. `test/invites.test.ts` drives exactly that, and
 asserts the session row is still present and still unexpired while it is refused.
 
 **A `view` guest's attempt to comment is refused by the GATE, not by the 501.**
-That is deliberate: `POST /api/threads` answers 501 because the hosted write is
-slice 4's, but the *authorization* rule is ADR-0009's and it is testable now, so
-the read-only refusal happens in front of the handler and the 501 is only ever
-reached by a caller entitled to write.
+That is deliberate: `POST <repo>/pr-<n>/api/threads` answers 501 because the
+hosted write is slice 4's, but the *authorization* rule is ADR-0009's and it is
+testable now, so the read-only refusal happens in front of the handler and the 501
+is only ever reached by a caller entitled to write.
+
+**The one route a guest may reach without a named scope** is
+`POST /api/session/refresh` (`Route.guestScopeExempt`), because it rotates the
+caller's OWN credential and touches nothing else. It is a field on `Route` rather
+than a set of kinds here so that `classifyPath` has to be handed an answer for
+every path and verb in the table — a new route cannot inherit "unscoped is fine"
+without someone typing the word. `test/authorization.test.ts` pins that exactly
+one path carries it, and `test/invites.test.ts` drives `authorizeRequest` with a
+hand-built `Route` whose scope is absent, so the refusal is proven live against a
+route the table does not contain.
 
 **What the browser binding is, and is not.** A `__Host-` cookie, 256 bits, stored
 only as a digest, minted by the response to `GET /invite/<token>` — so "bound to
@@ -312,13 +347,21 @@ Stated here so nobody has to read the PR body to find out:
   extension→`Content-Type` allowlist. `parsePreviewPath` recognises a preview path
   and answers `501` naming the slice that serves it. ADR-0012's SVG-sandbox rule is
   implemented and tested as a header, against synthetic content only.
-- **Scope authorization is half-done, by construction.** A guest invite's scope IS
-  checked on every call — against the routes that NAME a repo and PR, which today
-  means `<repo>/pr-<n>/`. `GET /api/threads` names none, because `events` has no
-  `repo` column, so a guest in scope for one repo still reads the **whole** log,
-  exactly as an operator does. The preview surface (slice 5) adds the axis.
-  **Q6 stays partial.**
-- **`POST /api/threads` is still 501.** CSRF is load-bearing on a reachable route
+- **The GUEST half of scope authorization is done; the GitHub half is not.** A
+  guest's scope is checked on every call against the review the route NAMES, the
+  read is served from that review's own log, and a guest on a gated route that
+  names no scope is refused rather than admitted (`invite-scope-unbounded`).
+  What is still missing is ADR-0012's *other* clause — "a GitHub session must
+  still have read access to the repo" — so a `github`-kind session is confined to
+  no repository and reads any review in the deployment. That is the **named
+  missing axis**; slice 5 neither widened nor narrowed it.
+- **The org-wide read is GONE, not narrowed.** An operator session reads one review
+  per request, by URL. That is what a path-addressed surface means and it is the
+  safe direction, but it means nothing in this build can *enumerate* a
+  deployment's reviews. The GitHub bridge (slice 4) is what will want to, and
+  ADR-0012's unimplemented read clause is what would authorise it. **Q6 stays
+  partial** for that reason, not for the guest axis.
+- **`POST <repo>/pr-<n>/api/threads` is still 501.** CSRF is load-bearing on a reachable route
   (`POST /api/session/refresh`), but no CSRF-protected *review write* ships, so
   "CSRF-protected writes" is not proven.
 - **The 409 mapping for a lost refresh race is unexercised over HTTP.** The typed
@@ -327,7 +370,7 @@ Stated here so nobody has to read the PR body to find out:
   cannot open from outside the request.
 - **`POST /api/session/refresh` has no client.** The CSRF token is delivered by the
   issuance path and by this route's response header; no page reads it yet.
-- **The shipped Worker bundle grew to ~807 KB.** Re-opening `GET /api/threads`
+- **The shipped Worker bundle grew to ~807 KB.** Re-opening the thread read
   brought `@revkit/review-core` back into the deployed entry, so ADR-0025's "the
   core runs in workerd" is now a claim about the artefact that ships — asserted
   positively (named core exports must be present) and negatively (no Node/Bun
@@ -339,15 +382,24 @@ Stated here so nobody has to read the PR body to find out:
 - **Invite mechanics are real; the PRODUCT around them is not.** What is missing:
   the `"Name (guest)"` GitHub mirror (needs the App, #34 / slice 4); the
   `revkit invite --type` CLI, because minting is out of band by design; and
-  **any way for a guest to comment**, because `POST /api/threads` is still 501 —
-  so `view`'s read-only rule is enforced by the gate rather than observed in the
-  product.
+  **any way for a guest to comment**, because the append is still 501 — so `view`'s
+  read-only rule is enforced by the gate rather than observed in the product.
+  The **rest of slice 5** is also deliberately not here: the client page (the
+  `replaceState` for URL stripping, and how a browser page reads its CSRF token)
+  and the `revkit invite` CLI. Both depend on the scoped route existing, which is
+  why they follow it.
 - **The redeem `303` does not solve how a browser PAGE gets its CSRF token.** The
   token is minted and returned as a response header, exactly as
   `POST /api/session/refresh` does, but a navigation cannot read a response
   header. A meta tag in the preview document (whose hash then joins the committed
-  allowlist) or a second non-HttpOnly cookie is slice 5's choice. Shipping
-  neither is honest: no guest page exists to need one.
+  allowlist) or a second non-HttpOnly cookie is the client page's choice, and it
+  waits on the preview surface. Shipping neither is honest: no guest page exists to
+  need one.
+- **A repo-wide invite's holder is redirected to `/`, which 404s.** The redemption's
+  token-free target is the review the invite names, and a `pr IS NULL` invite names
+  none, so `previewPath` sends them to `/` — `unknown`, ungated, no index page in
+  this build. Security-neutral (a 404 leaks nothing) and pre-existing, but it does
+  mean a repo-wide guest can only reach a review by knowing its PR number.
 - **No guest-purge SCHEDULE.** `purgeStaleGuests` is the whole deletion and is
   tested; nothing CALLS it on a cron, because a Cron Trigger cannot be exercised
   offline. Until `revkit deploy init` wires one, **guests are retained
@@ -362,17 +414,20 @@ Stated here so nobody has to read the PR body to find out:
   out of bounds; `d1_databases[].database_id` is an obvious placeholder.
 - **No scale evidence.** Three specific costs, all recorded in `d1-store.ts` rather
   than assumed away:
-  - Throughput under a write burst is O(N) D1 round trips for N concurrent writers,
-    because the seq allocator is a compare-and-swap and only one writer wins per
-    round. The fix is a block allocator, not a transaction (D1 refuses interactive
-    ones).
-  - `since()` and `threads()` read the WHOLE `events` table with no `LIMIT` and no
-    index beyond `seq` (the PK) and `ts`. Nothing breaks at slice-1 scale because
-    nothing writes over HTTP yet, and it will break on the first log large enough
-    for one round trip to stop being cheap.
-  - The FIRST `append` on a fresh store instance replays the whole log (one
-    unbounded read plus one `validateNext` per event). Harmless today; a per-isolate
-    warm-up cost proportional to the log from the bridge onward.
+  - Throughput under a write burst is O(N) D1 round trips for N concurrent writers
+    **to the same review**, because the seq allocator is a compare-and-swap and only
+    one writer wins per round. Writers to *different* reviews no longer contend at
+    all (each takes `seq = 1` of its own log), which is one of the few costs the
+    partition removed. The fix for the remaining case is a block allocator, not a
+    transaction (D1 refuses interactive ones).
+  - `since()` and `threads()` read the WHOLE of **one review's** log with no `LIMIT`
+    and no index beyond `(log_key, seq)` (the PK) and `(log_key, ts)`. The partition
+    bounds it by review rather than by nothing, which is a real improvement and not
+    a bound: one very large review still breaks on the first round trip that stops
+    being cheap.
+  - The FIRST `append` on a fresh store instance replays that review's whole log
+    (one unbounded read plus one `validateNext` per event). Harmless today; a
+    per-isolate warm-up cost proportional to the log from the bridge onward.
 
 ## Adding a slice
 

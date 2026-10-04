@@ -26,7 +26,6 @@ import {
   DENIAL_REASONS,
   HEALTH_PATH,
   SESSION_REFRESH_PATH,
-  THREADS_PATH,
   type DenialReason,
   type RouteKind,
 } from "../src/authz.ts";
@@ -37,15 +36,39 @@ import {
   sha256Hex,
   SessionAlreadyRotatedError,
 } from "../src/session.ts";
-import { parsePreviewPath, parseThreadsQuery } from "../src/router.ts";
+import {
+  parsePreviewPath,
+  parseScopedThreadsPath,
+  parseThreadsQuery,
+  previewScopePath,
+  scopedThreadsPath,
+} from "../src/router.ts";
 import {
   authHeaders,
   cookieHeader,
   issueTestSession,
+  seedLogEvents,
   JSON_HEADERS,
   startWorker,
   type Harness,
 } from "./harness.ts";
+
+/**
+ * The review these cases are about, and the ONE path that reads it.
+ *
+ * **Slice 5 moved the read.** It was `GET /api/threads`, which named no
+ * repository, so ADR-0012's per-call scope check had nothing to select on and
+ * every authorized caller read the whole org's log. It is now
+ * `<repo>/pr-<n>/api/threads` — the scope is IN THE PATH, so a caller cannot
+ * forget it, cannot choose it, and has no parameter to tamper with. The removed
+ * spelling is `REMOVED_THREADS_PATH` below, and it is not a route at all.
+ */
+const REVIEW = { repo: "revkit", pr: 7 } as const;
+const THREADS_PATH = scopedThreadsPath(REVIEW.repo, REVIEW.pr);
+const LOG_KEY = previewScopePath(REVIEW.repo, REVIEW.pr);
+
+/** What `GET /api/threads` was. Asserted NOT to be a route, by several cases. */
+const REMOVED_THREADS_PATH = "/api/threads";
 
 /** The body every seeded comment carries. A refusal must never contain it, and
  * an admitted read must — so both halves assert against the SAME string
@@ -54,41 +77,35 @@ const SEED_BODY = "this comment body must only reach a caller with a session";
 
 /** A four-event log with a gap at seq 4..6 (seqs 1, 2, 3, 7). ADR-0006
  * blesses gaps in a D1-backed store, so a hosted read that renumbered them
- * would be wrong in a way a contiguous fixture cannot detect. */
-async function seedLog(db: D1Database): Promise<void> {
-  await db.prepare("DELETE FROM events").run();
-  for (const seq of [1, 2, 3, 7]) {
-    await db
-      .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
-      .bind(
-        seq,
-        `2026-10-04T12:00:0${seq}Z`,
-        JSON.stringify({
-          seq,
-          ts: `2026-10-04T12:00:0${seq}Z`,
-          actor: { kind: "gh-user", id: "gerchowl" },
-          kind: "comment.created",
-          threadId: `th-seed-${seq}`,
-          commentId: `c-seed-${seq}`,
-          anchor: {
-            path: "docs/a.mdx",
-            startLine: 1,
-            endLine: 1,
-            quote: { exact: "x", prefix: "", suffix: "" },
-            revision: "b".repeat(64),
-          },
-          body: SEED_BODY,
-        }),
-      )
-      .run();
-  }
+ * would be wrong in a way a contiguous fixture cannot detect.
+ *
+ * **Into `REVIEW`'s log and no other** (slice 5), which is why the seed is
+ * parameterized by log key at all: a flat table would have made "this review's
+ * events" and "the deployment's events" the same rows, and every assertion
+ * below about isolation would have been asserting about a table that no longer
+ * has that shape. */
+async function seedLog(db: D1Database, logKey: string = LOG_KEY, prefix = "th-seed"): Promise<void> {
+  await seedLogEvents(db, logKey, 4, { prefix, from: 1, body: SEED_BODY });
+  // The GAP is the fixture: seqs 1, 2, 3 and 7, because ADR-0006 blesses gaps
+  // in a D1-backed store and a hosted read that renumbered 7 to 4 would be wrong
+  // in a way a contiguous fixture cannot detect. The #76 review found exactly
+  // that bug through this seed.
+  await db
+    .prepare("DELETE FROM review_logs WHERE log_key = ? AND seq BETWEEN 4 AND 6")
+    .bind(logKey)
+    .run();
+  await seedLogEvents(db, logKey, 1, { prefix, from: 7, body: SEED_BODY });
 }
 
 const VERBS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
 
 /** Paths the surface answers, plus the alias spellings that must NOT be one. */
 const GATED_PATHS = [THREADS_PATH, SESSION_REFRESH_PATH, "/revkit/pr-7/index.html"] as const;
-const UNGATED_PATHS = [HEALTH_PATH, "/_revkit/0.0.0/rail.js", "/nope", `${THREADS_PATH}/`] as const;
+// The REMOVED unscoped read replaced the trailing-slash spelling slice 2 used
+// to probe with: `/api/threads/` is no longer "a near miss of the read" but an
+// unrecognised path, and `/revkit/pr-7/api/threads/` — which IS a preview path —
+// is gated, so it cannot stand in for an ungated probe.
+const UNGATED_PATHS = [HEALTH_PATH, "/_revkit/0.0.0/rail.js", "/nope", REMOVED_THREADS_PATH] as const;
 
 /** What `harness.dispatch` actually resolves to. Not the DOM `Response`: bun's
  * and `@cloudflare/workers-types`' declarations of that type disagree (one has
@@ -158,8 +175,32 @@ describe("ADR-0012's per-request gate", () => {
     await harness.dispose();
   });
 
-  beforeEach(async () => {
+  /**
+   * The seeded log is created ONCE, not per test — and that is a change with a
+   * measurement behind it.
+   *
+   * This `beforeEach` used to re-seed it, which is six D1 round trips (one
+   * `DELETE`, four `INSERT`s, one session wipe) before each of ~48 cases, all
+   * inside bun's 5 s per-hook timeout, with eleven test files' workerd
+   * instances competing for the same host. It was the single most reliable
+   * failure in the file and it is STILL the most reliable failure here at the
+   * base commit — measured: four consecutive `bun test` runs at `5cb60a9d`,
+   * three of them failing this hook. Slice 5 does not get to fix that by
+   * raising a timeout, so it fixed it by not doing the work 48 times.
+   *
+   * It is sound because **no case in this file writes to `review_logs`** — the
+   * one case that adds a second review's log (the `?scope=`-parameter case)
+   * adds its OWN key, and it deletes that key afterwards. And every refusal
+   * assertion in this file is read-only, so there is nothing to roll back.
+   */
+  beforeAll(async () => {
+    await harness.db.prepare("DELETE FROM review_logs").run();
     await seedLog(harness.db);
+  });
+
+  beforeEach(async () => {
+    // Sessions ARE mutated: `POST /api/session/refresh` rotates the caller's row
+    // and a forged-cookie case issues one, so this wipe stays per-test.
     await harness.db.prepare("DELETE FROM sessions").run();
   });
 
@@ -190,7 +231,15 @@ describe("ADR-0012's per-request gate", () => {
         ["/revkit/pr-7/index.html GET"]: "preview",
         ["/revkit/pr-7/index.html POST"]: "preview",
         ["/_revkit/0.0.0/rail.js GET"]: "revkit-bundle",
-        [`${THREADS_PATH}/ GET`]: "unknown",
+        ["/revkit/pr-7/api/threads GET"]: "threads-read",
+        ["/revkit/pr-7/api/threads POST"]: "threads-append",
+        ["/revkit/pr-7/api/threads PUT"]: "method-not-allowed",
+        ["/revkit/pr-7/docs/api/threads GET"]: "preview",
+        ["/revkit/pr-7/api/threads/ GET"]: "preview",
+        ["/revkit/pr-8/api/threads GET"]: "threads-read",
+        ["/other-repo/pr-7/api/threads GET"]: "threads-read",
+        [`${REMOVED_THREADS_PATH} GET`]: "unknown",
+        [`${REMOVED_THREADS_PATH} POST`]: "unknown",
         ["/nope GET"]: "unknown",
         ["/nope POST"]: "unknown",
       };
@@ -215,7 +264,9 @@ describe("ADR-0012's per-request gate", () => {
       // depending on which path produced it — which is itself the reason the
       // gate consults `requiresSession` rather than the kind.
       const isGatedPath = (pathname: string): boolean =>
-        pathname === THREADS_PATH || pathname === SESSION_REFRESH_PATH || parsePreviewPath(pathname) !== undefined;
+        pathname === SESSION_REFRESH_PATH ||
+        parseScopedThreadsPath(pathname) !== undefined ||
+        parsePreviewPath(pathname) !== undefined;
       const probes = [
         ...GATED_PATHS,
         ...UNGATED_PATHS,
@@ -224,6 +275,9 @@ describe("ADR-0012's per-request gate", () => {
         "/api",
         "/api/",
         "/api/threads.json",
+        REMOVED_THREADS_PATH,
+        `${REMOVED_THREADS_PATH}/`,
+        "/revkit/pr-7/api/threads/extra",
         "/api/session",
         "/api/session/",
         "/revkit/pr-0/",
@@ -277,6 +331,120 @@ describe("ADR-0012's per-request gate", () => {
       expect(route.stateChanging).toBe(false);
     });
 
+    // ── slice 5: the scope invariant, and the read it moved ───────────────
+    test("every gated route either names a scope or is the ONE exempt classification", () => {
+      // **This is the invariant `invite-scope-unbounded` defends.** The gate
+      // refuses a guest on a gated route that names no scope, so a route table
+      // with a gated, unscoped, non-exempt arm would be a guest reading
+      // something whose review it never named. Enumerated over the same broad
+      // probe set as the gating invariant above, every verb — and asserted in
+      // the direction that can fail.
+      const probes = [
+        ...GATED_PATHS,
+        ...UNGATED_PATHS,
+        THREADS_PATH,
+        REMOVED_THREADS_PATH,
+        "/",
+        "/api",
+        "/revkit/pr-7/api/threads",
+        "/revkit/pr-8/api/threads",
+        "/other-repo/pr-7/api/threads",
+        "/revkit/pr-7/api/threads/",
+        "/revkit/pr-7/docs/api/threads",
+        "/revkit/pr-7",
+        "/revkit/pr-0",
+        "/revkit/pr-07/api/threads",
+        "/_revkit/0.0.0/rail.js",
+      ];
+      for (const pathname of probes) {
+        for (const method of VERBS) {
+          const route = classifyRoute(pathname, method);
+          const label = `${pathname} ${method} is ${route.kind}`;
+          if (!route.requiresSession) {
+            // Ungated, so no guest reaches it and no scope is needed.
+            continue;
+          }
+          expect(route.scope !== undefined || route.guestScopeExempt, label).toBe(true);
+        }
+      }
+    });
+
+    test("guestScopeExempt is a property of exactly ONE path, and only that path's", () => {
+      // A SECOND exempt path would be a second hole, and nobody would notice it
+      // being added — so the set is pinned here rather than left to review.
+      // The one that exists is `/api/session/refresh`, which rotates the
+      // caller's own credential and names no review because it is not about one.
+      //
+      // It is asserted as a property of the PATH, so every classification of
+      // that path carries it — including the wrong verbs, which inherit it
+      // precisely because a wrong verb on the session route is still the session
+      // route and must still answer 405 to a guest rather than a misleading
+      // `invite-scope-unbounded`.
+      const exemptPaths = new Set<string>();
+      const probes = [
+        ...GATED_PATHS,
+        ...UNGATED_PATHS,
+        THREADS_PATH,
+        REMOVED_THREADS_PATH,
+        "/revkit/pr-8/api/threads",
+        "/revkit/pr-7",
+        "/revkit/pr-7/index.html",
+        "/invite/redeem",
+        "/",
+      ];
+      for (const pathname of probes) {
+        for (const method of VERBS) {
+          if (classifyRoute(pathname, method).guestScopeExempt) exemptPaths.add(pathname);
+        }
+      }
+      expect([...exemptPaths]).toEqual([SESSION_REFRESH_PATH]);
+      // And nothing on the review surface is exempt, on any verb, whatever the
+      // wrong verb does to the kind.
+      for (const pathname of [THREADS_PATH, "/revkit/pr-8/api/threads", "/revkit/pr-7", "/revkit/pr-7/index.html"]) {
+        for (const method of VERBS) {
+          expect(classifyRoute(pathname, method).guestScopeExempt, `${pathname} ${method}`).toBe(false);
+        }
+      }
+    });
+
+    test("the read is scoped to ONE review, and the removed unscoped read is not a route", () => {
+      // `GET /api/threads` named no repository, so it could only ever answer
+      // org-wide — and ADR-0012's per-call scope check has nothing to select on
+      // when a route names nothing. The scope moved INTO the path, and the old
+      // spelling is now `unknown` for every verb: not a 403, not a 405, not a
+      // gated 501. A path that is not a route cannot leak a review, so there
+      // was no reason to leave it gated.
+      for (const method of VERBS) {
+        expect(classifyRoute(REMOVED_THREADS_PATH, method).kind, method).toBe("unknown");
+        expect(classifyRoute(REMOVED_THREADS_PATH, method).requiresSession, method).toBe(false);
+      }
+      // And the one that replaced it names its review, on both the read and the
+      // write arm, with the log key derived by the same grammar.
+      for (const method of ["GET", "HEAD", "POST", "PUT"] as const) {
+        expect(classifyRoute(THREADS_PATH, method).scope, method).toEqual({
+          repo: REVIEW.repo,
+          pr: REVIEW.pr,
+          logKey: LOG_KEY,
+        });
+      }
+    });
+
+    test("the scope is a function of the PATH and of nothing a caller can set", () => {
+      // The three spellings a caller would reach for if the scope were a
+      // parameter. They are refused by `parseThreadsQuery`, so the log key is
+      // not attacker-chosen — and this also pins that the two spellings of a
+      // scope that ARE in the path cannot be mixed: `pr-07` is not `pr-7`.
+      for (const [pathname, expected] of [
+        ["/revkit/pr-7/api/threads", { repo: "revkit", pr: 7 }],
+        ["/revkit/pr-08/api/threads", undefined],
+        ["/other-repo/pr-7/api/threads", { repo: "other-repo", pr: 7 }],
+        ["/api/threads", undefined],
+      ] as const) {
+        const scope = classifyRoute(pathname, "GET").scope;
+        expect(scope === undefined ? undefined : { repo: scope.repo, pr: scope.pr }, pathname).toEqual(expected);
+      }
+    });
+
     test("only the two state-changing routes carry the CSRF obligation", () => {
       // A read must NOT need a CSRF token: requiring one would make every
       // `fetch()` in the rail carry a header it has no use for, and would
@@ -317,6 +485,7 @@ describe("ADR-0012's per-request gate", () => {
         "invite-read-only",
         "invite-revoked",
         "invite-scope-mismatch",
+        "invite-scope-unbounded",
         "malformed-session-cookie",
         "no-session-cookie",
         // Default JS string order: "unknown-s" < "unrecognised" because `k` <
@@ -559,7 +728,14 @@ describe("ADR-0012's per-request gate", () => {
         const known = await harness.dispatch(`http://localhost${alias}`, {
           headers: { cookie: cookieHeader(issued.sessionId) },
         });
-        expect([200, 404], alias).toContain(known.status);
+        // 200, 404, or 501 — and 501 is the honest answer for the two
+        // spellings that are still PREVIEW paths (`<repo>/pr-<n>/api/threads/`
+        // and the `%20` variant): slice 5 moved the read out of the preview's
+        // own path space, so those resolve to the R2 preview route, which is
+        // gated and not yet served. None of the three carries review content,
+        // and none is a refusal — which is what proves the anonymous 401 above
+        // was the GATE and not the router.
+        expect([200, 404, 501], alias).toContain(known.status);
       }
     });
 
@@ -598,7 +774,10 @@ describe("ADR-0012's per-request gate", () => {
     });
 
     test("the ungated 404 and the bundle 404 leak nothing either", async () => {
-      for (const pathname of ["/nope", "/_revkit/0.0.0/rail.js", `${THREADS_PATH}/`]) {
+      // The REMOVED unscoped read is here rather than a near-miss spelling of
+      // the new one: `/revkit/pr-7/api/threads/` is a preview path (gated, 501)
+      // and cannot stand in for an ungated 404.
+      for (const pathname of ["/nope", "/_revkit/0.0.0/rail.js", REMOVED_THREADS_PATH, `${REMOVED_THREADS_PATH}/`]) {
         const refusal = await refusalOf(await harness.dispatch(`http://localhost${pathname}`));
         expect(refusal.status).toBe(404);
         expect(refusal.raw).not.toContain(SEED_BODY);
@@ -609,7 +788,7 @@ describe("ADR-0012's per-request gate", () => {
 
   // ── 3. the gate admits ─────────────────────────────────────────────────
   describe("a session this build issued is admitted", () => {
-    test("GET /api/threads answers 200 with the projection, and only with a session", async () => {
+    test("the scoped read answers 200 with the projection, and only with a session", async () => {
       const issued = await issueTestSession(harness.db);
       const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
         headers: { cookie: cookieHeader(issued.sessionId) },
@@ -996,6 +1175,78 @@ describe("ADR-0012's per-request gate", () => {
         expect(() => parseThreadsQuery(query)).not.toThrow();
       }
     });
+
+    test("?repo=, ?scope= and ?log_key= are REFUSED — the scope is in the path, not in a parameter", async () => {
+      // The spellings a caller would reach for if the scope were a query
+      // parameter, and the reason `parseThreadsQuery`'s unknown-parameter
+      // refusal became load-bearing in slice 5 rather than prophylactic. If any
+      // of these were accepted-and-ignored, a client could be told nothing and
+      // ship believing it was scoped when it was not; if any were honoured, a
+      // caller would be able to CHOOSE which review's log it reads.
+      const issued = await issueTestSession(harness.db);
+      for (const query of ["?repo=other-repo", "?scope=admin", "?log_key=/other-repo/pr-7", "?pr=9", "?scope="]) {
+        const response = await harness.dispatch(`http://localhost${THREADS_PATH}${query}`, {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        expect(response.status, query).toBe(400);
+        const body = JSON.parse(await response.text()) as { reason: string; parameter: string };
+        expect(body.reason, query).toBe("unknown-parameter");
+        // The NAME is echoed; the value never is. A reflected value in a body
+        // is a reflected-XSS vector the moment anything renders it.
+        expect(body.parameter, query).not.toContain("/");
+        expect(body.parameter, query).toMatch(/^[A-Za-z][A-Za-z0-9_-]*$/);
+      }
+    });
+
+    test("a scope parameter cannot move the read to another review's log", async () => {
+      // The same refusals from the other end: TWO reviews, both populated, and
+      // no spelling of a query string that reaches the wrong one. With the scope
+      // in the path the only way to name a review is to BE at its URL — so this
+      // asserts both halves: the parameterised spellings are 400s, and the bare
+      // spelling reads THIS review and not the other.
+      // `beforeEach` has already seeded THIS review's log; add the second one.
+      const otherKey = previewScopePath(REVIEW.repo, 99);
+      await seedLog(harness.db, otherKey, "th-other");
+      try {
+        await scopeParameterAssertions(otherKey, await issueTestSession(harness.db));
+      } finally {
+        // Its own key only — `beforeAll` owns this review's log and the rest of
+        // the file reads it.
+        await harness.db
+          .prepare("DELETE FROM review_logs WHERE log_key = ?")
+          .bind(otherKey)
+          .run();
+      }
+    });
+
+    /** The body of the case above, factored so the `try`/`finally` above can
+     * wrap it without a nested closure in every assertion. */
+    async function scopeParameterAssertions(otherKey: string, issued: { sessionId: string }): Promise<void> {
+      const read = async (pathname: string): Promise<{ status: number; raw: string }> => {
+        const response = await harness.dispatch(`http://localhost${pathname}`, {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        return { status: response.status, raw: await response.text() };
+      };
+      for (const query of ["?repo=revkit&pr=99", "?log_key=/revkit/pr-99", "?scope=/revkit/pr-99"]) {
+        expect((await read(`${THREADS_PATH}${query}`)).status, query).toBe(400);
+      }
+      const mine = await read(THREADS_PATH);
+      expect(mine.status).toBe(200);
+      expect(mine.raw).toContain("th-seed-1");
+      expect(mine.raw).not.toContain("th-other");
+      // The other review's own URL reads the other log, and only that one.
+      const theirs = await read(scopedThreadsPath(REVIEW.repo, 99));
+      expect(theirs.status).toBe(200);
+      expect(theirs.raw).toContain("th-other-1");
+      expect(theirs.raw).not.toContain("th-seed");
+      // `head` is per log, and both logs are four events long with a gap — so
+      // the two reads agree on `head` here and that is the POINT: a shared
+      // `head` would be a shared counter. Asserting it separately below keeps
+      // this case about content.
+      expect(JSON.parse(mine.raw) as { head: number }).toMatchObject({ head: 7 });
+      expect(JSON.parse(theirs.raw) as { head: number }).toMatchObject({ head: 7 });
+    }
 
     test("the largest accepted ?since= is bounded, so a path cannot carry an unbounded integer into a query", async () => {
       const issued = await issueTestSession(harness.db);

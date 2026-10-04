@@ -12,8 +12,11 @@
 // that: an invariant with a test behind it cannot be quietly dropped when
 // the invite code lands.
 
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { MIGRATION_SQL, applyMigration, sqlStatements, startWorker, type Harness } from "./harness.ts";
+import { MIGRATIONS, MIGRATION_SQL, applyMigration, sqlStatements, startWorker, type Harness } from "./harness.ts";
 
 describe("D1 schema", () => {
   let harness: Harness;
@@ -204,6 +207,169 @@ describe("D1 schema", () => {
     const kinds = await harness.db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>();
     expect(kinds?.n).toBe(2);
   });
+
+  // ── A15 over the DIRECTORY, and slice 5's migration ──────────────────
+  test("A15: applying the WHOLE directory twice is a no-op — including 0003", async () => {
+    // The per-file case above is about `0001_init.sql`. Slice 5's
+    // `0003_scoped_logs.sql` is the one file here that is NOT entirely
+    // `CREATE … IF NOT EXISTS`, so the convergence claim has to be measured
+    // over the directory rather than asserted per file. Every statement in it
+    // is idempotent by construction (`IF NOT EXISTS`, `OR IGNORE`, `DELETE`),
+    // and this is what proves it: applied twice, the second pass changes
+    // nothing — and crucially does not re-empty `review_logs`.
+    await harness.db.prepare("DELETE FROM review_logs").run();
+    await harness.db
+      .prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+      .bind("/revkit/pr-7", 1, "2026-10-04T12:00:00Z", "{}")
+      .run();
+    const before = await tableNames();
+    const statements = await applyMigration(harness.db);
+    expect(statements).toBeGreaterThan(sqlStatements(MIGRATION_SQL).length);
+    expect(await tableNames()).toEqual(before);
+    // The row survived the second application. `DELETE FROM events` is
+    // idempotent and the copy is `OR IGNORE`; a `DROP TABLE` here would have
+    // failed this, which is why the migration empties rather than drops.
+    const kept = await harness.db
+      .prepare("SELECT COUNT(*) AS n FROM review_logs")
+      .first<{ n: number }>();
+    expect(kept?.n).toBe(1);
+  });
+
+  test("0003: review_logs is keyed (log_key, seq), and log_key is NOT NULL", async () => {
+    // The whole partition. `seq` alone being the key was the defect: with one
+    // key per deployment there was no scope for a check to select on.
+    type Column = { name: string; type: string; pk: number; notnull: number };
+    const columns = await harness.db.prepare("PRAGMA table_info(review_logs)").all<Column>();
+    const byName = new Map((columns.results ?? []).map((c) => [c.name, c]));
+    expect([...byName.keys()].sort()).toEqual(["log_key", "payload", "seq", "ts"]);
+    expect(byName.get("log_key")?.notnull).toBe(1);
+    // `pk > 0` on BOTH: a composite key, so two logs may each hold `seq = 1`.
+    expect(byName.get("log_key")?.pk).toBeGreaterThan(0);
+    expect(byName.get("seq")?.pk).toBeGreaterThan(0);
+    expect(byName.get("seq")?.type).toBe("INTEGER");
+    // Two logs, one seq each — the fact the old schema made impossible. Wiped
+    // first: the A15-directory case above seeded `/revkit/pr-7` seq 1, and this
+    // case must not depend on that.
+    await harness.db.prepare("DELETE FROM review_logs").run();
+    const insert = (logKey: string, seq: number): Promise<unknown> =>
+      harness.db
+        .prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+        .bind(logKey, seq, "2026-10-04T12:00:00Z", "{}")
+        .run();
+    await expect(insert("/revkit/pr-7", 1)).resolves.toBeDefined();
+    await expect(insert("/revkit/pr-8", 1)).resolves.toBeDefined();
+    // …and the same log cannot hold the same seq twice.
+    await expect(insert("/revkit/pr-7", 1)).rejects.toThrow(/UNIQUE constraint failed/i);
+    // And a row with NO key cannot exist at all, so there is no unscoped event
+    // for a query to find even if a statement forgot its predicate.
+    await expect(
+      harness.db
+        .prepare("INSERT INTO review_logs (seq, ts, payload) VALUES (?, ?, ?)")
+        .bind(99, "2026-10-04T12:00:00Z", "{}")
+        .run(),
+    ).rejects.toThrow(/NOT NULL/i);
+  });
+
+  test("0003: the retirement of `events` is COMPLETE — empty, and named by no statement in src/", async () => {
+    // `events` cannot be renamed (D1 does not authorise
+    // `sqlite_rename_table`), so the migration empties it and leaves it. An
+    // empty table nobody reads is the safe shape; a table SOMEONE reads is the
+    // defect this slice exists to remove. So both halves are asserted. FIRST, it
+    // is empty, so a mistake returns nothing rather than a whole org's log.
+    // SECOND, no statement in `src/` names it, so the mistake cannot be made
+    // without a test failing here first.
+    const seeded = await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>();
+    expect(seeded?.n).toBe(0);
+    const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
+    const srcFiles = readdirSync(srcDir).filter((f) => f.endsWith(".ts")).sort();
+    expect(srcFiles.length).toBeGreaterThan(5);
+    for (const file of srcFiles) {
+      const text = readFileSync(join(srcDir, file), "utf8");
+      // `events` as a WORD: `events_ts` and the retention prose are fine, an
+      // unquoted table reference is not.
+      const statement = /\b(?:FROM|INTO|UPDATE|TABLE)\s+events\b/i.exec(text);
+      expect(statement, `${file} names the retired table`).toBeNull();
+      // And neither is the legacy quarantine: it exists so nothing is
+      // discarded, and no route may name it.
+      const quarantine = /\b(?:FROM|INTO|UPDATE|TABLE)\s+events_unscoped_legacy\b/i.exec(text);
+      expect(quarantine, `${file} names the quarantine`).toBeNull();
+    }
+  });
+
+  test("0003: pre-existing rows are QUARANTINED, not discarded and not given a scope", async () => {
+    // The question the migration has to answer rather than assume. It empties
+    // `events`, copies every row into `events_unscoped_legacy`, and gives
+    // neither a repository. "Nothing can mint an invite in production yet, so
+    // the table is empty" is true in practice and not by construction — this
+    // case is what makes the answer a decision rather than an accident.
+    //
+    // It re-applies the migration's own STATEMENTS on top of freshly seeded
+    // legacy rows, on THIS harness — which is the production upgrade path (a
+    // database at `0002` with rows in `events`) reproduced on a database that
+    // has already had `0003` applied. `test/harness.ts` documents why it is not
+    // a second `startWorker()`: this host kills the sixth concurrent workerd
+    // instance in one `bun test` process and every later case in the file fails
+    // with "Unable to connect". The re-application is safe BECAUSE the migration
+    // is idempotent, which is the property the next assertions are about.
+    await harness.db.prepare("DELETE FROM review_logs").run();
+    await harness.db.prepare("DELETE FROM events_unscoped_legacy").run();
+    try {
+      await harness.db
+        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+        .bind(1, "2026-10-01T12:00:00Z", JSON.stringify({ seq: 1, ts: "2026-10-01T12:00:00Z" }))
+        .run();
+      await harness.db
+        .prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)")
+        .bind(2, "2026-10-01T12:00:02Z", JSON.stringify({ seq: 2, ts: "2026-10-01T12:00:02Z" }))
+        .run();
+      for (const statement of sqlStatements(MIGRATIONS[2] as string)) {
+        await harness.db.prepare(statement).run();
+      }
+      // Preserved, byte for byte, with its own seq — an operator who learns
+      // which review those rows belonged to can put them back.
+      const kept = await harness.db
+        .prepare("SELECT seq, ts, payload FROM events_unscoped_legacy ORDER BY seq ASC")
+        .all<{ seq: number; ts: string; payload: string }>();
+      expect((kept.results ?? []).map((r) => r.seq)).toEqual([1, 2]);
+      expect(kept.results?.[0]?.payload).toContain("2026-10-01T12:00:00Z");
+      // The old table is empty, and the new one is empty: NOTHING was moved into
+      // a review's log, because no review is known.
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM events").first<{ n: number }>())?.n).toBe(0);
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM review_logs").first<{ n: number }>())?.n).toBe(0);
+      // And the second half of the claim: applying the file AGAIN is a no-op
+      // rather than an error, which is what `DELETE` was chosen over `DROP` for.
+      for (const statement of sqlStatements(MIGRATIONS[2] as string)) {
+        await harness.db.prepare(statement).run();
+      }
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM events_unscoped_legacy").first<{ n: number }>())?.n).toBe(2);
+    } finally {
+      // The seeded rows are this case's fixture, not state another case may
+      // rely on; the migration emptied `events` itself.
+      await harness.db.prepare("DELETE FROM events_unscoped_legacy").run();
+    }
+  });
+
+  test("0003: the per-log retention index exists and leads with the log key", async () => {
+    const indexes = await indexNames(harness.db, "review_logs");
+    expect(indexes).toContain("review_logs_log_ts");
+    const sql = await harness.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+      .bind("review_logs_log_ts")
+      .first<{ sql?: string }>();
+    // A sweep is always per-review, and the index has to make THAT the cheap
+    // query — so `log_key` leads. A sweep that could drop the predicate would be
+    // able to express "every log in this org", which is what the partition is
+    // for.
+    expect(sql?.sql).toMatch(/review_logs\s*\(\s*log_key\s*,\s*ts\s*\)/i);
+  });
+
+  async function indexNames(db: D1Database, table: string): Promise<string[]> {
+    const rows = await db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?")
+      .bind(table)
+      .all<{ name: string }>();
+    return (rows.results ?? []).map((r) => r.name);
+  }
 
   // ── the shape the store depends on ────────────────────────────────────
   test("events carries seq and ts as query keys AND the full event in payload", async () => {

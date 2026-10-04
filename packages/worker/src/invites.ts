@@ -841,6 +841,19 @@ export async function loadInviteGrant(
 }
 
 /**
+ * What an invite's scope is compared against: the repo and PR a route NAMES.
+ *
+ * Declared here rather than imported from `src/authz.ts` so the store's log key
+ * (`authz.PreviewScope.logKey`) is **not in this type** and cannot be consulted
+ * by a scope check. The comparison is about the two halves an invite's
+ * `repo`/`pr` columns carry, and nothing else belongs in it.
+ */
+export interface InviteScope {
+  readonly repo: string;
+  readonly pr: number;
+}
+
+/**
  * Does this invite's scope cover this target?
  *
  * ADR-0009: "scoped to the repo, optionally one PR". So an invite with
@@ -849,19 +862,23 @@ export async function loadInviteGrant(
  * the whole isolation property, and it is why the comparison is on the repo
  * first and not on a normalised composite key.
  *
- * `undefined` target means "this route names no repo or PR", and the answer is
- * TRUE: there is nothing to be out of scope for. That is a real gap, not an
- * oversight — `GET /api/threads` has no `repo` column to select on
- * (`migrations/0001_init.sql`: `events(seq, ts, payload)`), so a session can
- * read the whole log today and no scope check can change that until the preview
- * surface adds the axis (slice 5). ADR-0012's 2026-10-04 amendment records
- * which clause is where.
+ * ── The target is REQUIRED, and that is slice 5's fix ────────────────────
+ *
+ * This signature used to accept `undefined` and answer `true` for it, on the
+ * reasoning that "this route names no repo or PR" leaves nothing to be out of
+ * scope for. **That reasoning is what let a guest in scope for `repo-a/pr-7`
+ * read the whole org's log:** `GET /api/threads` named nothing
+ * (`events(seq, ts, payload)` had no `repo` column), so the per-call check ran on
+ * every request of a stranger's session, selected nothing, and passed. The
+ * defect was never a missing comparison — it was an absent scope being read as
+ * an absent restriction.
+ *
+ * So the absent scope is no longer expressible here: a caller that has no scope
+ * cannot call this, and `authorizeRequest` refuses a guest outright instead
+ * (`invite-scope-unbounded`). A check that cannot be skipped by being handed
+ * nothing is worth more than one that answers carefully when handed nothing.
  */
-export function inviteCovers(
-  invite: InviteRecord,
-  target: { readonly repo: string; readonly pr: number } | undefined,
-): boolean {
-  if (target === undefined) return true;
+export function inviteCovers(invite: InviteRecord, target: InviteScope): boolean {
   if (invite.repo !== target.repo) return false;
   return invite.pr === null || invite.pr === target.pr;
 }

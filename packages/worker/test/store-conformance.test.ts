@@ -11,6 +11,7 @@
 import { afterAll, beforeAll, describe } from "bun:test";
 import type { ThreadStore } from "@revkit/review-core";
 import { D1ThreadStore } from "../src/d1-store.ts";
+import { previewScopePath } from "../src/router.ts";
 import { fixedClock, storeConformance, type StoreFactory } from "../../review-core/test/store-conformance.ts";
 import { startWorker, type Harness } from "./harness.ts";
 
@@ -25,13 +26,20 @@ describe("D1ThreadStore (hosted, miniflare D1)", () => {
     await harness.dispose();
   });
 
+  // Slice 5: the hosted lane is the one store that must name WHICH log it is,
+  // because the hosted table holds one log per `(repo, PR)` in the deployment.
+  // The key is built by the same `previewScopePath` a route's scope uses, and
+  // `reset` clears the whole partition rather than one key — the suite asserts
+  // nothing about a log's neighbours, and a leaked row from another key would
+  // make A5's "seq starts at 1" fail for the wrong reason, exactly as a leaked
+  // event in the flat table used to.
   const d1Factory: StoreFactory = {
-    name: "D1ThreadStore (hosted D1, workerd)",
+    name: "D1ThreadStore (hosted D1, workerd, one review's log)",
     async make(): Promise<ThreadStore> {
-      return new D1ThreadStore({ db: harness.db, clock: fixedClock() });
+      return new D1ThreadStore({ db: harness.db, logKey: previewScopePath("revkit", 7), clock: fixedClock() });
     },
     async reset(): Promise<void> {
-      for (const table of ["events", "snapshots"]) {
+      for (const table of ["review_logs", "snapshots"]) {
         await harness.db.prepare(`DELETE FROM ${table}`).run();
       }
     },

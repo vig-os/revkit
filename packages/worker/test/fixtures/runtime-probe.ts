@@ -54,7 +54,7 @@ export default {
       // The full hosted-store bridge, executed by workerd: D1 append ->
       // exportArchive -> import into a fresh in-memory store -> threads().
       // This is `revkit threads export|import` running in the Worker.
-      const d1 = new D1ThreadStore({ db: env.DB });
+      const d1 = new D1ThreadStore({ db: env.DB, logKey: "/revkit/pr-7" });
       const seq = await d1.append({
         actor: { kind: "gh-user", id: "gerchowl" },
         kind: "comment.created",
