@@ -1198,6 +1198,55 @@ describe("ADR-0012's per-request gate", () => {
       }
     });
 
+    test("the query is validated BEFORE a log key is chosen, so no parameter can name a log", async () => {
+      // **This case exists because a mutant survived, and its scope is what
+      // makes it interesting.** Reading the log key as
+      // `url.searchParams.get("log_key") ?? route.scope?.logKey` leaves the suite
+      // fully green — in BOTH statement orders — because `parseThreadsQuery` is
+      // TOTAL over the parameter set: a query naming a log is refused above, and
+      // an accepted query has no `log_key` for the fallback to read. The mutant
+      // is equivalent, not merely uncovered (see `readThreads`).
+      //
+      // What is NOT guaranteed by that argument is the parser staying total, and
+      // that is what this case pins: a caller-supplied key is refused with the
+      // generic reason, and the named log's `head` and events are absent from
+      // the answer rather than merely alongside a 400. Two reviews with
+      // DIFFERENT heads, so a key honoured anywhere in this handler would be
+      // visible in the body.
+      // `beforeAll` seeded THIS review's log; add a second one whose threads
+      // and `head` are distinguishable from it.
+      const otherKey = previewScopePath(REVIEW.repo, 99);
+      await seedLog(harness.db, otherKey, "th-other");
+      const issued = await issueTestSession(harness.db);
+      const response = await harness.dispatch(
+        `http://localhost${THREADS_PATH}?log_key=${encodeURIComponent(otherKey)}`,
+        { headers: { cookie: cookieHeader(issued.sessionId) } },
+      );
+      expect(response.status).toBe(400);
+      const raw = await response.text();
+      expect(JSON.parse(raw) as Record<string, unknown>).toMatchObject({
+        error: "bad-request",
+        reason: "unknown-parameter",
+        parameter: "log_key",
+      });
+      // Neither log's head appears, and no event does. A key honoured anywhere
+      // in this handler would put one of these two numbers in the body.
+      expect(raw).not.toContain("th-other");
+      expect(raw).not.toContain("th-seed");
+      expect(raw).not.toContain(`"head"`);
+      // And the same request WITHOUT the parameter reads this review normally,
+      // so the refusal above is about the parameter and nothing else.
+      const clean = await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+        headers: { cookie: cookieHeader(issued.sessionId) },
+      });
+      expect(clean.status).toBe(200);
+      expect(JSON.parse(await clean.text()) as { head: number }).toMatchObject({ head: 7 });
+      await harness.db
+        .prepare("DELETE FROM review_logs WHERE log_key = ?")
+        .bind(otherKey)
+        .run();
+    });
+
     test("a scope parameter cannot move the read to another review's log", async () => {
       // The same refusals from the other end: TWO reviews, both populated, and
       // no spelling of a query string that reaches the wrong one. With the scope

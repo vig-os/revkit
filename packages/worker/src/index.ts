@@ -1040,12 +1040,41 @@ async function readThreads(
   route: Route,
 ): Promise<Response> {
   void authorized;
-  const logKey = route.scope?.logKey;
-  if (logKey === undefined) return unreachable(route);
+  // ── The ORDER of these two blocks is what makes the mutation equivalent ──
+  //
+  // The query is validated BEFORE a log key is chosen. `parseThreadsQuery`
+  // refuses every parameter but `since`, so a request naming a log in its query
+  // string is refused here and the key below is the only one that can reach a
+  // store.
+  //
+  // **A mutation run put a number on this, and the number is 0.** Changing
+  // `route.scope?.logKey` to
+  // `url.searchParams.get("log_key") ?? route.scope?.logKey` — a
+  // caller-supplied log key — leaves the suite **fully green**, and it is worth
+  // being precise about WHY rather than recording it as an untested risk:
+  //
+  //   - It was tried in BOTH orders. Before this reorder it was safe only by
+  //     accident of ordering; after it, the mutated line is **unreachable** for
+  //     any query carrying a parameter, because the refusal returned 400 above.
+  //   - For every query the parser ACCEPTS — none, or `?since=<canonical>` —
+  //     `searchParams.get("log_key")` is `null`, so the fallback yields the
+  //     same key. Every input, therefore, produces identical behaviour: the
+  //     mutant is **equivalent**, and no test can kill it.
+  //
+  // So the control is not "a test asserts this", because there is none to
+  // write. It is structural: the key comes from `route.scope`, which
+  // `classifyRoute` derives from the path by a pure function of
+  // `(pathname, method)`, and the query parser is **total** over the parameter
+  // set. `test/authorization.test.ts` pins both halves — the refusal, and the
+  // absence of any log's `head` from the answer — so a future edit that made
+  // the parser accept a parameter would be caught, which is the case that
+  // would actually open the hole.
   const query = parseThreadsQuery(url.search);
   if (query.kind === "invalid") {
     return json({ error: "bad-request", reason: query.reason, parameter: query.parameter }, 400, scope);
   }
+  const logKey = route.scope?.logKey;
+  if (logKey === undefined) return unreachable(route);
   const store = new D1ThreadStore({ db: env.DB, logKey });
   if (query.kind === "delta") {
     return json({ head: await store.head(), events: await store.since(query.since) }, 200, scope);
