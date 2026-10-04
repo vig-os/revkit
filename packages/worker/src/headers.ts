@@ -125,6 +125,29 @@ export function applyAuthHeaders(response: Response, ctx: HeaderContext): Respon
   return applyResponseHeaders(response, "auth", undefined, ctx);
 }
 
+/** Attach ADR-0012 headers to an ASSET — the revkit-owned client script on
+ * `/_revkit/<version>/`, and whatever a future R2-backed preview serves.
+ *
+ * **No CSP, and that is the shared policy's rule rather than an omission.** The
+ * `asset` kind exists precisely so a JS/CSS/font/image response carries no
+ * `Content-Security-Policy`: browsers apply the EMBEDDING DOCUMENT's CSP to
+ * subresource fetches, so `default-src 'none'` on the script response would deny
+ * the document's own load of it. The document's `default-src 'none'` is the
+ * control — see the issue #22 review's second blocker, recorded on
+ * `buildMinimalCspHeader`.
+ *
+ * **No `Cache-Control` either.** The shared policy sets that for `json` and
+ * `auth` only, and an asset's caching is a property of ITS name — this one is
+ * content-addressed and version-scoped, so `src/index.ts` sets `immutable`
+ * explicitly rather than getting a policy default it cannot justify.
+ *
+ * The hygiene quartet and `Permissions-Policy` still apply: they are every
+ * response's, including this one.
+ */
+export function applyAssetHeaders(response: Response, ctx: HeaderContext, contentType: string): Response {
+  return applyResponseHeaders(response, "asset", contentType, ctx);
+}
+
 /** Attach the minimal CSP plus `Content-Disposition: inline` to an SVG.
  *
  * ADR-0012: "SVG is served with `Content-Security-Policy: sandbox` and

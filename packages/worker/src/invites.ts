@@ -138,12 +138,28 @@
 //     refused as a replay
 //
 // That last point is the honest statement of what "stripped from the URL"
-// achieves. History rewriting (`history.replaceState`) needs JavaScript, and
-// this Worker serves no script on any path — `script-src` is
-// `/_revkit/<version>/` and the preview surface is slice 5 — so there is no
-// in-page mechanism to reach for. Single-use plus a token-free redirect is
-// available today and is what retires the token; the `replaceState` belt is
-// recorded as slice 5's, when a script-bearing document exists and can do it.
+// achieves, and it remains true without any script: single-use plus a
+// token-free redirect retires the token on the SERVER, and it is the control
+// that does not depend on a browser.
+//
+// **The client-side belt arrived in slice 5b, and this paragraph was its
+// holding statement until then.** `GET /invite/<token>` now loads one external
+// script (`src/client-script.ts`) which rewrites the address bar to `/invite/`
+// with `history.replaceState`, so the token does not survive in the current tab's
+// history, in a Back-navigation, or in a reload — and it does so **on load**,
+// before the exchange, because the token is in the form's hidden field and the
+// URL is not needed for anything once the document has loaded.
+//
+// Three things about that belt are properties rather than good intentions, and
+// each is pinned in `test/invites.test.ts`:
+//
+//   - `replaceState`, never `pushState`: pushing the clean URL would leave
+//     `/invite/<token>` as the PREVIOUS entry, one Back press away.
+//   - it needs JavaScript, so a guest with scripting disabled keeps the token in
+//     the URL — recorded as a residual risk rather than papered over. What such
+//     a guest does NOT lose is the redemption: the form posts natively.
+//   - it drops the query string and the fragment rather than carrying them
+//     across, because a query string is the most durable part of a URL.
 //
 // The display name is collected on the POST rather than through `?name=` on the
 // GET for the same reason the token is: **a guest's display name is personal

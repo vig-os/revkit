@@ -15,7 +15,10 @@
 //   GET    /api/threads             404 — REMOVED in slice 5; it named no
 //                                      review, so it could only answer org-wide
 //   ANY    /api/* (other verbs)     404
-//   ANY    /_revkit/…               404 — never a redirect (ADR-0012)
+//   ANY    /_revkit/<version>/invite-<sha256>.js   200 — the ONE client script
+//                                      (slice 5b), content-addressed; every
+//                                      OTHER name under /_revkit/ is 404 and
+//                                      NONE of them redirects (ADR-0012)
 //   ANY    <repo>/pr-<n>/…          501 — behind the gate; R2 serving is slice 5's
 //                                      other half
 //   ANY    anything else            404
@@ -135,6 +138,15 @@ import {
 } from "./authz.ts";
 import { D1ThreadStore } from "./d1-store.ts";
 import {
+  CLIENT_ASSET_CACHE_CONTROL,
+  CLIENT_ASSET_MEDIA_TYPE,
+  clientAssetDigest,
+  clientScriptSrc,
+  clientAssetSource,
+  isClientAssetPath,
+} from "./client-asset.ts";
+import {
+  applyAssetHeaders,
   applyAuthHeaders,
   applyHtmlHeaders,
   applyJsonHeaders,
@@ -330,10 +342,15 @@ function html(body: string, status: number, scope: RequestScope, extra?: Readonl
  * The credential-bearing `303` the redemption answers.
  *
  * `Location` is a TOKEN-FREE path — the preview path the invite's scope names,
- * built by `previewPath`, never the URL the token arrived on. That is the
- * "stripped from the URL" half of ADR-0009 that is available without
- * JavaScript; `src/invites.ts`'s header has the rest of the argument, including
- * why `history.replaceState` is slice 5's and not this slice's.
+ * built by `previewPath`, never the URL the token arrived on.
+ *
+ * **This is the half of ADR-0009's "stripped from the URL" that needs no
+ * JavaScript, and it is the control.** The other half arrived in slice 5b: the
+ * invite page now loads one external script that rewrites the address bar with
+ * `history.replaceState` on load, so the token does not survive in this tab's
+ * history either. That is a belt; this is the pair of braces. `src/invites.ts`'s
+ * header has the full argument, including what a guest with scripting disabled
+ * keeps and does not lose.
  *
  * `kind: "auth"` gives it `Cache-Control: no-store`, which ADR-0012's
  * amendment names for exactly this kind of answer.
@@ -536,7 +553,7 @@ async function handleOpen(
     case "method-not-allowed":
       return json({ error: "method-not-allowed" }, 405, scope);
     case "revkit-bundle":
-      return json({ error: "not-found", note: "revkit bundle serving lands in M4 slice 3" }, 404, scope);
+      return serveClientAsset(safePath(request), env, scope);
     case "invite-open":
       return openInvite(request, env, keys, scope);
     case "invite-redeem":
@@ -547,6 +564,72 @@ async function handleOpen(
       return unreachable(route);
   }
 }
+
+// ── the invite surface (slice 3) ──────────────────────────────────────────
+
+/**
+ * `ANY /_revkit/<version>/invite-<digest>.js` — the Worker serves ONE client
+ * script, and this is it.
+ *
+ * **This replaces a 404 that a CSP was already pointing at.** Until slice 5b,
+ * `script-src` named `/_revkit/<version>/` and every path under it answered
+ * `404 {"note": "revkit bundle serving lands in M4 slice 3"}`, so the policy
+ * allowlisted a directory that served nothing.
+ *
+ * ── Why this is a route at all, rather than R2 or a static upload ──────────
+ *
+ * ADR-0012 says the bundle path is "deployed by revkit's own release". The
+ * honest state of that is that there is no release pipeline for this surface
+ * yet: there is no R2 binding, and `revkit deploy init` — which would provision
+ * one — is slice 8 and owner-gated (#34). So the bytes are compiled INTO the
+ * Worker (`src/client-script.ts`) and served from the bundle path, which keeps
+ * the property ADR-0012 actually cares about: **the script comes from the
+ * running revkit version, never from a PR artefact.** Whoever controls the
+ * artefact controls the `<script>` tag in it; the digest in the filename is
+ * computed from the same string this handler writes to the body, in the same
+ * request, so a page and the asset it names cannot disagree.
+ *
+ * ── The three properties this handler is responsible for ───────────────────
+ *
+ *   1. **Exact-match only.** `isClientAssetPath` is string equality against the
+ *      one name that resolves, so an unhashed name, a mis-hashed name, a `.mjs`
+ *      spelling, another version, and the bare `/_revkit/` are all 404s — and
+ *      there is no pattern in here to widen.
+ *   2. **Never a redirect.** ADR-0012: a browser drops the path part of a CSP
+ *      source after a redirect, which would widen `script-src` from one pinned
+ *      directory to whatever a `Location` named. `isRevkitBundlePath` classifies
+ *      the whole prefix and this handler only ever answers 200 or 404.
+ *   3. **No database, no gate, no request-derived input.** `env.DB` is never
+ *      touched, so this cannot become a second reader of review data; and the
+ *      only things read are `env.REVKIT_VERSION` and the request's own pathname.
+ *
+ * **Ungated, and that is correct for the same reason `/healthz` is.** The bytes
+ * are a compile-time constant: there is nothing here to authorize, and a gate in
+ * front of it would only mean a first-visit failure mode for a page that must
+ * load before anything else does.
+ *
+ * **`Cache-Control` is set HERE rather than left to the shared policy**, because
+ * the policy sets it only for `json` and `auth` kinds and an asset is neither.
+ * The value is `immutable` and the naming scheme is what makes that true rather
+ * than optimistic — see `src/client-asset.ts`.
+ *
+ * The `asset` kind is what makes this response carry **no CSP of its own**:
+ * browsers apply the embedding document's CSP to subresource loads, so a
+ * `default-src 'none'` on the script response would deny the document's own load
+ * of it. The document's `default-src 'none'` is the control; this one would be
+ * the thing that breaks it.
+ */
+async function serveClientAsset(pathname: string, env: Env, scope: RequestScope): Promise<Response> {
+  const digest = await clientAssetDigest();
+  if (!isClientAssetPath(pathname, env.REVKIT_VERSION, digest)) {
+    scope.logger.log("info", "asset.miss", { pathKind: "revkit-bundle" });
+    return json({ error: "not-found" }, 404, scope);
+  }
+  const response = new Response(clientAssetSource(), { status: 200 });
+  response.headers.set("cache-control", CLIENT_ASSET_CACHE_CONTROL);
+  return withExtra(applyAssetHeaders(response, scope.headers, CLIENT_ASSET_MEDIA_TYPE), scope);
+}
+
 
 // ── the invite surface (slice 3) ──────────────────────────────────────────
 
@@ -614,6 +697,11 @@ async function openInvite(
 ): Promise<Response> {
   const pathname = safePath(request);
   const token = inviteTokenFrom(pathname);
+  // Resolved ONCE per request and reused by every page this handler can return —
+  // the form, the closed page and the 429 all load the same script, and all
+  // three are served at a URL that still contains the token. Memoised in
+  // `src/client-asset.ts`, so this is a map read after the first request.
+  const scriptSrc = await clientScriptSrc(env.REVKIT_VERSION);
   // NEVER unmetered, and the rule that guarantees it lives in `openBuckets` —
   // the address bucket when the edge set one, the per-token bucket when it did
   // not, because an empty bucket list writes nothing at all.
@@ -626,14 +714,14 @@ async function openInvite(
   );
   if (!limited.ok) {
     scope.logger.log("info", "rate.limit.hit", { bucketKind: limited.kind, route: "invite-open" });
-    return rateLimited(limited.retryAfterSeconds, scope);
+    return rateLimited(limited.retryAfterSeconds, scope, scriptSrc);
   }
-  if (token === undefined) return html(inviteClosedPage(), 404, scope);
+  if (token === undefined) return html(inviteClosedPage(scriptSrc), 404, scope);
   const invite = await loadInviteByToken(env.DB, token, { keys });
   const now = Date.now();
   if (invite === undefined || invite.revokedAt !== null || Date.parse(invite.expiresAt) <= now) {
     scope.logger.log("info", "invite.denied", { stage: "open", reason: invite === undefined ? "unknown-token" : "not-live" });
-    return html(inviteClosedPage(), 410, scope);
+    return html(inviteClosedPage(scriptSrc), 410, scope);
   }
   // L1: the field is `writable`, and the first two names tried were both wrong.
   // `SENSITIVE_KEY`'s content-word alternative has NO boundary guards —
@@ -654,7 +742,14 @@ async function openInvite(
   const presented = readBrowserCookie(request.headers.get("cookie"));
   const reuse = presented.kind === "present" && isTokenShaped(presented.value) ? presented.value : mintToken();
   return html(
-    redeemFormPage({ token, repo: invite.repo, pr: invite.pr, kind: invite.kind, canComment: invite.canComment }),
+    redeemFormPage({
+      token,
+      repo: invite.repo,
+      pr: invite.pr,
+      kind: invite.kind,
+      canComment: invite.canComment,
+      scriptSrc,
+    }),
     200,
     scope,
     {
@@ -709,6 +804,9 @@ async function redeemFromRequest(
   scope: RequestScope,
 ): Promise<Response> {
   const address = clientAddress(request.headers);
+  // Same reasoning as the open route: every page below is rendered here, so the
+  // script URL is resolved once rather than at each return.
+  const scriptSrc = await clientScriptSrc(env.REVKIT_VERSION);
   // Same rule as the open route, and for the same reason: an empty bucket list
   // writes nothing, so a request with no edge address would skip the limiter
   // entirely on this path too. The token is inside the body, which has not been
@@ -721,7 +819,7 @@ async function redeemFromRequest(
   const limited = await spendAttempts(env.DB, addressBucket(address));
   if (!limited.ok) {
     scope.logger.log("info", "rate.limit.hit", { bucketKind: limited.kind, route: "invite-redeem" });
-    return rateLimited(limited.retryAfterSeconds, scope);
+    return rateLimited(limited.retryAfterSeconds, scope, scriptSrc);
   }
   if (!isRedeemContentType(request.headers.get("content-type"))) {
     return json({ error: "unsupported-media-type", reason: "content-type-not-json" }, 415, scope);
@@ -736,14 +834,14 @@ async function redeemFromRequest(
   const invite = await loadInviteByToken(env.DB, body.token, { keys });
   if (invite === undefined) {
     scope.logger.log("info", "invite.redeem.denied", { reason: "unknown-token" });
-    return html(inviteClosedPage(), 410, scope);
+    return html(inviteClosedPage(scriptSrc), 410, scope);
   }
   // The token resolved, so its own bucket is now worth charging. A guessed token
   // never reaches this line and therefore never creates a counter row.
   const tokenLimit = await spendAttempts(env.DB, tokenBucket(invite.tokenHash));
   if (!tokenLimit.ok) {
     scope.logger.log("info", "rate.limit.hit", { bucketKind: tokenLimit.kind, route: "invite-redeem-token" });
-    return rateLimited(tokenLimit.retryAfterSeconds, scope);
+    return rateLimited(tokenLimit.retryAfterSeconds, scope, scriptSrc);
   }
   // No outer "no binding cookie" guard here, and that is the SECOND half of a
   // correction rather than a fresh decision. There was one, and the mutation run
@@ -765,7 +863,7 @@ async function redeemFromRequest(
   );
   if (!result.ok) {
     scope.logger.log("info", "invite.redeem.denied", { reason: result.refusal });
-    return html(inviteClosedPage(), 410, scope);
+    return html(inviteClosedPage(scriptSrc), 410, scope);
   }
   scope.logger.log("info", "invite.redeem.ok", { inviteKind: result.invite.kind, writable: result.invite.canComment });
   // The CSRF token rides on the `303` as a response header, exactly as
@@ -800,8 +898,8 @@ function previewPath(repo: string, pr: number | null): string {
 /** A 429 in whichever shape the caller can use: HTML for the navigation the
  * invite routes are reached by, and it always carries `Retry-After` because a
  * 429 without one tells a client nothing except that it should guess. */
-function rateLimited(retryAfterSeconds: number, scope: RequestScope): Response {
-  return html(rateLimitedPage(retryAfterSeconds), 429, scope, { "retry-after": String(Math.max(1, retryAfterSeconds)) });
+function rateLimited(retryAfterSeconds: number, scope: RequestScope, scriptSrc: string): Response {
+  return html(rateLimitedPage(retryAfterSeconds, scriptSrc), 429, scope, { "retry-after": String(Math.max(1, retryAfterSeconds)) });
 }
 
 /**
@@ -818,10 +916,16 @@ function rateLimited(retryAfterSeconds: number, scope: RequestScope): Response {
  * slice 3's first cut treated it as one — which made the shipped flow
  * **unsubmittable**: `redeemFormPage` emits `<form method="post">` with no
  * `enctype`, so a browser sends `application/x-www-form-urlencoded`; the route
- * refused it with 415; and the page serves no script (`default-src 'none'`, no
- * `<script>`), so there is no `fetch()` that could send JSON and **no HTML
- * mechanism can produce `application/json` at all**. Every guest got a 415 and
- * no session.
+ * refused it with 415; and the page had no `fetch()` that could send JSON, so
+ * **no HTML mechanism could produce `application/json` at all**. Every guest got
+ * a 415 and no session.
+ *
+ * *Still true after slice 5b, and worth being precise about why:* the page now
+ * loads a script, so "the page serves no script" is no longer the premise — but
+ * that script only rewrites the address bar (`src/client-script.ts`), and
+ * `test/invites.test.ts` asserts it contains no `fetch` at all. The form still
+ * posts natively, so `application/x-www-form-urlencoded` remains the only thing a
+ * browser can produce here.
  *
  * Nothing caught it because every POST in the suite was a hand-built JSON
  * `Request`. The fix is therefore paired with a test that parses the SHIPPED
