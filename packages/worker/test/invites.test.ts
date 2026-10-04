@@ -1429,6 +1429,65 @@ function parseJson(raw: string): Record<string, unknown> {
   }
 }
 
+/** Every element name in a served page, lowercased and in document order.
+ *
+ * **Why a CLOSED SET rather than a denylist of dangerous tags.** The obvious
+ * shape here is a list of patterns for the ways script can run — `<script>`,
+ * `<iframe>`, `<object>`, `<embed>`, `<link>`, `<style>`, `on*=` — and that is
+ * what this file used. It is open-ended: it only catches the executions somebody
+ * thought of, and every pattern in it has to model HTML's tag syntax correctly
+ * or it silently under-matches. CodeQL's `js/bad-tag-filter` kept finding ways
+ * it under-matched (`<SCRIPT>`, `</script >`, `</script\n bar>`), one facet per
+ * run, and each fix narrowed the spelling rather than removing the problem.
+ *
+ * Extracting tag NAMES closes it. The pattern matches an OPENING tag's name and
+ * stops; it does not model attributes, spacing, or any closing tag, so no
+ * spelling of any tag can hide from it — and matching opening tags only is what
+ * makes the COUNT mean "elements" rather than "names seen twice per element".
+ * A page that carries an element nobody allowlisted fails, and the allowlist is
+ * finite and reviewable.
+ */
+function tagNames(html: string): string[] {
+  return [...html.matchAll(/<\s*([a-z][a-z0-9]*)/gi)].map((m) => (m[1] ?? "").toLowerCase());
+}
+
+/** The one `<script>` element's attributes, and whether its body is empty.
+ *
+ * **The body check never looks at the closing tag.** An inline body is anything
+ * between the end of the opening tag and the NEXT tag; if that span is empty or
+ * whitespace, there is no body. So: find the opening tag, then assert the run of
+ * characters up to the next `<` is blank. `script` elements are void-free so
+ * there is no ambiguity about what "next tag" means here, and the assertion does
+ * not become wrong when a browser or a serializer writes `</script >`.
+ */
+function scriptElement(html: string): { attributes: string; bodyIsEmpty: boolean } | undefined {
+  const opening = /<\s*script\b([^>]*)>/i.exec(html);
+  if (opening === null) return undefined;
+  const afterTag = html.slice(opening.index + opening[0].length);
+  const bodyIsEmpty = /^\s*(?:<!--[\s\S]*?-->\s*)*</.test(afterTag);
+  return { attributes: opening[1] ?? "", bodyIsEmpty };
+}
+
+/** Every element name `src/invite-page.ts` is allowed to emit. A closed set, so
+ * an element nobody thought of is a red test rather than a silent widening. */
+const PAGE_ELEMENTS = [
+  "html",
+  "head",
+  "meta",
+  "title",
+  "script",
+  "body",
+  "main",
+  "h1",
+  "p",
+  "strong",
+  "form",
+  "input",
+  "label",
+  "br",
+  "button",
+] as const;
+
   // ── the same mechanics, over HTTP through real workerd ──────────────────
 
   // NO lifecycle hooks in this describe. It shares the file's ONE harness, and
@@ -1525,10 +1584,10 @@ function parseJson(raw: string): Record<string, unknown> {
         // EXTERNAL `src` on the allowlisted path: an inline body would need
         // `'unsafe-inline'` (or a nonce, or `strict-dynamic`) and `script-src`
         // stays a pinned path with none of them.
-        const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
+        const scripts = [...html.matchAll(/<\s*script\b([^>]*)>/gi)];
         expect(scripts).toHaveLength(1);
         expect(scripts[0]?.[1], "the one script is a src, not a body").toMatch(/\ssrc="[^"]+"/);
-        expect(scripts[0]?.[2]?.trim(), "and it carries no inline body").toBe("");
+        expect(scriptElement(html)?.bodyIsEmpty, "and it carries no inline body").toBe(true);
         expect(html).not.toContain("javascript:");
         expect(html).not.toContain("onclick");
         // The token appears in the form and nowhere else on the page.
@@ -1623,9 +1682,17 @@ function parseJson(raw: string): Record<string, unknown> {
           // be that asset — an inline body here would BE the injection.
           expect(html, token.slice(0, 20)).not.toContain("<script>alert");
           expect(html, token.slice(0, 20)).not.toContain("<img src=x");
-          const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
-          expect(scripts.length, token.slice(0, 20)).toBe(1);
-          expect(scripts[0]?.[2]?.trim(), token.slice(0, 20)).toBe("");
+          // Same closed-set and no-closing-tag helpers as the form page: the
+          // claim is about the page's ELEMENTS, not about one spelling of one
+          // tag. See `tagNames`.
+          expect(tagNames(html).filter((name) => name === "script"), token.slice(0, 20)).toHaveLength(1);
+          // A SUBSET of the allowlist, because the three pages differ and the
+          // allowlist is their union; "an element nobody allowlisted" is the
+          // failure this exists to catch, and a subset says exactly that.
+          for (const name of new Set(tagNames(html))) {
+            expect(PAGE_ELEMENTS as readonly string[], `the closed page emitted <${name}>`).toContain(name);
+          }
+          expect(scriptElement(html)?.bodyIsEmpty, token.slice(0, 20)).toBe(true);
         }
       });
 
@@ -1952,32 +2019,34 @@ function parseJson(raw: string): Record<string, unknown> {
           // With no inline script, `script-src` needs no `'unsafe-inline'`, no
           // nonce and no `'strict-dynamic'`: the strongest posture available,
           // and it keeps ADR-0012's `default-src 'none'` intact rather than
-          // relaxing it. Every one of these is a way to execute script that
-          // `script-src` does NOT allow, so each is a hole if one appears.
+          // relaxing it.
           const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
           if (!minted.ok) throw new Error("mint failed");
           const { response } = await open(harness, minted.minted.token);
           const html = await response.text();
-          // **Every tag pattern below is case-INsensitive and tolerates
-          // `</script >`, and that is the assertion being made**, not a lint
-          // appeasement. These regexes answer "does this page contain a way to
-          // execute script": `<SCRIPT>` is such a way, and so is the perfectly
-          // legal `</script >` spelling, so a pattern that misses either would
-          // pass a page carrying one. The Worker emits lowercase markup with no
-          // space before the closing bracket today, so neither flag changes a
-          // result now; both are here so the assertion stays true if that ever
-          // stops being so. CodeQL's `js/bad-tag-filter` flagged these patterns
-          // for exactly those two reasons, and the honest response to that is to
-          // strengthen the check rather than suppress the rule.
+
+          // **The elements are a CLOSED SET, not a denylist of dangerous ones.**
+          // This list used to name the ways script can run — `<style>`,
+          // `<iframe>`, `<object>`, `<embed>`, `<link>`, `<script>` with a body
+          // — which only catches the executions somebody thought of, and which
+          // needed each pattern to model HTML's tag syntax correctly or it
+          // silently under-matched (CodeQL's `js/bad-tag-filter` found three
+          // separate ways, one per run: `<SCRIPT>`, `</script >`,
+          // `</script\n bar>`). Naming the elements the page is ALLOWED to carry
+          // closes that class: the pattern matches an opening tag's name and
+          // stops, so no spelling hides, and anything not on this list fails —
+          // including an element nobody has thought of yet.
+          expect([...new Set(tagNames(html))].sort()).toEqual([...PAGE_ELEMENTS].sort());
+          expect(tagNames(html).filter((name) => name === "script"), "exactly one script ELEMENT").toHaveLength(1);
+          expect(scriptElement(html)?.bodyIsEmpty, "and it has no inline body").toBe(true);
+
+          // What a tag allowlist cannot see is an ATTRIBUTE, so those stay
+          // patterns. None of them models tag syntax, so none of them can
+          // under-match a spelling.
           for (const [what, pattern] of [
-            ["an inline script body", /<script\b[^>]*>[\s\S]*?\S[\s\S]*?<\/script\s*>/i],
             ["an inline event handler", /\son[a-z]+\s*=/i],
             ["a javascript: URL", /javascript:/i],
-            ["a <style> block", /<style\b/i],
             ["a style attribute", /\sstyle\s*=/i],
-            ["an <iframe>", /<iframe\b/i],
-            ["an <object>/<embed>", /<(?:object|embed)\b/i],
-            ["an external stylesheet", /<link\b/i],
             ["an inline script nonce", /\bnonce\s*=/i],
           ] as const) {
             expect(html, what).not.toMatch(pattern);
