@@ -132,23 +132,28 @@ export const SESSION_MAX_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 export type IdentityKind = (typeof RECOGNISED_IDENTITY_KINDS)[number];
 
 /**
- * Identity kinds the AUTHORIZATION GATE honours, in one place, because two
+ * The identity kinds the AUTHORIZATION GATE honours, in one place, because two
  * modules must agree on it: `issueSession` will not mint a kind the gate
  * would refuse, and the gate refuses everything that is not in this list.
  *
- * `operator` is the one slice 2 mints, and naming it is the answer to
- * "where does a session come from with no invites and no App?" — see the
- * `issueSession` header. `github` and `invite` are ADR-0009's two real
- * classes; they are ABSENT here on purpose. When slice 3/4 adds the code
- * that redeems an invite or completes a GitHub OAuth exchange, it adds the
- * arm HERE, in the gate, where the review will see it — that is the point of
- * the gate refusing unknown kinds rather than defaulting them to "allowed".
+ * `operator` is slice 2's: "the person or process that provisioned this
+ * deployment", out of band, by whoever holds D1 write access.
+ * `invite` is slice 3's: a guest who exchanged an ADR-0009 invite link for a
+ * session. Its arrival is what slice 2's 2026-10-04 amendment predicted — the
+ * arm goes HERE, in the gate, and adding it there is what brings the scope,
+ * type, expiry, revocation and browser-binding rules with it. `invites.ts`
+ * calls `loadInviteGrant` on every authorized read, so a row naming a kind this
+ * list does not contain cannot be honoured by guessing.
+ *
+ * `github` is ADR-0009's third class and is still ABSENT on purpose: there is
+ * no App and no `TokenSource` (#34), so there is nothing to check repo read
+ * access against.
  *
  * The TABLE stays open (`migrations/0001_init.sql` records why: adding a
  * provider must not mean a table rewrite). Open in the schema, closed in the
  * gate: a provider revkit cannot honour is denied, not guessed at.
  */
-export const RECOGNISED_IDENTITY_KINDS = ["operator"] as const;
+export const RECOGNISED_IDENTITY_KINDS = ["operator", "invite"] as const;
 
 /** The identity a session is bound to: a kind from the closed set and an
  * opaque id (ADR-0020 — never a login, an email, or a guest display name). */
@@ -303,16 +308,36 @@ export type CookieLookup =
   | { readonly kind: "present"; readonly value: string }
   | { readonly kind: "ambiguous" };
 
-/** Parse one named cookie out of a `Cookie` request header. Total: no input
- * makes it throw, and it never reads anything but the requested name. */
+/** Parse the session cookie out of a request's `Cookie` header. */
 export function readSessionCookie(header: string | null): CookieLookup {
+  return readCookie(header, SESSION_COOKIE_NAME);
+}
+
+/**
+ * Parse one named cookie out of a `Cookie` request header. Total: no input
+ * makes it throw, and it never reads anything but the requested name.
+ *
+ * **One implementation for every cookie this Worker reads.** Slice 3 adds a
+ * second one — the browser-binding cookie that identifies which browser
+ * redeemed an invite — and the `ambiguous` verdict is not a nicety there, it is
+ * the same cookie-tossing guard: two `__Host-revkit_browser` values would mean
+ * two browsers' bindings arrived on one request and "the first" is how one
+ * browser's invite silently becomes another's. Copying the parser for the
+ * second name would leave that judgement to whoever copied it.
+ *
+ * It lives here rather than in a new `cookies.ts` because `readSessionCookie`
+ * and `sessionCookieHeader` already made this module the owner of the cookie
+ * shape, and moving one of them out would have touched slice 2's tests for no
+ * gain in clarity.
+ */
+export function readCookie(header: string | null, name: string): CookieLookup {
   if (header === null) return { kind: "absent" };
   let found: string | undefined;
   for (const raw of header.split(";")) {
     const pair = raw.trim();
     const equals = pair.indexOf("=");
     if (equals === -1) continue;
-    if (pair.slice(0, equals) !== SESSION_COOKIE_NAME) continue;
+    if (pair.slice(0, equals) !== name) continue;
     if (found !== undefined) return { kind: "ambiguous" };
     found = pair.slice(equals + 1);
   }
@@ -327,60 +352,176 @@ const INSERT_SESSION_SQL =
 const SELECT_SESSION_SQL = "SELECT identity_kind, identity_id, csrf_hash, created_at, expires_at FROM sessions WHERE id = ?";
 
 /**
+ * A minted session: the two plaintext credentials, their digests, and the
+ * timestamps. Produced by `mintSession` with **no database access**, which is
+ * what lets a caller put the row INSERT inside a larger `db.batch()` — the
+ * invite redemption needs its session write to be atomic with the redemption
+ * that authorises it, and `D1Database` has no interactive transaction to wrap
+ * the two (`migrations/0001_init.sql` records the measurement).
+ *
+ * The plaintext values live here and in the `IssuedSession` the caller hands
+ * back. Neither is ever stored: `sessionDigest` and `csrfDigest` are what go
+ * into the row.
+ */
+export interface MintedSession {
+  readonly sessionId: string;
+  readonly csrfToken: string;
+  readonly sessionDigest: string;
+  readonly csrfDigest: string;
+  readonly identity: SessionIdentity;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+  readonly maxAgeSeconds: number;
+}
+
+/**
+ * Mint a session's credentials without writing anything.
+ *
+ * `createdAt` / `expiresAt` may be supplied by a caller that must compute an
+ * expiry itself — `rotateSession` caps a sliding TTL against the ORIGINAL
+ * `created_at`, so it cannot let this function decide the timestamps. Both
+ * defaults come from `now` + `ttlMs`, and `ttlMs` defaults to
+ * `SESSION_TTL_MS`.
+ *
+ * A caller that supplies only `expiresAt` gets `createdAt` from `now`, which
+ * is what the cap in `rotateSession` measures from, so the two cannot be
+ * derived from different clocks inside one rotation.
+ */
+export async function mintSession(
+  identity: SessionIdentity,
+  options: {
+    readonly ttlMs?: number;
+    readonly now?: MsClock;
+    readonly createdAt?: string;
+    readonly expiresAt?: string;
+  } = {},
+): Promise<MintedSession> {
+  const now = (options.now ?? wallClock)();
+  const ttlMs = options.ttlMs ?? SESSION_TTL_MS;
+  const sessionId = mintToken();
+  const csrfToken = mintToken();
+  const createdAt = options.createdAt ?? isoAt(now);
+  const expiresAt = options.expiresAt ?? isoAt(now + ttlMs);
+  return {
+    sessionId,
+    csrfToken,
+    sessionDigest: await sha256Hex(sessionId),
+    csrfDigest: await sha256Hex(csrfToken),
+    identity,
+    createdAt,
+    expiresAt,
+    maxAgeSeconds: Math.max(0, Math.floor((Date.parse(expiresAt) - now) / 1000)),
+  };
+}
+
+/**
+ * The `INSERT` for a minted session, as a statement the caller runs.
+ *
+ * A plain `INSERT`, so it can be handed to `db.batch([...])` on its own — which
+ * is how the invite redemption makes "the redemption row, the guest row and
+ * the session row" one all-or-nothing unit. `gate` narrows it to a
+ * conditional insert that writes ZERO rows unless the caller's predicate holds,
+ * which is what makes a lost redemption race leave nothing behind: `batch()` is
+ * all-or-nothing, but a guard that writes no rows is not an error, so the later
+ * statements have to be gated on the first one having succeeded.
+ *
+ * Gating is by the caller's own SQL plus its bindings, not by a revkit-specific
+ * mechanism, so the redeem handler can express "this guest row exists because my
+ * redemption landed" without this module knowing what a redemption is.
+ *
+ * **The gate's bindings are passed IN rather than chained onto the returned
+ * statement, because `D1PreparedStatement.bind()` REPLACES its bindings rather
+ * than appending to them — measured on workerd 2026-05-18.** A four-placeholder
+ * query bound once with three values and then again with one value fails with
+ * `D1_ERROR: Wrong number of parameter bindings for SQL query`; the same query
+ * bound once with all four values answers. So the ergonomic spelling
+ * (`sessionInsertStatement(db, minted, gate).bind(...gateBindings)`) silently
+ * throws, which is how this was found: the first shape compiled, typechecked,
+ * and failed at the first redemption. One `bind` call, built here, is the only
+ * spelling that works.
+ */
+export function sessionInsertStatement(
+  db: D1Database,
+  minted: MintedSession,
+  gate?: { readonly where: string; readonly bindings: readonly unknown[] },
+): D1PreparedStatement {
+  const columns = "INSERT INTO sessions (id, identity_kind, identity_id, csrf_hash, created_at, expires_at)";
+  const sql = gate === undefined ? INSERT_SESSION_SQL : `${columns} SELECT ?, ?, ?, ?, ?, ? WHERE ${gate.where}`;
+  return db.prepare(sql).bind(
+    minted.sessionDigest,
+    minted.identity.kind,
+    minted.identity.id,
+    minted.csrfDigest,
+    minted.createdAt,
+    minted.expiresAt,
+    ...(gate?.bindings ?? []),
+  );
+}
+
+/** The caller-facing view of a minted session: the plaintext credentials plus
+ * the complete `Set-Cookie` value. */
+export function issuedFrom(minted: MintedSession): IssuedSession {
+  return {
+    sessionId: minted.sessionId,
+    csrfToken: minted.csrfToken,
+    cookie: sessionCookieHeader(minted.sessionId, minted.maxAgeSeconds),
+    identity: minted.identity,
+    createdAt: minted.createdAt,
+    expiresAt: minted.expiresAt,
+    maxAgeSeconds: minted.maxAgeSeconds,
+  };
+}
+
+/**
  * Mint a session and write its row.
  *
- * ── WHERE A SESSION COMES FROM, IN THIS SLICE ─────────────────────────────
+ * ── WHERE A SESSION COMES FROM ────────────────────────────────────────────
  *
  * ADR-0012 says every request is authorized, so a session must be issued by
- * something. Slice 2 has neither the GitHub App (owner-gated, #34) nor an
- * invite (slice 3), so this function has exactly ONE caller shape available
- * today: **out of band, by whoever holds write access to the D1 database** —
- * in production that is `revkit deploy init` (slice 8), and in these tests
- * the harness. The identity kind it mints is `operator`, meaning "the person
- * or process that provisioned this deployment".
+ * something. There are exactly TWO caller shapes in this build:
  *
- * That is safe to ship because of WHAT IT IS NOT: it is not an HTTP route, so
- * no request can reach it, so there is no unauthenticated endpoint that
- * hands a session to whoever asks — the failure mode a "POST /api/session"
- * would be. It is also not a forgery defence on its own: write access to D1
- * is, in this model, the credential, exactly as ADR-0013's daemon makes
- * process memory the credential. The forgery defence is the OTHER half —
- * `lookupSession` resolves a cookie by digest against a row that must exist,
- * be unexpired, and carry a recognised identity kind, so no cookie VALUE
- * that a client can construct reaches data. `test/authorization.test.ts`
- * drives each of those refusals through a real request.
+ *   1. **Out of band, by whoever holds write access to the D1 database** — in
+ *      production that is `revkit deploy init` (slice 8), in tests the
+ *      harness. The identity kind is `operator`, meaning "the person or process
+ *      that provisioned this deployment". That is safe because of WHAT IT IS
+ *      NOT: not an HTTP route, so no request can reach it, so there is no
+ *      unauthenticated endpoint that hands a session to whoever asks — the
+ *      failure mode a `POST /api/session` would be.
+ *   2. **`redeemInvite`**, slice 3, exchanging an ADR-0009 invite link. That
+ *      route IS reachable, and it is reachable by design: ADR-0009 requires
+ *      the exchange. Its credential is the 256-bit invite token, its
+ *      single-use property is the redemption ledger, and its abuse limit is
+ *      `src/rate-limit.ts`.
  *
- * The alternative considered and rejected: a `POST /api/session` guarded by a
- * deployment secret. It needs a Worker secret, so it cannot be built or
- * tested without provisioning (#34), it would add an unauthenticated
+ * Both go through `mintSession` + `sessionInsertStatement`, so there is ONE
+ * issuance path: the same 256-bit `crypto.getRandomValues` mint, the same
+ * digesting at rest, the same `__Host-` cookie. `redeemInvite` uses the
+ * statement form rather than this function because its INSERT must be atomic
+ * with the redemption row — see `sessionInsertStatement`.
+ *
+ * Write access to D1 is, for shape 1, the credential, exactly as ADR-0013's
+ * daemon makes process memory the credential. The forgery defence for both is
+ * the OTHER half: `resolveSession` resolves a cookie by digest against a row
+ * that must exist, be unexpired, and carry a recognised identity kind, so no
+ * cookie VALUE that a client can construct reaches data.
+ * `test/authorization.test.ts` drives each of those refusals through a real
+ * request.
+ *
+ * The alternative considered and rejected for shape 1: a `POST /api/session`
+ * guarded by a deployment secret. It needs a Worker secret, so it cannot be
+ * built or tested without provisioning (#34), it would add an unauthenticated
  * endpoint to the shipped surface, and it would be the first thing a future
- * refactor widens. An unbuildable, unreachable control is worse than an
- * honest "the operator mints it".
+ * refactor widens. An unbuildable, unreachable control is worse than an honest
+ * "the operator mints it".
  */
 export async function issueSession(
   db: D1Database,
   identity: SessionIdentity,
   options: { readonly ttlMs?: number; readonly now?: MsClock } = {},
 ): Promise<IssuedSession> {
-  const now = (options.now ?? wallClock)();
-  const ttlMs = options.ttlMs ?? SESSION_TTL_MS;
-  const sessionId = mintToken();
-  const csrfToken = mintToken();
-  const createdAt = isoAt(now);
-  const expiresAt = isoAt(now + ttlMs);
-  await db
-    .prepare(INSERT_SESSION_SQL)
-    .bind(await sha256Hex(sessionId), identity.kind, identity.id, await sha256Hex(csrfToken), createdAt, expiresAt)
-    .run();
-  return {
-    sessionId,
-    csrfToken,
-    cookie: sessionCookieHeader(sessionId, Math.floor(ttlMs / 1000)),
-    identity,
-    createdAt,
-    expiresAt,
-    maxAgeSeconds: Math.floor(ttlMs / 1000),
-  };
+  const minted = await mintSession(identity, options);
+  await sessionInsertStatement(db, minted).run();
+  return issuedFrom(minted);
 }
 
 interface SessionRow {
@@ -610,8 +751,6 @@ export async function rotateSession(
   const principal = input.principal;
   const now = (options.now ?? wallClock)();
   const ttlMs = options.ttlMs ?? SESSION_TTL_MS;
-  const sessionId = mintToken();
-  const csrfToken = mintToken();
   const createdAt = principal.createdAt;
   const slidingExpiry = now + ttlMs;
   // FAIL CLOSED. `resolveSession` refuses a row whose `created_at` does not
@@ -626,10 +765,23 @@ export async function rotateSession(
   // layer is what makes the guarantee independent of the gate's callers.
   const hardCap = Date.parse(createdAt) + SESSION_MAX_LIFETIME_MS;
   const expiresAtMs = Number.isFinite(hardCap) ? Math.min(slidingExpiry, hardCap) : now;
-  const expiresAt = isoAt(expiresAtMs);
+  // One minting path, so the rotated session's id, CSRF token, digests and
+  // cookie are produced by exactly the code that produced the first one's. The
+  // timestamps are supplied because the cap above is this function's to
+  // decide; `maxAgeSeconds` is then derived from `expiresAt` by `mintSession`
+  // rather than recomputed here, so the cookie and the row cannot disagree.
+  const minted = await mintSession(
+    { kind: principal.kind, id: principal.id },
+    // `now` was already resolved from the clock above, so it is handed back
+    // as the function `mintSession`'s option type is. Resolving it twice would
+    // be a different reading of the clock and could disagree about the cap.
+    { now: () => now, ttlMs, createdAt, expiresAt: isoAt(expiresAtMs) },
+  );
   // Named once, used twice. The old row's digest is the DELETE's key and the
   // INSERT's `EXISTS` probe; it is derived from the cookie, never stored in
-  // `RotationInput`.
+  // `RotationInput`. Note it is NOT `minted.sessionDigest`: that is the NEW
+  // row's key, and using it here would make the rotation delete the row it just
+  // wrote.
   const replacedDigest = await sha256Hex(input.sessionId);
   const results = await db.batch([
     db
@@ -638,12 +790,12 @@ export async function rotateSession(
           "SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?)",
       )
       .bind(
-        await sha256Hex(sessionId),
+        minted.sessionDigest,
         principal.kind,
         principal.id,
-        await sha256Hex(csrfToken),
+        minted.csrfDigest,
         createdAt,
-        expiresAt,
+        minted.expiresAt,
         replacedDigest,
       ),
     db.prepare("DELETE FROM sessions WHERE id = ?").bind(replacedDigest),
@@ -653,16 +805,7 @@ export async function rotateSession(
       "rotateSession: the session was already replaced by a concurrent refresh; the caller must re-authenticate.",
     );
   }
-  const maxAgeSeconds = Math.max(0, Math.floor((expiresAtMs - now) / 1000));
-  return {
-    sessionId,
-    csrfToken,
-    cookie: sessionCookieHeader(sessionId, maxAgeSeconds),
-    identity: { kind: principal.kind, id: principal.id },
-    createdAt,
-    expiresAt,
-    maxAgeSeconds,
-  };
+  return issuedFrom(minted);
 }
 
 /** ISO-8601 UTC with millisecond precision and a literal `Z`. Fixed width

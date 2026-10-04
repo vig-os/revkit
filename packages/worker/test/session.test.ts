@@ -571,7 +571,10 @@ describe("resolution — the checks, and the order they run in", () => {
     // The two ADR-0009 providers, plus a typo, plus an empty string. A future
     // slice adds its arm HERE, in the gate, where the scope rules get
     // written — that is the point of refusing here rather than defaulting.
-    for (const kind of ["github", "invite", "operatr", "OPERATOR", "Operator", " operator"]) {
+    // `invite` LEFT this list in slice 3, which added the arm `invites.ts` needed
+    // and which this very comment predicted. `github` stays: the App is
+    // owner-gated (#34) and there is still nothing to check repo access against.
+    for (const kind of ["github", "auth0", "operatr", "OPERATOR", "Operator", " operator"]) {
       await harness.db.prepare("UPDATE sessions SET identity_kind = ?").bind(kind).run();
       expect((await resolveSession(harness.db, issued.sessionId, { now: clock.now })).outcome, kind).toBe(
         "unrecognised-identity-kind",

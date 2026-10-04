@@ -99,6 +99,15 @@ describe("structured logger", () => {
       "auth.denied",
       "auth.granted",
       "csrf.rejected",
+      // Slice 3's five. `invite.denied` is also what a GUEST-invite refusal
+      // logs as (`denialLogMessage`'s prefix rule), which is why the gate's
+      // revocation refusals and the redeem handler's refusals are one event
+      // rather than two that mean the same thing.
+      "invite.denied",
+      "invite.opened",
+      "invite.redeem.denied",
+      "invite.redeem.ok",
+      "rate.limit.hit",
       "request.end",
       "request.error",
       "request.start",

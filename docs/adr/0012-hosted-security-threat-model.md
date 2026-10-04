@@ -164,3 +164,155 @@ asymmetry was the defect. Both are pinned in `test/session.test.ts`.
 There is no logout-all-sessions, no revocation list and no device tracking;
 ADR-0009's invite revocation (slice 3) is the first mechanism that closes any of
 those.
+
+## Amendment (2026-10-04, issue #9, slice 3) — invite tokens, rate limits, and
+## the per-call guest check
+
+Slice 3 implements ADR-0009's invite mechanics. Two of this ADR's lines are
+**amended rather than implemented as written**, and both amendments are
+recorded here with the measurements behind them, because a divergence from an
+accepted ADR that lives only in a commit message is the failure mode this ADR
+exists to prevent.
+
+### 1. "stored as HMAC" → stored as SHA-256
+
+The abuse-limits bullet above ends *"invite tokens are 256-bit random, stored as
+HMAC"*. `packages/worker/src/invites.ts` stores `sha256(token)`. The decision
+and its evidence:
+
+- **HMAC's advantage is for LOW-entropy secrets.** A keyed MAC stops an attacker
+  holding the database from *verifying a guess*: they cannot compute
+  `HMAC_k(guess)` without `k`. For a 256-bit value from `crypto.getRandomValues`
+  there is no dictionary — guessing one value is 2^256 work either way.
+  **Measured on workerd 2026-05-18** (`compatibility_flags: []`): SHA-256 and
+  HMAC-SHA-256 both produce a 64-character hex digest of a 43-character token,
+  and 200 interleaved calls of each are indistinguishable at the platform's
+  0–1 ms timer resolution. So for *this* secret the keyed form buys nothing and
+  costs a second secret to provision, rotate and keep out of the deploy path.
+- **The keyed form is not testable in this repo's harness, and its failure mode
+  is silent.** **Measured:** miniflare 4.20260518.0 IGNORES its `secrets` option
+  — `env.INVITE_TOKEN_HMAC_KEY` came back `undefined` when passed there, and the
+  same key supplied through `bindings` (which miniflare DOES bind) came back as
+  the string. `crypto.subtle.importKey("raw", undefined, …)` then throws
+  `Cannot initialize … from an undefined or null value`, so a real HMAC
+  implementation would either 500 on every redemption under test or — far more
+  likely, and far worse — reach for a fallback key. **Measured:** a zero-filled
+  32-byte key produces a valid, *wrong* digest (`58a98994…`), i.e. a green suite
+  against a function that is not the deployed one. A keyed hash whose key the
+  test harness cannot supply is a control verified nowhere.
+- **The switch is not a one-way door.** `invites.token_hash` is `TEXT` and both
+  forms are 64 hex characters, so moving to HMAC is one function and one line of
+  this ADR — no migration, no table rewrite, no invalidation of live invites.
+  That is what makes amending acceptable rather than merely convenient.
+
+What is **not** given up: a stolen database still yields no usable token.
+`token_hash` is the only thing stored, the plaintext exists once in the mint
+result, and every lookup is `WHERE token_hash = ?` — an indexed equality, so
+there is no candidate scan to time and therefore no reason for a timing-safe
+comparison here either. Session ids and CSRF tokens were already plain SHA-256 in
+slice 2 (`sessions.id`, `sessions.csrf_hash`), so this makes the whole surface
+consistent rather than half-and-half.
+
+**This amendment needs the coordinator's agreement** and is flagged as such in
+the PR; it is not a silent deviation.
+
+### 2. "rate limits … (Durable Object counters)" → a D1-backed counter
+
+The same bullet names the mechanism. Slice 3 ships
+`packages/worker/src/rate-limit.ts` on D1 and records the Durable Object as the
+end state (M4 slice 6, with the rest of the DO work).
+
+- **A D1 counter is a real counter, not an approximation. Measured on workerd
+  2026-05-18:** `INSERT … ON CONFLICT(bucket) DO UPDATE SET count = count + 1
+  RETURNING count`, issued **20 times concurrently** against one bucket,
+  produced 20 distinct counts (1…20) — no lost updates. The increment and the
+  window rollover happen in one statement, so the whole check is a single round
+  trip with no read-then-write window. (Slice 1 measured what that window costs:
+  six concurrent read-then-write appends produced three distinct `seq` values.)
+- **"We could not test a Durable Object here" would be false. Measured:** a
+  Durable Object namespace bound in miniflare with an exported `DurableObject`
+  subclass answers 200 offline, with no account. The argument for D1 is
+  therefore **scope**, not tooling, and saying otherwise would be the
+  plausible-mechanism story this repo keeps warning about.
+- Shipping redemption with **no** limit while this ADR claims one was not an
+  option, and shipping a limit that is honestly D1 is.
+
+Cost, stated rather than hidden: one row write per limited attempt, against D1's
+daily row-write quota, so a sustained flood spends that deployment's quota. A
+Durable Object trades that for per-isolate consistency at a per-request cost.
+The limit's purpose here is to make a 256-bit token unguessable *by volume*; a
+quota exhaustion is a louder failure than a leaked invite. Residual risk, in the
+ADR rather than only in a PR.
+
+Two further properties of the shipped limit, both measured by test rather than
+asserted: `X-Forwarded-For` is **never** read (every hop appends to it, so it is
+forgeable and a forgeable identity half would make the whole limit forgeable);
+and the **per-token limit is derived from `max_browsers`**, because a limit
+below `2 × max_browsers` makes a legitimate multi-browser invite unusable — it
+was 10 against `team`'s `max_browsers = 10`, and each browser costs two attempts
+(open, then redeem), so the tenth browser was rate-limited rather than admitted.
+
+### 3. "a guest invite is checked for scope, type and expiry on each call" — now
+### implemented, in two halves
+
+ADR-0009's invitation revocation is implemented. A session whose
+`identity_id` is a guest id is re-checked **on every authorized request**:
+
+1. **revocation** — `invites.revoked_at`, from the row as it stands now;
+2. **expiry** — `invites.expires_at`, with an unreadable value failing closed;
+3. **scope** — the invite's `repo` and optional `pr` against the repo/PR the
+   route names;
+4. **type** — `invites.can_comment` against whether the route writes review
+   content.
+
+Plus one property this ADR did not name and ADR-0009 implies: the session must
+present the **same browser** the invite was redeemed in
+(`__Host-revkit_browser`, stored as a digest, checked on every call). The
+mechanism and the attacks it does *not* stop are in `src/invites.ts`'s header;
+the short version is that a cookie binds a browser *profile*, so it bounds
+sharing and does not authenticate anybody.
+
+**What "on each call" does not yet cover, and this is the honest half.** The
+scope check selects on routes that NAME a repo and PR, which today means
+ADR-0008's `<repo>/pr-<n>/` preview paths. `GET /api/threads` names none,
+because `events(seq, ts, payload)` has no `repo` column for a scope check to
+select on — so a guest with a valid invite currently reads the whole log, exactly
+as an operator does. The preview surface (slice 5) adds the axis; until then a
+revoked, expired or wrong-browser guest is refused everywhere, and an in-scope
+guest is refused on out-of-scope paths.
+
+The `view`-is-read-only half is enforced **by the gate, before the handler**,
+which is how it is testable while `POST /api/threads` is still a 501: a
+read-only guest's attempt at the append is refused `403 invite-read-only`, and
+the 501 is only ever reached by a caller entitled to write.
+
+### 4. Sessions are issued to a guest by an unauthenticated route — and why that
+### is not `POST /api/session`
+
+Slice 3 adds the first route in this Worker that hands a session to a caller who
+has none, and it is worth saying precisely what stands in for the gate there:
+
+- the credential is the **invite token** (256 bits, hashed at rest, `UNIQUE`),
+  not an absent session;
+- ADR-0012's **CSRF rule is deliberately not applied** to it, because a CSRF
+  token binds a state change to an *existing* session and there is none. The
+  controls that fit this shape are single use and a rate limit; a CSRF check
+  here would be a control that cannot fail.
+- **single use** is per browser and bounded by `max_browsers`, enforced inside
+  one D1 batch so a lost race leaves nothing behind. This is the precise reading
+  of ADR-0009's three share types — see the ADR-0009 amendment dated
+  2026-10-04.
+- `HEAD` is refused on both invite routes, so a link checker cannot consume a
+  guest's single redemption.
+- **Minting** an invite has no HTTP route at all, for the same reason
+  `POST /api/session` does not exist: an endpoint that hands out review access
+  is worse than "whoever holds write access to D1 mints it".
+
+### 5. Two ungated readers of `env.DB`, and the restated invariant
+
+Slice 2's invariant was "the gate is the only path to `env.DB`". The invite
+routes must be ungated — a guest arriving from a mail client has no session — so
+the invariant is restated rather than dropped: the gate is still the only path to
+the **thread store** and to `sessions` for authorized requests, and the invite
+handlers touch only `invites`, `invite_redemptions`, `guests` and
+`rate_limit_counters`. `D1ThreadStore` is not constructible from them.

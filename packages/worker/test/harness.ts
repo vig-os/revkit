@@ -23,11 +23,31 @@ import { CSRF_HEADER, SESSION_COOKIE_NAME, issueSession, type IssuedSession } fr
 
 const PKG_ROOT = new URL("../", import.meta.url);
 
-/** The shipped D1 migration, verbatim — comments and all. */
-export const MIGRATION_SQL: string = readFileSync(
-  fileURLToPath(new URL("migrations/0001_init.sql", PKG_ROOT)),
-  "utf8",
+/**
+ * Every shipped D1 migration, in filename order — which is the order
+ * `wrangler d1 migrations apply` walks the directory in, so the schema the
+ * tests exercise is the schema a provisioned database gets.
+ *
+ * **Why this is a LIST and not one file.** Slice 1 shipped `0001_init.sql`
+ * with an `invites` table whose columns nothing used, and slice 3 is the code
+ * that uses them plus the two tables they need (`invite_redemptions`,
+ * `rate_limit_counters`). Reading `0001_init.sql` alone would have made the
+ * harness apply a schema the Worker cannot run against, which is the exact
+ * failure the single-file version was written to prevent.
+ *
+ * `MIGRATION_SQL` stays exported because `test/schema.test.ts` asserts things
+ * about that one file's bytes (A15 idempotence, A16/A17's constraints, and
+ * that the statement splitter loses nothing). It is `MIGRATIONS[0]` by
+ * construction, so the two cannot drift.
+ */
+export const MIGRATIONS: readonly string[] = Object.freeze(
+  ["0001_init.sql", "0002_invites.sql"]
+    .map((name) => readFileSync(fileURLToPath(new URL(`migrations/${name}`, PKG_ROOT)), "utf8"))
+    .map((sql) => sql.toString()),
 );
+
+/** The first migration, verbatim — comments and all. */
+export const MIGRATION_SQL: string = MIGRATIONS[0] as string;
 
 /**
  * Split a SQL file into single statements.
@@ -107,11 +127,11 @@ export function sqlStatements(sql: string): string[] {
   return statements;
 }
 
-/** Apply the shipped migration to a D1 database, one statement at a
- * time. Idempotent by construction — every statement is
- * `IF NOT EXISTS` — so calling it twice is a no-op (A15). */
+/** Apply every shipped migration to a D1 database, one statement at a time.
+ * Idempotent by construction — every statement is `IF NOT EXISTS` — so
+ * calling it twice is a no-op (A15). */
 export async function applyMigration(db: D1Database): Promise<number> {
-  const statements = sqlStatements(MIGRATION_SQL);
+  const statements = MIGRATIONS.flatMap((sql) => sqlStatements(sql));
   for (const statement of statements) {
     await db.prepare(statement).run();
   }
@@ -290,6 +310,40 @@ export function authHeaders(issued: IssuedSession): Record<string, string> {
 /** `Content-Type` for a state-changing call. ADR-0012 accepts only
  * `application/json`, so even a body-less POST has to declare it. */
 export const JSON_HEADERS: Readonly<Record<string, string>> = { "content-type": JSON_MEDIA_TYPE };
+
+// ── invite helpers ────────────────────────────────────────────────────────
+
+/** Every table the invite surface touches, cleared. The per-test reset, so a
+ * case cannot pass because a previous case left a redemption, a guest or a
+ * rate-limit counter behind — and `sessions` for the same reason: a guest
+ * session from case N must not authorize case N+1. */
+export async function resetInvites(db: D1Database): Promise<void> {
+  await db.prepare("DELETE FROM invite_redemptions").run();
+  await db.prepare("DELETE FROM rate_limit_counters").run();
+  await db.prepare("DELETE FROM invites").run();
+  await db.prepare("DELETE FROM guests").run();
+  await db.prepare("DELETE FROM sessions").run();
+}
+
+/** The name/value pair out of a `Set-Cookie` header value, so a test can build
+ * the `Cookie` header a browser would send without a browser. */
+export function cookieValue(setCookie: string): string {
+  const first = (setCookie.split(";")[0] ?? "").trim();
+  const equals = first.indexOf("=");
+  return equals === -1 ? "" : first.slice(0, equals);
+}
+
+/** The value out of a `Set-Cookie`, by cookie NAME — which is what a test
+ * asserting "the redeem response set the browser cookie" actually wants, and
+ * it cannot be satisfied by the session cookie by accident. */
+export function setCookieValue(setCookie: string, name: string): string | undefined {
+  for (const part of setCookie.split(/,\s*(?=[A-Za-z0-9_-]+=)/)) {
+    const pair = (part.split(";")[0] ?? "").trim();
+    if (!pair.startsWith(`${name}=`)) continue;
+    return pair.slice(name.length + 1);
+  }
+  return undefined;
+}
 
 /** A running miniflare plus its D1 handle. */
 export interface Harness {

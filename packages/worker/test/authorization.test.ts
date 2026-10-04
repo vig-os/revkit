@@ -309,9 +309,19 @@ describe("ADR-0012's per-request gate", () => {
         "csrf-header-missing",
         "csrf-header-rejected",
         "expired-session",
+        "incomplete-invite-row",
         "incomplete-session-row",
+        "invite-browser-mismatch",
+        "invite-expired",
+        "invite-no-grant",
+        "invite-read-only",
+        "invite-revoked",
+        "invite-scope-mismatch",
         "malformed-session-cookie",
         "no-session-cookie",
+        // Default JS string order: "unknown-s" < "unrecognised" because `k` <
+        // `r`. Spelled out rather than sorted by hand so the mismatch above is
+        // a diff a reader can check by eye.
         "unknown-session",
         "unrecognised-identity-kind",
       ]);
@@ -451,8 +461,14 @@ describe("ADR-0012's per-request gate", () => {
       // Deny by default. A row written by a future migration that the gate
       // has no rules for must not be honoured with no scope check, no expiry
       // rule and no revocation path.
+      // `invite` was in this list until slice 3, which added the arm the
+      // comment above predicted — and it is deliberately NOT here now: an
+      // `invite` row with no redemption behind it is refused as
+      // `invite-no-grant` (401) rather than as an unrecognised kind, because
+      // this build DOES know the rules for that provider and the row does not
+      // satisfy them. `test/invite-http.test.ts` pins that half.
       const issued = await issueTestSession(harness.db);
-      for (const kind of ["github", "invite"]) {
+      for (const kind of ["github", "auth0", "invitee", "OPERATOR", "Operator", " operator"]) {
         await harness.db.prepare("UPDATE sessions SET identity_kind = ?").bind(kind).run();
         const refusal = await refusalOf(
           await harness.dispatch(`http://localhost${THREADS_PATH}`, {
@@ -462,6 +478,21 @@ describe("ADR-0012's per-request gate", () => {
         expectRefused(refusal, [401]);
         expect(refusal.body.reason).toBe("unrecognised-identity-kind");
       }
+    });
+
+    test("an `invite` session with no redemption behind it is refused as no-grant, not as an unknown kind", async () => {
+      // The other direction, and the reason `invite` left the list above: this
+      // build knows the provider's rules, so a row that does not satisfy them
+      // is a DIFFERENT refusal with a different fix for the operator.
+      const issued = await issueTestSession(harness.db);
+      await harness.db.prepare("UPDATE sessions SET identity_kind = 'invite', identity_id = ?").bind("no-such-guest").run();
+      const refusal = await refusalOf(
+        await harness.dispatch(`http://localhost${THREADS_PATH}`, {
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        }),
+      );
+      expectRefused(refusal, [401]);
+      expect(refusal.body.reason).toBe("invite-no-grant");
     });
 
     test("an incomplete row is refused, and named differently from an unknown kind", async () => {

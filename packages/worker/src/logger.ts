@@ -84,6 +84,11 @@ export const LOG_MESSAGES = [
   "csrf.rejected",
   "api.session.refresh.ok",
   "api.threads.append.disabled",
+  "invite.denied",
+  "invite.opened",
+  "invite.redeem.ok",
+  "invite.redeem.denied",
+  "rate.limit.hit",
 ] as const;
 
 export type LogMessage = (typeof LOG_MESSAGES)[number];

@@ -51,6 +51,23 @@ export const API_SEGMENT = "api";
  */
 const REPO_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
+/**
+ * Is this a repository name this surface is willing to act on?
+ *
+ * **One predicate, two consumers, and the second one is load-bearing.** Slice
+ * 3 compares an invite's `repo` column against a preview path's repository
+ * segment on every authorized guest request (ADR-0012's per-call scope check),
+ * and that comparison is only sound if both sides were validated by the SAME
+ * rule. Two patterns would leave inputs that one side accepts and the other
+ * rejects, and a scope check that misses those is a cross-repo read.
+ *
+ * Exported rather than re-implemented in `src/invites.ts`, and re-implemented
+ * is exactly what this avoids: a copy would also be a second thing to widen.
+ */
+export function isRepoName(value: string): boolean {
+  return REPO_SEGMENT.test(value);
+}
+
 /** The `pr-<n>` segment. `\d{1,9}` caps the number at nine digits so a
  * path cannot carry an unbounded integer into a key, and the bound is
  * far above any real PR number. Leading zeros are REFUSED rather than
@@ -96,7 +113,7 @@ export function parsePreviewPath(pathname: string): PreviewRef | undefined {
   const prSegment = segments[2];
   if (repo === undefined || prSegment === undefined) return undefined;
   if (repo === "" || repo === REVKIT_SEGMENT || repo === API_SEGMENT) return undefined;
-  if (!REPO_SEGMENT.test(repo)) return undefined;
+  if (!isRepoName(repo)) return undefined;
   const match = PR_SEGMENT.exec(prSegment);
   if (match === null) return undefined;
   const pr = Number.parseInt(match[1] as string, 10);

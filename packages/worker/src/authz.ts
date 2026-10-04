@@ -23,24 +23,34 @@
 //   3. On a state-changing verb, `application/json` and nothing else
 //      (ADR-0012).
 //
+// IMPLEMENTED, for a GUEST session, on every route that requires one — slice 3:
+//
+//   4. The invite is re-read and re-decided ON THIS REQUEST: binding, then
+//      revocation/expiry, then scope, then comment rights. Not once at
+//      redemption — a session's authority belongs to its invite, and the
+//      invite moves after the session exists.
+//
 // NOT IMPLEMENTED YET, and named so nobody reads the list above as more than
 // it is:
 //
 //   - "a GitHub session must still have read access to the repo (cached ≤ 5
 //     min)". There is no `TokenSource` — the App is owner-gated (#34) — and
 //     nothing to check repo access against. Slice 4.
-//   - "a guest invite is checked for scope, type and expiry on each call".
-//     There is no invite to redeem (slice 3), and the store has no repo axis
-//     to scope a read by: `events(seq, ts, payload)` has no `repo` column, so
-//     there is literally nothing for a scope check to select on. Slice 3 for
-//     the invite's own scope/type/expiry, slice 5 for the repo axis.
+//   - "a guest invite is checked for scope … on each call" is implemented for
+//     the routes that NAME a repo and PR — today ADR-0008's `<repo>/pr-<n>/`
+//     preview paths — and is a no-op for `GET /api/threads`, because
+//     `events(seq, ts, payload)` has no `repo` column for a scope check to
+//     select on. The preview surface (slice 5) adds the axis. So a guest with
+//     a valid invite currently reads the whole log, exactly as an operator
+//     does; ADR-0012's 2026-10-04 amendment records that half as landing in
+//     slice 5.
 //
-// So "authorized" in this slice means exactly: **a session this build issued
-// is presenting, unexpired, for a request that carries no scope check
-// because there is no scope to check yet.** That is a necessary condition, and
-// calling it sufficient would be the same kind of overclaim slice 1 corrected
-// twice. The two missing clauses are recorded in the ADR-0012 amendment dated
-// 2026-10-04.
+// So "authorized" in this slice means: **a session this build issued is
+// presenting, unexpired; and if it is a guest session, its invite still exists,
+// is unrevoked, unexpired, covers what this route names, permits what this
+// route writes, and was redeemed in THIS browser.** Calling the remaining
+// GitHub-read clause sufficient would be the same kind of overclaim slice 1
+// corrected twice.
 //
 // ── Why `RECOGNISED_IDENTITY_KINDS` is closed here ───────────────────────
 //
@@ -75,6 +85,7 @@ import {
   type MsClock,
   type SessionPrincipal,
 } from "./session.ts";
+import { inviteCovers, loadInviteGrant, readBrowserCookie, type GrantRefusal } from "./invites.ts";
 import type { LogMessage } from "./logger.ts";
 
 // ── the routes ────────────────────────────────────────────────────────────
@@ -97,6 +108,17 @@ export const THREADS_PATH = "/api/threads";
  * writes nothing but the caller's own `sessions` row. */
 export const SESSION_REFRESH_PATH = "/api/session/refresh";
 
+/** `GET /invite/<token>` — the display-name form. UNGATED by necessity: a
+ * guest arriving from a mail client has no session, and ADR-0009 requires the
+ * exchange. See `INVITE_PATH_PREFIX`'s own comment for what that costs and
+ * which controls stand in for the gate. */
+export const INVITE_OPEN_PREFIX = "/invite/";
+
+/** `POST /invite/redeem` — exchange the token for a session. Same reasoning,
+ * and it is the only route in this Worker that issues a credential to a caller
+ * who has none. */
+export const INVITE_REDEEM_PATH = "/invite/redeem";
+
 /** Every route kind. `method-not-allowed` is its own kind rather than a flag
  * on a real one so the classification table below reads the way the dispatch
  * does, and so a test can enumerate it exhaustively. */
@@ -106,6 +128,8 @@ export type RouteKind =
   | "threads-read"
   | "threads-append"
   | "session-refresh"
+  | "invite-open"
+  | "invite-redeem"
   | "preview"
   | "revkit-bundle"
   | "unknown";
@@ -117,10 +141,28 @@ export interface Route {
   /** ADR-0012: this route changes state, so it also needs the CSRF token and
    * `application/json`. */
   readonly stateChanging: boolean;
+  /** ADR-0012's "a guest invite is checked for … type on each call": this
+   * route WRITES review content, so a `view` invite's `can_comment = 0` must
+   * refuse it. Separate from `stateChanging` on purpose — `POST
+   * /api/session/refresh` changes state and must work for a read-only guest,
+   * because it only touches the guest's own session row. */
+  readonly requiresComment: boolean;
+  /** The repo and PR this route names, when it names any. A guest session's
+   * invite scope is checked against it. Computed HERE, at classification, so
+   * the gate still never parses a URL — see `classifyRoute`. */
+  readonly scope: PreviewScope | undefined;
   /** The path is real but the verb is not. Answered 405 — AFTER the gate,
    * where `requiresSession` is true, so an unauthorized caller learns
    * "unauthorized", never "that route exists". */
   readonly unsupportedMethod: boolean;
+}
+
+/** What an invite's scope is compared against. Structurally identical to
+ * `PreviewRef`'s first two fields, and declared separately rather than
+ * importing it so `authz.ts` does not depend on the preview grammar's shape. */
+export interface PreviewScope {
+  readonly repo: string;
+  readonly pr: number;
 }
 
 /** Methods that read. `HEAD` is `GET` without a body; treating it as a read
@@ -138,16 +180,20 @@ const READ_METHODS: ReadonlySet<string> = new Set(["GET", "HEAD"]);
  *      slash, no case folding, no alias: `/api/threads/` is a different path
  *      and falls through to `unknown`, which is how a closed route does not
  *      come back under a second spelling.
- *   3. `/_revkit/…` — ADR-0012: never a preview, never a redirect. Not gated,
- *      because it is a static bundle path with no data behind it; the 404 it
- *      answers is what slice 3 changes.
- *   4. `<repo>/pr-<n>/…` — a preview path. GATED NOW, though it answers 501
- *      and has nothing to serve, so that slice 5 inherits the gate from the
- *      route table instead of having to remember it. A 501 for an
- *      unauthorized caller and a 501 for an authorized one differ only in
- *      status (401 vs 501), and the stricter answer is the one that survives
- *      the day R2 exists.
- *   5. anything else — 404, ungated, because there is nothing to authorize.
+ *   3. `/invite/redeem` — exact path, POST only. Before `/invite/…`, because
+ *      `redeem` is itself a well-shaped invite token: without this ordering a
+ *      `POST /invite/redeem` would be classified as opening a token whose name
+ *      is `redeem`, which is one spelling of two meanings.
+ *   4. `/invite/<token>` — GET only. **`HEAD` is refused, and that is not
+ *      uniformity.** `HEAD` is a read everywhere else in this table, but a
+ *      redeem is the one read that CONSUMES: answering it for `HEAD` would let
+ *      a link checker, a proxy or a prefetch burn a guest's single redemption
+ *      without the guest ever seeing a page. So the invite routes are
+ *      GET-or-nothing.
+ *   5. `/_revkit/…` — ADR-0012: never a preview, never a redirect.
+ *   6. `<repo>/pr-<n>/…` — a preview path. GATED, and it now carries a
+ *      `scope`, which is what ADR-0012's per-call scope check selects on.
+ *   7. anything else — 404, ungated, because there is nothing to authorize.
  */
 export function classifyRoute(pathname: string, method: string): Route {
   const verb = method.toUpperCase();
@@ -155,34 +201,53 @@ export function classifyRoute(pathname: string, method: string): Route {
     // The probe is ungated either way, but the classification is uniform:
     // a path whose verb is wrong answers `method-not-allowed`, not a special
     // case the dispatcher has to remember.
-    if (!READ_METHODS.has(verb)) return route("method-not-allowed", false, false, true);
-    return route("health", false, false, false);
+    if (!READ_METHODS.has(verb)) return route("method-not-allowed", false, false, false, undefined, true);
+    return route("health", false, false, false, undefined, false);
   }
   if (pathname === THREADS_PATH) {
-    if (READ_METHODS.has(verb)) return route("threads-read", true, false, false);
-    if (verb === "POST") return route("threads-append", true, true, false);
-    return route("method-not-allowed", true, false, true);
+    if (READ_METHODS.has(verb)) return route("threads-read", true, false, false, undefined, false);
+    // `requiresComment` is what makes ADR-0009's "view is read-only"
+    // enforceable while `POST /api/threads` is still a 501: the gate refuses a
+    // read-only guest BEFORE the handler, so the 501 is only ever reached by a
+    // caller entitled to write. See `test/invite-http.test.ts`.
+    if (verb === "POST") return route("threads-append", true, true, true, undefined, false);
+    return route("method-not-allowed", true, false, false, undefined, true);
   }
   if (pathname === SESSION_REFRESH_PATH) {
-    if (verb === "POST") return route("session-refresh", true, true, false);
-    return route("method-not-allowed", true, false, true);
+    if (verb === "POST") return route("session-refresh", true, true, false, undefined, false);
+    return route("method-not-allowed", true, false, false, undefined, true);
+  }
+  if (pathname === INVITE_REDEEM_PATH) {
+    if (verb === "POST") return route("invite-redeem", false, true, false, undefined, false);
+    return route("method-not-allowed", false, false, false, undefined, true);
+  }
+  if (pathname.startsWith(INVITE_OPEN_PREFIX)) {
+    if (verb === "GET") return route("invite-open", false, false, false, undefined, false);
+    return route("method-not-allowed", false, false, false, undefined, true);
   }
   if (isRevkitBundlePath(pathname)) {
-    return route("revkit-bundle", false, false, false);
+    return route("revkit-bundle", false, false, false, undefined, false);
   }
-  if (parsePreviewPath(pathname) !== undefined) {
-    return route("preview", true, false, false);
+  const preview = parsePreviewPath(pathname);
+  if (preview !== undefined) {
+    // The scope travels WITH the classification rather than being re-derived
+    // in the gate: the gate must not become an oracle that parses a request
+    // before authorization, and `classifyRoute` is a pure function of the path
+    // so nothing about the request's contents reaches it.
+    return route("preview", true, false, false, { repo: preview.repo, pr: preview.pr }, false);
   }
-  return route("unknown", false, false, false);
+  return route("unknown", false, false, false, undefined, false);
 }
 
 function route(
   kind: RouteKind,
   requiresSession: boolean,
   stateChanging: boolean,
+  requiresComment: boolean,
+  scope: PreviewScope | undefined,
   unsupportedMethod: boolean,
 ): Route {
-  return { kind, requiresSession, stateChanging, unsupportedMethod };
+  return { kind, requiresSession, stateChanging, requiresComment, scope, unsupportedMethod };
 }
 
 // ── the decision ──────────────────────────────────────────────────────────
@@ -221,17 +286,36 @@ export const DENIAL_REASONS = [
   "csrf-header-missing",
   "csrf-header-rejected",
   "content-type-not-json",
+  // Slice 3: a GUEST session is a necessary condition plus four more, all
+  // decided against the invite row as it stands NOW (ADR-0012: "a guest invite
+  // is checked for scope, type and expiry on each call").
+  //
+  // The 401/403 split is the same one the session checks use and means the same
+  // thing: a 401 says "I do not know who you are" — which is what a revoked or
+  // expired invite means, because the credential is dead — and a 403 says "I
+  // know who you are and this request is not permitted", which is what a
+  // wrong-scope, read-only or wrong-browser request means.
+  "invite-no-grant",
+  "incomplete-invite-row",
+  "invite-revoked",
+  "invite-expired",
+  "invite-browser-mismatch",
+  "invite-scope-mismatch",
+  "invite-read-only",
 ] as const;
 
 /** Why a request was refused. */
 export type DenialReason = (typeof DENIAL_REASONS)[number];
 
-/** The refusal's log event. CSRF failures and shape failures are separate
- * events from authorization failures because they have different causes and a
- * different response to one — a burst of `auth.denied` is an attack, a burst
- * of `csrf.rejected` is usually a broken client. */
+/** The refusal's log event. CSRF failures, shape failures and guest-invite
+ * failures are separate events from authorization failures because they have
+ * different causes and a different response to one — a burst of `auth.denied`
+ * is an attack, a burst of `csrf.rejected` is usually a broken client, and a
+ * burst of `invite.denied` is usually a revoked link rather than an
+ * authentication failure. */
 export function denialLogMessage(reason: DenialReason): LogMessage {
   if (reason === "csrf-header-missing" || reason === "csrf-header-rejected") return "csrf.rejected";
+  if (reason.startsWith("invite-")) return "invite.denied";
   return "auth.denied";
 }
 
@@ -258,12 +342,12 @@ export type Decision =
   | { readonly ok: true; readonly authorized: AuthorizedSession }
   | {
       readonly ok: false;
-      /** 401 for authorization, 403 for a CSRF failure, 415 for a shape
-       * failure. Standard and conventional: 401 says "I do not know who you
-       * are", 403 says "I know who you are and this request is not
-       * permitted". */
+      /** 401 for authorization, 403 for a CSRF failure or a refused guest
+       * request, 415 for a shape failure. Standard and conventional: 401 says
+       * "I do not know who you are", 403 says "I know who you are and this
+       * request is not permitted". */
       readonly status: 401 | 403 | 415;
-      readonly error: "unauthorized" | "csrf" | "unsupported-media-type";
+      readonly error: "unauthorized" | "forbidden" | "csrf" | "unsupported-media-type";
       readonly reason: DenialReason;
     };
 
@@ -333,12 +417,78 @@ export async function authorizeRequest(
     }
   }
 
+  // ── A GUEST SESSION IS NOT AUTHORIZED YET ─────────────────────────────
+  //
+  // Everything above proves "a session this build issued is presenting, and has
+  // not expired". For `identity_kind = "invite"` that is a NECESSARY
+  // condition and nowhere near sufficient, because the session's authority is
+  // not its own — it is its invite's, and the invite moves after the session
+  // exists. ADR-0012 names exactly this: "a guest invite is checked for scope,
+  // type and expiry on each call".
+  //
+  // So here, on every request, `loadInviteGrant` reads the invite row as it
+  // stands NOW and the gate adds the two checks that need the route's shape:
+  // the invite's scope against `route.scope`, and its `can_comment` against
+  // `route.requiresComment`. Revocation is therefore immediate — a session
+  // already in a cookie jar dies on its next request, with no expiry to wait
+  // for — which is the mechanism ADR-0012's slice-2 amendment called "the first
+  // mechanism that closes any of" its open items.
+  //
+  // **The order of the four is a contract about what a caller can learn**, and
+  // it runs from "is this the right credential" to "is this the right request":
+  //
+  //   1. the browser binding — the cheapest question, and the one that decides
+  //      whether a stolen cookie is being replayed from somewhere else at all
+  //   2. revocation and expiry — the invite's own liveness, which supersedes
+  //      everything else and is decided from the row, never from a cache
+  //   3. scope — whether this invite covers what this route names
+  //   4. comment rights — ADR-0009's `view` is read-only
+  //
+  // It runs AFTER the CSRF and content-type checks because those are about the
+  // REQUEST and this is about the CREDENTIAL, and a request with no session is
+  // refused before this is reached at all.
+  if (resolved.principal.kind === "invite") {
+    const binding = readBrowserCookie(request.headers.get("cookie"));
+    const bindingValue = binding.kind === "present" ? binding.value : null;
+    const grant = await loadInviteGrant(db, { guestId: resolved.principal.id, binding: bindingValue }, options);
+    if (!grant.ok) {
+      return refused(...grantDenial(grant.refusal));
+    }
+    if (!grant.grant.browserMatches) return refused(403, "forbidden", "invite-browser-mismatch");
+    if (!inviteCovers(grant.grant.invite, route.scope)) return refused(403, "forbidden", "invite-scope-mismatch");
+    if (route.requiresComment && !grant.grant.invite.canComment) {
+      return refused(403, "forbidden", "invite-read-only");
+    }
+  }
+
   return { ok: true, authorized: grant(resolved.principal, cookie.value) };
+}
+
+/** A guest-invite refusal as a `(status, error, reason)` triple.
+ *
+ * The map is EXHAUSTIVE over `GrantRefusal`, so a new refusal kind in
+ * `src/invites.ts` fails to typecheck here rather than defaulting to a 500 or,
+ * worse, to a success. */
+type DenialTriple = [401 | 403, "unauthorized" | "forbidden", DenialReason];
+
+function grantDenial(refusal: GrantRefusal): DenialTriple {
+  switch (refusal) {
+    case "invite-row-unreadable":
+      return [401, "unauthorized", "incomplete-invite-row"];
+    case "invite-revoked":
+      return [401, "unauthorized", "invite-revoked"];
+    case "invite-expired":
+      return [401, "unauthorized", "invite-expired"];
+    case "browser-mismatch":
+      return [403, "forbidden", "invite-browser-mismatch"];
+    case "no-grant":
+      return [401, "unauthorized", "invite-no-grant"];
+  }
 }
 
 function refused(
   status: 401 | 403 | 415,
-  error: "unauthorized" | "csrf" | "unsupported-media-type",
+  error: "unauthorized" | "forbidden" | "csrf" | "unsupported-media-type",
   reason: DenialReason,
 ): Decision {
   return { ok: false, status, error, reason };
