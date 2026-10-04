@@ -1525,7 +1525,7 @@ function parseJson(raw: string): Record<string, unknown> {
         // EXTERNAL `src` on the allowlisted path: an inline body would need
         // `'unsafe-inline'` (or a nonce, or `strict-dynamic`) and `script-src`
         // stays a pinned path with none of them.
-        const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+        const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
         expect(scripts).toHaveLength(1);
         expect(scripts[0]?.[1], "the one script is a src, not a body").toMatch(/\ssrc="[^"]+"/);
         expect(scripts[0]?.[2]?.trim(), "and it carries no inline body").toBe("");
@@ -1623,7 +1623,7 @@ function parseJson(raw: string): Record<string, unknown> {
           // be that asset — an inline body here would BE the injection.
           expect(html, token.slice(0, 20)).not.toContain("<script>alert");
           expect(html, token.slice(0, 20)).not.toContain("<img src=x");
-          const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)];
+          const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
           expect(scripts.length, token.slice(0, 20)).toBe(1);
           expect(scripts[0]?.[2]?.trim(), token.slice(0, 20)).toBe("");
         }
@@ -1958,17 +1958,19 @@ function parseJson(raw: string): Record<string, unknown> {
           if (!minted.ok) throw new Error("mint failed");
           const { response } = await open(harness, minted.minted.token);
           const html = await response.text();
-          // **Every tag pattern below is case-INsensitive, and that is the
-          // assertion being made**, not a lint appeasement. These regexes answer
-          // "does this page contain a way to execute script", and `<SCRIPT>` is
-          // exactly such a way — a lowercase-only pattern would pass a page
-          // carrying one. The Worker emits lowercase markup from a template
-          // literal today, so the flag changes no current result; it is here so
-          // the assertion stays true if that ever stops being so. CodeQL's
-          // `js/bad-tag-filter` flagged the `<script>` patterns for the same
-          // reason, and the honest response to that is to strengthen the check.
+          // **Every tag pattern below is case-INsensitive and tolerates
+          // `</script >`, and that is the assertion being made**, not a lint
+          // appeasement. These regexes answer "does this page contain a way to
+          // execute script": `<SCRIPT>` is such a way, and so is the perfectly
+          // legal `</script >` spelling, so a pattern that misses either would
+          // pass a page carrying one. The Worker emits lowercase markup with no
+          // space before the closing bracket today, so neither flag changes a
+          // result now; both are here so the assertion stays true if that ever
+          // stops being so. CodeQL's `js/bad-tag-filter` flagged these patterns
+          // for exactly those two reasons, and the honest response to that is to
+          // strengthen the check rather than suppress the rule.
           for (const [what, pattern] of [
-            ["an inline script body", /<script\b[^>]*>[\s\S]*?\S[\s\S]*?<\/script>/i],
+            ["an inline script body", /<script\b[^>]*>[\s\S]*?\S[\s\S]*?<\/script\s*>/i],
             ["an inline event handler", /\son[a-z]+\s*=/i],
             ["a javascript: URL", /javascript:/i],
             ["a <style> block", /<style\b/i],
