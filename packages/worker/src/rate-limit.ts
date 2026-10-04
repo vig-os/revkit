@@ -130,19 +130,46 @@ export function clientAddress(headers: Headers): string | undefined {
   return trimmed.length === 0 ? undefined : trimmed;
 }
 
-/** The two buckets one redemption attempt spends: the invite ("identity",
- * before a session exists the invite IS the identity) and the address. */
-export function redeemBuckets(input: {
-  readonly tokenDigest: string;
-  readonly address: string | undefined;
-}): RateBucket[] {
-  const buckets: RateBucket[] = [
-    { kind: "invite", name: `invite:${input.tokenDigest}`, limit: REDEEM_TOKEN_LIMIT },
-  ];
-  if (input.address !== undefined) {
-    buckets.push({ kind: "ip", name: `ip:${input.address}`, limit: REDEEM_IP_LIMIT });
-  }
-  return buckets;
+/** The ADDRESS bucket — the one real control — for one request.
+ *
+ * **Spent FIRST, on every path, before anything is parsed.** It is the only
+ * bucket whose key is not derived from the request body, so it is the only one
+ * that can be charged before the body exists. Its key is the edge-set address,
+ * which bounds how many distinct rows an attacker can create to the number of
+ * source addresses they control; the per-token key does not have that property
+ * and is therefore spent later and only for a token that resolves.
+ */
+export function addressBucket(address: string | undefined): RateBucket[] {
+  return address === undefined ? [] : [{ kind: "ip", name: `ip:${address}`, limit: REDEEM_IP_LIMIT }];
+}
+
+/**
+ * The PER-TOKEN bucket, and when it is spent.
+ *
+ * **Only after `loadInviteByToken` has found the invite LIVE**, and only on the
+ * redemption route. Two measured reasons, both from the review of slice 3:
+ *
+ *   1. **Charging it on the OPEN route let anyone holding the URL lock the
+ *      intended guest out.** The bucket is `invite:<hmac(token)>`, and the open
+ *      is unauthenticated and idempotent, so 45 `GET`s from another address
+ *      spent the guest's whole window and the guest then met a 429 with no
+ *      recovery — the redemption slot is single-use, so there is nothing to
+ *      retry. An open must never be able to do that.
+ *   2. **Charging it on a token that does not resolve gave it no defensive
+ *      value at all.** Every guessed token is a distinct key, so a flood of
+ *      garbage costs one D1 row write each and never touches any real invite's
+ *      budget — a per-token limit that cannot defend against guessing is not
+ *      defending against guessing. Since the token is 256 bits of CSPRNG, the
+ *      honest position is that the per-IP bucket is the control and this one
+ *      bounds repeated REDEMPTION of one known-good token.
+ *
+ * The consequence, stated rather than left implicit: an attacker who already
+ * holds a leaked URL can burn one window of the real token's redemption budget.
+ * It is bounded, it needs the token, and the alternative — an unmetered
+ * redemption — is worse.
+ */
+export function tokenBucket(tokenHash: string): RateBucket[] {
+  return [{ kind: "invite", name: `invite:${tokenHash}`, limit: REDEEM_TOKEN_LIMIT }];
 }
 
 /**

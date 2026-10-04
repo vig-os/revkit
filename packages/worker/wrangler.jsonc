@@ -43,6 +43,15 @@
 // So treat flipping either line as a security-relevant change requiring a
 // fresh argument, not a config tidy-up.
 //
+// `INVITE_TOKEN_HMAC_KEY` is NOT here, and its absence is load-bearing. It is
+// a Worker SECRET (`wrangler secret put INVITE_TOKEN_HMAC_KEY`, provisioned by
+// `revkit deploy init` — slice 8, owner-gated #34), never a `vars` entry: a
+// `vars` value lives in this tracked file, and ADR-0014's first rule is that no
+// secret does. `test/worker-config.test.ts` asserts this file names the binding
+// and declares no value for it. A deployment missing it answers 500 on every
+// route, deliberately — see `src/invite-token.ts` for why there is no fallback
+// key.
+//
 // `d1_databases[].database_id` is a PLACEHOLDER. Provisioning is
 // `wrangler d1 create`, which needs an account, so `revkit deploy init`
 // replaces this value with the provisioned id. It is deliberately an

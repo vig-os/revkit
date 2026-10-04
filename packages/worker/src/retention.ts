@@ -94,6 +94,19 @@ export interface PurgeResult {
  * "30 days after" is an inclusive deadline, and the alternative leaves a
  * guest alive forever if the sweep runs at a moment that never equals it.
  *
+ * ── The `expires_at IS NOT NULL` disjunction that WAS here ────────────────
+ *
+ * This predicate used to carry `(i.revoked_at IS NOT NULL OR i.expires_at IS NOT
+ * NULL)`. It is gone because it is a tautology: `expires_at` is `TEXT NOT NULL`
+ * in `migrations/0001_init.sql`, so the right-hand side is always true and the
+ * disjunction always reduces to `true`. The mutation run agreed — deleting it
+ * changed **zero** of 92 tests — and the deletion is not tidiness, it is
+ * removing a clause that only LOOKED like it was saying "the invite has ended".
+ * A reader checking whether expiry alone starts the clock had to reason about a
+ * term that could never be false. What actually starts the clock is the
+ * `MAX(COALESCE(...)) <= ?` comparison below, and `expires_at` participates in
+ * it directly.
+ *
  * ── Why `deleted_at IS NULL` is in the WHERE ──────────────────────────────
  *
  * It makes the sweep idempotent AND self-limiting: a guest already anonymised
@@ -121,7 +134,6 @@ export async function purgeStaleGuests(
         "WHERE deleted_at IS NULL AND EXISTS (" +
         "SELECT 1 FROM invite_redemptions r JOIN invites i ON i.id = r.invite_id " +
         "WHERE r.guest_id = guests.id " +
-        "AND (i.revoked_at IS NOT NULL OR i.expires_at IS NOT NULL) " +
         "AND MAX(COALESCE(i.revoked_at, ''), i.expires_at) <= ?)",
     )
     .bind(GUEST_DELETED_NAME, asOf, cutoff)

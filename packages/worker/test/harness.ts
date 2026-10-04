@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Miniflare, type MiniflareOptions } from "miniflare";
 import { JSON_MEDIA_TYPE } from "../src/authz.ts";
+import { INVITE_TOKEN_HMAC_KEY, MIN_INVITE_TOKEN_HMAC_KEY_CHARS, inviteTokenHasher } from "../src/invite-token.ts";
 import { CSRF_HEADER, SESSION_COOKIE_NAME, issueSession, type IssuedSession } from "../src/session.ts";
 
 const PKG_ROOT = new URL("../", import.meta.url);
@@ -345,6 +346,24 @@ export function setCookieValue(setCookie: string, name: string): string | undefi
   return undefined;
 }
 
+/**
+ * The HMAC key the offline harness binds. A FIXED literal, not a random one,
+ * because a test that asserts "this token hashes to that digest" needs the key
+ * to be knowable; nothing here depends on the key being secret, and the real one
+ * is a Worker secret provisioned by `revkit deploy init` (slice 8, #34).
+ *
+ * It is long enough to clear `MIN_INVITE_TOKEN_HMAC_KEY_CHARS`, and it is
+ * visibly not a production value — the point of a fixed literal is that a reader
+ * can see it is a test input.
+ */
+export const TEST_INVITE_TOKEN_HMAC_KEY = "revkit-offline-test-invite-token-hmac-key-000000000000";
+
+/** The same key as a hasher, for the D1-level cases that call `mintInvite`,
+ * `loadInviteByToken` and `redeemInvite` directly rather than over HTTP. */
+export async function testTokenHasher(): Promise<ReturnType<typeof inviteTokenHasher>> {
+  return inviteTokenHasher(TEST_INVITE_TOKEN_HMAC_KEY);
+}
+
 /** A running miniflare plus its D1 handle. */
 export interface Harness {
   readonly mf: Miniflare;
@@ -427,16 +446,30 @@ export async function startWorker(
      * Worker deployed without it throws before any route runs — the
      * misconfigured-deploy shape, driven rather than described. */
     readonly vars?: Record<string, string> | null;
+    /** Override `INVITE_TOKEN_HMAC_KEY`, the invite-token HMAC key. `null`
+     * means bind NOTHING for it, which is how the missing-secret shape is
+     * driven rather than described. */
+    readonly inviteTokenKey?: string | null;
   } = {},
 ): Promise<Harness> {
   const config = readWranglerConfig();
   const vars = options.vars === undefined ? (config["vars"] as Record<string, string>) : options.vars;
+  // The key arrives through `bindings`, NOT through miniflare's `secrets`
+  // option — miniflare 4.20260518.0 IGNORES `secrets` (measured:
+  // `env.INVITE_TOKEN_HMAC_KEY` came back `undefined` with
+  // `secrets: { … }`, and the same value through `bindings` came back as the
+  // string). Slice 3's first cut read that measurement as "a keyed hash is
+  // verified nowhere"; the correct reading is "the harness was wrong", because
+  // `wrangler secret put` also lands in `env` and from inside the Worker the two
+  // are indistinguishable. `REVKIT_VERSION` was already supplied this way.
+  const key = options.inviteTokenKey === undefined ? TEST_INVITE_TOKEN_HMAC_KEY : options.inviteTokenKey;
+  const bindings = { ...(vars ?? {}), ...(key === null ? {} : { [INVITE_TOKEN_HMAC_KEY]: key }) };
   const mf = new Miniflare({
     modules: true,
     script: options.script ?? (await workerBundle()),
     compatibilityDate: config["compatibility_date"],
     compatibilityFlags: config["compatibility_flags"],
-    bindings: vars ?? undefined,
+    bindings: Object.keys(bindings).length === 0 ? undefined : bindings,
     d1Databases: { DB: `revkit-test-${Math.random().toString(36).slice(2)}` },
   } as MiniflareOptions);
   // Boot timing, on demand. `getD1Database` is where a miniflare instance

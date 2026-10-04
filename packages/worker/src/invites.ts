@@ -164,6 +164,7 @@ import {
   type IssuedSession,
   type MsClock,
 } from "./session.ts";
+import type { InviteTokenHasher } from "./invite-token.ts";
 import { isRepoName } from "./router.ts";
 import { GUEST_RETENTION_MS, GUEST_DELETED_NAME } from "./retention.ts";
 
@@ -402,7 +403,7 @@ export interface MintInviteInput {
 export async function mintInvite(
   db: D1Database,
   input: MintInviteInput,
-  options: { readonly now?: MsClock } = {},
+  options: { readonly now?: MsClock; readonly keys: InviteTokenHasher },
 ): Promise<MintResult> {
   if (!isRepoName(input.repo)) return { ok: false, refusal: "bad-repo" };
   const pr = input.pr ?? null;
@@ -411,7 +412,7 @@ export async function mintInvite(
   if (!(SHARE_TYPES as readonly string[]).includes(kind)) return { ok: false, refusal: "bad-kind" };
   const now = (options.now ?? Date.now)();
   const token = mintToken();
-  const tokenHash = await sha256Hex(token);
+  const tokenHash = await options.keys.hash(token);
   const id = crypto.randomUUID();
   const createdAt = new Date(now).toISOString();
   const expiresAt = new Date(now + INVITE_LIFETIME_DAYS[kind] * 24 * 60 * 60 * 1000).toISOString();
@@ -452,11 +453,12 @@ export async function loadInviteById(db: D1Database, inviteId: string): Promise<
 export async function loadInviteByToken(
   db: D1Database,
   token: string,
-  options: { readonly now?: MsClock } = {},
+  options: { readonly keys: InviteTokenHasher },
 ): Promise<InviteRecord | undefined> {
-  void options;
   if (!isTokenShaped(token)) return undefined;
-  return readInvite(await db.prepare(SELECT_INVITE_BY_TOKEN_SQL).bind(await sha256Hex(token)).first<InviteRow>());
+  return readInvite(
+    await db.prepare(SELECT_INVITE_BY_TOKEN_SQL).bind(await options.keys.hash(token)).first<InviteRow>(),
+  );
 }
 
 // ── redemption ────────────────────────────────────────────────────────────
@@ -615,7 +617,7 @@ export function redemptionClaimStatement(
 export async function redeemInvite(
   db: D1Database,
   input: { readonly token: string; readonly binding: string; readonly displayName: string },
-  options: { readonly now?: MsClock } = {},
+  options: { readonly now?: MsClock; readonly keys: InviteTokenHasher },
 ): Promise<RedeemResult> {
   const now = (options.now ?? Date.now)();
   const displayName = input.displayName.trim();
@@ -627,10 +629,16 @@ export async function redeemInvite(
   // which would otherwise silently consume one of the invite's slots.
   if (!isTokenShaped(input.binding)) return { ok: false, refusal: "browser-binding-missing" };
   const bindingHash = await sha256Hex(input.binding);
+  // NO pre-read revocation or expiry refusal here, and that is the same
+  // treatment `revokeInvite` got rather than a second opinion about the same
+  // pattern: both decisions are made by `redemptionClaimStatement`'s `WHERE`
+  // clause inside the atomic batch, so a pre-check could only duplicate them.
+  // Deleting it leaves the mutation run's verdict unchanged (the pre-read
+  // mutants M11/M31 still go red through the statement), and the refusals are
+  // still reported — `classifyLostRedemption` re-derives them on the refusal
+  // path.
   const invite = await loadInviteByToken(db, input.token, options);
   if (invite === undefined) return { ok: false, refusal: "unknown-token" };
-  if (invite.revokedAt !== null) return { ok: false, refusal: "invite-revoked" };
-  if (Date.parse(invite.expiresAt) <= now) return { ok: false, refusal: "invite-expired" };
   const guestId = crypto.randomUUID();
   const createdAt = new Date(now).toISOString();
   const lifetimeMs = Math.max(0, Date.parse(invite.expiresAt) - now);
@@ -662,7 +670,13 @@ export async function redeemInvite(
     sessionInsertStatement(db, minted, { where: claim, bindings: [invite.id, bindingHash, guestId] }),
   ]);
   if ((results[0]?.meta?.changes ?? 0) === 0) {
-    return { ok: false, refusal: await classifyLostRedemption(db, invite, bindingHash) };
+    // The injected clock, not the wall clock: a refusal REASON computed from a
+    // different clock than the decision is exactly the drift an injectable
+    // clock exists to prevent, and it is not hypothetical — dropping the
+    // pre-read and leaving this call on `Date.now()` made "an expired invite
+    // cannot be redeemed" report `already-redeemed`, because the batch correctly
+    // refused an invite the wall clock still considered live.
+    return { ok: false, refusal: await classifyLostRedemption(db, invite, bindingHash, now) };
   }
   return {
     ok: true,
@@ -689,6 +703,7 @@ async function classifyLostRedemption(
   db: D1Database,
   invite: InviteRecord,
   bindingHash: string,
+  nowMs: number,
 ): Promise<RedeemRefusal> {
   if (invite.revokedAt !== null) return "invite-revoked";
   const already = await db
@@ -698,7 +713,7 @@ async function classifyLostRedemption(
   if (already !== null && already !== undefined) return "already-redeemed";
   const live = await loadInviteById(db, invite.id);
   if (live === undefined || live.revokedAt !== null) return "invite-revoked";
-  if (Date.parse(live.expiresAt) <= Date.now()) return "invite-expired";
+  if (Date.parse(live.expiresAt) <= nowMs) return "invite-expired";
   const slots = await db
     .prepare("SELECT COUNT(*) AS used FROM invite_redemptions WHERE invite_id = ?")
     .bind(invite.id)
@@ -711,6 +726,26 @@ async function classifyLostRedemption(
  * UTF-16 units). Bounded because ADR-0009 mirrors the name into a GitHub
  * comment and an unbounded name is an unbounded mirror. */
 export const MAX_DISPLAY_NAME_CHARS = 64;
+
+/**
+ * The largest redeem body the Worker will read, in bytes.
+ *
+ * **This is a real bound, not a courtesy.** `/invite/redeem` is an
+ * UNAUTHENTICATED route — its credential is the token in the body, so it has not
+ * been checked when the body arrives — which makes an unbounded read the
+ * cheapest denial of service on the surface: one request, megabytes of memory,
+ * no credential needed. The limiter in front of it bounds the NUMBER of such
+ * requests and not their size, so the size needs its own ceiling.
+ *
+ * 64 KiB is far above anything legitimate (a token is 43 characters and a
+ * display name is capped at 64) and far below anything interesting. It lives
+ * here, beside `MAX_DISPLAY_NAME_CHARS`, because `src/index.ts` may export
+ * nothing but the Worker handler — a named export there is a module-shape error
+ * at runtime, not a style note (measured: workerd refuses to start with
+ * `Incorrect type for map entry`).
+ */
+export const MAX_REDEEM_BODY_BYTES = 64 * 1024;
+
 
 // ── the per-call check ────────────────────────────────────────────────────
 
@@ -794,8 +829,14 @@ export async function loadInviteGrant(
   // A missing or malformed binding cookie is a MISMATCH, not a separate case:
   // both mean "this request did not come from the browser the invite was
   // redeemed in", and the gate's answer is the same 403 either way.
-  const browserMatches =
-    input.binding !== null && isTokenShaped(input.binding) && joined.binding_hash === await sha256Hex(input.binding);
+  // No `isTokenShaped` guard on `binding`, and the reasoning is slice 2's: the
+  // comparison is a digest equality, and the digest of a malformed value cannot
+  // equal a stored digest, so a shape check cannot make a non-matching digest
+  // match. An earlier revision had one; it was measured (the mutation run) to
+  // change nothing, which is the same result that removed the CSRF shape check
+  // in slice 2. `null` still short-circuits, because `sha256Hex(null)` is not a
+  // call this makes — that guard is the one with teeth.
+  const browserMatches = input.binding !== null && joined.binding_hash === await sha256Hex(input.binding);
   return { ok: true, grant: { invite, browserMatches } };
 }
 
@@ -835,7 +876,7 @@ export function inviteCovers(
  * `loadInviteGrant`, which the gate runs on every authorized request — so a
  * session already in a browser's cookie jar is refused on its NEXT request,
  * with no expiry to wait for and no revocation list to consult.
- * `test/invite-http.test.ts` drives exactly that: mint, redeem, revoke,
+ * `test/invites.test.ts` drives exactly that: mint, redeem, revoke,
  * then present the still-unexpired cookie.
  *
  * Idempotent, and the boolean says whether THIS call was the one that revoked

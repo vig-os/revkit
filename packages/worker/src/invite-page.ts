@@ -28,7 +28,7 @@
 //     rendered — it exists only in the POST body and in the `guests` row.
 //
 // So there is no HTML-escaping helper here, and adding one would be a false
-// comfort: there is nothing to escape. `test/invite-http.test.ts` proves it by
+// comfort: there is nothing to escape. the validation half in `test/invites.test.ts` proves it by
 // minting with a hostile `repo` and asserting the MINT is refused, and by
 // opening a link whose token carries markup and asserting the response does not
 // contain it.
@@ -39,7 +39,11 @@
 // personal data under ADR-0015 and ADR-0020. The token is in the URL because a
 // mail link has to be; the name does not have to be, so it is not.
 
-import type { ShareType } from "./invites.ts";
+import { MAX_DISPLAY_NAME_CHARS, type ShareType } from "./invites.ts";
+
+/** The encoding this page's form submits with, by not declaring an `enctype`.
+ * Named here because the page is what fixes it; see the note on `redeemFormPage`. */
+export const FORM_MEDIA_TYPE = "application/x-www-form-urlencoded";
 
 /** Escape hatch for text that is NOT validated by shape. Used for the fixed
  * strings below only — and there are none, which is why this exists at all:
@@ -76,11 +80,24 @@ export interface RedeemFormInput {
 /**
  * The display-name form. A guest who followed a link lands here, sees what
  * they have been invited to, types a name, and POSTs.
+ * *
+ * The form declares **no `enctype`**, which is what makes a browser submit
+ * `application/x-www-form-urlencoded`. That string is therefore a property of
+ * THIS PAGE, not of the route that receives it, so it is named and exported here
+ * and the route imports it. It was a real defect once: the page shipped the
+ * default encoding while the route accepted only `application/json`, so the
+ * form the Worker itself rendered answered `415 Unsupported Media Type` — the
+ * whole flow was unusable by a browser and every test passed, because the tests
+ * posted JSON the way a program would rather than the way a browser does. One
+ * test now derives its request from this page's own markup.
  *
- * `maxlength` on the input is the browser's half of the length bound
- * `redeemInvite` enforces on the server; the server is the control, because a
- * `maxlength` attribute is a hint a `curl` does not have to honour. Both bound
- * the same number, and the two drifting apart would be a finding.
+ * `maxlength` is `MAX_DISPLAY_NAME_CHARS`, imported from the module that
+ * enforces it — **not a literal**, because the two drifting apart would be a
+ * finding and a literal is how they drift. That was measurable: the mutation run
+ * changed `maxlength="64"` to `maxlength="4096"` and left every test green, since
+ * nothing asserted the attribute. The server is still the control, because a
+ * `maxlength` attribute is a hint a `curl` does not have to honour; this is the
+ * browser's half of the same bound.
  *
  * `autocomplete="nickname"` rather than `name`: this is the name the guest
  * chooses to be called in someone else's review, not their account name, and
@@ -109,7 +126,7 @@ export function redeemFormPage(input: RedeemFormInput): string {
 <input type="hidden" name="token" value="${text(input.token)}">
 <p>
 <label for="displayName">Your display name</label><br>
-<input id="displayName" name="displayName" type="text" maxlength="64" autocomplete="nickname" required>
+<input id="displayName" name="displayName" type="text" maxlength="${MAX_DISPLAY_NAME_CHARS}" autocomplete="nickname" required>
 </p>
 <p>
 <button type="submit">Accept and open the review</button>

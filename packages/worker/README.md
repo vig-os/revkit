@@ -15,6 +15,7 @@ mentions it.
 | Invites | `src/invites.ts` | ADR-0009's mint / redeem / revoke, the browser binding, and the per-call grant the gate checks |
 | Invite pages | `src/invite-page.ts` | the display-name form and the closed/rate-limited pages — no script, no reflected input |
 | Abuse limits | `src/rate-limit.ts` | ADR-0012's per-invite and per-address counters (D1-backed; see the ADR amendment) |
+| Invite tokens | `src/invite-token.ts` | the HMAC-SHA-256 hasher and its no-fallback key rule (ADR-0012's "stored as HMAC") |
 | Retention | `src/retention.ts` | ADR-0015's 30-day guest anonymisation |
 | Sessions | `src/session.ts` | mint, hash, store, resolve, rotate; the cookie and the CSRF token |
 | The gate | `src/authz.ts` | ADR-0012's per-request authorization, and the route table that says which routes it applies to |
@@ -65,6 +66,34 @@ bump that re-enables the flag goes red.
    `sessionInsertStatement` internals, so there is **one** issuance path rather
    than two; only the `INSERT` differs, because the redemption's write has to be
    atomic with the redemption that authorises it.
+
+**The invite token is stored as `HMAC-SHA-256(token)`, not a bare digest**, under
+the `INVITE_TOKEN_HMAC_KEY` Worker secret (`wrangler secret put
+INVITE_TOKEN_HMAC_KEY`, at least 32 characters). There is **no fallback key**:
+`inviteTokenHasher` has no overload that returns a hasher without one, so a
+deployment missing the secret throws on every route — `/healthz` included,
+because a deployment that cannot hash an invite token is not healthy. The key is
+deliberately absent from `wrangler.jsonc`, and `test/worker-config.test.ts`
+asserts it stays absent. Rotating it invalidates every outstanding invite. The
+full argument, including the withdrawn plain-SHA-256 proposal, is in the ADR-0012
+amendment.
+
+**The limiter runs BEFORE the body is read, and it charges the address bucket
+first.** Every path through the redeem handler is metered: malformed JSON, a
+wrong media type, an over-long body, and both malformed spellings of the open
+route all cost exactly one row write. The limiter bounds how MANY requests there
+are and not how big each one is, so the body has its own ceiling:
+`MAX_REDEEM_BODY_BYTES` (64 KiB, in `src/invites.ts` beside
+`MAX_DISPLAY_NAME_CHARS`). A body over it is `413 body-too-large`, refused by a
+**streaming** cap that cancels the reader past the ceiling rather than by
+`request.text()` and a check afterwards — `content-length` is consulted first
+because it is free, but it is attacker-controlled and never the guarantee. That ordering is load bearing rather than
+tidy — the parse used to run first, so a 5 MB body was an unmetered
+`request.text()` on an unauthenticated route. The **per-token** bucket, whose key
+is `invite:<hmac(whatever the caller presented)>` and is therefore
+attacker-chosen, is charged only *after* the token resolves to a real invite;
+charging it earlier would make every guessed token a fresh row and no invite's
+real budget ever touched.
 
 **MINTING an invite has no HTTP route at all.** ADR-0009's only stated
 consequence is "Invite minting requires write access", so `mintInvite` is out of
@@ -124,8 +153,8 @@ written — not relaxing a `default`.
 | `/api/threads` | POST | **501.** Passes the gate and the CSRF check, then: the hosted write is slice 4. |
 | `/api/session/refresh` | POST | 200. Rotates the session id *and* the CSRF token, in one D1 batch, so a stolen cookie dies at the next refresh. |
 | `/api/*` | other verbs | 405, **behind the gate**, so route existence is not enumerable anonymously |
-| `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no script, no reflected input) plus the browser-binding cookie; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
-| `/invite/redeem` | **POST only** | 303 to a **token-free** path, with two `Set-Cookie`s (session + browser binding) and the CSRF token; 410 the same closed page; 429; 415 unless `application/json`; 400 for an unreadable body. |
+| `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no script, no reflected input) plus the browser-binding cookie — **minted only when the browser has none**, so re-opening the mail link does not rotate the binding a live session depends on; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
+| `/invite/redeem` | **POST only** | 303 to a **token-free** path, with two `Set-Cookie`s (session + browser binding) and the CSRF token; 410 the same closed page; 429; 415 unless `application/json` **or `application/x-www-form-urlencoded`**; 400 for an unreadable body. The form encoding exists because the Worker SHIPS a form: `src/invite-page.ts` emits no `enctype`, so a browser submits `x-www-form-urlencoded` and a JSON-only route answers the shipped page with `415`. A repeated form field is refused outright (JSON's repeated-key "last wins" is left as-is and asserted separately). |
 | `/<repo>/pr-<n>/…` | any | 501 naming slice 5 — **behind the gate**, and now carrying a **scope**, which is what a guest invite is checked against |
 | `/_revkit/…` | any | 404, never a redirect (ADR-0012) |
 | anything else | any | 404 |
@@ -161,7 +190,7 @@ order:
 **Why revocation here is immediate rather than eventual:** it is a property of
 *where* the check lives, not of how fast it runs. A session already sitting in a
 browser's cookie jar is refused on its next request — no expiry to wait for, no
-revocation list, no cache. `test/invite-http.test.ts` drives exactly that, and
+revocation list, no cache. `test/invites.test.ts` drives exactly that, and
 asserts the session row is still present and still unexpired while it is refused.
 
 **A `view` guest's attempt to comment is refused by the GATE, not by the 501.**

@@ -567,7 +567,15 @@ describe("the Worker's own log lines (end to end)", () => {
    * So: poll until the expected count arrives or a bounded budget expires.
    * The assertion is NOT weakened — both lines are still required, with the
    * same request id — and a line that never arrives still fails, just after
-   * a second instead of immediately. */
+   * a second instead of immediately.
+   *
+   * (A per-instance structured hook was tried and REMOVED: miniflare's
+   * `handleStructuredLogs` suppresses its default stdio piping, so it starves
+   * this function, and — measured — enabling it made workerd's D1 control pipe
+   * return unparsable responses under this host's load
+   * (`SyntaxError: JSON Parse error: Unexpected identifier "ERROR"` at
+   * `parseSyncResponse`), which broke unrelated tests. Replaced-global capture at
+   * this instance count is stable: three consecutive clean runs of the suite.) */
   async function captureWorkerLog(
     run: () => Promise<DispatchResult>,
     options: { readonly expectLines?: number; readonly drainMs?: number } = {},

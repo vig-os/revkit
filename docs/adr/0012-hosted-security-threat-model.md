@@ -174,47 +174,62 @@ recorded here with the measurements behind them, because a divergence from an
 accepted ADR that lives only in a commit message is the failure mode this ADR
 exists to prevent.
 
-### 1. "stored as HMAC" → stored as SHA-256
+### 1. "stored as HMAC" → **kept** as HMAC, and the first proposal is withdrawn
 
 The abuse-limits bullet above ends *"invite tokens are 256-bit random, stored as
-HMAC"*. `packages/worker/src/invites.ts` stores `sha256(token)`. The decision
-and its evidence:
+HMAC"*. Slice 3 **implements it as written**:
+`packages/worker/src/invite-token.ts` stores `HMAC-SHA-256(token)` under the
+`INVITE_TOKEN_HMAC_KEY` Worker secret.
 
-- **HMAC's advantage is for LOW-entropy secrets.** A keyed MAC stops an attacker
-  holding the database from *verifying a guess*: they cannot compute
-  `HMAC_k(guess)` without `k`. For a 256-bit value from `crypto.getRandomValues`
-  there is no dictionary — guessing one value is 2^256 work either way.
-  **Measured on workerd 2026-05-18** (`compatibility_flags: []`): SHA-256 and
-  HMAC-SHA-256 both produce a 64-character hex digest of a 43-character token,
-  and 200 interleaved calls of each are indistinguishable at the platform's
-  0–1 ms timer resolution. So for *this* secret the keyed form buys nothing and
-  costs a second secret to provision, rotate and keep out of the deploy path.
-- **The keyed form is not testable in this repo's harness, and its failure mode
-  is silent.** **Measured:** miniflare 4.20260518.0 IGNORES its `secrets` option
-  — `env.INVITE_TOKEN_HMAC_KEY` came back `undefined` when passed there, and the
-  same key supplied through `bindings` (which miniflare DOES bind) came back as
-  the string. `crypto.subtle.importKey("raw", undefined, …)` then throws
-  `Cannot initialize … from an undefined or null value`, so a real HMAC
-  implementation would either 500 on every redemption under test or — far more
-  likely, and far worse — reach for a fallback key. **Measured:** a zero-filled
-  32-byte key produces a valid, *wrong* digest (`58a98994…`), i.e. a green suite
-  against a function that is not the deployed one. A keyed hash whose key the
-  test harness cannot supply is a control verified nowhere.
-- **The switch is not a one-way door.** `invites.token_hash` is `TEXT` and both
-  forms are 64 hex characters, so moving to HMAC is one function and one line of
-  this ADR — no migration, no table rewrite, no invalidation of live invites.
-  That is what makes amending acceptable rather than merely convenient.
+**The withdrawn proposal.** An earlier draft of this slice proposed amending the
+bullet to plain `SHA-256`, on two grounds: that HMAC's advantage is for
+low-entropy secrets and a 256-bit CSPRNG token has no dictionary, and that the
+harness could not supply a key. **Both grounds were measured and both were
+answered, and the amendment is withdrawn rather than left standing:**
 
-What is **not** given up: a stolen database still yields no usable token.
-`token_hash` is the only thing stored, the plaintext exists once in the mint
-result, and every lookup is `WHERE token_hash = ?` — an indexed equality, so
-there is no candidate scan to time and therefore no reason for a timing-safe
-comparison here either. Session ids and CSRF tokens were already plain SHA-256 in
-slice 2 (`sessions.id`, `sessions.csrf_hash`), so this makes the whole surface
-consistent rather than half-and-half.
+- **The entropy argument does not decide this.** At 256 bits of
+  `crypto.getRandomValues` there is no dictionary, so the *marginal* protection
+  today is small — the ADR does not claim otherwise. What the keyed form buys
+  is that the lookup key's safety stops depending on an unstated invariant
+  about a function in another file: HMAC's safety rests on a key, a bare
+  digest's rests entirely on "nobody ever derives a token instead of drawing
+  it". `invites.token_hash` is the row's identity, so that invariant is load
+  bearing and unversioned. The narrow claim is the property worth having.
+- **"The harness cannot supply a key" was a misdiagnosis.** **Measured:**
+  miniflare 4.20260518.0 ignores its `secrets` option, so
+  `env.INVITE_TOKEN_HMAC_KEY` came back `undefined` when passed there — and the
+  same value passed through `bindings` came back as the string. `wrangler
+  secret put` also lands in `env`, and from inside the Worker the two are
+  indistinguishable, so nothing about the *deployed* shape was untestable. The
+  harness was wrong, not the design. `test/harness.ts` binds through
+  `bindings` and says why.
+- **The fallback-key worry was real and is answered by construction.**
+  `inviteTokenHasher(key)` has no overload that returns a working hasher without
+  a key, and `test/worker-config.test.ts` asserts the key is named but never
+  declared in `wrangler.jsonc`'s `vars` or `secrets_store`. A missing secret
+  throws rather than defaulting.
 
-**This amendment needs the coordinator's agreement** and is flagged as such in
-the PR; it is not a silent deviation.
+**Cost, stated rather than hidden.** One deployment secret to provision
+(`wrangler secret put INVITE_TOKEN_HMAC_KEY`, ≥ 32 characters) and to rotate.
+Rotation invalidates every outstanding invite, which is a deliberate, documented
+cost rather than an accident.
+
+**Migration:** none. Both forms are 64 hex characters and `invites.token_hash`
+is `TEXT`, so `migrations/0001_init.sql` needs no `ALTER`. That is what made
+the original amendment cheap, and it is also what made reversing it cheap.
+
+**A missing key is a 500 on every route, `/healthz` included, and that is
+deliberate.** A Workers *module* worker has no module-scope initialiser — `env`
+does not exist until a handler runs — so there is no "start" at which to refuse.
+The equivalent is a first-line check in `fetch`, and `/healthz` is included
+because a deployment that cannot hash an invite token is not healthy and a probe
+that says otherwise is a probe nobody should trust. The alternatives were worse:
+a per-call throw alone reports `/healthz` 200 while every invite route 500s, and
+refusing to start is not expressible. The check is **first**, before
+`beginRequest`, because a deployment missing both bindings would otherwise
+report the `REVKIT_VERSION` fault instead of the one an operator has to fix
+(`test/worker-runtime.test.ts` measures exactly that, which is why it asserts on
+the message and not merely on a 500).
 
 ### 2. "rate limits … (Durable Object counters)" → a D1-backed counter
 
@@ -237,20 +252,46 @@ end state (M4 slice 6, with the rest of the DO work).
 - Shipping redemption with **no** limit while this ADR claims one was not an
   option, and shipping a limit that is honestly D1 is.
 
-Cost, stated rather than hidden: one row write per limited attempt, against D1's
-daily row-write quota, so a sustained flood spends that deployment's quota. A
-Durable Object trades that for per-isolate consistency at a per-request cost.
-The limit's purpose here is to make a 256-bit token unguessable *by volume*; a
-quota exhaustion is a louder failure than a leaked invite. Residual risk, in the
-ADR rather than only in a PR.
+Cost, stated rather than hidden: **one row write per limited attempt** against
+D1's daily row-write quota, so a sustained flood spends that deployment's quota.
+The quota is **100,000 rows written per day per database** on D1's Free plan
+(Cloudflare's published limit); the paid plan's ceiling is orders of magnitude
+higher. Every metered attempt is one `INSERT … ON CONFLICT … DO UPDATE`, and the
+increment and the window rollover are in that same statement, so one attempt is
+one write and not two.
+
+The quota is what makes the ordering rule below load bearing rather than
+cosmetic: the address bucket is charged **first, on every path**, so an
+unresolvable or malformed request still costs exactly one write.
+
+The **per-token bucket key is attacker-chosen** — it is
+`invite:<hmac(whatever the caller presented)>`, and an attacker chooses what to
+present. So it is charged only *after* the token resolves to a real invite.
+Charging it before the lookup would make **every guessed token a fresh row** —
+one write per guess, and no invite's real budget touched, so a limit that cannot
+defend against guessing is not defending against guessing
+(`test/invites.test.ts`, "a token that does NOT resolve creates no counter row at
+all"). Because the address bucket's key is the edge-set address, the number of
+rows an attacker can mint is bounded by how many source addresses they hold
+rather than by how much they can guess.
+
+A Durable Object trades the row-write cost for per-isolate consistency at a
+per-request cost. The limit's purpose here is to make a 256-bit token
+unguessable *by volume*; a quota exhaustion is a louder failure than a leaked
+invite. Residual risk, in the ADR rather than only in a PR.
 
 Two further properties of the shipped limit, both measured by test rather than
 asserted: `X-Forwarded-For` is **never** read (every hop appends to it, so it is
 forgeable and a forgeable identity half would make the whole limit forgeable);
-and the **per-token limit is derived from `max_browsers`**, because a limit
-below `2 × max_browsers` makes a legitimate multi-browser invite unusable — it
-was 10 against `team`'s `max_browsers = 10`, and each browser costs two attempts
-(open, then redeem), so the tenth browser was rate-limited rather than admitted.
+and the **per-token limit is enforced by a test against `max_browsers`**, because
+a limit below `2 × max_browsers` makes a legitimate multi-browser invite
+unusable — it was 10 against `team`'s `max_browsers = 10`, and each browser costs
+two attempts (open, then redeem), so the tenth browser was rate-limited rather
+than admitted. The relationship is **asserted, not derived**: `REDEEM_TOKEN_LIMIT`
+is the constant `40` and the test
+("the per-token limit is above 2 x the largest max_browsers") is what fails if
+someone edits one without the other. No code computes the limit from
+`max_browsers`, so there is no derivation to keep in step.
 
 ### 3. "a guest invite is checked for scope, type and expiry on each call" — now
 ### implemented, in two halves

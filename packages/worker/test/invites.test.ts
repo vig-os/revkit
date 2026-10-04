@@ -44,6 +44,8 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { classifyRoute, DENIAL_REASONS, INVITE_OPEN_PREFIX, INVITE_REDEEM_PATH, THREADS_PATH } from "../src/authz.ts";
+import { FORM_MEDIA_TYPE } from "../src/invite-page.ts";
+import { MAX_REDEEM_BODY_BYTES } from "../src/invites.ts";
 import {
   DEFAULT_SHARE_TYPE,
   INVITE_LIFETIME_DAYS,
@@ -63,16 +65,34 @@ import {
 } from "../src/invites.ts";
 import { GUEST_DELETED_NAME, GUEST_RETENTION_MS, purgeStaleGuests } from "../src/retention.ts";
 import {
+  INVITE_TOKEN_HMAC_KEY,
+  MIN_INVITE_TOKEN_HMAC_KEY_CHARS,
+  MissingInviteTokenKeyError,
+  hasUsableInviteTokenKey,
+  inviteTokenHasher,
+} from "../src/invite-token.ts";
+import {
   CLIENT_IP_HEADER,
   RATE_LIMIT_WINDOW_MS,
   REDEEM_IP_LIMIT,
   REDEEM_TOKEN_LIMIT,
+  addressBucket,
   clientAddress,
-  redeemBuckets,
   spendAttempts,
+  tokenBucket,
+  type RateBucket,
 } from "../src/rate-limit.ts";
 import { CSRF_HEADER, SESSION_COOKIE_NAME, isTokenShaped, mintToken, sha256Hex } from "../src/session.ts";
-import { issueTestSession, JSON_HEADERS, resetInvites, setCookieValue, startWorker, type Harness } from "./harness.ts";
+import {
+  issueTestSession,
+  JSON_HEADERS,
+  resetInvites,
+  setCookieValue,
+  startWorker,
+  TEST_INVITE_TOKEN_HMAC_KEY,
+  testTokenHasher,
+  type Harness,
+} from "./harness.ts";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const VERBS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
@@ -82,7 +102,7 @@ const REPO = "revkit";
 const NAME = "Ada Lovelace";
 
 async function mintOk(db: D1Database, input: Parameters<typeof mintInvite>[1], now = NOW): Promise<MintResult> {
-  return mintInvite(db, input, { now: () => now });
+  return mintInvite(db, input, { keys, now: () => now });
 }
 
 /** Mint and assert success, so a case reads as one line of setup. */
@@ -116,8 +136,18 @@ async function mint(
  */
 let harness: Harness;
 
+/**
+ * The HMAC hasher the D1-level cases pass, built from the SAME literal the
+ * harness binds into `env`. `inviteTokenHasher` imports the `CryptoKey` once and
+ * this is that one import, shared by every case in the file — which is also the
+ * shape production has, where the key is a deployment input and the import
+ * happens per invocation.
+ */
+let keys: Awaited<ReturnType<typeof testTokenHasher>>;
+
 beforeAll(async () => {
   harness = await startWorker();
+  keys = await testTokenHasher();
 });
 
 afterAll(async () => {
@@ -127,6 +157,39 @@ afterAll(async () => {
 beforeEach(async () => {
   await resetInvites(harness.db);
 });
+
+  /**
+   * Put a counter exactly where a test needs it, in ONE write.
+   *
+   * Counting up to a limit is the obvious way to test a limit and it is the
+   * weak one: it proves "at some point it refused", not *where* the boundary
+   * is, and it costs `limit + 1` sequential D1 round trips. That cost is not
+   * theoretical — at `REDEEM_TOKEN_LIMIT = 40` it took a case past bun's 5 s
+   * per-test timeout under this host's load, which is what produced a
+   * "killed 1 dangling process" failure cascade in the first draft of this
+   * file. Seeding `count = limit - 1` and taking two attempts asserts the
+   * boundary is EXACTLY at `limit`, in two round trips.
+   */
+  async function seedCounter(bucket: string, count: number, windowStartMs = NOW): Promise<void> {
+    await harness.db
+      .prepare(
+        "INSERT INTO rate_limit_counters (bucket, count, window_start) VALUES (?, ?, ?) " +
+          "ON CONFLICT(bucket) DO UPDATE SET count = ?, window_start = ?",
+      )
+      .bind(bucket, count, new Date(windowStartMs).toISOString(), count, new Date(windowStartMs).toISOString())
+      .run();
+  }
+
+  /** Both halves a full redemption attempt spends, in the order the handler
+   * spends them: the address bucket first and unconditionally, the token
+   * bucket only once the token has resolved. */
+  function redeemBuckets(digest: string, address?: string): RateBucket[] {
+    return [...addressBucket(address), ...tokenBucket(digest)];
+  }
+
+  /** One bucket: the per-token half. Renamed from the old two-bucket helper
+   * when the token bucket was split out and gated on liveness, so a case that
+   * means "the token's budget" cannot silently acquire the address one. */
 
 describe("invite mechanics (ADR-0009) against D1", () => {
 
@@ -138,8 +201,13 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     test("a minted token is 256 bits of CSPRNG and is stored only as its digest", async () => {
       const { token, inviteId } = await mint(db());
       expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      // ADR-0012: "stored as HMAC". The digest is the HMAC under the
+      // deployment key, and it is 64 hex characters like the bare SHA-256 it
+      // replaced — which is why `invites.token_hash` stays `TEXT` and
+      // `migrations/0001_init.sql` needs no ALTER.
+      expect(await keys.hash(token)).toMatch(/^[0-9a-f]{64}$/);
       const invite = await loadInviteById(db(), inviteId);
-      expect(invite?.tokenHash).toBe(await sha256Hex(token));
+      expect(invite?.tokenHash).toBe(await keys.hash(token));
       // The plaintext is nowhere in the row. Asserted against the whole row as
       // JSON, so a future column that stored it would fail here too.
       const row = await db().prepare("SELECT * FROM invites WHERE id = ?").bind(inviteId).first<Record<string, unknown>>();
@@ -223,7 +291,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     });
 
     test("an unrecognised kind is refused rather than defaulted to personal", async () => {
-      const result = await mintInvite(db(), { repo: REPO, kind: "admin" as never });
+      const result = await mintInvite(db(), { repo: REPO, kind: "admin" as never }, { keys });
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.refusal).toBe("bad-kind");
       expect((await db().prepare("SELECT COUNT(*) AS n FROM invites").first<{ n: number }>())?.n).toBe(0);
@@ -255,6 +323,63 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     });
   });
 
+  // ── the token hash: HMAC under a deployment key ───────────────────────
+
+  describe("the stored token digest is HMAC-SHA-256, not a bare hash", () => {
+    test("the stored digest is the HMAC, and it is 64 hex characters", async () => {
+      const { token, inviteId } = await mint(db());
+      const invite = await loadInviteById(db(), inviteId);
+      expect(await keys.hash(token)).toMatch(/^[0-9a-f]{64}$/);
+      expect(invite?.tokenHash).toBe(await keys.hash(token));
+      // ADR-0012 said "stored as HMAC". It is NOT the bare digest, and the
+      // difference is the property the ADR was asking for: the keyed form does
+      // not let a holder of the database verify a guess, which is why the
+      // amendment slice 3 first proposed (plain SHA-256, "HMAC buys nothing at
+      // 256 bits") was withdrawn.
+      expect(invite?.tokenHash).not.toBe(await sha256Hex(token));
+    });
+
+    test("a different key produces a different digest for the SAME token", async () => {
+      // The measurable difference between a keyed hash and a bare one, and the
+      // reason the column cannot be migrated later without invalidating every
+      // live invite: `token_hash` IS the lookup key.
+      const other = await inviteTokenHasher(`${TEST_INVITE_TOKEN_HMAC_KEY}-different`);
+      const { token, inviteId } = await mint(db());
+      const invite = await loadInviteById(db(), inviteId);
+      expect(await other.hash(token)).not.toBe(invite?.tokenHash);
+      // …and the lookup under the wrong key finds nothing, which is what "not
+      // verifiable from the database" means operationally.
+      expect(await loadInviteByToken(db(), token, { keys: other })).toBeUndefined();
+      expect(await loadInviteByToken(db(), token, { keys })).toBeDefined();
+    });
+
+    test("the digest is stable across calls, so a lookup is repeatable", async () => {
+      const { token } = await mint(db());
+      expect(await keys.hash(token)).toBe(await keys.hash(token));
+      // And two tokens never collide, which `invites.token_hash UNIQUE` would
+      // enforce anyway — this is the cheap half of that guarantee.
+      const other = await mint(db());
+      expect(await keys.hash(other.token)).not.toBe(await keys.hash(token));
+    });
+
+    test("a missing or short key is refused, and there is NO fallback digest", async () => {
+      // A default key would be worse than no key: a zero-filled 32-byte key
+      // produces a VALID, WRONG digest, so invites minted under it could never
+      // be redeemed and a suite would stay green against a function that is not
+      // the deployed one. So the hasher's TYPE has no overload that returns
+      // without a key, and these throw.
+      for (const key of [undefined, "", "short", "x".repeat(MIN_INVITE_TOKEN_HMAC_KEY_CHARS - 1)]) {
+        expect(hasUsableInviteTokenKey(key), String(key?.length)).toBe(false);
+        await expect(inviteTokenHasher(key)).rejects.toThrow(MissingInviteTokenKeyError);
+      }
+      expect(hasUsableInviteTokenKey("x".repeat(MIN_INVITE_TOKEN_HMAC_KEY_CHARS))).toBe(true);
+      // The message names the binding and never a value.
+      const error = await inviteTokenHasher(undefined).catch((thrown: unknown) => thrown);
+      expect(String(error)).toContain(INVITE_TOKEN_HMAC_KEY);
+      expect(String(error)).not.toContain("undefined =");
+    });
+  });
+
   // ── redemption, and every way it is refused ───────────────────────────
 
   describe("redemption", () => {
@@ -270,7 +395,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
           binding: options.binding ?? mintToken(),
           displayName: options.displayName ?? NAME,
         },
-        { now: () => options.now ?? NOW },
+        { keys, now: () => options.now ?? NOW },
       );
     }
 
@@ -304,8 +429,13 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       // under a 30-minute invite would hand out a credential that outlives its
       // own authority.
       const short = await mint(db(), { repo: REPO }, NOW);
+      // Keyed on the HMAC, not the bare digest. A first cut of this case used
+      // `sha256Hex(token)` here and the `UPDATE` matched **zero** rows silently —
+      // the invite kept its 14-day expiry, the assertion still had a plausible
+      // number to fail against, and the case only got caught because the
+      // expected 30 minutes arrived as 30 days.
       await db().prepare("UPDATE invites SET expires_at = ? WHERE token_hash = ?")
-        .bind(new Date(NOW + 30 * 60 * 1000).toISOString(), await sha256Hex(short.token))
+        .bind(new Date(NOW + 30 * 60 * 1000).toISOString(), await keys.hash(short.token))
         .run();
       const result = await redeem(short.token, { binding: mintToken() });
       expect(result.ok).toBe(true);
@@ -520,7 +650,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       const { token, inviteId } = await mint(db(), { repo: REPO, kind, pr });
       const binding = mintToken();
       const { redeemInvite } = await import("../src/invites.ts");
-      const redeemed = await redeemInvite(db(), { token, binding, displayName: NAME }, { now: at() });
+      const redeemed = await redeemInvite(db(), { token, binding, displayName: NAME }, { keys, now: at() });
       if (!redeemed.ok) throw new Error(`redeem failed: ${redeemed.refusal}`);
       return { binding, guestId: redeemed.guestId, inviteId, redeemed };
     }
@@ -708,7 +838,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     async function guestWithInvite(kind: "personal" | "team" = "team") {
       const { token, inviteId, expiresAt } = await mint(db(), { repo: REPO, kind });
       const { redeemInvite } = await import("../src/invites.ts");
-      const result = await redeemInvite(db(), { token, binding: mintToken(), displayName: NAME }, { now: at() });
+      const result = await redeemInvite(db(), { token, binding: mintToken(), displayName: NAME }, { keys, now: at() });
       if (!result.ok) throw new Error("redeem failed");
       return { inviteId, guestId: result.guestId, expiresAt };
     }
@@ -827,30 +957,8 @@ describe("invite mechanics (ADR-0009) against D1", () => {
   // ── rate limits (ADR-0012) ────────────────────────────────────────────
 
   describe("rate limits", () => {
-    /**
-     * Put a counter exactly where a test needs it, in ONE write.
-     *
-     * Counting up to a limit is the obvious way to test a limit and it is the
-     * weak one: it proves "at some point it refused", not *where* the boundary
-     * is, and it costs `limit + 1` sequential D1 round trips. That cost is not
-     * theoretical — at `REDEEM_TOKEN_LIMIT = 40` it took a case past bun's 5 s
-     * per-test timeout under this host's load, which is what produced a
-     * "killed 1 dangling process" failure cascade in the first draft of this
-     * file. Seeding `count = limit - 1` and taking two attempts asserts the
-     * boundary is EXACTLY at `limit`, in two round trips.
-     */
-    async function seedCounter(bucket: string, count: number, windowStartMs = NOW): Promise<void> {
-      await db()
-        .prepare(
-          "INSERT INTO rate_limit_counters (bucket, count, window_start) VALUES (?, ?, ?) " +
-            "ON CONFLICT(bucket) DO UPDATE SET count = ?, window_start = ?",
-        )
-        .bind(bucket, count, new Date(windowStartMs).toISOString(), count, new Date(windowStartMs).toISOString())
-        .run();
-    }
-
-    function inviteBuckets(digest: string, address?: string): ReturnType<typeof redeemBuckets> {
-      return redeemBuckets({ tokenDigest: digest, address });
+    function inviteBuckets(digest: string): RateBucket[] {
+      return tokenBucket(digest);
     }
 
     test("the invite bucket admits its limit and refuses the next attempt, exactly", async () => {
@@ -924,7 +1032,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       // refusal short-circuited the loop, ten rotated tokens would leave it at 0
       // and the address half of "per identity AND IP" would not exist.
       const digest = "d".repeat(64);
-      const buckets = inviteBuckets(digest, "203.0.113.9");
+      const buckets = [...addressBucket("203.0.113.9"), ...inviteBuckets(digest)];
       await seedCounter(`invite:${digest}`, REDEEM_TOKEN_LIMIT, NOW);
       const refused = await spendAttempts(db(), buckets, { now: NOW });
       expect(refused.ok).toBe(false);
@@ -938,8 +1046,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
 
     test("the address bucket has its own, higher ceiling, exactly", async () => {
       expect(REDEEM_IP_LIMIT).toBeGreaterThan(REDEEM_TOKEN_LIMIT);
-      const addressOnly = (): ReturnType<typeof redeemBuckets> =>
-        inviteBuckets(mintToken(), "203.0.113.9").filter((bucket) => bucket.kind === "ip");
+      const addressOnly = (): RateBucket[] => addressBucket("203.0.113.9");
       const bucket = addressOnly()[0];
       expect(bucket?.limit).toBe(REDEEM_IP_LIMIT);
       await seedCounter(bucket?.name ?? "", REDEEM_IP_LIMIT - 1);
@@ -950,7 +1057,7 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     });
 
     test("no bucket name is ever returned by a verdict, so a refusal cannot echo one", async () => {
-      const buckets = inviteBuckets("0".repeat(64), "198.51.100.4");
+      const buckets = [...addressBucket("198.51.100.4"), ...inviteBuckets("0".repeat(64))];
       await seedCounter("ip:198.51.100.4", REDEEM_IP_LIMIT, NOW);
       const verdict = await spendAttempts(db(), buckets, { now: NOW });
       expect(verdict.ok).toBe(false);
@@ -995,9 +1102,9 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       // sharing a NAT could deny a stranger their invite.
       const digest = "3".repeat(64);
       await seedCounter("ip:203.0.113.9", REDEEM_IP_LIMIT, NOW);
-      const sameTokenElsewhere = await spendAttempts(db(), inviteBuckets(digest, "198.51.100.4"), { now: NOW });
+      const sameTokenElsewhere = await spendAttempts(db(), [...addressBucket("198.51.100.4"), ...inviteBuckets(digest)], { now: NOW });
       expect(sameTokenElsewhere.ok).toBe(true);
-      const otherTokenSameAddress = await spendAttempts(db(), inviteBuckets("4".repeat(64), "203.0.113.9"), { now: NOW });
+      const otherTokenSameAddress = await spendAttempts(db(), [...addressBucket("203.0.113.9"), ...inviteBuckets("4".repeat(64))], { now: NOW });
       expect(otherTokenSameAddress.ok).toBe(false);
     });
   });
@@ -1090,6 +1197,56 @@ async function redeem(
   });
 }
 
+/**
+ * `GET /invite/<token>` in a browser that ALREADY has cookies — the second
+ * click, the second tab, the Back-navigation.
+ *
+ * `open` deliberately starts an empty jar, because most of what follows it is a
+ * first visit. This one dispatches the browser's own cookies and absorbs the
+ * response back into the same jar, which is what a browser does and what the
+ * H1 regression needs: a first draft of that test used `open`, so the new
+ * `Set-Cookie` landed in a throwaway jar and the defect was invisible.
+ */
+async function reopen(
+  harness: Harness,
+  browser: Browser,
+  token: string,
+  init: DispatchInit = {},
+): Promise<DispatchResponse> {
+  const cookie = browser.header();
+  const response = await harness.dispatch(`http://localhost${INVITE_OPEN_PREFIX}${token}`, {
+    ...init,
+    headers: { ...((init.headers as Record<string, string>) ?? {}), ...(cookie === null ? {} : { cookie }) },
+  });
+  browser.absorb(response);
+  return response;
+}
+
+/**
+ * `POST /invite/redeem` the way a BROWSER submits the shipped form: the default
+ * enctype, both fields urlencoded, and whatever cookies the browser holds.
+ *
+ * Deliberately not a variant of `redeem`'s parameter list — the point is that it
+ * has no way to send JSON, because the page has no way to send JSON.
+ */
+async function redeemUrlEncoded(
+  harness: Harness,
+  browser: Browser,
+  token: string,
+  fields: Readonly<Record<string, string>> = { displayName: NAME },
+): Promise<DispatchResponse> {
+  const body = new URLSearchParams();
+  body.set("token", token);
+  for (const [name, value] of Object.entries(fields)) body.set(name, value);
+  const cookie = browser.header();
+  return harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+    method: "POST",
+    ...NO_FOLLOW,
+    headers: { "content-type": "application/x-www-form-urlencoded", ...(cookie === null ? {} : { cookie }) },
+    body: body.toString(),
+  });
+}
+
 /** Mint, open, redeem — the whole legitimate flow, for a test whose subject is
  * something that happens AFTER it. */
 async function onboard(
@@ -1104,7 +1261,7 @@ async function onboard(
   csrfToken: string;
   response: DispatchResponse;
 }> {
-  const minted = await mintInvite(harness.db, input);
+  const minted = await mintInvite(harness.db, input, { keys });
   if (!minted.ok) throw new Error(`mint failed: ${minted.refusal}`);
   const { browser } = await open(harness, minted.minted.token);
   const response = await redeem(harness, browser, minted.minted.token);
@@ -1150,22 +1307,15 @@ function parseJson(raw: string): Record<string, unknown> {
 
   // ── the same mechanics, over HTTP through real workerd ──────────────────
 
+  // NO lifecycle hooks in this describe. It shares the file's ONE harness, and
+  // that sharing is load-bearing rather than tidy: a second `beforeAll` here
+  // used to call `startWorker()` again, silently replacing the module-level
+  // `harness` with a second miniflare instance and a SECOND in-memory D1. Every
+  // write a case made before that point went to a database the Worker never read
+  // — a seeded rate-limit row vanished and the case failed for a reason that had
+  // nothing to do with rate limits. The instance budget documented above
+  // `beforeAll` is the same constraint seen from the other side.
   describe("the invite surface over HTTP", () => {
-
-  let harness: Harness;
-
-  beforeAll(async () => {
-    harness = await startWorker();
-  });
-
-  afterAll(async () => {
-    await harness.dispose();
-  });
-
-  beforeEach(async () => {
-    await resetInvites(harness.db);
-  });
-
   // ── the routes ────────────────────────────────────────────────────────
 
   describe("the route table", () => {
@@ -1181,7 +1331,7 @@ function parseJson(raw: string): Record<string, unknown> {
       expect(classifyRoute(INVITE_REDEEM_PATH, "GET").kind).toBe("method-not-allowed");
       expect(classifyRoute(INVITE_REDEEM_PATH, "HEAD").kind).toBe("method-not-allowed");
 
-      const minted = await mintInvite(harness.db, { repo: REPO });
+      const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       for (const path of [`${INVITE_OPEN_PREFIX}${minted.minted.token}`, INVITE_REDEEM_PATH]) {
         for (const verb of ["HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"]) {
@@ -1228,7 +1378,7 @@ function parseJson(raw: string): Record<string, unknown> {
 
   describe("GET /invite/<token>", () => {
     test("a live invite serves a CSP-hardened, no-store form that carries the token once", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, pr: 42 });
+      const minted = await mintInvite(harness.db, { repo: REPO, pr: 42 }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const { browser, response } = await open(harness, minted.minted.token);
       expect(response.status).toBe(200);
@@ -1254,6 +1404,10 @@ function parseJson(raw: string): Record<string, unknown> {
       expect(html).toContain(`action="${INVITE_REDEEM_PATH}"`);
       expect(html).toContain("revkit");
       expect(html).toContain("#42");
+      // L3: the browser's half of the name bound is the SAME constant the
+      // module enforces, asserted here because changing `maxlength` to 4096
+      // used to leave every test green.
+      expect(html).toContain(`maxlength="${MAX_DISPLAY_NAME_CHARS}"`);
       // And the form's URL is token-free, so the POST lands in history without it.
       expect(html).not.toContain(`${INVITE_REDEEM_PATH}?`);
       // The browser is bound on the OPEN, which is what makes ADR-0009's "bound
@@ -1272,7 +1426,7 @@ function parseJson(raw: string): Record<string, unknown> {
       // assertions covered. Two builders, one covered. There is now one builder,
       // and both routes' cookies are asserted, so the copy cannot come back
       // unasserted.
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const { response } = await open(harness, minted.minted.token);
       const raw = setCookieValue(response.headers.get("set-cookie") ?? joinedSetCookie(response), BROWSER_COOKIE_NAME);
@@ -1296,12 +1450,12 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("the form says what the invite permits, and a view invite says read-only before the guest commits", async () => {
-      const view = await mintInvite(harness.db, { repo: REPO, kind: "view" });
+      const view = await mintInvite(harness.db, { repo: REPO, kind: "view" }, { keys });
       if (!view.ok) throw new Error("mint failed");
       const viewHtml = await (await open(harness, view.minted.token)).response.text();
       expect(viewHtml).toContain("read-only");
       expect(viewHtml).toContain("view");
-      const personal = await mintInvite(harness.db, { repo: REPO });
+      const personal = await mintInvite(harness.db, { repo: REPO }, { keys });
       if (!personal.ok) throw new Error("mint failed");
       const personalHtml = await (await open(harness, personal.minted.token)).response.text();
       expect(personalHtml).toContain("can comment");
@@ -1309,10 +1463,10 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("a repo-scoped invite says \"all pull requests\"; a PR-scoped one names the PR", async () => {
-      const whole = await mintInvite(harness.db, { repo: REPO });
+      const whole = await mintInvite(harness.db, { repo: REPO }, { keys });
       if (!whole.ok) throw new Error("mint failed");
       expect(await (await open(harness, whole.minted.token)).response.text()).toContain("all pull requests");
-      const one = await mintInvite(harness.db, { repo: REPO, pr: 7 });
+      const one = await mintInvite(harness.db, { repo: REPO, pr: 7 }, { keys });
       if (!one.ok) throw new Error("mint failed");
       expect(await (await open(harness, one.minted.token)).response.text()).toContain("pull request #7");
     });
@@ -1333,10 +1487,84 @@ function parseJson(raw: string): Record<string, unknown> {
       }
     });
 
+    test("C1: the SHIPPED form, submitted the way a browser submits it, redeems", async () => {
+      // The regression this exists for. `redeemFormPage` emits a plain
+      // `<form method="post">` with NO `enctype`, so a browser sends
+      // `application/x-www-form-urlencoded` — and the route accepted only
+      // `application/json`. The page serves no script (`default-src 'none'`, no
+      // `<script>`), so there is no `fetch()` to send JSON and **no HTML
+      // mechanism can produce `application/json` at all**: every guest got 415
+      // and no session, and no test noticed because every POST in this file was
+      // a hand-built JSON `Request`.
+      //
+      // So this test READS THE SHIPPED PAGE and derives the request from it —
+      // the `action`, the `method`, the *absent* `enctype`, and the input names
+      // — rather than from what the route happens to accept. If the page and the
+      // route ever disagree about the wire format again, this goes red.
+      const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+      if (!minted.ok) throw new Error("mint failed");
+      const { browser, response } = await open(harness, minted.minted.token);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+
+      const form = /<form\b([^>]*)>([\s\S]*?)<\/form>/.exec(html);
+      expect(form, "the page must ship exactly one <form>").not.toBeNull();
+      const attrs = form?.[1] ?? "";
+      const method = /\bmethod="([^"]*)"/.exec(attrs)?.[1];
+      const action = /\baction="([^"]*)"/.exec(attrs)?.[1];
+      const enctype = /\benctype="([^"]*)"/.exec(attrs)?.[1];
+      // What the page declares, asserted so a future `enctype` change is a
+      // deliberate edit here rather than a silent format switch.
+      expect(method).toBe("post");
+      expect(action).toBe(INVITE_REDEEM_PATH);
+      expect(enctype, "the page declares no enctype, so the browser picks the default").toBeUndefined();
+      // The two named fields, read from the markup.
+      const hidden = /<input type="hidden" name="([^"]+)" value="([^"]*)">/.exec(form?.[2] ?? "");
+      const named = /<input id="displayName" name="([^"]+)"[^>]*>/.exec(form?.[2] ?? "");
+      expect(hidden?.[1]).toBe("token");
+      expect(hidden?.[2]).toBe(minted.minted.token);
+      expect(named?.[1]).toBe("displayName");
+
+      // Exactly what a browser does with that form: the default enctype, and
+      // both fields urlencoded. NOT a JSON body.
+      const body = new URLSearchParams();
+      body.set(hidden?.[1] ?? "", hidden?.[2] ?? "");
+      body.set(named?.[1] ?? "", NAME);
+      const cookie = browser.header() ?? "";
+      const submitted = await harness.dispatch(`http://localhost${action ?? ""}`, {
+        method: (method ?? "get").toUpperCase(),
+        ...NO_FOLLOW,
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+        body: body.toString(),
+      });
+      expect(submitted.status, "the shipped form must redeem").toBe(303);
+      browser.absorb(submitted);
+      expect(browser.get(SESSION_COOKIE_NAME), "and it must set a session").toBeDefined();
+      // The session the form produced is a working one.
+      expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+    });
+
+    test("C1: the display name survives URLENCODING, not just JSON", async () => {
+      // The other half of accepting a second media type: the bytes differ. A
+      // name with a space, an ampersand and a non-ASCII character is encoded
+      // differently by each, and a form-encoded `+` must arrive as a space.
+      // `revokeInvite` and `loadInviteByToken` never see the raw string, so
+      // this is the only place the round trip is pinned.
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+      if (!minted.ok) throw new Error("mint failed");
+      const { browser } = await open(harness, minted.minted.token);
+      const name = "Ada L/ovelace & co — 引き継ぎ";
+      const submitted = await redeemUrlEncoded(harness, browser, minted.minted.token, { displayName: name });
+      expect(submitted.status).toBe(303);
+      browser.absorb(submitted);
+      const stored = await harness.db.prepare("SELECT display_name FROM guests").first<{ display_name: string }>();
+      expect(stored?.display_name).toBe(name);
+    });
+
     test("a revoked, expired or unknown invite all get the SAME closed page, and never the token", async () => {
       // A distinctive repo name, so "the page does not name the invite's scope"
       // is assertable without matching the product's own name in the title.
-      const revoked = await mintInvite(harness.db, { repo: "scope-canary-org" });
+      const revoked = await mintInvite(harness.db, { repo: "scope-canary-org" }, { keys });
       if (!revoked.ok) throw new Error("mint failed");
       await revokeInvite(harness.db, revoked.minted.invite.id);
       const unknown = await (await open(harness, "A".repeat(43))).response;
@@ -1353,7 +1581,7 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("an expired invite's page is closed, and the DB row is still there (expiry is a decision, not a deletion)", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       await harness.db.prepare("UPDATE invites SET expires_at = ? WHERE id = ?")
         .bind(new Date(Date.now() - 1000).toISOString(), minted.minted.invite.id)
@@ -1403,8 +1631,8 @@ function parseJson(raw: string): Record<string, unknown> {
       const lines: string[] = [];
       const original = console.log;
       console.log = (line: unknown) => { lines.push(String(line)); };
-      try {
-        const minted = await mintInvite(harness.db, { repo: REPO });
+        try {
+        const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
         if (!minted.ok) throw new Error("mint failed");
         const token = minted.minted.token;
         const { browser } = await open(harness, token);
@@ -1425,10 +1653,10 @@ function parseJson(raw: string): Record<string, unknown> {
       } finally {
         console.log = original;
       }
-    });
+        });
 
     test("an already-redeemed token is refused, and the closed page never says why", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const { browser } = await open(harness, minted.minted.token);
       expect((await redeem(harness, browser, minted.minted.token)).status).toBe(303);
@@ -1446,7 +1674,7 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("a second browser on a personal invite is refused, and no session is minted for it", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO });
+      const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const first = await open(harness, minted.minted.token);
       expect((await redeem(harness, first.browser, minted.minted.token)).status).toBe(303);
@@ -1462,7 +1690,7 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("max_browsers exceeded is refused at the HTTP boundary too", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const statuses: number[] = [];
       for (let index = 0; index < minted.minted.invite.maxBrowsers + 2; index++) {
@@ -1545,7 +1773,7 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("a tampered token redeems nothing", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const { browser } = await open(harness, minted.minted.token);
       const token = minted.minted.token;
@@ -1561,7 +1789,7 @@ function parseJson(raw: string): Record<string, unknown> {
     });
 
     test("a redemption with no browser binding is refused", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO });
+      const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       // Straight to the POST, skipping the open that mints the binding.
       const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
@@ -1574,50 +1802,124 @@ function parseJson(raw: string): Record<string, unknown> {
       expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>())?.n).toBe(0);
     });
 
-    test("the redeem body must be application/json, and a display name is required and bounded", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+    test("the redeem body accepts JSON or a browser form, and refuses everything else", async () => {
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const { browser } = await open(harness, minted.minted.token);
-      // Wrong media type: ADR-0012's rule, and it happens before the body is read.
-      for (const contentType of ["text/plain", "application/x-www-form-urlencoded", "application/ld+json", "text/json"]) {
+      const token = minted.minted.token;
+      const cookie = browser.header() ?? "";
+      // ADR-0012's named type, and everything that merely resembles it. The
+      // form's default type is the ONE addition, and it is the only addition on
+      // this route — `isRedeemContentType`'s comment says why, and the "C1: the
+      // SHIPPED form" case is what makes it load-bearing rather than
+      // theoretical.
+      // A trailing space is the SAME type after the trim every other route in
+      // this Worker already does. Its own invite, because a successful
+      // redemption consumes the slot — the first draft of this case reused
+      // `token` and every later assertion in it then met `already-redeemed`,
+      // which is correct behaviour landing on a test that had not noticed.
+      const spaced = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+      if (!spaced.ok) throw new Error("mint failed");
+      const { browser: bSpace } = await open(harness, spaced.minted.token);
+      expect((await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+        method: "POST",
+        ...NO_FOLLOW,
+        headers: { "content-type": "application/x-www-form-urlencoded ", cookie: bSpace.header() ?? "" },
+        body: `token=${spaced.minted.token}&displayName=${encodeURIComponent(NAME)}`,
+      })).status).toBe(303);
+      for (const contentType of ["text/plain", "application/ld+json", "text/json", "multipart/form-data", "application/x-www-form-urlencodedx"]) {
         const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
           method: "POST",
-          headers: { "content-type": contentType, cookie: browser.header() ?? "" },
-          body: JSON.stringify({ token: minted.minted.token, displayName: NAME }),
+          ...NO_FOLLOW,
+          headers: { "content-type": contentType, cookie },
+          body: `token=${token}&displayName=${NAME}`,
         });
-        expect(response.status, contentType).toBe(415);
-        expect(await json(response)).toMatchObject({ error: "unsupported-media-type" });
+        expect([400, 415], contentType).toContain(response.status);
+        if (response.status === 415) expect(await json(response)).toMatchObject({ error: "unsupported-media-type" });
       }
       // No header at all.
       expect((await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
         method: "POST",
         ...NO_FOLLOW,
-        headers: { cookie: browser.header() ?? "" },
-        body: JSON.stringify({ token: minted.minted.token, displayName: NAME }),
+        headers: { cookie },
+        body: `token=${token}&displayName=${NAME}`,
       })).status).toBe(415);
-      // A parameterised type is accepted, as it is everywhere else in the API.
-      expect((await redeem(harness, browser, minted.minted.token, { displayName: NAME }, { headers: { "content-type": "application/json; charset=utf-8" } })).status).toBe(303);
-      // Blank and over-long names, on a fresh team invite so slots remain.
-      const second = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      // A parameterised JSON type is accepted, as it is everywhere else.
+      expect((await redeem(harness, browser, token, { displayName: NAME }, { headers: { "content-type": "application/json; charset=utf-8" } })).status).toBe(303);
+      // And the form type, with and without a parameter.
+      const second = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!second.ok) throw new Error("mint failed");
       const { browser: b2 } = await open(harness, second.minted.token);
-      // A name inside the HTTP body's own bound but past `MAX_DISPLAY_NAME_CHARS`
-      // reaches the module and is refused as `display-name-rejected` -> the
-      // closed page (410).
+      expect((await redeemUrlEncoded(harness, b2, second.minted.token)).status).toBe(303);
+      const third = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+      if (!third.ok) throw new Error("mint failed");
+      const { browser: b3 } = await open(harness, third.minted.token);
+      expect((await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+        method: "POST",
+        ...NO_FOLLOW,
+        headers: { "content-type": "application/x-www-form-urlencoded; charset=utf-8", cookie: b3.header() ?? "" },
+        body: new URLSearchParams({ token: third.minted.token, displayName: NAME }).toString(),
+      })).status).toBe(303);
+      // The display name is required and bounded on BOTH encodings, and the
+      // bound is `redeemInvite`'s, not the parser's.
+      const fourth = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+      if (!fourth.ok) throw new Error("mint failed");
+      const { browser: b4 } = await open(harness, fourth.minted.token);
       for (const displayName of ["", "   ", "x".repeat(65)]) {
-        expect((await redeem(harness, b2, second.minted.token, { displayName })).status, JSON.stringify(displayName.slice(0, 12))).toBe(410);
+        expect((await redeemUrlEncoded(harness, b4, fourth.minted.token, { displayName })).status, displayName.slice(0, 8)).toBe(410);
+        expect((await redeem(harness, b4, fourth.minted.token, { displayName })).status, displayName.slice(0, 8)).toBe(410);
       }
-      // A name past the body bound is refused EARLIER, as a malformed body
-      // (400), because the handler never parses a field it has already decided
-      // it will not accept. Two shapes, one property: no name is stored.
-      for (const displayName of ["x".repeat(5000), "x".repeat(100_000)]) {
-        expect((await redeem(harness, b2, second.minted.token, { displayName })).status, String(displayName.length)).toBe(400);
-      }
-      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM guests WHERE display_name = ?").bind(NAME).first<{ n: number }>())?.n).toBe(1);
+      // Over the PARSER's ceiling but inside the module's is still refused by
+      // the module, so the two bounds are not confused for each other.
+      expect((await redeem(harness, b4, fourth.minted.token, { displayName: "x".repeat(5000) })).status).toBe(400);
+      expect((await redeemUrlEncoded(harness, b4, fourth.minted.token, { displayName: "x".repeat(5000) })).status).toBe(400);
+      // The FOUR successful redemptions above — the trailing-space probe, the
+      // parameterised JSON type, and the form type with and without a parameter
+      // — and no more: every refusal in this case must leave no guest behind.
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM guests").first<{ n: number }>())?.n).toBe(4);
+    });
+
+    test("a REPEATED form field is refused, and a repeated JSON key is deterministic", async () => {
+      // A form body can legitimately carry `token` twice, and "the first one" is
+      // how one browser's redemption becomes another's — the `since-repeated`
+      // rule `parseThreadsQuery` already applies. So the FORM encoding refuses a
+      // repeated name outright.
+      //
+      // JSON is different and the difference is not glossed over: `JSON.parse`
+      // keeps the LAST of a repeated key. That is standard, deterministic, and
+      // cannot be exploited — only one of the two values can match an invite and
+      // the other simply finds no row — so this asserts the behaviour rather
+      // than claiming a refusal the parser does not perform. Detecting it would
+      // mean re-scanning the raw text for top-level keys, which is a JSON
+      // parser, for a client-side bug a browser cannot produce.
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+      if (!minted.ok) throw new Error("mint failed");
+      const { browser } = await open(harness, minted.minted.token);
+      const token = minted.minted.token;
+      const cookie = browser.header() ?? "";
+      const decoy = "A".repeat(43);
+      const posted = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+        method: "POST",
+        ...NO_FOLLOW,
+        headers: { "content-type": "application/x-www-form-urlencoded", cookie },
+        body: `token=${token}&token=${token}&displayName=${encodeURIComponent(NAME)}`,
+      });
+      expect(posted.status).toBe(400);
+      expect(await json(posted)).toMatchObject({ error: "bad-request", reason: "unparsable-body" });
+      // JSON: last wins, and it is the value that counts.
+      const viaJson = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+        method: "POST",
+        ...NO_FOLLOW,
+        headers: { ...JSON_HEADERS, cookie },
+        body: `{"token":"${decoy}","token":"${token}","displayName":"${NAME}"}`,
+      });
+      expect(viaJson.status).toBe(303);
+      // Exactly one session either way — a repeat never mints a second one.
+      expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>())?.n).toBe(1);
     });
 
     test("an unparsable, non-object or wrongly-typed body is one 400 with a fixed reason", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO });
+      const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const { browser } = await open(harness, minted.minted.token);
       const cookie = browser.header() ?? "";
@@ -1649,6 +1951,35 @@ function parseJson(raw: string): Record<string, unknown> {
       const { browser } = await onboard(harness);
       const response = await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
       expect(response.status).toBe(200);
+    });
+
+    test("H1: re-opening the mail link does NOT strand a live session", async () => {
+      // The second regression this exists for. `GET /invite/<token>` minted a
+      // FRESH binding on every open and `Set-Cookie`d it, while the live
+      // session stays bound to the binding it was redeemed with — which is
+      // re-read on every call. So a second click on the mail link, a second tab,
+      // a session restore or a Back-navigation silently replaced the cookie the
+      // session depends on:
+      //
+      //   redeem -> 303 | GET /api/threads -> 200
+      //   re-open -> 200 | binding changed -> GET /api/threads -> 403
+      //   re-redeem -> 410 (the slot is spent, so there is no recovery)
+      //
+      // Triggers are ordinary browser behaviour, not an attack.
+      const { browser, token } = await onboard(harness);
+      const boundAtRedemption = browser.get(BROWSER_COOKIE_NAME);
+      expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+
+      // The guest clicks the mail link again. Same browser, same cookie jar —
+      // so the response's `Set-Cookie` lands on top of the live session's
+      // binding, which is the whole mechanism of the defect.
+      expect((await reopen(harness, browser, token)).status).toBe(200);
+      // …and the binding the live session depends on must be UNCHANGED.
+      expect(browser.get(BROWSER_COOKIE_NAME), "re-opening must not rotate the binding").toBe(boundAtRedemption);
+      expect((await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) })).status).toBe(200);
+      // And re-redeeming is still refused, so nothing was widened: single use is
+      // single use.
+      expect((await redeem(harness, browser, token)).status).toBe(410);
     });
 
     test("revoking the invite stops an ALREADY-MINTED, UNEXPIRED session on its next request", async () => {
@@ -1833,31 +2164,76 @@ function parseJson(raw: string): Record<string, unknown> {
   // ── rate limiting over HTTP ───────────────────────────────────────────
 
   describe("ADR-0012's rate limit, over HTTP", () => {
-    test("a token over its limit gets 429 with Retry-After, and the limit is shared with the OPEN route", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+    test("a token over its limit gets 429 with Retry-After, and the OPEN route cannot spend it", async () => {
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const token = minted.minted.token;
-      // The OPEN route spends the same bucket, so an unmetered oracle for "is
-      // this token live?" does not exist. Half the budget on opens…
-      for (let attempt = 0; attempt < Math.ceil(REDEEM_TOKEN_LIMIT / 2); attempt++) {
-        expect((await open(harness, token)).response.status, `open ${attempt}`).toBe(200);
-      }
       const { browser } = await open(harness, token);
-      let limited: DispatchResponse | undefined;
-      for (let attempt = 0; attempt < REDEEM_TOKEN_LIMIT; attempt++) {
-        const response = await redeem(harness, browser, token);
-        if (response.status === 429) { limited = response; break; }
+
+      // ── The OPEN route must NOT spend the per-token bucket ───────────────
+      // It used to, and that was a shipped DoS: the bucket is
+      // `invite:<hmac(token)>`, so anyone holding the URL could spend the
+      // intended guest's whole window with GETs and lock them out with no
+      // recovery, because the redemption slot is single-use and there is nothing
+      // to retry. Forty-five opens from a different address, then the guest.
+      const attacker = "198.51.100.4";
+      for (let attempt = 0; attempt < REDEEM_TOKEN_LIMIT + 5; attempt++) {
+        const response = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: attacker } });
+        expect(response.response.status, `open ${attempt}`).toBe(200);
       }
-      expect(limited?.status).toBe(429);
-      expect(Number(limited?.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
-      expect(limited?.headers.get("cache-control")).toBe("no-store");
-      expect(limited?.headers.get("x-content-type-options")).toBe("nosniff");
-      expect(await limited?.text()).toContain("Too many attempts");
-      // A different token is unaffected: the buckets are per invite.
-      const other = await mintInvite(harness.db, { repo: REPO });
+      // And the guest's own redemption is untouched by all of that.
+      expect((await redeem(harness, browser, token, { displayName: NAME })).status).toBe(303);
+    });
+
+    test("a token over its REDEMPTION limit gets 429 with Retry-After", async () => {
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+      if (!minted.ok) throw new Error("mint failed");
+      const token = minted.minted.token;
+      const digest = await keys.hash(token);
+      // Seed the token's own bucket at its ceiling, then one attempt from a
+      // fresh address, so the refusal can only be the token's.
+      // Seeded rather than counted up to: `seedCounter` writes one row where
+      // counting to the limit costs `limit + 1` sequential D1 round trips, and
+      // at 40 that once ran a case past bun's 5 s per-test timeout. It also
+      // asserts the boundary EXACTLY rather than "at some point it refused".
+      await seedCounter(`invite:${digest}`, REDEEM_TOKEN_LIMIT);
+      const { browser } = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
+      const limited = await redeem(harness, browser, token, { displayName: NAME }, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
+      expect(limited.status).toBe(429);
+      expect(Number(limited.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+      expect(limited.headers.get("cache-control")).toBe("no-store");
+      expect(limited.headers.get("x-content-type-options")).toBe("nosniff");
+      expect(await limited.text()).toContain("Too many attempts");
+      // A DIFFERENT token is unaffected: the two buckets are separate.
+      const other = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!other.ok) throw new Error("mint failed");
-      const { browser: b2 } = await open(harness, other.minted.token);
-      expect((await redeem(harness, b2, other.minted.token)).status).toBe(303);
+      const { browser: b2 } = await open(harness, other.minted.token, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
+      expect((await redeem(harness, b2, other.minted.token, { displayName: NAME }, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } })).status).toBe(303);
+    });
+
+    test("a token that does NOT resolve creates no counter row at all", async () => {
+      // M2's second half. The per-token key is `invite:<hmac(token)>` over
+      // whatever the caller presented, so charging it before the lookup would
+      // mean every guessed token is a fresh row: one D1 write each, and no real
+      // invite's budget ever touched. A per-token limit that cannot defend
+      // against guessing is not defending against guessing.
+      const garbage = ["A".repeat(43), "B".repeat(43), "C".repeat(43)];
+      const address = "192.0.2.55";
+      for (const token of garbage) {
+        const { browser } = await open(harness, token, { headers: { [CLIENT_IP_HEADER]: address } });
+        expect((await redeem(harness, browser, token, { displayName: NAME }, { headers: { [CLIENT_IP_HEADER]: address } })).status).toBe(410);
+      }
+      const rows = await harness.db.prepare("SELECT bucket, count FROM rate_limit_counters").all<{ bucket: string; count: number }>();
+      // NOT ONE `invite:` row. Six guessed tokens, six rows that do not exist.
+      expect(rows.results.filter((row) => row.bucket.startsWith("invite:"))).toEqual([]);
+      // The address bucket WAS charged for every one of them, which is the
+      // control that does work: ONE row, count 6 — the key is the edge-set
+      // address, so how many rows an attacker can create is bounded by how many
+      // source addresses they hold rather than by how much they can guess.
+      const ipRows = rows.results.filter((row) => row.bucket.startsWith("ip:"));
+      expect(ipRows).toHaveLength(1);
+      expect(ipRows[0]?.bucket).toBe("ip:192.0.2.55");
+      expect(ipRows[0]?.count).toBe(6);
     });
 
     test("a per-address limit exists and is separate from the per-token one", async () => {
@@ -1874,13 +2250,12 @@ function parseJson(raw: string): Record<string, unknown> {
       // got there is `test/invites.test.ts`'s job, and it spends 40 rows there
       // in milliseconds.
       const address = "203.0.113.7";
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!minted.ok) throw new Error("mint failed");
       const digest = await sha256Hex(minted.minted.token);
       // ONLY the address bucket, so the token's own budget stays whole and the
       // refusal that follows cannot be the token's.
-      const addressOnly = (): ReturnType<typeof redeemBuckets> =>
-        redeemBuckets({ tokenDigest: digest, address }).filter((bucket) => bucket.kind === "ip");
+      const addressOnly = (): RateBucket[] => addressBucket(address);
       for (let attempt = 0; attempt < REDEEM_IP_LIMIT; attempt++) {
         const spent = await spendAttempts(harness.db, addressOnly());
         expect(spent.ok, `prefill ${attempt}`).toBe(true);
@@ -1899,32 +2274,146 @@ function parseJson(raw: string): Record<string, unknown> {
       // And the same token from a DIFFERENT address is unaffected, so one
       // noisy neighbour cannot deny a stranger their own invite.
       const elsewhere = await open(harness, minted.minted.token, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
-      const fresh = await mintInvite(harness.db, { repo: REPO, kind: "team" });
+      const fresh = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
       if (!fresh.ok) throw new Error("mint failed");
       const other = await open(harness, fresh.minted.token, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } });
       expect((await redeem(harness, other.browser, fresh.minted.token, { displayName: NAME }, { headers: { [CLIENT_IP_HEADER]: "198.51.100.4" } })).status).toBe(303);
       expect(elsewhere.browser.get(BROWSER_COOKIE_NAME)).toBeDefined();
     });
 
-    test("a rate-limit refusal never names the bucket, the address or the token", async () => {
-      const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" });
-      if (!minted.ok) throw new Error("mint failed");
-      const token = minted.minted.token;
-      const { browser } = await open(harness, token, { headers: { "cf-connecting-ip": "198.51.100.4" } });
-      let body = "";
-      // The open spent one; the loop spends the rest.
-      for (let attempt = 0; attempt <= REDEEM_TOKEN_LIMIT; attempt++) {
-        const response = await redeem(harness, browser, token, { displayName: NAME }, { headers: { "cf-connecting-ip": "198.51.100.4" } });
-        const text = await response.text();
-        if (response.status === 429) { body = text; break; }
+    // ── M1: every path through the redeem handler is metered ─────────────
+    describe("every unmetered path from slice 3 is now metered", () => {
+      /** Counter rows, split by kind. The shape the handler must leave behind
+       * for an attempt that got as far as its own early return. */
+      async function counters(): Promise<{ ip: number; token: number }> {
+        const rows = (await harness.db.prepare("SELECT bucket FROM rate_limit_counters").all<{ bucket: string }>()).results;
+        return {
+          ip: rows.filter((row) => row.bucket.startsWith("ip:")).length,
+          token: rows.filter((row) => row.bucket.startsWith("invite:")).length,
+        };
       }
-      expect(body, "the per-token limit never fired").not.toBe("");
-      expect(body).not.toContain("198.51.100.4");
-      expect(body).not.toContain(token);
-      expect(body).not.toContain("invite:");
-      expect(body).not.toContain("ip:");
+      const ADDRESS = "198.51.100.77";
+
+      test("a malformed JSON body is metered", async () => {
+        const before = await counters();
+        expect((await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+          method: "POST",
+          ...NO_FOLLOW,
+          headers: { ...JSON_HEADERS, [CLIENT_IP_HEADER]: ADDRESS },
+          body: "not json at all",
+        })).status).toBe(400);
+        expect(await counters()).toEqual({ ip: before.ip + 1, token: before.token });
+      });
+
+      test("a wrong media type is metered", async () => {
+        const before = await counters();
+        expect((await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+          method: "POST",
+          ...NO_FOLLOW,
+          headers: { "content-type": "text/plain", [CLIENT_IP_HEADER]: ADDRESS },
+          body: "token=x",
+        })).status).toBe(415);
+        expect(await counters()).toEqual({ ip: before.ip + 1, token: before.token });
+      });
+
+      test("an over-long body is metered, and refused as TOO LARGE rather than unparsable", async () => {
+        // The parser used to run BEFORE the limiter, so an oversized body was an
+        // unmetered `request.text()` on an unauthenticated route — and
+        // `/invite/redeem` is unauthenticated BY DESIGN, because its credential
+        // is the token inside the body, so it has not been checked when the body
+        // arrives. The limiter bounds how MANY such requests there are; only a
+        // size ceiling bounds how BIG each one is.
+        const before = await counters();
+        const oversized = `{"token":"${"A".repeat(MAX_REDEEM_BODY_BYTES * 4)}","displayName":"x"}`;
+        const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+          method: "POST",
+          ...NO_FOLLOW,
+          headers: { ...JSON_HEADERS, [CLIENT_IP_HEADER]: ADDRESS },
+          body: oversized,
+        });
+        // 413, not 400: "send less" and "send something I can parse" are
+        // different answers, and collapsing them would hide the ceiling.
+        expect(response.status).toBe(413);
+        expect(await json(response)).toMatchObject({ error: "bad-request", reason: "body-too-large" });
+        expect(await counters()).toEqual({ ip: before.ip + 1, token: before.token });
+      });
+
+      test("the ceiling holds when there is NO content-length at all", async () => {
+        // The guarantee is the streaming cap, not the header, and the case that
+        // proves it is a body with **no declared length** — chunked transfer,
+        // which is what a client sends when it does not know the size, and what
+        // `content-length` cannot be relied on to describe.
+        //
+        // Two earlier versions of this test were wrong in ways worth recording.
+        // One asserted the cap using a STRING body, and miniflare computes
+        // `content-length` from a string — so it passed with the cap deleted
+        // (measured: the mutation survived). The next declared
+        // `content-length: "12"` over a large body and expected the cap to catch
+        // the discrepancy; it returned 400 instead, because at the HTTP layer a
+        // short declared length means the body IS 12 bytes — the platform, not
+        // the Worker, enforces that, so a lying header cannot deliver an
+        // oversized body and there is nothing for the cap to catch. The
+        // reachable case is an ABSENT header.
+        const oversized = `token=${"A".repeat(MAX_REDEEM_BODY_BYTES * 4)}&displayName=x`;
+        const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+          method: "POST",
+          ...NO_FOLLOW,
+          headers: { "content-type": FORM_MEDIA_TYPE, [CLIENT_IP_HEADER]: ADDRESS },
+          // A stream, so there is no length for miniflare to add.
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(oversized));
+              controller.close();
+            },
+          }),
+        });
+        expect(response.status).toBe(413);
+        expect(await json(response)).toMatchObject({ reason: "body-too-large" });
+      });
+
+      test("a body just under the ceiling is still parsed, so the bound is not a blanket refusal", async () => {
+        // The other side of the boundary, because a ceiling that refuses
+        // everything passes both tests above.
+        const name = "A".repeat(20);
+        const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+          method: "POST",
+          ...NO_FOLLOW,
+          headers: { "content-type": FORM_MEDIA_TYPE, cookie: "", [CLIENT_IP_HEADER]: ADDRESS },
+          body: new URLSearchParams({ token: "A".repeat(43), displayName: name }).toString(),
+        });
+        // 410 and the closed page, NOT 413: a body under the ceiling got all the
+        // way to the token lookup, which is the whole point of the other side.
+        expect(response.status).toBe(410);
+        expect(await response.text()).not.toContain("A".repeat(43));
+      });
+
+      test("both malformed OPEN-route spellings are metered", async () => {
+        // `/invite/` with an empty token, and a segment far past any real token.
+        // Neither spends a per-token bucket — there is no token to spend one on
+        // — and both spend the address bucket, which is the whole point.
+        const before = await counters();
+        for (const path of [`${INVITE_OPEN_PREFIX}`, `${INVITE_OPEN_PREFIX}${"a".repeat(400)}`]) {
+          const response = await harness.dispatch(`http://localhost${path}`, { headers: { [CLIENT_IP_HEADER]: ADDRESS } });
+          expect([404, 410], path).toContain(response.status);
+        }
+        expect(await counters()).toEqual({ ip: before.ip + 1, token: before.token });
+      });
+
+      test("a rate-limited address is refused BEFORE the body is read", async () => {
+        // The order, asserted through the counter rather than by reading the
+        // source: at the ceiling, a request whose body would otherwise be a 400
+        // is a 429. If the limiter moved back below the parse, this flips.
+        await seedCounter("ip:198.51.100.78", REDEEM_IP_LIMIT);
+        const response = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+          method: "POST",
+          ...NO_FOLLOW,
+          headers: { ...JSON_HEADERS, [CLIENT_IP_HEADER]: "198.51.100.78" },
+          body: "not json at all",
+        });
+        expect(response.status).toBe(429);
+      });
     });
-  });
+
 
   // ── logging ───────────────────────────────────────────────────────────
 
@@ -1933,7 +2422,7 @@ function parseJson(raw: string): Record<string, unknown> {
       const lines: string[] = [];
       const original = console.log;
       console.log = (line: unknown) => { lines.push(String(line)); };
-      try {
+        try {
         const { browser, sessionId, csrfToken } = await onboard(harness, { repo: REPO });
         await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
         await harness.dispatch(`http://localhost${THREADS_PATH}`, {
@@ -1955,13 +2444,13 @@ function parseJson(raw: string): Record<string, unknown> {
       } finally {
         console.log = original;
       }
-    });
+        });
 
     test("a refusal logs the reason from the closed vocabulary and nothing from the request", async () => {
       const lines: string[] = [];
       const original = console.log;
       console.log = (line: unknown) => { lines.push(String(line)); };
-      try {
+        try {
         const { browser, inviteId } = await onboard(harness);
         await revokeInvite(harness.db, inviteId);
         await harness.dispatch(`http://localhost${THREADS_PATH}`, { headers: authedHeaders(browser, null) });
@@ -1981,10 +2470,119 @@ function parseJson(raw: string): Record<string, unknown> {
         }
         // And no line anywhere in the exchange names the guest.
         for (const line of lines) expect(line).not.toContain(NAME);
+    } finally {
+      console.log = original;
+    }
+        });
+  });
+});
+      describe("the redactor's backstop is not the caller rule", () => {
+        test("the caller rule is pinned directly: the deny lines carry no guest field", async () => {
+          // Mutation N14 added `displayName` to the `invite.redeem.denied` line
+          // and SURVIVED, because `SENSITIVE_KEY` matches `display_?name` and ate
+          // the value. So the outcome was protected by the backstop while the
+          // caller rule the logger's own header calls primary was not enforced
+          // anywhere. This asserts the rule and not the outcome: the deny line's
+          // field set is exactly the closed vocabulary, so a future field has to
+          // be added here deliberately.
+          const lines: string[] = [];
+      const original = console.log;
+      console.log = (line: unknown) => { lines.push(String(line)); };
+            try {
+            const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+            if (!minted.ok) throw new Error("mint failed");
+            const { browser } = await open(harness, minted.minted.token);
+            await redeemUrlEncoded(harness, browser, minted.minted.token, { displayName: NAME });
+            await redeemUrlEncoded(harness, browser, minted.minted.token, { displayName: NAME });
+            const denials = lines
+              .map((line) => JSON.parse(line) as Record<string, unknown>)
+              .filter((parsed) => parsed["msg"] === "invite.redeem.denied");
+            expect(denials.length).toBeGreaterThan(0);
+            for (const denial of denials) {
+              expect(Object.keys(denial).sort(), JSON.stringify(denial)).toEqual(["level", "msg", "reason", "requestId", "ts"]);
+              expect(denial["reason"]).toBe("already-redeemed");
+            }
+        } finally {
+          console.log = original;
+        }
+    });
+
+        test("the invite log lines' field set is closed, and `canComment` is not one of them", async () => {
+          // L1. `SENSITIVE_KEY`'s content-word alternative has NO boundary guards
+          // (deliberately — it is what stops `arrayOfEmails`), so `canComment` was
+          // matched by `comment` and the BOOLEAN was redacted: every invite log
+          // line carried `"canComment":"[redacted]"` and no information at all.
+          // Renaming the field is the fix; narrowing the redactor is not, because
+          // that alternative is guard-free by design and slice 2's boundary work
+          // was on the token-shape rule.
+          const lines: string[] = [];
+      const original = console.log;
+      console.log = (line: unknown) => { lines.push(String(line)); };
+            try {
+            const minted = await mintInvite(harness.db, { repo: REPO, kind: "view" }, { keys });
+            if (!minted.ok) throw new Error("mint failed");
+            const { browser } = await open(harness, minted.minted.token);
+            await redeemUrlEncoded(harness, browser, minted.minted.token, { displayName: NAME });
+            const inviteLines = lines
+              .map((line) => JSON.parse(line) as Record<string, unknown>)
+              .filter((parsed) => typeof parsed["msg"] === "string" && parsed["msg"].startsWith("invite."));
+            expect(inviteLines.length).toBeGreaterThan(1);
+            // No invite line carries a redaction at all, and none of them names a
+            // field containing `comment` — `canComment` and `commentable` both
+            // did, so both were replaced.
+            for (const line of inviteLines) {
+              expect(JSON.stringify(line)).not.toContain("[redacted]");
+              for (const field of Object.keys(line)) expect(field.toLowerCase()).not.toContain("comment");
+            }
+            // The rights bit is logged as the real boolean, under a name the
+            // redactor does not own — and it is the COLUMN, not a value derived
+            // from `kind`, because the schema does not tie the two together.
+            const opened = inviteLines.find((line) => line["msg"] === "invite.opened");
+            expect(opened?.["inviteKind"]).toBe("view");
+            expect(opened?.["writable"]).toBe(false);
+            const ok = inviteLines.find((line) => line["msg"] === "invite.redeem.ok");
+            expect(ok?.["inviteKind"]).toBe("view");
+            expect(ok?.["writable"]).toBe(false);
+            // A `view` row whose COLUMN disagrees with its kind is reported from
+            // the column, which is the whole reason the bit is logged at all.
+            await harness.db.prepare("UPDATE invites SET can_comment = 1 WHERE repo = ?").bind(REPO).run();
+            const second = await mintInvite(harness.db, { repo: "coerced-org", kind: "view" }, { keys });
+            if (!second.ok) throw new Error("mint failed");
+            const coerced: string[] = [];
+            console.log = (line: unknown) => { coerced.push(String(line)); };
+            try {
+              await harness.db.prepare("UPDATE invites SET can_comment = 1 WHERE id = ?").bind(second.minted.invite.id).run();
+              await open(harness, second.minted.token);
+              const coercedLine = coerced
+                .map((line) => JSON.parse(line) as Record<string, unknown>)
+                .find((parsed) => parsed["msg"] === "invite.opened");
+              expect(coercedLine?.["writable"]).toBe(true);
+            } finally {
+              console.log = original;
+            }
       } finally {
         console.log = original;
       }
     });
-  });
-  });
+
+      test("a rate-limit refusal never names the bucket, the address or the token", async () => {
+        const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
+        if (!minted.ok) throw new Error("mint failed");
+        const token = minted.minted.token;
+        const { browser } = await open(harness, token, { headers: { "cf-connecting-ip": "198.51.100.4" } });
+        let body = "";
+        // The open spent one; the loop spends the rest.
+        for (let attempt = 0; attempt <= REDEEM_TOKEN_LIMIT; attempt++) {
+          const response = await redeem(harness, browser, token, { displayName: NAME }, { headers: { "cf-connecting-ip": "198.51.100.4" } });
+          const text = await response.text();
+          if (response.status === 429) { body = text; break; }
+        }
+        expect(body, "the per-token limit never fired").not.toBe("");
+        expect(body).not.toContain("198.51.100.4");
+        expect(body).not.toContain(token);
+        expect(body).not.toContain("invite:");
+        expect(body).not.toContain("ip:");
+      });
+    });
 });
+  });

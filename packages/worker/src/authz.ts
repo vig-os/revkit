@@ -209,7 +209,7 @@ export function classifyRoute(pathname: string, method: string): Route {
     // `requiresComment` is what makes ADR-0009's "view is read-only"
     // enforceable while `POST /api/threads` is still a 501: the gate refuses a
     // read-only guest BEFORE the handler, so the 501 is only ever reached by a
-    // caller entitled to write. See `test/invite-http.test.ts`.
+    // caller entitled to write. See the HTTP half of `test/invites.test.ts`.
     if (verb === "POST") return route("threads-append", true, true, true, undefined, false);
     return route("method-not-allowed", true, false, false, undefined, true);
   }

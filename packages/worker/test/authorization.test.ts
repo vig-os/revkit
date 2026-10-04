@@ -466,7 +466,7 @@ describe("ADR-0012's per-request gate", () => {
       // `invite` row with no redemption behind it is refused as
       // `invite-no-grant` (401) rather than as an unrecognised kind, because
       // this build DOES know the rules for that provider and the row does not
-      // satisfy them. `test/invite-http.test.ts` pins that half.
+      // satisfy them. the HTTP half of `test/invites.test.ts` pins that.
       const issued = await issueTestSession(harness.db);
       for (const kind of ["github", "auth0", "invitee", "OPERATOR", "Operator", " operator"]) {
         await harness.db.prepare("UPDATE sessions SET identity_kind = ?").bind(kind).run();

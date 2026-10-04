@@ -18,6 +18,7 @@
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { revisionOf } from "@revkit/review-core";
+import { TEST_INVITE_TOKEN_HMAC_KEY } from "./harness.ts";
 import {
   authHeaders,
   cookieHeader,
@@ -113,6 +114,7 @@ describe("ADR-0025 runtime gate", () => {
   let harness: Harness;
   let probe: Harness;
 
+  let broken: Harness;
   beforeAll(async () => {
     // Sequential on purpose: both bundles are built before either
     // miniflare starts, so the two `Bun.build` calls never overlap.
@@ -120,11 +122,39 @@ describe("ADR-0025 runtime gate", () => {
     const probeScript = await probeBundle();
     harness = await startWorker({ script: workerScript });
     probe = await startWorker({ script: probeScript });
+    // ONE misconfigured deploy, shared by every case that needs it.
+    //
+    // `vars: null` plus `inviteTokenKey: null` binds NOTHING, so this
+    // instance has neither `REVKIT_VERSION` nor `INVITE_TOKEN_HMAC_KEY`.
+    //
+    // `inviteTokenKey: null` is REQUIRED and was the reason this describe's
+    // missing-key case measured the wrong error: `vars: null` alone leaves the
+    // key bound, because the harness supplies it through `bindings` rather
+    // than through `vars`. So the instance had a key and no `REVKIT_VERSION`,
+    // `revkitBundlePath(undefined)` threw first, and the log line said
+    // `Cannot read properties of undefined (reading 'length')` — a real
+    // message about a real fault, just not the one under test.
+    //
+    // The two bindings are absent TOGETHER on purpose: the missing-key check
+    // is deliberately the first statement in `fetch`, so on this instance it
+    // is what fires, and a deployment missing `REVKIT_VERSION` alone would
+    // report the same thing. `revkitBundlePath`'s own refusal is covered
+    // directly in `test/headers.test.ts`.
+    //
+    // And since slice 3's
+    // review the missing-secret refusal is checked HERE, on the same instance,
+    // rather than from a second one in `invites.test.ts`. Sharing it is the
+    // right shape for the same reason `harness` is reused as the healthy
+    // control below: two `Miniflare` instances are not obviously running the
+    // same bytes, and this host has a measured cliff on how many workerd
+    // instances one `bun test` process holds (see `test/harness.ts`).
+    broken = await startWorker({ script: workerScript, vars: null, inviteTokenKey: null });
   });
 
   afterAll(async () => {
     await harness.dispose();
     await probe.dispose();
+    await broken.dispose();
   });
 
   // ── A1 ───────────────────────────────────────────────────────────────
@@ -508,8 +538,8 @@ describe("ADR-0025 runtime gate", () => {
     // `revkitBundlePath(undefined)` throws on `version.length` while the
     // header context is being built — before any route runs. That is a
     // misconfigured deploy, which is worth keeping tested.
-    const broken = await startWorker({ vars: null });
-    try {
+    // The shared misconfigured instance from this describe's `beforeAll`.
+
       const response = await broken.dispatch("http://localhost/healthz");
       // Exactly 500. Not a set containing 500.
       expect(response.status).toBe(500);
@@ -524,31 +554,77 @@ describe("ADR-0025 runtime gate", () => {
       expect(response.headers.get("permissions-policy")).toContain("camera=()");
       // ADR-0020: the id a reviewer quotes is in the response AND in the log.
       expect(response.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
-    } finally {
-      await broken.dispose();
+  });
+
+  // ── the catch block, actually entered ─────────────────────────────────
+
+  // ── the missing HMAC key, and what the error boundary logs ───────────
+  test("a deployment with no INVITE_TOKEN_HMAC_KEY refuses EVERY route, /healthz included", async () => {
+    // There is no fallback key: a missing secret is a hard failure rather than a
+    // silent one, because a zero-filled key produces a VALID, WRONG digest,
+    // which is worse than no key. `/healthz` is included deliberately — a
+    // deployment that cannot hash an invite token cannot redeem one, so a
+    // liveness probe that reported it healthy would be lying. `src/invite-token.ts`
+    // has the full argument, including why a Workers module has no "start" at
+    // which to refuse and why this first-line check is the equivalent.
+    for (const [path, method] of [
+      ["/healthz", "GET"],
+      ["/api/threads", "GET"],
+      ["/invite/redeem", "POST"],
+      [`/invite/${"A".repeat(43)}`, "GET"],
+      ["/nope", "GET"],
+    ] as const) {
+      const response = await broken.dispatch(`http://localhost${path}`, { method });
+      expect(response.status, `${method} ${path}`).toBe(500);
+      expect(await response.text()).toBe("internal error\n");
     }
   });
 
-  test("the 500's cause is the missing var, not an unrelated fault", async () => {
-    // Proves the case above is not passing for some other reason: the SAME
-    // script bytes with `REVKIT_VERSION` bound answer 200, so the only
-    // variable is the var.
-    //
-    // **The control is this file's OWN `harness`, not a freshly-spawned
-    // Worker.** An earlier revision built a second healthy miniflare for
-    // this, which is a weaker control AND cost a workerd spawn: two separate
-    // `Miniflare` instances are not obviously running the same bytes, so a
-    // difference between them could have been the cause. `harness` was built
-    // from `workerBundle()` and `broken` from the same call, so the script is
-    // byte-identical by construction and the only variable is `vars`. It also
-    // answers `/healthz` 200 in the A1 case above, so nothing new has to be
-    // believed.
-    expect((await harness.dispatch("http://localhost/healthz")).status).toBe(200);
-    const broken = await startWorker({ vars: null });
+  test("the error boundary logs the MESSAGE, not the class name", async () => {
+    // Slice 3 logged `error.name` and justified it by hand. The redactor is the
+    // control for "a message can carry a SQL fragment or a store path", and it
+    // was never applied to a field the call site chose not to fill — so the
+    // strongest available claim about the Worker's logs was untested on the one
+    // path that matters. With `error.name` the field below would be the bare
+    // class name, so the two are distinguishable rather than interchangeable.
+    // The line is forwarded by miniflare over its own wire, so it reaches the
+    // HOST after the response resolves — restoring `console.log` the moment
+    // `dispatch` returns truncates the capture at an unpredictable point, and
+    // this test measured exactly that (it failed whenever the suite ran under
+    // load, with zero lines). So: poll for the line on a bounded budget, which
+    // is what `test/logger.test.ts` does for the same reason. A line that never
+    // arrives still fails, just after the budget rather than immediately.
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (line: unknown) => { lines.push(String(line)); };
+    let response;
     try {
-      expect((await broken.dispatch("http://localhost/healthz")).status).toBe(500);
+      response = await broken.dispatch("http://localhost/healthz");
+      const deadline = Date.now() + 2_000;
+      while (
+        !lines.some((line) => line.includes('"request.error"')) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
     } finally {
-      await broken.dispose();
+      console.log = original;
     }
+    expect(response.status).toBe(500);
+    const errors = lines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((parsed) => parsed["msg"] === "request.error");
+    expect(errors.length).toBeGreaterThan(0);
+    for (const line of errors) {
+      expect(line["error"]).toBe(
+        "MissingInviteTokenKeyError: env.INVITE_TOKEN_HMAC_KEY is absent or shorter than 32 characters; " +
+          "invite tokens cannot be hashed or verified.",
+      );
+      expect(line["error"]).not.toBe("MissingInviteTokenKeyError");
+      // It names the BINDING, which is a fixed identifier, and no value.
+      expect(String(line["error"])).toContain("INVITE_TOKEN_HMAC_KEY");
+      expect(String(line["error"])).not.toContain(TEST_INVITE_TOKEN_HMAC_KEY);
+    }
+    for (const line of lines) expect(line).not.toContain(TEST_INVITE_TOKEN_HMAC_KEY);
   });
 });

@@ -46,6 +46,18 @@ carrier CGNAT is many browsers, and it is trivially shared), and a user-agent
 string is forgeable attacker-controlled text on every request. The cookie
 identifies a browser *profile*, which is what the property is about.
 
+**Correction from the slice-3 review round: the binding is minted on the open,
+but REUSED when one already exists.** The original text above says the cookie is
+"minted by the response to `GET /invite/<token>`", and implemented literally
+that minted a FRESH binding on every open. Because a live session is bound to
+the binding it was redeemed with and that binding is re-read on every call,
+clicking the mail link a second time — or a Back-navigation, or a session
+restore — silently replaced the cookie the live session depended on and locked
+the guest out of their own review, with no recovery, because the redemption slot
+is single-use. `GET /invite/<token>` now **reuses** a present, token-shaped
+binding and only mints one when the browser has none. A second browser still
+gets its own, so "several browsers" is unchanged; only the rotation was wrong.
+
 What it stops: an invite forwarded to a second person (that browser finds the
 slot spent) and a session cookie copied out of one profile and replayed from
 another (refused on every call). What it does **not** stop: an attacker who
