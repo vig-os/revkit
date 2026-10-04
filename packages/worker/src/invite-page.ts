@@ -27,10 +27,27 @@
 //   - the guest's own display name is typed into an `<input>`, never
 //     rendered — it exists only in the POST body and in the `guests` row.
 //
-// So there is no HTML-escaping helper here, and adding one would be a false
-// comfort: there is nothing to escape. the validation half in `test/invites.test.ts` proves it by
-// minting with a hostile `repo` and asserting the MINT is refused, and by
-// opening a link whose token carries markup and asserting the response does not
+// Two independent controls, and which one is load bearing matters.
+//
+// **Validation is the control.** Every interpolated value is checked by SHAPE
+// before it reaches this module — the token by `isTokenShaped`, `repo` by
+// `isRepoName`, `pr` by `isPullNumber`, `kind` by membership of `SHARE_TYPES` —
+// and the character sets those admit contain none of `<`, `"`, `&` or `'`. So
+// nothing here CAN be escaped, which is why a whole-page escaping helper would
+// be a false comfort: it would be untestable, because no input reaches these
+// interpolations that it could have changed.
+//
+// **Escaping is the backstop, and it is applied to every interpolated value
+// anyway** — `text()` below, on all four: `scope`, `kind`, `rights` and the
+// hidden `token`. Two of those four are caller-supplied, so "only fixed strings
+// need it" would be the wrong rule. It is the backstop rather than the control
+// precisely because no input today can exercise it; if a future edit widens a
+// validator's character set, the failure mode is a visibly wrong page rather
+// than markup execution.
+//
+// `test/invites.test.ts` proves the validation half — the half that carries the
+// argument: it mints with a hostile `repo` and asserts the MINT is refused, and
+// it opens a link whose token carries markup and asserts the response does not
 // contain it.
 //
 // The alternative that was rejected is `?name=` on the `GET`, which would have
@@ -45,10 +62,19 @@ import { MAX_DISPLAY_NAME_CHARS, type ShareType } from "./invites.ts";
  * Named here because the page is what fixes it; see the note on `redeemFormPage`. */
 export const FORM_MEDIA_TYPE = "application/x-www-form-urlencoded";
 
-/** Escape hatch for text that is NOT validated by shape. Used for the fixed
- * strings below only — and there are none, which is why this exists at all:
- * `revokeInvite` and the rate-limit kinds are interpolated through it so that
- * a future editable string cannot skip a check by landing in the wrong spot. */
+/** HTML-escape a value on its way into the markup.
+ *
+ * Applied to EVERY interpolated value in this module — `scope`, `kind`,
+ * `rights` and the hidden `token` — and not only to fixed strings, because two
+ * of those four are caller-supplied. It is the **backstop**, not the control:
+ * each is also shape-validated upstream into a character set containing none of
+ * `<`, `"`, `&` or `'`, which is what makes the page safe, and which is why no
+ * input can exercise this function today.
+ *
+ * It exists so that a future edit widening a validator's character set degrades
+ * to a visibly wrong page instead of markup execution, and so that a value
+ * cannot skip escaping merely by being interpolated in the wrong spot.
+ */
 function text(value: string): string {
   return value
     .replace(/&/g, "&amp;")

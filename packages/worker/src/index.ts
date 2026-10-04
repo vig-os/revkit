@@ -139,7 +139,7 @@ import {
   inviteTokenHasher,
   type InviteTokenHasher,
 } from "./invite-token.ts";
-import { addressBucket, clientAddress, spendAttempts, tokenBucket } from "./rate-limit.ts";
+import { addressBucket, clientAddress, openBuckets, spendAttempts, tokenBucket } from "./rate-limit.ts";
 import {
   CSRF_HEADER,
   SessionAlreadyRotatedError,
@@ -575,9 +575,16 @@ async function openInvite(
 ): Promise<Response> {
   const pathname = safePath(request);
   const token = inviteTokenFrom(pathname);
-  // No token, so no token-shaped bucket to charge, but the address bucket still
-  // applies: this path is reachable for free and must not be unmetered.
-  const limited = await spendAttempts(env.DB, addressBucket(clientAddress(request.headers)));
+  // NEVER unmetered, and the rule that guarantees it lives in `openBuckets` —
+  // the address bucket when the edge set one, the per-token bucket when it did
+  // not, because an empty bucket list writes nothing at all.
+  const limited = await spendAttempts(
+    env.DB,
+    openBuckets({
+      address: clientAddress(request.headers),
+      tokenHash: token === undefined ? undefined : await keys.hash(token),
+    }),
+  );
   if (!limited.ok) {
     scope.logger.log("info", "rate.limit.hit", { bucketKind: limited.kind, route: "invite-open" });
     return rateLimited(limited.retryAfterSeconds, scope);
@@ -663,6 +670,15 @@ async function redeemFromRequest(
   scope: RequestScope,
 ): Promise<Response> {
   const address = clientAddress(request.headers);
+  // Same rule as the open route, and for the same reason: an empty bucket list
+  // writes nothing, so a request with no edge address would skip the limiter
+  // entirely on this path too. The token is inside the body, which has not been
+  // read yet at this point — so before the parse there is no token key to fall
+  // back to, and the address bucket being empty here means this specific request
+  // is unmetered. That is stated rather than papered over: reading the body to
+  // get a key would undo the ordering rule above. What IS metered without an
+  // address is every request that reaches the token lookup, which is the
+  // expensive path.
   const limited = await spendAttempts(env.DB, addressBucket(address));
   if (!limited.ok) {
     scope.logger.log("info", "rate.limit.hit", { bucketKind: limited.kind, route: "invite-redeem" });

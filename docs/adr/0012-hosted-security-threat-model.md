@@ -97,7 +97,10 @@ the 404s, and it runs in this order:
    read is not a credential.
 2. **CSRF**, on state-changing verbs only: `x-revkit-csrf` must hash to that
    session's own `sessions.csrf_hash`.
-3. **`application/json`**, on state-changing verbs only.
+3. **`application/json`**, on state-changing verbs only — **with exactly one
+   documented exception, `POST /invite/redeem`**, which also accepts
+   `application/x-www-form-urlencoded`. See the amendment at the end of this
+   document for why that is not a second API media type.
 
 **Satisfied by this amendment:**
 
@@ -105,7 +108,7 @@ the 404s, and it runs in this order:
   and load-bearing on a reachable route (`POST /api/session/refresh`), with the
   token bound per session rather than being a constant.
 - "the API accepts only `application/json`" — real, including a body-less POST,
-  which must still declare it.
+  which must still declare it, and with the **one exception below**.
 - Sessions are HttpOnly / Secure / SameSite=Lax, and additionally `__Host-`,
   which the browser only accepts without a `Domain` attribute — so a sibling
   subdomain cannot set a cookie this origin will send.
@@ -285,9 +288,13 @@ asserted: `X-Forwarded-For` is **never** read (every hop appends to it, so it is
 forgeable and a forgeable identity half would make the whole limit forgeable);
 and the **per-token limit is enforced by a test against `max_browsers`**, because
 a limit below `2 × max_browsers` makes a legitimate multi-browser invite
-unusable — it was 10 against `team`'s `max_browsers = 10`, and each browser costs
-two attempts (open, then redeem), so the tenth browser was rate-limited rather
-than admitted. The relationship is **asserted, not derived**: `REDEEM_TOKEN_LIMIT`
+unusable — it was 10 against `team`'s `max_browsers = 10`, and each browser used
+to cost two attempts against that budget (open, then redeem), so the tenth
+browser was rate-limited rather than admitted. **It costs one now**: the open
+route no longer spends the per-token bucket, because charging a budget to a GET
+on a URL anyone holding the link can replay was a denial of service in its own
+right. The `2 ×` in the relationship is therefore slack rather than a tight fit,
+which is the safe direction. The relationship is **asserted, not derived**: `REDEEM_TOKEN_LIMIT`
 is the constant `40` and the test
 ("the per-token limit is above 2 x the largest max_browsers") is what fails if
 someone edits one without the other. No code computes the limit from
@@ -327,7 +334,35 @@ which is how it is testable while `POST /api/threads` is still a 501: a
 read-only guest's attempt at the append is refused `403 invite-read-only`, and
 the 501 is only ever reached by a caller entitled to write.
 
-### 4. Sessions are issued to a guest by an unauthenticated route — and why that
+### 4. "`application/json` only" — and the one route that also accepts a form
+
+**The JSON-only clause above is about the API, and `POST /invite/redeem` is not
+one.** Its caller is a person who followed a link in a mail client and is
+standing in front of the display-name form this Worker itself rendered; a
+browser submits that form as `application/x-www-form-urlencoded`, because the
+page declares no `enctype`. Refusing it means the shipped page cannot be
+submitted by the thing it was built for — which is what happened: the route
+accepted only JSON, so every redemption through the shipped form answered `415`
+while the test suite was green, because the tests posted JSON the way a *program*
+would rather than the way a *browser* does. **This is the only route in the
+Worker with the exception**, and it stays that way deliberately: every other
+body-carrying route is consumed by revkit's own client code and has no browser
+in the loop, so a second media type there would widen the surface for nothing.
+
+What the exception does **not** do is relax the rules. `text/plain`,
+`application/ld+json` and every other type are still refused with `415`, a
+parameterised type of either (`application/json; charset=utf-8`) is accepted as
+the type it names, and the two encodings are held to the **same** limits:
+a repeated form field is refused outright rather than resolved, the display-name
+bound is `redeemInvite`'s on both paths, and the token shape is one predicate
+(`TOKEN_SHAPE`) for both. The encoding is named once, in `src/invite-page.ts`,
+and imported by the route — so the page and the route cannot disagree about it
+without a type error, and a test derives its request from the page's own markup
+(`action`, `method`, the absent `enctype` and the field names) rather than from a
+hand-written copy of what the page emits.
+
+
+### 5. Sessions are issued to a guest by an unauthenticated route — and why that
 ### is not `POST /api/session`
 
 Slice 3 adds the first route in this Worker that hands a session to a caller who
@@ -349,7 +384,7 @@ has none, and it is worth saying precisely what stands in for the gate there:
   `POST /api/session` does not exist: an endpoint that hands out review access
   is worse than "whoever holds write access to D1 mints it".
 
-### 5. Two ungated readers of `env.DB`, and the restated invariant
+### 6. Two ungated readers of `env.DB`, and the restated invariant
 
 Slice 2's invariant was "the gate is the only path to `env.DB`". The invite
 routes must be ungated — a guest arriving from a mail client has no session — so

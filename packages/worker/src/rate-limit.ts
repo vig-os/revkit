@@ -144,6 +144,40 @@ export function addressBucket(address: string | undefined): RateBucket[] {
 }
 
 /**
+ * Which buckets the OPEN route charges, and the one rule behind it: **the open
+ * route is never unmetered.**
+ *
+ * Normally that is the address bucket alone, because the per-token bucket must
+ * NOT be charged here — the open is a GET on a URL anyone holding the link can
+ * replay, so charging their redemption budget to it is the denial of service
+ * this route used to ship.
+ *
+ * But `addressBucket(undefined)` is `[]`, and `spendAttempts` over an empty list
+ * writes **nothing** — so an absent edge address would leave the route with no
+ * limiter at all, which is a regression against the version before the
+ * per-token bucket was dropped here (that one always charged something). The
+ * edge always sets the address in production (`workers_dev: false` plus
+ * `routes`), so this is defence in depth — and defence in depth that depends on
+ * a header being present is not defence in depth. So with no address, the
+ * per-token bucket is charged INSTEAD: it is the only key available, it is
+ * per-token so no unrelated caller shares it, and the trade (a holder of the URL
+ * spending that token's budget) is strictly better than spending nothing.
+ *
+ * With neither an address nor a token — a malformed open path — there is no key
+ * at all, and the result is empty. That is stated rather than papered over: a
+ * synthetic shared bucket would be one row every caller contends for, so it
+ * would trade a metering gap for a denial of service.
+ */
+export function openBuckets(input: {
+  readonly address: string | undefined;
+  readonly tokenHash: string | undefined;
+}): RateBucket[] {
+  const byAddress = addressBucket(input.address);
+  if (byAddress.length > 0 || input.tokenHash === undefined) return byAddress;
+  return tokenBucket(input.tokenHash);
+}
+
+/**
  * The PER-TOKEN bucket, and when it is spent.
  *
  * **Only after `loadInviteByToken` has found the invite LIVE**, and only on the
