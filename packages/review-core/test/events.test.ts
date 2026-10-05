@@ -226,6 +226,8 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     threadId: "th-1",
     target: "comment",
     commentId: "c-1",
+    commentSeq: 1,
+    bodyHash: "f".repeat(64),
   },
   "build.requested": {
     seq: 19,

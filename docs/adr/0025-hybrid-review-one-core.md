@@ -234,6 +234,18 @@ review. What changed is that the decision is now *possible*, and it is recorded
 as an event whose only permitted author is the reviewer — see the ADR-0006
 amendment for the log-level trust rules.
 
+**What that property is, precisely.** *The agent bearer is refused the promote
+route, and an agent-authored item reaches GitHub only via a `draft.promoted`
+recorded by a cookie session.* It is a statement about the bearer and the HTTP
+surface. It is **not** a statement that the agent as a process has no route to a
+write: on the local surface a same-user agent can mint a launch code
+(`POST /-/launch-code`) and exchange it for the reviewer's session cookie
+(`GET /-/auth?code=…`), and that session is `local` like any other, so it can
+promote. That is a pre-existing property of the local surface (since PR #38),
+not something this amendment introduces or settles, and it is owned as a decision
+on **#55**. Promotion makes a reviewer's session load-bearing for B6, so this
+amendment records the limit of the claim rather than leaving it implicit.
+
 **A refusal writes nothing, and a superseded promotion does not fire.** Every
 refusal the route can return is decided before the log's first append, so a
 refused promotion leaves the draft exactly where it was — still badged, still
@@ -244,6 +256,16 @@ stale target, and no reconcile resolves it. The rule is one derivation in
 `@revkit/review-core` (`reduceThreadLifecycleStates`) read by the rail's draft
 list, the route and the reconciler alike, and it is enforced in the log's
 validator too — the writer is not allowed a different answer than the UI.
+
+**Promotion pins the text it approves.** The event records the promoted comment's
+authoring `seq` and the SHA-256 of its body at promotion time, and a comment whose
+body no longer matches is refused rather than published — so a future edit route
+cannot swap the text between the reviewer's click and the write.
+
+**A superseded change supersedes the reviewer's own intent too.** The rule is "the
+thread's current lifecycle change acts, whoever authored it". Before this amendment
+existed, a reviewer's own unresolved resolve survived an agent's later reopen and was
+then fired, leaving GitHub resolved and the log `open`. Both orders are now pinned.
 
 **Promotion needs an open pending review.** The route refuses
 (`no-open-pending-review`) when the log's pending review is submitted or

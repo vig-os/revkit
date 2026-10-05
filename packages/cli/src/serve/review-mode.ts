@@ -1063,6 +1063,14 @@ export type DraftToPromote =
        * already in the log. A promotion whose intent append was lost is
        * `promotedAtSeq` set + this false, and the caller repairs it. */
       readonly intentRecorded: boolean;
+      /** The content pin the reviewer's promotion recorded: the `seq` of
+       * the authoring event and `revisionOf(body)` of the text they
+       * approved. `findDraftToPromote` has already refused a body that
+       * no longer matches, so these are what a NEW promotion must
+       * record. */
+      readonly commentSeq: number;
+      /** The pin already on the log, when one is. */
+      readonly promotedPin?: { readonly commentSeq: number; readonly bodyHash: string };
     }
   | {
       /** An agent-authored resolve/reopen to promote. */
@@ -1118,6 +1126,34 @@ export async function findDraftToPromote(input: {
         detail: `comment '${commentId}' was authored by '${authoredBy ?? "unknown"}' — only an agent's draft can be promoted.`,
       };
     }
+    // Issue #70 round 2: refuse a draft whose body has moved since the
+    // reviewer last approved it. There is no edit route today, so this
+    // cannot fire yet — which is exactly why it is pinned here rather
+    // than left to the day an edit route lands. The check is on the
+    // CURRENT body against the pin the last promotion recorded; a
+    // promotion that pinned nothing (a log written before the pin
+    // existed) cannot be compared and is reported so the caller can
+    // refuse it rather than promote unknown text.
+    const pinned = promotionPinFor(events, commentId);
+    if (pinned !== undefined) {
+      const currentHash = await revisionOf(comment.body);
+      if (currentHash !== pinned.bodyHash) {
+        return {
+          ok: false,
+          error: "promoted-body-changed",
+          detail:
+            `comment '${commentId}' has changed since it was promoted (the approved text hashes to ` +
+            `${pinned.bodyHash.slice(0, 12)}…, the current text to ${currentHash.slice(0, 12)}…) — ` +
+            `review the current text and promote it again.`,
+        };
+      }
+    } else if (promotionSeqFor(events, { threadId: thread.id, target: "comment", commentId }) !== undefined) {
+      return {
+        ok: false,
+        error: "promoted-body-changed",
+        detail: `comment '${commentId}' was promoted without a content pin, so its current text cannot be shown to be the approved text.`,
+      };
+    }
     const reply = !events.some((event) => event.kind === "comment.created" && event.commentId === commentId);
     // Narrowing here is what lets the caller build a reply intent
     // without re-narrowing (or casting) `thread.external`.
@@ -1139,6 +1175,8 @@ export async function findDraftToPromote(input: {
         ...(githubThreadId !== undefined ? { replyThreadNodeId: githubThreadId } : {}),
         promotedAtSeq: promotionSeqFor(events, { threadId: thread.id, target: "comment", ...(commentId !== "" ? { commentId } : {}) }),
         intentRecorded: intentRecordedFor(events, commentId),
+        commentSeq: authoringSeqOf(events, commentId) ?? 0,
+        ...(pinned !== undefined ? { promotedPin: pinned } : {}),
       },
     };
   }
@@ -1209,9 +1247,51 @@ function promotionSeqFor(
   return promoted;
 }
 
+/** The content pin on the most recent promotion of this comment, or
+ * `undefined` when no promotion carries one. */
+function promotionPinFor(
+  events: readonly ReviewEvent[],
+  commentId: string,
+): { readonly commentSeq: number; readonly bodyHash: string } | undefined {
+  let pin: { readonly commentSeq: number; readonly bodyHash: string } | undefined;
+  for (const event of events) {
+    if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
+    if ((event.commentId ?? "") !== commentId) continue;
+    if (event.commentSeq === undefined || event.bodyHash === undefined) continue;
+    pin = { commentSeq: event.commentSeq, bodyHash: event.bodyHash };
+  }
+  return pin;
+}
+
+/** The `seq` of the event that authored this comment — what a NEW
+ * promotion pins. */
+function authoringSeqOf(events: readonly ReviewEvent[], commentId: string): number | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if ((event.kind === "comment.created" || event.kind === "comment.replied") && event.commentId === commentId) {
+      return event.seq;
+    }
+  }
+  return undefined;
+}
+
 /** True when the machine intent for this comment (`comment.sync_requested`)
  * is already in the log. A promotion that landed without its intent is
- * `promotedAtSeq` set and this false — the state a retry repairs. */
+ * `promotedAtSeq` set and this false — the state a retry repairs.
+ *
+ * INVARIANT this rests on: a `comment.linked` for an agent-authored
+ * comment is only ever appended BY the reconciler, inside its loop over
+ * `comment.sync_requested` intents (plus the adapter's import path,
+ * which mints `gh-…` ids or reuses an already-linked id). So for an
+ * agent draft, `comment.linked` here implies an intent was recorded —
+ * and treating it as "the intent is present" is therefore safe. If a
+ * future writer ever links a comment with NO intent, this predicate
+ * would report `intentRecorded: true`, the route would skip the intent
+ * append, and the promotion would sit in the log authorizing nothing —
+ * the shape round 1 called unreachable. The test "a linked agent
+ * comment always has an intent behind it" in
+ * `packages/cli/test/serve/review-mode-promote.test.ts` pins it, so the
+ * day it breaks, the test breaks with it. */
 function intentRecordedFor(events: readonly ReviewEvent[], commentId: string): boolean {
   return events.some(
     (event) =>

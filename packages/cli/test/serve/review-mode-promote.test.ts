@@ -17,6 +17,7 @@
 //     duplicate
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,9 +28,12 @@ import {
   type PrFile,
   type PrRef,
   type PullRequestSummary,
+  type ReviewEvent,
+  type ReviewEventInput,
   type TokenSource,
 } from "@revkit/review-core";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
+import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 import type { LineSink } from "../../src/serve/logger.ts";
 import { makeFakeGithubFetch, makePendingState, type FakePendingState } from "../review/helpers/fake-github.ts";
 
@@ -55,6 +59,7 @@ interface Ctx {
   fake: FakePendingState;
   fakeFetch: typeof fetch;
   root: string;
+  sqlitePath: string;
   cookie: string;
 }
 
@@ -143,7 +148,75 @@ async function startCtx(overrides?: {
   authUrl.searchParams.set("code", handle.launchCode);
   const authResponse = await fetch(authUrl, { redirect: "manual" });
   const setCookie = authResponse.headers.get("set-cookie")!;
-  return { handle, fake: pending, fakeFetch, root, cookie: setCookie.slice(0, setCookie.indexOf(";")) };
+  return {
+    handle,
+    fake: pending,
+    fakeFetch,
+    root,
+    sqlitePath: join(root, "threads.sqlite"),
+    cookie: setCookie.slice(0, setCookie.indexOf(";")),
+  };
+}
+
+/** Read the daemon's own sqlite with a SECOND store handle — the log
+ * as bytes on disk, not as any route projects it. Used to assert that a
+ * refusal appended nothing, and to read the crash-window state. */
+async function readRawEvents(sqlitePath: string): Promise<ReviewEvent[]> {
+  const store = SqliteThreadStore.open({ filename: sqlitePath });
+  try {
+    const events: ReviewEvent[] = [];
+    let after = 0;
+    for (;;) {
+      const page = await store.since(after);
+      if (page.length === 0) break;
+      events.push(...page);
+      after = page[page.length - 1]!.seq;
+    }
+    return events;
+  } finally {
+    store.close();
+  }
+}
+
+/** Rewrite a stored comment's body in place, directly on the sqlite —
+ * the only way to reach the state a future `comment.edited` route would
+ * produce, and the point of pinning the promotion's content. Done with a
+ * raw UPDATE rather than an event so the daemon's own log order is
+ * untouched; an edit route would append, and the pin refuses either. */
+function rewriteCommentBody(sqlitePath: string, commentId: string, body: string): void {
+  const db = new Database(sqlitePath);
+  try {
+    const rows = db
+      .query<{ seq: number }, []>("SELECT seq FROM events ORDER BY seq ASC")
+      .all();
+    for (const { seq } of rows) {
+      const payloadRow = db
+        .query<{ payload: string }, [number]>("SELECT payload FROM events WHERE seq = ?")
+        .get(seq);
+      if (payloadRow === null) continue;
+      const event = JSON.parse(payloadRow.payload) as { commentId?: string; body?: string };
+      if (event.commentId !== commentId || typeof event.body !== "string") continue;
+      event.body = body;
+      db.query("UPDATE events SET payload = ? WHERE seq = ?").run(JSON.stringify(event), seq);
+    }
+  } finally {
+    db.close();
+  }
+}
+
+/** Reproduce the crash window EXACTLY, without racing a process: with
+ * the daemon stopped, append only what `promoteAgentDraft`'s first
+ * append would have written — `draft.promoted` with no intent after it.
+ * The two appends are adjacent in the code and nothing fallible sits
+ * between them, so this is byte-for-byte what a process death leaves
+ * behind. */
+async function appendPromotionOnly(ctx: Ctx, event: ReviewEventInput): Promise<void> {
+  const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+  try {
+    await store.append(event);
+  } finally {
+    store.close();
+  }
 }
 
 async function restartCtx(ctx: Ctx): Promise<Ctx> {
@@ -788,5 +861,299 @@ describe("#70 round 1 — PROBE 2: a superseded promotion must not fire (review 
       { threadNodeId: "PRT_stale_then_reopen", op: "unresolve" },
     ]);
     expect((await readState(ctx)).state.agentDrafts).toEqual([]);
+  });
+});
+
+// ── Round 2 ────────────────────────────────────────────────────────────
+// (a) the content pin, (b) an agent lifecycle change superseding the
+// reviewer's own pending intent, (c) the crash window, (d) the N3
+// invariant behind `intentRecordedFor`.
+
+describe("#70 round 2 — the promotion PINS the content it approves", () => {
+  test("a promotion records the comment's authoring seq and its body hash", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "pinned")).status).toBe(201);
+
+    const before = await readRawEvents(ctx.sqlitePath);
+    const authored = before.find((event) => event.kind === "comment.created" && event.commentId === "c-pinned");
+    if (authored === undefined) throw new Error("no authored event");
+    expect(before.some((event) => event.kind === "draft.promoted")).toBe(false);
+
+    expect((await promote(ctx, { threadId: "th-pinned", target: "comment", commentId: "c-pinned" })).status).toBe(201);
+    const after = await readRawEvents(ctx.sqlitePath);
+    const recorded = after.find((event) => event.kind === "draft.promoted");
+    if (recorded === undefined || recorded.kind !== "draft.promoted") throw new Error("no promotion recorded");
+    expect(recorded.commentSeq).toBe(authored.seq);
+    expect(recorded.bodyHash).toBe(await revisionOf("agent draft body"));
+    // The pin is the SAME text the intent carries, so a reviewer who
+    // reads one has read the other.
+    const intent = after.find((event) => event.kind === "comment.sync_requested" && event.commentId === "c-pinned");
+    expect(intent?.kind === "comment.sync_requested" ? intent.bodyHash : undefined).toBe(recorded.bodyHash);
+  });
+
+  test("a comment whose body no longer matches the pin is refused (promoted-body-changed)", async () => {
+    // There is no edit route today, so this reproduces the shape an edit
+    // route would produce: the log's `comment.created` body is replaced
+    // with different text behind the daemon's back (a second store
+    // handle on the same sqlite, the only way to do it today).
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "swapped")).status).toBe(201);
+    // Promote, and let the intent append be lost (the crash window), so
+    // the promotion is on the log with its pin and NO intent.
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find(
+      (event) => event.kind === "comment.created" && event.commentId === "c-swapped",
+    );
+    if (authored === undefined) throw new Error("no authored event");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted",
+      actor: { kind: "local", id: "p70-user" },
+      threadId: "th-swapped",
+      target: "comment",
+      commentId: "c-swapped",
+      commentSeq: authored.seq,
+      bodyHash: await revisionOf("agent draft body"),
+    });
+    // Now rewrite the stored body, as an edit would.
+    rewriteCommentBody(ctx.sqlitePath, "c-swapped", "SWAPPED TEXT THE REVIEWER NEVER READ");
+
+    const restarted = await restartCtx(ctx);
+    const draftsBefore = restarted.fake.drafts.length;
+    const refusal = await promote(restarted, { threadId: "th-swapped", target: "comment", commentId: "c-swapped" });
+    expect(refusal.status).toBe(409);
+    const body = (await refusal.json()) as { error: string };
+    expect(body.error).toBe("promoted-body-changed");
+    // Nothing was posted, and the daemon did not heal an intent either.
+    await Bun.sleep(100);
+    expect(restarted.fake.drafts.length).toBe(draftsBefore);
+    expect((await readState(restarted)).state.agentDrafts).toEqual([]);
+  });
+});
+
+describe("#70 round 2 — an agent lifecycle change supersedes the reviewer's own pending intent", () => {
+  test("a reviewer resolve whose write failed is dropped when the agent reopens — no write", async () => {
+    // The behaviour change vs bf56d878: the reconciler used to keep a
+    // reviewer's OWN unresolved intent alive no matter what came after
+    // it. Now the thread's current lifecycle change wins whoever
+    // authored it, so the agent's reopen retires the reviewer's
+    // resolve. Both threads end `open`, which is the point: firing the
+    // stale resolve would make GitHub disagree with the log.
+    const ctx = await startCtx({ threads: [importedThread("PRT_local_pending")], failBeforeOnce: "ResolveReviewThread" });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+
+    // The REVIEWER resolves (cookie) and the write fails, so the intent
+    // is still outstanding.
+    const reviewResolve = await fetch(`${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reviewResolve.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+
+    // The agent reopens the thread locally.
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+
+    // A cookie reconcile must not now fire the reviewer's stale resolve.
+    const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+
+    // And it survives a restart: the supersession is a property of the
+    // log, not of the process that read it.
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(60);
+    expect(restarted.fake.resolutions).toHaveLength(0);
+    const reconcile2 = await fetch(`${restarted.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: restarted.handle.url, "sec-fetch-site": "same-origin", cookie: restarted.cookie },
+      body: "{}",
+    });
+    expect(reconcile2.status).toBe(201);
+    expect(restarted.fake.resolutions).toHaveLength(0);
+
+    // No `thread.external_synced` claims a baseline that never happened.
+    const log = await readRawEvents(restarted.sqlitePath);
+    expect(log.filter((event) => event.kind === "thread.external_synced")).toEqual([]);
+  });
+
+  test("the reverse order: the agent resolves, the reviewer reopens — the reviewer's own current change is what acts", async () => {
+    // The counterpart to the case above, so the precedence is pinned from
+    // both directions: a reviewer's OWN later change supersedes an agent
+    // draft (and, being authorized already, it acts without promotion).
+    const ctx = await startCtx({ threads: [importedThread("PRT_reverse")] });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+
+    // The agent resolves (a draft, unpromoted: no write), then the
+    // reviewer reopens. A reopen needs a resolved thread, so the order
+    // here is resolve-then-reopen with the REVIEWER reopening.
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+    expect((await readState(ctx)).state.agentDrafts).toEqual([
+      { threadId: imported.id, target: "resolve", path: "docs/index.md" },
+    ]);
+    const reviewReopen = await fetch(`${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/reopen`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reviewReopen.status).toBe(201);
+
+    // The agent's resolve is superseded: no draft, and nothing was ever
+    // promoted, so no write.
+    expect((await readState(ctx)).state.agentDrafts).toEqual([]);
+    const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+  });
+});
+
+describe("#70 round 2 — the crash window: boot heals a promotion with no intent", () => {
+  test("a promotion with no intent is repaired on the next start, and writes exactly once", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "crash")).status).toBe(201);
+    const writesBefore = writes(ctx);
+
+    // Kill between the two appends, exactly.
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find(
+      (event) => event.kind === "comment.created" && event.commentId === "c-crash",
+    );
+    if (authored === undefined) throw new Error("no authored event");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted",
+      actor: { kind: "local", id: "p70-user" },
+      threadId: "th-crash",
+      target: "comment",
+      commentId: "c-crash",
+      commentSeq: authored.seq,
+      bodyHash: await revisionOf("agent draft body"),
+    });
+    const crashed = await readRawEvents(ctx.sqlitePath);
+    // The window really is "promotion, no intent".
+    expect(crashed.some((event) => event.kind === "draft.promoted")).toBe(true);
+    expect(crashed.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-crash")).toBe(false);
+
+    // Restart. Boot heals the intent and, being read-only on the remote,
+    // does NOT write.
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const healed = await readRawEvents(restarted.sqlitePath);
+    const repaired = healed.find((event) => event.kind === "comment.sync_requested" && event.commentId === "c-crash");
+    expect(repaired).toBeDefined();
+    if (repaired?.kind !== "comment.sync_requested") throw new Error("no repaired intent");
+    // The repaired intent carries the pinned text, not a fresh reading.
+    expect(repaired.bodyHash).toBe(await revisionOf("agent draft body"));
+    expect(writes(restarted)).toBe(writesBefore);
+
+    // The draft is back in the unsynced set (it is no longer invisible),
+    // and the reviewer's next cookie action posts it — exactly once.
+    expect((await readState(restarted)).state.unsyncedCommentIds).toContain("c-crash");
+    // The reviewer's promote answers 200 here: the boot heal already
+    // recorded the intent, so this call appends no event — it only runs
+    // the read-first reconcile that posts it.
+    const retry = await promote(restarted, { threadId: "th-crash", target: "comment", commentId: "c-crash" });
+    expect(retry.status).toBe(200);
+    expect(((await retry.json()) as { promoted: boolean }).promoted).toBe(false);
+    expect(writes(restarted)).toBe(writesBefore + 1);
+    expect(restarted.fake.drafts[restarted.fake.drafts.length - 1]?.body).toContain("agent draft body");
+
+    // A second promote, a second reconcile and a restart add nothing.
+    expect((await promote(restarted, { threadId: "th-crash", target: "comment", commentId: "c-crash" })).status).toBe(200);
+    const reconcile = await fetch(`${restarted.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: restarted.handle.url, "sec-fetch-site": "same-origin", cookie: restarted.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(writes(restarted)).toBe(writesBefore + 1);
+  });
+
+  test("the boot heal is idempotent: a restart over a healed log appends nothing new", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "healed")).status).toBe(201);
+    expect((await promote(ctx, { threadId: "th-healed", target: "comment", commentId: "c-healed" })).status).toBe(201);
+    const afterPromote = (await readRawEvents(ctx.sqlitePath)).length;
+
+    let restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    expect((await readRawEvents(restarted.sqlitePath)).length).toBe(afterPromote);
+    restarted = await restartCtx(restarted);
+    await Bun.sleep(120);
+    expect((await readRawEvents(restarted.sqlitePath)).length).toBe(afterPromote);
+    expect(writes(restarted)).toBe(2);
+  });
+
+  test("a promotion with no intent and an unmappable anchor is NOT healed", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft outside", "outside", OUTSIDE_PATH)).status).toBe(201);
+    const writesBefore = writes(ctx);
+
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find(
+      (event) => event.kind === "comment.created" && event.commentId === "c-outside",
+    );
+    if (authored === undefined) throw new Error("no authored event");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted",
+      actor: { kind: "local", id: "p70-user" },
+      threadId: "th-outside",
+      target: "comment",
+      commentId: "c-outside",
+      commentSeq: authored.seq,
+      bodyHash: await revisionOf("agent draft outside"),
+    });
+
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const log = await readRawEvents(restarted.sqlitePath);
+    expect(log.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-outside")).toBe(false);
+    expect(writes(restarted)).toBe(writesBefore);
+    // The promotion still stands as the record of what was attempted.
+    expect(log.some((event) => event.kind === "draft.promoted")).toBe(true);
+  });
+});
+
+describe("#70 round 2 — N3: the invariant behind intentRecordedFor", () => {
+  test("a linked agent comment always has an intent behind it", async () => {
+    // `intentRecordedFor` treats a bare `comment.linked` as "the intent
+    // was already recorded". That is only safe while nothing links a
+    // comment without an intent, so this pins the fact the docstring
+    // names: every `comment.linked` the daemon appends for an
+    // agent-authored comment is preceded by its `comment.sync_requested`.
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "linked")).status).toBe(201);
+    expect((await promote(ctx, { threadId: "th-linked", target: "comment", commentId: "c-linked" })).status).toBe(201);
+    const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+
+    const log = await readRawEvents(ctx.sqlitePath);
+    for (const event of log) {
+      if (event.kind !== "comment.linked") continue;
+      const intent = log.find(
+        (candidate) => candidate.kind === "comment.sync_requested" && candidate.commentId === event.commentId,
+      );
+      expect(intent !== undefined && intent.seq < event.seq).toBe(true);
+    }
   });
 });

@@ -531,14 +531,46 @@ const commentSyncCancelledPayload = {
  *
  * `commentId` is required iff `target === "comment"` — a resolve or
  * reopen promotion names the THREAD, not a comment. `actor` is the
- * reviewer; the transition validator refuses any other actor, so the
- * agent bearer can author a draft but can never record that it was
- * promoted (see validator.ts `draft.promoted`). */
+ * reviewer; the transition validator refuses any other actor, so a
+ * `draft.promoted` over HTTP can only come from a cookie session (see
+ * validator.ts `draft.promoted`, and the limit of that claim in the
+ * ADR-0006 amendment).
+ *
+ * `commentSeq` and `bodyHash` PIN the content the reviewer approved:
+ * the `seq` of the `comment.created` / `comment.replied` that authored
+ * the draft, and `revisionOf(body)` of its text at promotion time.
+ * Without them the event would name a comment id and leave *which
+ * text* open — so a later edit of the same comment (there is no edit
+ * route today) could swap the body between the reviewer's approval and
+ * the reconciler's write, and the intent would fingerprint the NEW text
+ * while the promotion recorded the human act on the OLD. With the pin,
+ * a comment whose current body no longer hashes to `bodyHash` is not
+ * promoted at all (`promoted-body-changed`).
+ *
+ * Both are OPTIONAL, because a log written before they existed must
+ * still validate (ADR-0006: `validateNext` is a state machine over
+ * appends, so a stricter rule than the log's own history is a boot
+ * failure). They are not optional in practice: the route always writes
+ * them for a comment promotion, and the reconciler treats a promotion
+ * that lacks them as pinning nothing — which is exactly the old,
+ * weaker behaviour, and is why the route is the place that must write
+ * them. */
 const draftPromotedPayload = {
   kind: z.literal("draft.promoted"),
   threadId: idSchema,
   target: z.enum(["comment", "resolve", "reopen"]),
   commentId: idSchema.optional(),
+  /** `seq` of the authoring event, pinning WHICH version of the
+   * comment the reviewer approved. Paired with `bodyHash`. */
+  commentSeq: z.number().int().positive().optional(),
+  /** `revisionOf(body)` at promotion time. Paired with `commentSeq`. */
+  bodyHash: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "draft.promoted.bodyHash must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
+    )
+    .optional(),
 } as const;
 
 /** Shared envelope for the four `build.*` kinds (M2 item 9, story
@@ -666,6 +698,25 @@ const eventVariants = [
           code: "custom",
           path: ["commentId"],
           message: `draft.promoted: target='${event.target}' must not carry a commentId (a resolve/reopen promotion names the thread).`,
+        });
+      }
+      // The content pin is a PAIR: a `commentSeq` without a `bodyHash`
+      // (or the reverse) would pin half of what the reviewer approved,
+      // which is the ambiguity this exists to remove.
+      if ((event.commentSeq === undefined) !== (event.bodyHash === undefined)) {
+        ctx.addIssue({
+          code: "custom",
+          path: [event.commentSeq === undefined ? "commentSeq" : "bodyHash"],
+          message:
+            "draft.promoted: the content pin is a pair — a comment promotion that pins the approved version carries BOTH commentSeq and bodyHash.",
+        });
+      }
+      // A lifecycle promotion pins no content: there is none.
+      if (event.target !== "comment" && (event.commentSeq !== undefined || event.bodyHash !== undefined)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["commentSeq"],
+          message: `draft.promoted: target='${event.target}' must not carry a content pin (a resolve/reopen promotion has no body to pin).`,
         });
       }
     }),

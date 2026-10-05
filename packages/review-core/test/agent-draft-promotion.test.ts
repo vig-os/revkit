@@ -82,6 +82,41 @@ describe("draft.promoted — wire shape", () => {
   });
 });
 
+describe("draft.promoted — the content pin (issue #70 round 2)", () => {
+  test("the pin is a PAIR; a lifecycle promotion carries none", () => {
+    const base = { seq: 2, ts: t, actor: localActor, kind: "draft.promoted", threadId: "th-1" } as const;
+    // A comment promotion pins both the version and the text.
+    expect(
+      reviewEventSchema.safeParse({ ...base, target: "comment", commentId: "c-1", commentSeq: 1, bodyHash: "a".repeat(64) })
+        .success,
+    ).toBe(true);
+    // Half a pin is refused in either direction — it would approve a
+    // version without saying which text that version carried.
+    expect(reviewEventSchema.safeParse({ ...base, target: "comment", commentId: "c-1", commentSeq: 1 }).success).toBe(false);
+    expect(
+      reviewEventSchema.safeParse({ ...base, target: "comment", commentId: "c-1", bodyHash: "a".repeat(64) }).success,
+    ).toBe(false);
+    // A resolve promotion has no body to pin.
+    expect(
+      reviewEventSchema.safeParse({ ...base, target: "resolve", commentSeq: 1, bodyHash: "a".repeat(64) }).success,
+    ).toBe(false);
+    // An older promotion with no pin still parses — a log written
+    // before the pin existed must keep validating.
+    expect(reviewEventSchema.safeParse({ ...base, target: "comment", commentId: "c-1" }).success).toBe(true);
+  });
+
+  test("the pin must name the authoring event's real seq (unknown-comment)", () => {
+    const state = withValidated([agentComment(7, "th-1", "c-1")]);
+    const good = promoted(8, { threadId: "th-1", target: "comment", commentId: "c-1", commentSeq: 7, bodyHash: "b".repeat(64) });
+    expect(validateNext(state, good).ok).toBe(true);
+    const wrong = promoted(9, { threadId: "th-1", target: "comment", commentId: "c-1", commentSeq: 3, bodyHash: "b".repeat(64) });
+    const result = validateNext(state, wrong);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.rejection.kind).toBe("unknown-comment");
+  });
+});
+
 describe("draft.promoted — the trust rule lives in the log, not only in the route", () => {
   test("an agent actor cannot record a promotion (invalid-actor)", () => {
     const state = withValidated([agentComment(1, "th-1", "c-1")]);

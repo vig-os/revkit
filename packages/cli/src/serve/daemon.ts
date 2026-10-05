@@ -1041,6 +1041,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     void (async () => {
       try {
         await reviewOperations.run(async () => {
+          // Issue #70 round 2: repair a promotion whose intent append
+          // was lost BEFORE reconciling, so the repaired intent is
+          // visible to the read-first pass below (which still cannot
+          // write to GitHub — `allowMutations: false`).
+          await healMissingPromotionIntents(reviewMode, "boot-promotion-intent");
           await reconcile({
             review: reviewMode,
             store,
@@ -2310,21 +2315,36 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    *   (b) resolve exactly which draft is named, refusing a
    *       reviewer's own comment with a precise reason
    *       (`findDraftToPromote`);
-   *   (c) append `draft.promoted` — the human act, in the log, BEFORE
-   *       any adapter call — once. A promotion that already landed
-   *       (a retry after a crash between the event and the reconcile)
-   *       appends nothing and falls through to (e), so a double
-   *       promote never doubles the write;
-   *   (d) append the machine intent under the REVIEWER's actor: the
-   *       same `comment.sync_requested` the reviewer's own comment
-   *       would have produced (top-level draft, or reply intent
-   *       against the remote thread);
+   *   (c) COMPOSE the machine intent the promotion would authorize —
+   *       the same `comment.sync_requested` the reviewer's own comment
+   *       would have produced (top-level draft, or reply intent against
+   *       the remote thread). Nothing is written yet: composing is pure,
+   *       and it is where the last possible refusal
+   *       (`promote-mapping-orphan`) is decided;
+   *   (d) append `draft.promoted` — the human act, in the log, BEFORE
+   *       any adapter call — and then the composed intent, each at most
+   *       once. A promotion that already landed (a retry after a crash
+   *       between the two appends) skips the first of those and still
+   *       appends a missing intent, so a double promote never doubles
+   *       the write and an interrupted one always converges;
    *   (e) run the existing reconcilers, which READ GitHub first and
    *       post only what is missing.
    *
    * A promoted draft is then an ordinary pending draft: same
    * fingerprint matching, same `comment.linked` completion, same submit
-   * gate. Nothing here gives the agent bearer any path to a write. */
+   * gate.
+   *
+   * The property this route holds: the agent BEARER is refused with 403,
+   * and an agent-authored item reaches GitHub only through a
+   * `draft.promoted` event that `validateNext` accepts only from a
+   * `local` actor — so a bearer cannot author a promotion by any HTTP
+   * path. That is a statement about the bearer and the HTTP surface,
+   * not about the agent as a process: a same-user agent that obtains a
+   * REVIEWER SESSION through the launch-code exchange
+   * (`POST /-/launch-code` then `GET /-/auth?code=…`) is identified as
+   * `local` like any cookie, and that escalation is a separate,
+   * pre-existing property of the local surface — owned and tracked on
+   * #55, deliberately not settled here. */
   async function promoteAgentDraft(
     review: ReviewModeHandle,
     request: PromoteAgentDraftRequest,
@@ -2339,7 +2359,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         "there is no open pending review to promote into — comment first, then promote.",
       );
     }
-const found = await findDraftToPromote({
+    const found = await findDraftToPromote({
       store,
       threadId: request.threadId,
       target: request.target,
@@ -2374,7 +2394,7 @@ const found = await findDraftToPromote({
     // (d) Record the human act, then the intent. The two appends are
     // ordered so that ANY crash between them is recoverable by a retry:
     // the promotion alone retires the draft but authorizes nothing, and
-    // the retry below recognises `alreadyPromoted` and still appends the
+    // the retry below recognises `promotedAtSeq` and still appends the
     // missing intent (an intent is idempotent — the reconciler
     // fingerprints it, so re-appending changes nothing that matters).
     if (promoted) {
@@ -2384,7 +2404,17 @@ const found = await findDraftToPromote({
           actor,
           threadId: draft.thread.id,
           target: request.target,
-          ...(draft.kind === "comment" ? { commentId: draft.comment.id } : {}),
+          ...(draft.kind === "comment"
+            ? {
+                commentId: draft.comment.id,
+                // Pin the version the reviewer approved (issue #70
+                // round 2): `findDraftToPromote` has already refused a
+                // body that no longer matches an earlier pin, so these
+                // describe exactly the text now in the log.
+                commentSeq: draft.commentSeq,
+                bodyHash: await revisionOf(draft.comment.body),
+              }
+            : {}),
         },
         requestId,
       );
@@ -2434,6 +2464,80 @@ const found = await findDraftToPromote({
       newlySynced: [...outcome.newlySynced],
       newlyFailed: outcome.newlyFailed.map((entry) => ({ ...entry })),
     };
+  }
+
+  /** Issue #70 round 2: heal a promotion whose intent append was lost.
+   *
+   * A promotion is two adjacent appends (`draft.promoted`, then the
+   * machine intent), and nothing fallible sits between them — but a
+   * process death or a sqlite error on the second leaves the log
+   * claiming a human attached a draft that has no intent, so the
+   * reconciler has nothing to act on and the rail's affordance (driven
+   * by `agentDrafts`, which the promotion retired) is gone. The draft
+   * then vanishes silently at submit.
+   *
+   * This composes the missing intent from the log itself, which is all
+   * the route used: the promotion names the comment, the thread carries
+   * its anchor and body. It is a LOCAL append, not a GitHub write — the
+   * reconcile that follows still runs with `allowMutations: false`, so
+   * the repaired intent is picked up by the next cookie-authenticated
+   * action, exactly like any other durable intent (ADR-0006: boot never
+   * mutates the remote).
+   *
+   * The composition goes through the same `findDraftToPromote` the route
+   * uses, so a body that no longer matches the promotion's pin is
+   * refused here too (`promoted-body-changed`) rather than healed into
+   * text the reviewer did not approve. */
+  async function healMissingPromotionIntents(
+    review: ReviewModeHandle,
+    requestId: string,
+  ): Promise<number> {
+    const events = await store.since(0);
+    const incomplete = new Map<string, string>();
+    for (const event of events) {
+      if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
+      const commentId = event.commentId;
+      if (commentId === undefined) continue;
+      const hasIntent = events.some(
+        (candidate) =>
+          (candidate.kind === "comment.sync_requested" || candidate.kind === "comment.linked") &&
+          candidate.commentId === commentId,
+      );
+      if (!hasIntent) incomplete.set(commentId, event.threadId);
+    }
+    if (incomplete.size === 0) return 0;
+    let healed = 0;
+    for (const [commentId, threadId] of incomplete) {
+      const found = await findDraftToPromote({ store, threadId, target: "comment", commentId });
+      if (!found.ok) {
+        logger.warn("review.boot.promotion-intent.refused", { requestId, commentId, reason: found.error });
+        continue;
+      }
+      const draft = found.draft;
+      if (draft.kind !== "comment") continue;
+      const intent = draft.reply
+        ? await buildReplySyncRequestForDraft(draft, localActor)
+        : await buildSyncRequestForDraft(review, draft.thread.anchor, draft.comment.id, draft.comment.body, localActor);
+      // A mapping orphan cannot be repaired here any more than at the
+      // route: there is no GitHub position to post to. The promotion
+      // stays as the record of what the reviewer tried to attach.
+      if (intent === undefined) {
+        logger.warn("review.boot.promotion-intent.unmappable", { requestId, commentId });
+        continue;
+      }
+      try {
+        await appendReviewLifecycleEvent(intent, requestId);
+        healed++;
+        logger.info("review.boot.promotion-intent.healed", { requestId, commentId });
+      } catch (error) {
+        logger.warn("review.boot.promotion-intent.append-failed", {
+          requestId,
+          commentId,
+          errorKind: (error as Error).name,
+        });
+      }
+    }
+    return healed;
   }
 
   /** Boot-time read-only healing for accepted resolve/reopen writes.

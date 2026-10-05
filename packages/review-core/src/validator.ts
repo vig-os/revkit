@@ -66,7 +66,11 @@
 //                      lifecycle target must be the thread's CURRENT
 //                      change (also `not-an-agent-draft`), so a
 //                      promotion cannot authorize a resolve the thread
-//                      has since reopened.
+//                      has since reopened. A comment promotion's
+//                      `commentSeq`/`bodyHash` pin must name the
+//                      authoring event's seq, so the log cannot record
+//                      an approval of a version that does not exist
+//                      (`unknown-comment`).
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -117,6 +121,12 @@ export interface LogState {
    * draft an agent wrote — a reviewer's own comment mirrors itself,
    * so promoting it would be a claim the log cannot support. */
   readonly commentAuthors: Map<string, ReviewEvent["actor"]>;
+  /** commentId → the `seq` of the event that authored it. Issue #70
+   * round 2: `draft.promoted` PINS the version it approves via
+   * `commentSeq`, so a comment edited between one promotion and a
+   * later one is refused rather than promoting text the reviewer did
+   * not read. */
+  readonly commentSeqs: Map<string, number>;
   /** askId → { spec, status }. The FULL spec is kept so
    * `ask.answered` can validate the answer's SHAPE against the
    * question — not just the discriminant. PR #52 review: the
@@ -152,6 +162,7 @@ export function emptyLogState(): LogState {
     threads: new Map(),
     commentIndex: new Map(),
     commentAuthors: new Map(),
+    commentSeqs: new Map(),
     asks: new Map(),
     commentLinks: new Map(),
     externalIndex: new Map(),
@@ -203,6 +214,7 @@ export function cloneLogState(state: LogState): LogState {
     threads,
     commentIndex: new Map(state.commentIndex),
     commentAuthors: new Map(state.commentAuthors),
+    commentSeqs: new Map(state.commentSeqs),
     asks,
     commentLinks,
     externalIndex: new Map(state.externalIndex),
@@ -313,6 +325,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       });
       state.commentIndex.set(event.commentId, event.threadId);
       state.commentAuthors.set(event.commentId, event.actor);
+      state.commentSeqs.set(event.commentId, event.seq);
       return { ok: true };
     }
     case "comment.replied": {
@@ -335,6 +348,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       thread.commentIds.add(event.commentId);
       state.commentIndex.set(event.commentId, event.threadId);
       state.commentAuthors.set(event.commentId, event.actor);
+      state.commentSeqs.set(event.commentId, event.seq);
       return { ok: true };
     }
     case "comment.edited": {
@@ -831,6 +845,27 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
               message:
                 `draft.promoted: comment '${commentId}' was authored by '${author?.kind ?? "unknown"}', not an agent — ` +
                 `a reviewer's own comment is mirrored without a promotion.`,
+            },
+          };
+        }
+        // Issue #70 round 2: the content pin must name the version of
+        // the comment that is CURRENT. An append-time check only: the
+        // rule is "this promotion approves THIS text", and at append
+        // time the log's own history is the whole world available. A
+        // comment edited AFTER a promotion is caught by the route
+        // (`promoted-body-changed`) and by the reconciler, which both
+        // re-read the body; here we refuse the shape that can never be
+        // right — a pin naming a seq this log has never issued.
+        if (event.commentSeq !== undefined && state.commentSeqs.get(commentId) !== event.commentSeq) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "unknown-comment",
+              commentId,
+              message:
+                `draft.promoted: commentSeq ${event.commentSeq} is not the seq of the authoring event for ` +
+                `'${commentId}' (the log has ${state.commentSeqs.get(commentId) ?? "none"}) — ` +
+                `a promotion pins the version of the comment it approves.`,
             },
           };
         }
