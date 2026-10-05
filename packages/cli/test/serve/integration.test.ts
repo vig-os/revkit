@@ -44,7 +44,17 @@ async function json<T>(response: Response): Promise<T> {
  * client would, without letting any URL parser normalise the target.
  * Returns the parsed status and the response body. Used by the
  * traversal tests, where `fetch()` collapses `/../` before it hits
- * the wire and would make the guard look untested. */
+ * the wire and would make the guard look untested.
+ *
+ * **Rejects rather than resolving a sentinel.** A response that is
+ * not parseable as HTTP — no header terminator, or a first line that
+ * is not an HTTP status line — throws. It used to resolve
+ * `{ status: 0, body: "" }`, which satisfied every caller assertion
+ * at once (`0 !== 200` and `"".includes("SECRET") === false`), so a
+ * daemon that answered with garbage, or answered nothing parseable,
+ * was indistinguishable from one that correctly refused a traversal.
+ * Every caller of this helper therefore sees a real status or an
+ * exception. */
 async function rawHttpGet(port: number, rawTarget: string): Promise<{ status: number; body: string }> {
   const request =
     `GET ${rawTarget} HTTP/1.1\r\n` +
@@ -61,12 +71,22 @@ async function rawHttpGet(port: number, rawTarget: string): Promise<{ status: nu
     socket.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf8");
       const headerEnd = raw.indexOf("\r\n\r\n");
-      const headerSection = headerEnd === -1 ? raw : raw.slice(0, headerEnd);
-      const bodySection = headerEnd === -1 ? "" : raw.slice(headerEnd + 4);
-      const firstLine = headerSection.split("\r\n")[0] ?? "";
-      const match = firstLine.match(/^HTTP\/1\.\d (\d{3})/);
-      const status = match !== null ? Number.parseInt(match[1] ?? "0", 10) : 0;
-      resolveOuter({ status, body: bodySection });
+      const firstLine = (headerEnd === -1 ? raw : raw.slice(0, headerEnd)).split("\r\n")[0] ?? "";
+      const match = firstLine.match(/^HTTP\/1\.\d (\d{3})(?:\s|$)/);
+      // No header terminator means the body cannot be delimited, so
+      // `body` would be a lie — the bytes after the status line
+      // cannot be told apart from headers. Refuse the whole response.
+      if (headerEnd === -1 || match === null) {
+        rejectOuter(
+          new Error(
+            `rawHttpGet: response to '${rawTarget}' is not parseable HTTP ` +
+              `(header terminator ${headerEnd === -1 ? "absent" : "present"}, ` +
+              `first line ${JSON.stringify(firstLine)})`,
+          ),
+        );
+        return;
+      }
+      resolveOuter({ status: Number.parseInt(match[1] ?? "0", 10), body: raw.slice(headerEnd + 4) });
     });
     socket.on("error", (error) => rejectOuter(error));
     setTimeout(() => {
@@ -466,23 +486,54 @@ describe("revkit serve — security", () => {
     // is not exercised. To test the guard, we open a raw TCP socket
     // to the daemon and write the HTTP request line ourselves,
     // preserving `%2e%2e`, `..%2f`, backslashes and double-encoded
-    // forms. Each candidate must NOT succeed and must NOT leak the
-    // outside file's contents.
+    // forms.
+    //
+    // Each payload asserts its EXACT expected status, measured
+    // against this daemon rather than guessed — they genuinely
+    // differ, because two different layers refuse two different
+    // shapes (see the table):
+    //
+    //   * 400 — the daemon's `resolveWithinRoot` sees a decoded `..`
+    //     SEGMENT and refuses it as `traversal`
+    //     (`static.rejected` `errorKind: "traversal"` → 400). This
+    //     needs the traversal marker to survive URL normalisation,
+    //     which it does when the marker is glued to an encoded
+    //     slash: `..%2f` decodes to `../` only at the daemon's own
+    //     `decodeURIComponent`, after the URL parser is done.
+    //   * 404 — the URL parser (or a single decode) collapses the
+    //     `..` before the guard sees it, so the request is a
+    //     well-formed path to a file that does not exist in dist
+    //     (`errorKind: "not-found"` → 404). Still a refusal, and
+    //     still no `SECRET` — but it is the *404* half of
+    //     "refused", not the 400 half.
+    //
+    // The statuses were captured from the daemon's own structured
+    // `static.rejected` log line for each payload; an `expect(status)
+    // .not.toBe(200)` here was previously satisfied by the parse
+    // sentinel `0` as well as by a real refusal, so a non-HTTP
+    // answer passed as a refusal.
     const ctx = await startCtx();
     try {
-      const attacks = [
-        "/../outside/secret.txt",
-        "/%2e%2e/outside/secret.txt",
-        "/..%2foutside/secret.txt",
-        "/..%2Foutside/secret.txt",
-        "/%2e%2e%2foutside/secret.txt",
-        "/%2E%2E%2Foutside/secret.txt",
-        "/sub/..%2f..%2foutside/secret.txt",
-        "/%252e%252e/outside/secret.txt", // double-encoded — daemon decodes once, so `%2e%2e` remains and is refused by shape or 404
+      const attacks: ReadonlyArray<readonly [target: string, expectedStatus: number]> = [
+        // `/../` and `%2e%2e` are dot-segments to the URL parser, so
+        // it normalises them away before the request line reaches the
+        // daemon: `/outside/secret.txt`, which is simply not in dist.
+        ["/../outside/secret.txt", 404],
+        ["/%2e%2e/outside/secret.txt", 404],
+        // Encoded slash: the dot-segment is only decoded at the
+        // daemon boundary, so the guard itself refuses these.
+        ["/..%2foutside/secret.txt", 400],
+        ["/..%2Foutside/secret.txt", 400],
+        ["/%2e%2e%2foutside/secret.txt", 400],
+        ["/%2E%2E%2Foutside/secret.txt", 400],
+        ["/sub/..%2f..%2foutside/secret.txt", 400],
+        // Double-encoded — the daemon decodes once, so `%2e%2e`
+        // remains a literal (non-dot) segment name and 404s.
+        ["/%252e%252e/outside/secret.txt", 404],
       ];
-      for (const attack of attacks) {
+      for (const [attack, expectedStatus] of attacks) {
         const { status, body } = await rawHttpGet(ctx.handle.port, attack);
-        expect(status, `attack '${attack}' should NOT succeed`).not.toBe(200);
+        expect(status, `attack '${attack}' must be refused with ${expectedStatus}`).toBe(expectedStatus);
         expect(body, `attack '${attack}' body must not carry SECRET`).not.toContain("SECRET");
       }
     } finally {
