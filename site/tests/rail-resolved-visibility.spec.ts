@@ -881,6 +881,62 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
     );
   }
 
+  /** The origin's seen storage, read only once the rail's mount-time
+   *  write for the CURRENT repo is durable (issue #78).
+   *
+   *  The rail resolves `repoId` from `/-/health` on an async mount
+   *  path and only then calls `migrateSeenStorage`, which writes this
+   *  repo's bucket, then the shared LRU index, then reclaims the keys
+   *  the index does not vouch for (`unread.ts:364`, `:376`, `:383`).
+   *  Both things this spec does after a navigation land before that
+   *  write: `page.goto(..., { waitUntil: "commit" })` resolves on
+   *  response headers by design, and a VISIBLE `revkit-rail` only
+   *  means the component rendered. A bare read after either one
+   *  observes the pre-write state — issue #78, where CI's
+   *  `retries: 2` reported
+   *  `expect(afterY[bucketY]).toBeDefined()` as passing on a retry
+   *  while attempt 1 had failed. So each read below polls for the
+   *  durable condition rather than sampling storage once: a poll is a
+   *  WAIT, and every assertion after it still has to earn its pass.
+   *
+   *  What makes "the bucket is there" mean "the mount write landed" is
+   *  that `migrateSeenStorage` is FULLY SYNCHRONOUS — no `await`
+   *  anywhere in its body — so the bucket write, the index write and
+   *  the reclaim pass all land in one uninterrupted task and no poll
+   *  iteration can sample between them. The index is checked as a
+   *  second, cheap witness, not because it is written last (it is
+   *  not: the reclaim pass follows it). If `migrateSeenStorage` is
+   *  ever made async, that synchronicity — not the key list below —
+   *  is what has to be re-checked.
+   *
+   *  Only the current repo's OWN keys are waited on. Another repo's
+   *  bucket is precisely the thing under assertion in all three legs,
+   *  so waiting on it would turn a real cross-repo loss into a poll
+   *  timeout and hide the assertion that names it.
+   *
+   *  Honest scope, per call site: on the two legs that MINT a bucket
+   *  (repo X, then repo Y) the poll is the real barrier. On the third
+   *  leg, back to repo X, both keys already exist from the first leg
+   *  and were never removed, so the poll returns on its first
+   *  iteration — there it is a no-op. That leg is safe anyway: the
+   *  neighbouring `toBeHidden()` cannot pass before the mount write
+   *  completes (the pill reads `seenMap()`, refreshed from storage
+   *  only after `migrateSeenStorage` returns), and the LRU-order
+   *  assertion on that snapshot requires the remount's index write. */
+  async function readSeenStorageAfterMount(page: Page, bucket: string): Promise<Record<string, string>> {
+    let snapshot: Record<string, string> = {};
+    await expect
+      .poll(
+        async () => {
+          snapshot = await readSeenStorage(page);
+          return snapshot[bucket] !== undefined && snapshot[SEEN_INDEX_KEY] !== undefined;
+        },
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+    return snapshot;
+  }
+
   function repoIdOf(root: string): string {
     return readFileSync(join(root, ".revkit", "repo-id"), "utf8").trim();
   }
@@ -950,7 +1006,7 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
       await page.getByTestId("revkit-rail-thread").click();
       await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
 
-      const afterX = await readSeenStorage(page);
+      const afterX = await readSeenStorageAfterMount(page, bucketX);
       expect(Object.keys(JSON.parse(afterX[bucketX]!) as Record<string, string>)).toEqual([x.id]);
 
       // ── Repo Y on the SAME port: a different repoId, same origin ──
@@ -966,7 +1022,7 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
       const bucketY = `${SEEN_PREFIX}.${repoIdOf(rootY)}`;
       expect(repoIdOf(rootY)).not.toBe(repoIdOf(rootX));
 
-      const afterY = await readSeenStorage(page);
+      const afterY = await readSeenStorageAfterMount(page, bucketY);
       // Load-bearing: repo X's bucket is still there, byte for byte.
       // Pre-fix this key was gone — `migrateSeenStorage` had merged it
       // into Y's bucket and deleted it.
@@ -986,7 +1042,7 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
       await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(1);
       // The user-visible claim of this whole fix: no re-ack needed.
       await expect(page.getByTestId("revkit-rail-unread-pill")).toBeHidden();
-      const afterBack = await readSeenStorage(page);
+      const afterBack = await readSeenStorageAfterMount(page, bucketX);
       expect(afterBack[bucketX]).toBe(afterX[bucketX]);
       // The index vouches for both repos, LRU order: this leg
       // touched X again (mounts went X → Y → X), so Y is now the
