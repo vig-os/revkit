@@ -39,6 +39,11 @@ export interface LogFields {
   readonly errorKind?: string;
   readonly bytes?: number;
   readonly count?: number;
+  /** Issue #70 (`draft.promoted`): which kind of agent draft a
+   * promotion named, and whether THIS call appended the promotion or
+   * only confirmed one already in the log. */
+  readonly target?: string;
+  readonly promoted?: boolean;
   readonly artefact?: string;
   /** M2 item 9 (publish): number of files in a `POST /api/publish`
    * batch. */

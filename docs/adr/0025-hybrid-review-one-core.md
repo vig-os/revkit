@@ -5,6 +5,11 @@
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: B1, B2, B3, B4, B5, B6, B7
 - Amends: [ADR-0009](0009-auth-github-app-invite-links.md)
+- Amended by: the 2026-10-05 (issue #70) amendment below — on the LOCAL surface,
+  an agent-authored reply / resolve reaches GitHub only through an explicit
+  reviewer promotion, so it is a human act like every other GitHub write. The
+  subject of that claim is the agent BEARER, not the agent as a process: a
+  same-user agent holding a reviewer session is out of the model (see #55).
 
 ## Context
 
@@ -203,3 +208,83 @@ exists, and can therefore still check against it.
 existing BYTE-EXACT test in `packages/cli/test/serve/headers.test.ts` was not
 edited. The daemon's public module surface is unchanged too, so `daemon.ts` and its
 tests are untouched.
+
+## Amendment (2026-10-05, issue #70) — the local surface promotes agent drafts through a reviewer session, never the bearer
+
+**"Comments accumulate in the pending review, as the reviewer"** (Decision,
+surface (b)) is unchanged for everything the reviewer authors. This amendment
+states what happens when the **agent** authors something, which the Decision
+left open.
+
+**An agent's reply or resolve is a local draft until a reviewer promotes it.**
+The rail badges it "agent draft · not on GitHub" and offers one action,
+**Promote to my review**, which calls `POST /api/review/promote`. That route is
+**cookie-only**, in the same class as `submit` / `discard` / `refresh` /
+`reanchor` / `reconcile`: the agent bearer receives `403 agent-forbidden`, and a
+non-`local` actor a bare `403`. The promotion appends `draft.promoted` to the
+intent log **before** any adapter call and then replays the ordinary reconcilers,
+so the write that reaches GitHub is indistinguishable from one the reviewer
+triggered by hand — same pending review, same viewer identity, same
+`comment.linked` completion.
+
+**This preserves the property PR #59 established, rather than relaxing it.** That
+PR made every GitHub mutation cookie-only because a human's review must be
+authored by the human. Promotion keeps that exactly: the agent can still author
+content locally through the M2 channel (that is how B6's "agent replies, fixes,
+resolves" works at all), and a human decides whether it becomes part of their
+review. What changed is that the decision is now *possible*, and it is recorded
+as an event whose only permitted author is the reviewer — see the ADR-0006
+amendment for the log-level trust rules.
+
+**What that property is, precisely.** *The agent bearer is refused the promote
+route, and an agent-authored item reaches GitHub only via a `draft.promoted`
+recorded by a cookie session.* It is a statement about the bearer and the HTTP
+surface. It is **not** a statement that the agent as a process has no route to a
+write: on the local surface a same-user agent can mint a launch code
+(`POST /-/launch-code`) and exchange it for the reviewer's session cookie
+(`GET /-/auth?code=…`), and that session is `local` like any other, so it can
+promote. That is a pre-existing property of the local surface (since PR #38),
+not something this amendment introduces or settles, and it is owned as a decision
+on **#55**. Promotion makes a reviewer's session load-bearing for B6, so this
+amendment records the limit of the claim rather than leaving it implicit.
+
+**A refusal writes nothing, and a superseded promotion does not fire.** Every
+refusal the route can return is decided before the log's first append, so a
+refused promotion leaves the draft exactly where it was — still badged, still
+promotable, retryable. A promotion authorizes a lifecycle change only while that
+change is the thread's current one: if the agent reopens a thread whose resolve
+the reviewer had promoted, the promotion is superseded, the route refuses the
+stale target, and no reconcile resolves it. The rule is one derivation in
+`@revkit/review-core` (`reduceThreadLifecycleStates`) read by the rail's draft
+list, the route and the reconciler alike, and it is enforced in the log's
+validator too — the writer is not allowed a different answer than the UI.
+
+**The reviewer is told when their own resolve is superseded.** An agent's later
+change retires a reviewer's outstanding resolve or reopen before it reaches GitHub
+(above). The reconciler correctly refuses to fire it, and the rail says so — naming
+the thread — rather than leaving the reviewer to believe their click posted. This is
+a notice, not a prompt: nothing is stuck and nothing needs a decision.
+
+**Promotion pins the text it approves.** The event records the promoted comment's
+authoring `seq` and the SHA-256 of its body at promotion time, and a comment whose
+body no longer matches is refused rather than published — so a future edit route
+cannot swap the text between the reviewer's click and the write.
+
+**A superseded change supersedes the reviewer's own intent too.** The rule is "the
+thread's current lifecycle change acts, whoever authored it". Before this amendment
+existed, a reviewer's own unresolved resolve survived an agent's later reopen and was
+then fired, leaving GitHub resolved and the log `open`. Both orders are now pinned.
+
+**Promotion needs an open pending review.** The route refuses
+(`no-open-pending-review`) when the log's pending review is submitted or
+abandoned. This is deliberate: after a submit or a discard, the reviewer's
+decision was "this does not go out as drafted", and re-opening it silently on an
+agent's behalf would contradict that. The reviewer comments first (which opens a
+fresh pending review) and then promotes.
+
+**Not in this amendment.** The **hosted** surface (c) is untouched: no hosted
+promotion route, no Worker change, no App change. A hosted agent draft stays a
+hosted draft until that surface designs the same act — and because
+`reduceReviewState`'s `agentDrafts` is a derivation over the shared core, the
+hosted surface gets the same *view* of the draft list for free if it wants it.
+Refs: #70, #59, #8

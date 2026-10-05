@@ -218,8 +218,19 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     commentId: "c-1",
     requestedAtSeq: 15,
   },
-  "build.requested": {
+  "draft.promoted": {
     seq: 18,
+    ts: t,
+    actor: { kind: "local", id: "u-1" },
+    kind: "draft.promoted",
+    threadId: "th-1",
+    target: "comment",
+    commentId: "c-1",
+    commentSeq: 1,
+    bodyHash: "f".repeat(64),
+  },
+  "build.requested": {
+    seq: 19,
     ts: t,
     actor: { kind: "system", id: "revkit-daemon" },
     kind: "build.requested",
