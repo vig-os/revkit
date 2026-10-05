@@ -7,7 +7,11 @@
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
   export|import` CLI command; and the 2026-10-05 (issue #73) amendment — an
-  `import` lands only in an empty store, judged against the log the store holds.
+  `import` lands only in an empty store, judged against the log the store holds;
+  and the 2026-10-05 (issue #67) amendment — the lazy trigger fires for a read
+  that can RETURN AN ANCHOR, so the rail's ids-only prune fetch no longer pays
+  for a sweep it cannot observe, and one sweep reads the log once rather than
+  once per path.
 
 ## Context
 
@@ -290,3 +294,59 @@ refusal to test). `import` is also a read-then-write, so its commit is guarded
 against a writer that moves the head in between: one guard row inside the same
 `batch()`, gating every archive row, so a stale head writes nothing rather than
 something. Refs: #73, #107, #108
+
+## Amendment (2026-10-05, issue #67): the lazy trigger is a read that can return an anchor
+
+Trigger 1 above — "**Lazy — before `/api/threads` GET and before `/events`
+catch-up** … even if watchers miss an event or the site was edited while the daemon
+was down, the next read re-anchors before serving" — is stated as though every
+`GET /api/threads` were the same read. It is not, and the difference was measurable
+at the review surface's own scale.
+
+**The measurement.** A rail mount issues, per page: the path-scoped reads
+`fetchThreads` renders from, ONE unscoped read for the prune pass
+(`fetchAllThreadIds` — seen-marks must survive for threads on *other* pages, issue
+#60), and an `/events` subscription whose server-side prime re-anchors before the
+first frame. Both unscoped surfaces ran a full sweep over every threaded path. At
+40 threaded paths that measured (server-side `durationMs`, 5 warm samples, real
+`startDaemon`, sqlite `:memory:`): the path-scoped read 1 ms, the unscoped read
+8–20 ms, the `/events` prime 10–20 ms — 81 file reads and ~460 ms per mount at 400
+paths. The reviewer's page was served in 1 ms; the rest was a sweep paid twice for
+anchors the mount cannot use. The issue's correction comment is confirmed on both
+counts: there really were **two** full sweeps per mount, and the second one
+(`daemon.ts`'s `/events` prime) is invisible from the client.
+
+**Two changes, one guarantee.**
+
+1. **The trigger follows the response projection.** `GET /api/threads?fields=id`
+   returns `{ threads: [{ id }], head }` and **does not re-anchor**, because a body
+   with no anchor in it cannot hand a reader a stale one. Nothing else about the
+   read changed: same store, same `status` filter, same envelope. An unrecognised
+   `fields` value is a 400 rather than a silent full read, so a typo cannot quietly
+   buy the sweep back — and the refusal is answered *before* the trigger, so it
+   costs nothing either.
+2. **One sweep reads the log once.** `refreshAll` already read the whole log
+   (`store.threads()`, no filter) to collect the path set; each `doRefresh` then
+   asked for its own path again, and `store.threads(filter)` is `since(0)` plus a
+   full reduce — so a sweep over P paths cost **O(P × events)**, which measured as
+   17.7 ms of a 21.6 ms sweep at P = 40 against 1.8 ms of file reads. `refreshAll`
+   now groups the one read it already pays for by `anchor.path` and hands each path
+   its bucket through the SAME per-path mutex and the SAME coalescing; a coalesced
+   rerun drops the bucket and asks the store, because the log may have moved since.
+   The per-path query count for a sweep is now 1 at P = 1, 8 and 40 (it was 1 + P).
+
+**What is NOT weakened.** Trigger 1's guarantee is unchanged for every read that can
+return an anchor. A path-scoped `GET /api/threads`, an unscoped one, the `/events`
+prime and the WebSocket prime all still re-anchor **every threaded path** before
+serving — the `/events` prime in particular is *not* gated by the projection, because
+it is the trigger that catches a file edited while the daemon was down, and nothing
+about its response shape says whether the subscriber will read an anchor. The sweep
+is also still a full sweep: the fix made it cheaper, not narrower. The rail's own
+page paths are refreshed by the path-scoped read on every mount regardless.
+
+**What IS new, stated plainly.** A caller can now ask for ids and receive ids whose
+anchors are behind disk, and will not be told. That is the trade the parameter
+names out loud: `fields=id` is a promise that you are not reading anchors. A caller
+that wants fresh anchors asks without it.
+
+Refs: #67

@@ -79,6 +79,8 @@ import {
   type ReviewEvent,
   type ReviewEventInput,
   type Thread,
+  type ThreadFilter,
+  type ThreadStatus,
 } from "@revkit/review-core";
 import type { EventBus } from "./event-bus.ts";
 import type { Logger } from "./logger.ts";
@@ -90,6 +92,15 @@ import { REANCHOR_SOURCE_MAX_BYTES, resolveSourceUnderRoot } from "./anchor-sour
  * filter on it without seeing the user's own agent id. */
 export const REANCHOR_ACTOR_ID = "revkit-reanchor";
 
+/** The statuses the re-anchor pipeline tracks. `resolved` is NOT one
+ * of them — the human/agent's final word stands, so a resolved thread
+ * is never re-anchored or orphaned. Named here because `refreshAll`
+ * has to apply the same filter when it groups one unfiltered log read
+ * by `anchor.path` (issue #67), and a filter that drifts between the
+ * grouping and the per-path query would silently change what a sweep
+ * considers. */
+const TRACKED_STATUSES: NonNullable<ThreadFilter["status"]> = ["open", "orphaned"];
+const TRACKED_STATUS_SET: ReadonlySet<ThreadStatus> = new Set(TRACKED_STATUSES);
 
 /** Debounce for the anchored-file watcher. A single edit fires 2–3
  * OS-level events (write, stat, close); 300 ms coalesces them into
@@ -407,11 +418,26 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * invocation, so a joiner never observes stale anchors — the
    * blocker 2 fix. */
   async function refresh(path: string): Promise<void> {
+    return refreshWith(path);
+  }
+
+  /** `refresh` for a caller that already holds the path's open +
+   * orphaned threads (`refreshAll`'s single log read, grouped by
+   * `anchor.path` — issue #67). Same mutex, same coalescing, same
+   * guarantee; the only difference is that `doRefresh` is handed the
+   * thread list instead of re-querying it per path. A coalesced RERUN
+   * deliberately drops the list: the log may have moved since the
+   * caller's read, so the rerun asks the store itself.
+   *
+   * NOT exposed on the handle: `known` is only ever a regrouping of a
+   * read this module already performed, so a public caller could only
+   * get it wrong. */
+  async function refreshWith(path: string, known?: readonly Thread[]): Promise<void> {
     if (stopped) return;
     const existing = inflight.get(path);
     if (existing === undefined) {
       // Fresh run.
-      const run = doRefresh(path).finally(() => onRunFinished(path));
+      const run = doRefresh(path, known).finally(() => onRunFinished(path));
       inflight.set(path, { run, dirty: false });
       return run;
     }
@@ -458,7 +484,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
   }
 
-  async function doRefresh(path: string): Promise<void> {
+  async function doRefresh(path: string, known?: readonly Thread[]): Promise<void> {
     // Read the on-disk source under the containment helper — this
     // is the SAME resolver the POST /api/threads path uses, so a
     // path that snuck onto a thread despite the anchor check (or a
@@ -501,7 +527,16 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
 
     // Fetch open + orphaned threads on this path. `resolved` threads
     // are not tracked — the human/agent's final word stands.
-    const threads = await store.threads({ path, status: ["open", "orphaned"] });
+    //
+    // `known` is the caller-supplied answer to exactly that question,
+    // handed down by `refreshAll` from the single unfiltered
+    // `store.threads()` it already reads (issue #67). It is only ever
+    // passed with the SAME filter — the caller groups by
+    // `anchor.path` and keeps `open` + `orphaned` — so it is the same
+    // list, not a weaker one. Without it the query below runs, which
+    // is `since(0)` + a full reduce PER PATH: one sweep over P paths
+    // costs O(P x events) and that is the whole cost of the fan-out.
+    const threads = known ?? (await store.threads({ path, status: TRACKED_STATUSES }));
     if (threads.length === 0) {
       // Nothing to do; ensure the snapshot for the new revision is
       // stored anyway so a subsequent POST does not re-read the file.
@@ -744,13 +779,31 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // with a moderate log this is a few ms. Unanchored threads (PR
     // #43) contribute nothing here — they have no revision to
     // re-anchor against.
+    //
+    // **The same read also answers the per-path question.** Each
+    // `doRefresh` needs "the open + orphaned threads on THIS path",
+    // which it used to answer with its own `store.threads({ path })`
+    // — `since(0)` plus a full reduce, once PER PATH, so a sweep over
+    // P paths cost O(P x events) (issue #67). At P = 40 that per-path
+    // reduce measured 17.7 ms of a 21.6 ms sweep; the file reads the
+    // sweep actually needs are 1.8 ms of it. So group the one log
+    // read we are already paying for by `anchor.path` and hand each
+    // path its bucket. Same filter (`open` + `orphaned`), same list —
+    // see `doRefresh`'s `known` parameter.
     const all = await store.threads();
+    const byPath = new Map<string, Thread[]>();
+    for (const thread of all) {
+      if (!TRACKED_STATUS_SET.has(thread.status)) continue;
+      const bucket = byPath.get(thread.anchor.path);
+      if (bucket === undefined) byPath.set(thread.anchor.path, [thread]);
+      else bucket.push(thread);
+    }
     const paths = new Set<string>();
     for (const thread of all) {
       if (!isLineAnchor(thread.anchor)) continue;
       paths.add(thread.anchor.path);
     }
-    await Promise.all([...paths].map((path) => refresh(path)));
+    await Promise.all([...paths].map((path) => refreshWith(path, byPath.get(path) ?? [])));
   }
 
   async function gcOnce(): Promise<void> {

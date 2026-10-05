@@ -1422,18 +1422,48 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         if (parsedStatus.data.length === 1) filter.status = parsedStatus.data[0];
         else filter.status = parsedStatus.data;
       }
+      // Response projection. `fields=id` asks for the id list alone —
+      // the rail's mount-time prune pass (`fetchAllThreadIds`) needs
+      // exactly that and nothing else.
+      //
+      // **The projection gates the lazy re-anchor trigger below**, and
+      // that is the whole point of the parameter: an ids-only response
+      // carries no anchor, so a caller cannot observe a stale one, so
+      // the read must not pay to re-anchor. Issue #67 measured that
+      // unscoped read as ~94% of a rail mount's daemon cost at 40
+      // threaded paths, paid for anchors the caller throws away.
+      // ADR-0006's trigger set is amended accordingly ("a read that
+      // can return an anchor re-anchors first").
+      //
+      // An UNRECOGNISED value is a 400, not a silent full read: a
+      // typo in `fields` must not quietly turn the cheap projection
+      // back into a full sweep (and must not quietly drop anchors a
+      // caller believed it had asked for). Same discipline as
+      // `status` above.
+      const fieldsParam = url.searchParams.get("fields");
+      if (fieldsParam !== null && fieldsParam !== "id") {
+        return badRequest([{ code: "custom", path: ["fields"], message: "fields must be 'id' when present" }]);
+      }
+      const idsOnly = fieldsParam === "id";
       // Lazy re-anchor trigger (M2 item 5b): a page-load fetch is
       // the moment the human is about to look at the rail, so we
       // pay the re-anchor cost here even if the watcher missed the
       // event or the site was edited while the daemon was down.
       // Serialised per-path in `reanchor-daemon.ts`, so a repeated
       // call joins the in-flight promise.
-      if (filter.path !== undefined) {
-        await reanchor.refresh(filter.path);
-      } else {
-        await reanchor.refreshAll();
+      if (!idsOnly) {
+        if (filter.path !== undefined) {
+          await reanchor.refresh(filter.path);
+        } else {
+          await reanchor.refreshAll();
+        }
       }
       const threads = await store.threads(filter);
+      if (idsOnly) {
+        // Same envelope, one field per thread. `head` is kept: a
+        // caller reconciling ids still wants the store's head.
+        return jsonResponse({ threads: threads.map((thread) => ({ id: thread.id })), head: store.head() });
+      }
       return jsonResponse({ threads, head: store.head() });
     }
 
