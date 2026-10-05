@@ -49,7 +49,13 @@ async function bootDaemon(): Promise<DaemonCtx> {
   mkdirSync(join(root, dirname(FIXTURE_REL_PATH)), { recursive: true });
   writeFileSync(
     join(root, FIXTURE_REL_PATH),
-    "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    // Line 5 must BE the paragraph the fixture page renders: the daemon derives
+    // `anchor.quote` from the SOURCE at the anchor's range (issue #113), so a
+    // seed that puts different text on line 5 makes the reviewer's rendered
+    // selection unresolvable against it — and an unresolvable selection is a
+    // refusal, not a wider quote (`rail-roundtrip.spec.ts` documents the same
+    // invariant for its own seed).
+    `# Title\n\nline 2\nline 3\n${FIXTURE_PARAGRAPH_TEXT}\nline 6\n`,
     "utf8",
   );
   const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {

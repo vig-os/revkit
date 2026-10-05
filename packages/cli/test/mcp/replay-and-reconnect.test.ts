@@ -29,10 +29,14 @@ import { DaemonClient } from "../../src/mcp/daemon-client.ts";
 import { startChannelServer, type DiscoverFn } from "../../src/mcp/channel-server.ts";
 import type { WireEvent } from "../../src/mcp/event-subscriber.ts";
 
+// The line range must name the line that HOLDS `quote.exact`: the daemon
+// derives the quote from the source and uses the client's text as the needle
+// (issue #113), so an anchor whose range and quote disagree is refused
+// rather than clamped onto whatever happens to be near the end of the file.
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 40,
-  endLine: 44,
+  startLine: 4,
+  endLine: 4,
   quote: { exact: "why 30s?", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };
@@ -204,7 +208,10 @@ describe("blocker 2b — tool call reconnect is bounded", () => {
     mkdirSync(join(root, "dist"), { recursive: true });
     writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
     mkdirSync(join(root, "docs", "adr"), { recursive: true });
-    writeFileSync(join(root, "docs", "adr", "0003.md"), "# X\n\nbody\n");
+    // Four lines, with the shared anchor's quoted text on line 4 — the
+    // daemon derives the quote from this file and refuses a range whose
+    // text the client's needle cannot be found in.
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# X\n\nbody\nwhy 30s?\n");
     daemon = await startDaemon({
       dir: join(root, "dist"),
       repoRoot: root,
@@ -281,7 +288,8 @@ describe("blocker 3 — reconnect on daemon restart", () => {
     mkdirSync(join(root, "dist"), { recursive: true });
     writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
     mkdirSync(join(root, "docs", "adr"), { recursive: true });
-    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR\n\nsecond line\nthird\nfourth\n");
+    // As above: the shared anchor names line 4, so line 4 holds its text.
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR\n\nsecond line\nwhy 30s?\nfourth\n");
     // Use ONE sqlite path shared across daemon boots — that's the
     // "sqlite persists across restarts" property.
     const sqlitePath = join(root, "threads.sqlite");

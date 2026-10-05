@@ -38,6 +38,7 @@ import {
   reviewSubmitEventSchema,
   threadStatusSchema,
   type Anchor,
+  type QuoteRefusal,
   type AskFilter,
   type AskRecord,
   type Author,
@@ -1526,35 +1527,50 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // bytes are the source's.
         parsed.data.selectionHint ?? parsed.data.anchor.quote?.exact,
       );
-      // One fallback, and it is deliberate: an anchor whose line range
-      // resolves to NO source text (the document shrank since the page
-      // was built — `data-src` stamps come from the BUILT output, so a
-      // stale build is the ordinary way to get here) has nothing to
-      // slice. Rather than refuse the reviewer's comment with a 400,
-      // the client's own quote is kept. That keeps the create path
-      // total, and the anchor it produces is an honest dead end: there
-      // is no text at those lines for the re-anchoring engine to match,
-      // so the thread orphans on the first rebuild and the reviewer
-      // sees why. Refusing instead would lose the comment outright.
+      // A quote is cut from the anchored block, or the create is REFUSED
+      // (issue #113, PR #124 round 2). This replaced a fallback that kept
+      // the client's own quote when the derived slice came back empty.
       //
-      // The fallback is reachable ONLY on an empty slice: whenever the
-      // source has text for the range, the derived quote wins and the
-      // client's is discarded. That ordering is the provenance rule.
-      const quote =
-        derivedQuote.exact.length > 0 ? derivedQuote : parsed.data.anchor.quote;
-      if (quote === undefined) {
-        // No source text and no client quote: there is nothing to
-        // anchor to, and `anchorSchema` would refuse an empty `exact`
-        // anyway. Say so instead of failing later with `invalid-shape`.
+      // That fallback was unreachable for the current rail, which sends
+      // no quote at all (so a stale anchor produced a 400 with a message
+      // about "no quote to fall back on" — a message describing a
+      // negotiation the client was never in), and for a legacy client it
+      // was reachable only on an EMPTY slice, where it stored RENDERED
+      // text — the exact provenance violation ADR-0006 forbids, and the
+      // one `anchorRequestSchema` already rules out in its own doc ("The
+      // daemon ignores its contents"). Worse, it was reachable only
+      // sometimes: on a file with no trailing newline a stale range
+      // clamped to the LAST paragraph and stored that text instead, so
+      // the same stale build stored two different wrong things depending
+      // on the file's last byte.
+      //
+      // **400, not "store it and orphan it".** The rail's
+      // `submitNewThread` catches the failure, shows the message and
+      // leaves the composer OPEN with the reviewer's text in it
+      // (`setComposerAnchor(undefined)` runs only on success), so a
+      // refusal costs one reload — the page's `data-src` stamps are what
+      // are stale, so a reload is exactly the fix, and the message says
+      // so. Storing the comment instead would be unrecoverable: an anchor
+      // built from a range that does not exist can never resolve, the
+      // reviewer is not told why, and the thread sits there looking
+      // healthy. All three refusals name their cause, because the causes
+      // call for different words: a stale page needs "reload", an empty
+      // range needs "this block has no text".
+      if (!derivedQuote.ok) {
         return badRequest([
           {
             code: "custom",
             path: ["anchor", "startLine"],
-            message:
-              "anchor.startLine..endLine resolves to no text in the source file and the request carries no quote to fall back on",
+            message: quoteRefusalMessage(derivedQuote.reason, {
+              path: parsed.data.anchor.path,
+              startLine: parsed.data.anchor.startLine,
+              endLine: parsed.data.anchor.endLine,
+              totalLines: derivedQuote.totalLines,
+            }),
           },
         ]);
       }
+      const quote = derivedQuote.quote;
       const anchorWithServerRevision: Anchor = {
         ...parsed.data.anchor,
         quote,
@@ -4295,6 +4311,32 @@ async function readCappedJsonBody(request: Request): Promise<
  * MAX_COMMENT_BODY_BYTES. */
 function enforceCommentBodyLimit(body: string): boolean {
   return Buffer.byteLength(body, "utf8") <= MAX_COMMENT_BODY_BYTES;
+}
+
+/** The 400 message for a refused comment quote (issue #113, PR #124
+ * round 2). One function so every refusal reads the same way and the
+ * wording lives in one place — a reviewer reading this in the rail has
+ * to be told the ACTION, not just that something failed.
+ *
+ * `range-past-eof` and `hint-not-found` are both stale-build signals
+ * and both say "reload the page", because the page's `data-src` stamps
+ * are the stale part; `empty-range` is a different fact about the block
+ * and says so. The line count goes in the message on purpose: a
+ * reviewer who commented on "lines 40-41" of a 19-line file needs to
+ * know the file is 19 lines long to understand what happened. */
+function quoteRefusalMessage(
+  reason: QuoteRefusal,
+  detail: { path: string; startLine: number; endLine: number; totalLines: number },
+): string {
+  const { path, startLine, endLine, totalLines } = detail;
+  switch (reason) {
+    case "range-past-eof":
+      return `stale-anchor: anchor.startLine..endLine (${startLine}-${endLine}) is past the end of ${path} (${totalLines} lines); reload the page`;
+    case "hint-not-found":
+      return "stale-anchor: selection not found in source range; reload the page";
+    case "empty-range":
+      return "anchor.startLine..endLine resolves to no text in the source file";
+  }
 }
 
 // `resolveAnchorSource` (server-side revision authority) and its

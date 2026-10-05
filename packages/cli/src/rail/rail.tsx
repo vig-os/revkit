@@ -449,6 +449,28 @@ interface CreateThreadBody {
   readonly selectionHint?: string;
   readonly body: string;
 }
+/**
+ * The daemon's reason for a refusal, when it sent one. `badRequest`
+ * answers `{ error, issues: [{ path, message }] }`, and those messages
+ * are written for the reviewer — a stale `data-src` stamp is fixed by
+ * reloading the page, and "reload the page" is the whole recovery. A
+ * bare `failed: 400` throws that away, which is why the composer's
+ * error line exists at all (issue #113, PR #124 round 2).
+ *
+ * Falls back to the status when the body is not the shape above — a
+ * proxy's HTML error page must not be rendered as rail text.
+ */
+async function refusalReason(response: Response): Promise<string> {
+  try {
+    const parsed = (await response.json()) as { issues?: { message?: unknown }[] };
+    const first = parsed.issues?.[0]?.message;
+    if (typeof first === "string" && first.length > 0) return first;
+  } catch {
+    // Not JSON — fall through to the status.
+  }
+  return `POST /api/threads failed: ${response.status}`;
+}
+
 async function createThread(body: CreateThreadBody): Promise<void> {
   const response = await fetch("/api/threads", {
     method: "POST",
@@ -456,7 +478,7 @@ async function createThread(body: CreateThreadBody): Promise<void> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(`POST /api/threads failed: ${response.status}`);
+  if (!response.ok) throw new Error(await refusalReason(response));
 }
 
 async function replyToThread(threadId: string, parentId: string, body: string): Promise<void> {

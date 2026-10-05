@@ -61,12 +61,29 @@
  * rendered text node carries no delimiter, so the fold removes it from
  * the source side rather than inventing one on the rendered side. The
  * asymmetry is deliberate and is what makes both directions agree —
- * source `` `gh` `` and rendered `gh` fold to the same string, and the
- * engine then slices the SOURCE span, so the stored quote grows the
- * backticks back. This is also what repairs the narrow variant issue
- * #113 measured (a `<code>` node's `position.start.offset` points at
- * the opening backtick): no offset nudge is needed, because the quote
- * is re-sliced from the source rather than patched.
+ * source `` `gh` `` and rendered `gh` fold to the same string, and a
+ * search that hits then cuts the SOURCE span. This is also what repairs
+ * the narrow variant issue #113 measured (a `<code>` node's
+ * `position.start.offset` points at the opening backtick): no offset
+ * nudge is needed, because the quote is re-sliced from the source
+ * rather than patched.
+ *
+ * **Where the delimiters come back, and where they do not (issue #113,
+ * PR #124 round 2).** Two paths cut a quote, and they differ:
+ *
+ * - RE-ANCHOR (`reanchor.ts`) re-slices the span the engine resolved, so
+ *   the delimiters are back: a quote on `` `gh` `` rebuilds as `` `gh` ``.
+ * - COMMENT CREATE (`quote.ts`) narrows by searching the FOLDED block and
+ *   slicing what the search hit, and the hit for `gh` is the inner `gh` —
+ *   the backtick deleted before the search, so it is not in the hit. The
+ *   stored quote is therefore `gh`.
+ *
+ * That is not a defect and the two are equivalent for matching: both fold
+ * to `gh`, so path 4a's comparison and the similarity gate see the same
+ * string either way, and the provenance property (the stored quote is a
+ * byte-exact slice of the source) holds for both. It is recorded here
+ * because an earlier version of this note claimed the create path grew the
+ * backticks back too, which it does not.
  *
  * `---` is deliberately NOT in the table: measured, the pipeline
  * leaves a three-dash run alone (`a --- b` renders as `a --- b`), so
@@ -113,6 +130,13 @@ const FOLD_PATTERN = new RegExp(
   `[${[...FOLD.keys()].map((c) => c.replace(/[.*+?^${}()|[\]\\\-]/g, "\\$&")).join("")}]`,
   "g",
 );
+
+/** ASCII whitespace — the characters HTML collapses to a single space
+ * in a rendered text node. Not `\u00a0`: HTML does NOT collapse a
+ * non-breaking space, so folding it would invent an equivalence the
+ * renderer does not have (the same rule that keeps `---` out of
+ * `FOLD`). */
+const WHITESPACE = new Set([" ", "\t", "\n", "\r", "\f", "\v"]);
 
 /** Fold `text` to the form the SOURCE would have had. The result is
  * what a comparison must use on BOTH sides; see the module header for
@@ -291,17 +315,66 @@ export interface FoldedSource {
  * shorter than the source and the map cannot be sized from
  * `source.length` up front. */
 export function foldSource(source: string): FoldedSource {
-  FOLD_PATTERN.lastIndex = 0;
+  return foldScan(source, false);
+}
+
+/**
+ * `foldSource`, plus every run of ASCII whitespace collapsed to ONE
+ * space — what a browser's `textContent` reports for the same span.
+ *
+ * **Why this exists (issue #113, PR #124 round 2).** A markdown soft
+ * break is a `\n` in the source and a COLLAPSED SPACE in the rendered
+ * page, so a reviewer who selects across one sends a hint the source
+ * does not contain. The quote builder used to read that as "no match"
+ * and widened the quote to the whole block. Now that an unresolvable
+ * hint is a refusal (a stale-build signal, not a hint), the matcher has
+ * to see across the soft break first — otherwise every routine
+ * two-line selection would come back as a 400.
+ *
+ * A collapsed run obeys the same map contract as an expanding
+ * substitution: all of its folded characters carry the run's own
+ * `starts` / `ends`, so a match that lands inside a run still cuts
+ * source text (possibly with a boundary space, which is source text).
+ *
+ * Only the quote builder uses this. The re-anchoring engine's
+ * comparisons must stay byte-exact, so `foldSource` is untouched by it.
+ */
+export function foldSourceLoose(source: string): FoldedSource {
+  return foldScan(source, true);
+}
+
+/** The needle-side counterpart of `foldSourceLoose`: fold the
+ * typographic forms and collapse whitespace runs, with no offset map
+ * (a needle is searched, never sliced). */
+export function foldTypographyLoose(text: string): string {
+  const folded = foldTypography(text);
+  if (!/\s/.test(folded)) return folded;
+  return folded.replace(/\s+/g, " ");
+}
+
+/** The one scanner behind `foldSource` and `foldSourceLoose`. Both are
+ * a two-pass measure-then-fill over the same three cases — a `FOLD`
+ * substitution, a whitespace run (only when `collapseWhitespace`), or a
+ * verbatim character — so the two folds cannot drift on the offset map
+ * that every search maps through. */
+function foldScan(source: string, collapseWhitespace: boolean): FoldedSource {
+  const foldLen = (replacement: string): number => replacement.length;
+  // Pass 1: the folded LENGTH (the fold expands and deletes, so it
+  // cannot be sized from `source.length`).
   let foldedLength = source.length;
-  for (let m = FOLD_PATTERN.exec(source); m !== null; m = FOLD_PATTERN.exec(source)) {
-    foldedLength += (FOLD.get(source.charAt(m.index)) ?? "").length - 1;
+  if (collapseWhitespace) {
+    foldedLength -= countCollapsedWhitespace(source);
+  } else {
+    FOLD_PATTERN.lastIndex = 0;
+    for (let m = FOLD_PATTERN.exec(source); m !== null; m = FOLD_PATTERN.exec(source)) {
+      foldedLength += foldLen(FOLD.get(source.charAt(m.index)) ?? "") - 1;
+    }
   }
 
   const starts = new Int32Array(foldedLength);
   const ends = new Int32Array(foldedLength);
   let text = "";
   let out = 0;
-  let copied = 0;
   /** Record one verbatim source character at `k` as folded character
    *  `out`. */
   const emitVerbatim = (k: number): void => {
@@ -309,37 +382,82 @@ export function foldSource(source: string): FoldedSource {
     ends[out] = k + 1;
     out += 1;
   };
-  FOLD_PATTERN.lastIndex = 0;
-  for (let m = FOLD_PATTERN.exec(source); m !== null; m = FOLD_PATTERN.exec(source)) {
-    const at = m.index;
-    // Copy the run before the match verbatim; `starts` is the identity
-    // map there, so the run loop only has to record the offsets.
-    text += source.slice(copied, at);
-    for (let k = copied; k < at; k += 1) emitVerbatim(k);
-    const replacement = FOLD.get(source.charAt(at)) ?? "";
-    if (replacement.length > 0) {
-      // An EXPANDING substitution (`…` → `...`) fills every slot it
-      // produces with the ONE source offset it came from, so a match
-      // that starts or ends mid-substitution still maps to the source
-      // character that produced the run.
-      for (let k = 0; k < replacement.length; k += 1) {
-        starts[out] = at;
-        ends[out] = at + 1;
-        out += 1;
-      }
+  /** Record an EXPANDING substitution: every character it produces
+   *  carries the ONE source offset it came from, so a match that
+   *  starts or ends mid-substitution maps to the source character that
+   *  produced the run. */
+  const emitSubstitution = (at: number, replacement: string): void => {
+    for (let k = 0; k < replacement.length; k += 1) {
+      starts[out] = at;
+      ends[out] = at + 1;
+      out += 1;
     }
-    // A DELETING substitution (a backtick) emits nothing: `out` does
-    // not advance, so the next real character overwrites that slot
-    // with its own offsets. In `` `w` `` the folded `w` therefore maps
-    // to source [1, 2) — the span that carries the text, without the
-    // delimiters — which is what lets the engine's unchanged-path
-    // check stay a byte-for-byte comparison.
     text += replacement;
-    copied = at + 1;
+  };
+  /** Record a collapsed whitespace RUN as one space, spanning the run
+   *  — same contract as `emitSubstitution`, with the run as the unit. */
+  const emitSpace = (runStart: number, runEnd: number): void => {
+    starts[out] = runStart;
+    ends[out] = runEnd;
+    out += 1;
+    text += " ";
+  };
+
+  if (collapseWhitespace) {
+    for (let k = 0; k < source.length; ) {
+      const replacement = FOLD.get(source.charAt(k));
+      if (replacement !== undefined) {
+        // A DELETING substitution (a backtick) emits nothing: `out` does
+        // not advance, so the next real character overwrites that slot.
+        if (replacement.length > 0) emitSubstitution(k, replacement);
+        k += 1;
+        continue;
+      }
+      if (WHITESPACE.has(source.charAt(k))) {
+        const runStart = k;
+        while (k < source.length && WHITESPACE.has(source.charAt(k))) k += 1;
+        emitSpace(runStart, k);
+        continue;
+      }
+      // This branch walks character by character (the run structure of
+      // the non-collapsing loop is useless once whitespace is its own
+      // case), so the verbatim character is appended here rather than
+      // sliced out in bulk afterwards.
+      text += source.charAt(k);
+      emitVerbatim(k);
+      k += 1;
+    }
+  } else {
+    let copied = 0;
+    FOLD_PATTERN.lastIndex = 0;
+    for (let m = FOLD_PATTERN.exec(source); m !== null; m = FOLD_PATTERN.exec(source)) {
+      const at = m.index;
+      // Copy the run before the match verbatim; `starts` is the identity
+      // map there, so the run loop only has to record the offsets.
+      text += source.slice(copied, at);
+      for (let k = copied; k < at; k += 1) emitVerbatim(k);
+      emitSubstitution(at, FOLD.get(source.charAt(at)) ?? "");
+      copied = at + 1;
+    }
+    text += source.slice(copied);
+    for (let k = copied; k < source.length; k += 1) emitVerbatim(k);
   }
-  text += source.slice(copied);
-  for (let k = copied; k < source.length; k += 1) emitVerbatim(k);
   return { text, starts, ends };
+}
+
+/** How many characters `foldSourceLoose` drops by collapsing runs — the
+ *  inverse of what `emitSpace` writes, so pass 1 sizes the map
+ *  exactly. */
+function countCollapsedWhitespace(source: string): number {
+  let dropped = 0;
+  for (let k = 0; k < source.length; k += 1) {
+    if (!WHITESPACE.has(source.charAt(k))) continue;
+    let runEnd = k + 1;
+    while (runEnd < source.length && WHITESPACE.has(source.charAt(runEnd))) runEnd += 1;
+    dropped += runEnd - k - 1;
+    k = runEnd - 1;
+  }
+  return dropped;
 }
 
 /**

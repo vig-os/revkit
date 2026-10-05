@@ -88,11 +88,15 @@ export {
   DEFAULT_QUOTE_CONTEXT_CHARS,
   lineStartsOf,
   type BuildQuoteOptions,
+  type QuoteBuild,
+  type QuoteRefusal,
 } from "./quote.ts";
 export {
   findFolded,
   foldPair,
   foldSource,
+  foldSourceLoose,
+  foldTypographyLoose,
   foldedEquals,
   foldedHasHitFrom,
   foldedOffsetFromSource,

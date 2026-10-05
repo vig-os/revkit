@@ -35,6 +35,19 @@
 // blocks — and a quote built from it orphaned on the first edit even
 // when the commented paragraph was byte-identical.
 //
+// **Two contracts, one geometry (issue #113, PR #124 round 2).**
+// `buildQuoteFromLines` is total: it clamps a range that overruns the
+// file. `buildQuoteForComment` is not, because the two have callers
+// with different standing. The adapter's range came from a diff hunk it
+// matched itself, so a small overrun should degrade rather than throw.
+// A COMMENT's range came from a `data-src` stamp in a built page, and
+// the quote taken from it is compared against the file for the life of
+// the thread — clamping there stored the last paragraph's text as the
+// quote for lines that do not exist, which the engine then reported as
+// a successful `move` onto that paragraph. So the create path refuses,
+// with a reason, and shares the line geometry with the total path
+// rather than a second copy of it.
+//
 // Runtime-neutral: no `node:*` / `bun:*` imports.
 
 import type { TextQuote } from "./anchor.ts";
@@ -44,7 +57,12 @@ import {
   lineToOffset,
   toLF,
 } from "./reanchor.ts";
-import { findFolded, foldSource, foldedHasHitFrom, foldTypography } from "./typography.ts";
+import {
+  findFolded,
+  foldSourceLoose,
+  foldedHasHitFrom,
+  foldTypographyLoose,
+} from "./typography.ts";
 
 /** Default context window — reuses the reanchor engine's constant so
  * both producers cut identical windows. */
@@ -65,6 +83,17 @@ export interface BuildQuoteOptions {
  * range is clamped to the file bounds; a truly empty exact quote
  * still returns a valid TextQuote shape (the anchor schema will
  * refuse an empty `exact` downstream, which is the safe path).
+ *
+ * **This clamping is safe here and NOT on the comment-create path.**
+ * This function's callers own a line range that is already trusted to
+ * name something in this content — the GitHub adapter reads it from a
+ * diff hunk it matched itself — so a range that overruns the file
+ * degrades to the nearest text rather than failing. For a COMMENT, the
+ * range comes from the `data-src` stamp in a built page and the daemon
+ * is slicing a quote that will be compared against the file for years;
+ * clamping there stores a different paragraph's text and then reports
+ * `moved` onto it (issue #113, PR #124 round 2). `buildQuoteForComment`
+ * is the refusing variant, and it is the one the create path uses.
  *
  * The `exact` slice starts at the first character of `startLine` and
  * ends at (but does NOT include) the newline that terminates
@@ -145,19 +174,40 @@ function trimTrailingNewline(source: string, startOffset: number, endOffset: num
  * such a quote orphaned on the first edit even when the commented
  * paragraph was byte-identical.
  *
- * `selectionHint` is a needle that narrows the quote to a span rather
- * than taking the whole line range — the reviewer's selected RENDERED
- * text, or (from a client that sends no `selectionHint`) the `exact` of
- * a quote it already carries. The narrowing searches the SOURCE slice,
- * not the needle, and stores the source bytes it lands on — so the
- * needle can only ever change WHICH source span is quoted, never WHAT
- * is quoted. Two cases fall back to the whole line range rather than
- * guessing: the needle matches nothing in the range, and the needle
- * matches more than once (the client cannot say which span it meant).
- * A wrong span is worse than a wide one.
+ * **A quote is cut from the anchored block, or there is no quote**
+ * (issue #113, PR #124 round 2 — the review BLOCKER). This function
+ * therefore REFUSES rather than inventing one, and says why:
  *
- * Returns the same quote as `buildQuoteFromLines` when no usable hint
- * is given, so a caller with nothing to narrow by gets identical bytes.
+ * - `range-past-eof` — the anchor's line range does not exist in the
+ *   source. Line numbers come from the `data-src` stamps in the BUILT
+ *   page, so the ordinary cause is a stale build: the file shrank
+ *   after the page was built. Clamping the range to EOF (what this did
+ *   before) stores a DIFFERENT paragraph's text as the quote, and the
+ *   engine then reports `moved` onto that paragraph — a silent wrong
+ *   anchor, where the pre-#113 code reported `orphaned` honestly.
+ * - `empty-range` — the range exists but holds no text (the empty last
+ *   line a trailing newline creates). A different fact, with a
+ *   different reason.
+ * - `hint-not-found` — a `selectionHint` was sent and matches nothing
+ *   in the range. The hint is the reviewer's rendered selection, so a
+ *   hint the source does not contain means the page is not describing
+ *   the file the daemon just read. Widening to the whole range stored
+ *   text the reviewer never selected, on an anchor they can no longer
+ *   trust.
+ *
+ * `selectionHint` narrows the quote to a span rather than taking the
+ * whole line range. The narrowing searches the SOURCE slice, not the
+ * needle, and stores the source bytes it lands on — so the needle can
+ * only ever change WHICH source span is quoted, never WHAT is quoted.
+ * Two needles are handled without guessing: one that matches more than
+ * once widens to the whole block (a coarse but truthful anchor, and the
+ * block IS what the reviewer commented on — see the ambiguity note
+ * below), and one that matches nothing is refused.
+ *
+ * Returns a `QuoteBuild` rather than a `TextQuote`: the caller is a
+ * request handler that has to turn a refusal into a response, and a
+ * refusal that still carried a quote would be one refactor away from
+ * being stored.
  */
 export function buildQuoteForComment(
   source: string,
@@ -165,34 +215,76 @@ export function buildQuoteForComment(
   endLine: number,
   selectionHint?: string,
   options: BuildQuoteOptions = {},
-): TextQuote {
+): QuoteBuild {
   const lf = toLF(source);
   const index = buildLineStartIndex(lf);
-  const wholeRange = buildQuoteFromLines(lf, startLine, endLine, options);
+  const totalLines = index.length;
+  // NO clamping on this path (issue #113, PR #124 round 2). A range past
+  // the end of the file describes nothing, and the text nearest to its
+  // end belongs to a block the reviewer never read. `buildQuoteFromLines`
+  // above keeps clamping for the callers whose contract is total — see
+  // its note.
+  if (startLine > totalLines || endLine > totalLines) {
+    return { ok: false, reason: "range-past-eof", totalLines };
+  }
+  const start = Math.max(1, startLine);
+  const end = Math.max(start, endLine);
+  const blockStart = lineToOffset(index, start);
+  const blockEnd =
+    end + 1 > totalLines ? lf.length : trimTrailingNewline(lf, blockStart, lineToOffset(index, end + 1));
+  const wholeRange = buildQuoteFromOffsets(lf, blockStart, blockEnd, options);
+  if (wholeRange.exact.length === 0) return { ok: false, reason: "empty-range", totalLines };
+
   const hint = selectionHint?.trim();
-  if (hint === undefined || hint.length === 0) return wholeRange;
-  // Search the folded form of the SOURCE slice. Folding is what lets a
-  // rendered hint match its source counterpart (`“hi”` is not a
-  // substring of `"hi"`), and the hit is mapped back to source offsets
-  // so the stored `exact` is source text — with its backticks, its
-  // `--`, its `...`.
-  const blockFolded = foldSource(wholeRange.exact);
-  const foldedHint = foldTypography(hint);
-  if (foldedHint.length === 0) return wholeRange;
+  if (hint === undefined || hint.length === 0) return { ok: true, quote: wholeRange };
+  // Search the LOOSE-folded form of the SOURCE slice. Folding is what
+  // lets a rendered hint match its source counterpart (`“hi”` is not a
+  // substring of `"hi"`); collapsing whitespace runs is what lets a
+  // selection across a markdown soft break match, since the source
+  // holds a newline where the rendered page holds a space. The hit is
+  // mapped back to source offsets, so the stored `exact` is source
+  // text — with its `--`, its `...`, and its newlines.
+  const blockFolded = foldSourceLoose(wholeRange.exact);
+  const foldedHint = foldTypographyLoose(hint);
+  // A needle with no resolvable form (a selection that is only
+  // backticks, say) is a needle the source cannot contain. Refusing is
+  // the honest answer; treating it as absent would store the block for
+  // a selection we cannot read.
+  if (foldedHint.length === 0) return { ok: false, reason: "hint-not-found", totalLines };
   const hit = findFolded(blockFolded, foldedHint);
-  if (hit === null) return wholeRange;
+  if (hit === null) return { ok: false, reason: "hint-not-found", totalLines };
   if (foldedHasHitFrom(blockFolded, foldedHint, hit.foldedAt + foldedHint.length)) {
     // Ambiguous — the reviewer selected text that occurs twice in the
-    // range and the rendered hint cannot say which one. Quote the
-    // whole line range; the anchor is still correct, just wider.
-    return wholeRange;
+    // block and the rendered hint cannot say which. Quote the whole
+    // line range. This is the reviewer's OWN block: the anchor is
+    // coarser than their selection, but every byte of it is source
+    // text they commented on. Widening is right here and refused above,
+    // and the difference is exactly whether the stored text comes from
+    // inside the block the reviewer addressed.
+    return { ok: true, quote: wholeRange };
   }
-  // `wholeRange.exact` is the source from the start of `startLine`
-  // (clamped to the file by `buildQuoteFromLines`), so its hits are
-  // relative to `lineToOffset(index, clampedStart)`.
-  const blockStart = lineToOffset(index, Math.max(1, Math.min(startLine, Math.max(1, index.length))));
-  return buildQuoteFromOffsets(lf, blockStart + hit.start, blockStart + hit.end, options);
+  return {
+    ok: true,
+    quote: buildQuoteFromOffsets(lf, blockStart + hit.start, blockStart + hit.end, options),
+  };
 }
+
+/** Why `buildQuoteForComment` produced no quote. Carried to the caller so
+ * the refusal can name the cause instead of reporting a generic failure. */
+export type QuoteRefusal = "range-past-eof" | "empty-range" | "hint-not-found";
+
+/** The outcome of `buildQuoteForComment`: a quote cut from the anchored
+ * block, or a refusal that names its cause. `totalLines` is the number of
+ * lines the source actually has, which is what a caller needs to tell a
+ * reviewer how far off the anchor was. */
+export type QuoteBuild =
+  | { readonly ok: true; readonly quote: TextQuote }
+  | {
+      readonly ok: false;
+      readonly reason: QuoteRefusal;
+      readonly totalLines: number;
+    };
+
 
 /** Backwards-compat re-export — some earlier tests imported
  * `lineStartsOf` from this module. The reanchor engine's

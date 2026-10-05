@@ -20,8 +20,10 @@ import { describe, expect, test } from "bun:test";
 import {
   findFolded,
   foldSource,
+  foldSourceLoose,
   foldedEquals,
   foldTypography,
+  foldTypographyLoose,
   sourceOffsetInFoldedMatch,
 } from "../src/typography.ts";
 
@@ -250,5 +252,96 @@ describe("findFolded — mapping a folded match back to a source span", () => {
 
   test("a needle that only differs in words does not match", () => {
     expect(findFolded(foldSource('He said "hi" ok...'), foldTypography('She said “no” ok…'))).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `foldSourceLoose` / `foldTypographyLoose` — issue #113, PR #124 round 2.
+//
+// The comment builder now REFUSES a selection hint it cannot resolve
+// instead of widening the quote to the whole block. That only works if
+// the matcher can see across a markdown soft break first: the source
+// holds a newline where the rendered page holds a collapsed space, and
+// selecting across one is a routine thing for a reviewer to do.
+//
+// The map contract is the whole risk here — every search maps its hit
+// back through `starts` / `ends` to slice SOURCE bytes — so each case
+// below asserts the sliced text, not just the folded text.
+// ---------------------------------------------------------------------------
+
+describe("foldSourceLoose — the typographic fold plus collapsed whitespace", () => {
+  test("a soft break folds to one space, so a rendered hint matches", () => {
+    const source = "first line of the pair\nsecond line of the pair\nthird line";
+    const folded = foldSourceLoose(source);
+    expect(folded.text).toBe("first line of the pair second line of the pair third line");
+    expect(folded.text).not.toContain("\n");
+  });
+
+  test("a hit across the soft break slices SOURCE bytes, newline included", () => {
+    // The provenance property: what comes back is a byte-exact slice of
+    // the file, so the stored quote is source text even though the
+    // needle was rendered text.
+    const source = "first line of the pair\nsecond line of the pair\nthird line";
+    const folded = foldSourceLoose(source);
+    const hit = findFolded(folded, foldTypographyLoose("first line of the pair second line of the pair"));
+    expect(hit).not.toBeNull();
+    expect(source.slice(hit?.start ?? -1, hit?.end ?? -1)).toBe(
+      "first line of the pair\nsecond line of the pair",
+    );
+  });
+
+  test("a run of whitespace collapses to one space and keeps the run's span", () => {
+    const source = "alpha   \n\t  beta";
+    const folded = foldSourceLoose(source);
+    expect(folded.text).toBe("alpha beta");
+    // The collapsed space carries the WHOLE run's offsets, per the same
+    // contract an expanding substitution obeys.
+    const at = folded.text.indexOf(" ");
+    expect(folded.starts[at]).toBe(5);
+    expect(folded.ends[at]).toBe(source.indexOf("beta"));
+  });
+
+  test("both folds compose: a rendered quote AND a soft break in one span", () => {
+    const source = 'He said "hi" -- ok.\nAnd more.';
+    const folded = foldSourceLoose(source);
+    const hit = findFolded(folded, foldTypographyLoose("He said “hi” — ok. And more."));
+    expect(hit).not.toBeNull();
+    expect(source.slice(hit?.start ?? -1, hit?.end ?? -1)).toBe('He said "hi" -- ok.\nAnd more.');
+  });
+
+  test("a backtick still deletes, so the hit carries no delimiter of its own", () => {
+    // The two shapes the inline-code note in the module header turns on:
+    // a needle covering the whole line slices the whole line (delimiters
+    // included, because they sit inside the resolved span), while a needle
+    // that is only the code text slices the INNER span — the backtick was
+    // deleted before the search, so it is not in the hit. Both are source
+    // bytes; that is the property the comparison relies on.
+    const source = "Run `gh pr list` now.";
+    const folded = foldSourceLoose(source);
+    expect(folded.text).toBe("Run gh pr list now.");
+
+    const whole = findFolded(folded, foldTypographyLoose("Run gh pr list now."));
+    expect(source.slice(whole?.start ?? -1, whole?.end ?? -1)).toBe("Run `gh pr list` now.");
+
+    const inner = findFolded(folded, foldTypographyLoose("gh"));
+    expect(source.slice(inner?.start ?? -1, inner?.end ?? -1)).toBe("gh");
+  });
+
+  test("foldSource is NOT loosened: the engine's byte-exact path is untouched", () => {
+    // The engine compares quotes byte-for-byte, so the two folds must
+    // not be the same function. A newline here is what keeps them
+    // distinct — and what keeps a recorded quote matchable.
+    const source = "alpha\nbeta   gamma";
+    expect(foldSource(source).text).toBe(source);
+    expect(foldSourceLoose(source).text).toBe("alpha beta gamma");
+  });
+
+  test("an empty and a whitespace-only needle never match", () => {
+    const folded = foldSourceLoose("alpha\nbeta");
+    expect(findFolded(folded, foldTypographyLoose(""))).toBeNull();
+    // A whitespace-only needle would match every collapsed space, so the
+    // builder refuses it before searching; asserted here so the guard in
+    // `quote.ts` cannot be dropped without this noticing.
+    expect(foldTypographyLoose("   ").trim().length).toBe(0);
   });
 });

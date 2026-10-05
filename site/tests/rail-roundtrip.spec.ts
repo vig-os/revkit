@@ -444,6 +444,52 @@ test.describe("rail round-trip @chromium-only", () => {
     }
   });
 
+  // Round 2 (issue #113, PR #124): a stale build is refused with a REASON the
+  // reviewer can act on. Before this, the daemon refused with a precise
+  // message and the rail threw it away — `POST /api/threads failed: 400` —
+  // so the recovery ("reload the page") was never shown, and the argument for
+  // refusing over storing was an argument about a message nobody could read.
+  test("a stale build is refused with a readable reason, and the composer's text survives", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    try {
+      const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      expect(nav?.status()).toBeLessThan(400);
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+
+      // Make the page stale the way a live doc goes stale: the source moves
+      // on under a page that was built from the old one. Line 5 no longer
+      // holds the paragraph `data-src` names, so the reviewer's rendered
+      // selection cannot be resolved against the file — a stale-build signal,
+      // not something to widen a quote over.
+      const seedPath = join(daemon.root, FIXTURE_REL_PATH);
+      writeFileSync(seedPath, "# Title\n\nline 2\nline 3\nsomething else entirely\nline 6\n", "utf8");
+
+      await selectSubstring(page, FIXTURE_SELECTED_QUOTE);
+      await page.getByTestId("revkit-rail-floating").click();
+      const composer = page.getByTestId("revkit-rail-composer");
+      await expect(composer).toBeVisible();
+      await page.getByTestId("revkit-rail-composer-input").fill("why does this happen?");
+      await composer.locator("[data-testid=\"revkit-rail-submit\"]").click();
+
+      // The refusal says what to do, and it is the daemon's own message
+      // rather than a status code.
+      const error = page.locator(".revkit-rail__error");
+      await expect(error).toBeVisible({ timeout: 5000 });
+      await expect(error).toContainText("stale-anchor");
+      await expect(error).toContainText("reload the page");
+      // Recoverable: the composer is still open with the reviewer's text, so
+      // a reload and a re-select is all it costs. Nothing was stored.
+      await expect(composer).toBeVisible();
+      await expect(page.getByTestId("revkit-rail-composer-input")).toHaveValue("why does this happen?");
+      await expect(page.getByTestId("revkit-rail-thread")).toHaveCount(0);
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+
   test("XSS regression: <img onerror> in a comment body renders as text (no handler fires)", async ({ page }) => {
     // If the rail were rendering `comment.body` via innerHTML,
     // posting `<img src=x onerror=window.__xss=true>` would run the
@@ -461,10 +507,13 @@ test.describe("rail round-trip @chromium-only", () => {
       await page.goto(`${daemon.url}/${fixture.relPath}`);
       await expect(page.getByTestId("revkit-rail")).toBeVisible();
 
+      // Line 4 is the one that holds "line 3": the seed above is
+      // `# Title`, blank, `line 2`, `line 3`, … so the range has to name
+      // the line the quoted text is actually on.
       const seedAnchor = {
         path: "docs/adr/0003-content-model-mdx-typed-data.md",
-        startLine: 3,
-        endLine: 3,
+        startLine: 4,
+        endLine: 4,
         quote: { exact: "line 3", prefix: "", suffix: "" },
         revision: "c".repeat(64),
       };

@@ -45,10 +45,14 @@ interface Ctx {
   cookie: string;
 }
 
+// The line range must name the line that HOLDS `quote.exact`: the daemon
+// derives the quote from the source and uses the client's text as the needle
+// (issue #113), so an anchor whose range and quote disagree is refused
+// rather than clamped onto whatever happens to be near the end of the file.
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 40,
-  endLine: 44,
+  startLine: 4,
+  endLine: 4,
   quote: { exact: "why 30s?", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };

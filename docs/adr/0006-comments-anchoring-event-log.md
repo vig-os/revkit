@@ -418,7 +418,81 @@ but it changes rendered output for every document in the repo —
 `packages/cli/test/serve/publish-equivalence.test.ts` pins the smartypants
 behaviour deliberately — so it is a visible product change, out of scope here.
 
-### 3. The orphan reason no longer lies
+### 3. A comment is created from the anchored block, or not at all
+
+*(Added by the round-2 review of the change above, issue #113, PR #124. The
+decision in §1 — the source is the authority — was not sufficient on its own: a
+builder that has to produce a quote from whatever it is handed will invent one
+when the source does not contain what was asked for, and an invented quote is
+worse than no quote.)*
+
+`buildQuoteForComment` used to be **total**. It clamped a line range past EOF to
+the file's end, and a `selectionHint` that matched nothing in the range widened
+the quote to the whole range. Both produce a quote, and both produce the wrong
+one:
+
+- Line numbers reach the daemon from the `data-src` stamps in the **BUILT** page,
+  so the ordinary cause of a range past EOF is a **stale build** — the file
+  shrank after the page was built. Clamping then stored the file's LAST paragraph
+  as the quote for lines that do not exist. Measured: a 19-line source with no
+  trailing newline, an anchor of L40-41, and the stored quote is line 19's
+  paragraph. After an unrelated edit the engine does not report the mismatch — it
+  reports `moved`, re-anchoring confidently onto that paragraph. `moved` is a
+  success, so the rail shows a live anchor button pointing at text the reviewer
+  never read. The pre-#113 code reported `orphaned`, which is honest, visible and
+  recoverable. The clamp traded one for the other.
+- A `selectionHint` is the reviewer's **rendered** selection. If it matches
+  nothing in the anchored range, the page is not describing the file the daemon
+  just read — the same stale-build signal. Widening stored a paragraph the
+  reviewer did not select.
+
+**Decision.** The comment-create path refuses, and says which of three things
+was true: `range-past-eof`, `empty-range` (the range exists and is empty — the
+empty last line a trailing newline creates, a different fact with a different
+message), or `hint-not-found`. The refusal is a `400`, and the client's own
+`anchor.quote` is **never** substituted for it — that fallback is removed, not
+narrowed. It was unreachable for the current rail, which sends no quote, so a
+stale anchor produced a 400 complaining about a missing quote the client was
+never asked to send; for a legacy client it stored RENDERED text, which is the
+provenance violation §1 forbids and which `anchorRequestSchema`'s own note already
+ruled out ("The daemon ignores its contents"); and it fired only on an empty
+slice, so on a source without a trailing newline the same stale build stored
+different wrong text depending on the file's last byte.
+
+**Why a 400 and not "store it, orphan it".** The rail's `submitNewThread`
+catches the failure, shows the message and leaves the composer OPEN with the
+reviewer's text in it, so a refusal costs one reload — and a reload is exactly the
+fix, because the stale thing is the page's `data-src` stamps. Storing the comment
+instead is unrecoverable: an anchor built from a range that does not exist can
+never resolve, and the reviewer is never told why. A refusal is recoverable and
+names its cause; a stored comment with an invented anchor is neither.
+
+**One rule survives the narrowing.** A hint that matches MORE THAN ONCE still
+widens to the whole block. That is not the same failure: we know which block the
+reviewer commented on and cannot tell which of two identical spans they picked,
+so the anchor is coarser than their selection but every byte of it is source text
+they addressed. The line between the two cases is exactly whether the stored text
+comes from inside the block the reviewer commented on.
+
+**The matcher had to learn the soft break to make this safe.** Turning "matched
+nothing" into a refusal is only correct if a hint that *legitimately* matches
+still does. A markdown soft break is a newline in the source and a collapsed
+space in the rendered page, so selecting across one sends a hint the source does
+not contain — routinely, and it would have become a 400. The quote builder
+therefore searches a `foldSourceLoose` form (the typographic fold plus every
+whitespace run collapsed to one space), the needle-side counterpart being
+`foldTypographyLoose`. The re-anchoring engine is untouched by this: its
+comparisons stay byte-exact, which is why `foldSource` and `foldSourceLoose` are
+separate functions over one scanner rather than one function with a flag on the
+engine's hot path.
+
+**`buildQuoteFromLines` keeps clamping, deliberately.** Its other caller reads its
+line range from a diff hunk it matched itself (`github-adapter.ts`), where a small
+overrun should degrade to the nearest text rather than fail. Two callers with
+different standing, two contracts, one shared line geometry — a single clamped
+implementation is the bug this section is about.
+
+### 4. The orphan reason no longer lies
 
 Path 4a's refusal used one sentence for two different failures: *"diff reports
 unchanged, but the block's surroundings differ (substring accident) and no move

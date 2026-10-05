@@ -236,6 +236,16 @@ async function renderedCollapseParagraph(): Promise<string> {
   return m[1].replace(/<[^>]+>/g, "");
 }
 
+/** Line `n` (1-indexed) of `source`, throwing when it is absent.
+ * `noUncheckedIndexedAccess` makes `split()[n - 1]` `string | undefined`,
+ * and these assertions compare a quote against a fixture line — so the
+ * absence is a broken fixture, not a value to compare against. */
+function line(source: string, n: number): string {
+  const value = source.split("\n")[n - 1];
+  if (value === undefined) throw new Error(`fixture broke: no line ${n} in:\n${source}`);
+  return value;
+}
+
 /** The source-quote anchor for line 3 of the collapse fixture. */
 async function collapseSourceQuoteAnchor(): Promise<Anchor> {
   return {
@@ -274,7 +284,7 @@ describe("issue #113 F1 — a legacy whole-block quote aligns on the source span
     }
     expect(result.anchor.startLine).toBe(3);
     expect(result.anchor.endLine).toBe(3);
-    expect(result.anchor.quote.exact).toBe(COLLAPSE_NEW.split("\n")[2]);
+    expect(result.anchor.quote.exact).toBe(line(COLLAPSE_NEW, 3));
   });
 
   test("the LEGACY rendered quote lands on the SAME line range as the source-quote path", async () => {
@@ -307,7 +317,7 @@ describe("issue #113 F1 — a legacy whole-block quote aligns on the source span
       throw new Error(`expected both paths to re-anchor; got ${legacy.kind} / ${source.kind}`);
     }
     expect(legacy.anchor).toEqual(source.anchor);
-    expect(legacy.anchor.quote.exact).toBe(COLLAPSE_NEW.split("\n")[2]);
+    expect(legacy.anchor.quote.exact).toBe(line(COLLAPSE_NEW, 3));
   });
 
   test("the edited sentence is in the quote — the edit is not silently dropped", async () => {
@@ -323,5 +333,71 @@ describe("issue #113 F1 — a legacy whole-block quote aligns on the source span
       throw new Error(`expected the legacy quote to re-anchor, got orphaned: ${legacy.reason}`);
     }
     expect(legacy.anchor.quote.exact).toContain("ok... wrong... yes...");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #124 round 2, review BLOCKER B1 — why the clamp had to GO rather than
+// be documented.
+//
+// `buildQuoteForComment` clamped a line range past EOF to the file's end. On a
+// source with no trailing newline, an anchor of L40-41 against a 19-line file
+// therefore stored line 19's PARAGRAPH as the comment's quote. This test pins
+// what the engine then does with such an anchor, because that is the whole
+// argument: the pre-#113 code reported `orphaned` — honest, visible, and
+// recoverable — while the clamp converts the same situation into `moved`, a
+// silent wrong anchor persisted through `thread.reanchored`.
+// ---------------------------------------------------------------------------
+
+describe("issue #113 round 2 — a quote cut from the WRONG block reports `moved`, not `orphaned`", () => {
+  const para = (n: number): string => `Paragraph ${n}: the quick brown fox jumps over the lazy dog.`;
+  const NINETEEN = Array.from({ length: 19 }, (_, i) => para(i + 1)).join("\n");
+  const EDITED = `An unrelated edit at the top.\n${NINETEEN}`;
+
+  test("an anchor whose lines do not exist, carrying another paragraph's text, re-anchors as MOVED", async () => {
+    // The harm, in the engine's own words. `moved` is a SUCCESS: the rail
+    // re-renders the thread with an anchor button pointing at L1-1, and the
+    // reviewer has no signal that their comment is on the wrong paragraph.
+    // `orphaned` is the outcome the same facts used to produce.
+    const clamped: Anchor = {
+      path: "docs/x.md",
+      startLine: 40,
+      endLine: 41,
+      quote: { exact: para(19), prefix: "", suffix: "" },
+      revision: await revisionOf(NINETEEN),
+    };
+    const result = await reanchor(clamped, NINETEEN, EDITED);
+    expect(result.kind).not.toBe("orphaned");
+    if (result.kind === "orphaned") throw new Error("unreachable");
+    expect(result.kind).toBe("moved");
+    // And it re-anchors CONFIDENTLY to where the stolen text now lives —
+    // line 20, since the edit was prepended. The anchor's own coordinates
+    // said 40-41, which exist nowhere; the reviewer gets a live anchor
+    // button on a paragraph they never read, with nothing to indicate it.
+    expect(result.anchor.startLine).toBe(20);
+    expect(result.anchor.endLine).toBe(20);
+    expect(EDITED.split("\n")[19]).toBe(para(19));
+  });
+
+  test("the same anchor with NO quote orphans instead — the honest dead end", async () => {
+    // The contrast. With nothing to match, the engine says so; that is why
+    // storing a quote it had to invent is worse than storing none.
+    const noQuote = {
+      path: "docs/x.md",
+      startLine: 40,
+      endLine: 41,
+      quote: { exact: "", prefix: "", suffix: "" },
+      revision: await revisionOf(NINETEEN),
+    } as unknown as Anchor;
+    const result = await reanchor(noQuote, NINETEEN, EDITED);
+    expect(result.kind).toBe("orphaned");
+  });
+
+  test("so the create path refuses instead — see `anchor-quote-source.test.ts`", () => {
+    // The two halves are in different files on purpose: this one is the
+    // engine's account of why the daemon must not clamp, that one is the
+    // daemon refusing. Both are needed — an assertion on the refusal alone
+    // would not say what it prevents.
+    expect(40).toBeGreaterThan(19);
   });
 });

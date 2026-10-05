@@ -972,10 +972,24 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
   // (`test/serve/quote-provenance.test.ts`, F1).
   const sourceExact = oldLF.slice(oldSpan.start, oldSpan.end);
   // The trailing context bounds the walker's INSERT, so it must be
-  // source-shaped too. It is read at the recorded `suffix` LENGTH
-  // because that length is the context window the producer cut; the
-  // bytes come from the source, which is what the walker diffs
-  // against.
+  // source-shaped too — hence read from `oldLF`, never from the
+  // recorded `suffix`.
+  //
+  // Its LENGTH is the recorded `suffix.length`, which is exact for a
+  // SOURCE quote (the producer cut `contextChars` source bytes, and
+  // every comment created since #113 carries one) and approximate for
+  // a LEGACY rendered one: there `suffix.length` counts rendered
+  // characters, and a collapsed form (`…` for `...`, `—` for `--`) is
+  // fewer characters than the source it came from, so this reads
+  // slightly FEWER source bytes than the window the old rail cut. The
+  // consequence is bounded and one-directional — a shorter trailing
+  // context narrows the region the walker may insert into, which can
+  // only cost a match the walker would have made past the window, and
+  // the similarity gate still sees the recorded quote itself. Measuring
+  // the exact source length instead is not possible from the recorded
+  // text (the fold is many-to-one: `---` and `…` both fold toward
+  // `--`/`...`), so the length stays and the imprecision is recorded
+  // here rather than papered over with a guess.
   const sourceTrailingContext = oldLF.slice(oldSpan.end, oldSpan.end + anchor.quote.suffix.length);
   const aligned = alignMatchedText(sourceExact, newLF, clampedStart, {
     trailingContext: sourceTrailingContext,

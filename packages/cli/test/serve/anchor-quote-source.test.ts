@@ -114,6 +114,34 @@ async function postComment(selectionHint?: string): Promise<CreatedAnchor> {
   return parsed.event.anchor;
 }
 
+/** POST an arbitrary body and return the status plus the first issue
+ * message, so a refusal can be asserted by its REASON and not only by its
+ * code. */
+async function postRaw(body: unknown): Promise<{ status: number; message: string }> {
+  const response = await fetch(`${daemon.url}/api/threads`, {
+    method: "POST",
+    headers: {
+      cookie,
+      host: `127.0.0.1:${daemon.port}`,
+      origin: daemon.url,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let message = "";
+  try {
+    const parsed = JSON.parse(text) as {
+      issues?: { message: string }[];
+      detail?: { issues?: { message: string }[] };
+    };
+    message = parsed.issues?.[0]?.message ?? parsed.detail?.issues?.[0]?.message ?? text;
+  } catch {
+    message = text;
+  }
+  return { status: response.status, message };
+}
+
 describe("POST /api/threads — the stored quote is a SOURCE slice (issue #113)", () => {
   test("the fixture's rendered text really differs from its source", () => {
     // Without this the whole suite would be vacuous: if the rendered
@@ -219,11 +247,44 @@ describe("POST /api/threads — the stored quote is a SOURCE slice (issue #113)"
     expect(stored.revision).not.toBe("0".repeat(64));
   });
 
-  test("a selection hint that matches nothing in the line range falls back to the line range", async () => {
-    // A hint the source does not contain must NOT become the quote —
-    // that would be the client dictating quote text again.
-    const stored = await postComment("this text is nowhere in the file");
-    expect(stored.quote.exact).toBe(SOURCE_LINE_5);
+  test("a selection hint that matches nothing in the line range is REFUSED (round 2)", async () => {
+    // Round 1 widened here. That is the BLOCKER's second half: the hint is
+    // the reviewer's rendered selection, so a hint the source does not
+    // contain means the page is not describing the file the daemon just
+    // read — a stale build. Storing the whole line anyway stored text the
+    // reviewer never selected, on an anchor they can no longer trust.
+    // Refused with a reason instead; see `postRaw` for the response shape.
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 5, endLine: 5, revision: "0".repeat(64) },
+      selectionHint: "this text is nowhere in the file",
+      body: "stale page",
+    });
+    expect(response.status).toBe(400);
+    expect(response.message).toBe(
+      "stale-anchor: selection not found in source range; reload the page",
+    );
+  });
+
+  test("a hint that matches nothing is refused even when the client ALSO sent a quote", async () => {
+    // The fallback this replaces would have kept the client's own text for an
+    // empty slice. It cannot fire for the new rail (which sends no quote), and
+    // for a legacy client it would store rendered text — so it is gone, and
+    // the outcome no longer depends on what the client volunteered.
+    const response = await postRaw({
+      anchor: {
+        path: REL_PATH,
+        startLine: 5,
+        endLine: 5,
+        revision: "0".repeat(64),
+        quote: { exact: RENDERED_LINE_5, prefix: "", suffix: "" },
+      },
+      selectionHint: "this text is nowhere in the file",
+      body: "legacy client, stale page",
+    });
+    expect(response.status).toBe(400);
+    expect(response.message).toBe(
+      "stale-anchor: selection not found in source range; reload the page",
+    );
   });
 
   test("an ambiguous selection hint falls back to the line range rather than guessing", async () => {
@@ -238,7 +299,12 @@ describe("POST /api/threads — the stored quote is a SOURCE slice (issue #113)"
     expect(stored.quote.exact).toBe("repeated phrase here and repeated phrase here.");
   });
 
-  test("a selection that spans lines still stores source text only", async () => {
+  test("a selection that spans a soft break stores that two-line SPAN (round 2)", async () => {
+    // Round 1 widened this to the whole range, because the rendered text of a
+    // two-line selection joins the lines with a space while the source holds a
+    // newline, so the hint matched nothing. Round 2 makes an unresolvable hint
+    // a refusal — so the matcher had to learn the soft break first, or every
+    // routine two-line selection would have become a 400.
     const twoLines = "# T\n\nfirst line of the pair\nsecond line of the pair\n\ntail\n";
     writeFileSync(join(root, REL_PATH), twoLines);
     const anchor: AnchorRequest = {
@@ -257,9 +323,8 @@ describe("POST /api/threads — the stored quote is a SOURCE slice (issue #113)"
       },
       body: JSON.stringify({
         anchor,
-        // The rendered text of a two-line selection joins the lines
-        // with a space; the source holds a newline, so this hint
-        // cannot be resolved to a source span and must not become one.
+        // The rendered text of a two-line selection: the soft break
+        // collapses to a space in the DOM.
         selectionHint: "first line of the pair second line of the pair",
         body: "both lines",
       }),
@@ -267,7 +332,126 @@ describe("POST /api/threads — the stored quote is a SOURCE slice (issue #113)"
     expect(response.status).toBe(201);
     const parsed = (await response.json()) as { event: { anchor: CreatedAnchor } };
     const stored = parsed.event.anchor;
+    expect(stored.quote.exact).toBe("first line of the pair\nsecond line of the pair");
     expect(twoLines).toContain(stored.quote.exact);
     expect(stored.quote.exact).not.toContain("first line of the pair second line");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #124 round 2, review BLOCKER B1 — the daemon must not STORE a quote it
+// had to invent.
+//
+// `buildQuoteFromLines` clamped an out-of-range line range to EOF. On a file
+// with no trailing newline, an anchor of L40-41 against a 19-line source
+// therefore stored line 19's paragraph as the comment's quote, and a later
+// unrelated edit made the engine report `moved` onto that paragraph: a silent
+// wrong anchor, where the pre-#113 code reported `orphaned` honestly.
+//
+// These go through the real POST because the property is the daemon's: a
+// stored comment's quote is source text from the block the reviewer
+// commented on, or the create is refused with a reason.
+// ---------------------------------------------------------------------------
+
+describe("POST /api/threads — a stale anchor is refused, not clamped (round 2, B1)", () => {
+  /** 19 lines, NO trailing newline: the shape the falsifier measured. */
+  const STALE_NO_NL = Array.from(
+    { length: 19 },
+    (_, i) => `Paragraph ${i + 1}: the quick brown fox jumps over the lazy dog.`,
+  ).join("\n");
+
+  test("a range past EOF is REFUSED, and the file's last paragraph is NOT stored", async () => {
+    writeFileSync(join(root, REL_PATH), STALE_NO_NL);
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 40, endLine: 41, revision: "0".repeat(64) },
+      body: "commenting on lines 40-41 of a 19-line file",
+    });
+    expect(response.status).toBe(400);
+    expect(response.message).toBe(
+      "stale-anchor: anchor.startLine..endLine (40-41) is past the end of docs/adr/0013-smart.md (19 lines); reload the page",
+    );
+  });
+
+  test("the SAME stale anchor on a file WITH a trailing newline is refused identically", async () => {
+    // Round 1 clamped this to the empty 20th line, which handed the request to
+    // the client-quote fallback — so the last byte of the file decided whether
+    // the reviewer got a wrong quote or a silent no-op.
+    writeFileSync(join(root, REL_PATH), `${STALE_NO_NL}\n`);
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 40, endLine: 41, revision: "0".repeat(64) },
+      body: "commenting on lines 40-41 of a 19-line file",
+    });
+    expect(response.status).toBe(400);
+    expect(response.message).toBe(
+      "stale-anchor: anchor.startLine..endLine (40-41) is past the end of docs/adr/0013-smart.md (20 lines); reload the page",
+    );
+  });
+
+  test("a stale anchor is refused even when the client sent a quote to fall back on", async () => {
+    // This is the falsifier's exact harm: the clamped quote WAS stored, so the
+    // comment existed and looked healthy, pointing at a paragraph the reviewer
+    // never read.
+    writeFileSync(join(root, REL_PATH), STALE_NO_NL);
+    const response = await postRaw({
+      anchor: {
+        path: REL_PATH,
+        startLine: 40,
+        endLine: 41,
+        revision: "0".repeat(64),
+        quote: { exact: "Paragraph 19: the quick brown fox jumps over the lazy dog.", prefix: "", suffix: "" },
+      },
+      body: "legacy client with a stale anchor",
+    });
+    expect(response.status).toBe(400);
+  });
+
+  test("nothing was stored: the refused create leaves no thread behind", async () => {
+    // A 400 that still wrote a thread would be a lie about the outcome, and
+    // the reviewer would see their comment with an anchor they never chose.
+    writeFileSync(join(root, REL_PATH), STALE_NO_NL);
+    await postRaw({
+      anchor: { path: REL_PATH, startLine: 40, endLine: 41, revision: "0".repeat(64) },
+      body: "this comment must not exist",
+    });
+    const threads = await (await fetch(`${daemon.url}/api/threads`, {
+      headers: { cookie, host: `127.0.0.1:${daemon.port}`, origin: daemon.url },
+    })).json() as { threads: { body: string }[] };
+    expect(threads.threads).toHaveLength(0);
+  });
+
+  test("a range that is IN bounds but empty is refused with the empty-slice reason", async () => {
+    // The trailing newline makes line 20 an existing, empty line — a different
+    // fact from "line 40 does not exist", so it must read differently.
+    writeFileSync(join(root, REL_PATH), `${STALE_NO_NL}\n`);
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 20, endLine: 20, revision: "0".repeat(64) },
+      body: "commenting on the empty line the trailing newline creates",
+    });
+    expect(response.status).toBe(400);
+    expect(response.message).toBe(
+      "anchor.startLine..endLine resolves to no text in the source file",
+    );
+  });
+
+  test("the refusal keeps the rail's composer usable — a 400, not a dead POST", async () => {
+    // Why 400 and not "store it, orphan it": the rail's `submitNewThread`
+    // catches the failure, shows the message and leaves the composer open with
+    // the reviewer's text in it (`setComposerAnchor(undefined)` runs only on
+    // success). A refusal is recoverable — reload and re-select. A stored
+    // comment with an invented anchor is not recoverable at all: it is
+    // permanently unanchorable and the reviewer is never told why.
+    writeFileSync(join(root, REL_PATH), STALE_NO_NL);
+    const refused = await postRaw({
+      anchor: { path: REL_PATH, startLine: 40, endLine: 41, revision: "0".repeat(64) },
+      body: "the reviewer's text survives the refusal",
+    });
+    expect(refused.status).toBe(400);
+    // And the same request with an in-range anchor succeeds, so the route
+    // itself is not what refuses.
+    const accepted = await postRaw({
+      anchor: { path: REL_PATH, startLine: 19, endLine: 19, revision: "0".repeat(64) },
+      body: "the reviewer's text survives the refusal",
+    });
+    expect(accepted.status).toBe(201);
   });
 });

@@ -18,11 +18,15 @@ import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
 import type { LineSink } from "../../src/serve/logger.ts";
 import { MAX_COMMENT_BODY_BYTES } from "../../src/serve/daemon.ts";
 
+// The line range must name the line that HOLDS `quote.exact`: the daemon
+// derives the quote from the source and uses the client's text as the needle
+// (issue #113), so an anchor whose range and quote disagree is refused
+// rather than clamped onto whatever happens to be near the end of the file.
 const anchor: Anchor = {
   path: "docs/x.md",
-  startLine: 1,
-  endLine: 2,
-  quote: { exact: "hi", prefix: "", suffix: "" },
+  startLine: 3,
+  endLine: 3,
+  quote: { exact: "hello", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };
 
