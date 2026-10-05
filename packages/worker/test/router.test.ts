@@ -221,7 +221,11 @@ describe("canonicalRepoName — the ONE stored spelling of a repository name", (
     // file already refuses for `//`, for `%2e` and for a leading zero. A refusal
     // is the same answer a caller gets for `/API/pr-7`, so the case variant has
     // no spelling at all.
-    for (const spelling of ["Revkit", "REVKIT", "rEvKiT", "Rev-Kit", "vig-OS.revkit", "_REVKIT", "API"]) {
+    // `_REVKIT` is deliberately absent: `REPO_SEGMENT` demands an alphanumeric
+    // first character, so `isRepoName` refuses it and it never reaches the case
+    // rule. A spelling that short-circuits earlier proves nothing about the check
+    // under test — `isRepoName`'s own cases already cover it.
+    for (const spelling of ["Revkit", "REVKIT", "rEvKiT", "Rev-Kit", "vig-OS.revkit", "API"]) {
       expect(parsePreviewPath(`/${spelling}/pr-7`), spelling).toBeUndefined();
       expect(parseScopedThreadsPath(scopedThreadsPath(spelling, 7)), spelling).toBeUndefined();
     }
@@ -238,15 +242,12 @@ describe("canonicalRepoName — the ONE stored spelling of a repository name", (
     // the spellings a fixture picked: for every admitted letter, lowercase serves
     // and uppercase does not. `isRepoName` still ACCEPTS `Revkit` — mint does,
     // and folds it — which is the difference between the two sides.
-    let served = 0;
     for (let code = 0x61; code <= 0x7a; code += 1) {
       const lower = String.fromCharCode(code);
-      expect(parsePreviewPath(`/${lower}/pr-7`) !== undefined, lower).toBe(true);
+      expect(parsePreviewPath(`/${lower}/pr-7`)?.repo, lower).toBe(canonicalRepoName(lower));
       expect(isRepoName(lower.toUpperCase()), `${lower}: the MINT still accepts it`).toBe(true);
-      expect(parsePreviewPath(`/${lower.toUpperCase()}/pr-7`) !== undefined, lower).toBe(false);
-      served += 1;
+      expect(parsePreviewPath(`/${lower.toUpperCase()}/pr-7`), `${lower}: and the ROUTE does not`).toBeUndefined();
     }
-    expect(served).toBe(26);
   });
 });
 

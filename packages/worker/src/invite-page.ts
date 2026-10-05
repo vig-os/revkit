@@ -266,10 +266,12 @@ export interface RedeemFormInput {
  * also wrong about the WHAT: the sweep ANONYMISES (`display_name` → `deleted
  * user`, `email` → NULL, row kept), it does not delete. A guest reading a promise
  * the deployment cannot keep is worse than a guest reading no promise, so the
- * sentence now states the actual mechanism — ask, and a person runs
- * `revkit data delete --identity <id>`. `test/invites.test.ts` asserts the page
- * and `wrangler.jsonc` agree, so the sentence cannot quietly become a claim
- * again.
+ * sentence states only what is true now: nothing removes it automatically, and a
+ * person can be asked to. It deliberately does not name
+ * `revkit data delete --identity <id>` — ADR-0015 **plans** that command and it
+ * does not exist, so pointing a guest at it would be the same false claim in a
+ * different key. `test/invites.test.ts` asserts the page and `wrangler.jsonc`
+ * agree, so the sentence cannot quietly become a claim again.
  */
 export function redeemFormPage(input: RedeemFormInput): string {
   const scope = input.pr === null ? `all pull requests in ${input.repo}` : `${input.repo} pull request #${input.pr}`;

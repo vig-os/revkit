@@ -366,7 +366,10 @@ interface PathRoute {
   readonly guestScopeExempt: boolean;
   /** Does this path answer `verb` as `kind`? Anything else becomes
    * `method-not-allowed` with the fields below preserved. A predicate rather
-   * than a set because one path accepts EVERY verb — see `ANY_VERB`. */
+   * than a set because TWO paths accept EVERY verb — `unknown` and
+   * `revkit-bundle`, both ungated, where the verb cannot change the answer; see
+   * `ANY_VERB`. Every GATED path takes a read or a write predicate, so a wrong
+   * verb on one is a 405 rather than a route that quietly accepts it. */
   readonly acceptsVerb: (verb: string) => boolean;
   /**
    * The one path that answers DIFFERENTLY per verb: `<repo>/pr-<n>/api/threads`

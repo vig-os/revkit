@@ -46,6 +46,7 @@ import {
 } from "../src/session.ts";
 import {
   SCOPED_THREADS_SUFFIX,
+  canonicalRepoName,
   parsePreviewPath,
   parseScopedThreadsPath,
   parseThreadsQuery,
@@ -493,7 +494,12 @@ describe("ADR-0012's per-request gate", () => {
       //
       // So the parser refuses, and "not a preview" is the same answer a caller
       // gets for `/API/pr-7`. Exactly one spelling resolves.
-      for (const spelling of ["Revkit", "REVKIT", "rEvKiT", "Revkit2", "vig-OS.revkit", "API", "_REVKIT"]) {
+      // `_REVKIT` is deliberately NOT in this list, and the reason is the point:
+      // `REPO_SEGMENT` requires an alphanumeric FIRST character, so `_REVKIT` is
+      // refused by `isRepoName` and never reaches the case rule at all. A spelling
+      // that short-circuits three checks earlier proves nothing about this one —
+      // it belongs with the `isRepoName` cases, which already cover it.
+      for (const spelling of ["Revkit", "REVKIT", "rEvKiT", "Revkit2", "vig-OS.revkit", "API"]) {
         expect(parsePreviewPath(`/${spelling}/pr-7`), spelling).toBeUndefined();
         expect(parseScopedThreadsPath(scopedThreadsPath(spelling, 7)), spelling).toBeUndefined();
         // Not a preview, so not a gated path, so not a scope — 404 for everyone.
@@ -527,16 +533,16 @@ describe("ADR-0012's per-request gate", () => {
       // whole admitted character class, a repo segment is servable at the
       // canonical spelling and is a 404 at every other one, so "two spellings of
       // one path must not both resolve" holds for every name rather than for the
-      // seven a fixture happened to spell.
-      let canonicals = 0;
+      // seven a fixture happened to spell. Asserted as the SEGMENT being equal
+      // to its canonical form — the fixed-point rule itself — so a future fold
+      // that made some letter work in both cases fails here rather than needing a
+      // new fixture line.
       for (let code = 0x61; code <= 0x7a; code += 1) {
         const lower = String.fromCharCode(code);
         const upper = lower.toUpperCase();
-        expect(parsePreviewPath(`/${lower}/pr-7`) !== undefined, lower).toBe(true);
-        expect(parsePreviewPath(`/${upper}/pr-7`) !== undefined, upper).toBe(false);
-        canonicals += 1;
+        expect(parsePreviewPath(`/${lower}/pr-7`)?.repo, lower).toBe(canonicalRepoName(lower));
+        expect(parsePreviewPath(`/${upper}/pr-7`), `${lower}: uppercase must not be a second review`).toBeUndefined();
       }
-      expect(canonicals).toBe(26);
     });
 
     // ── slice 5: the scope invariant, and the read it moved ───────────────
