@@ -7,7 +7,7 @@
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
   export|import` CLI command; and the 2026-10-05 (issue #73) amendment — an
-  `import` lands only in an empty store.
+  `import` lands only in an empty store, judged against the log the store holds.
 
 ## Context
 
@@ -272,4 +272,17 @@ arriving at `head + 1` used to be accepted silently and then handed to
 bridge designs the deep comparison that would settle it (#35), a store holding a
 log refuses every archive (`divergent-archive`, or `seq-gap` when the archive
 starts above `head + 1`); an empty store still accepts any archive, which is the
-one shape `exportArchive` — the only producer — emits. Refs: #73
+one shape `exportArchive` — the only producer — emits.
+
+**Both of those sentences are about the log the STORE holds, and that is a
+commitment each backing has to earn** — "its own" is not the instance's
+in-memory state. `bun:sqlite` rehydrates head and validator state in `open`;
+`D1ThreadStore` holds neither at construction and `src/index.ts` builds a fresh
+store per request, so until #107's fix it compared every archive against an
+empty state — the guard could not fire and a colliding archive committed. A
+backing that judges an archive against anything other than the stored log
+breaks this amendment, so the property is asserted per backing, through a second
+store instance over the same storage (`StoreFactory.reopen`). `import` is also a
+read-then-write, so its commit is guarded against a writer that moves the head in
+between: one guard row inside the same `batch()`, gating every archive row, so a
+stale head writes nothing rather than something. Refs: #73, #107, #108

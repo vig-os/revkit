@@ -22,6 +22,7 @@ import {
   CURRENT_SCHEMA_VERSION,
   InMemoryThreadStore,
   ThreadStoreAppendError,
+  ThreadStoreImportError,
   exportArchive,
   isUnanchoredAnchor,
   revisionOf,
@@ -416,10 +417,12 @@ describe("D1ThreadStore — D1 concurrency model", () => {
 
   test("A11(b): two stores importing the SAME archive — the loser writes nothing", async () => {
     // The scenario the bridge actually has: `revkit threads publish` runs
-    // twice, or two Worker isolates both pull the same local log. The
-    // second import's head-monotone rule passes (its own head is 0) and
-    // its batch then collides on the PK, which must roll the WHOLE batch
-    // back rather than half-apply it.
+    // twice, or two Worker isolates both pull the same local log. Since
+    // #107 the loser does not even reach its batch: it reconciles first,
+    // sees the winner's rows, and its own `prepareImport` refuses
+    // (`head-not-monotone` — the archive starts at seq 1 and the log it
+    // was going to write into is at seq 2). Either way the requirement is
+    // the same and stronger than before: the loser writes NOTHING.
     const publisher = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock(0) });
     await publisher.append(createThread("th-pub-1", "c-pub-1"));
     await publisher.append(createThread("th-pub-2", "c-pub-2"));
@@ -433,6 +436,97 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // The winner's payloads are intact — the loser's batch overwrote none
     // of them, which a per-statement commit would have done.
     expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-pub-1");
+  });
+
+  // ── I6: `import`'s read-then-write window (#107's second half) ───────
+  //
+  // `append` reads its head INSIDE the batch that writes, so nothing can
+  // move between the two. `import` cannot: it must read the log, run the
+  // whole `prepareImport` dry run in JS, and only then write. So its
+  // commit is guarded, and these two cases are the proof the guard holds
+  // — one for the window being open and losing nothing, one for the guard
+  // being a single statement for the WHOLE archive (a per-row guard writes
+  // the first row of a three-row archive and silently drops the rest,
+  // which is what the SQL comment in `d1-store.ts` records as measured).
+
+  test("I6: an import whose log GREW between its read and its write writes nothing", async () => {
+    const publisher = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock(0) });
+    await publisher.append(createThread("th-race-1", "c-race-1"));
+    await publisher.append(createThread("th-race-2", "c-race-2"));
+    await publisher.append(createThread("th-race-3", "c-race-3"));
+    const archive = await exportArchive(publisher);
+    expect(await countIn(harness.db, LOG)).toBe(0);
+
+    // Open the window deterministically: the proxy fires after the
+    // import's FIRST batch (its reconcile read, which sees an empty log)
+    // and before its SECOND (the guarded commit), which is exactly the gap
+    // a concurrent request's append would land in. Same technique as A10's
+    // "the compare-and-swap retry path runs" case, aimed at `import`.
+    const competitor: ReviewEvent = {
+      seq: 1,
+      ts: "2026-10-03T12:00:00Z",
+      ...createThread("th-race-competitor", "c-race-competitor"),
+    } as ReviewEvent;
+    let batches = 0;
+    let raced = false;
+    const racingDb = proxyDb(harness.db, async () => {
+      batches += 1;
+      if (batches !== 2) return;
+      raced = true;
+      await harness.db
+        .prepare(INSERT_FOR)
+        .bind(LOG, 1, competitor.ts, JSON.stringify(competitor))
+        .run();
+    });
+
+    const store = new D1ThreadStore({ db: racingDb, logKey: LOG, clock: fixedClock() });
+    // The import refuses, and it refuses LOUDLY and TYPED — the guard is
+    // not a silent skip.
+    let thrown: unknown;
+    try {
+      await store.import(archive);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(raced).toBe(true);
+    expect(thrown).toBeInstanceOf(ThreadStoreImportError);
+
+    // Nothing of the archive landed — not one row of the three. This is
+    // the assertion the unguarded commit fails: it would have written
+    // seqs 1, 2 and 3 on top of the competitor's seq 1 (and thrown a PK
+    // collision on the first, leaving the log at one row that is not the
+    // archive's).
+    expect(await seqsIn(harness.db, LOG)).toEqual([1]);
+    const rows = await rowsIn(harness.db, LOG);
+    expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-race-competitor");
+  });
+
+  test("I6: the guard is ONE statement for the whole archive, not one per row", async () => {
+    // Kills the per-row mutant. A per-row `… WHERE MAX(seq) = <validated
+    // head>` guard looks correct and is not: the first row's own insert
+    // raises MAX(seq), so every later row's guard then fails. Measured on
+    // this build: three rows guarded that way into an empty log come back
+    // `meta.changes = [1, 0, 0]` and the log holds one row. So a
+    // MULTI-event archive is the case that tells the two apart — which is
+    // why this is a three-event archive and not one.
+    const publisher = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock(0) });
+    await publisher.append(createThread("th-all-1", "c-all-1"));
+    await publisher.append(createThread("th-all-2", "c-all-2"));
+    await publisher.append(createThread("th-all-3", "c-all-3"));
+    const archive = await exportArchive(publisher);
+
+    const store = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
+    await store.import(archive);
+    expect(await seqsIn(harness.db, LOG)).toEqual([1, 2, 3]);
+    // All three payloads, so a partial commit cannot pass as a count.
+    const rows = await rowsIn(harness.db, LOG);
+    expect(rows.map((r) => JSON.parse(r.payload).threadId)).toEqual(["th-all-1", "th-all-2", "th-all-3"]);
+    // And no guard row survived. `since(0)` parses every payload through
+    // `reviewEventSchema`, so a leftover marker row (empty payload) would
+    // make the read below THROW rather than quietly return — which is why
+    // this assertion is about the public read and not about SQL.
+    expect((await store.since(0)).map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(await countIn(harness.db, LOG)).toBe(3);
   });
 
   // ── head() on a NON-EMPTY log (the #76 review's I1) ──────────────────

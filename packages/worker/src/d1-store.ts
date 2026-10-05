@@ -78,6 +78,7 @@ import {
   selectThreads,
   validateNext,
   ThreadStoreAppendError,
+  ThreadStoreImportError,
   type AskFilter,
   type AskRecord,
   type Clock,
@@ -134,6 +135,23 @@ const wallClock: Clock = () => new Date().toISOString();
  */
 export const APPEND_CAS_ATTEMPTS = 64;
 
+/**
+ * Cap on compare-and-swap attempts in `import`.
+ *
+ * **Not measured the way `APPEND_CAS_ATTEMPTS` was, because it cannot be.**
+ * `append` contends against every other writer to the log, so its worst case
+ * is a function of the burst. `import` can only ever commit into an EMPTY log
+ * (the #73 guard in `prepareImport` refuses a store that holds one), so the
+ * only writer an import can race is another importer of the same empty log —
+ * a client publishing the same review twice. One attempt always resolves that
+ * race for somebody: the winner commits, the loser's guard fails, its retry
+ * re-reads a log that is no longer empty and is refused with a precise kind.
+ * 4 therefore covers a pathological duplicate-publish storm and then fails
+ * LOUDLY with a typed `retryable` error instead of spinning — the same posture
+ * as `append`'s cap, at a size that says "clients" rather than "contention".
+ */
+export const IMPORT_CAS_ATTEMPTS = 4;
+
 /** Reads the log's current head. Cheapest statement that proves the
  * batch's other statements are looking at a consistent snapshot.
  *
@@ -171,16 +189,64 @@ const INSERT_SQL =
   "INSERT INTO review_logs (log_key, seq, ts, payload) SELECT ?, ?, ?, ? " +
   "WHERE (SELECT COALESCE(MAX(seq), 0) FROM review_logs WHERE log_key = ?) = ?";
 
-/** `import`'s insert: the archive's OWN seqs, unguarded, but still carrying this
- * store's log key — the archive names seqs, never a log, and a store that
- * imported into "everything" would be a cross-review write. The head-monotone
- * rule is already enforced above against this store's head, and a concurrent
- * writer that claimed one of the archive's seqs must fail the whole batch loudly
- * (batch atomicity) rather than be silently skipped. A guard here would be WRONG
- * rather than merely redundant: an archive may legally carry gaps (ADR-0006 —
- * consumers use `since(lastSeen)` and never assume contiguity, and A14 pins that),
- * and a `MAX(seq) = seq - 1` guard would skip exactly those rows. */
-const INSERT_ARCHIVE_SQL = "INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)";
+/** `import`'s commit: the archive's OWN seqs — never re-derived — but only
+ * while THIS LOG's head is still the head the archive was validated against.
+ *
+ * **`import` is a read-then-write, so it needs a compare-and-swap that
+ * `append` does not.** `append` puts its head read INSIDE the same batch as
+ * its insert, so nothing can move between them. `import` cannot: it has to
+ * read the log, run the whole `prepareImport` dry run in JS, and only then
+ * write, so the read and the write are necessarily two round trips. Without
+ * a guard, a writer that committed in that window would have its events
+ * silently overwritten by an archive validated against a log that no longer
+ * exists (#107/#108's family of defects, one layer down).
+ *
+ * **The guard is ONE guarded statement, then N gated ones, then its cleanup
+ * — and it must be that shape.** The obvious spelling, a per-row
+ * `… WHERE MAX(seq) = <head I validated against>` on every insert, is
+ * WRONG, and silently so. Measured on miniflare 4.20260518.0: three rows
+ * guarded that way into an EMPTY log come back `meta.changes = [1, 0, 0]`
+ * and the log holds seq 41 and nothing else — the first row's own insert
+ * raises MAX(seq), so every later row's guard now fails. An archive of one
+ * event works; an archive of two writes half. (The old comment in this file
+ * rejected a guard for a different reason — a `MAX(seq) = seq - 1` form
+ * would skip gapped rows — and was right about THAT while leaving this trap
+ * open.)
+ *
+ * So the guard is a **row, not a predicate**: one insert that lands only if
+ * the head still matches, every archive row gated on that row's EXISTENCE,
+ * and a delete of it last. All inside one `db.batch()`, i.e. one
+ * transaction, so the sentinel is never observable from outside — a
+ * concurrent `since()` cannot see it, and a failed guard leaves nothing
+ * behind to clean up. Measured, same build:
+ *
+ * | case | `meta.changes` | rows after |
+ * |---|---|---|
+ * | head still the validated one | `[1, 1, 1, 1, 1]` (sentinel + 3 + delete) | the 3 archive rows, sentinel gone |
+ * | head moved under us | `[0, 0, 0, 0]` | unchanged — **no partial import** |
+ * | gapped archive `[41, 42]` at head 5 | `[1, 1, 1]` | both rows — gaps still legal |
+ *
+ * The sentinel is identified by its PAYLOAD, not by its seq, because a seq
+ * is a thing another writer can legitimately hold (a writer that appended
+ * past the archive's top) while this payload is not: it is a string no
+ * `reviewEventSchema` event can carry, since every event has a non-empty
+ * `body`. The seq is still the archive's top + 1, purely so the sentinel
+ * cannot collide with a row of the archive it is gating. */
+const IMPORT_GUARD_MARKER = "__revkit_import_guard__";
+
+const IMPORT_GUARD_SQL =
+  "INSERT INTO review_logs (log_key, seq, ts, payload) SELECT ?, ?, '', ? " +
+  "WHERE (SELECT COALESCE(MAX(seq), 0) FROM review_logs WHERE log_key = ?) = ?";
+
+/** One archive event, gated on the guard row being there. `ts` and
+ * `payload` are this archive's own, unlike the sentinel's. */
+const IMPORT_ROW_SQL =
+  "INSERT INTO review_logs (log_key, seq, ts, payload) SELECT ?, ?, ?, ? " +
+  "WHERE EXISTS (SELECT 1 FROM review_logs WHERE log_key = ? AND payload = ?)";
+
+/** The guard row's own cleanup, last in the batch. Keyed on the marker, so
+ * it cannot delete a legitimate row: no event payload is this string. */
+const IMPORT_GUARD_DELETE_SQL = "DELETE FROM review_logs WHERE log_key = ? AND payload = ?";
 
 /** Thrown when `append` exhausts its compare-and-swap budget.
  *
@@ -233,7 +299,19 @@ export interface D1ThreadStoreOptions {
 
 /** `D1ThreadStore` — the hosted `ThreadStore`, ONE PER REVIEW. Construct it
  * once per request scope and reuse it: `#logState` is the validator's state and
- * rebuilding it per call would replay the whole log on every append. */
+ * rebuilding it per call would replay the whole log on every append.
+ *
+ * **Reusing it is an OPTIMISATION, not a correctness requirement — which was
+ * not true of `import` before #107.** `src/index.ts` builds a fresh store per
+ * request, so on any log this instance did not append to, `#head` is 0 and
+ * `#logState` is empty. `append` has always reconciled that inside its own
+ * batch (that is what the CAS and `CATCH_UP_SQL` are for); `import` now reads
+ * the log before it validates anything. Judging an archive against `#head`
+ * without reading the table meant the hosted lane compared every archive
+ * against an EMPTY store: the #73 divergence guard could not fire (a foreign
+ * log's tail landed at seq 3 of a log at head 2), and an archive reusing a
+ * stored `threadId`/`commentId` committed outright. A fresh instance is now a
+ * correct store — a slow one. */
 export class D1ThreadStore implements ThreadStore {
   readonly #db: D1Database;
   readonly #logKey: string;
@@ -309,15 +387,22 @@ export class D1ThreadStore implements ThreadStore {
    *
    * After `append`/`import` on THIS instance the two VALUES agree, because
    * those are the only ways `#head` advances and both leave the table's
-   * `MAX(seq)` equal to it. */
+   * `MAX(seq)` equal to it. A REFUSED import leaves them disagreeing, which
+   * is correct: it refused to write, so the table's head is whatever it
+   * was — and `head()` is the value to trust either way. */
   async head(): Promise<number> {
     const row = await this.#db.prepare(HEAD_SQL).bind(this.#logKey).first<{ head?: number }>();
     return typeof row?.head === "number" ? row.head : 0;
   }
 
   /** This instance's validated watermark, without a query. Diagnostics
-   * and the append path's bookkeeping only — a caller that wants the log's
-   * head wants `head()`. */
+   * and the mutation paths' bookkeeping only — a caller that wants the
+   * log's head wants `head()`.
+   *
+   * **It is a watermark, not a cache of the log.** `import` reconciles it
+   * from the table before it validates anything, and a fresh instance's is
+   * 0 on a log holding seq 7; #107 existed because `import` read it as an
+   * answer instead of a starting point. */
   validatedHead(): number {
     return this.#head;
   }
@@ -359,7 +444,7 @@ export class D1ThreadStore implements ThreadStore {
       // Whatever another writer committed is durable, so it belongs in
       // the real state whether or not our own insert landed — the next
       // attempt must validate against it, not against a stale state.
-      absorbCatchUp(this.#logState, readPayloads(batched[1]));
+      absorbCatchUp(this.#logState, readPayloads(batched[1]), appendInconsistency);
       if (this.#head < dbHead) this.#head = dbHead;
       if ((batched[2]?.meta?.changes ?? 0) > 0) {
         // The CAS held, which means `MAX(seq)` was still `expected`, which
@@ -383,25 +468,86 @@ export class D1ThreadStore implements ThreadStore {
 
   private async importNow(archive: ThreadArchive): Promise<void> {
     // Same guarantees as `InMemoryThreadStore.import` and
-    // `SqliteThreadStore.import`, for the same reason:
-    // `prepareImport` (review-core) owns the parse, the head
-    // precondition and the dry run against a DEEP COPY of this store's
-    // state, and raises `ThreadStoreImportError` for every refusal. Here
-    // we only COMMIT, in ONE batch, so a PK collision mid-archive writes
-    // none of the events (measured: D1 refuses the whole batch) and the
-    // store is left exactly as it was.
-    const events = prepareImport(archive, this.#logState, this.#head);
-    if (events.length === 0) return;
-    await this.#db.batch(
-      events.map((event) =>
-        this.#db.prepare(INSERT_ARCHIVE_SQL).bind(this.#logKey, event.seq, event.ts, JSON.stringify(event)),
-      ),
-    );
-    for (const event of events) {
-      // Cannot fail — the dry run accepted this exact sequence.
-      validateNext(this.#logState, event);
-      this.#head = event.seq;
+    // `SqliteThreadStore.import`, for the same reason: `prepareImport`
+    // (review-core) owns the parse, the head precondition, the dry run
+    // and the divergence guard, and raises `ThreadStoreImportError` for
+    // every refusal. What this backing owes it is a STATE it can trust.
+    for (let attempt = 1; attempt <= IMPORT_CAS_ATTEMPTS; attempt++) {
+      // ── Reconcile with the log D1 actually holds ───────────────────────
+      // `src/index.ts` builds a fresh `D1ThreadStore` per request, and
+      // this class rehydrates nothing at construction — so on any log this
+      // instance did not append to, `#head` is 0 and `#logState` is empty.
+      // Validating against THOSE is precisely how the #73 guard failed to
+      // fire on the hosted lane (#107: a foreign log's tail at seq 3 landed
+      // in a log at head 2) and how an archive reusing a stored
+      // `threadId`/`commentId` COMMITTED (#108): `prepareImport` was handed
+      // an empty store and an empty head, so it had nothing to compare
+      // against and nothing to refuse.
+      //
+      // The two statements are `append`'s, in one `batch` so the head and
+      // the rows come from the SAME snapshot — a head read outside the
+      // rows' read could claim seqs this state never absorbed. The bound is
+      // `seq > this.#head`, so a retry never re-absorbs a row it already
+      // folded in (which would come back as `duplicate-thread`).
+      const snapshot = await this.#db.batch<{ payload: string }>([
+        this.#db.prepare(HEAD_SQL).bind(this.#logKey),
+        this.#db.prepare(CATCH_UP_SQL).bind(this.#logKey, this.#head),
+      ]);
+      absorbCatchUp(this.#logState, readPayloads(snapshot[1]), importInconsistency);
+      const dbHead = readHead(snapshot[0]);
+      if (this.#head < dbHead) this.#head = dbHead;
+
+      const events = prepareImport(archive, this.#logState, this.#head);
+      if (events.length === 0) return;
+
+      // ── Commit, guarded against a writer that moved the head ──────────
+      // The guard row lands only if MAX(seq) for this log is still
+      // `expected`; every archive row is gated on that row; the row is
+      // deleted last. All one transaction, so this is all-or-nothing: a
+      // writer that committed since the read above makes the guard row
+      // miss, every archive row skip, and the batch leave the log exactly
+      // as it was — so the loop re-reads and re-decides rather than
+      // trusting an archive validated against a log that has moved.
+      const expected = this.#head;
+      // The archive's events are seq-ascending (`threadArchiveSchema`
+      // refuses any other order), so the last one is the top — which is
+      // what keeps the sentinel from colliding with a row it gates.
+      const sentinelSeq = (events[events.length - 1]?.seq ?? expected) + 1;
+      const committed = await this.#db.batch([
+        this.#db
+          .prepare(IMPORT_GUARD_SQL)
+          .bind(this.#logKey, sentinelSeq, IMPORT_GUARD_MARKER, this.#logKey, expected),
+        ...events.map((event) =>
+          this.#db
+            .prepare(IMPORT_ROW_SQL)
+            .bind(this.#logKey, event.seq, event.ts, JSON.stringify(event), this.#logKey, IMPORT_GUARD_MARKER),
+        ),
+        this.#db.prepare(IMPORT_GUARD_DELETE_SQL).bind(this.#logKey, IMPORT_GUARD_MARKER),
+      ]);
+      // The archive's own rows, which are `committed[1 … n]`. Summed and
+      // compared to the FULL count rather than reading one statement: all
+      // of them share one guard, so this is `events.length` or `0` — and
+      // requiring the full count means a partial write (which would mean
+      // the atomicity claim above is wrong) is treated as contention and
+      // re-read, never reported as success.
+      const written = committed
+        .slice(1, events.length + 1)
+        .reduce((total, statement) => total + (statement?.meta?.changes ?? 0), 0);
+      if (written !== events.length) continue;
+      for (const event of events) {
+        // Cannot fail — the dry run accepted this exact sequence against a
+        // clone of the state, and the guard just proved that state is still
+        // the log's state (rows are only ever ADDED, so an unchanged
+        // MAX(seq) means no writer wrote anything).
+        validateNext(this.#logState, event);
+        this.#head = event.seq;
+      }
+      return;
     }
+    throw new ThreadStoreContendedError(
+      IMPORT_CAS_ATTEMPTS,
+      `import: gave up after ${IMPORT_CAS_ATTEMPTS} attempts; another writer kept moving this log's head. Nothing was written.`,
+    );
   }
 
   async since(after: number): Promise<ReviewEvent[]> {
@@ -444,17 +590,41 @@ function readPayloads(statement: D1Result<{ payload: string }> | undefined): str
 
 /** Replay rows another writer committed into this store's validator
  * state. A refusal here means the log is genuinely inconsistent with the
- * shared rules — surface it as the typed append error rather than
- * letting our own event ride on top of a state we could not build. */
-function absorbCatchUp(state: LogState, payloads: readonly string[]): void {
+ * shared rules — surface it in the CALLER's error taxonomy rather than
+ * letting our own event ride on top of a state we could not build.
+ *
+ * `refuse` exists because `import` must not answer with
+ * `ThreadStoreAppendError`: #72's promise is that EVERY `import` refusal
+ * leaves the store boundary as a `ThreadStoreImportError`, and before
+ * `import` reconciled at all this path was `append`'s alone. `import`
+ * cannot pass a `transition` (the event that broke the state is another
+ * writer's, not an archive event), so it reports `invalid-shape` with no
+ * `seq`/`index`. */
+function absorbCatchUp(
+  state: LogState,
+  payloads: readonly string[],
+  refuse: (message: string) => Error,
+): void {
   for (const payload of payloads) {
     const foreign = reviewEventSchema.parse(JSON.parse(payload));
     const result = validateNext(state, foreign);
     if (!result.ok) {
-      throw new ThreadStoreAppendError({
-        kind: "invalid-shape",
-        message: `append: another writer's event seq=${foreign.seq} broke the local log state (${result.rejection.kind}: ${result.rejection.message}).`,
-      });
+      throw refuse(
+        `another writer's event seq=${foreign.seq} broke the local log state (${result.rejection.kind}: ${result.rejection.message}).`,
+      );
     }
   }
+}
+
+/** The `append` half of `absorbCatchUp`'s taxonomy. */
+function appendInconsistency(message: string): ThreadStoreAppendError {
+  return new ThreadStoreAppendError({ kind: "invalid-shape", message: `append: ${message}` });
+}
+
+/** The `import` half: same condition, the class #72 promised, and no
+ * `cause` — there is no `ZodError` behind a log that will not replay. */
+function importInconsistency(message: string): ThreadStoreImportError {
+  return new ThreadStoreImportError(`import: archive refused — ${message}`, {
+    rejection: { kind: "invalid-shape", seq: undefined, index: undefined, transition: undefined },
+  });
 }

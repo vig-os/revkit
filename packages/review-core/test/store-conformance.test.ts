@@ -16,6 +16,15 @@ describe("store conformance — InMemoryThreadStore (review-core reference)", ()
     async make(): Promise<ThreadStore> {
       return new InMemoryThreadStore({ clock: fixedClock() });
     },
+    async reopen(): Promise<ThreadStore> {
+      // Honest answer, not a dodge: the reference store keeps its log in
+      // INSTANCE fields (`#events`, `#logState`, `#head`), so there is no
+      // storage for a second handle to reach. "Reopen" is a new instance,
+      // and a new instance is a new empty log. The case that uses this
+      // reads what the second instance can see and asserts the verdict
+      // that follows, rather than pretending a second handle exists.
+      return new InMemoryThreadStore({ clock: fixedClock() });
+    },
     async reset(): Promise<void> {
       // Nothing to drop — `make()` hands back a fresh instance, which is
       // already empty. Same shape as any other in-memory store.

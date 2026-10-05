@@ -123,10 +123,13 @@ export type ImportRejection = {
   /** Which invariant failed. Stable across implementations. */
   readonly kind: AppendRejection["kind"] | "head-not-monotone" | "seq-gap" | "divergent-archive";
   /** The `seq` of the offending archive event, when the failure named
-   * one. `undefined` only for a failure that names no event at all: a bad
-   * `schemaVersion`, an `events` that is not an array, a `null` archive.
-   * A head-precondition refusal DOES name an event — `events[0]`, whose
-   * seq is the one that failed the check. */
+   * one. `undefined` when the failure names no event OF THE ARCHIVE: a bad
+   * `schemaVersion`, an `events` that is not an array, a `null` archive, or
+   * a refusal about a foreign writer's event a backing could not replay
+   * into its state (that event belongs to the store's log, not to the
+   * archive, so it has no index here). A head-precondition refusal DOES
+   * name an event — `events[0]`, whose seq is the one that failed the
+   * check. */
   readonly seq: number | undefined;
   /** Index into `archive.events`, when the failure named one event. */
   readonly index: number | undefined;
@@ -306,6 +309,14 @@ export function prepareImport(archive: ThreadArchive, state: LogState, head: num
   // events or another repo's history wearing this log's seqs can only be
   // settled by deep-comparing the overlap, which is the parked #35
   // bridge's design to make.
+  //
+  // **Every clause of that paragraph is conditional on the caller having
+  // passed the log the STORE holds.** A backing that hands us a
+  // per-instance watermark instead — `D1ThreadStore` did exactly that,
+  // with `#head === 0` and an empty `#logState` on every fresh instance,
+  // and `src/index.ts` builds one per request — gets an EMPTY comparison
+  // here and neither the dry run nor this guard can see anything
+  // (#107/#108). `state` and `head` are the store's, not this object's.
   //
   // Until then the conservative reading holds: a store that already has
   // a log accepts no archive, and an EMPTY store accepts any (which is

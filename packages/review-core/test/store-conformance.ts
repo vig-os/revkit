@@ -38,9 +38,10 @@
 // **Cases covered:** A5 (seq starts at 1, strictly increasing), A6
 // (`since(n)`), A7 (`threads()` ordering), A8 (invalid event refused, log
 // unchanged), A9 (`validateNext` refusal leaves the store byte-identical),
-// A12 (import is refused whole, and every refusal is a
-// `ThreadStoreImportError` with a typed `rejection` — #72), A14 (gaps are
-// legal).
+// A12 (import is refused whole; every refusal is a
+// `ThreadStoreImportError` with a typed `rejection` — #72; and an import
+// is judged against the log the STORE holds, not against what one instance
+// validated — #107/#108), A14 (gaps are legal).
 //
 // **Not here, and deliberately:** A10 (20 concurrent appends) and A11
 // (batch atomicity). Those are properties of D1's concurrency model, and
@@ -76,6 +77,19 @@ export interface StoreFactory {
   readonly name: string;
   /** A store over an EMPTY log. */
   make(): Promise<ThreadStore>;
+  /** **Another store instance over the SAME storage `make()` hands
+   * out** — a reopened `bun:sqlite` file, a second `D1ThreadStore` on the
+   * same `logKey`. Required, not optional, because the hosted lane builds
+   * a fresh store per request (`src/index.ts`), so "the instance that
+   * wrote the log" and "the instance that judges an archive against it"
+   * are different objects in production, and a factory that cannot
+   * express that cannot express a `ThreadStore` property (#107/#108).
+   *
+   * A backing whose log does not outlive its instance answers this
+   * honestly — the in-memory reference returns a new empty store, because
+   * its log IS instance fields — and the case that uses this reads the
+   * storage rather than assuming which answer it got. */
+  reopen(): Promise<ThreadStore>;
   /** Drop all state so the next `make()` starts clean. Callers use it
    * between cases; the suite calls it in `beforeEach`. */
   reset(): Promise<void>;
@@ -630,6 +644,92 @@ export function storeConformance(factory: StoreFactory): void {
       expect((await store.since(0)).map((e) => e.seq)).toEqual([3, 4]);
     });
 
+    test("A12: a fresh instance over a non-empty log refuses a DIVERGENT archive (#107)", async () => {
+      // #107, one case, all three backings. It was invisible here because
+      // every case so far used ONE instance to do everything: the instance
+      // that appended was the instance that imported, so its head and its
+      // log state WERE the log's. In production they are not the same
+      // object — `src/index.ts` builds a fresh `D1ThreadStore` per request
+      // — and a fresh instance's head is 0 and its validator state is
+      // empty, so the #73 guard had nothing to fire on.
+      const { fresh, stored } = await secondInstanceOverSeededLog(factory, store);
+      if (stored.length === 0) {
+        // The in-memory reference: its log IS its instance, so there is
+        // nothing to be judged against and the archive lands. The honest
+        // answer for a backing with no storage behind the handle.
+        await fresh.import(await buildGappedArchive([3]));
+        expect((await fresh.since(0)).map((e) => e.seq)).toEqual([3]);
+        return;
+      }
+
+      // #73's repro, through the instance that did not write the log: a
+      // foreign thread's `comment.created` at seq 3, refused exactly as
+      // the writer instance refuses it.
+      const foreign = {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        events: [archiveEvent(3, "th-inst-3", "c-inst-3")],
+      } satisfies ThreadArchive;
+      expect(() => parseArchive(foreign)).not.toThrow();
+      let caught: unknown;
+      try {
+        await fresh.import(foreign);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ThreadStoreImportError);
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      expect(rejection?.kind).toBe("divergent-archive");
+      expect(rejection?.seq).toBe(3);
+      // The log the storage held is byte-identical, and the second
+      // instance can still append onto it — a refusal is not a wedged
+      // store.
+      expect(JSON.stringify(await fresh.since(0))).toBe(JSON.stringify(stored));
+      expect(await fresh.append(createThread("th-inst-next", "c-inst-next"))).toBe(3);
+    });
+
+    test("A12: a fresh instance over a non-empty log refuses an archive whose ids collide with it (#108)", async () => {
+      // #108 is the same root cause with a worse consequence: it
+      // COMMITTED rather than merely failing to refuse. An archive at
+      // non-colliding seqs 7, 8 whose first event re-opens `th-inst-1`
+      // under a new commentId — internally consistent, so `parseArchive`
+      // accepts it, and refused only by the store's dry run against the
+      // log the storage holds. Against an empty state there is nothing to
+      // collide with, and both events land.
+      const { fresh, stored } = await secondInstanceOverSeededLog(factory, store);
+      if (stored.length === 0) {
+        await fresh.import(await buildGappedArchive([7, 8]));
+        expect((await fresh.since(0)).map((e) => e.seq)).toEqual([7, 8]);
+        return;
+      }
+
+      const collides = {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        events: [archiveEvent(7, "th-inst-1", "c-inst-7"), archiveEvent(8, "th-inst-b", "c-inst-b")],
+      } satisfies ThreadArchive;
+      expect(() => parseArchive(collides)).not.toThrow();
+      let caught: unknown;
+      try {
+        await fresh.import(collides);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ThreadStoreImportError);
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      // `duplicate-thread`, NOT `divergent-archive`: the dry run runs
+      // before the guard, so the more specific invariant still wins and
+      // the kinds a caller branched on since #72 are unchanged.
+      expect(rejection?.kind).toBe("duplicate-thread");
+      expect(rejection?.seq).toBe(7);
+      expect(rejection?.transition?.kind).toBe("duplicate-thread");
+      // Nothing landed — neither event — and the derived view has no
+      // duplicate threadId, which is the property #108 broke. (The view
+      // alone would not show it: the reduce absorbs the second
+      // `comment.created` as another comment on the same thread, so only
+      // the event log shows the fork.)
+      expect(JSON.stringify(await fresh.since(0))).toBe(JSON.stringify(stored));
+      expect((await fresh.threads()).map((t) => t.id)).toEqual(["th-inst-1", "th-inst-2"]);
+    });
+
     // ── A14 ───────────────────────────────────────────────────────────────
     test("A14: a store whose seq jumps still satisfies since/threads and never throws", async () => {
       // An archive starting at seq 41 — a fresh store on a log whose
@@ -659,6 +759,29 @@ export function storeConformance(factory: StoreFactory): void {
       expect(archive.events.map((e) => e.seq)).toEqual([41, 42, 43]);
     });
   });
+}
+
+/** Seed two events through `store`, then hand back a SECOND instance over
+ * the SAME storage (`StoreFactory.reopen`) together with what that storage
+ * holds — read, not assumed.
+ *
+ * `stored` is empty exactly when the backing's log does not outlive its
+ * instance, which is true of the in-memory reference and nothing else. The
+ * two #107/#108 cases branch on it rather than on a declared flag, so the
+ * branch follows an observed fact about the store rather than a property
+ * the factory claimed about itself.
+ *
+ * Two events, not one: the repro's head is 2, and a head of 2 is also the
+ * smallest store where `since(2)` (the daemon's catch-up cursor) has
+ * something to be wrong about. */
+async function secondInstanceOverSeededLog(
+  factory: StoreFactory,
+  store: ThreadStore,
+): Promise<{ fresh: ThreadStore; stored: readonly ReviewEvent[] }> {
+  await store.append(createThread("th-inst-1", "c-inst-1"));
+  await store.append(createThread("th-inst-2", "c-inst-2"));
+  const fresh = await factory.reopen();
+  return { fresh, stored: await fresh.since(0) };
 }
 
 /** One `comment.created` as it appears inside an archive — i.e. WITH the
