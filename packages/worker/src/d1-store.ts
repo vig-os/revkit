@@ -138,17 +138,22 @@ export const APPEND_CAS_ATTEMPTS = 64;
 /**
  * Cap on compare-and-swap attempts in `import`.
  *
- * **Not measured the way `APPEND_CAS_ATTEMPTS` was, because it cannot be.**
- * `append` contends against every other writer to the log, so its worst case
- * is a function of the burst. `import` can only ever commit into an EMPTY log
- * (the #73 guard in `prepareImport` refuses a store that holds one), so the
- * only writer an import can race is another importer of the same empty log —
- * a client publishing the same review twice. One attempt always resolves that
- * race for somebody: the winner commits, the loser's guard fails, its retry
- * re-reads a log that is no longer empty and is refused with a precise kind.
- * 4 therefore covers a pathological duplicate-publish storm and then fails
- * LOUDLY with a typed `retryable` error instead of spinning — the same posture
- * as `append`'s cap, at a size that says "clients" rather than "contention".
+ * **A backstop, not a budget — and effectively unreachable.** Not measured
+ * the way `APPEND_CAS_ATTEMPTS` was, because it cannot be measured: the
+ * guard can only fail if `MAX(seq)` for this log is no longer the head the
+ * archive was validated against, rows are only ever ADDED to a log, and a
+ * log that has gained a row stays non-empty. So the first lost guard already
+ * guarantees the next attempt's reconcile sees a non-empty log, which
+ * `prepareImport` refuses outright (`divergent-archive`) — the loop runs at
+ * most twice and the second pass is a refusal, not an error.
+ *
+ * The only ways past that are not contention at all: a writer that DELETES
+ * rows so the head falls back below `expected` (nothing in this package
+ * prunes `review_logs` today — a future retention job would have to think
+ * about this loop), or a bug. 4 exists so those fail LOUDLY with a typed
+ * `retryable` error instead of spinning, which is the same posture as
+ * `append`'s cap — but read it as a backstop, not as "4 attempts of
+ * contention to expect".
  */
 export const IMPORT_CAS_ATTEMPTS = 4;
 
@@ -222,16 +227,20 @@ const INSERT_SQL =
  *
  * | case | `meta.changes` | rows after |
  * |---|---|---|
- * | head still the validated one | `[1, 1, 1, 1, 1]` (sentinel + 3 + delete) | the 3 archive rows, sentinel gone |
- * | head moved under us | `[0, 0, 0, 0]` | unchanged — **no partial import** |
+ * | head still the validated one, 3-event archive | `[1, 1, 1, 1, 1]` (sentinel + 3 + delete) | the 3 archive rows, sentinel gone |
+ * | the SAME 3-event archive with a stale head | `[0, 0, 0, 0, 0]` | unchanged — **no partial import** |
  * | gapped archive `[41, 42]` at head 5 | `[1, 1, 1]` | both rows — gaps still legal |
  *
  * The sentinel is identified by its PAYLOAD, not by its seq, because a seq
  * is a thing another writer can legitimately hold (a writer that appended
- * past the archive's top) while this payload is not: it is a string no
- * `reviewEventSchema` event can carry, since every event has a non-empty
- * `body`. The seq is still the archive's top + 1, purely so the sentinel
- * cannot collide with a row of the archive it is gating. */
+ * past the archive's top) while this payload is not: **every payload in
+ * this table is `JSON.stringify(event)` — a JSON OBJECT, so it always
+ * begins with `{` — and the marker is a bare token with no braces**, so it
+ * cannot be any event's payload whatever that event's fields say. (The
+ * secondary belt is that no event has an empty `body`; the structural one
+ * is that the shapes do not overlap at all.) The seq is still the
+ * archive's top + 1, purely so the sentinel cannot collide with a row of
+ * the archive it is gating. */
 const IMPORT_GUARD_MARKER = "__revkit_import_guard__";
 
 const IMPORT_GUARD_SQL =
@@ -385,11 +394,18 @@ export class D1ThreadStore implements ThreadStore {
    * construction (the bug above) or blocking. A caller holding both types
    * must `await` this one, and that is the honest cost of a remote store.
    *
-   * After `append`/`import` on THIS instance the two VALUES agree, because
-   * those are the only ways `#head` advances and both leave the table's
-   * `MAX(seq)` equal to it. A REFUSED import leaves them disagreeing, which
-   * is correct: it refused to write, so the table's head is whatever it
-   * was — and `head()` is the value to trust either way. */
+   * After `append` on THIS instance the two VALUES agree, because that is
+   * the only way `#head` advances and it leaves the table's `MAX(seq)`
+   * equal to it.
+   *
+   * A REFUSED `import` usually agrees too, and the reason is worth stating
+   * because the earlier version of this sentence claimed the opposite:
+   * `importNow` reconciles `#head` from the table BEFORE `prepareImport`
+   * refuses, so after a `#107` refusal on a fresh instance over a log at
+   * seq 2, `validatedHead()` and `head()` both read 2 (measured). They
+   * still DISAGREE on exactly one path — the catch-up-inconsistency
+   * refusal, which throws before `#head = dbHead` — and in every case
+   * `head()` is the value to trust. */
   async head(): Promise<number> {
     const row = await this.#db.prepare(HEAD_SQL).bind(this.#logKey).first<{ head?: number }>();
     return typeof row?.head === "number" ? row.head : 0;

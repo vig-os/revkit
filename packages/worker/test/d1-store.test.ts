@@ -443,43 +443,19 @@ describe("D1ThreadStore — D1 concurrency model", () => {
   // `append` reads its head INSIDE the batch that writes, so nothing can
   // move between the two. `import` cannot: it must read the log, run the
   // whole `prepareImport` dry run in JS, and only then write. So its
-  // commit is guarded, and these two cases are the proof the guard holds
-  // — one for the window being open and losing nothing, one for the guard
-  // being a single statement for the WHOLE archive (a per-row guard writes
-  // the first row of a three-row archive and silently drops the rest,
-  // which is what the SQL comment in `d1-store.ts` records as measured).
+  // commit is guarded, and these cases are the proof the guard holds —
+  // one per way an unguarded commit fails, plus one for the guard being a
+  // single statement for the WHOLE archive (a per-row guard writes the
+  // first row of a three-row archive and silently drops the rest, which is
+  // what the SQL comment in `d1-store.ts` records as measured).
 
-  test("I6: an import whose log GREW between its read and its write writes nothing", async () => {
-    const publisher = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock(0) });
-    await publisher.append(createThread("th-race-1", "c-race-1"));
-    await publisher.append(createThread("th-race-2", "c-race-2"));
-    await publisher.append(createThread("th-race-3", "c-race-3"));
-    const archive = await exportArchive(publisher);
-    expect(await countIn(harness.db, LOG)).toBe(0);
-
-    // Open the window deterministically: the proxy fires after the
-    // import's FIRST batch (its reconcile read, which sees an empty log)
-    // and before its SECOND (the guarded commit), which is exactly the gap
-    // a concurrent request's append would land in. Same technique as A10's
-    // "the compare-and-swap retry path runs" case, aimed at `import`.
-    const competitor: ReviewEvent = {
-      seq: 1,
-      ts: "2026-10-03T12:00:00Z",
-      ...createThread("th-race-competitor", "c-race-competitor"),
-    } as ReviewEvent;
-    let batches = 0;
-    let raced = false;
-    const racingDb = proxyDb(harness.db, async () => {
-      batches += 1;
-      if (batches !== 2) return;
-      raced = true;
-      await harness.db
-        .prepare(INSERT_FOR)
-        .bind(LOG, 1, competitor.ts, JSON.stringify(competitor))
-        .run();
+  test("I6: an import whose log GREW between its read and its write writes nothing (colliding seq)", async () => {
+    const { archive, store, raced } = await raceOnSecondBatch({
+      db: harness.db,
+      logKey: LOG,
+      competitor: { threadId: "th-race-1", commentId: "c-race-1" },
     });
 
-    const store = new D1ThreadStore({ db: racingDb, logKey: LOG, clock: fixedClock() });
     // The import refuses, and it refuses LOUDLY and TYPED — the guard is
     // not a silent skip.
     let thrown: unknown;
@@ -488,17 +464,50 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     } catch (error) {
       thrown = error;
     }
-    expect(raced).toBe(true);
+    expect(raced()).toBe(true);
     expect(thrown).toBeInstanceOf(ThreadStoreImportError);
 
-    // Nothing of the archive landed — not one row of the three. This is
-    // the assertion the unguarded commit fails: it would have written
-    // seqs 1, 2 and 3 on top of the competitor's seq 1 (and thrown a PK
-    // collision on the first, leaving the log at one row that is not the
-    // archive's).
+    // Nothing of the archive landed — not one row of the three. The
+    // competitor holds seq 1, so an UNGUARDED commit collides on the
+    // archive's own first row: the batch throws a raw D1 PK error and the
+    // log ends up holding the competitor's row and none of the archive's.
+    // The guard replaces that with a refusal and the same empty outcome.
     expect(await seqsIn(harness.db, LOG)).toEqual([1]);
     const rows = await rowsIn(harness.db, LOG);
-    expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-race-competitor");
+    expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-race-1");
+  });
+
+  test("I6: …and writes nothing when the racing seq is one the archive does NOT claim", async () => {
+    // The variant the colliding case cannot see. Here the competitor holds
+    // seq 4 — past the archive's 1, 2, 3 — so an unguarded commit would
+    // write **all three** of the archive's rows with nothing to collide
+    // with: no error, no refusal, a log holding four events, three of them
+    // from an archive validated against a log that no longer existed. That
+    // is the failure the guard exists for, and it is SILENT, so it cannot
+    // be asserted by "the import threw" — only by what the log holds.
+    const { archive, store, raced } = await raceOnSecondBatch({
+      db: harness.db,
+      logKey: LOG,
+      competitor: { threadId: "th-race-4", commentId: "c-race-4" },
+      competitorSeq: 4,
+    });
+
+    let thrown: unknown;
+    try {
+      await store.import(archive);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(raced()).toBe(true);
+    expect(thrown).toBeInstanceOf(ThreadStoreImportError);
+
+    // The log holds the competitor's row and NOTHING else — the archive
+    // contributed no seq, so no half-import and no silent graft.
+    expect(await seqsIn(harness.db, LOG)).toEqual([4]);
+    expect(JSON.parse((await rowsIn(harness.db, LOG))[0]?.payload ?? "{}").threadId).toBe("th-race-4");
+    // …and the store agrees about what it holds, so a later read is not
+    // handed the archive's rows either.
+    expect((await store.since(0)).map((event) => event.seq)).toEqual([4]);
   });
 
   test("I6: the guard is ONE statement for the whole archive, not one per row", async () => {
@@ -910,4 +919,62 @@ function proxyDb(db: D1Database, onBatch: () => Promise<void>): D1Database {
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+/**
+ * Open `import`'s read-then-write window and hand back a store whose next
+ * `import` will race it.
+ *
+ * The proxy commits `competitor` into `logKey` just before the SECOND batch
+ * the store issues — which is exactly the gap a concurrent request's
+ * `append` lands in: batch 1 is `import`'s reconcile read (it sees an EMPTY
+ * log), batch 2 is the guarded commit. Same technique as A10's "the
+ * compare-and-swap retry path runs" case, aimed at `import`, and it is why
+ * the assertion `raced()` exists: an implementation with no second batch has
+ * no window, and a test that did not check would pass against one.
+ *
+ * `competitorSeq` is what makes the two cases different. At seq 1 an
+ * unguarded commit COLLIDES with the archive's own first row and the batch
+ * throws a raw D1 PK error. Past the archive's top it collides with nothing
+ * and an unguarded commit writes every archive row in silence — so only the
+ * log's contents can catch that one.
+ *
+ * The archive is three `comment.created`s from a DIFFERENT log, so it is a
+ * well-formed full log and the store under test is looking at an empty one.
+ */
+async function raceOnSecondBatch(options: {
+  readonly db: D1Database;
+  readonly logKey: string;
+  readonly competitor: { readonly threadId: string; readonly commentId: string };
+  readonly competitorSeq?: number;
+}): Promise<{
+  archive: ThreadArchive;
+  store: D1ThreadStore;
+  raced: () => boolean;
+}> {
+  const { db, logKey, competitor, competitorSeq = 1 } = options;
+  // A source log of its own, so the archive names a different review's
+  // threads — exactly what a diverged foreign archive looks like.
+  const source = new D1ThreadStore({ db, logKey: OTHER_LOG, clock: fixedClock(0) });
+  await source.append(createThread("th-race-1", "c-race-1"));
+  await source.append(createThread("th-race-2", "c-race-2"));
+  await source.append(createThread("th-race-3", "c-race-3"));
+  const archive = await exportArchive(source);
+
+  const event: ReviewEvent = {
+    seq: competitorSeq,
+    ts: "2026-10-03T12:00:00Z",
+    ...createThread(competitor.threadId, competitor.commentId),
+  } as ReviewEvent;
+
+  let batches = 0;
+  let raced = false;
+  const racingDb = proxyDb(db, async () => {
+    batches += 1;
+    if (batches !== 2) return;
+    raced = true;
+    await db.prepare(INSERT_FOR).bind(logKey, competitorSeq, event.ts, JSON.stringify(event)).run();
+  });
+
+  return { archive, store: new D1ThreadStore({ db: racingDb, logKey, clock: fixedClock() }), raced: () => raced };
 }

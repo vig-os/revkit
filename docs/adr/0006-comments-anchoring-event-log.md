@@ -281,8 +281,12 @@ in-memory state. `bun:sqlite` rehydrates head and validator state in `open`;
 store per request, so until #107's fix it compared every archive against an
 empty state — the guard could not fire and a colliding archive committed. A
 backing that judges an archive against anything other than the stored log
-breaks this amendment, so the property is asserted per backing, through a second
-store instance over the same storage (`StoreFactory.reopen`). `import` is also a
-read-then-write, so its commit is guarded against a writer that moves the head in
-between: one guard row inside the same `batch()`, gating every archive row, so a
-stale head writes nothing rather than something. Refs: #73, #107, #108
+breaks this amendment, so the property is asserted per backing: on the two
+whose log outlives the instance — `bun:sqlite` and D1 — through a second store
+instance over the same storage (`StoreFactory.reopen`), and on the in-memory
+reference, whose log IS its instance, by the single-instance cases (a second
+handle there would be a new empty store, which is the honest answer and not a
+refusal to test). `import` is also a read-then-write, so its commit is guarded
+against a writer that moves the head in between: one guard row inside the same
+`batch()`, gating every archive row, so a stale head writes nothing rather than
+something. Refs: #73, #107, #108
