@@ -40,6 +40,7 @@ import {
   type ReviewState,
   type ReviewSubmitEvent,
   type SyncFingerprint,
+  type Thread,
   type ThreadStore,
   type ViewerReviewSummary,
   ThreadStoreAppendError,
@@ -49,6 +50,7 @@ import {
   isPendingReviewStale,
   reanchor,
   reduceReviewState,
+  reduceThreadLifecycleStates,
   revisionOf,
 } from "@revkit/review-core";
 
@@ -1032,4 +1034,282 @@ export async function reanchorPendingReviewAtNewHead(input: {
  * pending review is not stale. */
 export function unsyncedCount(state: ReviewState): number {
   return state.unsyncedCommentIds.length;
+}
+
+/** What `findDraftToPromote` resolved a promotion request to. */
+export type DraftToPromote =
+  | {
+      /** An agent-authored COMMENT (top-level or reply) to promote. */
+      readonly kind: "comment";
+      readonly thread: Thread;
+      readonly comment: Thread["comments"][number];
+      /** True when the draft is a REPLY — the reconciler posts it
+       * through `addReviewThreadThreadReply` against
+       * `thread.external.threadId` rather than opening a new draft.
+       * Narrowing this flag also narrows `replyThreadNodeId`, so the
+       * caller never has to re-narrow or cast `thread.external`. */
+      readonly reply: boolean;
+      /** The GitHub thread node a reply posts into. Present iff
+       * `reply` — `findDraftToPromote` refuses a reply on a thread with
+       * no GitHub origin before getting here. */
+      readonly replyThreadNodeId?: string;
+      /** The seq of the `draft.promoted` already in the log for this
+       * exact draft, or `undefined` when the reviewer has not promoted
+       * it yet. Two halves of crash recovery read this: the caller skips
+       * a second promotion when it is set, and still appends the
+       * missing intent when `intentRecorded` is false. */
+      readonly promotedAtSeq: number | undefined;
+      /** True when the machine intent (`comment.sync_requested`) is
+       * already in the log. A promotion whose intent append was lost is
+       * `promotedAtSeq` set + this false, and the caller repairs it. */
+      readonly intentRecorded: boolean;
+      /** The content pin the reviewer's promotion recorded: the `seq` of
+       * the authoring event and `revisionOf(body)` of the text they
+       * approved. `findDraftToPromote` has already refused a body that
+       * no longer matches, so these are what a NEW promotion must
+       * record. */
+      readonly commentSeq: number;
+      /** The pin already on the log, when one is. */
+      readonly promotedPin?: { readonly commentSeq: number; readonly bodyHash: string };
+    }
+  | {
+      /** An agent-authored resolve/reopen to promote. */
+      readonly kind: "lifecycle";
+      readonly thread: Thread;
+      readonly desiredResolved: boolean;
+      readonly promotedAtSeq: number | undefined;
+    };
+
+/** Resolve a `POST /api/review/promote` body to the draft it names
+ * (issue #70), or say precisely why there is nothing to promote.
+ *
+ * The rules, each with its own refusal reason so the route answers
+ * with a machine-readable `error`:
+ *   - `unknown-thread` / `unknown-comment` — the named ids are not in
+ *     the log.
+ *   - `not-an-agent-draft` — the comment or the lifecycle change was
+ *     the REVIEWER's own act. A reviewer's own comment mirrors itself
+ *     (or has already mirrored); promoting it would be a no-op at best
+ *     and a misattribution at worst.
+ *   - `no-github-thread` — a reply draft has no remote thread to
+ *     reply to, so there is nothing to promote it into.
+ *   - `stale-lifecycle-draft` — the thread's current state no longer
+ *     matches the named target (e.g. promoting `resolve` on a thread
+ *     that is open), so the promotion would not describe what it
+ *     promotes.
+ *
+ * `target` on the request is what makes the last check meaningful: a
+ * `resolve` promotion names a RESOLVED thread and a `reopen`
+ * promotion an OPEN one. */
+export async function findDraftToPromote(input: {
+  readonly store: ThreadStore;
+  readonly threadId: string;
+  readonly target: "comment" | "resolve" | "reopen";
+  readonly commentId?: string;
+}): Promise<{ readonly ok: true; readonly draft: DraftToPromote } | { readonly ok: false; readonly error: string; readonly detail: string }> {
+  const events = await input.store.since(0);
+  const thread = await input.store.thread(input.threadId);
+  if (thread === undefined) {
+    return { ok: false, error: "unknown-thread", detail: `thread '${input.threadId}' is not in the log.` };
+  }
+  if (input.target === "comment") {
+    const commentId = input.commentId ?? "";
+    const comment = thread.comments.find((entry) => entry.id === commentId);
+    if (comment === undefined) {
+      return { ok: false, error: "unknown-comment", detail: `comment '${commentId}' is not in thread '${thread.id}'.` };
+    }
+    const authoredBy = commentAuthorKind(events, commentId);
+    if (authoredBy !== "agent") {
+      return {
+        ok: false,
+        error: "not-an-agent-draft",
+        detail: `comment '${commentId}' was authored by '${authoredBy ?? "unknown"}' — only an agent's draft can be promoted.`,
+      };
+    }
+    // Issue #70 round 2: refuse a draft whose body has moved since the
+    // reviewer last approved it. There is no edit route today, so this
+    // cannot fire yet — which is exactly why it is pinned here rather
+    // than left to the day an edit route lands. The check is on the
+    // CURRENT body against the pin the last promotion recorded; a
+    // promotion that pinned nothing (a log written before the pin
+    // existed) cannot be compared and is reported so the caller can
+    // refuse it rather than promote unknown text.
+    const pinned = promotionPinFor(events, commentId);
+    if (pinned !== undefined) {
+      const currentHash = await revisionOf(comment.body);
+      if (currentHash !== pinned.bodyHash) {
+        return {
+          ok: false,
+          error: "promoted-body-changed",
+          detail:
+            `comment '${commentId}' has changed since it was promoted (the approved text hashes to ` +
+            `${pinned.bodyHash.slice(0, 12)}…, the current text to ${currentHash.slice(0, 12)}…) — ` +
+            `review the current text and promote it again.`,
+        };
+      }
+    } else if (promotionSeqFor(events, { threadId: thread.id, target: "comment", commentId }) !== undefined) {
+      return {
+        ok: false,
+        error: "promoted-body-changed",
+        detail: `comment '${commentId}' was promoted without a content pin, so its current text cannot be shown to be the approved text.`,
+      };
+    }
+    const reply = !events.some((event) => event.kind === "comment.created" && event.commentId === commentId);
+    // Narrowing here is what lets the caller build a reply intent
+    // without re-narrowing (or casting) `thread.external`.
+    const githubThreadId = thread.external?.provider === "github" ? thread.external.threadId : undefined;
+    if (reply && githubThreadId === undefined) {
+      return {
+        ok: false,
+        error: "no-github-thread",
+        detail: `comment '${commentId}' is a reply on a thread with no GitHub origin — there is no remote thread to reply to.`,
+      };
+    }
+    return {
+      ok: true,
+      draft: {
+        kind: "comment",
+        thread,
+        comment,
+        reply,
+        ...(githubThreadId !== undefined ? { replyThreadNodeId: githubThreadId } : {}),
+        promotedAtSeq: promotionSeqFor(events, { threadId: thread.id, target: "comment", ...(commentId !== "" ? { commentId } : {}) }),
+        intentRecorded: intentRecordedFor(events, commentId),
+        commentSeq: authoringSeqOf(events, commentId) ?? 0,
+        ...(pinned !== undefined ? { promotedPin: pinned } : {}),
+      },
+    };
+  }
+  // The lifecycle arm reads the SAME shared derivation the rail's draft
+  // list and `reconcileThreadStateIntents` read, so "which change is
+  // this thread's current one, and has it been promoted" has exactly
+  // one implementation (issue #70 review, finding 2).
+  const lifecycle = reduceThreadLifecycleStates(events).get(input.threadId);
+  if (lifecycle === undefined) {
+    return {
+      ok: false,
+      error: "stale-lifecycle-draft",
+      detail: `thread '${thread.id}' has no lifecycle change on the log to promote.`,
+    };
+  }
+  if (lifecycle.target !== input.target) {
+    return {
+      ok: false,
+      error: "stale-lifecycle-draft",
+      detail: `thread '${thread.id}' currently carries a '${lifecycle.target}'${lifecycle.actorKind === "local" ? " of the reviewer's own" : ""}, not a '${input.target}' — there is no '${input.target}' to promote.`,
+    };
+  }
+  if (lifecycle.actorKind !== "agent") {
+    return {
+      ok: false,
+      error: "not-an-agent-draft",
+      detail: `the current '${input.target}' on thread '${thread.id}' was the reviewer's own act — there is no agent draft to promote.`,
+    };
+  }
+  if (thread.external?.provider !== "github") {
+    return {
+      ok: false,
+      error: "no-github-thread",
+      detail: `thread '${thread.id}' has no GitHub origin — there is no remote thread to resolve.`,
+    };
+  }
+  return {
+    ok: true,
+    draft: {
+      kind: "lifecycle",
+      thread,
+      desiredResolved: lifecycle.desiredResolved,
+      promotedAtSeq: lifecycle.promotedAtSeq,
+    },
+  };
+}
+
+/** The seq of the `draft.promoted` that names this exact draft, or
+ * `undefined`. Matches on the draft's own identity — and, for a
+ * lifecycle target, only when the shared derivation still considers
+ * that change current, so a promotion the log has but that a later
+ * opposite lifecycle change superseded does NOT count as promoted
+ * (the reviewer may promote the replacement instead). */
+function promotionSeqFor(
+  events: readonly ReviewEvent[],
+  draft: { readonly threadId: string; readonly target: "comment" | "resolve" | "reopen"; readonly commentId?: string },
+): number | undefined {
+  if (draft.target !== "comment") {
+    return reduceThreadLifecycleStates(events).get(draft.threadId)?.promotedAtSeq;
+  }
+  const commentId = draft.commentId ?? "";
+  let promoted: number | undefined;
+  for (const event of events) {
+    if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
+    if ((event.commentId ?? "") !== commentId) continue;
+    if (promoted === undefined || event.seq > promoted) promoted = event.seq;
+  }
+  return promoted;
+}
+
+/** The content pin on the most recent promotion of this comment, or
+ * `undefined` when no promotion carries one. */
+function promotionPinFor(
+  events: readonly ReviewEvent[],
+  commentId: string,
+): { readonly commentSeq: number; readonly bodyHash: string } | undefined {
+  let pin: { readonly commentSeq: number; readonly bodyHash: string } | undefined;
+  for (const event of events) {
+    if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
+    if ((event.commentId ?? "") !== commentId) continue;
+    if (event.commentSeq === undefined || event.bodyHash === undefined) continue;
+    pin = { commentSeq: event.commentSeq, bodyHash: event.bodyHash };
+  }
+  return pin;
+}
+
+/** The `seq` of the event that authored this comment — what a NEW
+ * promotion pins. */
+function authoringSeqOf(events: readonly ReviewEvent[], commentId: string): number | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if ((event.kind === "comment.created" || event.kind === "comment.replied") && event.commentId === commentId) {
+      return event.seq;
+    }
+  }
+  return undefined;
+}
+
+/** True when the machine intent for this comment (`comment.sync_requested`)
+ * is already in the log. A promotion that landed without its intent is
+ * `promotedAtSeq` set and this false — the state a retry repairs.
+ *
+ * INVARIANT this rests on: a `comment.linked` for an agent-authored
+ * comment is only ever appended BY the reconciler, inside its loop over
+ * `comment.sync_requested` intents (plus the adapter's import path,
+ * which mints `gh-…` ids or reuses an already-linked id). So for an
+ * agent draft, `comment.linked` here implies an intent was recorded —
+ * and treating it as "the intent is present" is therefore safe. If a
+ * future writer ever links a comment with NO intent, this predicate
+ * would report `intentRecorded: true`, the route would skip the intent
+ * append, and the promotion would sit in the log authorizing nothing —
+ * the shape round 1 called unreachable. The test "a linked agent
+ * comment always has an intent behind it" in
+ * `packages/cli/test/serve/review-mode-promote.test.ts` pins it, so the
+ * day it breaks, the test breaks with it. */
+function intentRecordedFor(events: readonly ReviewEvent[], commentId: string): boolean {
+  return events.some(
+    (event) =>
+      (event.kind === "comment.sync_requested" || event.kind === "comment.linked") && event.commentId === commentId,
+  );
+}
+
+/** The actor kind that authored a comment (`comment.created` /
+ * `comment.replied`), or undefined when the comment is not in the log. */
+function commentAuthorKind(
+  events: readonly ReviewEvent[],
+  commentId: string,
+): ReviewEvent["actor"]["kind"] | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if ((event.kind === "comment.created" || event.kind === "comment.replied") && event.commentId === commentId) {
+      return event.actor.kind;
+    }
+  }
+  return undefined;
 }

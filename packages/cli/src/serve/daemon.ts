@@ -44,22 +44,27 @@ import {
   type Author,
   type CommentSyncState,
   type HandoverTrigger,
+  isLineAnchor,
+  reduceThreadLifecycleStates,
   type ReviewEvent,
   type ReviewEventInput,
   type ReviewState,
   type ReviewSubmitEvent,
+  type Thread,
   type ThreadFilter,
   ThreadStoreAppendError,
 } from "@revkit/review-core";
 import {
   buildSyncRequest,
   defaultSubmitBody,
+  findDraftToPromote,
   makeReviewModeHandle,
   mapAnchorForPending,
   fingerprintMatches,
   reanchorPendingReviewAtNewHead,
   reconcile,
   unsyncedCount,
+  type DraftToPromote,
   type ReviewModeHandle,
   type ReviewModeOptions,
 } from "./review-mode.ts";
@@ -102,10 +107,12 @@ import {
   createThreadRequestSchema,
   publishRequestSchema,
   discardReviewRequestSchema,
+  promoteAgentDraftRequestSchema,
   reopenRequestSchema,
   replyRequestSchema,
   resolveRequestSchema,
   submitReviewRequestSchema,
+  type PromoteAgentDraftRequest,
 } from "./api-schemas.ts";
 import { runPublish, spliceArticleBody, ARTICLE_OPEN_MARKER } from "./publish.ts";
 import {
@@ -309,6 +316,90 @@ class WebSocketSubscriber implements Subscriber {
 /** How often to send an SSE keepalive comment. Kept short so a paused
  * tab wakes quickly; long enough not to spam the log. */
 const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
+
+/** Issue #70: `POST /api/review/promote` declined to act, with a
+ * machine-readable `error` and a human-readable `reason`. Distinct
+ * from a failure: the request was understood and refused. */
+class PromoteRefused extends Error {
+  readonly status: number;
+  readonly error: string;
+  readonly detail: string;
+  constructor(status: number, error: string, detail: string) {
+    super(`${error}: ${detail}`);
+    this.name = "PromoteRefused";
+    this.status = status;
+    this.error = error;
+    this.detail = detail;
+  }
+}
+
+/** What a promotion actually did. `promoted: false` means the draft
+ * was ALREADY promoted and this call confirmed it without appending a
+ * second event — the double-promote answer, and the reason the status
+ * code differs (201 vs 200). */
+interface PromoteOutcome {
+  readonly promoted: boolean;
+  readonly target: "comment" | "resolve" | "reopen";
+  readonly commentId?: string;
+  readonly reason?: "already-promoted";
+  readonly reviewNodeId: string | null;
+  readonly newlySynced?: readonly string[];
+  readonly newlyFailed?: ReadonlyArray<{ readonly commentId: string; readonly reason: string }>;
+}
+
+/** Compose the REPLY intent for an agent reply the reviewer is
+ * promoting, from the thread node `findDraftToPromote` already
+ * narrowed — no cast of `thread.external` is needed here or at the
+ * call site, and the shape is the one `mirrorReplyToGitHubThread`
+ * records for the reviewer's own replies: the remote thread to post
+ * into, the outgoing body's hash, and the node ids observed before the
+ * intent (so a retry can tell an accepted-but-response-lost reply from
+ * a pre-accept failure). */
+async function buildReplySyncRequestForDraft(
+  draft: Extract<DraftToPromote, { readonly kind: "comment" }>,
+  actor: Author,
+): Promise<ReviewEventInput> {
+  if (draft.replyThreadNodeId === undefined) {
+    throw new Error(
+      "buildReplySyncRequestForDraft: a reply draft must carry the thread node findDraftToPromote narrowed.",
+    );
+  }
+  return {
+    kind: "comment.sync_requested",
+    actor,
+    commentId: draft.comment.id,
+    path: draft.thread.anchor.path,
+    subjectType: "FILE",
+    bodyHash: await revisionOf(draft.comment.body),
+    replyThreadNodeId: draft.replyThreadNodeId,
+    knownCommentNodeIds: draft.thread.comments.flatMap((comment) => {
+      const nodeId = comment.external?.github?.nodeId;
+      return nodeId === undefined ? [] : [nodeId];
+    }),
+  };
+}
+
+/** Compose the top-level draft intent for an agent draft the reviewer
+ * is promoting, exactly as the reviewer's own comment would have been
+ * mirrored (`buildSyncRequest` over the draft's own anchor). Returns
+ * `undefined` when the anchor no longer maps to a GitHub comment
+ * position — the caller refuses with `promote-mapping-orphan` instead
+ * of recording an intent that can never be satisfied. */
+async function buildSyncRequestForDraft(
+  review: ReviewModeHandle,
+  anchor: Thread["anchor"],
+  commentId: string,
+  body: string,
+  actor: Author,
+): Promise<ReviewEventInput | undefined> {
+  // An `unanchored` thread (an import whose source could not be
+  // fetched) has no line to comment on; refuse rather than record an
+  // intent the reconciler could only fail.
+  if (!isLineAnchor(anchor)) return undefined;
+  const mapping = mapAnchorForPending(anchor, review.options.files, body);
+  if (mapping.kind === "orphan") return undefined;
+  return await buildSyncRequest({ actor, commentId, mapping });
+}
 
 /** JSON body schemas for the delivery-mode surface (M2 item 6).
  * Kept at module scope so unit tests can reference them and so a
@@ -952,6 +1043,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     void (async () => {
       try {
         await reviewOperations.run(async () => {
+          // Issue #70 round 2: repair a promotion whose intent append
+          // was lost BEFORE reconciling, so the repaired intent is
+          // visible to the read-first pass below (which still cannot
+          // write to GitHub — `allowMutations: false`).
+          await healMissingPromotionIntents(reviewMode, "boot-promotion-intent");
           await reconcile({
             review: reviewMode,
             store,
@@ -2334,6 +2430,256 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
   }
 
+  /** Issue #70: a reviewer's explicit promotion of an AGENT-authored
+   * draft into their own pending review. The ordering is the whole
+   * point, and it mirrors every other mirror path in this file:
+   *
+   *   (a) refuse unless a pending review is OPEN — a draft is promoted
+   *       INTO a review, so after a submit or a discard there is
+   *       nothing to promote into and we say so rather than opening a
+   *       fresh review behind the reviewer's back;
+   *   (b) resolve exactly which draft is named, refusing a
+   *       reviewer's own comment with a precise reason
+   *       (`findDraftToPromote`);
+   *   (c) COMPOSE the machine intent the promotion would authorize —
+   *       the same `comment.sync_requested` the reviewer's own comment
+   *       would have produced (top-level draft, or reply intent against
+   *       the remote thread). Nothing is written yet: composing is pure,
+   *       and it is where the last possible refusal
+   *       (`promote-mapping-orphan`) is decided;
+   *   (d) append `draft.promoted` — the human act, in the log, BEFORE
+   *       any adapter call — and then the composed intent, each at most
+   *       once. A promotion that already landed (a retry after a crash
+   *       between the two appends) skips the first of those and still
+   *       appends a missing intent, so a double promote never doubles
+   *       the write and an interrupted one always converges;
+   *   (e) run the existing reconcilers, which READ GitHub first and
+   *       post only what is missing.
+   *
+   * A promoted draft is then an ordinary pending draft: same
+   * fingerprint matching, same `comment.linked` completion, same submit
+   * gate.
+   *
+   * The property this route holds: the agent BEARER is refused with 403,
+   * and an agent-authored item reaches GitHub only through a
+   * `draft.promoted` event that `validateNext` accepts only from a
+   * `local` actor — so a bearer cannot author a promotion by any HTTP
+   * path. That is a statement about the bearer and the HTTP surface,
+   * not about the agent as a process: a same-user agent that obtains a
+   * REVIEWER SESSION through the launch-code exchange
+   * (`POST /-/launch-code` then `GET /-/auth?code=…`) is identified as
+   * `local` like any cookie, and that escalation is a separate,
+   * pre-existing property of the local surface — owned and tracked on
+   * #55, deliberately not settled here. */
+  async function promoteAgentDraft(
+    review: ReviewModeHandle,
+    request: PromoteAgentDraftRequest,
+    actor: Author,
+    requestId: string,
+  ): Promise<PromoteOutcome> {
+    const state = await review.readState(store);
+    if (state.openPending === null) {
+      throw new PromoteRefused(
+        409,
+        "no-open-pending-review",
+        "there is no open pending review to promote into — comment first, then promote.",
+      );
+    }
+    const found = await findDraftToPromote({
+      store,
+      threadId: request.threadId,
+      target: request.target,
+      ...(request.commentId !== undefined ? { commentId: request.commentId } : {}),
+    });
+    if (!found.ok) {
+      throw new PromoteRefused(409, found.error, found.detail);
+    }
+    const draft = found.draft;
+    const promoted = draft.promotedAtSeq === undefined;
+
+    // (c) Build the machine intent BEFORE any append. Everything that
+    // can refuse this promotion is decided by now, so the log never
+    // records an authorization for a promotion that did not happen
+    // (issue #70 review, finding 1). `draft.promoted` retires the draft
+    // from `agentDrafts`, so an append followed by a refusal left the
+    // comment unreachable AND permanently unattached.
+    const intent =
+      draft.kind === "lifecycle"
+        ? undefined
+        : draft.reply
+          ? await buildReplySyncRequestForDraft(draft, actor)
+          : await buildSyncRequestForDraft(review, draft.thread.anchor, draft.comment.id, draft.comment.body, actor);
+    if (draft.kind === "comment" && intent === undefined) {
+      throw new PromoteRefused(
+        409,
+        "promote-mapping-orphan",
+        "the draft's anchor no longer maps to a GitHub comment position — orphan it on the thread first.",
+      );
+    }
+
+    // (d) Record the human act, then the intent. The two appends are
+    // ordered so that ANY crash between them is recoverable by a retry:
+    // the promotion alone retires the draft but authorizes nothing, and
+    // the retry below recognises `promotedAtSeq` and still appends the
+    // missing intent (an intent is idempotent — the reconciler
+    // fingerprints it, so re-appending changes nothing that matters).
+    if (promoted) {
+      await appendReviewLifecycleEvent(
+        {
+          kind: "draft.promoted",
+          actor,
+          threadId: draft.thread.id,
+          target: request.target,
+          ...(draft.kind === "comment"
+            ? {
+                commentId: draft.comment.id,
+                // Pin the version the reviewer approved (issue #70
+                // round 2): `findDraftToPromote` has already refused a
+                // body that no longer matches an earlier pin, so these
+                // describe exactly the text now in the log.
+                commentSeq: draft.commentSeq,
+                bodyHash: await revisionOf(draft.comment.body),
+              }
+            : {}),
+        },
+        requestId,
+      );
+    }
+    if (draft.kind === "lifecycle") {
+      // The `thread.resolved` / `thread.reopened` intent is already in
+      // the log; the promotion above is what `reconcileThreadStateIntents`
+      // now needs to see before it treats that intent as authorized.
+      // Its reconcile is read-first, so a thread already resolved
+      // remotely costs no write.
+      await reconcileThreadStateIntents(review, true, requestId);
+      logger.info("review.promote.lifecycle", {
+        requestId,
+        threadId: draft.thread.id,
+        target: request.target,
+        promoted,
+      });
+      return {
+        promoted,
+        target: request.target,
+        reason: promoted ? undefined : "already-promoted",
+        reviewNodeId: state.openPending.reviewNodeId,
+      };
+    }
+    if (intent !== undefined && !draft.intentRecorded) {
+      await appendReviewLifecycleEvent(intent, requestId);
+    }
+    const outcome = await reconcile({
+      review,
+      store,
+      actor,
+      appendAndPublish: async (event) => await appendReviewLifecycleEvent(event, requestId),
+      allowMutations: true,
+    });
+    logger.info("review.promote.reconciled", {
+      requestId,
+      commentId: draft.comment.id,
+      promoted,
+      count: outcome.newlySynced.length,
+    });
+    return {
+      promoted,
+      target: request.target,
+      commentId: draft.comment.id,
+      reason: promoted ? undefined : "already-promoted",
+      reviewNodeId: outcome.reviewNodeId,
+      newlySynced: [...outcome.newlySynced],
+      newlyFailed: outcome.newlyFailed.map((entry) => ({ ...entry })),
+    };
+  }
+
+  /** Issue #70 round 2: heal a promotion whose intent append was lost.
+   *
+   * A promotion is two adjacent appends (`draft.promoted`, then the
+   * machine intent), and nothing fallible sits between them — but a
+   * process death or a sqlite error on the second leaves the log
+   * claiming a human attached a draft that has no intent, so the
+   * reconciler has nothing to act on and the rail's affordance (driven
+   * by `agentDrafts`, which the promotion retired) is gone. The draft
+   * then vanishes silently at submit.
+   *
+   * This composes the missing intent from the log itself, which is all
+   * the route used: the promotion names the comment, the thread carries
+   * its anchor and body. It is a LOCAL append, not a GitHub write — the
+   * reconcile that follows still runs with `allowMutations: false`, so
+   * the repaired intent is picked up by the next cookie-authenticated
+   * action, exactly like any other durable intent (ADR-0006: boot never
+   * mutates the remote).
+   *
+   * The composition goes through the same `findDraftToPromote` the route
+   * uses, so a body that no longer matches the promotion's pin is
+   * refused here too (`promoted-body-changed`) rather than healed into
+   * text the reviewer did not approve.
+   *
+   * It also applies the route's OPEN-PENDING-REVIEW check, and that is
+   * not belt-and-braces: without it, a promotion left incomplete by a
+   * submit would be repaired into an intent that the next
+   * cookie-authenticated reconcile posts into a FRESH pending review —
+   * reopening, automatically and after the fact, the review the
+   * reviewer had already submitted or discarded. The route refuses that
+   * with `no-open-pending-review`, so the heal must refuse it too, or it
+   * would compose exactly what the route will not. */
+  async function healMissingPromotionIntents(
+    review: ReviewModeHandle,
+    requestId: string,
+  ): Promise<number> {
+    const open = (await review.readState(store)).openPending;
+    if (open === null) {
+      logger.info("review.boot.promotion-intent.no-pending-review", { requestId });
+      return 0;
+    }
+    const events = await store.since(0);
+    const incomplete = new Map<string, string>();
+    for (const event of events) {
+      if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
+      const commentId = event.commentId;
+      if (commentId === undefined) continue;
+      const hasIntent = events.some(
+        (candidate) =>
+          (candidate.kind === "comment.sync_requested" || candidate.kind === "comment.linked") &&
+          candidate.commentId === commentId,
+      );
+      if (!hasIntent) incomplete.set(commentId, event.threadId);
+    }
+    if (incomplete.size === 0) return 0;
+    let healed = 0;
+    for (const [commentId, threadId] of incomplete) {
+      const found = await findDraftToPromote({ store, threadId, target: "comment", commentId });
+      if (!found.ok) {
+        logger.warn("review.boot.promotion-intent.refused", { requestId, commentId, reason: found.error });
+        continue;
+      }
+      const draft = found.draft;
+      if (draft.kind !== "comment") continue;
+      const intent = draft.reply
+        ? await buildReplySyncRequestForDraft(draft, localActor)
+        : await buildSyncRequestForDraft(review, draft.thread.anchor, draft.comment.id, draft.comment.body, localActor);
+      // A mapping orphan cannot be repaired here any more than at the
+      // route: there is no GitHub position to post to. The promotion
+      // stays as the record of what the reviewer tried to attach.
+      if (intent === undefined) {
+        logger.warn("review.boot.promotion-intent.unmappable", { requestId, commentId });
+        continue;
+      }
+      try {
+        await appendReviewLifecycleEvent(intent, requestId);
+        healed++;
+        logger.info("review.boot.promotion-intent.healed", { requestId, commentId });
+      } catch (error) {
+        logger.warn("review.boot.promotion-intent.append-failed", {
+          requestId,
+          commentId,
+          errorKind: (error as Error).name,
+        });
+      }
+    }
+    return healed;
+  }
+
   /** Boot-time read-only healing for accepted resolve/reopen writes.
    * A mismatch is left pending for the next cookie-authenticated
    * action; a matching remote state advances only the local baseline. */
@@ -2344,16 +2690,43 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   ): Promise<void> {
     const events = await store.since(0);
     const pending = new Map<string, { readonly desiredResolved: boolean; readonly intentSeq: number }>();
+    // Issue #70: WHICH lifecycle change is this thread's current one,
+    // and is it authorized, comes from the SHARED derivation
+    // (`reduceThreadLifecycleStates`) — the same one the rail's draft
+    // list and `findDraftToPromote` read. Three implementations of one
+    // rule is how a promoted resolve came to be fired for a thread that
+    // had since been reopened (issue #70 review, finding 2), so there is
+    // one now and the reconciler reads it.
+    //
+    // The two arms differ only in what authorizes the write:
+    //   - `local`: the reviewer's own resolve/reopen, which has always
+    //     been authorized. `intentSeq` is the change's own seq, so the
+    //     matching `thread.external_synced` correlates exactly as
+    //     before (round-4 fix).
+    //   - `agent`: authorized only by a LATER `draft.promoted`, whose
+    //     seq becomes the `intentSeq`. An unpromoted agent change has
+    //     no intent at all, so it can never reach the adapter.
+    // A later lifecycle change of EITHER kind supersedes the earlier
+    // one, including a promoted resolve the agent then reopened.
+    for (const state of reduceThreadLifecycleStates(events).values()) {
+      if (state.actorKind === "local") {
+        pending.set(state.threadId, { desiredResolved: state.desiredResolved, intentSeq: state.atSeq });
+        continue;
+      }
+      if (state.actorKind === "agent" && state.promotedAtSeq !== undefined) {
+        pending.set(state.threadId, {
+          desiredResolved: state.desiredResolved,
+          intentSeq: state.promotedAtSeq,
+        });
+      }
+    }
+    // A completion only clears the intent it was correlated to, so a
+    // delayed resolve cannot retire a newer reopen.
     for (const event of events) {
-      if (event.kind === "thread.resolved" && event.actor.kind === "local") {
-        pending.set(event.threadId, { desiredResolved: true, intentSeq: event.seq });
-      } else if (event.kind === "thread.reopened" && event.actor.kind === "local") {
-        pending.set(event.threadId, { desiredResolved: false, intentSeq: event.seq });
-      } else if (event.kind === "thread.external_synced" && event.intentSeq !== undefined) {
-        const intent = pending.get(event.threadId);
-        if (intent?.intentSeq === event.intentSeq && intent.desiredResolved === event.resolved) {
-          pending.delete(event.threadId);
-        }
+      if (event.kind !== "thread.external_synced" || event.intentSeq === undefined) continue;
+      const intent = pending.get(event.threadId);
+      if (intent?.intentSeq === event.intentSeq && intent.desiredResolved === event.resolved) {
+        pending.delete(event.threadId);
       }
     }
     if (pending.size === 0) return;
@@ -2574,6 +2947,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           terminal: state.terminal,
           unsyncedCommentIds: [...state.unsyncedCommentIds],
           commentSync: commentSyncEntries,
+          // Issue #70: the agent-authored drafts awaiting an explicit
+          // reviewer promotion. The rail badges each one and offers
+          // the promote action; nothing here is ever mirrored without
+          // that action.
+          agentDrafts: state.agentDrafts,
+          // Issue #70 round 3: the reviewer's own resolve/reopen that
+          // a later lifecycle change superseded, so they know their
+          // click did not reach GitHub rather than finding out later.
+          droppedReviewerIntents: state.droppedReviewerIntents,
         },
         stale,
       });
@@ -2750,6 +3132,65 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           errorKind: (error as Error).name,
         });
         return internalServerError({ error: "reconcile-failed" });
+      }
+    }
+    // POST /api/review/promote — session cookie ONLY (issue #70).
+    // An agent-authored reply / resolve / reopen stays a LOCAL draft
+    // until the reviewer explicitly promotes it; this route is that
+    // act, and it is recorded in the intent log as `draft.promoted`
+    // before any adapter call. The agent bearer is refused with 403 in
+    // the same style as every other review mutation — a promotion is
+    // the reviewer's decision to publish under their own identity, and
+    // `validateNext` refuses a `draft.promoted` from any other actor
+    // even if it reaches the store by another path.
+    if (url.pathname === "/api/review/promote" && method === "POST") {
+      if (hasValidBearer && actor.kind === "agent") {
+        logger.warn("review.promote.rejected.agent-bearer", { requestId });
+        return withHygiene(
+          new Response(
+            JSON.stringify({
+              error: "agent-forbidden",
+              reason: "Agent bearer cannot promote a draft into the reviewer's review — attaching an agent draft is the reviewer's act.",
+            }),
+            { status: 403 },
+          ),
+          "json",
+          "application/json; charset=utf-8",
+        );
+      }
+      if (actor.kind !== "local") {
+        return withHygiene(new Response("Forbidden", { status: 403 }), "text", "text/plain; charset=utf-8");
+      }
+      const bodyRead = await readCappedJsonBody(request);
+      if (!bodyRead.ok) return bodyRead.kind === "too-large" ? payloadTooLarge() : badRequest([{ code: "custom", path: [], message: "invalid json" }]);
+      const parsed = promoteAgentDraftRequestSchema.safeParse(bodyRead.value);
+      if (!parsed.success) return badRequest(parsed.error.issues);
+      try {
+        const outcome = await reviewOperations.run(
+          async () => await promoteAgentDraft(reviewMode, parsed.data, actor, requestId),
+        );
+        // 201 when this call appended the promotion; 200 when the draft
+        // was already promoted and this call only confirmed it — the
+        // difference a caller can branch on without parsing prose.
+        return jsonResponse({ ok: true, ...outcome }, outcome.promoted ? 201 : 200);
+      } catch (error) {
+        if (error instanceof PromoteRefused) {
+          logger.warn("review.promote.refused", {
+            requestId,
+            target: parsed.data.target,
+            reason: error.error,
+          });
+          return withHygiene(
+            new Response(JSON.stringify({ error: error.error, reason: error.detail }), { status: error.status }),
+            "json",
+            "application/json; charset=utf-8",
+          );
+        }
+        logger.warn("review.promote.failed", {
+          requestId,
+          errorKind: (error as Error).name,
+        });
+        return internalServerError({ error: "promote-failed" });
       }
     }
 

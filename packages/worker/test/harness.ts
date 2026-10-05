@@ -17,6 +17,7 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { expect } from "bun:test";
 import { Miniflare, type MiniflareOptions } from "miniflare";
 import { JSON_MEDIA_TYPE } from "../src/authz.ts";
 import { INVITE_TOKEN_HMAC_KEY, MIN_INVITE_TOKEN_HMAC_KEY_CHARS, inviteTokenHasher } from "../src/invite-token.ts";
@@ -259,6 +260,10 @@ export function scanAllForbidden(text: string): string[] {
 export interface Bundles {
   readonly worker: string;
   readonly probe: string;
+  /** The Worker wrapped in a counting R2 binding — see
+   *  `test/fixtures/preview-spy.ts`. Same default export, one binding
+   *  replaced, and nothing else. */
+  readonly previewSpy: string;
 }
 
 let bundlesPromise: Promise<Bundles> | undefined;
@@ -272,6 +277,7 @@ export function bundles(): Promise<Bundles> {
       entrypoints: [
         fileURLToPath(new URL("src/index.ts", PKG_ROOT)),
         fileURLToPath(new URL("test/fixtures/runtime-probe.ts", PKG_ROOT)),
+        fileURLToPath(new URL("test/fixtures/preview-spy.ts", PKG_ROOT)),
       ],
       naming: { entry: "[name].mjs" },
     });
@@ -285,12 +291,13 @@ export function bundles(): Promise<Bundles> {
     }
     const worker = byName.get("index.mjs");
     const probe = byName.get("runtime-probe.mjs");
-    if (worker === undefined || probe === undefined) {
+    const previewSpy = byName.get("preview-spy.mjs");
+    if (worker === undefined || probe === undefined || previewSpy === undefined) {
       throw new Error(
-        `worker bundle produced unexpected outputs: ${[...byName.keys()].join(", ")} (wanted index.mjs and runtime-probe.mjs)`,
+        `worker bundle produced unexpected outputs: ${[...byName.keys()].join(", ")} (wanted index.mjs, runtime-probe.mjs and preview-spy.mjs)`,
       );
     }
-    return { worker, probe };
+    return { worker, probe, previewSpy };
   })();
   return bundlesPromise;
 }
@@ -319,6 +326,55 @@ export async function workerBundle(): Promise<string> {
  * global is absent. */
 export async function probeBundle(): Promise<string> {
   return (await bundles()).probe;
+}
+
+/**
+ * The preview-spy bundle: `src/index.ts`'s own default export, invoked with a
+ * `PREVIEWS` binding that COUNTS its reads.
+ *
+ * **Why a wrapper rather than a mutated bundle.** "The R2 binding is never
+ * called" is not observable from outside workerd — an R2 bucket has no request
+ * log, and a refused request and a read of a missing object produce the same 404.
+ * `test/worker-runtime.test.ts` already builds a deliberately-broken Worker by
+ * string-replacing text in the emitted bundle, and that pattern's weakness is on
+ * record there: the replacement target did not exist, so the "broken" script was
+ * byte-identical to the real one. This wrapper has no such seam: it imports the
+ * real module and calls the real `fetch`, and the ONLY thing that differs is the
+ * object bound to `env.PREVIEWS`.
+ *
+ * It costs a workerd instance, so it is used by exactly one file
+ * (`test/preview.test.ts`) and that file uses nothing else.
+ */
+export async function previewSpyBundle(): Promise<string> {
+  return (await bundles()).previewSpy;
+}
+
+/** The fixture's own count endpoint, and its reset sibling. Exported so the
+ * test asserts the paths against the fixture rather than against a literal, and
+ * so a rename cannot leave the test reading a path that answers 404. */
+export const PREVIEW_SPY_READS_PATH = "/__revkit-preview-spy";
+export const PREVIEW_SPY_RESET_PATH = "/__revkit-preview-spy/reset";
+
+/** The bucket `PREVIEWS` is bound to in every harness. Named rather than
+ * generated so the config line a reader checks (`wrangler.jsonc`) and the
+ * binding a reader runs agree about what the bucket is CALLED — which is the one
+ * half of provisioning this repo can do offline. */
+const PREVIEW_BUCKET_NAME = "revkit-previews";
+
+/** Empty the preview bucket, so a case cannot pass because a previous case left
+ * an object behind. The per-test reset for R2, in the same spirit as
+ * `resetInvites`.
+ *
+ * **Listed and deleted rather than "deleted wholesale"** because R2 has no
+ * `deleteAll` on the object handle this harness gets (measured on miniflare
+ * 4.20260518.0: `get`, `put`, `delete` and `list` exist; `deleteAll` and
+ * `listAll` do not), and because a whole-bucket wipe would be a surprising thing
+ * for a helper named after the bucket's binding to do to a bucket a future test
+ * had deliberately shared. */
+export async function clearPreviews(previews: R2Bucket): Promise<void> {
+  const listed = await previews.list();
+  for (const object of listed.objects) await previews.delete(object.key);
+  expect(listed.truncated, "the preview bucket outgrew one page, so a reset would miss objects").toBe(false);
 }
 
 // ── session helpers ───────────────────────────────────────────────────────
@@ -521,6 +577,10 @@ export interface Harness {
   readonly mf: Miniflare;
   /** The D1 database the Worker sees as `env.DB`. */
   readonly db: D1Database;
+  /** The R2 bucket the Worker sees as `env.PREVIEWS`. **A test-process handle,
+   *  so a case can seed a preview** — and it is the same bucket the Worker
+   *  reads, not a copy of one. */
+  readonly previews: R2Bucket;
   /** Dispatch a request through the real workerd, exactly as the
    * platform would. The `init` type is miniflare's OWN `RequestInit`:
    * `bun`'s and `@cloudflare/workers-types`' declarations of the DOM
@@ -623,6 +683,14 @@ export async function startWorker(
     compatibilityFlags: config["compatibility_flags"],
     bindings: Object.keys(bindings).length === 0 ? undefined : bindings,
     d1Databases: { DB: `revkit-test-${Math.random().toString(36).slice(2)}` },
+    // The preview bucket, bound for EVERY harness and not only for the tests
+    // that read it: `src/index.ts` calls `env.PREVIEWS.get` on the preview
+    // path, so a harness without the binding would answer 500 there instead of
+    // the 404 the route is supposed to give — and the preview assertions in
+    // `test/authorization.test.ts` and `test/invites.test.ts` run on harnesses
+    // that are not about previews at all. In-memory per instance, exactly like
+    // the D1 above, and never a bucket this repo has created.
+    r2Buckets: { PREVIEWS: PREVIEW_BUCKET_NAME },
   } as MiniflareOptions);
   // Boot timing, on demand. `getD1Database` is where a miniflare instance
   // actually starts workerd and opens its D1 session — measured at 102 ms
@@ -660,13 +728,18 @@ export async function startWorker(
   const db = await mf.getD1Database("DB");
   const dbReady = performance.now();
   await applyMigration(db);
+  const previews = await mf.getR2Bucket("PREVIEWS");
+  const r2Ready = performance.now();
   if (process.env["REVKIT_WORKER_BOOT_LOG"] === "1") {
     const ms = (dbReady - bootStarted).toFixed(0);
-    process.stderr.write(`[harness] workerd+D1 ready in ${ms}ms (migrated by ${(performance.now() - dbReady).toFixed(0)}ms)\n`);
+    process.stderr.write(
+      `[harness] workerd+D1 ready in ${ms}ms (migrated by ${(performance.now() - dbReady).toFixed(0)}ms, R2 by ${(r2Ready - dbReady).toFixed(0)}ms)\n`,
+    );
   }
   return {
     mf,
     db,
+    previews: previews as unknown as R2Bucket,
     dispatch: (input, init) => mf.dispatchFetch(input, init),
     dispose: () => mf.dispose(),
   };

@@ -55,6 +55,25 @@
 //                      `thread.orphaned` events on threads that
 //                      lived on `path` fire from the re-anchor
 //                      pipeline the daemon triggers after the write.
+//   draft.promoted   — issue #70: a reviewer attached an AGENT-
+//                      authored draft to their own pending review.
+//                      The actor must be `local` (`invalid-actor`) —
+//                      over HTTP, the bearer is refused the promote
+//                      route and its requests are identified as
+//                      `agent`, so it cannot author a promotion; a
+//                      same-user agent holding a REVIEWER SESSION is a
+//                      different question, owned on #55 — the named
+//                      draft must actually be agent-authored
+//                      (`not-an-agent-draft`), so the event can never
+//                      claim a human's own comment was promoted, and a
+//                      lifecycle target must be the thread's CURRENT
+//                      change (also `not-an-agent-draft`), so a
+//                      promotion cannot authorize a resolve the thread
+//                      has since reopened. A comment promotion's
+//                      `commentSeq`/`bodyHash` pin must name the
+//                      authoring event's seq, so the log cannot record
+//                      an approval of a version that does not exist
+//                      (`unknown-comment`).
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -88,11 +107,31 @@ export interface LogState {
       resumeStatus?: "open" | "orphaned";
       readonly path: string;
       readonly commentIds: Set<string>;
+      /** Set by the LAST `thread.resolved` / `thread.reopened` for
+       * this thread: which change it was, and who authored it. Issue
+       * #70: `draft.promoted` with a lifecycle target may only name a
+       * change an agent made, and may only name the one that is
+       * CURRENT — a promotion recorded against a superseded resolve is
+       * refused here as well as at the route. */
+      lifecycle?: { readonly target: "resolve" | "reopen"; readonly actorKind: string };
     }
   >;
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
   readonly commentIndex: Map<string, string>;
+  /** commentId → the actor that AUTHORED it (`comment.created` /
+   * `comment.replied`). Issue #70: `draft.promoted` may only name a
+   * draft an agent wrote — a reviewer's own comment mirrors itself,
+   * so promoting it would be a claim the log cannot support. */
+  readonly commentAuthors: Map<string, ReviewEvent["actor"]>;
+  /** commentId → the `seq` of the event that AUTHORED it, fixed at
+   * creation (`comment.edited` does not advance it). Issue #70 round 2:
+   * `draft.promoted.commentSeq` records the version a reviewer
+   * approved, and this is what makes that field checkable at append
+   * time. It is provenance, not a currentness guard — the currentness
+   * guard is `bodyHash`, compared against the live body outside the
+   * validator. */
+  readonly commentSeqs: Map<string, number>;
   /** askId → { spec, status }. The FULL spec is kept so
    * `ask.answered` can validate the answer's SHAPE against the
    * question — not just the discriminant. PR #52 review: the
@@ -127,6 +166,8 @@ export function emptyLogState(): LogState {
   return {
     threads: new Map(),
     commentIndex: new Map(),
+    commentAuthors: new Map(),
+    commentSeqs: new Map(),
     asks: new Map(),
     commentLinks: new Map(),
     externalIndex: new Map(),
@@ -147,6 +188,7 @@ export function cloneLogState(state: LogState): LogState {
       resumeStatus?: "open" | "orphaned";
       path: string;
       commentIds: Set<string>;
+      lifecycle?: { readonly target: "resolve" | "reopen"; readonly actorKind: string };
     }
   >();
   for (const [id, entry] of state.threads) {
@@ -155,6 +197,7 @@ export function cloneLogState(state: LogState): LogState {
       ...(entry.resumeStatus !== undefined ? { resumeStatus: entry.resumeStatus } : {}),
       path: entry.path,
       commentIds: new Set(entry.commentIds),
+      ...(entry.lifecycle !== undefined ? { lifecycle: { ...entry.lifecycle } } : {}),
     });
   }
   const asks = new Map<string, { spec: Ask; status: AskStatus }>();
@@ -175,6 +218,8 @@ export function cloneLogState(state: LogState): LogState {
   return {
     threads,
     commentIndex: new Map(state.commentIndex),
+    commentAuthors: new Map(state.commentAuthors),
+    commentSeqs: new Map(state.commentSeqs),
     asks,
     commentLinks,
     externalIndex: new Map(state.externalIndex),
@@ -192,6 +237,10 @@ export type AppendRejection =
   | { kind: "duplicate-comment-id"; commentId: string; message: string }
   | { kind: "not-open"; threadId: string; message: string }
   | { kind: "not-resolved"; threadId: string; message: string }
+  /** `commentId` is absent only when the event refused to name one at
+   * all (issue #70: a `draft.promoted` with `target: "comment"` and no
+   * `commentId`, which the wire schema also refuses) — the message
+   * names the thread in that case. */
   | { kind: "unknown-comment"; commentId: string; message: string }
   /** Round-3 nit: an event's actor is not the one the shape
    * allows (e.g. an agent trying to edit a human comment). */
@@ -220,6 +269,10 @@ export type AppendRejection =
   | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
   | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string }
   | { kind: "already-orphaned"; threadId: string; message: string }
+  /** Issue #70: `draft.promoted` naming something an agent did not
+   * author. A reviewer's own comment is mirrored on its own; there is
+   * nothing to promote, so the log refuses to record one. */
+  | { kind: "not-an-agent-draft"; threadId: string; commentId?: string; message: string }
   | { kind: "cross-file-reanchor"; threadId: string; fromPath: string; toPath: string; message: string }
   /** M3 part 2b: `review.opened` for a `reviewNodeId` that already
    * exists in the log (with any status). GitHub allows at most one
@@ -276,6 +329,8 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
         commentIds: new Set([event.commentId]),
       });
       state.commentIndex.set(event.commentId, event.threadId);
+      state.commentAuthors.set(event.commentId, event.actor);
+      state.commentSeqs.set(event.commentId, event.seq);
       return { ok: true };
     }
     case "comment.replied": {
@@ -297,6 +352,8 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       }
       thread.commentIds.add(event.commentId);
       state.commentIndex.set(event.commentId, event.threadId);
+      state.commentAuthors.set(event.commentId, event.actor);
+      state.commentSeqs.set(event.commentId, event.seq);
       return { ok: true };
     }
     case "comment.edited": {
@@ -350,6 +407,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       }
       thread.resumeStatus = thread.status;
       thread.status = "resolved";
+      thread.lifecycle = { target: "resolve", actorKind: event.actor.kind };
       return { ok: true };
     }
     case "thread.reopened": {
@@ -369,6 +427,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       // Falls back to `open` for logs from before this field existed.
       thread.status = thread.resumeStatus ?? "open";
       thread.resumeStatus = undefined;
+      thread.lifecycle = { target: "reopen", actorKind: event.actor.kind };
       return { ok: true };
     }
     case "thread.external_synced": {
@@ -734,6 +793,122 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
             kind: "unknown-comment",
             commentId: event.commentId,
             message: `${event.kind}: comment '${event.commentId}' is not in the log.`,
+          },
+        };
+      }
+      return { ok: true };
+    }
+    case "draft.promoted": {
+      // Issue #70. Three independent guarantees, all enforced HERE so
+      // they hold for every store backing and every writer — not only
+      // for the daemon route that happens to check them first.
+      if (event.actor.kind !== "local") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "invalid-actor",
+            actor: event.actor,
+            message:
+              `draft.promoted: only the reviewer may promote a draft into their own pending review, ` +
+              `got actor kind '${event.actor.kind}'.`,
+          },
+        };
+      }
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (event.target === "comment") {
+        const commentId = event.commentId;
+        if (commentId === undefined) {
+          // The wire schema already refuses this shape; reaching here
+          // means a caller bypassed `reviewEventSchema`.
+          return {
+            ok: false,
+            rejection: {
+              kind: "invalid-shape",
+              message: "draft.promoted: target='comment' requires the commentId of the draft being promoted.",
+            },
+          };
+        }
+        if (!thread.commentIds.has(commentId)) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "unknown-comment",
+              commentId,
+              message: `draft.promoted: comment '${commentId}' is not in thread '${event.threadId}'.`,
+            },
+          };
+        }
+        const author = state.commentAuthors.get(commentId);
+        if (author?.kind !== "agent") {
+          return {
+            ok: false,
+            rejection: {
+              kind: "not-an-agent-draft",
+              threadId: event.threadId,
+              commentId,
+              message:
+                `draft.promoted: comment '${commentId}' was authored by '${author?.kind ?? "unknown"}', not an agent — ` +
+                `a reviewer's own comment is mirrored without a promotion.`,
+            },
+          };
+        }
+        // Issue #70 round 2: `commentSeq` must name a version this log
+        // actually issued. This is an APPEND-time check on
+        // PROVENANCE, not on currentness: the comment's authoring seq is
+        // stable for the life of the log (`comment.edited` does not
+        // advance it), so this cannot detect a body swapped after the
+        // fact. Detecting that is `bodyHash`'s job, and it happens
+        // outside the validator — `findDraftToPromote` compares the
+        // CURRENT body against the pin and refuses
+        // (`promoted-body-changed`), and the reconciler separately
+        // refuses a `body-drift` retry against the INTENT's bodyHash.
+        // What is refused HERE is the shape that can never be right: a
+        // promotion claiming to approve a version that does not exist.
+        if (event.commentSeq !== undefined && state.commentSeqs.get(commentId) !== event.commentSeq) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "unknown-comment",
+              commentId,
+              message:
+                `draft.promoted: commentSeq ${event.commentSeq} is not the seq of the authoring event for ` +
+                `'${commentId}' (the log has ${state.commentSeqs.get(commentId) ?? "none"}) — ` +
+                `a promotion pins the version of the comment it approves.`,
+            },
+          };
+        }
+        return { ok: true };
+      }
+      // Lifecycle targets close the asymmetry the comment arm above
+      // does not have (issue #70 review, finding in §5): the log now
+      // checks that the named change is agent-authored AND is the
+      // thread's CURRENT one, so a `draft.promoted` cannot authorize a
+      // resolve the thread has since reopened — the same rule the route,
+      // the reconciler and the rail's draft list read.
+      const lifecycle = thread.lifecycle;
+      if (lifecycle === undefined || lifecycle.target !== event.target) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-an-agent-draft",
+            threadId: event.threadId,
+            message:
+              `draft.promoted: thread '${event.threadId}' has no current '${event.target}' to promote ` +
+              `(its latest lifecycle change is ${lifecycle === undefined ? "none" : `'${lifecycle.target}'`}) — ` +
+              `a superseded lifecycle change has nothing left to write to GitHub.`,
+          },
+        };
+      }
+      if (lifecycle.actorKind !== "agent") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-an-agent-draft",
+            threadId: event.threadId,
+            message:
+              `draft.promoted: the current '${event.target}' on thread '${event.threadId}' was authored by ` +
+              `'${lifecycle.actorKind}', not an agent — there is no agent draft to promote.`,
           },
         };
       }

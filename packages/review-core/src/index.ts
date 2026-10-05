@@ -159,12 +159,16 @@ export {
 export {
   isPendingReviewStale,
   reduceReviewState,
+  reduceThreadLifecycleStates,
+  type AgentDraft,
   type CommentSyncState,
+  type DroppedReviewerIntent,
   type OpenPendingReview,
   type PendingReviewComment as DerivedPendingReviewComment,
   type ReviewState,
   type SyncFingerprint,
   type TerminalReview,
+  type ThreadLifecycleState,
 } from "./review-state.ts";
 export {
   alignMatchedText,

@@ -1878,7 +1878,16 @@ describe("ADR-0012's per-request gate", () => {
         { label: "refresh 415 (wrong media type)", path: SESSION_REFRESH_PATH, init: (i) => ({ method: "POST", headers: { ...authHeaders(i), "content-type": "text/plain" } }), expected: 415 },
         { label: "threads 501 (append not shipped)", path: THREADS_PATH, init: (i) => ({ method: "POST", headers: { ...authHeaders(i), ...JSON_HEADERS } }), expected: 501 },
         { label: "threads 405 (wrong verb)", path: THREADS_PATH, init: (i) => ({ method: "PUT", headers: authHeaders(i) }), expected: 405 },
-        { label: "preview 501 (gated, not yet served)", path: "/revkit/pr-7/index.html", init: (i) => ({ headers: authHeaders(i) }), expected: 501 },
+        // Was `501`. **The replacement is STRONGER, and the reason is the surface
+        // itself rather than the status:** this step used to assert "gated, not
+        // yet served", which is a claim about a missing feature. A preview path is
+        // now served (issue #101), so the step asserts the served-and-empty half:
+        // an object the harness has not published is a 404 with NO body, and the
+        // hygiene the rest of this loop checks is on it. The allowlist rules and
+        // the "refused before the R2 read" claim are in `test/preview.test.ts`,
+        // which seeds the bucket; this file's job is that the answer carries the
+        // policy, and a 404 that leaked a body would be the thing to catch.
+        { label: "preview 404 (gated, nothing published under it)", path: "/revkit/pr-7/index.html", init: (i) => ({ headers: authHeaders(i) }), expected: 404 },
       ];
       for (const step of steps) {
         // A session per step, and only for the steps that need one — minting

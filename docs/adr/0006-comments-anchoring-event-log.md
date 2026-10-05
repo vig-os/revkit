@@ -9,12 +9,14 @@
   export|import` CLI command; the 2026-10-05 (issue #73) amendment — an
   `import` lands only in an empty store, judged against the log the store holds;
   the 2026-10-05 (issue #113) amendment — quote provenance (the SOURCE is the
-  authority) and the typography fold the engine compares through; and the
-  2026-10-05 (issue #67) amendment at the end of this file — the lazy trigger
-  fires for a read that can RETURN AN ANCHOR, so the rail's ids-only prune fetch
-  no longer pays for a sweep it cannot observe, and one sweep reads the log once
-  rather than once per path, re-reading per path whenever the log moved while
-  the sweep ran.
+  authority) and the typography fold the engine compares through; the
+  2026-10-05 (issue #70) amendment — `draft.promoted`, the one reviewer act that
+  lets an agent-authored draft reach the pending review; and the 2026-10-05
+  (issue #67) amendment at the end of this file — the lazy trigger fires for a
+  read that can RETURN AN ANCHOR, so the rail's ids-only prune fetch no longer
+  pays for a sweep it cannot observe, and one sweep reads the log once rather
+  than once per path, re-reading per path whenever the log moved while the
+  sweep ran.
 
 ## Context
 
@@ -585,7 +587,9 @@ and says that, carrying `tryMove`'s reason when there was one.
 
 *(This section is self-contained on purpose: it amends trigger 1 of the "Triggers,
 layered" list above and changes nothing else. PR #106 also amends this ADR; the
-two sections are independent blocks and both are kept verbatim.)*
+sections are independent blocks and each is kept verbatim, in issue order — the
+issue #70 `draft.promoted` amendment follows this one and is likewise
+self-contained.)*
 
 Trigger 1 above — "**Lazy — before `/api/threads` GET and before `/events`
 catch-up** … even if watchers miss an event or the site was edited while the daemon
@@ -662,3 +666,208 @@ sweeps — twice, with the prime — so such a mount keeps three of its four swe
 projection removes the prune fetch's sweep, not that one.
 
 Refs: #67
+
+## Amendment (2026-10-05, issue #70): `draft.promoted` — a reviewer attaches an agent's draft
+
+**The gap.** An agent reply, resolve or reopen against a thread in an in-flight
+local PR review reached the reviewer and nothing else: the local log got the
+agent's `comment.replied` / `thread.resolved`, and PR #59's mirror paths refuse
+any non-`local` actor, so the reviewer's `gh` identity never carried it. B6's
+"the agent replies" was true only in the weakest possible reading.
+
+**The decision (option B, owner-decided 2026-10-05).** An agent-authored reply or
+resolve/reopen stays a **local draft**, badged as agent-authored. One explicit
+reviewer action — **promote** — attaches it to the reviewer's own pending review,
+and that action is recorded in this log as a new event kind:
+
+```
+{ kind: "draft.promoted", actor: <local>, threadId, target: "comment"|"resolve"|"reopen", commentId? }
+```
+
+`commentId` is required iff `target === "comment"` (a resolve/reopen promotion
+names the thread). The existing machine intents are unchanged: a promoted comment
+becomes an ordinary `comment.sync_requested` under the reviewer — the same event
+the reviewer's own comment produces — and a promoted resolve/reopen is the
+already-logged `thread.resolved`/`thread.reopened`, which the reconciler now
+treats as an intent once a later `draft.promoted` authorizes it. Promotion adds
+the *authorization*, not a second kind of intent, so every property the existing
+reconciler already has (read-first, fingerprint matching, `comment.linked`
+completion, submit gating, crash healing) applies to a promoted draft unchanged.
+
+**Why an event and not a field on the intent.** For a comment, a `promotedBy`
+field on `comment.sync_requested` would have carried the same information. For a
+**resolve** it cannot: the agent's `thread.resolved` is already in the log and
+the validator refuses a second resolve on a resolved thread, so there is no new
+event to hang a field on — and without the separate event, half of B6 would have
+no record that a human authorized the write at all. One kind, one meaning: *a
+reviewer attached this agent-authored draft to their own pending review.*
+
+**The trust argument, enforced in the log.** Every rule below is in
+`validateNext`, so each holds for every store backing and every writer rather
+than only for the route that checks it first.
+
+1. **Only the reviewer may record a promotion.** `draft.promoted` with any
+   non-`local` actor is rejected (`invalid-actor`). The precise property is
+   *the agent bearer cannot author a promotion over HTTP*: the bearer is
+   refused `403` on the route and its requests are identified as `agent`, so
+   every append it could cause is built server-side from an `agent` actor.
+   This is **not** a claim that the agent, as a process, has no route to a
+   write: a same-user agent that obtains a REVIEWER SESSION via the
+   launch-code exchange (`POST /-/launch-code` mints a code, `GET /-/auth`
+   exchanges it for the reviewer's cookie) is identified as `local` like any
+   cookie and can promote. That escalation is pre-existing on the local
+   surface (since PR #38), is a property of the launch-code flow rather than of
+   this event, and is owned as a decision on **#55**. It is stated here
+   because this amendment is what makes a reviewer's session
+   load-bearing.
+2. **Only an agent draft may be promoted.** Promoting a comment, or a
+   resolve/reopen, an agent did not author is rejected
+   (`not-an-agent-draft`) — a reviewer's own comment mirrors without a promotion
+   and their own resolve is authorized already, so the log can never claim one
+   was promoted.
+3. **A lifecycle promotion must name the thread's CURRENT change.** A
+   `draft.promoted` with `target: "resolve"` against a thread whose latest
+   lifecycle change is a reopen is rejected with the same kind: a superseded
+   change has nothing left to write to GitHub, and the reconciler would
+   otherwise fire an intent the reviewer has already moved past.
+4. **The named ids must be real.** `unknown-thread` / `unknown-comment`, and the
+   comment must belong to the thread named (mirroring `comment.replied`'s
+   parent check).
+
+The route adds one rule the log cannot see, because it is about the world
+outside the log: **promotion requires an OPEN pending review.** After
+`review.submitted` or `review.abandoned` there is nothing to promote into, and
+the route refuses (`no-open-pending-review`) rather than opening a fresh review
+behind the reviewer's back — a discarded review stays discarded until the
+reviewer opens a new one deliberately.
+
+**What the pin is, precisely — `bodyHash` holds, `commentSeq` is provenance.**
+`bodyHash` is the enforcement: `findDraftToPromote` refuses to promote a comment
+whose current body no longer hashes to the recorded value
+(`promoted-body-changed`), and refuses to promote *again* on top of a promotion
+carrying no pin; the boot heal composes through the same check, so nothing is
+repaired into unpinned text. `commentSeq` records WHICH version was approved and is
+checked at **append** time only — that it names an authoring event the log actually
+issued. It is **not** a currentness guard: `comment.edited` does not advance the
+authoring seq, so it is fixed for the life of the log; it is what makes the pin
+checkable at append time at all, and it is the provenance of the hash rather than a
+second independent lock on the text. The reconciler separately refuses a
+`body-drift` retry by comparing the live body against the **intent's** `bodyHash`
+(the intent is composed from the pinned text, so both must agree).
+
+**A refusal writes nothing.** Every check above, plus the ones the route makes
+about the world (`no-github-thread`, `stale-lifecycle-draft`,
+`promote-mapping-orphan`), is decided **before the first append**. This is
+load-bearing rather than tidiness: `draft.promoted` is what retires a draft
+from `agentDrafts`, so a refusal raised *after* it left the log claiming an
+authorization that never happened, retired the draft the rail's affordance is
+built from, and made the comment permanently unreachable — the reviewer was
+shown a badge, a button, and then nothing, with no route left that could
+produce the intent. A refused promotion is a no-op on the log.
+
+**Idempotency is a property of the log, not of the route.** A promotion already
+in the log is not appended twice; the route recognises it and re-runs the
+read-first reconcile to finish the interrupted one, answering `200` with
+`promoted: false` instead of `201`. So a double promote, a promote retried after
+a crash between the event and its reconcile, and a restart all converge on one
+GitHub write.
+
+The crash window is **between** the promotion and the machine intent, and it is
+recoverable in both directions: the promotion alone authorizes nothing (the
+reconciler needs the intent too), and a retry recognises the recorded promotion,
+skips appending a second one, and still appends the missing intent. Boot stays
+read-only: an unpromoted draft produces no intent, so nothing about it can be
+written on restart.
+
+**The promotion PINS the content it approves.** A `draft.promoted` for a comment
+carries `commentSeq` (the `seq` of the `comment.created` / `comment.replied` that
+authored the draft) and `bodyHash` (`revisionOf(body)` at promotion time). Without
+them the event names a comment id and leaves *which text* open, so a later edit of
+that comment could swap the body between the reviewer's approval and the
+reconciler's write: the intent would fingerprint the NEW text while the promotion
+recorded the human act on the OLD. With the pin, a comment whose current body no
+longer hashes to the recorded `bodyHash` is **refused**
+(`promoted-body-changed`) rather than promoted, and the reviewer is told the text
+changed and to re-read it.
+
+`validateNext` also checks that `commentSeq` is the seq of the authoring event the
+log actually issued (`unknown-comment` otherwise), so the pin cannot name a version
+that does not exist. Both fields are **optional at the wire** — a log written before
+they existed must still validate, since `validateNext` is a state machine over
+appends and a stricter rule than the log's own history is a boot failure. A
+promotion carrying neither pin is the old, weaker shape, and `findDraftToPromote`
+refuses to promote *again* on top of one (`promoted-body-changed`: the current text
+cannot be shown to be the approved text). The route always writes the pin.
+
+**The heal never composes what the route would refuse.** In particular it applies
+the same open-pending-review rule. Without it, a promotion left incomplete by a
+submit (or a discard, or a head-move reanchor's abandon — none of which go through
+the promote route) would be repaired into an intent that the next
+cookie-authenticated reconcile posts into a **fresh** pending review: reopening,
+automatically and after the fact, a review the reviewer had already closed. The
+route refuses that with `no-open-pending-review`, so a repair that composed it
+anyway would be the one path that publishes into a closed review.
+
+**A dropped reviewer intent is visible, not silent.** The supersession rule below
+applies to the reviewer's own change, so their click can be superseded by a later
+lifecycle event before the reconciler fires it. Refusing to fire it is correct;
+leaving the reviewer to believe it posted is not. `reduceReviewState` therefore also
+derives `droppedReviewerIntents`: a `local` resolve/reopen that carries **no**
+completing `thread.external_synced` and is **not** the thread's current change. A
+change that is current and merely unsatisfied is not reported — it is in flight, and
+reporting it would be a false alarm on every pending sync. The rail shows the list
+as a notice (not an alert: nothing is broken, and no decision is needed) naming the
+thread and which of the two it was.
+
+**A crash between the promotion and its intent is healed on the next start.**
+Promotion is two adjacent appends, and nothing fallible sits between them — but a
+process death or a sqlite error on the second leaves the log claiming a human
+attached a draft that has no intent. That draft is invisible: `agentDrafts` (which
+the promotion retired) is empty, and `unsyncedCommentIds` is empty too, so the
+reviewer's rail shows nothing and a submit ships without it. Boot therefore composes
+the missing intent from the log — the promotion names the comment and the thread
+carries its anchor and body, which is all the route had. It is a **local** append:
+the reconcile that follows still runs read-only, so the repaired intent is picked up
+by the next cookie-authenticated action like any other durable intent, and boot
+still never writes to the remote. The composition goes through the same
+`findDraftToPromote`, so an unmappable anchor or a body that no longer matches the
+pin is left alone rather than healed into something unpromotable.
+
+**Derived, not held — and derived ONCE.** `reduceReviewState(...).agentDrafts`
+lists the unpromoted drafts from the log, so there is no second source of truth
+and nothing to reconcile across a restart. A second agent draft on a thread
+after a promotion is a new entry (keyed by the draft's own identity), and a
+lifecycle draft is gone the moment the thread's state changes — there is no
+longer anything to resolve on GitHub.
+
+**The supersession applies to the reviewer's OWN unresolved intent too.** This is a
+behaviour change from before `reduceThreadLifecycleStates` existed, and it is
+deliberate. Previously a `thread.resolved` by a `local` actor stayed an outstanding
+intent no matter what came after it, so an agent's later reopen left the reviewer's
+resolve queued: the reconciler would resolve the remote thread while the local log
+said `open`, and append a `thread.external_synced` claiming a baseline that never
+happened. That is the same divergence finding 2 was about, reached from the other
+side, so the rule is stated once and applies whoever authored the change: **the
+thread's current lifecycle change is the only one that acts.** A reviewer's own later
+change therefore supersedes an agent draft (and acts without promotion, as before),
+and an agent change supersedes the reviewer's earlier one. Both orders are pinned by
+tests.
+
+That last rule is **`reduceThreadLifecycleStates`, one exported derivation with
+three consumers**: the reducer's draft list, the daemon's `findDraftToPromote`
+(which refuses a stale target), and `reconcileThreadStateIntents` — the one that
+**writes**. Three separate implementations of "which lifecycle change is
+current, and is it promoted" is how a promoted resolve came to be fired for a
+thread that had since been reopened, while the rail's badge and the route both
+correctly showed nothing to promote: the writer was the outlier, and it corrupted
+the external baseline besides making the wrong write. The rule is therefore
+stated once, here, and enforced by rule 3 above so that even a writer that
+bypasses the derivation cannot produce a stale authorization. Refs: #70, #59, #8
+
+## Amendment (2026-10-05, issue #69): a directory that vanishes inside the watcher callback is polled, never unwatched
+
+The #49 amendment above enumerates the fallback set — re-armed onto `fs.watch` for a never-watched
+path, `stat`-poll for the swap-damaged ones — and this adds the one shape that belonged to neither: a
+directory whose own `fs.watch` callback observes it disappear now installs the same `stat`-poll every
+other teardown path installs, so **every tracked directory is always in exactly one of watch or poll,
+never neither**. Refs: #69

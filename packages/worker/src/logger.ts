@@ -101,6 +101,17 @@ export const LOG_MESSAGES = [
   // compared the array against a list and stayed green throughout, because
   // nothing ran the names through the logger. There is now a case that does.
   "asset.miss",
+  // The preview surface (issue #101), three events for three outcomes that are
+  // ONE answer to the caller and are worth telling apart in a log: a path the
+  // allowlist refused (no R2 read happened — the distinction from a miss is the
+  // whole point of the gate, and `request.end` already records the 404), an
+  // allowlisted object that is not in the bucket, and an object that was served.
+  // Fields are CONSTANTS: `objectKind` is one of the four names the extension
+  // table holds, and `reason` comes from `preview-assets.ts`'s closed
+  // vocabulary. Neither carries a pathname — `request.end` has it.
+  "preview.refused",
+  "preview.miss",
+  "preview.served",
   "invite.redeem.ok",
   "invite.redeem.denied",
   "rate.limit.hit",

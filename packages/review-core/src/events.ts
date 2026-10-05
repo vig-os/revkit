@@ -521,6 +521,69 @@ const commentSyncCancelledPayload = {
   requestedAtSeq: z.number().int().positive(),
 } as const;
 
+/** Issue #70 (B6, option B): a reviewer explicitly promoted an
+ * AGENT-authored draft into their own pending GitHub review. The
+ * draft itself is already in the log (`comment.replied` /
+ * `thread.resolved` / `thread.reopened` with an `agent` actor) and
+ * stays LOCAL until this event lands; promotion is the human act that
+ * authorizes the machine intent the reconciler then replays under the
+ * reviewer's identity.
+ *
+ * `commentId` is required iff `target === "comment"` — a resolve or
+ * reopen promotion names the THREAD, not a comment. `actor` is the
+ * reviewer; the transition validator refuses any other actor, so a
+ * `draft.promoted` over HTTP can only come from a cookie session (see
+ * validator.ts `draft.promoted`, and the limit of that claim in the
+ * ADR-0006 amendment).
+ *
+ * `commentSeq` and `bodyHash` record WHICH version and WHICH text the
+ * reviewer approved: the `seq` of the `comment.created` /
+ * `comment.replied` that authored the draft, and `revisionOf(body)` of
+ * its body at promotion time. Without them the event names a comment id
+ * and leaves the text open, so a later edit of that comment (no edit
+ * route exists today) could swap the body between the reviewer's
+ * approval and the write.
+ *
+ * What each one actually does, precisely:
+ *   - `bodyHash` is the pin that HOLDS. `findDraftToPromote` refuses to
+ *     promote a comment whose current body no longer hashes to it
+ *     (`promoted-body-changed`), and refuses to promote again on top of
+ *     a promotion carrying no pin at all. The boot heal composes
+ *     through the same check.
+ *   - `commentSeq` records the version and is checked at APPEND time
+ *     only: `validateNext` refuses one the log never issued. It does NOT
+ *     track later edits — `comment.edited` does not advance
+ *     `commentSeqs`, so the authoring event's seq is stable for the life
+ *     of the log — which means it cannot by itself detect a swapped
+ *     body. The enforcement is `bodyHash`'s; `commentSeq` is the
+ *     provenance of it ("this is the version that was on the page"), and
+ *     it is what makes the pin checkable at all at append time.
+ *
+ * Both are OPTIONAL, because a log written before they existed must
+ * still validate (ADR-0006: `validateNext` is a state machine over
+ * appends, so a stricter rule than the log's own history is a boot
+ * failure). They are not optional in practice: the route always writes
+ * them for a comment promotion, and a promotion that lacks them is
+ * treated as pinning nothing — which is exactly the old, weaker
+ * behaviour, and is why the route is the place that must write them. */
+const draftPromotedPayload = {
+  kind: z.literal("draft.promoted"),
+  threadId: idSchema,
+  target: z.enum(["comment", "resolve", "reopen"]),
+  commentId: idSchema.optional(),
+  /** `seq` of the authoring event, pinning WHICH version of the
+   * comment the reviewer approved. Paired with `bodyHash`. */
+  commentSeq: z.number().int().positive().optional(),
+  /** `revisionOf(body)` at promotion time. Paired with `commentSeq`. */
+  bodyHash: z
+    .string()
+    .regex(
+      SHA256_HEX_REGEX,
+      "draft.promoted.bodyHash must be a lowercase 64-char SHA-256 hex string (see revisionOf).",
+    )
+    .optional(),
+} as const;
+
 /** Shared envelope for the four `build.*` kinds (M2 item 9, story
  * A4). `generation` names the publish generation the build was
  * scheduled FOR, so a terminal `build.succeeded` clears exactly the
@@ -626,6 +689,48 @@ const eventVariants = [
   z.object({ ...envelope, ...commentSyncRequestedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncFailedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncCancelledPayload }).strict(),
+  z
+    .object({ ...envelope, ...draftPromotedPayload })
+    .strict()
+    .superRefine((event, ctx) => {
+      // `commentId` is the identity of a comment draft and is
+      // meaningless on a thread-lifecycle promotion. Requiring it one
+      // way and forbidding it the other keeps the promotion
+      // unambiguous: there is exactly one way to promote each kind.
+      if (event.target === "comment" && event.commentId === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["commentId"],
+          message: "draft.promoted: target='comment' requires the commentId of the draft being promoted.",
+        });
+      }
+      if (event.target !== "comment" && event.commentId !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["commentId"],
+          message: `draft.promoted: target='${event.target}' must not carry a commentId (a resolve/reopen promotion names the thread).`,
+        });
+      }
+      // The content pin is a PAIR: a `commentSeq` without a `bodyHash`
+      // (or the reverse) would pin half of what the reviewer approved,
+      // which is the ambiguity this exists to remove.
+      if ((event.commentSeq === undefined) !== (event.bodyHash === undefined)) {
+        ctx.addIssue({
+          code: "custom",
+          path: [event.commentSeq === undefined ? "commentSeq" : "bodyHash"],
+          message:
+            "draft.promoted: the content pin is a pair — a comment promotion that pins the approved version carries BOTH commentSeq and bodyHash.",
+        });
+      }
+      // A lifecycle promotion pins no content: there is none.
+      if (event.target !== "comment" && (event.commentSeq !== undefined || event.bodyHash !== undefined)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["commentSeq"],
+          message: `draft.promoted: target='${event.target}' must not carry a content pin (a resolve/reopen promotion has no body to pin).`,
+        });
+      }
+    }),
   z.object({ ...envelope, ...buildRequestedPayload }).strict(),
   z.object({ ...envelope, ...buildStartedPayload }).strict(),
   z.object({ ...envelope, ...buildSucceededPayload }).strict(),
@@ -670,6 +775,7 @@ export const reviewEventKinds = [
   "comment.sync_requested",
   "comment.sync_failed",
   "comment.sync_cancelled",
+  "draft.promoted",
   "build.requested",
   "build.started",
   "build.succeeded",

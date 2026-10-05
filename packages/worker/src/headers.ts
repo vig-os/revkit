@@ -155,7 +155,8 @@ export function applyAuthHeaders(response: Response, ctx: HeaderContext): Respon
 }
 
 /** Attach ADR-0012 headers to an ASSET — the revkit-owned client script on
- * `/_revkit/<version>/`, and whatever a future R2-backed preview serves.
+ * `/_revkit/<version>/`, and every image and font a preview serves
+ * (`src/preview-assets.ts`'s `asset` kind).
  *
  * **No CSP, and that is the shared policy's rule rather than an omission.** The
  * `asset` kind exists precisely so a JS/CSS/font/image response carries no
@@ -180,10 +181,11 @@ export function applyAssetHeaders(response: Response, ctx: HeaderContext, conten
 /** Attach the minimal CSP plus `Content-Disposition: inline` to an SVG.
  *
  * ADR-0012: "SVG is served with `Content-Security-Policy: sandbox` and
- * `Content-Disposition: inline` so it can't run script." Slice 1 serves
- * no SVG — there is no R2 — but the header SHAPE is exported and pinned
- * now, so slice 3 (the preview surface) inherits a tested policy instead
- * of writing one.
+ * `Content-Disposition: inline` so it can't run script." Until issue #101 this
+ * had **no route that could reach it** — the shape was exported and pinned, and
+ * nothing served an SVG, which is the shape of a control that reads as present
+ * and is inert. A preview `.svg` now comes through here for real, and
+ * `test/preview.test.ts` asserts both headers on the RESPONSE.
  *
  * `inline` (not `attachment`) because an SVG inlined into the page is
  * rendered by the embedding document's CSP and never becomes a document

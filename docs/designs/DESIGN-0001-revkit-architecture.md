@@ -47,7 +47,7 @@ It has three review surfaces on one core (ADR-0025), sharing one content model a
 | B3 | As a reviewer, I **submit the review** (comment / approve / request changes) from the page |
 | B4 | As a reviewer, I see existing PR review threads **on the page** (two-way), resolved state included |
 | B5 | As a non-GitHub reviewer, I open a **personal invite link**; my comments are attributed to me and mirrored to the PR |
-| B6 | As an agent, I pick up the review (threads with anchors), fix the source, reply and resolve; the next preview re-anchors |
+| B6 | As an agent, I pick up the review (threads with anchors), fix the source, reply and resolve; the reviewer **promotes** each agent reply/resolve into their pending review to publish it; the next preview re-anchors |
 | B7 | *(M8)* As a reviewer, I review **code diffs** of a PR in revkit with the same comment rail, mapped to PR lines |
 
 **C — authoring and consistency (guards)**
@@ -361,6 +361,9 @@ sequenceDiagram
   D-->>Ag: same thread pushed via the M2 channel
   R->>D: submit (COMMENT / APPROVE / REQUEST_CHANGES)
   D->>GH: submit pending review pinned to commit_id
+  Ag->>D: agent replies / resolves via the M2 channel (LOCAL draft only)
+  R->>D: promote agent draft (cookie-only; recorded as draft.promoted)
+  D->>GH: replay the draft into the reviewer's pending review, as the reviewer
 ```
 
 Details:

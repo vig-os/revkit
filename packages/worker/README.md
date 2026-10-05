@@ -21,6 +21,7 @@ mentions it.
 | Retention | `src/retention.ts` | ADR-0015's 30-day guest anonymisation |
 | Sessions | `src/session.ts` | mint, hash, store, resolve, rotate; the cookie and the CSRF token |
 | The gate | `src/authz.ts` | ADR-0012's per-request authorization, and the route table that says which routes it applies to |
+| Preview serving | `src/preview-assets.ts` | ADR-0012's extension→`Content-Type` allowlist as DATA, the R2 key layout, and the refusals — all decided from the REQUEST PATH |
 | Hosted store | `src/d1-store.ts` | `D1ThreadStore implements ThreadStore` — ADR-0006's log on D1 |
 | D1 schema | `migrations/0001_init.sql`, `migrations/0002_invites.sql` | the ONLY DDL for the hosted store, applied out of band, in filename order |
 | Response headers | `src/headers.ts` | adapter over the **shared** policy in `@revkit/review-core/http-headers` |
@@ -173,7 +174,7 @@ written — not relaxing a `default`.
 | `/<repo>/pr-<n>/api/threads` | other verbs | 405, in the review's scope, **behind the gate** |
 | `/invite/<token>` | **GET only** | 200 the display-name form (`no-store`, full CSP, no inline script, no reflected input, plus one external `<script src>` on the allowlisted path) plus the browser-binding cookie — **minted only when the browser has none**, so re-opening the mail link does not rotate the binding a live session depends on; 410 one closed page for every dead-link reason; 429 with `Retry-After`. `HEAD` is **refused**, because a read that consumes a redemption must not be answerable by a link checker. |
 | `/invite/redeem` | **POST only** | 303 to a **token-free** path, with two `Set-Cookie`s (session + browser binding) and the CSRF token; 410 the same closed page; 429; 415 unless `application/json` **or `application/x-www-form-urlencoded`**; 400 for an unreadable body. The form encoding exists because the Worker SHIPS a form: `src/invite-page.ts` emits no `enctype`, so a browser submits `x-www-form-urlencoded` and a JSON-only route answers the shipped page with `415`. A repeated form field is refused outright (JSON's repeated-key "last wins" is left as-is and asserted separately). |
-| `/<repo>/pr-<n>/…` (not the API) | any | 501 — **behind the gate**, carrying the same **scope** as the API inside it. The R2 preview surface is the rest of slice 5. |
+| `/<repo>/pr-<n>/…` (not the API) | GET, HEAD | 200 the one object named by the path, out of the R2 `PREVIEWS` binding — **behind the gate**, carrying the same **scope** as the API inside it. `Content-Type` comes from the path's extension against `src/preview-assets.ts`'s allowlist and **never** from the object's metadata; `.js`, `.mjs`, `.css`, `.wasm`, a double extension, a case variant, a trailing dot and a name with no extension are **404 with no body and no R2 read at all**; a missing object is the same 404. `html` gets the full CSP, `svg` gets `sandbox` + `Content-Disposition: inline`, `json`/images/fonts get theirs. 405 for every other verb, behind the gate. See "The preview surface" below. |
 | `/_revkit/<version>/invite-<sha256>.js` | any | **200, the one client script** (slice 5b). `text/javascript; charset=utf-8`, `nosniff`, `Cache-Control: public, max-age=31536000, immutable`, and **no CSP of its own** — the embedding document's `default-src 'none'` is the control, and a CSP here would deny the document's own load of it. Ungated: the bytes are a compile-time constant (`src/client-script.ts`), so there is nothing to authorize and no `env.DB` on this path. |
 | `/_revkit/…` (anything else) | any | 404, **never a redirect** (ADR-0012 — a browser drops the path part of a CSP source after a redirect, which would widen `script-src`). Every other version, an unhashed name, a mis-hashed name, a `.mjs`/`.html` spelling and the bare `/_revkit/` all miss, by exact string equality against the one name that resolves. |
 | anything else | any | 404 |
@@ -221,6 +222,137 @@ shape to someone who has proved nothing.
 `POST /api/session/refresh` exists because ADR-0012's CSRF and `application/json`
 rules are only testable end to end if some state-changing call is reachable, and it
 is the smallest such route: it writes nothing but the caller's own `sessions` row.
+
+### The preview surface: `<repo>/pr-<n>/…` serves ONE object
+
+`GET|HEAD <repo>/pr-<n>/<path>` reads one key out of the R2 `PREVIEWS` binding,
+behind the gate, in the review's scope. Everything security-shaped about it is in
+`src/preview-assets.ts`, and this section says what that is rather than how it is
+coded.
+
+**1. The media type comes from the REQUEST PATH and from nothing else.** The
+allowlist is a table — `html`, `json`, `svg`, `png`, `jpg`, `jpeg`, `webp`,
+`avif`, `woff`, `woff2` — and the lookup is exact and lowercase, so `.PNG` is a
+miss rather than a fold. `R2Object.httpMetadata` and `customMetadata` are never
+read: `writeHttpMetadata`, the only API that would put an object's metadata on a
+response, is not called. `test/preview.test.ts` stores an object whose stored
+`contentType` is `text/javascript` under `index.html` and asserts the response is
+`text/html; charset=utf-8`, and the reverse (a `.png` whose metadata says
+`text/html`). `X-Content-Type-Options: nosniff` is what makes the derived type
+load-bearing rather than advisory.
+
+**2. A refused path never becomes an R2 operation.** The decision is made from
+the path BEFORE a key exists, so there is nothing to read. Refused: `.js`,
+`.mjs`, `.css`, `.wasm`, anything not in the table, a double extension
+(`page.html.js` — its extension *is* `js`), a case variant, a trailing dot, a
+name with no extension, a name that is nothing but an extension, a bare
+directory name. All of them are **404 with no body**, and the refusal reason is
+one of a closed seven-word vocabulary that reaches neither the response nor the
+log line.
+
+**That is asserted with a counting binding, not by reading the order of two
+statements.** R2 has no request log, so a refused path and a read of a missing
+object are indistinguishable from outside workerd. `test/preview.test.ts` runs
+the real Worker through `test/fixtures/preview-spy.ts` — the same module, the
+same `fetch`, one binding replaced by a counter — and asserts `reads` is **zero**
+for every refusal and **one** for an allowlisted path, with the key it asked for.
+A contrast case exists so the counter cannot be vacuously zero.
+
+**3. The 404 has no body, and that is the requirement.** A refused path, a
+missing object and a review with nothing built in it are ONE answer. A body
+would be the only place on this surface where a caller-supplied name could
+travel, and none of the three has anything to say that the status does not. The
+hygiene quartet and `Permissions-Policy` are still on it, and `no-store` is set
+explicitly because the shared policy sets `Cache-Control` only for `json` and
+`auth`.
+
+**4. Each kind goes through the SHARED policy**, and the pair (kind, media type)
+comes from one table row so they cannot disagree: `html` → `applyHtmlHeaders`
+(the full ADR-0012 CSP, asserted directive by directive **on the response**),
+`svg` → `applySvgHeaders` (minimal CSP + `sandbox` + `Content-Disposition:
+inline`), `json` → `applyJsonHeaders`, images and fonts → `applyAssetHeaders` and
+therefore **no CSP of their own** — a `default-src 'none'` on a font response
+would deny the document's own load of it.
+
+**5. The key layout is `<repo>/pr-<n>/<path>`**, which is DESIGN-0001 §6.1's
+("R2, holding one built site per `<repo>/pr-<n>/`") and not a new convention: it
+is `previewScopePath(repo, pr)` with the built site's path appended, so the R2
+prefix and the log partition come from ONE string and one review's objects cannot
+share a prefix with another's. A path ending in a slash is that review's
+`index.html` — without that, the redemption's own `303` target would be refused for
+having no extension. The lookup is a `Map` rather than a property read, because
+`MEDIA_TYPES["constructor"]` on a plain object is `Object`'s own constructor: a
+hit for an extension nobody allowlisted.
+
+**6. A traversal alias normalises onto ANOTHER review, and it has three
+spellings.** Two of them cross a review boundary and one does not, and the
+distinction is the whole point:
+
+| spelling | lands on | reads |
+|---|---|---|
+| `%2e%2e/pr-8/index.html` | `/revkit/pr-8/index.html` | **pr-8's object** |
+| `..\pr-8\index.html` | `/revkit/pr-8/index.html` | **pr-8's object** |
+| `./index.html`, `docs/./index.html`, `docs\index.html` | the same path | ONE key, byte-identical |
+
+A URL spec decodes `%2e` far enough to recognise a dot segment, and a WHATWG path
+treats `\` as a separator — so the first two rows are the same cross-review
+request, and the backslash form is the one an attacker reaches for first on
+Windows. It is safe because the scope travels with the **normalised** path:
+`Route.scope` and the key come from the same string. Both crossing spellings are
+asserted in one loop, in both directions — an operator reads pr-8's object, and a
+guest scoped to pr-7 is refused `403 invite-scope-mismatch` with `reads === 0` on
+each. The third row does not cross a boundary, so it is inert for the same reason
+and is asserted byte-for-byte.
+
+A lone `%2e`, `%2f` or `%5c` cannot survive as itself: `parsePreviewPath` refuses
+those and `src/preview-assets.ts` refuses them again at the place the key is
+built. **A double-encoded `%252e%252e` does reach `serve`, and that is what a
+`serve` decision does not claim** — see `src/preview-assets.ts`'s header. It is
+inert because an R2 key is an opaque byte string, so the key addresses exactly
+the object stored under those literal characters and is still prefixed with the
+review's scope.
+
+**7. A key over R2's 1024-byte limit is refused, not thrown at.** R2 *throws* on a
+key over 1024 bytes rather than returning a miss, and the object path is
+caller-supplied, so an over-long preview path used to escape as a `500 internal
+error` **with a body and without `Cache-Control`** (#133). `MAX_R2_KEY_BYTES` is
+the boundary measured on the platform — 1024 answers a miss, 1025 throws — and the
+check is `>` because of it, so the largest legal key is served and the first
+illegal one is the surface's own bodyless 404. It is measured in UTF-8 **bytes**
+because that is what R2 counts, which matters over HTTP in one reachable way: a
+pathname is percent-encoded, so a name of 200 `é` arrives as 1200 characters and
+its key is 1217 bytes — a path can cross the limit without any segment looking
+long.
+
+**8. The extension that decides the type is the LAST one, in both directions.**
+`x.js.png` is served as `image/png` and `x.js.html` as `text/html`, while
+`x.html.js` is refused — the same rule, opposite direction, and both are pinned,
+because swapping `lastIndexOf(".")` for `indexOf(".")` would reject the first two
+and no comment would notice. What makes the accepted direction safe is
+`nosniff` plus the CSP: a PR's script renamed `.js.png` is decoded as an image,
+and a document named `x.js.html` loads no script because `script-src` names only
+`/_revkit/<version>/`.
+
+**9. Nothing here writes.** No `put`, no `delete`, no R2 credential in this repo.
+The upload side — CI publishing a PR-head build, provisioning the bucket,
+ADR-0014's fork approval — is tracked separately, so whoever controls the bucket's
+contents is whoever runs the build pipeline, and ADR-0012's guarantee does not
+depend on that being careful: the bytes are typed by the path.
+
+**A missing `PREVIEWS` binding is a 500 on preview paths and nothing else.** No
+route outside this one reads the binding, so a deployment without it cannot be
+mistaken for a healthy surface that simply has no previews in it.
+`test/worker-config.test.ts` asserts `wrangler.jsonc` declares the binding.
+
+**Two residual risks of serving PR HTML on this origin are accepted, not solved,
+and they are in ADR-0012's amendment rather than only here**: a PR's
+`<meta http-equiv="refresh">` can navigate the tab off-site (no CSP directive
+covers it), and `POST /invite/redeem` is reachable by a cross-site form post
+because it is deliberately ungated and has no CSRF check — bounded by single use,
+`max_browsers` and the rate limit, not prevented. The structural answer to both is
+a separate preview origin (#135). Read that section before describing this surface
+as isolated: **the type, the script source and the framing are controls; the
+ORIGIN is shared with PR-controlled content.**
 
 ### A GUEST session is a session plus four more checks
 
@@ -325,7 +457,7 @@ relocate it, fix `src/index.ts` in the same commit.
 
 `src/logger.ts`'s header is the authority. Three mechanisms are enforced:
 
-1. **The message is a closed vocabulary.** `msg` is one of eight event names and a
+1. **The message is a closed vocabulary.** `msg` is one of a fixed list of event names and a
    runtime guard refuses anything else, which is the only mechanism that can stop a
    **comment body** — no regex distinguishes prose from a log line.
 2. **Key names.** A field whose name matches the sensitive set has its value
@@ -353,15 +485,30 @@ dev`, no Cloudflare API call, no DNS.
 nix develop            # or: direnv allow
 bun install
 cd packages/worker
-bun test               # ~10 s over 10 files
+bun test               # 12 files
 bun run typecheck
 ```
 
 The harness (`test/harness.ts`) starts one `miniflare` per test file, applies the
-**real** migration file, and dispatches through workerd — the same binary
+**real** migration file, binds an in-memory D1 **and an in-memory R2 bucket**
+(`PREVIEWS`), and dispatches through workerd — the same binary
 `wrangler deploy` would run. `wrangler.jsonc`'s compatibility date, flags and vars
 are read from that file rather than duplicated in the harness, so the test runtime
 cannot drift from the shipped config.
+
+**Two things about the runtime budget, both measured and recorded in the harness's
+header comment**, because they are easy to trip over:
+
+- **Keep the number of `miniflare` instances low.** On this host a `bun test`
+  process tolerates a handful; past that, whichever file runs next hangs in
+  `getD1Database` and every later case in it fails with "Unable to connect".
+  `test/preview.test.ts` therefore has exactly ONE instance and reuses it for the
+  pure allowlist cases too.
+- **The full-suite run flakes on a loaded host, and it flakes on `origin/dev`
+  too.** Measured twice on an untouched `origin/dev` worktree during issue #101:
+  422 pass / 14 fail and 322 pass / 114 fail, with the same "Unable to connect"
+  cascade. The canonical comparison is per-file — `bun test --timeout 10000
+  test/<file>.test.ts` — which is what CI's timeout value is for.
 
 ## What slices 1–3 do NOT do
 
@@ -371,10 +518,20 @@ Stated here so nobody has to read the PR body to find out:
   stays unimplemented, so hosted **B2** (comment as the reviewer) and **B3**
   (submit review) do not move — and the gate has no repo-access check to make,
   because there is nothing to check it against.
-- **No preview serving.** No R2, no `<repo>/pr-<n>/` object, no
-  extension→`Content-Type` allowlist. `parsePreviewPath` recognises a preview path
-  and answers `501` naming the slice that serves it. ADR-0012's SVG-sandbox rule is
-  implemented and tested as a header, against synthetic content only.
+- **The preview surface SERVES; nothing PUBLISHES to it.** See "The preview
+  surface" below for exactly what ships. What does not ship is the other half:
+  **no CI step writes a PR-head build into the bucket**, the bucket itself is not
+  created (`wrangler.jsonc` declares the binding name and nothing has run
+  `wrangler r2 bucket create`), there is no R2 credential anywhere in this repo,
+  and no fork preview is approved (ADR-0014). So a deployment answers 404 on every
+  preview path until an operator puts something there, and `B1` — "CI builds a
+  preview and posts the link" — has not moved.
+- **The allowlist is ADR-0012's list, which leaves two real gaps a build emits.**
+  `.xml` and `.txt` are refused: the bullet names HTML, JSON, images, fonts and
+  SVG, and an XML document is something a browser renders *as a document*, which
+  is what the shared policy's unused `xml` kind exists for. Adding either is one
+  table row plus (for XML) `buildMinimalCspHeader("xml")` behind it, and it should
+  be an ADR amendment rather than a drive-by.
 - **The GUEST half of scope authorization is done; the GitHub half is not.** A
   guest's scope is checked on every call against the review the route NAMES, the
   read is served from that review's own log, and a guest on a gated route that
