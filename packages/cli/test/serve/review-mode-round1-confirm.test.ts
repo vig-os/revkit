@@ -537,10 +537,20 @@ describe("R8 — B4 pull is idempotent (no echo)", () => {
     // Exact expected values, measured against the round-2/3 code
     // (`populateStoreFromPr`): one remote comment yields two store
     // events (`comment.created` + `comment.linked`), so the first
-    // pass reports `importedNew: 2`. The second pass re-presents the
-    // same deterministic comment id, which the store refuses as
-    // `duplicate-comment-id` → counted as skipped, not refused, and
-    // not appended. Hence `importedNew: 0, importedSkipped: 1`.
+    // pass reports `importedNew: 2`.
+    //
+    // The second pass re-presents BOTH events, and only ONE of them is
+    // skipped. `comment.created` repeats the same deterministic
+    // comment id and is refused `duplicate-comment-id`, which
+    // `import-threads.ts:243` classifies as skipped. `comment.linked`
+    // repeats the same BACKEND link instead, so it is refused
+    // `duplicate-link` (`validator.ts:675`) — a kind that classifier
+    // does NOT recognise, so it lands in `refused`, not `skipped`.
+    // Hence `importedNew: 0, importedSkipped: 1` and a `refused: 1`
+    // the endpoint does not surface. That asymmetry is pre-existing
+    // and tracked in #114; it is why `importedSkipped` is 1 here and
+    // not 2, and this test pins the real numbers rather than the
+    // tidier-looking 2.
     const ctx = await startCtx({ remoteThreads: [remoteThread("PRRC_r8_1")] });
     const cookieHdr = { cookie: ctx.cookie, origin: ctx.handle.url, "sec-fetch-site": "same-origin", "content-type": "application/json" } as const;
     const r1 = await fetch(`${ctx.handle.url}/api/review/refresh`, { method: "POST", headers: cookieHdr, body: "{}" });
@@ -555,8 +565,9 @@ describe("R8 — B4 pull is idempotent (no echo)", () => {
     expect([200, 201]).toContain(r2.status);
     const b2 = (await r2.json()) as { importedNew: number; importedSkipped: number };
     // The idempotency invariant, and the point of the test name: the
-    // second pass adds nothing and reports the already-present row
-    // as skipped — no echo of already-imported rows back to GitHub.
+    // second pass appends nothing and reports one already-present
+    // event as skipped (see the note on `comment.linked` above) — no
+    // echo of already-imported rows back to GitHub.
     expect(b2.importedNew).toBe(0);
     expect(b2.importedSkipped).toBe(1);
     // No adapter writes fired: no drafts, no submits, no
