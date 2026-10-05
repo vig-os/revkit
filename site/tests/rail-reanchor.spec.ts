@@ -98,8 +98,9 @@ const REPO_ROOT = resolve(__dirname, "..", "..");
 // temp copy of the source (so tests never edit the real repo file).
 const SOURCE_REL_PATH = "docs/adr/0006-comments-anchoring-event-log.md";
 const BUILT_PAGE_PATH = "/adr/0006-comments-anchoring-event-log/";
-// The context paragraph in ADR-0006 starts with this text (line 9
-// of the source at time of writing). The rail selects a substring
+// The context paragraph in ADR-0006 starts with this text (its line
+// moves as amendments lengthen the header; `selectAndComment` scrolls
+// to it). The rail selects a substring
 // of a stamped block; the daemon computes prefix/suffix from the
 // SOURCE file. Both must line up for the anchor to survive the
 // re-anchor pipeline.
@@ -209,6 +210,12 @@ async function selectAndComment(page: Page, quote: string, body: string): Promis
       }
     }
     if (hit === undefined) throw new Error(`no stamped block contains ${JSON.stringify(needle)}`);
+    // A reviewer scrolls a block into view before selecting it; do the
+    // same. The fixture is the LIVE ADR-0006 source, so every
+    // amendment that lengthens its "Amended by" header pushes this
+    // paragraph further down — below the fold, the rail's floating
+    // button lands outside the viewport and the click never lands.
+    hit.scrollIntoView({ block: "center" });
     // Find the text node inside `hit` whose content carries the
     // substring. Prose blocks (paragraphs) often have exactly one
     // text node child; walk defensively.
