@@ -25,20 +25,16 @@
 #                     that is active on every leg of every run.
 #   --delta-budget N  growth after a warm-up. Retracted claim, corrected here:
 #                     it used to read "The one that can SEE the leak", and on CI
-#                     that is false. The `packages/cli` leg — the one this budget
-#                     was derived from — DECLINES to produce a growth figure on
-#                     CI, because that runner's module-load ramp extends past
-#                     the warm-up (measured twice: floor 3966/3971 against an
-#                     opening probe of 3497/3431, deficit 469/540). So on CI the
-#                     growth check is not applied to the leg it was built for,
-#                     and the in-process per-cycle test in
-#                     `packages/cli/test/serve/fd-budget.test.ts` is the only
-#                     active guard against a descriptor leak — and it covers
-#                     `startDaemon`/`stop` alone, not the whole process tree
-#                     this script watches. What the growth budget still buys is
-#                     a cross-process total on the legs whose window IS settled
-#                     (`packages/worker`, `site/playwright`) and a hard refusal
-#                     to report a figure it cannot defend. Tracked with #86.
+#                     that is false. It was false for a reason #89 removed: the
+#                     2s warm-up below did not transfer to the CI runner, so the
+#                     `packages/cli` leg — the one this budget was derived from
+#                     — declined to produce a growth figure at all (measured
+#                     three times across two commits: floor 3966/3971/3973
+#                     against opening probes of 3497/3431/3537, deficits
+#                     469/540/436, printed `baseline settled: no`). The warm-up
+#                     is now adaptive and the leg reports a figure again; see
+#                     "THE ADAPTIVE WARM-UP" below for the cap, the new third
+#                     state, and what it costs.
 #
 # The `packages/cli` leg breaks down as ~3433 fixed plus ~1020 of leak, and
 # the fixed part is a module-load cost rather than a leak. Three separate
@@ -63,6 +59,110 @@
 # makes a doubling visible. The warm-up is discarded rather than the first
 # sample, because the first samples race the module graph being loaded — and
 # one of them measured 3, against a settled plateau of 3433.
+#
+# THE ADAPTIVE WARM-UP (issue #89). The warm-up used to be a fixed 2s and is
+# now a decision: the window opens when the count has been flat for one settle
+# span, and not before. The minimum stays 2s, which is what every local run
+# rides, so nothing about a healthy dev box moves.
+#
+# WHY 2s WAS NOT WRONG ON THIS HOST AND WAS WRONG ON CI. It was not wrong here —
+# it was MEASURED here, and the measurement was sound. Instrumenting the poller
+# on the real `packages/cli` leg (loadavg 0.85, 660 polls over 174.6s, 1388
+# tests passing), the raw trace is:
+#
+#     t+12ms 3      t+150ms 447    t+313ms 693    t+506ms 1301
+#     t+712ms 2342  t+930ms 3382   t+1157ms 3382  t+1390ms 3389
+#     t+1617ms 3405 t+1940ms 3429  t+2284ms 3429  t+2513ms 3416
+#
+# so the whole ~3.4k module-load ramp is inside the first FIVE polls, ~0.93s of
+# wall clock, and 2s carries ~1.07s of margin. On CI the same climb takes ~4.1s,
+# which is where #89 came from, and the arithmetic for that number is below.
+#
+# HOW THE CI RAMP END WAS MEASURED WITHOUT A NEW CI RUN, because it is derivable
+# from a summary line this script already prints. `probe` is p10 of the window's
+# first DECILE, and the window's first decile is a fixed span into the run — on
+# run 37258522674 that is 140 samples at 127.7ms (1406 polls over 179.6s), i.e.
+# the probe is the count at t=2+13x0.128 = 3.66s. `floor` is the plateau once
+# the ramp has ended. For a linear ramp, `probe/floor` = (3.66-t0)/(T-t0), so
+#
+#     T = (3.66 - 0.1098 t0) / (probe/floor)
+#
+# and the three recorded CI runs give T = 4.08s, 4.12s and 4.19s — a 0.11s
+# spread across two commits, which is what makes this a measurement of the
+# runner rather than a guess. The implied ramp rate is 995-1051 fds/s against
+# this host's ~3700, so CI's module-load pace is 3.5-3.7x slower, and the count
+# at t=2s is ~1790 against a plateau of ~3970. That last number is the defect in
+# one figure: at 2s the count is barely half way up the ramp.
+#
+# THE THIRD STATE, NAMED. There are now four outcomes and three of them are not
+# a growth figure:
+#
+#   settled     the count was flat for a settle span, the window opened, and the
+#               verdict's own probe agreed the baseline was down.
+#   too short   the leg's last poll fell inside the minimum warm-up. #86's
+#               existing state, kept deliberately: it asserts a fact about the
+#               LEG ("there was no window to open"), which is still exactly what
+#               happened. The ramp-ended-in-the-cap state is not this one
+#               because it asserts something about the RAMP, and a short leg
+#               gives no evidence about the ramp at all.
+#   unsettled   the window opened and the opening probe was still below the
+#               floor. #86's existing state.
+#   ramp did    the count was STILL climbing when the warm-up reached its cap,
+#   not settle  so no window was ever opened. Distinct from both neighbours in
+#               cause, in evidence and in remedy, and it is the only one that
+#               says something about the runner.
+#
+# THE CAP, AND WHY IT IS 10s. Both bounds on it are measurements of a runner,
+# not of the code, and they conflict: the cap must be long enough to clear the
+# CI ramp (lower bound) and short enough that the warm-up cannot discard more
+# wall clock than the verdict's own floor already discards of the window (upper
+# bound). Neither is a formula, and pretending otherwise would be the same
+# mistake #86 was about.
+#
+#   LOWER, from the ramp: the measured CI ramp ends at 4.08-4.19s and the settle
+#   span is 1s, so the warm-up needs ~5.2s. 10s is 1.9x that. Beyond it, the
+#   gate reports `ramp did not settle` rather than a wrong number, which is the
+#   safe direction.
+#   UPPER, from the hole: the extended warm-up may not discard more wall clock
+#   than the p10 floor already discards of the window, and the floor discards
+#   the window's first decile — measured at 66 samples x 264ms = 17.4s locally
+#   and 140 x 128ms = 17.9s on CI. 10s extends the warm-up by 8s, which is
+#   2.2x inside that. This bound is the one worth holding tightly, because
+#   crossing it means a leak long enough to have been caught at the old warm-up
+#   can now finish inside the discarded prefix. A leak of the size the growth
+#   budget exists to catch has to run past the window's opening decile to be
+#   caught at all, i.e. past ~19.9s, and the cap fires at 10s — so the two
+#   cannot both be true of the same leak and the band is empty at this cap.
+#
+# THE WALL-TIME COST IS ZERO, which is the part that is easy to get wrong by
+# assuming otherwise. The warm-up does not delay the run: the poller and the
+# child are concurrent, so an extension is spent polling a process that is
+# already running. What an extension costs is WINDOW. By arithmetic, on CI: the
+# warm-up resolves ~5.2s into a 178s run instead of 2s, so 1.8% of the window is
+# discarded, which at the measured 4.8 fds/s leak rate is ~15 descriptors of
+# growth figure.
+#
+# MEASURED, and the local case costs nothing at all: three `just test` runs at
+# loadavg 7.9/8.2/9.0 all printed `warm-up settled at 2s (minimum 2s)` for the
+# cli leg, with growth 953/955/957 against PR #88's 960/957/961 on the same host
+# — a spread of 4 descriptors, 0.4%, which is the same spread #88 measured. The
+# window now opens on a precise 2000ms rather than on the first whole-second
+# boundary after it (`SECONDS` could not express a settle span, so the clock moved
+# to `EPOCHREALTIME`), and that is where the remaining descriptor or two comes
+# from. A warm-up that reaches its cap costs the whole window, and says so.
+#
+# The Playwright leg is the one that DOES extend: its `just build` is a real
+# descriptor ramp, and it settles at 5s rather than 2s. It still reports a figure
+# (measured 5723 against its 12000 budget, peak 5749, `baseline settled: yes`),
+# which is the point — before this change that leg's growth was measured over a
+# window that had opened during its build.
+#
+# IT IS NOT CONFIGURABLE, and that is deliberate rather than merely convenient.
+# `warmup_seconds` and the cap are literals for the same reason the verdict has
+# no way to be handed numbers instead of measuring them: a gate whose warm-up
+# can be set from the outside is a gate whose `baseline settled: yes` can be
+# bought. There is no flag and no environment variable for either, and
+# `fd-budget-script.test.ts` asserts the absence.
 #
 # THE FLOOR STATISTIC (issue #86). Growth used to be `max - min`, so ONE
 # sample defined the floor and any transient at the bottom of the window was
@@ -119,6 +219,7 @@ fi
 : "${fdv_polls:=0}" "${fdv_n:=0}" "${fdv_peak:=0}" "${fdv_window_peak:=0}"
 : "${fdv_no_samples:=1}" "${fdv_measured:=0}" "${fdv_settled:=0}"
 : "${fdv_floor:=}" "${fdv_probe:=}" "${fdv_growth:=}" "${fdv_deficit:=}"
+: "${fdw_n:=0}" "${fdw_rise:=0}" "${fdw_growth:=0}" "${fdw_tol:=0}" "${fdw_settled:=0}"
 
 budget=""
 delta_budget=""
@@ -173,11 +274,19 @@ fi
 
 samples=$(mktemp)
 raw=$(mktemp)
-trap 'rm -f "$samples" "$raw"' EXIT
+stamps=$(mktemp)
+warmstate=$(mktemp)
+trap 'rm -f "$samples" "$raw" "$stamps" "$warmstate"' EXIT
 
 "$@" &
 child=$!
-started=$SECONDS
+# Epoch milliseconds for the poll loop, from bash's own clock rather than
+# `SECONDS`. Two reasons, both #89: the settle span is a fraction of a second and
+# `SECONDS` cannot express one, and `SECONDS` also quantises the MINIMUM warm-up
+# to a second boundary — which is how the old script's window opened anywhere in
+# [2s, 3s) rather than at 2s. `EPOCHREALTIME` is bash 5.0+ and reads the clock
+# without forking, which matters because this is the hot loop.
+t0_ms=$((10#${EPOCHREALTIME%.*} * 1000 + 10#${EPOCHREALTIME#*.} / 1000))
 
 # Descriptors held by the command AND every descendant.
 #
@@ -235,39 +344,47 @@ poll_interval="0.05"
 # long and a short leg is left unmeasured — and a count is not even stable,
 # since the achieved interval above varies 165-358ms on one leg.
 #
-# MEASURED, stamped per sample on the real cli leg: the count reaches 3374 at
-# t+0.93s (3377, 3377, 3384, 3391, 3417, 3425 after that) and stays within
-# 1% of its plateau from t+1.1s onward. So the ramp is ~1s of WALL CLOCK,
-# and the earlier "flat by sample 20" was a sample index being read as a
-# duration — at 165ms that index would be 3.3s, which is how this came to be
-# flagged for review.
+# IT IS NOW A MINIMUM AND NOT A CONSTANT (issue #89). 2s is still the floor of
+# the warm-up and every local run rides it, but it is no longer the whole of it:
+# the poller keeps the window shut until `fd_budget_warmup` says the count has
+# been flat for a settle span, and gives up at `warmup_cap_seconds`. The ramp is
+# ~0.93s of wall clock on this host and ~4.1s on the CI runner, so the same 2s is
+# ample here and short there; the derivation of the span, of the tolerance and of
+# the cap is in `fd-budget-verdict.sh` and in the header above.
 #
-# Two seconds therefore clears the ~1s ramp with ~1s of margin.
+# IT IS NOT CONFIGURABLE and adding an input for it would reopen the seam #86
+# closed. There is no flag, no environment variable and no default-from-
+# environment here; both numbers are literals in this file, and
+# `fd-budget-script.test.ts` asserts that no bypass-shaped name has appeared.
 #
-# RE-MEASURED for #86, and it stays at 2. Instrumenting the poller to keep its
-# sample files, on a local `packages/cli` leg at loadavg ~3, the raw trace is
-# 3 at sample 1 and 3416-3433 by sample 11, holding 3433 flat through sample 50:
-# the whole ramp is inside the first TEN polls. Because the tree is narrow at
-# that point, the achieved interval there is the narrow-tree figure (~55ms) and
-# not the 226ms mean above, so ten polls is ~0.6-0.8s of wall clock — which
-# agrees with the ~1s measured by the per-sample stamps cited above. So 2s
-# carries ~1.2s of margin, not the ~1s previously claimed, and there is nothing
-# to gain by shortening it.
-#
-# Shortening would also be the wrong trade now. It used to be tempting because a
-# longer warm-up was the only defence against a ramp; after #86 the p10 floor and
-# the settledness test are that defence, so a longer warm-up buys nothing either.
-# But the ramp's FIRST sample is not near the plateau — it measured 3 against
-# 3433 — so a warm-up that expires before the ramp does does not merely lose
-# margin, it hands the floor a sample three orders of magnitude below the
-# baseline. A shorter warm-up trades a false negative for a blind one, and the
-# measurement says there is no false negative to trade away.
+# Shortening the minimum would also be the wrong trade. It used to be tempting
+# because a longer warm-up was the only defence against a ramp; after #86 the p10
+# floor and the settledness test are that defence, and after #89 the warm-up
+# extends by itself, so shortening buys nothing. But the ramp's FIRST sample is
+# not near the plateau — it measured 3 against 3433 — so a warm-up that expires
+# before the ramp does does not merely lose margin, it hands the floor a sample
+# three orders of magnitude below the baseline. A shorter warm-up trades a false
+# negative for a blind one, and the measurement says there is no false negative
+# to trade away.
 #
 # Every positive sample goes to `raw` (so "did we ever poll?" stays
-# answerable) and only post-warm-up ones go to `samples` (so growth is
-# measured). That distinction is what lets a leg too SHORT to measure be
-# reported honestly instead of either faking a number or failing.
+# answerable), every one also goes to `stamps` with its elapsed time (so the
+# warm-up can ask its question over a span in SECONDS, which a sample index
+# cannot express — CI's 128ms poll interval and this host's 264ms make the same
+# decile two different durations), and only post-warm-up ones go to `samples` (so
+# growth is measured). That distinction is what lets a leg too SHORT to measure
+# be reported honestly instead of either faking a number or failing.
 warmup_seconds=2
+# The settle span, in milliseconds, derived from the minimum and the percentage
+# in the verdict library — so there is one place that decides how long "settled"
+# means, and both the script and the tests read it from there.
+warmup_settle_ms=$((warmup_seconds * FDV_WARMUP_SETTLE_PCT * 1000 / 100))
+# The cap. The two bounds on it, both measurements and both stated in the header
+# above: the measured CI ramp needs ~5.2s of warm-up, and the warm-up must not
+# extend by more than the window's own first decile (17.4s local / 17.9s CI) or
+# it would discard more of the run than the p10 floor already does. 10s is 1.9x
+# the lower bound and 2.2x inside the upper one.
+warmup_cap_seconds=10
 
 # Poll the process tree's fd count. Started AFTER the child so the pid is
 # known, and torn down by the parent below — a poller that waited on the
@@ -300,12 +417,45 @@ warmup_seconds=2
 #                          that — that a trace containing >10% zeros floors at
 #                          0, and that a normal run's floor is strictly
 #                          positive.
+#
+# A THIRD condition is load-bearing under #89's warm-up, and it is the one that
+# made the old two conditions insufficient. The window used to open on a fixed
+# 2s and that was the entire decision; it now opens when the count has been flat
+# for a settle span, which means the poller has to ask that question on every
+# poll after the minimum. `fd_budget_warmup` is a pure function of the stamps
+# file, so asking is a read of a small file and no state — and the poller's own
+# `warm` variable is the ONLY thing that decides whether a sample lands in the
+# window. There is no branch around the call.
 (
+  warm=min
+  warm_now_ms=0
+  warm_open_ms=0
   while [ -d "/proc/$child" ]; do
     n=$(fds_of_tree "$child")
+    warm_now_ms=$((10#${EPOCHREALTIME%.*} * 1000 + 10#${EPOCHREALTIME#*.} / 1000 - t0_ms))
     if [ "$n" -gt 0 ]; then
       printf '%s\n' "$n" >>"$raw"
-      if [ $((SECONDS - started)) -ge "$warmup_seconds" ]; then
+      printf '%s %s\n' "$warm_now_ms" "$n" >>"$stamps"
+      if [ "$warm" = min ] && [ "$warm_now_ms" -ge $((warmup_seconds * 1000)) ]; then
+        fd_budget_warmup "$stamps" "$warmup_settle_ms"
+        if [ "$fdw_settled" -eq 1 ]; then
+          warm=settled
+          warm_open_ms=$warm_now_ms
+        elif [ "$warm_now_ms" -ge $((warmup_cap_seconds * 1000)) ]; then
+          warm=capped
+          warm_open_ms=$warm_now_ms
+        fi
+      fi
+      # Recorded on every poll, and the time it records is the RESOLVING one, not
+      # the latest: while the warm-up is unresolved it tracks the current poll (so
+      # a leg that ends mid-warm-up leaves behind how far it got), and the moment
+      # it resolves it freezes. Recording the latest poll instead reported
+      # `settled at 199s` on a 199s leg, which is a fact about the leg's length
+      # and not about the warm-up. The file is a `mktemp` handle created here, so
+      # there is no path by which anything outside this script can set it.
+      [ "$warm" = min ] && warm_open_ms=$warm_now_ms
+      printf '%s %s\n' "$warm" "$warm_open_ms" >"$warmstate"
+      if [ "$warm" = settled ]; then
         printf '%s\n' "$n" >>"$samples"
       fi
     fi
@@ -319,6 +469,18 @@ status=$?
 
 kill "$poller" 2>/dev/null || true
 wait "$poller" 2>/dev/null || true
+
+# How the warm-up ended, read back from the poller. `min` here means the leg's
+# last poll fell inside the minimum warm-up, which is #86's "too short to
+# measure" and only that: the poller resolves the warm-up on the very first poll
+# at or after the minimum, so a leg that reached the minimum and produced no
+# window has an unresolved CAP, not a short leg.
+warm=min
+warm_open_ms=0
+if [ -s "$warmstate" ]; then
+  read -r warm warm_open_ms <"$warmstate" || true
+  warm_open_ms=${warm_open_ms:-0}
+fi
 
 # The whole decision, delegated to one pure function of the two sample files.
 # The old inline version computed `growth = max - min`, where `min` was a single
@@ -354,17 +516,34 @@ else
   fdv_settled_word=no
 fi
 
+# How the warm-up ended, in words, for the summary line. Four outcomes and they
+# are four different facts: see the header's "THE THIRD STATE, NAMED". The
+# elapsed time is rendered from the poller's own millisecond stamp so the number
+# on the line is the number the decision was made on.
+warm_open_s=$((warm_open_ms / 1000))
+case "$warm" in
+  settled)
+    if [ "$warm_open_ms" -lt $((warmup_seconds * 1000)) ]; then
+      warm_word="warm-up settled at the ${warmup_seconds}s minimum"
+    else
+      warm_word="warm-up settled at ${warm_open_s}s (minimum ${warmup_seconds}s)"
+    fi
+    ;;
+  capped) warm_word="warm-up DID NOT SETTLE within the ${warmup_cap_seconds}s cap (minimum ${warmup_seconds}s)" ;;
+  *) warm_word="warm-up never completed: the leg's last poll was at ${warm_open_s}s, inside the ${warmup_seconds}s minimum" ;;
+esac
+
 # Cleanup of `$samples` and `$raw` is left to the EXIT trap. Doing it by hand
 # here would mean clearing the trap too (so the second file survives), or
 # removing one and leaving the other to a trap that a later `exit` may or may
 # not reach.
 if [ "$fdv_measured" -eq 1 ]; then
-  printf 'fd-budget: peak %s open fds (ceiling %s); post-warm-up window %s samples: floor %s (p%d), opening probe %s, deficit %s, baseline settled: %s, growth %s (budget %s); %s polls, %ss warm-up, target %ss interval\n' \
+  printf 'fd-budget: peak %s open fds (ceiling %s); post-warm-up window %s samples: floor %s (p%d), opening probe %s, deficit %s, baseline settled: %s, growth %s (budget %s); %s polls, %s, target %ss interval\n' \
     "$fdv_peak" "$budget" "$fdv_n" "$fdv_floor" "$FDV_FLOOR_PCTL" "$fdv_probe" "$fdv_deficit" \
-    "$fdv_settled_word" "$fdv_growth_reported" "${delta_budget:-none}" "$fdv_polls" "$warmup_seconds" "$poll_interval"
+    "$fdv_settled_word" "$fdv_growth_reported" "${delta_budget:-none}" "$fdv_polls" "$warm_word" "$poll_interval"
 else
-  printf 'fd-budget: peak %s open fds (ceiling %s); post-warm-up window %s samples: growth NOT MEASURED; %s polls, %ss warm-up, target %ss interval\n' \
-    "$fdv_peak" "$budget" "$fdv_n" "$fdv_polls" "$warmup_seconds" "$poll_interval"
+  printf 'fd-budget: peak %s open fds (ceiling %s); post-warm-up window %s samples: growth NOT MEASURED; %s polls, %s, target %ss interval\n' \
+    "$fdv_peak" "$budget" "$fdv_n" "$fdv_polls" "$warm_word" "$poll_interval"
 fi
 
 if [ "$status" -ne 0 ]; then
@@ -372,7 +551,30 @@ if [ "$status" -ne 0 ]; then
 fi
 
 if [ "$fdv_measured" -eq 0 ] || [ "$fdv_settled" -eq 0 ]; then
-  if [ "$fdv_measured" -eq 0 ]; then
+  if [ "$warm" = capped ]; then
+    printf '\nfd-budget: growth NOT MEASURED, so the growth budget was NOT applied to this run.\n' >&2
+    printf 'fd-budget:   The descriptor count was STILL CLIMBING when the warm-up reached its %ss cap, so no\n' \
+      "$warmup_cap_seconds" >&2
+    printf 'fd-budget:   measurement window was ever opened. This is a THIRD state and it is not either of\n' >&2
+    printf 'fd-budget:   the other two, which matters because all three decline a growth figure for\n' >&2
+    printf 'fd-budget:   different reasons and none of them is a pass on the leak:\n' >&2
+    printf 'fd-budget:     too short  the leg finished inside the %ss minimum warm-up; there was no window.\n' \
+      "$warmup_seconds" >&2
+    printf 'fd-budget:     unsettled  a window WAS opened and its opening probe was still below the floor.\n' >&2
+    printf 'fd-budget:     this       the ramp did not END within the cap. Nothing opened, so there is no\n' >&2
+    printf 'fd-budget:                 window, no floor and no probe to report — only the count.\n' >&2
+    printf 'fd-budget:   The count reached %s by t+%ss and was still rising then; across its last %sms it\n' \
+      "$fdv_peak" "$warm_open_s" "$warmup_settle_ms" >&2
+    printf 'fd-budget:   rose by more than the tolerance. That tolerance is the same one the verdict\n' >&2
+    printf 'fd-budget:   applies to a window it opens — fd_budget_warmup in scripts/fd-budget-verdict.sh\n' >&2
+    printf 'fd-budget:   carries the derivation, and the two are one number by construction.\n' >&2
+    printf 'fd-budget:   The measured module-load ramp ends ~0.93s into a run on a dev host and ~4.1s on\n' >&2
+    printf 'fd-budget:   the CI runner, so reaching a %ss cap means the module-load pace on this\n' \
+      "$warmup_cap_seconds" >&2
+    printf 'fd-budget:   pace is worse than about 2.4x the slowest pace measured anywhere. That is a\n' >&2
+    printf 'fd-budget:   property of the runner and not of the code: no fixed cap can clear a ramp whose\n' >&2
+    printf 'fd-budget:   length is not yet known, which is the whole reason the warm-up is adaptive.\n' >&2
+  elif [ "$fdv_measured" -eq 0 ]; then
     printf '\nfd-budget: growth NOT MEASURED, so the growth budget was NOT applied to this run.\n' >&2
     printf 'fd-budget:   Only %s post-warm-up sample(s) were taken — the leg finished inside the %ss\n' \
       "$fdv_n" "$warmup_seconds" >&2
@@ -387,7 +589,10 @@ if [ "$fdv_measured" -eq 0 ] || [ "$fdv_settled" -eq 0 ]; then
     printf 'fd-budget:   have produced is %s, so a deficit LARGER than that is expected here rather than\n' \
       "$fdv_growth" >&2
     printf 'fd-budget:   a symptom: the ramp simply climbed past the opening sample.\n' >&2
-    printf 'fd-budget:   Within one window, "the baseline had not finished settling" and "a leak is\n' >&2
+    printf 'fd-budget:   The window opened because the count HAD been flat for the %sms settle span, so\n' \
+      "$warmup_settle_ms" >&2
+    printf 'fd-budget:   this is the ramp RESTARTING after the warm-up resolved, not a warm-up that was too\n' >&2
+    printf 'fd-budget:   short. Within one window, "the baseline had not finished settling" and "a leak is\n' >&2
     printf 'fd-budget:   accumulating" are the same shape, and this gate counts descriptors rather than\n' >&2
     printf 'fd-budget:   daemon cycles, so it declines to report a growth figure it cannot defend.\n' >&2
   fi
@@ -415,14 +620,16 @@ if [ "$fdv_peak_exceeded" -ne 0 ] || [ "$fdv_growth_exceeded" -ne 0 ]; then
     fi
     printf '\n'
     [ "$fdv_peak_exceeded" -ne 0 ] &&
-      printf '  absolute:  peak %s against a ceiling of %s, over %s polls (warm-up %ss)\n' \
-        "$fdv_peak" "$budget" "$fdv_polls" "$warmup_seconds"
+      printf '  absolute:  peak %s against a ceiling of %s, over %s polls (%s)\n' \
+        "$fdv_peak" "$budget" "$fdv_polls" "$warm_word"
     [ "$fdv_growth_exceeded" -ne 0 ] &&
       printf '  growth:    %s over %s post-warm-up samples — floor %s (p%d), opening probe %s,\n' \
         "$fdv_growth" "$fdv_n" "$fdv_floor" "$FDV_FLOOR_PCTL" "$fdv_probe"
     [ "$fdv_growth_exceeded" -ne 0 ] &&
       printf '             deficit %s, baseline settled: %s, against a budget of %s\n' \
         "$fdv_deficit" "$fdv_settled_word" "$delta_budget"
+    [ "$fdv_growth_exceeded" -ne 0 ] &&
+      printf '             %s\n' "$warm_word"
     cat <<'EOF'
 
 CAUSE NOT ESTABLISHED. This gate counts descriptors. It did not count daemon

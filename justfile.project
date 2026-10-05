@@ -459,23 +459,45 @@ test_fd_budget_playwright := "16384"
 # module-load cost is excluded. It exists because of an arithmetic problem with
 # the absolute ceiling: the ceiling is blind to the first doubling of the leak.
 #
-# SCOPE CORRECTION, #86. This budget used to be described as "the budget that
-# can actually see the leak". That is no longer true and the claim is retracted
-# rather than softened. On CI the `packages/cli` leg DECLINES to produce a growth
-# figure at all — that runner's module-load ramp extends past the warm-up, and
-# the settledness test refuses the number (measured twice: floor 3966/3971
-# against an opening probe of 3497/3431, deficit 469/540, printed as
-# `baseline settled: no ... growth unmeasured`). So the leg this budget was
-# derived from is the leg it does not judge, and on CI the only active guard
-# against a descriptor leak is the in-process per-cycle test in
-# `packages/cli/test/serve/fd-budget.test.ts` — which measures `startDaemon` +
-# `handle.stop()` and nothing else.
+# SCOPE CORRECTION, #86, and then #89 UNDID IT. This budget used to be described
+# as "the budget that can actually see the leak". That stopped being true when
+# the `packages/cli` leg DECLINED to produce a growth figure on CI at all: that
+# runner's module-load ramp ran past the fixed 2s warm-up, and the settledness
+# test refused the number (measured three times over two commits: floor
+# 3966/3971/3973 against opening probes of 3497/3431/3537, deficits 469/540/436,
+# printed `baseline settled: no ... growth unmeasured`). The leg this budget was
+# derived from was the leg it did not judge.
 #
-# What this budget still does, on the legs whose window IS settled
-# (`packages/worker`, `site/playwright`): it bounds growth across the whole
-# process tree, which the per-cycle test does not. What it no longer does:
-# reliably bound growth on `packages/cli` anywhere. Both the coverage gap and
-# the fix that would restore it are tracked with #86.
+# #89 makes the warm-up adaptive, so that leg reports a figure again. The three
+# numbers above are the EVIDENCE, not the budget's provenance: the recovered CI
+# ramp ends at 4.08-4.19s of wall clock against this host's 0.93s, so a fixed
+# warm-up cannot be correct for both, and the script now waits for the count to
+# settle (one 1s span) up to a 10s cap before opening the window. Nothing about
+# this budget changed and nothing about the leak's magnitude changed.
+#
+# WHAT TO DO WITH A DECLINED LEG, restated because it is now the more likely
+# outcome on an unfamiliar runner. `scripts/fd-budget.sh` prints one of four
+# things and only the first carries a growth figure:
+#
+#   `baseline settled: yes`   a ramp-free figure; compare it against 1800.
+#   `unmeasured`, too short   the leg finished inside the 2s minimum warm-up.
+#   `unmeasured`, unsettled   a window opened and its probe was still below the
+#                             floor — a ramp that out-ran the warm-up's span.
+#   `DID NOT SETTLE`          the ramp had not ended within the 10s cap.
+#
+# None of the last three is a licence to raise this budget, and none is a pass on
+# the leak; the absolute ceiling judged all of them. A leg that declines
+# REPEATEDLY on CI is a signal about the runner's module-load pace, not about the
+# number here — the fix is the warm-up's cap or span in `scripts/fd-budget.sh`,
+# both of which are derived and bounded in that file's header.
+#
+# What this budget does on every leg: it bounds growth across the whole process
+# tree, which the in-process per-cycle test does not. The per-cycle test remains
+# the only guard against growth outside the measurement window — a leak that
+# completes inside the window's opening decile is charged nothing, and a leak
+# faster than ~222 descriptors per second inside the extended warm-up keeps the
+# window shut instead. Both are quantified in `scripts/fd-budget-verdict.sh`, and
+# #90 tracks the band they leave.
 #
 # THE FIXED COST, and which measurement each number is. Three distinct
 # quantities were previously conflated into one figure, so to be explicit:
@@ -559,8 +581,12 @@ test_fd_budget_playwright := "16384"
 # `growth NOT MEASURED`, means the leg declined to produce a figure at all —
 # that is NOT a growth regression and NOT a licence to raise the budget; it
 # means the run was blind, and the absolute ceiling is what judged it. A leg
-# that reports `unmeasured` repeatedly on CI, rather than occasionally, is the
-# signal worth acting on, and the fix is the warm-up window, not this number.
+# that declines repeatedly on CI, rather than occasionally, is the signal worth
+# acting on, and the fix is the warm-up's span or cap in `scripts/fd-budget.sh`,
+# not this number. #89 added a fourth outcome to that line — `DID NOT SETTLE`,
+# which means the module-load ramp had not ended within the 10s cap — and the
+# re-derivation this note asks for still comes back here: 1800 was fixed against
+# ramp-free local growth of 957-1015, and nothing #89 changed can move that.
 #
 # The ~20% CI/local growth gap is NOT the warm-up window. The hypothesis was
 # that CI samples more slowly, so its baseline sits lower and its growth
@@ -571,12 +597,15 @@ test_fd_budget_playwright := "16384"
 # the budget holds either way, with 40% headroom on the larger number.
 #
 # LEGS THAT REPORT `NOT MEASURED`, and why that is expected. Three of the six
-# legs finish inside the 2s warm-up — `packages/review-core` (520ms),
+# legs finish inside the 2s MINIMUM warm-up — `packages/review-core` (520ms),
 # `site/schemas` (117ms) and `just/check` (~2s) — so they have no post-warm-up
 # window and contribute nothing to the growth gate. That was equally true before
 # #86 (the old `observed <= 1` branch produced the same state) and is unchanged
-# by it; the absolute ceiling still judged all three. `packages/cli` is the leg
-# this budget is actually about, and it is the one whose growth the leak moves.
+# by #89: the minimum is still 2s, and a leg that ends inside it still reports
+# `too short` rather than #89's new cap state, because "the leg finished" and
+# "the ramp did not end" are different facts. The absolute ceiling still judged
+# all three. `packages/cli` is the leg this budget is actually about, and it is
+# the one whose growth the leak moves.
 #
 # The Playwright leg is a different shape and gets its own number. It starts
 # small (a `just build`) and grows into its workers, so on this host its
