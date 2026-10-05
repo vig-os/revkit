@@ -148,6 +148,84 @@ async function threadStatus(store: SqliteThreadStore, threadId: string): Promise
   return all.find((t) => t.id === threadId)?.status;
 }
 
+/** Issue #69's invariant, in ONE place: every tracked directory is
+ * served by exactly one of `fs.watch` and the `stat`-poll — never
+ * neither. `dirWatchMode(dir) === undefined` is the failure it pins,
+ * and `watchedDirs()` agreeing with `dirs.length` closes the other way
+ * to reach it (the directory's entry being dropped from the map, which
+ * would make every per-directory mode read `undefined` too).
+ *
+ * `dirWatchMode` cannot report both at once — it answers `watch` when a
+ * registration is live — so "exactly one" reduces to "not neither",
+ * which is the half that was broken. Called at the end of every
+ * scenario in this file. */
+function expectWatchXorPoll(rd: ReanchorDaemonHandle, dirs: string[]): void {
+  expect(rd.watchedDirs()).toBe(dirs.length);
+  for (const dir of dirs) {
+    expect(
+      rd.dirWatchMode(dir),
+      `${dir} is watched by neither fs.watch nor polling`,
+    ).toBeDefined();
+  }
+}
+
+/** Every `dirWatchMode(dir)` value seen across a `ms` window, sampled
+ * on a tight cadence. Pins "never neither" over a WINDOW rather than at
+ * one lucky instant — the gap #69 describes was a state the directory
+ * sat in until something else happened to rescue it. */
+async function sampleDirWatchMode(
+  rd: ReanchorDaemonHandle,
+  dir: string,
+  ms: number,
+): Promise<Array<"watch" | "poll" | undefined>> {
+  const seen = new Set<"watch" | "poll" | undefined>();
+  const deadline = Date.now() + ms;
+  do {
+    seen.add(rd.dirWatchMode(dir));
+    await new Promise((r) => setTimeout(r, 5));
+  } while (Date.now() < deadline);
+  return [...seen];
+}
+
+/** A `watchFn` that delegates to the real `fs.watch` and records every
+ * listener the daemon installs, so a test can deliver the
+ * DIRECTORY-level event a removed directory produces.
+ *
+ * Whether and when the kernel delivers that event is
+ * runtime-defined — the `platform fact` probe below is the measurement
+ * of exactly that — and it is NOT what the #69 scenarios are about:
+ * what they test is the daemon's reaction to the callback, so they
+ * drive the callback directly and stay deterministic on every runtime
+ * and platform. The real watcher is still installed underneath, so the
+ * daemon holds a genuine `fs.watch` registration (and a real
+ * descriptor) for the whole scenario. */
+function capturingWatch(): {
+  watchFn: ReanchorDaemonOptions["watchFn"];
+  /** Deliver a directory-level event to every listener installed so
+   * far. A listener belonging to a watcher the daemon has already
+   * replaced ignores it (`dw.watcher !== capturedWatcher`), which is
+   * the point of that guard. */
+  fire: (eventType: string, filename: string | null) => void;
+  installs: () => number;
+} {
+  const listeners: Array<(eventType: string, filename: string | null) => void> = [];
+  const watchFn = ((
+    target: string,
+    options: { persistent: boolean },
+    listener: (eventType: string, filename: string | null) => void,
+  ) => {
+    listeners.push(listener);
+    return watch(target, options, listener);
+  }) as unknown as ReanchorDaemonOptions["watchFn"];
+  return {
+    watchFn,
+    fire: (eventType, filename) => {
+      for (const listener of [...listeners]) listener(eventType, filename);
+    },
+    installs: () => listeners.length,
+  };
+}
+
 afterEach(async () => {
   while (envs.length > 0) {
     const env = envs.pop()!;
@@ -208,6 +286,7 @@ describe("issue #49 nit 1 — re-arm fs.watch once the directory is stable", () 
     // A live fs.watch signals in single-digit ms; the 2 s poll's worst
     // case approaches the interval.
     expect(worst).toBeLessThan(300);
+    expectWatchXorPoll(env.rd, [env.dir]);
   }, 60_000);
 
   test("a rebind polls FIRST, then returns to fs.watch once the dir is stable", async () => {
@@ -232,6 +311,7 @@ describe("issue #49 nit 1 — re-arm fs.watch once the directory is stable", () 
     const rearmed = await waitFor(() => env.rd.dirWatchMode(env.dir) === "watch");
     expect(rearmed).toBe(true);
     expect(env.rd.dirWatchMode(env.dir)).toBe("watch");
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("the re-arm does NOT trigger a rebuild / re-anchor storm", async () => {
@@ -258,6 +338,7 @@ describe("issue #49 nit 1 — re-arm fs.watch once the directory is stable", () 
     await new Promise((r) => setTimeout(r, 400));
     expect(env.rd.fileReadCount()).toBe(readsBefore);
     expect(env.rd.pipelineRunCount()).toBe(runsBefore);
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("if the re-arm cannot establish a watch, polling STAYS as the fallback", async () => {
@@ -301,6 +382,7 @@ describe("issue #49 nit 1 — re-arm fs.watch once the directory is stable", () 
       return t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === rev;
     });
     expect(settled).toBe(true);
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("DIRECTORY-FORCE-POLL FACT: a rename-swapped directory does NOT pretend to have a watcher", async () => {
@@ -336,6 +418,7 @@ describe("issue #49 nit 1 — re-arm fs.watch once the directory is stable", () 
     });
     expect(settled).toBe(true);
     expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("`poll: true` never re-arms — the caller asked for polling", async () => {
@@ -353,6 +436,7 @@ describe("issue #49 nit 1 — re-arm fs.watch once the directory is stable", () 
     writeFileSync(join(env.dir, "a.md"), mk(0));
     await new Promise((r) => setTimeout(r, 300));
     expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 });
 
@@ -458,6 +542,7 @@ describe("issue #49 nit 2 — prune the orphan memo on thread.reanchored", () =>
     await env.rd.refresh("docs/a.md");
     expect(await threadStatus(env.store, T)).toBe("open");
     expect(env.rd.orphanMemoSize()).toBe(0);
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("a still-orphaned thread KEEPS its memo entry", async () => {
@@ -479,6 +564,7 @@ describe("issue #49 nit 2 — prune the orphan memo on thread.reanchored", () =>
     await env.rd.refresh("docs/a.md");
     expect(await threadStatus(env.store, T)).toBe("orphaned");
     expect(env.rd.orphanMemoSize()).toBe(1);
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("two threads: re-anchoring ONE leaves the other's memo intact", async () => {
@@ -507,6 +593,7 @@ describe("issue #49 nit 2 — prune the orphan memo on thread.reanchored", () =>
     expect(await threadStatus(env.store, A)).toBe("open");
     expect(await threadStatus(env.store, B)).toBe("orphaned");
     expect(env.rd.orphanMemoSize()).toBe(1);
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
 
   test("two threads on the SAME file: the re-anchored one is pruned, its orphaned bucket-sibling is not", async () => {
@@ -565,10 +652,121 @@ describe("issue #49 nit 2 — prune the orphan memo on thread.reanchored", () =>
     writeFileSync(f, sib({ alpha: true, beta: false, filler: 4 }));
     await env.rd.refresh("docs/same.md");
 
-    expect(await threadStatus(env.store, MOVER)).toBe("open");
+expect(await threadStatus(env.store, MOVER)).toBe("open");
     expect(await threadStatus(env.store, ORPHAN)).toBe("orphaned");
     // The mover's entry is gone; the orphan's survives its sibling's
     // re-anchor even though it was visited FIRST in the same pass.
     expect(env.rd.orphanMemoSize()).toBe(1);
+    expectWatchXorPoll(env.rd, [env.dir]);
   });
+});
+
+// Issue #69: the one teardown path that installed NO fallback.
+//
+// The fs.watch callback can observe its own directory disappearing
+// (`!existsSync(dir)` under a directory-level event). It closes the
+// watcher and clears `dw.watcher` — and used to return right there,
+// leaving the directory watched by NEITHER an fs.watch registration
+// NOR the `stat`-poll until the rebind probe happened to rescue it.
+// Every other teardown in the module installs polling; this one did
+// not, so a directory that vanished inside its own callback was the
+// single shape that could go blind.
+//
+// The invariant pinned here: **every tracked directory is always in
+// exactly one of watch or poll, never neither** (`expectWatchXorPoll`).
+describe("issue #69 — a directory that vanishes inside the watcher callback falls back to polling", () => {
+  test("it is POLLED the moment the callback returns, and an edit after the dir returns is picked up", async () => {
+    // The rebind probe interval is deliberately set past this test's
+    // lifetime: `stepDirRebind`'s `needsRebind` branch is the ONLY
+    // other thing that could install polling for this directory, so
+    // with the probe out of reach, the mode read below is the vanish
+    // path's own doing — or nothing at all, which is the bug.
+    const cap = capturingWatch();
+    const env = await setup({
+      watchFn: cap.watchFn,
+      fileDebounceMs: 20,
+      pollIntervalMs: 40,
+      dirRebindIntervalMs: 10_000,
+    });
+    const f = join(env.dir, "a.md");
+    const T = "b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b";
+    writeFileSync(f, mk(0));
+    await seedThread(env.store, mk(0), "docs/a.md", T);
+    await env.rd.reconcileWatchers();
+    expect(await waitFor(() => env.rd.dirWatchMode(env.dir) === "watch")).toBe(true);
+
+    // The directory goes away under a live watcher, and the watcher's
+    // own callback is what notices.
+    rmSync(env.dir, { recursive: true, force: true });
+    cap.fire("rename", null);
+    expect(cap.installs()).toBe(1);
+
+    // Read synchronously, before any timer can run: the fallback is
+    // the callback's own work, not the probe's.
+    expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
+    expectWatchXorPoll(env.rd, [env.dir]);
+
+    // The directory comes back carrying an edit. The poll serves it.
+    mkdirSync(env.dir);
+    const rev = await revisionOf(mk(3));
+    writeFileSync(f, mk(3));
+    const settled = await waitFor(async () => {
+      const all = await env.store.threads();
+      const t = all.find((x) => x.id === T);
+      return t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === rev;
+    });
+    expect(settled).toBe(true);
+    expectWatchXorPoll(env.rd, [env.dir]);
+  }, 10_000);
+
+  test("under the everWatched gate: vanished and back stays POLLED — never neither at any point", async () => {
+    // The #68 interaction #69 predicted. This directory's canonical
+    // path HAS carried a registration, so `everWatched` is true and the
+    // rebind probe's re-arm is refused: polling is the terminal
+    // mechanism here, and the safe direction — 2 s slower, never
+    // blind. The probe interval is short on purpose so the gate is
+    // actually exercised inside the test.
+    const cap = capturingWatch();
+    const env = await setup({
+      watchFn: cap.watchFn,
+      fileDebounceMs: 20,
+      pollIntervalMs: 40,
+      dirRebindIntervalMs: 40,
+      dirStableIntervals: 2,
+    });
+    const f = join(env.dir, "a.md");
+    const T = "b2b2b2b2-b2b2-4b2b-8b2b-b2b2b2b2b2b";
+    writeFileSync(f, mk(0));
+    await seedThread(env.store, mk(0), "docs/a.md", T);
+    await env.rd.reconcileWatchers();
+    expect(await waitFor(() => env.rd.dirWatchMode(env.dir) === "watch")).toBe(true);
+
+    rmSync(env.dir, { recursive: true, force: true });
+    cap.fire("rename", null);
+    // Polled before the probe (40 ms) has had a chance to run even once.
+    expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
+    expectWatchXorPoll(env.rd, [env.dir]);
+
+    // The directory returns, with an edit in it, and stays returned for
+    // several probe ticks and stability windows. Every sample across
+    // that window must be watch or poll — `undefined` at any instant is
+    // the regression, whatever the probe happens to be doing.
+    mkdirSync(env.dir);
+    const rev = await revisionOf(mk(2));
+    writeFileSync(f, mk(2));
+    const samples = await sampleDirWatchMode(env.rd, env.dir, 400);
+    expect(samples).not.toContain(undefined);
+    expectWatchXorPoll(env.rd, [env.dir]);
+
+    // The poll never stopped working, and the gate kept it (no re-arm:
+    // the swap-damaged-path case is terminal by design).
+    const settled = await waitFor(async () => {
+      const all = await env.store.threads();
+      const t = all.find((x) => x.id === T);
+      return t !== undefined && isLineAnchor(t.anchor) && t.anchor.revision === rev;
+    });
+    expect(settled).toBe(true);
+    expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
+    expectWatchXorPoll(env.rd, [env.dir]);
+  }, 10_000);
 });

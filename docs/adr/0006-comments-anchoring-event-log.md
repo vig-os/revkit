@@ -377,3 +377,11 @@ sweeps — twice, with the prime — so such a mount keeps three of its four swe
 projection removes the prune fetch's sweep, not that one.
 
 Refs: #67
+
+## Amendment (2026-10-05, issue #69): a directory that vanishes inside the watcher callback is polled, never unwatched
+
+The #49 amendment above enumerates the fallback set — re-armed onto `fs.watch` for a never-watched
+path, `stat`-poll for the swap-damaged ones — and this adds the one shape that belonged to neither: a
+directory whose own `fs.watch` callback observes it disappear now installs the same `stat`-poll every
+other teardown path installs, so **every tracked directory is always in exactly one of watch or poll,
+never neither**. Refs: #69
