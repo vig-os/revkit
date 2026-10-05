@@ -7,7 +7,9 @@
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
   export|import` CLI command; and the 2026-10-05 (issue #73) amendment — an
-  `import` lands only in an empty store, judged against the log the store holds.
+  `import` lands only in an empty store, judged against the log the store holds;
+  and the 2026-10-05 (issue #70) amendment below — `draft.promoted`, the one
+  reviewer act that lets an agent-authored draft reach the pending review.
 
 ## Context
 
@@ -290,3 +292,75 @@ refusal to test). `import` is also a read-then-write, so its commit is guarded
 against a writer that moves the head in between: one guard row inside the same
 `batch()`, gating every archive row, so a stale head writes nothing rather than
 something. Refs: #73, #107, #108
+
+## Amendment (2026-10-05, issue #70): `draft.promoted` — a reviewer attaches an agent's draft
+
+**The gap.** An agent reply, resolve or reopen against a thread in an in-flight
+local PR review reached the reviewer and nothing else: the local log got the
+agent's `comment.replied` / `thread.resolved`, and PR #59's mirror paths refuse
+any non-`local` actor, so the reviewer's `gh` identity never carried it. B6's
+"the agent replies" was true only in the weakest possible reading.
+
+**The decision (option B, owner-decided 2026-10-05).** An agent-authored reply or
+resolve/reopen stays a **local draft**, badged as agent-authored. One explicit
+reviewer action — **promote** — attaches it to the reviewer's own pending review,
+and that action is recorded in this log as a new event kind:
+
+```
+{ kind: "draft.promoted", actor: <local>, threadId, target: "comment"|"resolve"|"reopen", commentId? }
+```
+
+`commentId` is required iff `target === "comment"` (a resolve/reopen promotion
+names the thread). The existing machine intents are unchanged: a promoted comment
+becomes an ordinary `comment.sync_requested` under the reviewer — the same event
+the reviewer's own comment produces — and a promoted resolve/reopen is the
+already-logged `thread.resolved`/`thread.reopened`, which the reconciler now
+treats as an intent once a later `draft.promoted` authorizes it. Promotion adds
+the *authorization*, not a second kind of intent, so every property the existing
+reconciler already has (read-first, fingerprint matching, `comment.linked`
+completion, submit gating, crash healing) applies to a promoted draft unchanged.
+
+**Why an event and not a field on the intent.** For a comment, a `promotedBy`
+field on `comment.sync_requested` would have carried the same information. For a
+**resolve** it cannot: the agent's `thread.resolved` is already in the log and
+the validator refuses a second resolve on a resolved thread, so there is no new
+event to hang a field on — and without the separate event, half of B6 would have
+no record that a human authorized the write at all. One kind, one meaning: *a
+reviewer attached this agent-authored draft to their own pending review.*
+
+**The trust argument, enforced in the log.** Three rules, all in
+`validateNext`, so they hold for every store backing and every writer rather than
+only for the route that checks them first:
+
+1. **Only the reviewer may record a promotion.** `draft.promoted` with any
+   non-`local` actor is rejected (`invalid-actor`) — the agent bearer can author
+   a draft, and can never record, by any path, that it was promoted.
+2. **Only an agent draft may be promoted.** Promoting a comment an agent did not
+   author is rejected (`not-an-agent-draft`) — a reviewer's own comment is
+   mirrored without a promotion, so the log can never claim one was promoted.
+3. **The named ids must be real.** `unknown-thread` / `unknown-comment`, and the
+   comment must belong to the thread named (mirroring `comment.replied`'s
+   parent check).
+
+The route adds a fourth rule the log cannot see, because it is about the world
+outside the log: **promotion requires an OPEN pending review.** After
+`review.submitted` or `review.abandoned` there is nothing to promote into, and
+the route refuses (`no-open-pending-review`) rather than opening a fresh review
+behind the reviewer's back — a discarded review stays discarded until the
+reviewer opens a new one deliberately.
+
+**Idempotency is a property of the log, not of the route.** A promotion already
+in the log is not appended twice; the route recognises it, re-runs the
+read-first reconcile to finish the interrupted one, and answers `200` with
+`promoted: false` instead of `201`. So a double promote, a promote retried after
+a crash between the event and its reconcile, and a restart all converge on one
+GitHub write. Boot stays read-only: an unpromoted draft produces no intent, so
+nothing about it can be written on restart.
+
+**Derived, not held.** `reduceReviewState(...).agentDrafts` lists the
+unpromoted drafts from the log — the same derivation the rail badges and the
+route acts on, so there is no second source of truth and nothing to reconcile
+across a restart. A second agent draft on a thread after a promotion is a new
+entry (keyed by the draft's own identity), and an agent resolve that was never
+promoted stops being a draft once the thread is reopened — there is no longer
+anything to resolve on GitHub. Refs: #70, #59, #8

@@ -170,3 +170,34 @@ export const discardReviewRequestSchema = z
   })
   .strict();
 export type DiscardReviewRequest = z.infer<typeof discardReviewRequestSchema>;
+
+/** POST /api/review/promote (issue #70). Cookie-authenticated only —
+ * promotion is the reviewer's explicit act, so the agent bearer is
+ * refused exactly like `submit` / `discard`. `target` names which kind
+ * of agent-authored draft to attach to the reviewer's pending review;
+ * `commentId` is required iff `target === "comment"` (mirrors the
+ * `draft.promoted` wire shape, so one request validates once). */
+export const promoteAgentDraftRequestSchema = z
+  .object({
+    threadId: idSchema,
+    target: z.enum(["comment", "resolve", "reopen"]),
+    commentId: idSchema.optional(),
+  })
+  .strict()
+  .superRefine((value, ctx) => {
+    if (value.target === "comment" && value.commentId === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["commentId"],
+        message: "promote: target='comment' requires the commentId of the draft being promoted.",
+      });
+    }
+    if (value.target !== "comment" && value.commentId !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["commentId"],
+        message: `promote: target='${value.target}' must not carry a commentId.`,
+      });
+    }
+  });
+export type PromoteAgentDraftRequest = z.infer<typeof promoteAgentDraftRequestSchema>;

@@ -140,6 +140,7 @@ export {
 export {
   isPendingReviewStale,
   reduceReviewState,
+  type AgentDraft,
   type CommentSyncState,
   type OpenPendingReview,
   type PendingReviewComment as DerivedPendingReviewComment,

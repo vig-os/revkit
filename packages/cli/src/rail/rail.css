@@ -803,6 +803,73 @@
   opacity: 0.5;
   cursor: wait;
 }
+/* Issue #70 — agent drafts awaiting the reviewer's promotion. The
+ * badge is the "this is not on GitHub yet" signal and rides on both
+ * the draft row and the comment itself; the button is the reviewer's
+ * act, so it is a real <button> with the same affordance language as
+ * the re-anchor / discard actions above. */
+.revkit-rail__agent-draft-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.4rem;
+  margin-left: 0.35rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 999px;
+  color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 10%, transparent);
+  font-size: 0.65rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.revkit-rail__agent-drafts {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 6%, transparent);
+}
+.revkit-rail__agent-drafts-summary {
+  margin: 0 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__agent-drafts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+.revkit-rail__agent-draft {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+}
+.revkit-rail__agent-draft .revkit-rail__agent-draft-badge {
+  margin-left: 0;
+}
+.revkit-rail__agent-draft-where {
+  color: var(--revkit-rail-muted);
+}
+.revkit-rail__agent-draft-promote {
+  margin-left: auto;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.revkit-rail__agent-draft-promote:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--revkit-rail-accent) 15%, transparent);
+}
+.revkit-rail__agent-draft-promote:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
 .revkit-rail__review-submit {
   display: flex;
   flex-direction: column;

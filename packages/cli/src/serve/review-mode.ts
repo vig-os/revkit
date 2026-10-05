@@ -40,6 +40,7 @@ import {
   type ReviewState,
   type ReviewSubmitEvent,
   type SyncFingerprint,
+  type Thread,
   type ThreadStore,
   type ViewerReviewSummary,
   ThreadStoreAppendError,
@@ -1032,4 +1033,176 @@ export async function reanchorPendingReviewAtNewHead(input: {
  * pending review is not stale. */
 export function unsyncedCount(state: ReviewState): number {
   return state.unsyncedCommentIds.length;
+}
+
+/** What `findDraftToPromote` resolved a promotion request to. */
+export type DraftToPromote =
+  | {
+      /** An agent-authored COMMENT (top-level or reply) to promote. */
+      readonly kind: "comment";
+      readonly thread: Thread;
+      readonly comment: Thread["comments"][number];
+      /** True when the draft is a REPLY — the reconciler posts it
+       * through `addReviewThreadThreadReply` against
+       * `thread.external.threadId` rather than opening a new draft. */
+      readonly reply: boolean;
+      /** True when a `draft.promoted` for this exact draft is already
+       * in the log, i.e. a promotion that crashed before (or during)
+       * its reconcile. The caller re-runs the reconcile instead of
+       * appending a second promotion. */
+      readonly alreadyPromoted: boolean;
+    }
+  | {
+      /** An agent-authored resolve/reopen to promote. */
+      readonly kind: "lifecycle";
+      readonly thread: Thread;
+      readonly desiredResolved: boolean;
+      readonly alreadyPromoted: boolean;
+    };
+
+/** Resolve a `POST /api/review/promote` body to the draft it names
+ * (issue #70), or say precisely why there is nothing to promote.
+ *
+ * The rules, each with its own refusal reason so the route answers
+ * with a machine-readable `error`:
+ *   - `unknown-thread` / `unknown-comment` — the named ids are not in
+ *     the log.
+ *   - `not-an-agent-draft` — the comment or the lifecycle change was
+ *     the REVIEWER's own act. A reviewer's own comment mirrors itself
+ *     (or has already mirrored); promoting it would be a no-op at best
+ *     and a misattribution at worst.
+ *   - `no-github-thread` — a reply draft has no remote thread to
+ *     reply to, so there is nothing to promote it into.
+ *   - `stale-lifecycle-draft` — the thread's current state no longer
+ *     matches the named target (e.g. promoting `resolve` on a thread
+ *     that is open), so the promotion would not describe what it
+ *     promotes.
+ *
+ * `target` on the request is what makes the last check meaningful: a
+ * `resolve` promotion names a RESOLVED thread and a `reopen`
+ * promotion an OPEN one. */
+export async function findDraftToPromote(input: {
+  readonly store: ThreadStore;
+  readonly threadId: string;
+  readonly target: "comment" | "resolve" | "reopen";
+  readonly commentId?: string;
+}): Promise<{ readonly ok: true; readonly draft: DraftToPromote } | { readonly ok: false; readonly error: string; readonly detail: string }> {
+  const events = await input.store.since(0);
+  const thread = await input.store.thread(input.threadId);
+  if (thread === undefined) {
+    return { ok: false, error: "unknown-thread", detail: `thread '${input.threadId}' is not in the log.` };
+  }
+  const promotedKeys = promotedDraftKeys(events);
+  if (input.target === "comment") {
+    const commentId = input.commentId ?? "";
+    const comment = thread.comments.find((entry) => entry.id === commentId);
+    if (comment === undefined) {
+      return { ok: false, error: "unknown-comment", detail: `comment '${commentId}' is not in thread '${thread.id}'.` };
+    }
+    const authoredBy = commentAuthorKind(events, commentId);
+    if (authoredBy !== "agent") {
+      return {
+        ok: false,
+        error: "not-an-agent-draft",
+        detail: `comment '${commentId}' was authored by '${authoredBy ?? "unknown"}' — only an agent's draft can be promoted.`,
+      };
+    }
+    const reply = !events.some((event) => event.kind === "comment.created" && event.commentId === commentId);
+    if (reply && thread.external?.provider !== "github") {
+      return {
+        ok: false,
+        error: "no-github-thread",
+        detail: `comment '${commentId}' is a reply on a thread with no GitHub origin — there is no remote thread to reply to.`,
+      };
+    }
+    return {
+      ok: true,
+      draft: {
+        kind: "comment",
+        thread,
+        comment,
+        reply,
+        alreadyPromoted: promotedKeys.has(`comment ${commentId}`),
+      },
+    };
+  }
+  const resolvedThread = thread.status === "resolved";
+  if (input.target === "resolve" && !resolvedThread) {
+    return {
+      ok: false,
+      error: "stale-lifecycle-draft",
+      detail: `thread '${thread.id}' is '${thread.status}', not 'resolved' — there is no resolve to promote.`,
+    };
+  }
+  if (input.target === "reopen" && resolvedThread) {
+    return {
+      ok: false,
+      error: "stale-lifecycle-draft",
+      detail: `thread '${thread.id}' is 'resolved', not open — there is no reopen to promote.`,
+    };
+  }
+  const lifecycleActor = latestLifecycleActor(events, thread.id);
+  if (lifecycleActor !== "agent") {
+    return {
+      ok: false,
+      error: "not-an-agent-draft",
+      detail: `the current '${input.target}' on thread '${thread.id}' was the reviewer's own act — there is no agent draft to promote.`,
+    };
+  }
+  if (thread.external?.provider !== "github") {
+    return {
+      ok: false,
+      error: "no-github-thread",
+      detail: `thread '${thread.id}' has no GitHub origin — there is no remote thread to resolve.`,
+    };
+  }
+  return {
+    ok: true,
+    draft: {
+      kind: "lifecycle",
+      thread,
+      desiredResolved: input.target === "resolve",
+      alreadyPromoted: promotedKeys.has(`${thread.id} ${input.target}`),
+    },
+  };
+}
+
+/** The keys of every `draft.promoted` already in the log, in the same
+ * `key` shape the reducer's agent-draft ledger uses. */
+function promotedDraftKeys(events: readonly ReviewEvent[]): Set<string> {
+  const keys = new Set<string>();
+  for (const event of events) {
+    if (event.kind !== "draft.promoted") continue;
+    keys.add(
+      event.target === "comment" ? `comment ${event.commentId ?? ""}` : `${event.threadId} ${event.target}`,
+    );
+  }
+  return keys;
+}
+
+/** The actor kind that authored a comment (`comment.created` /
+ * `comment.replied`), or undefined when the comment is not in the log. */
+function commentAuthorKind(
+  events: readonly ReviewEvent[],
+  commentId: string,
+): ReviewEvent["actor"]["kind"] | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if ((event.kind === "comment.created" || event.kind === "comment.replied") && event.commentId === commentId) {
+      return event.actor.kind;
+    }
+  }
+  return undefined;
+}
+
+/** The actor kind behind a thread's CURRENT resolved/open state — the
+ * last `thread.resolved` / `thread.reopened` in the log. */
+function latestLifecycleActor(events: readonly ReviewEvent[], threadId: string): ReviewEvent["actor"]["kind"] | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    if ((event.kind === "thread.resolved" || event.kind === "thread.reopened") && event.threadId === threadId) {
+      return event.actor.kind;
+    }
+  }
+  return undefined;
 }

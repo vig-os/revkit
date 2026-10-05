@@ -55,6 +55,14 @@
 //                      `thread.orphaned` events on threads that
 //                      lived on `path` fire from the re-anchor
 //                      pipeline the daemon triggers after the write.
+//   draft.promoted   — issue #70: a reviewer attached an AGENT-
+//                      authored draft to their own pending review.
+//                      The actor must be `local` (`invalid-actor`) —
+//                      the agent bearer can author a draft but can
+//                      never record that it was promoted — and the
+//                      draft must actually be agent-authored
+//                      (`not-an-agent-draft`), so the event can never
+//                      claim a human's own comment was promoted.
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -93,6 +101,11 @@ export interface LogState {
   /** commentId → threadId. Global (across threads) so a duplicate
    * commentId in any thread is a rejection. */
   readonly commentIndex: Map<string, string>;
+  /** commentId → the actor that AUTHORED it (`comment.created` /
+   * `comment.replied`). Issue #70: `draft.promoted` may only name a
+   * draft an agent wrote — a reviewer's own comment mirrors itself,
+   * so promoting it would be a claim the log cannot support. */
+  readonly commentAuthors: Map<string, ReviewEvent["actor"]>;
   /** askId → { spec, status }. The FULL spec is kept so
    * `ask.answered` can validate the answer's SHAPE against the
    * question — not just the discriminant. PR #52 review: the
@@ -127,6 +140,7 @@ export function emptyLogState(): LogState {
   return {
     threads: new Map(),
     commentIndex: new Map(),
+    commentAuthors: new Map(),
     asks: new Map(),
     commentLinks: new Map(),
     externalIndex: new Map(),
@@ -175,6 +189,7 @@ export function cloneLogState(state: LogState): LogState {
   return {
     threads,
     commentIndex: new Map(state.commentIndex),
+    commentAuthors: new Map(state.commentAuthors),
     asks,
     commentLinks,
     externalIndex: new Map(state.externalIndex),
@@ -192,6 +207,10 @@ export type AppendRejection =
   | { kind: "duplicate-comment-id"; commentId: string; message: string }
   | { kind: "not-open"; threadId: string; message: string }
   | { kind: "not-resolved"; threadId: string; message: string }
+  /** `commentId` is absent only when the event refused to name one at
+   * all (issue #70: a `draft.promoted` with `target: "comment"` and no
+   * `commentId`, which the wire schema also refuses) — the message
+   * names the thread in that case. */
   | { kind: "unknown-comment"; commentId: string; message: string }
   /** Round-3 nit: an event's actor is not the one the shape
    * allows (e.g. an agent trying to edit a human comment). */
@@ -220,6 +239,10 @@ export type AppendRejection =
   | { kind: "duplicate-link"; commentId: string; backend: string; message: string }
   | { kind: "duplicate-external-id"; commentId: string; backend: string; externalId: string; existingCommentId: string; message: string }
   | { kind: "already-orphaned"; threadId: string; message: string }
+  /** Issue #70: `draft.promoted` naming something an agent did not
+   * author. A reviewer's own comment is mirrored on its own; there is
+   * nothing to promote, so the log refuses to record one. */
+  | { kind: "not-an-agent-draft"; threadId: string; commentId?: string; message: string }
   | { kind: "cross-file-reanchor"; threadId: string; fromPath: string; toPath: string; message: string }
   /** M3 part 2b: `review.opened` for a `reviewNodeId` that already
    * exists in the log (with any status). GitHub allows at most one
@@ -276,6 +299,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
         commentIds: new Set([event.commentId]),
       });
       state.commentIndex.set(event.commentId, event.threadId);
+      state.commentAuthors.set(event.commentId, event.actor);
       return { ok: true };
     }
     case "comment.replied": {
@@ -297,6 +321,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       }
       thread.commentIds.add(event.commentId);
       state.commentIndex.set(event.commentId, event.threadId);
+      state.commentAuthors.set(event.commentId, event.actor);
       return { ok: true };
     }
     case "comment.edited": {
@@ -736,6 +761,64 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
             message: `${event.kind}: comment '${event.commentId}' is not in the log.`,
           },
         };
+      }
+      return { ok: true };
+    }
+    case "draft.promoted": {
+      // Issue #70. Two independent guarantees, both enforced HERE so
+      // they hold for every store backing and every writer — not only
+      // for the daemon route that happens to check them first.
+      if (event.actor.kind !== "local") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "invalid-actor",
+            actor: event.actor,
+            message:
+              `draft.promoted: only the reviewer may promote a draft into their own pending review, ` +
+              `got actor kind '${event.actor.kind}'.`,
+          },
+        };
+      }
+      const thread = state.threads.get(event.threadId);
+      if (thread === undefined) return unknownThread(event.threadId, event.kind);
+      if (event.target === "comment") {
+        const commentId = event.commentId;
+        if (commentId === undefined) {
+          // The wire schema already refuses this shape; reaching here
+          // means a caller bypassed `reviewEventSchema`.
+          return {
+            ok: false,
+            rejection: {
+              kind: "invalid-shape",
+              message: "draft.promoted: target='comment' requires the commentId of the draft being promoted.",
+            },
+          };
+        }
+        if (!thread.commentIds.has(commentId)) {
+          return {
+            ok: false,
+            rejection: {
+              kind: "unknown-comment",
+              commentId,
+              message: `draft.promoted: comment '${commentId}' is not in thread '${event.threadId}'.`,
+            },
+          };
+        }
+        const author = state.commentAuthors.get(commentId);
+        if (author?.kind !== "agent") {
+          return {
+            ok: false,
+            rejection: {
+              kind: "not-an-agent-draft",
+              threadId: event.threadId,
+              commentId,
+              message:
+                `draft.promoted: comment '${commentId}' was authored by '${author?.kind ?? "unknown"}', not an agent — ` +
+                `a reviewer's own comment is mirrored without a promotion.`,
+            },
+          };
+        }
       }
       return { ok: true };
     }

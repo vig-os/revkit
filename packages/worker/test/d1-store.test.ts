@@ -55,9 +55,13 @@ const THIRD_LOG = previewScopePath("other-repo", 7);
 
 /** `ReviewEvent` is a union whose arms do not share one identifier — the rows
  * seeded here are identified by their `commentId` because it is the field every
- * arm has, and it is narrow rather than cast. */
+ * arm carries, and it is narrow rather than cast. It is OPTIONAL on
+ * `draft.promoted` (a resolve/reopen promotion names no comment), so the
+ * narrowing checks the value too rather than only the key's presence. */
 function commentIdOf(event: ReviewEvent): string {
-  if (!("commentId" in event)) throw new Error(`no commentId on ${event.kind}`);
+  if (!("commentId" in event) || event.commentId === undefined) {
+    throw new Error(`no commentId on ${event.kind}`);
+  }
   return event.commentId;
 }
 

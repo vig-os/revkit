@@ -521,6 +521,26 @@ const commentSyncCancelledPayload = {
   requestedAtSeq: z.number().int().positive(),
 } as const;
 
+/** Issue #70 (B6, option B): a reviewer explicitly promoted an
+ * AGENT-authored draft into their own pending GitHub review. The
+ * draft itself is already in the log (`comment.replied` /
+ * `thread.resolved` / `thread.reopened` with an `agent` actor) and
+ * stays LOCAL until this event lands; promotion is the human act that
+ * authorizes the machine intent the reconciler then replays under the
+ * reviewer's identity.
+ *
+ * `commentId` is required iff `target === "comment"` — a resolve or
+ * reopen promotion names the THREAD, not a comment. `actor` is the
+ * reviewer; the transition validator refuses any other actor, so the
+ * agent bearer can author a draft but can never record that it was
+ * promoted (see validator.ts `draft.promoted`). */
+const draftPromotedPayload = {
+  kind: z.literal("draft.promoted"),
+  threadId: idSchema,
+  target: z.enum(["comment", "resolve", "reopen"]),
+  commentId: idSchema.optional(),
+} as const;
+
 /** Shared envelope for the four `build.*` kinds (M2 item 9, story
  * A4). `generation` names the publish generation the build was
  * scheduled FOR, so a terminal `build.succeeded` clears exactly the
@@ -626,6 +646,29 @@ const eventVariants = [
   z.object({ ...envelope, ...commentSyncRequestedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncFailedPayload }).strict(),
   z.object({ ...envelope, ...commentSyncCancelledPayload }).strict(),
+  z
+    .object({ ...envelope, ...draftPromotedPayload })
+    .strict()
+    .superRefine((event, ctx) => {
+      // `commentId` is the identity of a comment draft and is
+      // meaningless on a thread-lifecycle promotion. Requiring it one
+      // way and forbidding it the other keeps the promotion
+      // unambiguous: there is exactly one way to promote each kind.
+      if (event.target === "comment" && event.commentId === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["commentId"],
+          message: "draft.promoted: target='comment' requires the commentId of the draft being promoted.",
+        });
+      }
+      if (event.target !== "comment" && event.commentId !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["commentId"],
+          message: `draft.promoted: target='${event.target}' must not carry a commentId (a resolve/reopen promotion names the thread).`,
+        });
+      }
+    }),
   z.object({ ...envelope, ...buildRequestedPayload }).strict(),
   z.object({ ...envelope, ...buildStartedPayload }).strict(),
   z.object({ ...envelope, ...buildSucceededPayload }).strict(),
@@ -670,6 +713,7 @@ export const reviewEventKinds = [
   "comment.sync_requested",
   "comment.sync_failed",
   "comment.sync_cancelled",
+  "draft.promoted",
   "build.requested",
   "build.started",
   "build.succeeded",

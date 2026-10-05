@@ -265,9 +265,22 @@ interface RailReviewState {
         readonly reason?: string;
       };
     }>;
+    /** Issue #70: agent-authored drafts awaiting the reviewer's
+     * explicit promotion. Absent on a daemon that predates the
+     * promotion route. */
+    readonly agentDrafts?: ReadonlyArray<{
+      readonly threadId: string;
+      readonly target: "comment" | "resolve" | "reopen";
+      readonly commentId?: string;
+      readonly path: string;
+    }>;
   };
   readonly stale: boolean;
 }
+
+/** One agent-authored draft awaiting the reviewer's promotion
+ * (issue #70). Same shape the daemon's `/api/review/state` reports. */
+type RailAgentDraft = NonNullable<RailReviewState["state"]["agentDrafts"]>[number];
 
 /** Fetch review-mode state. Returns null when the daemon is not in
  * review mode (`/api/review/state` returns 404). Any other error
@@ -344,6 +357,43 @@ async function refreshReviewPr(): Promise<{ moved: boolean; stale: boolean; curr
   });
   if (!response.ok) throw new Error(`refresh failed: ${response.status}`);
   return (await response.json()) as { moved: boolean; stale: boolean; currentHeadSha: string };
+}
+
+/** Issue #70: the reviewer's promotion of an agent-authored draft
+ * into their own pending review. Cookie-authenticated like every other
+ * review mutation (the agent bearer is refused by the route), so this
+ * is the rail's half of a human act — nothing about it is available to
+ * the agent. A refusal carries the daemon's machine-readable error so
+ * the rail can say which one. */
+async function promoteAgentDraft(input: {
+  threadId: string;
+  target: "comment" | "resolve" | "reopen";
+  commentId?: string;
+}): Promise<{ ok: boolean; promoted: boolean; reason?: string; error?: string }> {
+  const response = await fetch("/api/review/promote", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({
+      threadId: input.threadId,
+      target: input.target,
+      ...(input.commentId !== undefined ? { commentId: input.commentId } : {}),
+    }),
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    ok?: boolean;
+    promoted?: boolean;
+    error?: string;
+    reason?: string;
+  };
+  if (!response.ok) {
+    throw new Error(
+      body.error === "no-open-pending-review"
+        ? "Cannot promote: your pending review was submitted or discarded. Comment on the PR to open a new one."
+        : `promote refused: ${body.error ?? response.status}`,
+    );
+  }
+  return { ok: body.ok === true, promoted: body.promoted === true, ...(body.reason !== undefined ? { reason: body.reason } : {}) };
 }
 
 /** Build the SHA-256 hex digest of the LF-normalised body — the
@@ -914,6 +964,18 @@ function Rail(): JSX.Element {
   // Review-mode state (M3 part 2b). `null` means the daemon is not
   // in review mode; the rail hides the panel entirely.
   const [reviewState, { refetch: refetchReview }] = createResource<RailReviewState | null>(fetchReviewState);
+  // Issue #70: the comment ids of agent-authored drafts that no
+  // reviewer has promoted yet. The badge on a comment reads this, so
+  // the badge disappears the moment the draft is promoted — the same
+  // derived state the daemon's promotion route acts on, never a second
+  // source of truth in the browser.
+  const unpromotedDraftCommentIds = createMemo<ReadonlySet<string>>(() => {
+    const ids = new Set<string>();
+    for (const draft of reviewState()?.state.agentDrafts ?? []) {
+      if (draft.target === "comment" && draft.commentId !== undefined) ids.add(draft.commentId);
+    }
+    return ids;
+  });
   const [submitEvent, setSubmitEvent] = createSignal<"COMMENT" | "APPROVE" | "REQUEST_CHANGES">("COMMENT");
   const [submitBody, setSubmitBody] = createSignal<string>("");
   const [reviewBusy, setReviewBusy] = createSignal<boolean>(false);
@@ -1820,6 +1882,73 @@ function Rail(): JSX.Element {
               >Retry sync</button>
             </div>
           </Show>
+          <Show when={(reviewState()!.state.agentDrafts ?? []).length > 0}>
+            {/* Issue #70 (B6, option B): the agent's reply / resolve /
+                reopen is a LOCAL draft until the reviewer attaches it
+                to their own pending review. Nothing here has reached
+                GitHub, and the button is the reviewer's explicit act —
+                it POSTs the cookie-authenticated promote route. */}
+            <div
+              class="revkit-rail__agent-drafts"
+              data-testid="revkit-rail-agent-drafts"
+              role="region"
+              aria-label="agent drafts awaiting promotion"
+            >
+              <p class="revkit-rail__agent-drafts-summary">
+                {(reviewState()!.state.agentDrafts ?? []).length} agent draft
+                {(reviewState()!.state.agentDrafts ?? []).length === 1 ? "" : "s"} — written locally by the
+                agent, not on GitHub. Promote to include {""}
+                {(reviewState()!.state.agentDrafts ?? []).length === 1 ? "it" : "them"} in your review.
+              </p>
+              <ul class="revkit-rail__agent-drafts-list">
+                <For each={reviewState()!.state.agentDrafts ?? []}>
+                  {(draft: RailAgentDraft) => (
+                    <li
+                      class="revkit-rail__agent-draft"
+                      data-testid="revkit-rail-agent-draft"
+                      data-target={draft.target}
+                      data-thread-id={draft.threadId}
+                      data-comment-id={draft.commentId ?? ""}
+                    >
+                      <span
+                        class="revkit-rail__agent-draft-badge"
+                        data-testid="revkit-rail-agent-draft-badge"
+                      >agent draft · not on GitHub</span>
+                      <span class="revkit-rail__agent-draft-where">
+                        {draft.target === "comment" ? "comment" : draft.target} on{" "}
+                        <code>{draft.path}</code>
+                      </span>
+                      <button
+                        type="button"
+                        class="revkit-rail__agent-draft-promote"
+                        data-testid="revkit-rail-agent-draft-promote"
+                        disabled={reviewBusy()}
+                        onClick={() => {
+                          void (async () => {
+                            setReviewBusy(true);
+                            setError(undefined);
+                            try {
+                              await promoteAgentDraft({
+                                threadId: draft.threadId,
+                                target: draft.target,
+                                ...(draft.commentId !== undefined ? { commentId: draft.commentId } : {}),
+                              });
+                              await refetchReview();
+                              await refetch();
+                            } catch (cause) {
+                              setError((cause as Error).message);
+                            } finally {
+                              setReviewBusy(false);
+                            }
+                          })();
+                        }}
+                      >Promote to my review</button>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </div>
+          </Show>
           <Show when={reviewState()!.state.openPending !== null && !reviewState()!.stale}>
             <form
               class="revkit-rail__review-submit"
@@ -2172,6 +2301,17 @@ function Rail(): JSX.Element {
                           <p class="revkit-rail__author">
                             <span class={`revkit-rail__author-kind revkit-rail__author-kind--${comment.author.kind}`}>{comment.author.kind}</span>
                             <span class="revkit-rail__author-id">{comment.author.displayName ?? comment.author.id}</span>
+                            {/* Issue #70: an agent draft says so, right
+                                where the reviewer reads it. The badge is
+                                driven by the daemon's derived draft list,
+                                so it vanishes the moment the draft is
+                                promoted. */}
+                            <Show when={unpromotedDraftCommentIds().has(comment.id)}>
+                              <span
+                                class="revkit-rail__agent-draft-badge"
+                                data-testid="revkit-rail-comment-agent-draft-badge"
+                              >agent draft · not on GitHub</span>
+                            </Show>
                           </p>
                           <p class="revkit-rail__body">{renderBodyWithMentions(comment.body, comment.mentions ?? [])}</p>
                         </li>
