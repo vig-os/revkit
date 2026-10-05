@@ -283,7 +283,7 @@ describe("import — propagates validateNext rejections", () => {
       expect(error).toBeInstanceOf(ThreadStoreImportError);
       if (error instanceof ThreadStoreImportError) {
         expect(error.rejection?.kind).toBe("duplicate-thread");
-        expect(error.rejection?.rejection?.kind).toBe("duplicate-thread");
+        expect(error.rejection?.transition?.kind).toBe("duplicate-thread");
       }
     }
   });
@@ -354,7 +354,7 @@ describe("import — atomic commit (all-or-nothing)", () => {
       // unchanged and still readable off the typed field.
       expect(error).toBeInstanceOf(ThreadStoreImportError);
       if (error instanceof ThreadStoreImportError) {
-        rejection = error.rejection?.rejection?.kind ?? null;
+        rejection = error.rejection?.transition?.kind ?? null;
       }
     }
     expect(rejection).toBe("duplicate-comment-id");

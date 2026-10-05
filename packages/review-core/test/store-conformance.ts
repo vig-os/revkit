@@ -368,15 +368,21 @@ export function storeConformance(factory: StoreFactory): void {
       expect(caught).toBeInstanceOf(ThreadStoreImportError);
       expect(Array.isArray((caught as { issues?: unknown }).issues)).toBe(false);
       // The message names the offending event and the invariant it broke,
-      // in one line — not a Zod path/issue blob.
-      expect((caught as Error).message).toContain("7");
+      // in one line — not a Zod path/issue blob. The seq is asserted in
+      // the exact phrase the message builds, not as a bare `toContain("7")`,
+      // which a `ts` of `…:07Z` would satisfy just as well.
+      expect((caught as Error).message).toContain("event 0 (seq 7)");
       expect((caught as Error).message).toContain("unknown-thread");
       expect((caught as Error).message.split("\n")).toHaveLength(1);
       // The typed field, so a caller branches without parsing the message.
+      // `kind` is the REAL invariant, not `invalid-shape`: this archive is
+      // shape-valid, so reporting it as malformed would be the same
+      // distinction the dry run already gets right.
       const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
       expect(rejection?.seq).toBe(7);
       expect(rejection?.index).toBe(0);
-      expect(rejection?.kind).toBe("invalid-shape");
+      expect(rejection?.kind).toBe("unknown-thread");
+      expect(rejection?.transition?.kind).toBe("unknown-thread");
       // The original ZodError is preserved, not swallowed.
       expect((caught as { cause?: unknown }).cause).toBeDefined();
       // And the refusal itself is unchanged: nothing landed.
@@ -411,8 +417,11 @@ export function storeConformance(factory: StoreFactory): void {
       expect(rejection?.index).toBe(1);
       // The `validateNext` rejection itself is reachable, not flattened
       // into the message.
-      expect(rejection?.rejection?.kind).toBe("duplicate-comment-id");
-      expect((caught as { cause?: unknown }).cause).toBeDefined();
+      expect(rejection?.transition?.kind).toBe("duplicate-comment-id");
+      // `cause` is set only on the shape path, so a caller that reaches
+      // for it never gets a non-`Error` — the transition is on the typed
+      // field instead.
+      expect((caught as { cause?: unknown }).cause).toBeUndefined();
       // No partial import: the first event of the archive did not land.
       expect(JSON.stringify(await store.since(0))).toBe(before);
     });
@@ -429,7 +438,56 @@ export function storeConformance(factory: StoreFactory): void {
         caught = error;
       }
       expect(caught).toBeInstanceOf(ThreadStoreImportError);
-      expect((caught as InstanceType<typeof ThreadStoreImportError>).rejection?.kind).toBe("head-not-monotone");
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      expect(rejection?.kind).toBe("head-not-monotone");
+      // This refusal DOES name an event — `events[0]`, whose seq is the
+      // one that failed the check. Pinned because `ImportRejection.seq`'s
+      // doc used to say the opposite, and a caller branching on
+      // `seq === undefined` would have mis-routed this case.
+      expect(rejection?.seq).toBe(1);
+      expect(rejection?.index).toBe(0);
+      expect(JSON.stringify(await store.since(0))).toBe(before);
+    });
+
+    test("A12: a genuinely malformed archive still reports invalid-shape", async () => {
+      await store.append(createThread("th-mal", "c-mal"));
+      const before = JSON.stringify(await store.since(0));
+
+      // The counterpart to the repro above: this archive's BYTES are
+      // wrong (`body: ""` violates the schema's `.min(1)`), so there is no
+      // transition to carry and `kind` is `invalid-shape` — which is what
+      // makes that kind mean something rather than being the default for
+      // every schema-path refusal.
+      const malformed = {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        events: [
+          {
+            seq: 9,
+            ts: "2026-10-03T12:00:09Z",
+            actor: human,
+            kind: "comment.created",
+            threadId: "th-mal",
+            commentId: "c-mal-2",
+            anchor,
+            body: "",
+          },
+        ],
+      };
+      let caught: unknown;
+      try {
+        await store.import(malformed as ThreadArchive);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ThreadStoreImportError);
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      expect(rejection?.kind).toBe("invalid-shape");
+      expect(rejection?.seq).toBe(9);
+      expect(rejection?.index).toBe(0);
+      // No transition to report — the Zod issues are on `cause`, which is
+      // an `Error` whenever it is present at all.
+      expect(rejection?.transition).toBeUndefined();
+      expect((caught as { cause?: unknown }).cause).toBeDefined();
       expect(JSON.stringify(await store.since(0))).toBe(before);
     });
 
