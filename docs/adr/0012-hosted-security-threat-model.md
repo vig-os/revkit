@@ -665,11 +665,17 @@ message is the failure mode this ADR exists to prevent.
 
 ### What the clause said, and what now happens
 
-> **Preview paths never serve executable content.** Under `/<repo>/pr-<n>/` the
-> Worker serves only HTML, JSON, images (PNG/JPEG/WebP/AVIF) and fonts; `.js`,
-> `.mjs`, `.css`, `.wasm` and anything else are refused. SVG is served with
-> `Content-Security-Policy: sandbox` and `Content-Disposition: inline` so it
-> can't run script.
+The Decision bullet this amendment is about reads, in full: **"Preview paths never
+serve executable content."** Under `/<repo>/pr-<n>/` the Worker serves only HTML,
+JSON, images (PNG/JPEG/WebP/AVIF) and fonts; `.js`, `.mjs`, `.css`, `.wasm` and
+anything else are refused. SVG is served with `Content-Security-Policy: sandbox`
+and `Content-Disposition: inline` so it can't run script.
+
+*(It is set as a paragraph rather than as a blockquote on purpose. A `>` block
+renders a real `<blockquote>`, and this ADR is built by `revkit build` into the
+docs site, where `check-dist` refuses any element outside the registry — so the
+quotation form failed the repository's own safe-build. The words are unchanged; a
+sentence that cannot be built is not documentation.)*
 
 **Implemented as written, with three rules that make it a control rather than an
 intention.** `packages/worker/src/preview-assets.ts` holds the extension→media
