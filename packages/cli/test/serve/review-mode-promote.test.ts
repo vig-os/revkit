@@ -59,6 +59,9 @@ interface Ctx {
 }
 
 const SOURCE = "line1\nline2 with quote\nline3\n";
+/** A path under the repo root that the fake PR's `files` omits. */
+const OUTSIDE_PATH = "docs/outside-diff.md";
+const OUTSIDE_SOURCE = "outside1\noutside2\n";
 
 async function startCtx(overrides?: {
   threads?: readonly GhReviewThread[];
@@ -72,6 +75,12 @@ async function startCtx(overrides?: {
   writeFileSync(join(dist, "index.html"), "<!doctype html><h1>PR</h1>");
   mkdirSync(join(root, "docs"), { recursive: true });
   writeFileSync(join(root, "docs/index.md"), SOURCE);
+  // A real file under the repo root that the PR's file list does NOT
+  // mention. `POST /api/threads` validates the path against the repo
+  // root only, so a comment can anchor here — and its anchor then has no
+  // GitHub position to map to, which is the `promote-mapping-orphan`
+  // refusal the BLOCKER-1 probe needs.
+  writeFileSync(join(root, OUTSIDE_PATH), OUTSIDE_SOURCE);
   const pending = makePendingState();
   const baseFetch = makeFakeGithubFetch(
     [
@@ -198,9 +207,17 @@ async function postComment(ctx: Ctx, body: string, suffix: string): Promise<Resp
 }
 
 /** Post a top-level comment as the AGENT (bearer). The mirror path
- * refuses a non-local actor, so this can only ever land locally. */
-async function postCommentAsAgent(ctx: Ctx, body: string, suffix: string): Promise<Response> {
-  const revision = await revisionOf(SOURCE);
+ * refuses a non-local actor, so this can only ever land locally.
+ * `path` defaults to the file the PR's diff covers; pass
+ * `OUTSIDE_PATH` for an anchor with no GitHub position. */
+async function postCommentAsAgent(
+  ctx: Ctx,
+  body: string,
+  suffix: string,
+  path = "docs/index.md",
+): Promise<Response> {
+  const outside = path === OUTSIDE_PATH;
+  const source = outside ? OUTSIDE_SOURCE : SOURCE;
   return await fetch(`${ctx.handle.url}/api/threads`, {
     method: "POST",
     headers: {
@@ -214,11 +231,13 @@ async function postCommentAsAgent(ctx: Ctx, body: string, suffix: string): Promi
       threadId: `th-${suffix}`,
       commentId: `c-${suffix}`,
       anchor: {
-        path: "docs/index.md",
+        path,
         startLine: 2,
         endLine: 2,
-        quote: { exact: "line2 with quote", prefix: "line1\n", suffix: "\nline3" },
-        revision,
+        quote: outside
+          ? { exact: "outside2", prefix: "outside1\n", suffix: "" }
+          : { exact: "line2 with quote", prefix: "line1\n", suffix: "\nline3" },
+        revision: await revisionOf(source),
       },
       body,
     }),
@@ -268,6 +287,7 @@ interface StateBody {
   readonly state: {
     readonly openPending: { readonly reviewNodeId: string; readonly comments: ReadonlyArray<{ readonly commentId: string }> } | null;
     readonly terminal: ReadonlyArray<{ readonly reviewNodeId: string; readonly outcome: { readonly kind: string; readonly reason?: string } }>;
+    readonly unsyncedCommentIds?: readonly string[];
     readonly agentDrafts: ReadonlyArray<{ readonly threadId: string; readonly target: string; readonly commentId?: string; readonly path: string }>;
   };
 }
@@ -609,6 +629,164 @@ describe("#70 — idempotency", () => {
     expect(retry.status).toBe(200);
     expect(((await retry.json()) as { promoted: boolean }).promoted).toBe(false);
     expect(ctx.fake.replies).toHaveLength(1);
+    expect((await readState(ctx)).state.agentDrafts).toEqual([]);
+  });
+});
+
+// The reviewer's two probes against PR #123 (`bf2fd9c6`), verbatim.
+// Both were reachable through ordinary reviewer/agent actions and the
+// fake only.
+describe("#70 round 1 — PROBE 1: a refused promotion must not retire the draft (review finding 1)", () => {
+  test("a promote-mapping-orphan refusal leaves agentDrafts unchanged and a later valid promotion still works", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    // An agent draft on a path OUTSIDE the PR's file list: the anchor
+    // is real under the repo root, so the comment lands, but it has no
+    // GitHub position to map to.
+    expect((await postCommentAsAgent(ctx, "agent draft outside the diff", "outside", OUTSIDE_PATH)).status).toBe(201);
+    const writesBefore = writes(ctx);
+
+    const before = await readState(ctx);
+    expect(before.state.agentDrafts).toEqual([
+      { threadId: "th-outside", target: "comment", commentId: "c-outside", path: OUTSIDE_PATH },
+    ]);
+
+    // PROBE 1: the refusal.
+    const refusal = await promote(ctx, { threadId: "th-outside", target: "comment", commentId: "c-outside" });
+    expect(refusal.status).toBe(409);
+    const body = (await refusal.json()) as { error: string };
+    expect(body.error).toBe("promote-mapping-orphan");
+
+    // The four harms the review named, each asserted.
+    //   1-2. the log did NOT record a promotion for a promotion that did
+    //         not happen — the draft is still listed
+    //   3.   the comment is still reachable as a draft
+    //   4.   the rail's affordance still exists, because it reads this
+    //         very list
+    const after = await readState(ctx);
+    expect(after.state.agentDrafts).toEqual(before.state.agentDrafts);
+    // Nothing was written to GitHub by the refusal.
+    expect(writes(ctx)).toBe(writesBefore);
+    // And the comment is not left stranded as an unsynced intent either.
+    expect(after.state.unsyncedCommentIds).toEqual([]);
+
+    // A later, valid promotion of a DIFFERENT draft still works, so the
+    // refusal did not poison the route or the pending review.
+    expect((await postCommentAsAgent(ctx, "agent draft inside the diff", "inside")).status).toBe(201);
+    const valid = await promote(ctx, { threadId: "th-inside", target: "comment", commentId: "c-inside" });
+    expect(valid.status).toBe(201);
+    expect(ctx.fake.drafts).toHaveLength(2);
+    expect(ctx.fake.drafts[1]?.body).toContain("agent draft inside the diff");
+
+    // The refused draft is STILL there — the reviewer can retry it (or
+    // re-anchor it) rather than having lost it.
+    const final = await readState(ctx);
+    expect(final.state.agentDrafts).toEqual([
+      { threadId: "th-outside", target: "comment", commentId: "c-outside", path: OUTSIDE_PATH },
+    ]);
+  });
+
+  test("retrying the refused promotion refuses identically — it does not claim the draft was promoted", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft outside the diff", "outside", OUTSIDE_PATH)).status).toBe(201);
+    const writesBefore = writes(ctx);
+
+    const first = await promote(ctx, { threadId: "th-outside", target: "comment", commentId: "c-outside" });
+    expect(first.status).toBe(409);
+    const retry = await promote(ctx, { threadId: "th-outside", target: "comment", commentId: "c-outside" });
+    // The old code answered 200 with promoted:false and
+    // reason "already-promoted" here — the false claim the finding is
+    // about, since nothing had been promoted.
+    expect(retry.status).toBe(409);
+    expect(((await retry.json()) as { error: string }).error).toBe("promote-mapping-orphan");
+    expect(writes(ctx)).toBe(writesBefore);
+    expect((await readState(ctx)).state.agentDrafts).toHaveLength(1);
+  });
+});
+
+describe("#70 round 1 — PROBE 2: a superseded promotion must not fire (review finding 2)", () => {
+  test("a promoted resolve followed by a reopen gives zero resolve writes to the fake", async () => {
+    // The adapter write FAILS so the promoted resolve is still an
+    // outstanding intent when the agent reopens the thread — which is
+    // the window the finding is about.
+    const ctx = await startCtx({ threads: [importedThread("PRT_stale")], failBeforeOnce: "ResolveReviewThread" });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+
+    // PROBE 2: the promotion's own write fails, so the intent survives.
+    const promoted = await promote(ctx, { threadId: imported.id, target: "resolve" });
+    expect(promoted.status).toBe(500);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+
+    // The agent reopens the thread locally.
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+    expect((await readState(ctx)).state.agentDrafts).toEqual([
+      { threadId: imported.id, target: "reopen", path: "docs/index.md" },
+    ]);
+
+    // The route refuses the now-stale resolve — the reviewer is told.
+    const stale = await promote(ctx, { threadId: imported.id, target: "resolve" });
+    expect(stale.status).toBe(409);
+    expect(((await stale.json()) as { error: string }).error).toBe("stale-lifecycle-draft");
+
+    // The next cookie-authenticated reconcile must NOT resurrect it.
+    const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+
+    // And the local thread is open, so GitHub agrees with it.
+    const threads = await fetch(`${ctx.handle.url}/api/threads`, {
+      headers: { cookie: ctx.cookie, "sec-fetch-site": "same-origin" },
+    });
+    const listed = (await threads.json()) as { threads: Array<{ id: string; status: string }> };
+    expect(listed.threads.find((thread) => thread.id === imported.id)?.status).toBe("open");
+  });
+
+  test("the same supersession holds across a restart (boot never resurrects a superseded intent)", async () => {
+    let ctx = await startCtx({ threads: [importedThread("PRT_stale_restart")], failBeforeOnce: "ResolveReviewThread" });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+    expect((await promote(ctx, { threadId: imported.id, target: "resolve" })).status).toBe(500);
+
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+
+    ctx = await restartCtx(ctx);
+    await Bun.sleep(50);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+
+    const reconcile = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+  });
+
+  test("promoting the REOPEN after a superseded resolve writes only the unresolve", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_stale_then_reopen")] });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+    // Promote the resolve, but the adapter write fails.
+    expect((await promote(ctx, { threadId: imported.id, target: "resolve" })).status).toBe(201);
+    expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_stale_then_reopen", op: "resolve" }]);
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+
+    const reopen = await promote(ctx, { threadId: imported.id, target: "reopen" });
+    expect(reopen.status).toBe(201);
+    // Exactly one unresolve; the resolve is not repeated.
+    expect(ctx.fake.resolutions).toEqual([
+      { threadNodeId: "PRT_stale_then_reopen", op: "resolve" },
+      { threadNodeId: "PRT_stale_then_reopen", op: "unresolve" },
+    ]);
     expect((await readState(ctx)).state.agentDrafts).toEqual([]);
   });
 });

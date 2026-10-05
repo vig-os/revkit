@@ -140,6 +140,7 @@ export {
 export {
   isPendingReviewStale,
   reduceReviewState,
+  reduceThreadLifecycleStates,
   type AgentDraft,
   type CommentSyncState,
   type OpenPendingReview,
@@ -147,6 +148,7 @@ export {
   type ReviewState,
   type SyncFingerprint,
   type TerminalReview,
+  type ThreadLifecycleState,
 } from "./review-state.ts";
 export {
   alignMatchedText,

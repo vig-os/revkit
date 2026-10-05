@@ -328,39 +328,72 @@ event to hang a field on — and without the separate event, half of B6 would ha
 no record that a human authorized the write at all. One kind, one meaning: *a
 reviewer attached this agent-authored draft to their own pending review.*
 
-**The trust argument, enforced in the log.** Three rules, all in
-`validateNext`, so they hold for every store backing and every writer rather than
-only for the route that checks them first:
+**The trust argument, enforced in the log.** Every rule below is in
+`validateNext`, so each holds for every store backing and every writer rather
+than only for the route that checks it first.
 
 1. **Only the reviewer may record a promotion.** `draft.promoted` with any
    non-`local` actor is rejected (`invalid-actor`) — the agent bearer can author
    a draft, and can never record, by any path, that it was promoted.
-2. **Only an agent draft may be promoted.** Promoting a comment an agent did not
-   author is rejected (`not-an-agent-draft`) — a reviewer's own comment is
-   mirrored without a promotion, so the log can never claim one was promoted.
-3. **The named ids must be real.** `unknown-thread` / `unknown-comment`, and the
+2. **Only an agent draft may be promoted.** Promoting a comment, or a
+   resolve/reopen, an agent did not author is rejected
+   (`not-an-agent-draft`) — a reviewer's own comment mirrors without a promotion
+   and their own resolve is authorized already, so the log can never claim one
+   was promoted.
+3. **A lifecycle promotion must name the thread's CURRENT change.** A
+   `draft.promoted` with `target: "resolve"` against a thread whose latest
+   lifecycle change is a reopen is rejected with the same kind: a superseded
+   change has nothing left to write to GitHub, and the reconciler would
+   otherwise fire an intent the reviewer has already moved past.
+4. **The named ids must be real.** `unknown-thread` / `unknown-comment`, and the
    comment must belong to the thread named (mirroring `comment.replied`'s
    parent check).
 
-The route adds a fourth rule the log cannot see, because it is about the world
+The route adds one rule the log cannot see, because it is about the world
 outside the log: **promotion requires an OPEN pending review.** After
 `review.submitted` or `review.abandoned` there is nothing to promote into, and
 the route refuses (`no-open-pending-review`) rather than opening a fresh review
 behind the reviewer's back — a discarded review stays discarded until the
 reviewer opens a new one deliberately.
 
+**A refusal writes nothing.** Every check above, plus the ones the route makes
+about the world (`no-github-thread`, `stale-lifecycle-draft`,
+`promote-mapping-orphan`), is decided **before the first append**. This is
+load-bearing rather than tidiness: `draft.promoted` is what retires a draft
+from `agentDrafts`, so a refusal raised *after* it left the log claiming an
+authorization that never happened, retired the draft the rail's affordance is
+built from, and made the comment permanently unreachable — the reviewer was
+shown a badge, a button, and then nothing, with no route left that could
+produce the intent. A refused promotion is a no-op on the log.
+
 **Idempotency is a property of the log, not of the route.** A promotion already
-in the log is not appended twice; the route recognises it, re-runs the
-read-first reconcile to finish the interrupted one, and answers `200` with
+in the log is not appended twice; the route recognises it and re-runs the
+read-first reconcile to finish the interrupted one, answering `200` with
 `promoted: false` instead of `201`. So a double promote, a promote retried after
 a crash between the event and its reconcile, and a restart all converge on one
-GitHub write. Boot stays read-only: an unpromoted draft produces no intent, so
-nothing about it can be written on restart.
+GitHub write.
 
-**Derived, not held.** `reduceReviewState(...).agentDrafts` lists the
-unpromoted drafts from the log — the same derivation the rail badges and the
-route acts on, so there is no second source of truth and nothing to reconcile
-across a restart. A second agent draft on a thread after a promotion is a new
-entry (keyed by the draft's own identity), and an agent resolve that was never
-promoted stops being a draft once the thread is reopened — there is no longer
-anything to resolve on GitHub. Refs: #70, #59, #8
+The crash window is **between** the promotion and the machine intent, and it is
+recoverable in both directions: the promotion alone authorizes nothing (the
+reconciler needs the intent too), and a retry recognises the recorded promotion,
+skips appending a second one, and still appends the missing intent. Boot stays
+read-only: an unpromoted draft produces no intent, so nothing about it can be
+written on restart.
+
+**Derived, not held — and derived ONCE.** `reduceReviewState(...).agentDrafts`
+lists the unpromoted drafts from the log, so there is no second source of truth
+and nothing to reconcile across a restart. A second agent draft on a thread
+after a promotion is a new entry (keyed by the draft's own identity), and a
+lifecycle draft is gone the moment the thread's state changes — there is no
+longer anything to resolve on GitHub.
+
+That last rule is **`reduceThreadLifecycleStates`, one exported derivation with
+three consumers**: the reducer's draft list, the daemon's `findDraftToPromote`
+(which refuses a stale target), and `reconcileThreadStateIntents` — the one that
+**writes**. Three separate implementations of "which lifecycle change is
+current, and is it promoted" is how a promoted resolve came to be fired for a
+thread that had since been reopened, while the rail's badge and the route both
+correctly showed nothing to promote: the writer was the outlier, and it corrupted
+the external baseline besides making the wrong write. The rule is therefore
+stated once, here, and enforced by rule 3 above so that even a writer that
+bypasses the derivation cannot produce a stale authorization. Refs: #70, #59, #8

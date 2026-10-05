@@ -234,6 +234,17 @@ review. What changed is that the decision is now *possible*, and it is recorded
 as an event whose only permitted author is the reviewer — see the ADR-0006
 amendment for the log-level trust rules.
 
+**A refusal writes nothing, and a superseded promotion does not fire.** Every
+refusal the route can return is decided before the log's first append, so a
+refused promotion leaves the draft exactly where it was — still badged, still
+promotable, retryable. A promotion authorizes a lifecycle change only while that
+change is the thread's current one: if the agent reopens a thread whose resolve
+the reviewer had promoted, the promotion is superseded, the route refuses the
+stale target, and no reconcile resolves it. The rule is one derivation in
+`@revkit/review-core` (`reduceThreadLifecycleStates`) read by the rail's draft
+list, the route and the reconciler alike, and it is enforced in the log's
+validator too — the writer is not allowed a different answer than the UI.
+
 **Promotion needs an open pending review.** The route refuses
 (`no-open-pending-review`) when the log's pending review is submitted or
 abandoned. This is deliberate: after a submit or a discard, the reviewer's

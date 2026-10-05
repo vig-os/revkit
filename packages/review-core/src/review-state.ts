@@ -123,15 +123,80 @@ export interface OpenPendingReview {
   readonly comments: readonly PendingReviewComment[];
 }
 
+/** One thread's lifecycle-draft state — the SINGLE derivation of
+ * "which resolve/reopen is this thread's current one, who authored it,
+ * and has a reviewer promoted it".
+ *
+ * It exists because three consumers must agree (issue #70 review,
+ * finding 2): the `agentDrafts` list below, the daemon's
+ * `findDraftToPromote` (which refuses a stale target), and
+ * `reconcileThreadStateIntents` (which is the one that WRITES). A
+ * second implementation in any of them is a divergence waiting to
+ * happen, so there is one and all three read it.
+ *
+ * The rule, in full:
+ *   - the thread's CURRENT lifecycle change is its LAST
+ *     `thread.resolved` / `thread.reopened`, whoever authored it;
+ *   - a later lifecycle change SUPERSEDES the earlier one, promotion
+ *     or not — an agent resolve the reviewer promoted, that the agent
+ *     then reopens, has nothing left to resolve on GitHub;
+ *   - it counts as PROMOTED only when a `draft.promoted` naming the
+ *     same target has a seq LATER than it, so a promotion recorded
+ *     before the change it claims authorizes nothing. */
+export interface ThreadLifecycleState {
+  readonly threadId: string;
+  /** Which change the thread's current state came from. */
+  readonly target: "resolve" | "reopen";
+  /** The remote state that change asks for. */
+  readonly desiredResolved: boolean;
+  /** The seq of the `thread.resolved` / `thread.reopened` that set it. */
+  readonly atSeq: number;
+  /** Who authored that change — `agent` for an unpromoted draft. */
+  readonly actorKind: ReviewEvent["actor"]["kind"];
+  /** The seq of a `draft.promoted` authorizing it, or `undefined`. */
+  readonly promotedAtSeq: number | undefined;
+}
+
+/** Derive every thread's `ThreadLifecycleState` from the log. Exported
+ * so the daemon's reconciler and promote route read the same rule the
+ * rail's draft list is built from. */
+export function reduceThreadLifecycleStates(
+  events: readonly ReviewEvent[],
+): ReadonlyMap<string, ThreadLifecycleState> {
+  const states = new Map<string, ThreadLifecycleState>();
+  for (const event of [...events].sort((a, b) => a.seq - b.seq)) {
+    if (event.kind === "thread.resolved" || event.kind === "thread.reopened") {
+      const target = event.kind === "thread.resolved" ? "resolve" : "reopen";
+      // A later lifecycle change REPLACES the state outright, dropping
+      // any promotion the earlier one carried — the supersession rule.
+      states.set(event.threadId, {
+        threadId: event.threadId,
+        target,
+        desiredResolved: target === "resolve",
+        atSeq: event.seq,
+        actorKind: event.actor.kind,
+        promotedAtSeq: undefined,
+      });
+      continue;
+    }
+    if (event.kind !== "draft.promoted" || event.target === "comment") continue;
+    const state = states.get(event.threadId);
+    if (state === undefined || state.target !== event.target) continue;
+    if (event.seq <= state.atSeq) continue;
+    states.set(event.threadId, { ...state, promotedAtSeq: event.seq });
+  }
+  return states;
+}
+
 /** An agent-authored reply / resolve / reopen that no reviewer has
  * promoted into the pending GitHub review yet (issue #70, option B).
  *
  * These are the drafts the rail badges as "agent draft — not on
  * GitHub" and offers to promote. Derived from the log like everything
- * else in this view: an agent-authored comment or lifecycle event with
- * no LATER `draft.promoted` naming it. A second agent draft on the
- * same thread after a promotion is a new entry, so the rail shows the
- * reviewer exactly the drafts still awaiting their decision. */
+ * else in this view: an agent-authored comment, or an agent-authored
+ * lifecycle change (see `reduceThreadLifecycleStates`) that no later
+ * `draft.promoted` authorizes. Ordered by the seq of the event that
+ * authored the draft. */
 export interface AgentDraft {
   /** The thread the draft belongs to. */
   readonly threadId: string;
@@ -201,19 +266,18 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
   const commentThread = new Map<string, string>();
   // commentId → last sync state (mutated as we replay).
   const syncState = new Map<string, CommentSyncState>();
-  // Issue #70: the agent-draft ledger. A draft is REGISTERED when an
-  // agent authors it (a comment, or a resolve/reopen on a thread) and
-  // RETIRED when a later `draft.promoted` names that same draft. Both
-  // sides are keyed by the draft's own identity, so a promotion of one
-  // comment on a thread never retires the thread's other drafts.
-  const agentDrafts = new Map<string, AgentDraft>();
+  // Issue #70: the agent-draft ledger for COMMENTS, keyed by the
+  // draft's own identity and carrying the seq that authored it. A
+  // comment draft is REGISTERED when an agent authors it and RETIRED
+  // when a later `draft.promoted` names it; promoting one comment of a
+  // thread never retires the thread's other drafts. LIFECYCLE drafts
+  // come from `reduceThreadLifecycleStates` after the walk — the SAME
+  // derivation the daemon's reconciler and promote route read, so one
+  // rule has one implementation.
+  const commentDrafts = new Map<string, { readonly atSeq: number; readonly draft: AgentDraft }>();
   // threadId → the path its opening comment anchored on. A reply and a
   // resolve/reopen all belong to that thread, so all three inherit it.
   const threadPath = new Map<string, string>();
-  // `${threadId} target` -> the seq of the lifecycle event that
-  // registered the draft, so a promotion can prove it is LATER than
-  // the draft it retires.
-  const lifecycleDraftSeq = new Map<string, number>();
 
   for (const event of ordered) {
     switch (event.kind) {
@@ -221,12 +285,12 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
         commentPath.set(event.commentId, event.anchor.path);
         commentThread.set(event.commentId, event.threadId);
         threadPath.set(event.threadId, event.anchor.path);
-        registerAgentDraft(agentDrafts, event, event.anchor.path);
+        registerAgentDraft(commentDrafts, event, event.anchor.path);
         break;
       }
       case "comment.replied": {
         commentThread.set(event.commentId, event.threadId);
-        registerAgentDraft(agentDrafts, event, threadPath.get(event.threadId) ?? "");
+        registerAgentDraft(commentDrafts, event, threadPath.get(event.threadId) ?? "");
         break;
       }
       case "review.opened": {
@@ -422,44 +486,20 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
         }
         break;
       }
-      case "thread.resolved":
-      case "thread.reopened": {
-        // An AGENT's lifecycle change is a draft, not an intent: it
-        // changes local state and nothing else until a reviewer
-        // promotes it (issue #70). A reviewer's own change is not a
-        // draft at all — the existing mirror path already authorizes
-        // it.
-        if (event.actor.kind !== "agent") break;
-        const target = event.kind === "thread.resolved" ? "resolve" : "reopen";
-        const key = `${event.threadId} ${target}`;
-        // The thread's CURRENT lifecycle draft supersedes the other
-        // one: an agent resolve that was never promoted is no longer a
-        // draft once the thread is reopened — there is nothing left to
-        // resolve on GitHub.
-        const superseded = `${event.threadId} ${target === "resolve" ? "reopen" : "resolve"}`;
-        agentDrafts.delete(superseded);
-        lifecycleDraftSeq.delete(superseded);
-        agentDrafts.set(key, {
-          threadId: event.threadId,
-          target,
-          path: threadPath.get(event.threadId) ?? "",
-        });
-        lifecycleDraftSeq.set(key, event.seq);
-        break;
-      }
       case "draft.promoted": {
-        if (event.target === "comment") {
-          agentDrafts.delete(`comment ${event.commentId ?? ""}`);
-          break;
-        }
-        const key = `${event.threadId} ${event.target}`;
-        const registeredAt = lifecycleDraftSeq.get(key);
+        // Only a COMMENT promotion retires anything here: the
+        // lifecycle half is derived once after the walk, from the
+        // shared rule, so there is one implementation of "which
+        // lifecycle change is current, and has it been promoted".
+        if (event.target !== "comment") break;
+        const key = `comment ${event.commentId ?? ""}`;
+        const registered = commentDrafts.get(key);
         // Retire the draft this promotion names — and only if the
         // promotion is LATER than the draft. A promotion recorded
         // before the draft it claims (only reachable through a
         // hand-built log) leaves the draft unpromoted.
-        if (registeredAt !== undefined && event.seq > registeredAt) {
-          agentDrafts.delete(key);
+        if (registered !== undefined && event.seq > registered.atSeq) {
+          commentDrafts.delete(key);
         }
         break;
       }
@@ -503,14 +543,35 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
     return rest;
   });
 
-  // Issue #70: insertion order is authoring order, so the rail lists
-  // the drafts in the sequence the agent wrote them.
+  // Issue #70: lifecycle drafts come from the SHARED derivation, so a
+  // superseded resolve is gone here for the same reason the daemon's
+  // reconciler will not fire it (issue #70 review, finding 2).
+  const lifecycleDrafts: Array<{ readonly atSeq: number; readonly draft: AgentDraft }> = [];
+  for (const state of reduceThreadLifecycleStates(ordered).values()) {
+    // An AGENT's lifecycle change is a draft until a reviewer promotes
+    // it; a reviewer's own change is not a draft at all (the existing
+    // mirror path already authorizes it).
+    if (state.actorKind !== "agent" || state.promotedAtSeq !== undefined) continue;
+    lifecycleDrafts.push({
+      atSeq: state.atSeq,
+      draft: {
+        threadId: state.threadId,
+        target: state.target,
+        path: threadPath.get(state.threadId) ?? "",
+      },
+    });
+  }
+
+  // Ordering is by the seq that AUTHORED each draft, so the rail lists
+  // them in the sequence the agent wrote them. Comment drafts first at
+  // equal seq is impossible (seqs are unique), so the merge is total.
+  const allDrafts = [...commentDrafts.values(), ...lifecycleDrafts].sort((a, b) => a.atSeq - b.atSeq);
   return {
     openPending,
     terminal: terminalWithoutSeq,
     commentSync: syncState,
     unsyncedCommentIds,
-    agentDrafts: [...agentDrafts.values()],
+    agentDrafts: allDrafts.map((entry) => entry.draft),
   };
 }
 
@@ -519,16 +580,19 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
  * comment of a thread never disturbs the thread's other drafts, and a
  * second agent reply after a promotion is a fresh entry. */
 function registerAgentDraft(
-  drafts: Map<string, AgentDraft>,
+  drafts: Map<string, { readonly atSeq: number; readonly draft: AgentDraft }>,
   event: Extract<ReviewEvent, { kind: "comment.created" | "comment.replied" }>,
   path: string,
 ): void {
   if (event.actor.kind !== "agent") return;
   drafts.set(`comment ${event.commentId}`, {
-    threadId: event.threadId,
-    target: "comment",
-    commentId: event.commentId,
-    path,
+    atSeq: event.seq,
+    draft: {
+      threadId: event.threadId,
+      target: "comment",
+      commentId: event.commentId,
+      path,
+    },
   });
 }
 

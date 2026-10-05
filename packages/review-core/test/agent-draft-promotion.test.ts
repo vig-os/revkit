@@ -16,6 +16,7 @@ import { describe, expect, test } from "bun:test";
 import {
   emptyLogState,
   reduceReviewState,
+  reduceThreadLifecycleStates,
   reviewEventSchema,
   validateNext,
   type LogState,
@@ -114,6 +115,43 @@ describe("draft.promoted — the trust rule lives in the log, not only in the ro
     expect(result.rejection.kind).toBe("unknown-comment");
   });
 
+  test("a promoted lifecycle change must be the thread's CURRENT one, and agent-authored", () => {
+    // The asymmetry the review named (§5): the comment arm checked
+    // authorship; the lifecycle arm did not. Both are checked now.
+    const superseded = withValidated([
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+      { seq: 3, ts: t, actor: agentActor, kind: "thread.reopened", threadId: "th-1" },
+    ]);
+    const stale = validateNext(superseded, promoted(4, { threadId: "th-1", target: "resolve" }));
+    expect(stale.ok).toBe(false);
+    if (stale.ok) return;
+    expect(stale.rejection.kind).toBe("not-an-agent-draft");
+
+    const reviewerOwn = withValidated([
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: localActor, kind: "thread.resolved", threadId: "th-1" },
+    ]);
+    const own = validateNext(reviewerOwn, promoted(3, { threadId: "th-1", target: "resolve" }));
+    expect(own.ok).toBe(false);
+    if (own.ok) return;
+    expect(own.rejection.kind).toBe("not-an-agent-draft");
+
+    const noLifecycle = withValidated([localComment(1, "th-1", "c-1")]);
+    const none = validateNext(noLifecycle, promoted(2, { threadId: "th-1", target: "resolve" }));
+    expect(none.ok).toBe(false);
+    if (none.ok) return;
+    expect(none.rejection.kind).toBe("not-an-agent-draft");
+
+    const current = withValidated([
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+    ]);
+    expect(validateNext(current, promoted(3, { threadId: "th-1", target: "resolve" })).ok).toBe(true);
+    // Promoting the OTHER target of a current change is refused.
+    expect(validateNext(current, promoted(3, { threadId: "th-1", target: "reopen" })).ok).toBe(false);
+  });
+
   test("a reviewer promoting an agent draft is accepted", () => {
     const state = withValidated([
       agentComment(1, "th-1", "c-1"),
@@ -206,5 +244,82 @@ describe("reduceReviewState — agentDrafts", () => {
     expect(state.agentDrafts).toEqual([
       { threadId: "th-1", target: "comment", commentId: "c-1", path: "docs/index.md" },
     ]);
+  });
+
+  test("a promotion recorded BEFORE the change it claims authorizes nothing", () => {
+    // Only reachable through a hand-built log (the route always
+    // promotes after the change exists), and the derivation must
+    // refuse it rather than retire a draft it never touched.
+    const state = reduceReviewState([
+      localComment(1, "th-1", "c-1"),
+      promoted(2, { threadId: "th-1", target: "resolve" }),
+      { seq: 3, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+    ]);
+    expect(state.agentDrafts).toEqual([{ threadId: "th-1", target: "resolve", path: "docs/index.md" }]);
+    expect(reduceThreadLifecycleStates([
+      localComment(1, "th-1", "c-1"),
+      promoted(2, { threadId: "th-1", target: "resolve" }),
+      { seq: 3, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+    ]).get("th-1")?.promotedAtSeq).toBeUndefined();
+  });
+});
+
+describe("reduceThreadLifecycleStates — the ONE supersession rule (issue #70 review, finding 2)", () => {
+  test("the last lifecycle change is the thread's current one, whoever authored it", () => {
+    const states = reduceThreadLifecycleStates([
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+      { seq: 3, ts: t, actor: localActor, kind: "thread.reopened", threadId: "th-1" },
+    ]);
+    expect(states.get("th-1")).toEqual({
+      threadId: "th-1",
+      target: "reopen",
+      desiredResolved: false,
+      atSeq: 3,
+      actorKind: "local",
+      promotedAtSeq: undefined,
+    });
+  });
+
+  test("a PROMOTED resolve superseded by a later reopen is NOT promoted — the writer's rule", () => {
+    // This is the reconciler's input. If `promotedAtSeq` were set here,
+    // `reconcileThreadStateIntents` would resolve a thread that is open.
+    const events: ReviewEvent[] = [
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+      promoted(3, { threadId: "th-1", target: "resolve" }),
+      { seq: 4, ts: t, actor: agentActor, kind: "thread.reopened", threadId: "th-1" },
+    ];
+    const state = reduceThreadLifecycleStates(events).get("th-1");
+    expect(state?.target).toBe("reopen");
+    expect(state?.actorKind).toBe("agent");
+    expect(state?.promotedAtSeq).toBeUndefined();
+    // And the draft list shows the reopen, not the retired resolve.
+    expect(reduceReviewState(events).agentDrafts).toEqual([
+      { threadId: "th-1", target: "reopen", path: "docs/index.md" },
+    ]);
+  });
+
+  test("promoting the REOPEN after the reopen works, and the resolve never comes back", () => {
+    const events: ReviewEvent[] = [
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+      promoted(3, { threadId: "th-1", target: "resolve" }),
+      { seq: 4, ts: t, actor: agentActor, kind: "thread.reopened", threadId: "th-1" },
+      promoted(5, { threadId: "th-1", target: "reopen" }),
+    ];
+    const state = reduceThreadLifecycleStates(events).get("th-1");
+    expect(state?.promotedAtSeq).toBe(5);
+    expect(state?.desiredResolved).toBe(false);
+    expect(reduceReviewState(events).agentDrafts).toEqual([]);
+  });
+
+  test("a promotion for the OTHER target never authorizes the current one", () => {
+    const events: ReviewEvent[] = [
+      localComment(1, "th-1", "c-1"),
+      { seq: 2, ts: t, actor: agentActor, kind: "thread.resolved", threadId: "th-1" },
+      promoted(3, { threadId: "th-1", target: "reopen" }),
+    ];
+    expect(reduceThreadLifecycleStates(events).get("th-1")?.promotedAtSeq).toBeUndefined();
   });
 });

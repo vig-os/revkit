@@ -59,10 +59,14 @@
 //                      authored draft to their own pending review.
 //                      The actor must be `local` (`invalid-actor`) —
 //                      the agent bearer can author a draft but can
-//                      never record that it was promoted — and the
+//                      never record that it was promoted — the named
 //                      draft must actually be agent-authored
 //                      (`not-an-agent-draft`), so the event can never
-//                      claim a human's own comment was promoted.
+//                      claim a human's own comment was promoted, and a
+//                      lifecycle target must be the thread's CURRENT
+//                      change (also `not-an-agent-draft`), so a
+//                      promotion cannot authorize a resolve the thread
+//                      has since reopened.
 //
 // State (`LogState`) is mutated on success — cheap and equivalent to a
 // functional model for the small maps we keep. Store implementations
@@ -96,6 +100,13 @@ export interface LogState {
       resumeStatus?: "open" | "orphaned";
       readonly path: string;
       readonly commentIds: Set<string>;
+      /** Set by the LAST `thread.resolved` / `thread.reopened` for
+       * this thread: which change it was, and who authored it. Issue
+       * #70: `draft.promoted` with a lifecycle target may only name a
+       * change an agent made, and may only name the one that is
+       * CURRENT — a promotion recorded against a superseded resolve is
+       * refused here as well as at the route. */
+      lifecycle?: { readonly target: "resolve" | "reopen"; readonly actorKind: string };
     }
   >;
   /** commentId → threadId. Global (across threads) so a duplicate
@@ -161,6 +172,7 @@ export function cloneLogState(state: LogState): LogState {
       resumeStatus?: "open" | "orphaned";
       path: string;
       commentIds: Set<string>;
+      lifecycle?: { readonly target: "resolve" | "reopen"; readonly actorKind: string };
     }
   >();
   for (const [id, entry] of state.threads) {
@@ -169,6 +181,7 @@ export function cloneLogState(state: LogState): LogState {
       ...(entry.resumeStatus !== undefined ? { resumeStatus: entry.resumeStatus } : {}),
       path: entry.path,
       commentIds: new Set(entry.commentIds),
+      ...(entry.lifecycle !== undefined ? { lifecycle: { ...entry.lifecycle } } : {}),
     });
   }
   const asks = new Map<string, { spec: Ask; status: AskStatus }>();
@@ -375,6 +388,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       }
       thread.resumeStatus = thread.status;
       thread.status = "resolved";
+      thread.lifecycle = { target: "resolve", actorKind: event.actor.kind };
       return { ok: true };
     }
     case "thread.reopened": {
@@ -394,6 +408,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       // Falls back to `open` for logs from before this field existed.
       thread.status = thread.resumeStatus ?? "open";
       thread.resumeStatus = undefined;
+      thread.lifecycle = { target: "reopen", actorKind: event.actor.kind };
       return { ok: true };
     }
     case "thread.external_synced": {
@@ -765,7 +780,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       return { ok: true };
     }
     case "draft.promoted": {
-      // Issue #70. Two independent guarantees, both enforced HERE so
+      // Issue #70. Three independent guarantees, all enforced HERE so
       // they hold for every store backing and every writer — not only
       // for the daemon route that happens to check them first.
       if (event.actor.kind !== "local") {
@@ -819,6 +834,39 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
             },
           };
         }
+        return { ok: true };
+      }
+      // Lifecycle targets close the asymmetry the comment arm above
+      // does not have (issue #70 review, finding in §5): the log now
+      // checks that the named change is agent-authored AND is the
+      // thread's CURRENT one, so a `draft.promoted` cannot authorize a
+      // resolve the thread has since reopened — the same rule the route,
+      // the reconciler and the rail's draft list read.
+      const lifecycle = thread.lifecycle;
+      if (lifecycle === undefined || lifecycle.target !== event.target) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-an-agent-draft",
+            threadId: event.threadId,
+            message:
+              `draft.promoted: thread '${event.threadId}' has no current '${event.target}' to promote ` +
+              `(its latest lifecycle change is ${lifecycle === undefined ? "none" : `'${lifecycle.target}'`}) — ` +
+              `a superseded lifecycle change has nothing left to write to GitHub.`,
+          },
+        };
+      }
+      if (lifecycle.actorKind !== "agent") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "not-an-agent-draft",
+            threadId: event.threadId,
+            message:
+              `draft.promoted: the current '${event.target}' on thread '${event.threadId}' was authored by ` +
+              `'${lifecycle.actorKind}', not an agent — there is no agent draft to promote.`,
+          },
+        };
       }
       return { ok: true };
     }

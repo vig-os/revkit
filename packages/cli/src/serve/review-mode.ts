@@ -50,6 +50,7 @@ import {
   isPendingReviewStale,
   reanchor,
   reduceReviewState,
+  reduceThreadLifecycleStates,
   revisionOf,
 } from "@revkit/review-core";
 
@@ -1044,20 +1045,31 @@ export type DraftToPromote =
       readonly comment: Thread["comments"][number];
       /** True when the draft is a REPLY — the reconciler posts it
        * through `addReviewThreadThreadReply` against
-       * `thread.external.threadId` rather than opening a new draft. */
+       * `thread.external.threadId` rather than opening a new draft.
+       * Narrowing this flag also narrows `replyThreadNodeId`, so the
+       * caller never has to re-narrow or cast `thread.external`. */
       readonly reply: boolean;
-      /** True when a `draft.promoted` for this exact draft is already
-       * in the log, i.e. a promotion that crashed before (or during)
-       * its reconcile. The caller re-runs the reconcile instead of
-       * appending a second promotion. */
-      readonly alreadyPromoted: boolean;
+      /** The GitHub thread node a reply posts into. Present iff
+       * `reply` — `findDraftToPromote` refuses a reply on a thread with
+       * no GitHub origin before getting here. */
+      readonly replyThreadNodeId?: string;
+      /** The seq of the `draft.promoted` already in the log for this
+       * exact draft, or `undefined` when the reviewer has not promoted
+       * it yet. Two halves of crash recovery read this: the caller skips
+       * a second promotion when it is set, and still appends the
+       * missing intent when `intentRecorded` is false. */
+      readonly promotedAtSeq: number | undefined;
+      /** True when the machine intent (`comment.sync_requested`) is
+       * already in the log. A promotion whose intent append was lost is
+       * `promotedAtSeq` set + this false, and the caller repairs it. */
+      readonly intentRecorded: boolean;
     }
   | {
       /** An agent-authored resolve/reopen to promote. */
       readonly kind: "lifecycle";
       readonly thread: Thread;
       readonly desiredResolved: boolean;
-      readonly alreadyPromoted: boolean;
+      readonly promotedAtSeq: number | undefined;
     };
 
 /** Resolve a `POST /api/review/promote` body to the draft it names
@@ -1092,7 +1104,6 @@ export async function findDraftToPromote(input: {
   if (thread === undefined) {
     return { ok: false, error: "unknown-thread", detail: `thread '${input.threadId}' is not in the log.` };
   }
-  const promotedKeys = promotedDraftKeys(events);
   if (input.target === "comment") {
     const commentId = input.commentId ?? "";
     const comment = thread.comments.find((entry) => entry.id === commentId);
@@ -1108,7 +1119,10 @@ export async function findDraftToPromote(input: {
       };
     }
     const reply = !events.some((event) => event.kind === "comment.created" && event.commentId === commentId);
-    if (reply && thread.external?.provider !== "github") {
+    // Narrowing here is what lets the caller build a reply intent
+    // without re-narrowing (or casting) `thread.external`.
+    const githubThreadId = thread.external?.provider === "github" ? thread.external.threadId : undefined;
+    if (reply && githubThreadId === undefined) {
       return {
         ok: false,
         error: "no-github-thread",
@@ -1122,27 +1136,32 @@ export async function findDraftToPromote(input: {
         thread,
         comment,
         reply,
-        alreadyPromoted: promotedKeys.has(`comment ${commentId}`),
+        ...(githubThreadId !== undefined ? { replyThreadNodeId: githubThreadId } : {}),
+        promotedAtSeq: promotionSeqFor(events, { threadId: thread.id, target: "comment", ...(commentId !== "" ? { commentId } : {}) }),
+        intentRecorded: intentRecordedFor(events, commentId),
       },
     };
   }
-  const resolvedThread = thread.status === "resolved";
-  if (input.target === "resolve" && !resolvedThread) {
+  // The lifecycle arm reads the SAME shared derivation the rail's draft
+  // list and `reconcileThreadStateIntents` read, so "which change is
+  // this thread's current one, and has it been promoted" has exactly
+  // one implementation (issue #70 review, finding 2).
+  const lifecycle = reduceThreadLifecycleStates(events).get(input.threadId);
+  if (lifecycle === undefined) {
     return {
       ok: false,
       error: "stale-lifecycle-draft",
-      detail: `thread '${thread.id}' is '${thread.status}', not 'resolved' — there is no resolve to promote.`,
+      detail: `thread '${thread.id}' has no lifecycle change on the log to promote.`,
     };
   }
-  if (input.target === "reopen" && resolvedThread) {
+  if (lifecycle.target !== input.target) {
     return {
       ok: false,
       error: "stale-lifecycle-draft",
-      detail: `thread '${thread.id}' is 'resolved', not open — there is no reopen to promote.`,
+      detail: `thread '${thread.id}' currently carries a '${lifecycle.target}'${lifecycle.actorKind === "local" ? " of the reviewer's own" : ""}, not a '${input.target}' — there is no '${input.target}' to promote.`,
     };
   }
-  const lifecycleActor = latestLifecycleActor(events, thread.id);
-  if (lifecycleActor !== "agent") {
+  if (lifecycle.actorKind !== "agent") {
     return {
       ok: false,
       error: "not-an-agent-draft",
@@ -1161,23 +1180,43 @@ export async function findDraftToPromote(input: {
     draft: {
       kind: "lifecycle",
       thread,
-      desiredResolved: input.target === "resolve",
-      alreadyPromoted: promotedKeys.has(`${thread.id} ${input.target}`),
+      desiredResolved: lifecycle.desiredResolved,
+      promotedAtSeq: lifecycle.promotedAtSeq,
     },
   };
 }
 
-/** The keys of every `draft.promoted` already in the log, in the same
- * `key` shape the reducer's agent-draft ledger uses. */
-function promotedDraftKeys(events: readonly ReviewEvent[]): Set<string> {
-  const keys = new Set<string>();
-  for (const event of events) {
-    if (event.kind !== "draft.promoted") continue;
-    keys.add(
-      event.target === "comment" ? `comment ${event.commentId ?? ""}` : `${event.threadId} ${event.target}`,
-    );
+/** The seq of the `draft.promoted` that names this exact draft, or
+ * `undefined`. Matches on the draft's own identity — and, for a
+ * lifecycle target, only when the shared derivation still considers
+ * that change current, so a promotion the log has but that a later
+ * opposite lifecycle change superseded does NOT count as promoted
+ * (the reviewer may promote the replacement instead). */
+function promotionSeqFor(
+  events: readonly ReviewEvent[],
+  draft: { readonly threadId: string; readonly target: "comment" | "resolve" | "reopen"; readonly commentId?: string },
+): number | undefined {
+  if (draft.target !== "comment") {
+    return reduceThreadLifecycleStates(events).get(draft.threadId)?.promotedAtSeq;
   }
-  return keys;
+  const commentId = draft.commentId ?? "";
+  let promoted: number | undefined;
+  for (const event of events) {
+    if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
+    if ((event.commentId ?? "") !== commentId) continue;
+    if (promoted === undefined || event.seq > promoted) promoted = event.seq;
+  }
+  return promoted;
+}
+
+/** True when the machine intent for this comment (`comment.sync_requested`)
+ * is already in the log. A promotion that landed without its intent is
+ * `promotedAtSeq` set and this false — the state a retry repairs. */
+function intentRecordedFor(events: readonly ReviewEvent[], commentId: string): boolean {
+  return events.some(
+    (event) =>
+      (event.kind === "comment.sync_requested" || event.kind === "comment.linked") && event.commentId === commentId,
+  );
 }
 
 /** The actor kind that authored a comment (`comment.created` /
@@ -1189,18 +1228,6 @@ function commentAuthorKind(
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]!;
     if ((event.kind === "comment.created" || event.kind === "comment.replied") && event.commentId === commentId) {
-      return event.actor.kind;
-    }
-  }
-  return undefined;
-}
-
-/** The actor kind behind a thread's CURRENT resolved/open state — the
- * last `thread.resolved` / `thread.reopened` in the log. */
-function latestLifecycleActor(events: readonly ReviewEvent[], threadId: string): ReviewEvent["actor"]["kind"] | undefined {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i]!;
-    if ((event.kind === "thread.resolved" || event.kind === "thread.reopened") && event.threadId === threadId) {
       return event.actor.kind;
     }
   }

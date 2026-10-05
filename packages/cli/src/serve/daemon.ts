@@ -43,6 +43,7 @@ import {
   type CommentSyncState,
   type HandoverTrigger,
   isLineAnchor,
+  reduceThreadLifecycleStates,
   type ReviewEvent,
   type ReviewEventInput,
   type ReviewState,
@@ -61,6 +62,7 @@ import {
   reanchorPendingReviewAtNewHead,
   reconcile,
   unsyncedCount,
+  type DraftToPromote,
   type ReviewModeHandle,
   type ReviewModeOptions,
 } from "./review-mode.ts";
@@ -341,6 +343,38 @@ interface PromoteOutcome {
   readonly reviewNodeId: string | null;
   readonly newlySynced?: readonly string[];
   readonly newlyFailed?: ReadonlyArray<{ readonly commentId: string; readonly reason: string }>;
+}
+
+/** Compose the REPLY intent for an agent reply the reviewer is
+ * promoting, from the thread node `findDraftToPromote` already
+ * narrowed — no cast of `thread.external` is needed here or at the
+ * call site, and the shape is the one `mirrorReplyToGitHubThread`
+ * records for the reviewer's own replies: the remote thread to post
+ * into, the outgoing body's hash, and the node ids observed before the
+ * intent (so a retry can tell an accepted-but-response-lost reply from
+ * a pre-accept failure). */
+async function buildReplySyncRequestForDraft(
+  draft: Extract<DraftToPromote, { readonly kind: "comment" }>,
+  actor: Author,
+): Promise<ReviewEventInput> {
+  if (draft.replyThreadNodeId === undefined) {
+    throw new Error(
+      "buildReplySyncRequestForDraft: a reply draft must carry the thread node findDraftToPromote narrowed.",
+    );
+  }
+  return {
+    kind: "comment.sync_requested",
+    actor,
+    commentId: draft.comment.id,
+    path: draft.thread.anchor.path,
+    subjectType: "FILE",
+    bodyHash: await revisionOf(draft.comment.body),
+    replyThreadNodeId: draft.replyThreadNodeId,
+    knownCommentNodeIds: draft.thread.comments.flatMap((comment) => {
+      const nodeId = comment.external?.github?.nodeId;
+      return nodeId === undefined ? [] : [nodeId];
+    }),
+  };
 }
 
 /** Compose the top-level draft intent for an agent draft the reviewer
@@ -2305,7 +2339,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         "there is no open pending review to promote into — comment first, then promote.",
       );
     }
-    const found = await findDraftToPromote({
+const found = await findDraftToPromote({
       store,
       threadId: request.threadId,
       target: request.target,
@@ -2315,7 +2349,34 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       throw new PromoteRefused(409, found.error, found.detail);
     }
     const draft = found.draft;
-    const promoted = !draft.alreadyPromoted;
+    const promoted = draft.promotedAtSeq === undefined;
+
+    // (c) Build the machine intent BEFORE any append. Everything that
+    // can refuse this promotion is decided by now, so the log never
+    // records an authorization for a promotion that did not happen
+    // (issue #70 review, finding 1). `draft.promoted` retires the draft
+    // from `agentDrafts`, so an append followed by a refusal left the
+    // comment unreachable AND permanently unattached.
+    const intent =
+      draft.kind === "lifecycle"
+        ? undefined
+        : draft.reply
+          ? await buildReplySyncRequestForDraft(draft, actor)
+          : await buildSyncRequestForDraft(review, draft.thread.anchor, draft.comment.id, draft.comment.body, actor);
+    if (draft.kind === "comment" && intent === undefined) {
+      throw new PromoteRefused(
+        409,
+        "promote-mapping-orphan",
+        "the draft's anchor no longer maps to a GitHub comment position — orphan it on the thread first.",
+      );
+    }
+
+    // (d) Record the human act, then the intent. The two appends are
+    // ordered so that ANY crash between them is recoverable by a retry:
+    // the promotion alone retires the draft but authorizes nothing, and
+    // the retry below recognises `alreadyPromoted` and still appends the
+    // missing intent (an intent is idempotent — the reconciler
+    // fingerprints it, so re-appending changes nothing that matters).
     if (promoted) {
       await appendReviewLifecycleEvent(
         {
@@ -2348,30 +2409,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         reviewNodeId: state.openPending.reviewNodeId,
       };
     }
-    if (promoted) {
-      const body = draft.comment.body;
-      const intent = draft.reply
-        ? {
-            kind: "comment.sync_requested" as const,
-            actor,
-            commentId: draft.comment.id,
-            path: draft.thread.anchor.path,
-            subjectType: "FILE" as const,
-            bodyHash: await revisionOf(body),
-            replyThreadNodeId: (draft.thread.external as { threadId: string }).threadId,
-            knownCommentNodeIds: draft.thread.comments.flatMap((comment) => {
-              const nodeId = comment.external?.github?.nodeId;
-              return nodeId === undefined ? [] : [nodeId];
-            }),
-          }
-        : await buildSyncRequestForDraft(review, draft.thread.anchor, draft.comment.id, body, actor);
-      if (intent === undefined) {
-        throw new PromoteRefused(
-          409,
-          "promote-mapping-orphan",
-          `the draft's anchor no longer maps to a GitHub comment position — orphan it on the thread first.`,
-        );
-      }
+    if (intent !== undefined && !draft.intentRecorded) {
       await appendReviewLifecycleEvent(intent, requestId);
     }
     const outcome = await reconcile({
@@ -2408,36 +2446,43 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   ): Promise<void> {
     const events = await store.since(0);
     const pending = new Map<string, { readonly desiredResolved: boolean; readonly intentSeq: number }>();
-    // Issue #70: an AGENT's resolve/reopen is an intent only once a
-    // LATER `draft.promoted` authorizes it; the promotion's own seq is
-    // the intent's identity, so the matching `thread.external_synced`
-    // that completes it is correlated exactly like a reviewer's own
-    // resolve. An unpromoted agent lifecycle change never enters this
-    // map, so it can never reach the adapter.
-    const promotedLifecycle = new Map<string, number>();
-    for (const event of events) {
-      if (event.kind !== "draft.promoted" || event.target === "comment") continue;
-      promotedLifecycle.set(`${event.threadId} ${event.target}`, event.seq);
-    }
-    for (const event of events) {
-      if (event.kind === "thread.resolved" || event.kind === "thread.reopened") {
-        const desiredResolved = event.kind === "thread.resolved";
-        if (event.actor.kind === "local") {
-          pending.set(event.threadId, { desiredResolved, intentSeq: event.seq });
-          continue;
-        }
-        if (event.actor.kind !== "agent") continue;
-        const promotedAt = promotedLifecycle.get(`${event.threadId} ${desiredResolved ? "resolve" : "reopen"}`);
-        if (promotedAt !== undefined && promotedAt > event.seq) {
-          pending.set(event.threadId, { desiredResolved, intentSeq: promotedAt });
-        }
+    // Issue #70: WHICH lifecycle change is this thread's current one,
+    // and is it authorized, comes from the SHARED derivation
+    // (`reduceThreadLifecycleStates`) — the same one the rail's draft
+    // list and `findDraftToPromote` read. Three implementations of one
+    // rule is how a promoted resolve came to be fired for a thread that
+    // had since been reopened (issue #70 review, finding 2), so there is
+    // one now and the reconciler reads it.
+    //
+    // The two arms differ only in what authorizes the write:
+    //   - `local`: the reviewer's own resolve/reopen, which has always
+    //     been authorized. `intentSeq` is the change's own seq, so the
+    //     matching `thread.external_synced` correlates exactly as
+    //     before (round-4 fix).
+    //   - `agent`: authorized only by a LATER `draft.promoted`, whose
+    //     seq becomes the `intentSeq`. An unpromoted agent change has
+    //     no intent at all, so it can never reach the adapter.
+    // A later lifecycle change of EITHER kind supersedes the earlier
+    // one, including a promoted resolve the agent then reopened.
+    for (const state of reduceThreadLifecycleStates(events).values()) {
+      if (state.actorKind === "local") {
+        pending.set(state.threadId, { desiredResolved: state.desiredResolved, intentSeq: state.atSeq });
         continue;
       }
-      if (event.kind === "thread.external_synced" && event.intentSeq !== undefined) {
-        const intent = pending.get(event.threadId);
-        if (intent?.intentSeq === event.intentSeq && intent.desiredResolved === event.resolved) {
-          pending.delete(event.threadId);
-        }
+      if (state.actorKind === "agent" && state.promotedAtSeq !== undefined) {
+        pending.set(state.threadId, {
+          desiredResolved: state.desiredResolved,
+          intentSeq: state.promotedAtSeq,
+        });
+      }
+    }
+    // A completion only clears the intent it was correlated to, so a
+    // delayed resolve cannot retire a newer reopen.
+    for (const event of events) {
+      if (event.kind !== "thread.external_synced" || event.intentSeq === undefined) continue;
+      const intent = pending.get(event.threadId);
+      if (intent?.intentSeq === event.intentSeq && intent.desiredResolved === event.resolved) {
+        pending.delete(event.threadId);
       }
     }
     if (pending.size === 0) return;

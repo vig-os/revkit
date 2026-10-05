@@ -387,13 +387,36 @@ async function promoteAgentDraft(input: {
     reason?: string;
   };
   if (!response.ok) {
-    throw new Error(
-      body.error === "no-open-pending-review"
-        ? "Cannot promote: your pending review was submitted or discarded. Comment on the PR to open a new one."
-        : `promote refused: ${body.error ?? response.status}`,
-    );
+    // Every refusal the route can return gets a sentence a reviewer can
+    // act on, not a code — including `promote-mapping-orphan`, which is a
+    // permanent outcome for a comment anchored outside the PR's diff
+    // (issue #70 review, §5).
+    throw new Error(promoteRefusalMessage(body.error, response.status));
   }
   return { ok: body.ok === true, promoted: body.promoted === true, ...(body.reason !== undefined ? { reason: body.reason } : {}) };
+}
+
+/** The reviewer's sentence for a refused promotion. An unrecognised
+ * code falls back to the code itself rather than inventing an
+ * explanation for a refusal we do not have wording for. */
+function promoteRefusalMessage(error: string | undefined, status: number): string {
+  switch (error) {
+    case "no-open-pending-review":
+      return "Cannot promote: your pending review was submitted or discarded. Comment on the PR to open a new one.";
+    case "promote-mapping-orphan":
+      return "Cannot promote: this comment is anchored outside the PR's diff, so it has no GitHub line to become a review comment on.";
+    case "no-github-thread":
+      return "Cannot promote: this thread has no GitHub origin, so there is nothing on the PR to attach to.";
+    case "not-an-agent-draft":
+      return "Cannot promote: that was your own comment or resolve, not the agent's draft.";
+    case "stale-lifecycle-draft":
+      return "Cannot promote: the agent has since changed this thread's resolve state, so that draft is no longer current.";
+    case "unknown-thread":
+    case "unknown-comment":
+      return "Cannot promote: that draft is no longer on this page.";
+    default:
+      return `promote refused: ${error ?? status}`;
+  }
 }
 
 /** Build the SHA-256 hex digest of the LF-normalised body — the
