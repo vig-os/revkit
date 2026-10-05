@@ -614,11 +614,19 @@ async function fetchRepoId(): Promise<string | undefined> {
 /** Fetch the FULL, unscoped list of thread ids so the prune
  * pass keeps marks for threads on OTHER pages. Issue #60
  * PR #62 round-3 review: pruning against the page-scoped
- * `threads()` wiped seen marks for every other page. */
+ * `threads()` wiped seen marks for every other page.
+ *
+ * `fields=id` asks the daemon for the id list alone, and that
+ * projection GATES the lazy re-anchor trigger (issue #67): the
+ * daemon re-anchors before serving a read that can return an
+ * anchor, and this one cannot. An unprojected fetch here — the
+ * shape this had on `dev` — fired a full `refreshAll()` on every
+ * rail mount, ~94% of the mount's daemon cost at 40 threaded
+ * paths, for anchors this pass discards. */
 async function fetchAllThreadIds(): Promise<readonly string[] | undefined> {
   try {
     const response = await fetch(
-      "/api/threads?status=" + encodeURIComponent("open,resolved,orphaned"),
+      "/api/threads?fields=id&status=" + encodeURIComponent("open,resolved,orphaned"),
       { credentials: "same-origin", headers: { accept: "application/json" } },
     );
     if (!response.ok) return undefined;
