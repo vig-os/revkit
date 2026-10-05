@@ -41,12 +41,13 @@
 //      **On Bun that watch is a `stat`-poll, not `fs.watch`** — see
 //      `buildWatchLeaksOnThisRuntime` below and issue #87. Bun 1.3.13
 //      does not release the descriptors `fs.watch` opens when the
-//      watcher is closed, so the poll trades up to
-//      `DEFAULT_BUILD_POLL_INTERVAL_MS` of detection latency for a
-//      leak-free teardown. The DEBOUNCE contract is unchanged: the
-//      settle timer restarts on every observed change and fires
-//      `refreshAll` once the tree has been quiet for
-//      `buildDebounceMs`.
+//      watcher is closed, so the poll trades detection latency for a
+//      leak-free teardown. ONE settled burst still yields ONE
+//      `refreshAll`, as the watcher did — but it takes an extra
+//      confirming poll interval to know a burst has settled, because a
+//      sample shorter than the settle window cannot coalesce two
+//      samples. See `installBuildPolling` for the exact contract and
+//      `DEFAULT_BUILD_POLL_INTERVAL_MS` for the latency it costs.
 //
 // **Justification.** Lazy alone would leave the rail stale until
 // the next fetch; the watchers close that gap on the interactive
@@ -129,29 +130,44 @@ export const DEFAULT_BUILD_REBIND_INTERVAL_MS = 2_000;
  *
  * This is the ONLY mechanism standing between a `revkit serve`
  * daemon and a `fs.watch(dist, {recursive: true})` that leaks one
- * descriptor per output file on Bun (see
- * `buildWatchLeaksOnThisRuntime`), so its cost is stated rather than
- * tuned away:
+ * descriptor per output file on Bun (see `buildWatchLeaksOnThisRuntime`),
+ * so its cost is stated rather than tuned away:
  *
- *   - **Latency.** A build's change is noticed up to this interval
- *     late, then `buildDebounceMs` (500 ms) of settle time elapses
- *     before `refreshAll` runs — the SAME settle window the
- *     `fs.watch` debounce used, so only the *detection* step is
- *     added, not a second debounce. Worst case a rebuild surfaces
- *     ~1 s later than it used to; the reviewer reloads and the lazy
- *     trigger has usually already re-anchored by then.
- *   - **CPU.** One `readdir`+`stat` walk of `dist/` per tick.
- *     Measured on this host: 0.07 ms for 52 entries, 1.11 ms for
- *     805, 11.4 ms for 6 409 (median of 25). At 1 s that is
- *     ≤ 1.1% of one core for a realistic Astro `dist`, and it is
- *     bounded by tree size, not by reviewer activity. (The same walk
- *     is what a single `fs.watch` did for free — this is the real
- *     price of the mitigation.)
+ *   - **Latency — this is the real price, and it is not one interval.**
+ *     A build is *observed* within `buildPollIntervalMs`, but it is
+ *     only known to have *settled* one interval after that: the settle
+ *     is armed only when a sample matches the previous one. So from the
+ *     last write, `refreshAll` runs after up to
+ *     `buildPollIntervalMs` (detect) + `buildPollIntervalMs` (confirm
+ *     stability) + `buildDebounceMs` (settle) = **2.5 s at the
+ *     defaults**, against 500 ms for the `fs.watch` debounce this
+ *     replaces. That extra interval is what buys "one settled burst is
+ *     one `refreshAll`"; a settle window shorter than the sample
+ *     interval cannot coalesce two samples, and paying that back in
+ *     duplicated passes is worse (measured: 5 passes for one 4 s build
+ *     before the confirming interval existed).
+ *   - **CPU, and it is a STALL, not background work.** One
+ *     `readdir`+`stat` walk of `dist/` per tick, run synchronously on
+ *     the daemon's event loop: the whole tick blocks. Measured on this
+ *     host, median of 25: 0.07 ms for 52 entries, 1.11 ms for 805,
+ *     11.4 ms for 6 409; over a 10 001-entry `dist`, median 19.1 ms,
+ *     p90 22.1 ms, max 30.0 ms. So the honest phrasing is "up to ~30 ms
+ *     of event-loop stall per tick on a very large build output", not
+ *     a percentage of a core — the daemon serves HTTP between ticks,
+ *     and a 19 ms pause on a 1 Hz tick is not free.
+ *   - **Allocation.** The snapshot is O(entries) per tick and is
+ *     rebuilt rather than diffed: 20 retained 10 001-entry snapshots
+ *     measured 40.07 MiB, i.e. ~2 MiB per tick, ~120 MiB/min of
+ *     short-lived garbage at 1 Hz. Linear in `dist` size, like the walk.
  *   - **What is given up.** Sub-second build-signal latency on Bun,
- *     and the ability of a kernel-level watch to see a write that
- *     lands between two ticks. Neither is load-bearing: trigger 1
- *     (the lazy `refresh` before every `/api/threads` read) is the
- *     correctness backstop and is untouched by this.
+ *     and a rewrite that preserves BOTH size and `mtimeMs` is invisible
+ *     to the next sample, where `fs.watch` would have fired — measured,
+ *     11 of 200 back-to-back same-size rewrites on ext4 produced an
+ *     identical snapshot key. Practical risk is small (sub-millisecond
+ *     window; real builds change size), but it is a class of miss the
+ *     kernel watch does not have. Neither loss is load-bearing:
+ *     trigger 1 (the lazy `refresh` before every `/api/threads` read)
+ *     is the correctness backstop and is untouched by this.
  *   - **What is bought.** On Bun the recursive watch costs one
  *     descriptor per file in the build output — measured at 103 for a
  *     100-file `dist`, 403 for 400, 1003 for 1000 — paid at start-up
@@ -177,19 +193,27 @@ export const DEFAULT_BUILD_POLL_INTERVAL_MS = 1_000;
  * keeps its inode alive after the tree is deleted.
  *
  * The count therefore scales with the watched tree, which is the part
- * that makes it matter. Over 20 `watch()`+`close()` pairs on a
+ * that makes it matter. Over 20 watch+close pairs on a
  * `dist/{index.html, _astro/}` fixture with N files under `_astro/`,
- * closing 50 ms after `watch()` (i.e. after the walk finishes):
+ * closing 50 ms after `watch()`, MEASURED THROUGH `startDaemon`/`stop`
+ * (the context every claim here is about) rather than through a bare
+ * `watch()`+`close()` loop:
  *
  *     N=0 -> 3    N=10 -> 13    N=100 -> 103    N=400 -> 403    N=1000 -> 1003
  *
- * i.e. exactly one per file. Closing in the same tick as `watch()`
- * leaks less (`1 + <immediate entries>` for this fixture: 3 rather
- * than 4), because the walk has not descended yet — so the leak is
- * scheduling-dependent but never absent. `recursive: false` behaves
- * the same way on the directory and its immediate entries, so
- * `recursive` is not the trigger and dropping it is not a workaround.
- * `node v24.21.0` leaks 0 over the identical loop.
+ * The harness matters and the distinction is not academic: a bare loop
+ * never gets the walk past the watched directory's immediate entries,
+ * so it measures a flat 3.00 per close for every N above, while a FLAT
+ * `dist` (N files directly in it) leaks 101.00 at 100 files and 1001.00
+ * at 1000 in either harness. What closes the gap is the time the
+ * watcher is allowed to live before `close()`: at 0 ms of dwell the
+ * walk has not descended and the daemon cycle leaks 3 rather than 4 on
+ * the two-level fixture. So the leak is scheduling-dependent and never
+ * absent — which is also why a measurement of it has to yield between
+ * iterations. `recursive: false` behaves the same way on the directory
+ * and its immediate entries, so `recursive` is not the trigger and
+ * dropping it is not a workaround. `node v24.21.0` leaks 0 over the
+ * identical loop.
  *
  * Only the BUILD watcher is switched to polling, and only because it
  * is the one that watches a whole tree recursively: for a real Astro
@@ -199,7 +223,19 @@ export const DEFAULT_BUILD_POLL_INTERVAL_MS = 1_000;
  * by `1 + <entries in that one directory>`, and issue #49's re-arm
  * contract is asserted through `dirWatchMode()`, which only
  * distinguishes `"watch"` from `"poll"`. Their residual leak is
- * tracked in #103. */
+ * tracked in #103.
+ *
+ * **Version guard — deliberately RUNTIME-wide, not pinned to a version.**
+ * The defect is measured on `bun 1.3.13`; this gate asks only "is this
+ * Bun?", so a future Bun that fixes `close()` would silently inherit
+ * the poll and its 2.5 s latency with nothing signalling it. That is
+ * the safer failure direction (a slower build signal, not a descriptor
+ * leak), and it is reversible in one edit: re-run the standalone repro
+ * in `.revkit/run/upstream-drafts/bun-fswatch-close-fd-leak.md` — it
+ * prints `per close=2` on a leaking runtime and `per close=0` on a
+ * fixed one — and if it prints 0, delete this constant and
+ * `installBuildPolling` and the poll goes away with no other change.
+ * #87 carries the measurement and the upstream draft. */
 const buildWatchLeaksOnThisRuntime = process.versions.bun !== undefined;
 
 /** How many CONSECUTIVE clean observations of a rebound directory the
@@ -1420,27 +1456,64 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * for every directory, so additions, removals, in-place rewrites and
    * a `dist` that appears or disappears are all one comparison.
    *
-   * The debounce contract is deliberately identical to the watcher's:
-   * every observed change RESTARTS the settle timer, and
-   * `refreshAll` runs once the tree has been quiet for
-   * `buildDebounceMs`. That makes a poll tick indistinguishable from
-   * a burst of kernel events for everything downstream — including
-   * the `rm -rf dist && just build` shape, which the watcher served
-   * by erroring out and re-arming: here it is served by the snapshot
-   * emptying and refilling, so `armBuildRebind` is not needed on this
-   * path at all. */
+   * **The debounce contract, stated exactly** (an earlier revision of
+   * this comment claimed it was "identical" to the watcher's, and that
+   * was false — see the review on #106):
+   *
+   *   - A change is only OBSERVED at a tick, so a build that spans N
+   *     poll intervals is N observations, not one.
+   *   - A settle is armed only once a tick finds the tree IDENTICAL to
+   *     the previous sample, i.e. after the tree has been stable for a
+   *     full `buildPollIntervalMs`. That is the load-bearing line: a
+   *     settle window shorter than the sample interval can never
+   *     coalesce two samples, which is precisely how the previous
+   *     revision turned one 4 s build into 5 `refreshAll` passes.
+   *   - `refreshAll` then runs `buildDebounceMs` after that. So ONE
+   *     settled burst is ONE `refreshAll`, whatever its length, and
+   *     `rm -rf dist && just build` is one pass too — the empty and
+   *     the refilled snapshot are one unsettled period, not two.
+   *   - Any new difference clears a pending settle, so a build still
+   *     running cannot fire a stale `refreshAll` mid-burst.
+   *
+   * The cost is the extra confirming interval: detection up to
+   * `buildPollIntervalMs`, then one more interval to confirm
+   * stability, then `buildDebounceMs` — so up to 2.5 s after the last
+   * write, where the watcher fired 500 ms after it. See
+   * `DEFAULT_BUILD_POLL_INTERVAL_MS`. `armBuildRebind` is not needed on
+   * this path: a `dist` that vanishes is served by the snapshot
+   * emptying, not by a watcher error. */
   function installBuildPolling(): void {
     if (distDir === undefined || stopped || buildPoll !== undefined) return;
     const dir = distDir;
     let snapshot = snapshotTree(dir);
+    /** A difference has been observed and the tree has not yet been
+     * seen stable across a full interval. Cleared when the settle
+     * fires, so a settled period produces exactly one `refreshAll`. */
+    let unsettled = false;
+    function cancelSettle(): void {
+      if (buildTimer === undefined) return;
+      clearTimeout(buildTimer);
+      buildTimer = undefined;
+    }
     const interval = setInterval(() => {
       if (stopped) return;
       const next = snapshotTree(dir);
-      if (sameTree(snapshot, next)) return;
-      snapshot = next;
-      if (buildTimer !== undefined) clearTimeout(buildTimer);
+      if (!sameTree(snapshot, next)) {
+        snapshot = next;
+        unsettled = true;
+        // A build is still moving: drop any settle armed on an earlier
+        // tick rather than firing a `refreshAll` into a live burst.
+        cancelSettle();
+        return;
+      }
+      // Identical to the previous sample, so this tree has been stable
+      // for a full interval. Arm the settle once — re-arming on every
+      // subsequent tick would starve it whenever `buildDebounceMs`
+      // exceeds `buildPollIntervalMs`.
+      if (!unsettled || buildTimer !== undefined) return;
       buildTimer = setTimeout(() => {
         buildTimer = undefined;
+        unsettled = false;
         void refreshAll().catch((error) =>
           logger.warn("reanchor.build.refresh.failed", {
             errorKind: (error as Error).name,

@@ -12,14 +12,21 @@
 //
 // So the count scales with the WATCHED TREE. Over 20 watch+close
 // pairs on a `dist/{index.html, _astro/}` fixture with N files under
-// `_astro/`, closing 50 ms after `watch()` (i.e. after the walk
-// finishes), same host, five runs each:
+// `_astro/`, closing 50 ms after `watch()`, same host, five runs each:
 //
 //     N=0 -> 3     N=10 -> 13     N=100 -> 103     N=400 -> 403     N=1000 -> 1003
 //
-// i.e. exactly one per file. Two details worth keeping, both of which
-// the earlier, coarser version of this header got wrong or did not
-// know:
+// i.e. exactly one per file. Those are measured THROUGH
+// `startDaemon`/`stop` — the context every claim here is about, and the
+// one this file's own test exercises. The harness is named because it
+// changes the number: a bare `watch()`+`close()` loop never gets its
+// walk past the watched directory's immediate entries, so it measures a
+// flat 3.00 per close at every one of those N, while a FLAT `dist` (N
+// files directly in it) leaks 101.00 at 100 files and 1001.00 at 1000 in
+// either harness. What closes the gap is how long the watcher is
+// allowed to live before `close()`. Three details worth keeping, all of
+// which the earlier, coarser version of this header got wrong or did
+// not know:
 //
 //   - It is NOT `anon_inode:inotify`. A LIVE watcher holds exactly two
 //     descriptors — the inotify one and the watched directory — and
@@ -53,12 +60,25 @@
 // what makes attribution a measurement rather than an inference: with
 // `reanchor.poll = true` and again with an injected `watchFn` that
 // throws, the leak was unchanged at 2.00/cycle, and a bare
-// `watch(dist).close()` loop over the same fixture reproduced both the
-// count and the descriptor kinds. So the mitigation replaces that one
-// watch, on Bun only, with a `stat`-poll of the `dist` tree
-// (`installBuildPolling`); `node` keeps `fs.watch`, which is correct
-// there. Measured after the change: 0 leaked descriptors over 10
-// cycles and 0 over 40.
+// `watch(dist).close()` loop over the same one-entry fixture
+// reproduced both the count and the descriptor kinds. (On a fixture
+// with a NESTED file the bare loop stops at the immediate entries —
+// see the harness note above — so the fixture this test now uses is
+// quoted at 4.00/cycle, measured through the daemon.) So the
+// mitigation replaces that one watch, on Bun only, with a `stat`-poll
+// of the `dist` tree (`installBuildPolling`); `node` keeps `fs.watch`,
+// which is correct there. Measured after the change: 0 leaked
+// descriptors over 10 cycles and 0 over 40.
+//
+// The poll is not behaviour-neutral, and this file's scope is
+// descriptors, so the rest of it is stated elsewhere rather than here:
+// one settled build burst still produces exactly ONE `refreshAll` (the
+// poll arms its settle only after the tree is unchanged across a full
+// poll interval), at up to 2.5 s of detection latency instead of the
+// watcher's 500 ms. The interval and its cost are documented on
+// DEFAULT_BUILD_POLL_INTERVAL_MS in reanchor-daemon.ts, the decision is
+// the #87 amendment in ADR-0006, and the one-pass property is pinned by
+// the build-poll tests in reanchor-daemon.test.ts.
 //
 // WHAT IS STILL LEAKED, AND IS NOT COVERED HERE (stated so the tight
 // budget is not read as "revkit leaks nothing"). The per-directory
@@ -81,10 +101,12 @@
 // and 4687 on CI (run 37117007176; 4682 in 37117515667), on the same
 // bun, against a post-warm-up floor of ~3433 — the ~1k above the floor
 // matched the instrumented 943 almost exactly. Re-measured after #87,
-// back-to-back on this host with the same leg, three runs each:
+// back-to-back on this host with the same leg — five runs of each here
+// plus one independent run of each from the #106 review, so the spread
+// is the spread rather than one sample's noise:
 //
-//     origin/dev   peak 4449-4454   floor 3433-3460   growth  994-1016
-//     with #87     peak 4272-4327   floor 3429-3433   growth  843- 894
+//     origin/dev   peak 4449-4454   floor 3433-3490   growth  962-1016
+//     with #87     peak 4272-4327   floor 3429-3445   growth  837- 894
 //
 // (the CI figures were NOT re-measured; that needs a CI run). The
 // residual growth of ~850 is NOT claimed to be watcher leak: the growth
@@ -219,9 +241,10 @@ const FD_DELTA_BUDGET = 1;
  * unchanged at 8192 so the constant dominates and the assertion stays
  * a backstop rather than a tripwire; test 1 is what tracks the leak,
  * and per this file's header it is the only active leak guard on CI —
- * see there for the scope that implies. Re-measured after #87: peak
- * 4272, floor 3429, on this host (the CI figure was NOT re-measured;
- * that needs a CI run). */
+ * see there for the scope that implies. Re-measured after #87 over six
+ * runs (five here, one from the #106 review): peak 4272-4327 against
+ * origin/dev's 4449-4454, floor unchanged at ~3430-3445 (the CI figure
+ * was NOT re-measured; that needs a CI run). */
 const SUITE_FD_CEILING = 8192;
 
 /** Every descriptor this process holds, as fd → readlink target.

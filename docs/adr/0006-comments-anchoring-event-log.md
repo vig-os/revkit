@@ -276,21 +276,41 @@ opened before the close landed — and it is **not** `anon_inode:inotify`, whose
 watcher holds exactly two descriptors (inotify + the directory). Because the count scales with the watched tree, a
 single build watch over a build output costs one descriptor per output file: measured 3 / 13 / 103 / 403 / 1003
 descriptors per close for a `dist/{index.html, _astro/}` fixture carrying 0 / 10 / 100 / 400 / 1000 files under
-`_astro/`, paid again on every re-install after `rm -rf dist && just build`. `node v24.21.0` leaks 0 over the
+`_astro/`, paid again on every re-install after `rm -rf dist && just build`. Those are measured **through
+`startDaemon`/`stop`**, the context this claim is about; a bare `watch()`+`close()` loop never gets its walk past
+the watched directory's immediate entries and measures a flat 3.00 per close at every one of those N, so the
+harness is named here rather than left to the reader. `node v24.21.0` leaks 0 over the
 identical loop, so this is Bun's `fs.watch`, not inotify and not the kernel.
 
-The poll keeps the same contract, so nothing downstream can tell the difference: every observed change RESTARTS the
-existing settle timer, and `refreshAll` runs once the tree has been quiet for `buildDebounceMs` (500 ms) — the same
-debounce the watcher's events fed. `rm -rf dist && just build`, which the watcher served by erroring out and
-re-arming its probe, is served instead by the tree snapshot emptying and refilling, so the re-arm probe is not
-needed on this path at all.
+The poll preserves the property the layering above depends on — **one settled burst is ONE `refreshAll`, whatever
+its length** — but it gets there differently from the watcher, and the difference is load-bearing rather than
+incidental. A watcher emits an event per write, so its settle timer is pushed out continuously through a build and
+fires once. The poll *samples*: a build that outlasts one `buildPollIntervalMs` is several observations, and a
+settle window shorter than the sample interval cannot coalesce two of them. So the settle is armed only once a
+sample matches the previous one — i.e. once the tree has been **stable for a full poll interval** — and any new
+difference clears a pending settle so a build still running cannot fire a stale pass. `rm -rf dist && just build`,
+which the watcher served by erroring out and re-arming its probe, is served instead by the tree snapshot emptying
+and refilling: the empty and the refilled snapshot are ONE unsettled period, so the re-arm probe is not needed on
+this path at all.
 
-**The cost, stated rather than absorbed.** A build's change is noticed up to `DEFAULT_BUILD_POLL_INTERVAL_MS` (1 s)
-late, on top of the unchanged 500 ms settle — sub-second build-signal latency is traded away, and a write landing
-between two ticks is seen at the next tick. The price is one `readdir`+`stat` walk of `dist/` per tick: measured on
-this host at 0.07 ms for 52 entries, 1.11 ms for 805 and 11.4 ms for 6 409 (median of 25), i.e. ≤ 1.1% of one core
-at a 1 s interval for a realistic Astro `dist`, bounded by tree size rather than by reviewer activity. On `node` the
-recursive `fs.watch` is kept, because there it is correct and free.
+*(An earlier revision of this amendment claimed the debounce contract was "unchanged" and that "nothing downstream
+can tell the difference". That was false, and measurement refuted it: restarting the settle on every observed
+change turned one 4 s build into 5 `refreshAll` passes, 3/3 runs, where `fs.watch` gives 1. The wording above is
+the corrected contract; `test/serve/reanchor-daemon.test.ts` pins both the multi-tick build and the `rm -rf` shape
+at exactly one pass, and the poll's confirming interval is what buys it.)*
+
+**The cost, stated rather than absorbed.** From the last write, `refreshAll` runs after up to
+`DEFAULT_BUILD_POLL_INTERVAL_MS` to observe the change, plus one more interval to confirm stability, plus
+`buildDebounceMs` — **2.5 s at the defaults**, against the 500 ms the `fs.watch` debounce gave. That extra interval
+is the price of the single pass. The walk itself is one `readdir`+`stat` of `dist/` per tick and it is
+**synchronous**, so it is an event-loop stall rather than background CPU: measured on this host at 0.07 ms / 52
+entries, 1.11 ms / 805 and 11.4 ms / 6 409 (median of 25), and over a 10 001-entry `dist` median 19.1 ms, p90
+22.1 ms, max 30.0 ms. It also allocates O(entries) per tick — ~2 MiB, i.e. ~120 MiB/min of short-lived garbage at
+1 Hz on a 10 001-entry tree. Finally, the snapshot key is `mtimeMs:size`, so a rewrite that preserves **both** is
+invisible to the next sample where a kernel watch would fire: measured 11 of 200 back-to-back same-size rewrites
+on ext4. Sub-second build-signal latency and that blind spot are what is given up; neither is load-bearing, because
+trigger 1 remains the correctness backstop. On `node` the recursive `fs.watch` is kept, because there it is correct
+and free.
 
 **2. Trigger 2 is deliberately NOT changed, and the cost of that is recorded.** The per-directory file watchers keep
 `fs.watch` on every runtime, so they still leak `1 + <immediate entries in that directory>` per directory per daemon

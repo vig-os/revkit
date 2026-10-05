@@ -621,16 +621,18 @@ describe("re-anchor daemon integration (M2 item 5b, story A8)", () => {
   });
 
   // ── #87: the build signal, whatever carries it ───────────────────
-  test("a write under dist/ re-anchors every threaded path on its own", async () => {
+  test("a write under dist/ refreshes every threaded path with no /api/threads read", async () => {
     // Trigger 3's contract, asserted through the contract and not
-    // through the mechanism: a build lands, and within one poll
-    // interval + settle window every threaded path is refreshed —
-    // with NO read of `/api/threads` in between. That has to hold on
-    // both runtimes, and the two carry the signal differently
-    // (`fs.watch(dist, {recursive: true})` on node, the `stat`-poll
-    // on bun, where closing the former leaks its descriptors), so a
-    // test pinned to one mechanism would pass on the runtime that has
-    // the other and prove nothing.
+    // through the mechanism: a build lands, and every threaded path is
+    // refreshed without any read of `/api/threads` in between. That
+    // has to hold on both runtimes, and the two carry the signal
+    // differently (`fs.watch(dist, {recursive: true})` on node, the
+    // `stat`-poll on bun, where closing the former leaks its
+    // descriptors), so a test pinned to one mechanism would pass on the
+    // runtime that has the other and prove nothing.
+    //
+    // It asserts that a refresh RAN, not that a re-anchor landed — the
+    // outcomes themselves are what this file's other fixtures cover.
     await createThread(ctx, "target phrase");
     const before = await countReads(ctx);
     writeFileSync(join(ctx.root, "dist", "built.html"), "<h1>a build landed</h1>");
@@ -640,16 +642,83 @@ describe("re-anchor daemon integration (M2 item 5b, story A8)", () => {
     );
   });
 
-  test("the build signal is carried by exactly one mechanism, and it is named", async () => {
+  test("a build spanning several poll intervals refreshes every threaded path EXACTLY ONCE", async () => {
+    // The #87 blocker, as a regression test. The poll SAMPLES the tree
+    // every `buildPollIntervalMs`, so a build that outlasts one sample
+    // is several observations, not one — and a settle window shorter
+    // than the sample interval cannot coalesce two of them. An earlier
+    // revision restarted the settle on every observed change, so one
+    // 4 s build produced 5 `refreshAll` passes (measured 3/3 runs)
+    // where `fs.watch` produces 1. The contract is now: a settle is
+    // armed only when a sample matches the previous one, so ONE settled
+    // burst is ONE refresh however long the burst is.
+    //
+    // Timings are the shared fixture's injected ones (100 ms poll, 50 ms
+    // settle), so "several intervals" is ~450 ms of writing rather than
+    // 4 s, and the whole test still finishes inside the 10 s budget.
+    await createThread(ctx, "target phrase");
+    const before = await countReads(ctx);
+    // Five writes one interval apart: at least four distinct samples
+    // observe a difference, which is the case that used to fan out.
+    for (let i = 0; i < 5; i++) {
+      writeFileSync(join(ctx.root, "dist", `chunk-${i}.html`), `<h1>build step ${i}</h1>`);
+      await sleep(100);
+    }
+    // Detection (≤1 interval) + confirming interval (≤1) + settle (50 ms)
+    // is 250 ms of slack on top of the last write; 1 s of quiet after it
+    // is what would expose a SECOND pass from a straggling settle.
+    await sleep(1_000);
+    const after = await countReads(ctx);
+    expect(
+      after - before,
+      `a 5-step build produced ${after - before} refresh passes, expected exactly 1. ` +
+        `One settled burst must be one refreshAll: the poll has to confirm the ` +
+        `tree is unchanged across a full poll interval before it settles, ` +
+        `because a settle window shorter than the sample interval cannot ` +
+        `coalesce two samples (reanchor-daemon.ts installBuildPolling).`,
+    ).toBe(1);
+  });
+
+  test("rm -rf dist/ and a rebuild are ONE refresh, not one per sample", async () => {
+    // The brief's acceptance shape, and the case where the fan-out was
+    // most visible: the watcher served `rm -rf dist && just build` by
+    // erroring out and re-arming, and the poll serves it by watching the
+    // snapshot empty and refill. The gap between the two is longer than
+    // one confirming interval, so the removal and the rebuild are one
+    // unsettled period and must settle once.
+    await createThread(ctx, "target phrase");
+    const before = await countReads(ctx);
+    rmSync(join(ctx.root, "dist"), { recursive: true, force: true });
+    await sleep(150);
+    mkdirSync(join(ctx.root, "dist"), { recursive: true });
+    writeFileSync(join(ctx.root, "dist", "index.html"), "<h1>rebuilt</h1>");
+    await sleep(1_000);
+    const after = await countReads(ctx);
+    expect(after - before, `rm + rebuild produced ${after - before} refresh passes, expected 1`).toBe(1);
+  });
+
+  test("the build signal is carried by the mechanism this runtime should use", async () => {
     // #87 made the choice runtime-dependent, which means "which one"
-    // stopped being inferable from the code. `buildWatchMode()` is the
-    // only observable, so assert both the runtime-conditional
-    // expectation and the invariant behind it: never both, never
-    // neither.
+    // stopped being inferable from the code, so the mode is asserted
+    // directly against the runtime gate. Deliberately NOT claiming more
+    // than one string can show: `buildWatchMode()` reports one state, so
+    // it cannot distinguish "poll live AND a stray watch still open".
+    // The code makes that unreachable (the two are set on disjoint
+    // branches of `installBuildWatcher`); pinning it would need a second
+    // observable and is not claimed here.
     const mode = ctx.daemon.reanchorDiagnostics.buildWatchMode();
-    expect(mode).toBe(process.versions.bun !== undefined ? "poll" : "watch");
+    expect(mode, `buildWatchMode() was ${mode}`).toBe(
+      process.versions.bun !== undefined ? "poll" : "watch",
+    );
   });
 });
+
+/** Wait `ms`. Distinct from `waitFor`: the build-poll tests below need
+ * a build to span several poll intervals and then need QUIET after it,
+ * and both are durations rather than a predicate. */
+async function sleep(ms: number): Promise<void> {
+  await new Promise((r) => setTimeout(r, ms));
+}
 
 /** Retry a predicate until it returns truthy or the timeout elapses.
  * `bun:test` has no `expect().toPass` (Playwright-only), so this
