@@ -290,16 +290,15 @@ describe("import — propagates validateNext rejections", () => {
 });
 
 describe("import — atomic commit (all-or-nothing)", () => {
-  test("a rejection at the second-or-later event leaves the store unchanged, and a corrected archive still imports", async () => {
+  test("a rejection at the second-or-later event leaves the store unchanged, head unmoved", async () => {
     // The reviewer's probe: an archive whose FIRST event lands a fresh
     // thread `tA` (seq 10, commentId `cA`), and whose SECOND event
     // (seq 11) reuses a commentId that ALREADY EXISTS in the target
     // store from an earlier `append`. `parseArchive` sees a clean log
     // from empty; the conflict shows up only when `import` plays the
     // archive against the target's real state. If `import` committed
-    // one-by-one, the seq-10 event would land, `head` would advance to
-    // 10, and a retry of the (necessarily seq-10-first) corrected
-    // archive would be refused by the monotone-head gate — bug.
+    // one-by-one, the seq-10 event would land and `head` would advance
+    // to 10 — which is exactly what the last assertion below detects.
     const t0 = "2026-09-30T13:00:00Z";
     const t1 = "2026-09-30T13:00:01Z";
 
@@ -365,9 +364,14 @@ describe("import — atomic commit (all-or-nothing)", () => {
     expect((await store.threads()).map((t) => t.id)).toEqual(beforeThreads);
     expect(await store.thread("tA")).toBeUndefined();
 
-    // A retry with a corrected archive (distinct commentIds) now
-    // imports cleanly — proving the failed attempt didn't advance
-    // `head` past the archive's first seq.
+    // The corrected archive (distinct commentIds) is now refused by the
+    // #73 divergence guard instead of importing: this store holds a log,
+    // so it accepts no archive it cannot show to be its continuation.
+    // The KIND is what proves the atomic-commit claim rather than merely
+    // restating it. A store that had committed the seq-10 event before
+    // refusing would answer `head-not-monotone` (first seq 10 is not
+    // above head 10); `seq-gap` is only reachable while head is still 1,
+    // so the guard is reading a head the failed attempt never moved.
     const goodArchive = parseArchive({
       schemaVersion: 1,
       events: [
@@ -393,9 +397,25 @@ describe("import — atomic commit (all-or-nothing)", () => {
         },
       ],
     });
-    await store.import(goodArchive);
-    const seqs = (await store.since(0)).map((e) => e.seq);
-    // Ordered: seed's seq 1, then the archive's 10 and 11.
-    expect(seqs).toEqual([1, 10, 11]);
+    let retryKind: string | null = null;
+    try {
+      await store.import(goodArchive);
+      throw new Error("import should have been refused");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ThreadStoreImportError);
+      if (error instanceof ThreadStoreImportError) {
+        retryKind = error.rejection?.kind ?? null;
+      }
+    }
+    expect(retryKind).toBe("seq-gap");
+    expect((await store.since(0)).map((e) => e.seq)).toEqual([1]);
+
+    // The corrected archive is still importable — into an EMPTY store,
+    // which is the only shape `import` accepts (see the #73 guard in
+    // `prepareImport`). The retry path the original test used is gone by
+    // design, so this is where a corrected archive is proved good.
+    const fresh = new InMemoryThreadStore({ clock: fixedClock() });
+    await fresh.import(goodArchive);
+    expect((await fresh.since(0)).map((e) => e.seq)).toEqual([10, 11]);
   });
 });

@@ -22,6 +22,13 @@
 // `validateNext` runs across the sequence, so the import path holds the
 // same log-shape guarantees the append path does — one source of truth
 // for the rules.
+//
+// An import into a store that ALREADY holds a log is refused outright
+// (#73): an archive that continues the head, or that starts above it,
+// cannot be shown to be a continuation of THIS log, and accepting one
+// silently gave `since(after)` — the daemon's SSE catch-up — foreign
+// events under this log's seqs. Only an empty store accepts an archive,
+// which is the one shape any producer emits (see `prepareImport`).
 
 import { parseArchive, type ThreadArchive } from "./export.ts";
 import { reviewEventSchema, type ReviewEvent, type ReviewEventInput } from "./events.ts";
@@ -48,9 +55,12 @@ export interface ThreadStore {
   /**
    * Replay an archive into this store, preserving each event's original
    * `seq`/`ts`. The archive's first seq must be strictly greater than
-   * the store's current head (a fresh store's head is 0). Same
-   * `validateNext` rules as `append` — an archive that violates them is
-   * refused as a whole (nothing is left half-imported).
+   * the store's current head (a fresh store's head is 0), and the store
+   * must be EMPTY: a store that already holds a log refuses every
+   * archive, because nothing in the archive can be shown to continue
+   * that log (#73). Same `validateNext` rules as `append` — an archive
+   * that violates them is refused as a whole (nothing is left
+   * half-imported).
    */
   import(archive: ThreadArchive): Promise<void>;
 
@@ -88,9 +98,10 @@ export class ThreadStoreAppendError extends Error {
 /** What an `import` refusal carries for a caller that has to branch on
  * it. `kind` reuses the `validateNext` vocabulary, so a caller that
  * already branches on `ThreadStoreAppendError.rejection.kind` branches
- * the same way here. `head-not-monotone` is import-only: the store-local
- * precondition that an archive starts strictly above the head, which
- * `append` cannot express (it assigns the seq).
+ * the same way here. `head-not-monotone`, `seq-gap` and
+ * `divergent-archive` are import-only: store-local preconditions about
+ * the archive's relation to the head, which `append` cannot express
+ * (it assigns the seq).
  *
  * `"invalid-shape"` means the archive's bytes are wrong — a field the
  * schema refuses, a duplicate `seq`, an out-of-order `seq`. An archive
@@ -99,10 +110,18 @@ export class ThreadStoreAppendError extends Error {
  * reports the real invariant kind, e.g. `"unknown-thread"` — the same
  * kind the store's own dry run reports for the same invariant, because
  * the archive's `superRefine` play-through carries it out structurally
- * (see `export.ts`). */
+ * (see `export.ts`).
+ *
+ * `"seq-gap"` and `"divergent-archive"` are the two halves of the #73
+ * guard, told apart because a caller can act on them differently: a gap
+ * means "events this store never had are missing below your first seq"
+ * (fetch them), and a divergence means "your log and this archive
+ * disagree about what comes next" (reconcile them). Both are refusals
+ * a store that already holds a log hands back for an archive it cannot
+ * prove is its continuation. */
 export type ImportRejection = {
   /** Which invariant failed. Stable across implementations. */
-  readonly kind: AppendRejection["kind"] | "head-not-monotone";
+  readonly kind: AppendRejection["kind"] | "head-not-monotone" | "seq-gap" | "divergent-archive";
   /** The `seq` of the offending archive event, when the failure named
    * one. `undefined` only for a failure that names no event at all: a bad
    * `schemaVersion`, an `events` that is not an array, a `null` archive.
@@ -122,12 +141,13 @@ export type ImportRejection = {
 };
 
 /** Thrown by `ThreadStore.import` for EVERY refusal — an archive that
- * fails the schema, one that starts at or below the store's head, and
- * one whose events break a `validateNext` transition against this
- * store's state. A caller can therefore branch on this one class at the
- * store boundary; nothing about an import escapes as a raw `ZodError`,
- * and nothing escapes as the `ThreadStoreAppendError` that the
- * per-event check would have raised on its own.
+ * fails the schema, one that starts at or below the store's head, one
+ * this store's dry run refuses, and one that cannot be shown to
+ * continue a log the store already holds (#73). A caller can therefore
+ * branch on this one class at the store boundary; nothing about an
+ * import escapes as a raw `ZodError`, and nothing escapes as the
+ * `ThreadStoreAppendError` that the per-event check would have raised
+ * on its own.
  *
  * `rejection` carries the machine-readable reason (the offending event's
  * `seq`/`index` plus the invariant's `kind`) so a caller never has to
@@ -220,10 +240,10 @@ function importSchemaError(raw: ThreadArchive, cause: unknown): ThreadStoreImpor
 /** Every check a `ThreadStore.import` performs before it is allowed to
  * write anything, in one place: `parseArchive` (the Zod shape and a
  * `validateNext` play-through from empty), the head-monotonicity
- * precondition, and a dry run of the whole sequence against a DEEP COPY
- * of the caller's state. Returns the archive's events on success, in
- * `seq` order; throws `ThreadStoreImportError` — and only that class —
- * on any refusal.
+ * precondition, a dry run of the whole sequence against a DEEP COPY
+ * of the caller's state, and the divergence guard. Returns the
+ * archive's events on success, in `seq` order; throws
+ * `ThreadStoreImportError` — and only that class — on any refusal.
  *
  * All three backings call this, so the taxonomy is one contract rather
  * than three (near-identical) copies: `InMemoryThreadStore`,
@@ -236,8 +256,8 @@ export function prepareImport(archive: ThreadArchive, state: LogState, head: num
   // `parseArchive` already ran once at the byte boundary. Re-parse here
   // so a caller that hands us an in-memory object (never JSON) still
   // hits the same shape check, and so this store can trust the events
-  // without re-checking each one — except the head-monotone rule, which
-  // is store-local.
+  // without re-checking each one — except the two store-local rules, the
+  // head precondition and the divergence guard below.
   let validated: ThreadArchive;
   try {
     validated = parseArchive(archive);
@@ -268,7 +288,61 @@ export function prepareImport(archive: ThreadArchive, state: LogState, head: num
       );
     }
   }
+  // ── The divergence guard (#73) ─────────────────────────────────────────
+  // Deliberately LAST, so every refusal this function already made keeps
+  // the kind a caller has seen since #72: the new checks only ever
+  // refuse archives that would otherwise have been committed.
+  //
+  // What is left at this point is narrower than it looks. `parseArchive`
+  // plays the archive through `validateNext` from an EMPTY state, so an
+  // archive that survived the byte boundary only ever references ids it
+  // created itself — an archive that named this store's threads,
+  // comments, asks or reviews could not have got here (`unknown-thread`
+  // and friends). And an archive whose ids COLLIDE with this store's
+  // was just refused by the dry run above, as `duplicate-thread` /
+  // `duplicate-comment-id` / `duplicate-external-id`. So an archive
+  // reaching this line shares nothing with a store that holds a log, and
+  // there is nothing left to compare: whether it is the same log's next
+  // events or another repo's history wearing this log's seqs can only be
+  // settled by deep-comparing the overlap, which is the parked #35
+  // bridge's design to make.
+  //
+  // Until then the conservative reading holds: a store that already has
+  // a log accepts no archive, and an EMPTY store accepts any (which is
+  // the one shape every producer emits — `exportArchive` is the only
+  // producer in `packages/*/src`, it emits the FULL log via
+  // `since(0)`, and nothing in `packages/*/src` calls `import` at all,
+  // so the only import that ships is a full log into a fresh store).
+  // An archive with no events at all returns above, before any of this:
+  // there is nothing to diverge when nothing is claimed.
+  if (head > 0) {
+    throw notAContinuation(firstSeq, head);
+  }
   return validated.events;
+}
+
+/** The refusal a store that ALREADY holds a log hands back for an
+ * archive above the head (#73). One kind per shape, so a caller can tell
+ * a hole it could fill from a disagreement it has to reconcile, and one
+ * line each naming the offending seq and the head it is measured
+ * against. No `transition`: no `validateNext` rule broke — the gap
+ * between two logs is a store-local fact, the same class of refusal as
+ * `head-not-monotone`, so `cause` stays unset too. */
+function notAContinuation(firstSeq: number, head: number): ThreadStoreImportError {
+  const gap = firstSeq > head + 1;
+  return new ThreadStoreImportError(
+    gap
+      ? `import: archive refused — its first seq ${firstSeq} sits above the store's head ${head} + 1, so seqs ${head + 1}..${firstSeq - 1} would stay empty forever.`
+      : `import: archive refused — its first seq ${firstSeq} would continue the store's head ${head}, but this store already holds a log and nothing shows the archive is its continuation.`,
+    {
+      rejection: {
+        kind: gap ? "seq-gap" : "divergent-archive",
+        seq: firstSeq,
+        index: 0,
+        transition: undefined,
+      },
+    },
+  );
 }
 
 export { type AppendRejection };

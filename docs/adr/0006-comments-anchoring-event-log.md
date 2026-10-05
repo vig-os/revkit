@@ -6,7 +6,8 @@
 - Stories: A2, A6, A7, A8, B2, B4
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
-  export|import` CLI command.
+  export|import` CLI command; and the 2026-10-05 (issue #73) amendment — an
+  `import` lands only in an empty store.
 
 ## Context
 
@@ -258,3 +259,17 @@ exported with `exportArchive` and imported by a hosted `ThreadStore` — the
 library API, not a CLI verb — so a local review can be published to a hosted PR.
 No user-facing command is claimed, and none should be inferred from this ADR
 until one ships and this line is amended again.*
+
+## Amendment (2026-10-05, issue #73): an import lands only in an empty store
+
+**`ThreadStore.import` accepts an archive only in a store whose log is empty.**
+`parseArchive` plays every archive through `validateNext` from an *empty* state,
+and the store's dry run refuses an archive whose ids collide with its own, so
+after those two checks an archive can only be a self-contained log — nothing in
+it can be shown to continue the store's existing log, and a foreign log's tail
+arriving at `head + 1` used to be accepted silently and then handed to
+`since(lastSeen)` callers as this log's next event. Until the local↔hosted
+bridge designs the deep comparison that would settle it (#35), a store holding a
+log refuses every archive (`divergent-archive`, or `seq-gap` when the archive
+starts above `head + 1`); an empty store still accepts any archive, which is the
+one shape `exportArchive` — the only producer — emits. Refs: #73

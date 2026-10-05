@@ -519,6 +519,117 @@ export function storeConformance(factory: StoreFactory): void {
       expect((await store.threads()).map((t) => t.id)).toEqual(["th-src-1", "th-src-2"]);
     });
 
+    // ── A12 (divergence, #73) ─────────────────────────────────────────────
+    // The issue's exact repro, verbatim: a store at head 2, handed an
+    // archive whose tail is a NEW thread's `comment.created` at seq 3.
+    // Every check the store already had passed on this one — the
+    // archive is shape-clean, its first seq (3) is strictly above the
+    // head (2), and the dry run finds no conflict, because the foreign
+    // thread shares no id with this log. So it landed, and `since(2)`
+    // then handed a client reconnecting with `after=2` an event from
+    // another repo's history as this log's seq 3.
+    test("A12: a DIVERGENT archive is refused whole — a foreign log's tail at head+1", async () => {
+      await store.append(createThread("th-div-1", "c-div-1"));
+      await store.append(createThread("th-div-2", "c-div-2"));
+      const before = JSON.stringify(await store.since(0));
+
+      const divergent = {
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+        events: [archiveEvent(3, "th-div-3", "c-div-3")],
+      } satisfies ThreadArchive;
+      // The parser accepts it, which is the point: `parseArchive` plays
+      // the archive through `validateNext` from an EMPTY state, and this
+      // archive is self-contained, so nothing short of a comparison
+      // against THIS store can see the divergence. The refusal has to
+      // come from the store.
+      expect(() => parseArchive(divergent)).not.toThrow();
+
+      let caught: unknown;
+      try {
+        await store.import(divergent);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ThreadStoreImportError);
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      expect(rejection?.kind).toBe("divergent-archive");
+      // It DOES name an event — `events[0]`, whose seq is the one that
+      // failed — and no transition, because no `validateNext` rule
+      // broke: the gap between two logs is a store-local fact, the same
+      // class of refusal as `head-not-monotone`.
+      expect(rejection?.seq).toBe(3);
+      expect(rejection?.index).toBe(0);
+      expect(rejection?.transition).toBeUndefined();
+      expect((caught as { cause?: unknown }).cause).toBeUndefined();
+      // One line, naming the offending seq AND the head it collides
+      // with — the two numbers a caller needs to reconcile by hand.
+      const message = (caught as Error).message;
+      expect(message.split("\n")).toHaveLength(1);
+      expect(message).toContain("first seq 3");
+      expect(message).toContain("head 2");
+      // Nothing landed, and the log is byte-identical.
+      expect(JSON.stringify(await store.since(0))).toBe(before);
+      // The head never moved either: a refused archive must not consume
+      // a seq, or the next `append` would skip one.
+      expect(await store.append(createThread("th-div-next", "c-div-next"))).toBe(3);
+    });
+
+    test("A12: a gap archive above a store that already holds a log is refused", async () => {
+      await store.append(createThread("th-gp-1", "c-gp-1"));
+      await store.append(createThread("th-gp-2", "c-gp-2"));
+      const before = JSON.stringify(await store.since(0));
+
+      // The A14 shape — a log whose first 40 events this store never
+      // had — aimed at a store that is NOT empty. On a fresh store that
+      // is legal (A14); here it would leave seqs 3..40 permanently
+      // empty in a log whose head claims 43, which is precisely the
+      // `since(lastSeen)` catch-up ADR-0006 warns about.
+      const gap = await buildGappedArchive([41, 42, 43]);
+      let caught: unknown;
+      try {
+        await store.import(gap);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ThreadStoreImportError);
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      expect(rejection?.kind).toBe("seq-gap");
+      expect(rejection?.seq).toBe(41);
+      expect(rejection?.index).toBe(0);
+      expect(rejection?.transition).toBeUndefined();
+      const message = (caught as Error).message;
+      expect(message.split("\n")).toHaveLength(1);
+      expect(message).toContain("first seq 41");
+      expect(message).toContain("head 2");
+      expect(JSON.stringify(await store.since(0))).toBe(before);
+    });
+
+    test("A12: the guard keys off a store that already holds a log, not off `append`", async () => {
+      // The scope of the guard, in one case: on an EMPTY store this
+      // archive is just a log whose first event sits at seq 3 (A14's
+      // shape, and the only shape `exportArchive` can produce), so it
+      // imports — the guard is not "import is broken". Once that store
+      // holds a log, the very next archive is refused, because nothing
+      // shows the two belong together. Building the log by `import`
+      // rather than by `append` is the half worth pinning: the guard
+      // reads the store's state, not how that state got there.
+      await store.import(await buildGappedArchive([3, 4]));
+      expect((await store.since(0)).map((e) => e.seq)).toEqual([3, 4]);
+
+      const next = await buildGappedArchive([5]);
+      let caught: unknown;
+      try {
+        await store.import(next);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(ThreadStoreImportError);
+      const rejection = (caught as InstanceType<typeof ThreadStoreImportError>).rejection;
+      expect(rejection?.kind).toBe("divergent-archive");
+      expect(rejection?.seq).toBe(5);
+      expect((await store.since(0)).map((e) => e.seq)).toEqual([3, 4]);
+    });
+
     // ── A14 ───────────────────────────────────────────────────────────────
     test("A14: a store whose seq jumps still satisfies since/threads and never throws", async () => {
       // An archive starting at seq 41 — a fresh store on a log whose
