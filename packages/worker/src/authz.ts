@@ -395,12 +395,15 @@ interface PathRoute {
  * 501 anyway". That justification described the handler and not the GATE:
  * `stateChanging: false` is precisely the flag that makes `authorizeRequest`
  * SKIP the CSRF and `application/json` checks, so POST/PUT/DELETE on a preview
- * path passed with neither. Nothing observable today, because the handler is 501
- * — but the day R2 serving lands the first write handler there inherits a CSRF
- * hole, and a gate default that silently widens when a handler changes is not a
- * gate default. So the preview arm accepts `READ_VERB`, like every other
- * read-only route, and a wrong verb becomes `method-not-allowed`: still behind the
- * gate, answered 405. */
+ * path passed with neither. Nothing observable then, because the handler was 501
+ * — and the arm was fixed BEFORE that could change, rather than after, which is
+ * the whole point of fixing a gate default on the strength of what the default
+ * is. **The prediction this comment made has since come true**: a preview route
+ * now serves bytes (issue #101), and a first WRITE handler under a preview path
+ * would have inherited exactly that hole. So the preview arm accepts `READ_VERB`,
+ * like every other read-only route, and a wrong verb becomes `method-not-allowed`:
+ * still behind the gate, answered 405 — asserted in `test/preview.test.ts` for
+ * every write verb, with the R2 read counter at zero. */
 const ANY_VERB = (): boolean => true;
 const READ_VERB = (verb: string): boolean => READ_METHODS.has(verb);
 const POST_VERB = (verb: string): boolean => verb === "POST";

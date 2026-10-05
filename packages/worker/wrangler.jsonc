@@ -59,6 +59,28 @@
 // that reads like a real one would let a deploy fail confusingly later.
 // The BINDING NAME is not a placeholder — `env.DB` is what the code binds
 // and the test asserts the name.
+//
+// `r2_buckets` is the PREVIEW surface's binding, and it is the only R2
+// this Worker declares. Three things about it are load-bearing:
+//
+//   - The BINDING NAME `PREVIEWS` is what `src/index.ts` reads
+//     (`env.PREVIEWS.get`), and `test/worker-config.test.ts` asserts it,
+//     so a rename here is a compile error in the deployed Worker rather
+//     than a 500 discovered by a reviewer.
+//   - `bucket_name` is a NAME, not an id, so there is no placeholder
+//     value to invent — but **no bucket with this name has been
+//     created.** Provisioning is `wrangler r2 bucket create`, which
+//     needs an account, and it is out of scope for the slice that added
+//     the read path. Nothing in this Worker WRITES to it: the upload side
+//     (CI publishing a PR-head build, and the credential that could) is
+//     tracked separately, so this declaration says "this is the bucket
+//     this Worker will read", and a deployment whose bucket is empty
+//     answers 404 on every preview path — which is the honest answer for
+//     a review nothing has been built for.
+//   - ADR-0012's guarantee does not depend on the bucket's contents being
+//     well-behaved: the response's `Content-Type` is derived from the
+//     REQUEST PATH's extension against `src/preview-assets.ts`, never
+//     from the object's `httpMetadata`.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "revkit-review",
@@ -74,6 +96,12 @@
       "binding": "DB",
       "database_name": "revkit-review",
       "database_id": "PLACEHOLDER_REPLACED_BY_REVKIT_DEPLOY_INIT"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PREVIEWS",
+      "bucket_name": "revkit-previews"
     }
   ]
 }

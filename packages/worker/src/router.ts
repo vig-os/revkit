@@ -12,11 +12,13 @@
 // a `..` or a doubled slash that slipped through would let one repo's
 // preview read another's R2 key.
 //
-// **What is NOT here.** Serving anything. Deciding whether a path may be
-// served (the ADR-0012 extension allowlist), whether a fork preview was
-// approved, and whether `/_revkit/` exists — all slice 3. What is here is the
-// recogniser, so slice 3 has one tested parser to build on instead of a regex
-// it writes itself.
+// **What is NOT here.** Whether a path may be SERVED — ADR-0012's
+// extension allowlist, and which R2 key a path names — is
+// `src/preview-assets.ts`; what is here is the recogniser, so the serving half
+// has one tested parser to build on instead of a regex it writes itself.
+// Approving a fork preview (ADR-0014) and whether `/_revkit/` exists are still
+// not here, and neither is any check that the caller may see this review — that
+// is `src/authz.ts`.
 //
 // **What slice 5 added, and why it belongs in this file.** The scope axis. A
 // route's scope is `parsePreviewPath`'s `(repo, pr)` — plus the `logKey` those
@@ -206,7 +208,7 @@ export function previewScopePath(repo: string, pr: number): string {
  *      refuses every parameter but `since`, so `?log_key=`/`?repo=`/`?scope=` are
  *      400s rather than a way to pick somebody else's log.
  *   3. It matches ADR-0008 rather than inventing a second convention — the same
- *      `<repo>/pr-<n>` the R2 preview keys will be built from.
+ *      `<repo>/pr-<n>` the R2 preview keys are built from (`src/preview-assets.ts`).
  *
  * **The base must be exactly two segments.** `/<repo>/pr-<n>/docs/api/threads` is
  * a path INSIDE a built site that happens to end in the API suffix, and it is
@@ -260,9 +262,21 @@ export function parsePreviewPath(pathname: string): PreviewRef | undefined {
   // spellings of one path must not both resolve.
   if (pathname.includes("//")) return undefined;
   // Reject the encoded and literal traversal forms before segmenting, so
-  // no consumer has to remember. `%2e`/`%2f` are matched
-  // case-insensitively by the `i` flag; workerd does not decode the
-  // pathname for us before this runs.
+  // no consumer has to remember. `%2e`/`%2f`/`%5c` are matched
+  // case-insensitively by the `i` flag.
+  //
+  // **AND the URL spec gets to `%2e` first, which is why the rule below is not
+  // the whole of it.** A WHATWG path parser decodes `%2e` inside a segment far
+  // enough to recognise a dot segment, so `/revkit/pr-7/%2e%2e/pr-8/index.html`
+  // normalises to `/revkit/pr-8/index.html` **before** this function runs.
+  // Measured on miniflare 4.20260518.0 (and the same in bun and Node), and it is
+  // harmless rather than a hole: the scope travels with the NORMALISED path, so
+  // the request is a request for pr-8 and the gate checks pr-8 — `Route.scope`
+  // and the R2 key are derived from the same string. What a lone `%2e`, a `%2f`
+  // or a `%5c` cannot do is survive as itself, and those are what this rule
+  // refuses. `test/preview.test.ts` pins both halves: the `%2e%2e` spelling is
+  // refused for a guest scoped to the review it left, and the three spellings
+  // below classify `unknown`.
   if (/%2e|%2f|%5c/i.test(pathname)) return undefined;
   const segments = pathname.split("/");
   // `.` and `..` are refused in EVERY segment, not only the first. The
