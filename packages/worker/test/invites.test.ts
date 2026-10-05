@@ -2702,8 +2702,9 @@ const PAGE_ELEMENTS = [
 
           // And it is in no markup. The token is bound to the session the
           // redemption minted, so it is the value a later state-changing call
-          // must present; no page in this build needs it yet (the preview
-          // surface is 501), so none carries it.
+          // must present; no page in this build needs one yet (the append is
+          // still 501, and a preview document is served from R2 rather than
+          // generated here), so no markup carries it.
           const page = await open(harness, minted.minted.token);
           const html = await page.response.text();
           expect(html).not.toMatch(new RegExp(csrf ?? "never-matches"));
@@ -3284,7 +3285,15 @@ const PAGE_ELEMENTS = [
         const whole = await onboard(harness, { repo: REPO });
         // Covered: same repo, any PR.
         expect((await harness.dispatch("http://localhost/revkit/pr-7/")).status).toBe(401);
-        expect((await harness.dispatch("http://localhost/revkit/pr-7/", { headers: authedHeaders(whole.browser, null) })).status).toBe(501);
+        // **Was `501`.** The two `404`s are the served surface's own answer for a
+        // review with nothing published under it, and this is the stronger
+        // assertion for a SCOPE case in two ways: a 404 cannot be reached at all
+        // without passing the scope check (the gate answers 403 first), and the
+        // distinction this case draws — 403 out of scope versus 404 in scope —
+        // can only be observed once the route serves something. What is published
+        // in the bucket, and the "refused before the R2 read" half, are
+        // `test/preview.test.ts`'s cases; this one is about the gate.
+        expect((await harness.dispatch("http://localhost/revkit/pr-7/", { headers: authedHeaders(whole.browser, null) })).status).toBe(404);
         // Not covered: a different repo, at any PR.
         const other = await harness.dispatch("http://localhost/other/pr-7/", { headers: authedHeaders(whole.browser, null) });
         expect(other.status).toBe(403);
@@ -3293,7 +3302,7 @@ const PAGE_ELEMENTS = [
         expect((await harness.dispatch("http://localhost/revkit2/pr-7/", { headers: authedHeaders(whole.browser, null) })).status).toBe(403);
 
         const onePr = await onboard(harness, { repo: REPO, pr: 42 });
-        expect((await harness.dispatch("http://localhost/revkit/pr-42/", { headers: authedHeaders(onePr.browser, null) })).status).toBe(501);
+        expect((await harness.dispatch("http://localhost/revkit/pr-42/", { headers: authedHeaders(onePr.browser, null) })).status).toBe(404);
         const wrongPr = await harness.dispatch("http://localhost/revkit/pr-43/", { headers: authedHeaders(onePr.browser, null) });
         expect(wrongPr.status).toBe(403);
         expect(await json(wrongPr)).toMatchObject({ reason: "invite-scope-mismatch" });
@@ -3604,8 +3613,15 @@ const PAGE_ELEMENTS = [
         const session = await issueTestSession(harness.db);
         const headers = { cookie: `${SESSION_COOKIE_NAME}=${session.sessionId}` };
         expect((await harness.dispatch(`http://localhost${SCOPED_READ}`, { headers })).status).toBe(200);
-        expect((await harness.dispatch("http://localhost/revkit/pr-7/", { headers })).status).toBe(501);
-        expect((await harness.dispatch("http://localhost/other/pr-7/", { headers })).status).toBe(501);
+        // **Was `501` twice.** Now a preview path is served, so the answer is the
+        // surface's own "nothing published under this review": 404, and the SAME
+        // answer for a repository the operator may not have an invite for —
+        // because `operator` is deliberately unscoped (ADR-0012's GitHub-read
+        // clause is unimplemented, #34), and this is the property to keep
+        // unchanged: serving content did not narrow the operator and did not
+        // widen the guest.
+        expect((await harness.dispatch("http://localhost/revkit/pr-7/", { headers })).status).toBe(404);
+        expect((await harness.dispatch("http://localhost/other/pr-7/", { headers })).status).toBe(404);
         const refresh = await harness.dispatch("http://localhost/api/session/refresh", {
           method: "POST",
           headers: { ...headers, [CSRF_HEADER]: session.csrfToken, ...JSON_HEADERS },

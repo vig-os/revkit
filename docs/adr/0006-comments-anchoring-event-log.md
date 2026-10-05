@@ -578,3 +578,11 @@ correctly showed nothing to promote: the writer was the outlier, and it corrupte
 the external baseline besides making the wrong write. The rule is therefore
 stated once, here, and enforced by rule 3 above so that even a writer that
 bypasses the derivation cannot produce a stale authorization. Refs: #70, #59, #8
+
+## Amendment (2026-10-05, issue #69): a directory that vanishes inside the watcher callback is polled, never unwatched
+
+The #49 amendment above enumerates the fallback set — re-armed onto `fs.watch` for a never-watched
+path, `stat`-poll for the swap-damaged ones — and this adds the one shape that belonged to neither: a
+directory whose own `fs.watch` callback observes it disappear now installs the same `stat`-poll every
+other teardown path installs, so **every tracked directory is always in exactly one of watch or poll,
+never neither**. Refs: #69

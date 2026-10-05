@@ -1004,13 +1004,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
           if (!existsSync(dir)) {
             dw.needsRebind = true;
             for (const p of dw.basenames.values()) fireForPath(p);
-            // Close the dead watcher; the rebind loop will reinstall.
-            try {
-              capturedWatcher?.close();
-            } catch {
-              // Already closed.
-            }
-            dw.watcher = undefined;
+            // Closing the watcher leaves the directory watched by
+            // NEITHER an fs.watch registration NOR the poll, until the
+            // rebind probe runs — issue #69, and the one teardown in
+            // this module that used to return there. Swap to the poll
+            // here, as every other teardown does, so the directory is
+            // served the whole time it is away.
+            installDirectoryPolling(dir, dw, { force: true });
             return;
           }
           // Directory rename event with no filename → conservatively
@@ -1025,15 +1025,9 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       });
       capturedWatcher.on("error", () => {
         if (dw.watcher !== capturedWatcher) return;
-        try {
-          capturedWatcher?.close();
-        } catch {
-          // Already closed.
-        }
-        dw.watcher = undefined;
         dw.needsRebind = true;
         dw.stableObs = 0;
-        installDirectoryPolling(dir, dw);
+        installDirectoryPolling(dir, dw, { force: true });
       });
       const watcher = capturedWatcher;
       dw.watcher = watcher;
@@ -1093,10 +1087,37 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
   }
 
+  /** Close a directory's `fs.watch` registration if one is live, and
+   * clear the reference so a late event from the dead watcher cannot
+   * touch `dw` (the callbacks' `dw.watcher !== capturedWatcher` guard).
+   * A watcher that is already closed must not throw — hence the
+   * swallow. Idempotent. */
+  function closeDirectoryWatcher(dw: DirectoryWatcher): void {
+    if (dw.watcher === undefined) return;
+    try {
+      dw.watcher.close();
+    } catch {
+      // Already closed.
+    }
+    dw.watcher = undefined;
+  }
+
   /** Polling fallback for a directory. Compares (mtime, size) of
    * each tracked file at `pollIntervalMs` and fires a refresh when
    * either changes. A file that vanishes fires once so `refresh`
-   * (which does its own read + orphan) sees the deletion. */
+   * (which does its own read + orphan) sees the deletion.
+   *
+   * `force: true` is the SWAP: replace whatever mechanism is serving
+   * the directory right now (a live `fs.watch` and/or an existing poll)
+   * with a freshly-primed poll. It is the whole of the
+   * teardown-then-poll transition, so **every** path that ends a
+   * watcher for a reason other than "this directory is no longer
+   * tracked" goes through it — the watcher's own `error` event, the
+   * callback seeing the directory vanish (#69), the rebind probe's
+   * `needsRebind` branch, and its inode-swap branch. Routing all of
+   * them through ONE function is what pins the invariant: a tracked
+   * directory is watched by exactly one of `fs.watch` and the poll,
+   * never neither (#69). */
   function installDirectoryPolling(
     dir: string,
     dw: DirectoryWatcher,
@@ -1108,16 +1129,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       dw.poll = undefined;
       dw.pollStat = undefined;
     }
-    // If a live fs.watch is still hanging around from a previous
-    // install, close it — the caller uses `force: true` to swap.
-    if (options.force === true && dw.watcher !== undefined) {
-      try {
-        dw.watcher.close();
-      } catch {
-        // Already closed.
-      }
-      dw.watcher = undefined;
-    }
+    if (options.force === true) closeDirectoryWatcher(dw);
     dw.pollStat = new Map();
     for (const [basename, path] of dw.basenames) {
       void basename;
@@ -1156,11 +1168,9 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       fileTimers.delete(path);
     }
     if (dw.basenames.size === 0) {
-      try {
-        dw.watcher?.close();
-      } catch {
-        // Already closed.
-      }
+      // The directory is no longer tracked at all, so it gets no
+      // fallback — there is nothing left to serve.
+      closeDirectoryWatcher(dw);
       if (dw.poll !== undefined) clearInterval(dw.poll);
       dirWatchers.delete(dir);
     }
@@ -1327,12 +1337,6 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         return true;
       }
       if (currentIdent.dev !== dw.boundIdent.dev || currentIdent.ino !== dw.boundIdent.ino) {
-        try {
-          dw.watcher.close();
-        } catch {
-          // Already closed.
-        }
-        dw.watcher = undefined;
         dw.boundIdent = currentIdent;
         // A swap means this path HAS carried a registration, so
         // `everWatched` is already true and no re-arm will be
@@ -1444,11 +1448,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       dirRebindTimer = undefined;
     }
     for (const dw of dirWatchers.values()) {
-      try {
-        dw.watcher?.close();
-      } catch {
-        // Already closed.
-      }
+      closeDirectoryWatcher(dw);
       if (dw.poll !== undefined) clearInterval(dw.poll);
     }
     dirWatchers.clear();

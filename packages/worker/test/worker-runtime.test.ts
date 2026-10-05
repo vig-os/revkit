@@ -83,6 +83,14 @@ const BUNDLE_CEILING_BYTES = 2 * 1024 * 1024;
  */
 const LOG_KEY = previewScopePath("revkit", 7);
 const READ_PATH = scopedThreadsPath("revkit", 7);
+/** The preview document's URL, derived from the same `previewScopePath` as the
+ *  log key because one review has one prefix in both stores (issue #101). */
+const PREVIEW_PATH = `${LOG_KEY}/index.html`;
+/** **The R2 key, written out on purpose.** `previewScopePath` derives the
+ *  key's first two segments, so building it here the same way would make this
+ *  case follow a layout change silently and pass. Written as a literal, the
+ *  layout `<repo>/pr-<n>/<path>` (DESIGN-0001 §6.1) is what is pinned. */
+const PREVIEW_KEY = "revkit/pr-7/index.html";
 
 /**
  * A four-event log with a GAP: seqs 1, 2, 3 and 7.
@@ -490,19 +498,50 @@ describe("ADR-0025 runtime gate", () => {
     expect(bundle.headers.get("location")).toBeNull();
   });
 
-  test("a recognised preview path is 501 naming slice 5, for a caller with a session", async () => {
-    // Preview paths are GATED from slice 2 even though they have nothing to
-    // serve, so slice 5 inherits the gate from the route table instead of
-    // having to remember it. The unauthenticated answer is 401 — driven in
-    // `authorization.test.ts` — and it is the stricter one, because the day
-    // R2 exists a 501 is a 200.
+  test("a preview path is served from R2 by the SHIPPED bundle, and is 404 with no body when nothing is published", async () => {
+    // **This case was "a recognised preview path is 501 naming slice 5", and the
+    // replacement is stronger rather than merely different.** A 501 asserted that
+    // the surface was closed; a 404-with-no-body plus a real 200 asserts that it
+    // is open AND that the two empty answers (a review with no build, a build
+    // that is not there) are the same answer.
+    //
+    // **And it is on this file's harness, which runs `src/index.ts` unmodified.**
+    // The allowlist, the counting binding and the full directive set are in
+    // `test/preview.test.ts`, which dispatches through a wrapper so it can count
+    // R2 reads. This file cannot do that — it is the plain bundle — so the two
+    // together are what cover the route: the rules are proven on the wrapper,
+    // and "the real artefact serves a real object" is proven here, where nothing
+    // stands between the assertion and the shipped code.
     const issued = await issueTestSession(harness.db);
-    const response = await harness.dispatch("http://localhost/revkit/pr-7/index.html", {
-      headers: { cookie: cookieHeader(issued.sessionId) },
+    const cookie = { cookie: cookieHeader(issued.sessionId) };
+
+    const missing = await harness.dispatch(`http://localhost${PREVIEW_PATH}`, { headers: cookie });
+    expect(missing.status).toBe(404);
+    // No body at all: not an error document, not an empty one with a length.
+    expect(await missing.text()).toBe("");
+    // Hygiene on the 404 too, because a 404 is a response a browser renders.
+    expect(missing.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(missing.headers.get("cache-control")).toBe("no-store");
+
+    const document = "<!doctype html><title>shipped-bundle preview</title>";
+    await harness.previews.put(PREVIEW_KEY, document, {
+      // The metadata an artefact would carry, and the one thing the handler must
+      // ignore: `src/preview-assets.ts` types the response from the PATH.
+      httpMetadata: { contentType: "text/javascript; charset=utf-8" },
     });
-    expect(response.status).toBe(501);
-    const body = (await response.json()) as { enabledIn: string };
-    expect(body.enabledIn).toContain("slice 5");
+    try {
+      const served = await harness.dispatch(`http://localhost${PREVIEW_PATH}`, { headers: cookie });
+      expect(served.status).toBe(200);
+      expect(served.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(served.headers.get("content-security-policy")).toContain("default-src 'none'");
+      expect(served.headers.get("cache-control")).toBe("no-store");
+      expect(await served.text()).toBe(document);
+      // And the unauthenticated answer is still 401 — the gate is in front of the
+      // bucket, so an anonymous caller never reaches an object at all.
+      expect((await harness.dispatch(`http://localhost${PREVIEW_PATH}`)).status).toBe(401);
+    } finally {
+      await harness.previews.delete(PREVIEW_KEY);
+    }
   });
 
   test("every response carries the request id in a header, on every status", async () => {
