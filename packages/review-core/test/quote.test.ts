@@ -16,6 +16,7 @@ import {
   type QuoteBuild,
   type QuoteRefusal,
 } from "../src/quote.ts";
+import { foldSourcePlain, foldTypographyLoose } from "../src/typography.ts";
 import {
   anchorSchema,
   DEFAULT_ANCHOR_CONTEXT_CHARS,
@@ -290,5 +291,215 @@ describe("buildQuoteForComment — refuses rather than inventing a quote (B1)", 
     const result = buildQuoteForComment(NO_TRAILING_NL, 3, 3);
     if (!result.ok) throw new Error(`expected the range to quote, got ${result.reason}`);
     expect(result.quote.exact).toBe(para(3));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #124 round 3 — the two new blockers.
+//
+// NB1: `foldScan`'s loose-mode length pass subtracted collapsed whitespace but
+// never added substitution GROWTH, so on any source holding `—` or `…` the
+// offset maps came out short, out-of-range writes were dropped, `findFolded`
+// read `?? 0`, and a valid selection came back as `exact: ""` — then a 400
+// with a misleading cause. ASCII-only fixtures cannot see it.
+//
+// NB2: the rail sends `selection.toString()`, which is the RENDERED text. A
+// reviewer selecting `really` out of `**really**` sends a hint that is not a
+// substring of the source, so matching against raw source refused the most
+// ordinary selections there are with "reload the page".
+// ---------------------------------------------------------------------------
+
+describe("buildQuoteForComment — non-ASCII source (NB1)", () => {
+  // The falsifier's exact fixture: two em dashes, each of which EXPANDS to
+  // `--` under the fold, so the map is two characters short when pass 1
+  // forgets the growth.
+  const DASHES = "We decided — after much debate — to ship the release tomorrow.\n";
+  const ELLIPSIS = "Wait… we agreed to ship the release tomorrow.\n";
+
+  test("the fixture really does expand: the fold is LONGER than its source", () => {
+    // Without this the fixtures below would be vacuous — an implementation
+    // that ignored the substitutions entirely would pass them.
+    const folded = foldSourcePlain(DASHES);
+    expect(folded.text.length).toBeGreaterThan(DASHES.length);
+    expect(folded.text).toContain("We decided -- after much debate --");
+  });
+
+  test("the offset maps are as long as the folded text — the NB1 invariant", () => {
+    // The shape of the bug: `starts` / `ends` sized by one pass and filled
+    // by another. Asserting the lengths agree catches any drift, whatever
+    // caused it.
+    for (const source of [DASHES, ELLIPSIS, "plain ascii line\n"]) {
+      const folded = foldSourcePlain(source);
+      expect(folded.starts.length).toBe(folded.text.length);
+      expect(folded.ends.length).toBe(folded.text.length);
+    }
+  });
+
+  test("a selection on a dash-bearing line resolves to its own span", () => {
+    // THE repro. On the pre-fix head this returned `exact: ""`.
+    const result = buildQuoteForComment(DASHES, 1, 1, "release tomorrow");
+    if (!result.ok) throw new Error(`expected a quote, got ${result.reason}`);
+    expect(result.quote.exact).toBe("release tomorrow");
+  });
+
+  test("a selection on an ellipsis-bearing line resolves too", () => {
+    const result = buildQuoteForComment(ELLIPSIS, 1, 1, "release tomorrow");
+    if (!result.ok) throw new Error(`expected a quote, got ${result.reason}`);
+    expect(result.quote.exact).toBe("release tomorrow");
+  });
+
+  test("every character of a folded hit maps to a real source offset", () => {
+    // The falsifier's `ends[lastAt] ?? 0` fallback: an out-of-range map read
+    // as offset 0, which is how a valid hit became an empty span. Asserting
+    // the whole map is in range is the general form.
+    const folded = foldSourcePlain(DASHES);
+    for (let i = 0; i < folded.text.length; i += 1) {
+      expect(folded.starts[i]).toBeGreaterThanOrEqual(0);
+      expect(folded.starts[i]).toBeLessThanOrEqual(DASHES.length);
+      expect(folded.ends[i]).toBeGreaterThanOrEqual(0);
+      expect(folded.ends[i]).toBeLessThanOrEqual(DASHES.length);
+    }
+  });
+
+  test("a dash-bearing line still refuses a hint that is genuinely absent", () => {
+    // The fix must not turn every non-ASCII block into a match.
+    expectRefusal(buildQuoteForComment(DASHES, 1, 1, "not in this line"), "hint-not-found");
+  });
+});
+
+describe("buildQuoteForComment — hints over inline markup (NB2)", () => {
+  /** Assert the hint resolves, and that the stored `exact` is source text
+   * whose PLAIN projection is the hint — the property that says the anchor
+   * is the selection without claiming to be byte-identical to the rendered
+   * text. */
+  function expectSelectionOn(source: string, hint: string, expected: string): void {
+    const lines = source.split("\n").length - 1;
+    const result = buildQuoteForComment(source, 1, lines, hint);
+    if (!result.ok) throw new Error(`expected "${hint}" to resolve, got ${result.reason}`);
+    expect(result.quote.exact).toBe(expected);
+    expect(foldSourcePlain(result.quote.exact).text.trim()).toBe(
+      foldTypographyLoose(hint).trim(),
+    );
+    // The provenance property from ADR-0006: source bytes, always.
+    expect(source).toContain(result.quote.exact);
+  }
+
+  // The hints below are PHRASES a reviewer dragged across, not words that
+  // happen to sit inside the delimiters: `really` alone is a substring of
+  // `**really**`, so it resolves on raw source by luck, while `were really
+  // happy` — what a drag actually reports — is not.
+  test("BOLD: a selection crossing **really** anchors the source span", () => {
+    expectSelectionOn(
+      "We were **really** happy about it.\n",
+      "were really happy",
+      "were **really** happy",
+    );
+  });
+
+  test("ITALIC: a selection crossing *really* anchors the source span", () => {
+    expectSelectionOn("We were *really* happy about it.\n", "were really happy", "were *really* happy");
+  });
+
+  test("a LINK: a selection crossing the label anchors source, not just the label", () => {
+    expectSelectionOn(
+      "Read [the docs](https://example.com/x) today.\n",
+      "Read the docs today",
+      "Read [the docs](https://example.com/x) today",
+    );
+  });
+
+  test("a LINK: selecting only the label still anchors just the label", () => {
+    // The narrow case: the label alone is a substring of the source, so it
+    // resolved before NB2 was fixed. Asserted so the plain-text path does
+    // not start over-widening where a tight span was available.
+    expectSelectionOn("Read [the docs](https://example.com/x) today.\n", "the docs", "the docs");
+  });
+
+  test("INLINE CODE: a selection crossing `gh pr list` anchors the source span", () => {
+    // The backtick was already in `FOLD` from round 1, so this one resolved
+    // before NB2 — measured, not assumed, and kept so a change to the table
+    // that broke it would show here.
+    expectSelectionOn("Run `gh pr list` now.\n", "Run gh pr list now", "Run `gh pr list` now");
+  });
+
+  test("a LIST: a selection spanning two items anchors both items' source", () => {
+    // Rendered as two bullets; `textContent` has no `- `, so the hint is
+    // `alpha item beta item` across a soft break.
+    expectSelectionOn("- alpha item\n- beta item\n", "alpha item beta item", "alpha item\n- beta item");
+  });
+
+  test("a LIST: a selection of one item anchors just that item", () => {
+    expectSelectionOn("- alpha item\n- beta item\n", "alpha item", "alpha item");
+  });
+
+  test("a SOFT BREAK: a two-line selection still resolves (round 2's case)", () => {
+    expectSelectionOn(
+      "first line of the pair\nsecond line of the pair\n",
+      "first line of the pair second line of the pair",
+      "first line of the pair\nsecond line of the pair",
+    );
+  });
+
+  test("SMART PUNCTUATION: a selection inside a rendered quote anchors the source span", () => {
+    // `“hi”` in the page, `"hi"` in the source.
+    expectSelectionOn('He said "hi" -- ok... (c) 2026\n', "hi", "hi");
+  });
+
+  test("a BLOCKQUOTE: the `>` marker is not part of the selection", () => {
+    expectSelectionOn("> quoted words here\n", "quoted words here", "quoted words here");
+  });
+
+  test("an ORDERED list item: the `1.` marker is not part of the selection", () => {
+    expectSelectionOn("1. first thing\n", "first thing", "first thing");
+  });
+
+  test("an IMAGE: the `!` is stripped but the alt text is kept", () => {
+    expectSelectionOn("Look ![a diagram](d.png) here\n", "a diagram", "a diagram");
+  });
+
+  test("a heading: the `#` run is not part of the selection", () => {
+    expectSelectionOn("## A heading\n", "A heading", "A heading");
+  });
+
+  test("intra-word underscores are NOT markup — snake_case stays whole", () => {
+    // CommonMark: `_` between word characters is literal. Stripping it would
+    // invent an equivalence the renderer does not have — the same rule that
+    // keeps `---` out of `FOLD`.
+    expectSelectionOn("The snake_case_name stays.\n", "snake_case_name", "snake_case_name");
+  });
+
+  test("a hyphen in prose is NOT a list marker", () => {
+    expectSelectionOn("A well-known fact -- truly.\n", "well-known fact", "well-known fact");
+  });
+
+  test("a selection that STRADDLES markup widens to the block, honestly", () => {
+    // `Read the docs` as plain text spans `Read [` and ` the docs` in the
+    // source. The mapped span's plain text still equals the selection, so it
+    // is kept — the stored quote's plain projection is the selection, which
+    // is the property that matters, and every byte is source text.
+    const result = buildQuoteForComment(
+      "Read [the docs](https://example.com/x) today.\n",
+      1,
+      1,
+      "Read the docs",
+    );
+    if (!result.ok) throw new Error(`expected a quote, got ${result.reason}`);
+    expect(foldSourcePlain(result.quote.exact).text).toContain("Read the docs");
+    expect("Read [the docs](https://example.com/x) today.\n").toContain(result.quote.exact);
+  });
+
+  test("the stale-build refusal SURVIVES markup stripping", () => {
+    // NB2's fix must not become a way to store anything: a hint that is in
+    // neither the source nor the range's rendered text is still a 400.
+    expectRefusal(
+      buildQuoteForComment("We were **really** happy.\n", 1, 1, "text from a different page"),
+      "hint-not-found",
+    );
+  });
+
+  test("markup does not make a hint matchable that spans OUTSIDE the range", () => {
+    // The strip is per-range, so text from another block cannot leak in.
+    const source = "First **block** here.\n\nSecond *block* there.\n";
+    expectRefusal(buildQuoteForComment(source, 1, 1, "Second"), "hint-not-found");
   });
 });

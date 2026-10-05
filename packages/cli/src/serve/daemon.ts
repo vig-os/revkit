@@ -1525,6 +1525,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // resolved against the source, not trusted. Either way the
         // needle only chooses WHICH source span to quote; the stored
         // bytes are the source's.
+        //
+        // The two needles go through the IDENTICAL match (issue #113,
+        // PR #124 round 3 — review nit): a legacy client's quote is its
+        // own rendered text, so it carries the same typographic forms
+        // and the same stripped inline markup a `selectionHint` does. A
+        // legacy client posting `were really happy` for a
+        // `**really**` paragraph must get the same source span the new
+        // rail would, not a `hint-not-found` refusal — that would have
+        // turned "an older rail bundle still works" into "an older rail
+        // bundle cannot comment on a paragraph with bold in it".
         parsed.data.selectionHint ?? parsed.data.anchor.quote?.exact,
       );
       // A quote is cut from the anchored block, or the create is REFUSED

@@ -47,6 +47,7 @@ const MARK_FAST = "DOGFOOD-FAST-PATH-BODY";
 const MARK_BUILT = "DOGFOOD-FULL-BUILD-BODY";
 const BUILD_FAILURE = "dogfood build failure: RollupError: cannot resolve './missing-entry.js'";
 
+
 const OLD_SOURCE = `# ADR-9910: Dogfood
 
 - Status: Proposed
@@ -81,6 +82,20 @@ ${MARK_BUILT}
 const x: number = 1;
 \`\`\`
 `;
+
+/** 1-indexed line of `MARK_BUILT` in `REFUSED_SOURCE` — the source on disk
+ *  when `scenarioChannel` posts. Derived rather than typed in, so a fixture
+ *  edit cannot leave the anchor pointing at a blank line again: the daemon
+ *  refuses a range that names an empty line, so the failure would read as a
+ *  quoting bug rather than a stale line number. */
+const MARK_BUILT_LINE = lineOfMarker(REFUSED_SOURCE, MARK_BUILT);
+
+/** 1-indexed line of the first line of `source` containing `marker`. */
+function lineOfMarker(source: string, marker: string): number {
+  const at = source.split("\n").findIndex((line) => line.includes(marker));
+  if (at === -1) throw new Error(`marker ${marker} is not in the fixture source`);
+  return at + 1;
+}
 
 /** Every check writes to STDOUT, because this file is not a unit test
  * — it is the report an operator reads after a dogfood run, and its
@@ -379,8 +394,16 @@ async function scenarioChannel(root: string, distPath: string, daemon: DaemonHan
       body: JSON.stringify({
         anchor: {
           path: REL,
-          startLine: 7,
-          endLine: 7,
+          // Line 8 is where `MARK_BUILT` actually is: the file on disk is
+          // `REFUSED_SOURCE` (with the trailing scenario's paragraphs), and
+          // line 7 is the blank line above the marker. The daemon derives
+          // the quote from the source at this range and refuses a range that
+          // names an empty line (`empty-range`), so pointing at the blank
+          // line would fail the check for the wrong reason. Computed from
+          // the marker rather than hard-coded so it cannot drift from the
+          // fixture again.
+          startLine: MARK_BUILT_LINE,
+          endLine: MARK_BUILT_LINE,
           quote: { exact: MARK_BUILT, prefix: "", suffix: "" },
           // The rail sends the revision it computed from the DOM; the
           // daemon overrides it with `revisionOf(source)` anyway, but

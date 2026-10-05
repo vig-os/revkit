@@ -96,6 +96,7 @@ export {
   foldPair,
   foldSource,
   foldSourceLoose,
+  foldSourcePlain,
   foldTypographyLoose,
   foldedEquals,
   foldedHasHitFrom,

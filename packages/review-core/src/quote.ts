@@ -59,7 +59,7 @@ import {
 } from "./reanchor.ts";
 import {
   findFolded,
-  foldSourceLoose,
+  foldSourcePlain,
   foldedHasHitFrom,
   foldTypographyLoose,
 } from "./typography.ts";
@@ -237,23 +237,31 @@ export function buildQuoteForComment(
 
   const hint = selectionHint?.trim();
   if (hint === undefined || hint.length === 0) return { ok: true, quote: wholeRange };
-  // Search the LOOSE-folded form of the SOURCE slice. Folding is what
-  // lets a rendered hint match its source counterpart (`“hi”` is not a
-  // substring of `"hi"`); collapsing whitespace runs is what lets a
-  // selection across a markdown soft break match, since the source
-  // holds a newline where the rendered page holds a space. The hit is
-  // mapped back to source offsets, so the stored `exact` is source
-  // text — with its `--`, its `...`, and its newlines.
-  const blockFolded = foldSourceLoose(wholeRange.exact);
+  // Search the range's PLAIN-TEXT projection — the text the rendered
+  // page shows, which is what `selection.toString()` reports. Three
+  // projections are stacked here, and each exists because the browser's
+  // text differs from the source in that way:
+  //
+  //   typographic fold — `“hi”` is not a substring of the source `"hi"`
+  //   collapsed runs   — a markdown soft break is a newline in the
+  //                      source and a collapsed space on the page
+  //   markup stripped  — a reviewer selecting `really` out of
+  //                      `**really**`, or `the docs` out of
+  //                      `[the docs](url)`, sends text the source does
+  //                      not contain. Searching raw source refused
+  //                      those (issue #113, PR #124 round 3 — the
+  //                      round-2 BLOCKER NB2), on the most ordinary
+  //                      selections there are.
+  const blockPlain = foldSourcePlain(wholeRange.exact);
   const foldedHint = foldTypographyLoose(hint);
   // A needle with no resolvable form (a selection that is only
-  // backticks, say) is a needle the source cannot contain. Refusing is
+  // backticks, say) is a needle no plain text can contain. Refusing is
   // the honest answer; treating it as absent would store the block for
   // a selection we cannot read.
   if (foldedHint.length === 0) return { ok: false, reason: "hint-not-found", totalLines };
-  const hit = findFolded(blockFolded, foldedHint);
+  const hit = findFolded(blockPlain, foldedHint);
   if (hit === null) return { ok: false, reason: "hint-not-found", totalLines };
-  if (foldedHasHitFrom(blockFolded, foldedHint, hit.foldedAt + foldedHint.length)) {
+  if (foldedHasHitFrom(blockPlain, foldedHint, hit.foldedAt + foldedHint.length)) {
     // Ambiguous — the reviewer selected text that occurs twice in the
     // block and the rendered hint cannot say which. Quote the whole
     // line range. This is the reviewer's OWN block: the anchor is
@@ -263,10 +271,22 @@ export function buildQuoteForComment(
     // inside the block the reviewer addressed.
     return { ok: true, quote: wholeRange };
   }
-  return {
-    ok: true,
-    quote: buildQuoteFromOffsets(lf, blockStart + hit.start, blockStart + hit.end, options),
-  };
+  // Map the hit back to source offsets and KEEP IT ONLY IF the mapped
+  // span's own plain text is the selection. That is the precision test
+  // (issue #113, PR #124 round 3): when markup sits inside the span,
+  // the source between the two boundaries holds characters the rendered
+  // page never showed — `**`, a link target — and quoting it would
+  // store text the reviewer did not select, which is the failure this
+  // whole path exists to prevent. When the span straddles markup, widen
+  // to the block's full source range: honest and coarse beats precise
+  // and wrong.
+  const sourceStart = blockStart + hit.start;
+  const sourceEnd = blockStart + hit.end;
+  const mapped = lf.slice(sourceStart, sourceEnd);
+  if (sourceEnd <= sourceStart || foldSourcePlain(mapped).text !== foldedHint) {
+    return { ok: true, quote: wholeRange };
+  }
+  return { ok: true, quote: buildQuoteFromOffsets(lf, sourceStart, sourceEnd, options) };
 }
 
 /** Why `buildQuoteForComment` produced no quote. Carried to the caller so

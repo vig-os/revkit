@@ -455,3 +455,171 @@ describe("POST /api/threads — a stale anchor is refused, not clamped (round 2,
     expect(accepted.status).toBe(201);
   });
 });
+
+// ---------------------------------------------------------------------------
+// PR #124 round 3 — NB2 through the real POST.
+//
+// The rail sends `selection.toString()`, which is the RENDERED text. A
+// reviewer dragging across `were **really** happy` sends `were really happy`,
+// which is not a substring of the source, so matching against raw source
+// refused it with "reload the page" — on the most ordinary selection there
+// is, and against a page that was perfectly current.
+//
+// These go through the real route because the property is the daemon's: a
+// hint is matched against the range's RENDERED PLAIN TEXT, and only a hint
+// that is in neither the source nor that projection is a stale build.
+// ---------------------------------------------------------------------------
+
+describe("POST /api/threads — a hint over inline markup resolves (round 3, NB2)", () => {
+  /** POST against `source` (anchoring lines 1..`endLine`) and return the
+   * status plus the stored quote. */
+  async function postOn(
+    source: string,
+    hint: string,
+    endLine = 1,
+  ): Promise<{ status: number; exact: string }> {
+    writeFileSync(join(root, REL_PATH), source);
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 1, endLine, revision: "0".repeat(64) },
+      selectionHint: hint,
+      body: "a comment over markup",
+    });
+    if (response.status !== 201) return { status: response.status, exact: "" };
+    const parsed = JSON.parse(
+      await (
+        await fetch(`${daemon.url}/api/threads`, {
+          headers: { cookie, host: `127.0.0.1:${daemon.port}`, origin: daemon.url },
+        })
+      ).text(),
+    ) as { threads: { comments: { body: string }[]; anchor: { quote: { exact: string } } }[] };
+    return { status: 201, exact: parsed.threads[0]?.anchor.quote.exact ?? "" };
+  }
+
+  test("BOLD: a phrase dragged across **really** is stored, not refused", async () => {
+    const source = "We were **really** happy about it.\n";
+    const { status, exact } = await postOn(source, "were really happy");
+    expect(status).toBe(201);
+    // Source bytes, delimiters included — the span the selection covers.
+    expect(exact).toBe("were **really** happy");
+    expect(source).toContain(exact);
+  });
+
+  test("ITALIC: a phrase dragged across *really* is stored", async () => {
+    const source = "We were *really* happy about it.\n";
+    const { status, exact } = await postOn(source, "were really happy");
+    expect(status).toBe(201);
+    expect(exact).toBe("were *really* happy");
+  });
+
+  test("LINK: a phrase crossing [the docs](url) is stored", async () => {
+    const source = "Read [the docs](https://example.com/x) today.\n";
+    const { status, exact } = await postOn(source, "Read the docs today");
+    expect(status).toBe(201);
+    expect(exact).toBe("Read [the docs](https://example.com/x) today");
+  });
+
+  test("INLINE CODE: a phrase crossing `gh pr list` is stored", async () => {
+    const source = "Run `gh pr list` now.\n";
+    const { status, exact } = await postOn(source, "Run gh pr list now");
+    expect(status).toBe(201);
+    expect(exact).toBe("Run `gh pr list` now");
+  });
+
+  test("LIST: a selection spanning two items is stored", async () => {
+    const source = "- alpha item\n- beta item\n";
+    writeFileSync(join(root, REL_PATH), source);
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 1, endLine: 2, revision: "0".repeat(64) },
+      // Rendered as two bullets; `textContent` has no `- ` and the line
+      // break collapses to a space.
+      selectionHint: "alpha item beta item",
+      body: "both items",
+    });
+    expect(response.status).toBe(201);
+    const parsed = JSON.parse(
+      await (
+        await fetch(`${daemon.url}/api/threads`, {
+          headers: { cookie, host: `127.0.0.1:${daemon.port}`, origin: daemon.url },
+        })
+      ).text(),
+    ) as { threads: { anchor: { quote: { exact: string } } }[] };
+    expect(parsed.threads[0]?.anchor.quote.exact).toBe("alpha item\n- beta item");
+  });
+
+  test("SOFT BREAK: a two-line selection is still stored (round 2's case)", async () => {
+    const source = "first line of the pair\nsecond line of the pair\n";
+    const { status, exact } = await postOn(
+      source,
+      "first line of the pair second line of the pair",
+      2,
+    );
+    expect(status).toBe(201);
+    expect(exact).toBe("first line of the pair\nsecond line of the pair");
+  });
+
+  test("SMART PUNCTUATION: a selection inside a rendered quote is stored", async () => {
+    // The hint is what the BROWSER reports for the rendered span, so it holds
+    // the curly quotes and the em dash — not the source's `"hi" -- ok`. The
+    // stored quote is the source's.
+    const source = 'He said "hi" -- ok... (c) 2026\n';
+    const { status, exact } = await postOn(source, "said “hi” — ok");
+    expect(status).toBe(201);
+    expect(exact).toBe('said "hi" -- ok');
+  });
+
+  test("a phrase that is in NEITHER the source nor the rendered text still 400s", async () => {
+    // NB2's fix must not become a way to store anything.
+    writeFileSync(join(root, REL_PATH), "We were **really** happy.\n");
+    const response = await postRaw({
+      anchor: { path: REL_PATH, startLine: 1, endLine: 1, revision: "0".repeat(64) },
+      selectionHint: "text from a completely different page",
+      body: "stale",
+    });
+    expect(response.status).toBe(400);
+    expect(response.message).toBe(
+      "stale-anchor: selection not found in source range; reload the page",
+    );
+  });
+
+  test("range-past-eof and empty-range are unaffected by the markup path", async () => {
+    // The round-2 refusals must stay refusals; a hint that resolves must not
+    // become a way around them.
+    const stale = await postRaw({
+      anchor: { path: REL_PATH, startLine: 90, endLine: 91, revision: "0".repeat(64) },
+      selectionHint: "really",
+      body: "past eof",
+    });
+    expect(stale.status).toBe(400);
+    expect(stale.message).toContain("stale-anchor");
+    expect(stale.message).toContain("past the end of");
+  });
+
+  test("a LEGACY client whose quote holds markup still resolves, not 400s", async () => {
+    // `daemon.ts` falls back to `anchor.quote.exact` as the hint when no
+    // `selectionHint` is sent. A legacy client's rendered quote can hold the
+    // same inline markup this path now projects away, so it has to go
+    // through the identical matching — the review nit.
+    const source = "We were **really** happy about it.\n";
+    writeFileSync(join(root, REL_PATH), source);
+    const response = await postRaw({
+      anchor: {
+        path: REL_PATH,
+        startLine: 1,
+        endLine: 1,
+        revision: "0".repeat(64),
+        quote: { exact: "were really happy", prefix: "", suffix: "" },
+      },
+      body: "legacy client with a markup-bearing quote",
+    });
+    expect(response.status).toBe(201);
+    const parsed = JSON.parse(
+      await (
+        await fetch(`${daemon.url}/api/threads`, {
+          headers: { cookie, host: `127.0.0.1:${daemon.port}`, origin: daemon.url },
+        })
+      ).text(),
+    ) as { threads: { anchor: { quote: { exact: string } } }[] };
+    // Stored from the source, and the client's own text is not what landed.
+    expect(parsed.threads[0]?.anchor.quote.exact).toBe("were **really** happy");
+  });
+});

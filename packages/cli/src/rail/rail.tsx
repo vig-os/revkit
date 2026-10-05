@@ -1419,9 +1419,17 @@ function Rail(): JSX.Element {
       // `remark-smartypants`, so `“hi”` stands where the source says
       // `"hi"`, and an inline-code span has lost its backticks). It
       // rides along as a hint about WHICH source span to quote; the
-      // daemon matches it against the file and stores the source
-      // bytes it lands on. A hint it cannot resolve widens the quote
-      // to the whole line range.
+      // daemon matches it against the file's plain text and stores the
+      // source bytes it lands on.
+      //
+      // What the daemon does when it cannot place the hint (issue #113,
+      // PR #124 rounds 2-3): a hint that is in neither the source nor
+      // the range's RENDERED PLAIN TEXT is a stale build and comes back
+      // as a 400 — so `refusalReason` below shows the daemon's reason
+      // ("reload the page") rather than a bare status. A hint it CAN
+      // place but not map to one source span (the selection straddles
+      // inline markup, say) widens to the whole block, which is honest
+      // and coarse; it never widens on a hint it could not find.
       //
       // `quoteFromBlock`, which used to cut `anchor.quote` out of
       // `block.textContent` right here, is gone with the defect.

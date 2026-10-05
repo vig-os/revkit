@@ -492,6 +492,55 @@ overrun should degrade to the nearest text rather than fail. Two callers with
 different standing, two contracts, one shared line geometry — a single clamped
 implementation is the bug this section is about.
 
+### 3a. The hint is matched against the range's RENDERED PLAIN TEXT
+
+*(Round-3 review of the change above, issue #113, PR #124. §3 made an
+unmatchable hint a refusal. That exposed the question §3 did not ask: matchable
+against WHAT?)*
+
+The rail sends `selection.toString()` — the browser's text for the rendered
+DOM. So the hint is not source text, and §1's rule ("the source is the
+authority") is about what gets STORED, not about what the needle is compared
+to. Matching the needle against raw source refuses ordinary selections:
+a reviewer dragging across `were **really** happy` sends `were really happy`,
+which is not a substring of the source, and round 2 answered that with a
+`400` telling them to reload a page that was perfectly current.
+
+**Decision.** The needle is matched against a plain-text projection of the
+source range: the typographic fold, collapsed whitespace runs, and inline
+markup deleted. Each of the three is there because the browser's text differs
+from the source in exactly that way — `“hi”` for `"hi"`, a space for a soft
+break's newline, no `**` for bold. Stripped constructs: strong, emphasis
+(intra-word `_` excluded, per CommonMark), link brackets and targets (the
+label is kept — it is usually most of the selection), image `!` and alt text,
+`~~strikethrough~~`, ATX heading runs, and blockquote / bullet / ordered list
+markers. Not handled, deliberately: fenced code (a block, and #120 owns
+anchoring inside one), HTML and entity references (the daemon never holds the
+rendered HTML — that mapping is #119), and reference-style link definitions
+(a `[ref]` label strips its brackets and keeps the text, which is coarser than
+ideal and never wrong).
+
+**A hit that maps cleanly is anchored precisely. A hit that straddles markup
+widens to the block.** The mapped span is kept only when its OWN plain-text
+projection is the selection; otherwise the source between the two boundaries
+holds characters the page never showed — `**`, a URL — and quoting it would
+store text the reviewer did not select, which is the failure this whole path
+exists to prevent. Widening there is honest and coarse, and it is bounded by
+the block the reviewer commented on. This is the same line §3 draws between
+"ambiguous" (widen: we know the block, not the span) and "absent" (refuse:
+we know neither).
+
+**The offset maps are sized by the walk that fills them.** Both passes of the
+fold run one `scanUnits` walk, so they cannot disagree about the folded
+length. They did: the round-3 review measured a build whose length pass
+subtracted collapsed whitespace but never added substitution GROWTH, so on any
+source holding `—` or `…` the maps came out short, out-of-range writes were
+dropped, an out-of-range read fell back to offset `0`, and a valid selection
+came back as `exact: ""` — then a schema 400 blaming the wrong thing. ASCII
+fixtures cannot see that class of bug, which is why the non-ASCII ones are
+pinned: the map length must equal the folded text length, whatever the source
+holds.
+
 ### 4. The orphan reason no longer lies
 
 Path 4a's refusal used one sentence for two different failures: *"diff reports

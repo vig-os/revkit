@@ -315,7 +315,7 @@ export interface FoldedSource {
  * shorter than the source and the map cannot be sized from
  * `source.length` up front. */
 export function foldSource(source: string): FoldedSource {
-  return foldScan(source, false);
+  return foldScan(source, FoldMode.NONE);
 }
 
 /**
@@ -340,36 +340,88 @@ export function foldSource(source: string): FoldedSource {
  * comparisons must stay byte-exact, so `foldSource` is untouched by it.
  */
 export function foldSourceLoose(source: string): FoldedSource {
-  return foldScan(source, true);
+  return foldScan(source, FoldMode.WHITESPACE);
+}
+
+/**
+ * The range's source projected to the PLAIN TEXT a rendered page shows — the
+ * typographic fold, collapsed whitespace, AND inline markup deleted.
+ *
+ * **Why (issue #113, PR #124 round 3).** The rail sends
+ * `selection.toString()`, which is the browser's text for the rendered
+ * DOM: markup is already stripped by the time the reviewer can select
+ * it. A reviewer who selects `really` inside `**really**`, or `the docs`
+ * inside `[the docs](https://…)`, therefore sends a hint that is NOT a
+ * substring of the source. Matching the hint against raw source refused
+ * those with a 400 telling the reviewer to reload a page that was
+ * perfectly current — on a core path, for the most ordinary selections
+ * there are.
+ *
+ * This is the projection that makes the hint comparable, so the comment
+ * builder can search it and map a hit back to source offsets. When the
+ * markup around a hit makes the mapping ambiguous, the caller widens to
+ * the block's source range, which is honest and coarse; the alternative
+ * is a span that claims to be the selection and is not.
+ *
+ * **Markup is stripped only here, never in `foldSource`.** The
+ * re-anchoring engine compares a recorded quote against source bytes, so
+ * it must see the markup — a quote that stored rendered text is the
+ * defect #113 fixed. Only the comment builder needs to compare what the
+ * REVIEWER selected, which is the page's text with no markup left in it.
+ * The re-anchoring engine calls no function in this section.
+ *
+ * Markup handling is `markupDelimiterAt`'s, and its limits are named
+ * there (fenced code is #120's, entities are #119's).
+ */
+export function foldSourcePlain(source: string): FoldedSource {
+  return foldScan(source, FoldMode.WHITESPACE_PLAIN);
 }
 
 /** The needle-side counterpart of `foldSourceLoose`: fold the
  * typographic forms and collapse whitespace runs, with no offset map
- * (a needle is searched, never sliced). */
+ * (a needle is searched, never sliced).
+ *
+ * A needle needs no markup stripping: it came from `textContent`, which
+ * has none left. Stripping it again would be harmless for well-formed
+ * input and wrong for a selection that legitimately contains a bracket,
+ * so it is deliberately not done. */
 export function foldTypographyLoose(text: string): string {
   const folded = foldTypography(text);
   if (!/\s/.test(folded)) return folded;
   return folded.replace(/\s+/g, " ");
 }
 
-/** The one scanner behind `foldSource` and `foldSourceLoose`. Both are
- * a two-pass measure-then-fill over the same three cases — a `FOLD`
- * substitution, a whitespace run (only when `collapseWhitespace`), or a
- * verbatim character — so the two folds cannot drift on the offset map
- * that every search maps through. */
-function foldScan(source: string, collapseWhitespace: boolean): FoldedSource {
-  const foldLen = (replacement: string): number => replacement.length;
-  // Pass 1: the folded LENGTH (the fold expands and deletes, so it
-  // cannot be sized from `source.length`).
-  let foldedLength = source.length;
-  if (collapseWhitespace) {
-    foldedLength -= countCollapsedWhitespace(source);
-  } else {
-    FOLD_PATTERN.lastIndex = 0;
-    for (let m = FOLD_PATTERN.exec(source); m !== null; m = FOLD_PATTERN.exec(source)) {
-      foldedLength += foldLen(FOLD.get(source.charAt(m.index)) ?? "") - 1;
-    }
-  }
+/** How `foldScan` treats the three things it can meet. The flags are
+ * orthogonal and every combination is a total function — `foldSource`
+ * is `NONE`, `foldSourceLoose` is `WHITESPACE`. */
+const enum FoldMode {
+  NONE = 0,
+  /** Collapse every run of ASCII whitespace to one space. */
+  WHITESPACE = 1,
+  /** Also delete Markdown INLINE MARKUP: `**`, `*`, `_`, `[`, `](url)`,
+   * a leading `> `, list markers. See `foldSourcePlain`. */
+  PLAIN = 2,
+  WHITESPACE_PLAIN = 3,
+}
+
+/** The one scanner behind every fold in this module. It is a
+ * two-pass measure-then-fill over the same cases, and **both passes run
+ * the identical walk** (`scanUnits`), so they cannot disagree about how
+ * long the result is. That is not a nicety: the round-3 review of #124
+ * measured a build where pass 1 subtracted collapsed whitespace but
+ * never added substitution growth (`—` → `--`), so on any non-ASCII
+ * source the maps were two characters short, out-of-range writes were
+ * dropped, `findFolded` read `?? 0`, and a valid selection came back as
+ * `exact: ""`. One walk, two passes over it, cannot have that bug. */
+function foldScan(source: string, mode: FoldMode): FoldedSource {
+  const collapseWhitespace = (mode & FoldMode.WHITESPACE) !== 0;
+  const stripMarkup = (mode & FoldMode.PLAIN) !== 0;
+
+  // Pass 1: the folded LENGTH. Same walk as pass 2, so it cannot drift.
+  let foldedLength = 0;
+  scanUnits(source, collapseWhitespace, stripMarkup, (unit) => {
+    foldedLength += unit.length;
+  });
 
   const starts = new Int32Array(foldedLength);
   const ends = new Int32Array(foldedLength);
@@ -403,61 +455,211 @@ function foldScan(source: string, collapseWhitespace: boolean): FoldedSource {
     text += " ";
   };
 
-  if (collapseWhitespace) {
-    for (let k = 0; k < source.length; ) {
-      const replacement = FOLD.get(source.charAt(k));
-      if (replacement !== undefined) {
-        // A DELETING substitution (a backtick) emits nothing: `out` does
-        // not advance, so the next real character overwrites that slot.
-        if (replacement.length > 0) emitSubstitution(k, replacement);
-        k += 1;
-        continue;
-      }
-      if (WHITESPACE.has(source.charAt(k))) {
-        const runStart = k;
-        while (k < source.length && WHITESPACE.has(source.charAt(k))) k += 1;
-        emitSpace(runStart, k);
-        continue;
-      }
-      // This branch walks character by character (the run structure of
-      // the non-collapsing loop is useless once whitespace is its own
-      // case), so the verbatim character is appended here rather than
-      // sliced out in bulk afterwards.
-      text += source.charAt(k);
-      emitVerbatim(k);
-      k += 1;
+  // Pass 2: the same walk again, this time recording where each emitted
+  // character came from.
+  scanUnits(source, collapseWhitespace, stripMarkup, (unit) => {
+    switch (unit.kind) {
+      case "verbatim":
+        text += source.charAt(unit.sourceStart);
+        emitVerbatim(unit.sourceStart);
+        return;
+      case "substitution":
+        emitSubstitution(unit.sourceStart, unit.text);
+        return;
+      case "space":
+        emitSpace(unit.sourceStart, unit.sourceEnd);
+        return;
+      case "markup":
+        // Nothing to write: the folded cursor does not advance, so the
+        // next real character overwrites this slot with its own offsets.
+        return;
     }
-  } else {
-    let copied = 0;
-    FOLD_PATTERN.lastIndex = 0;
-    for (let m = FOLD_PATTERN.exec(source); m !== null; m = FOLD_PATTERN.exec(source)) {
-      const at = m.index;
-      // Copy the run before the match verbatim; `starts` is the identity
-      // map there, so the run loop only has to record the offsets.
-      text += source.slice(copied, at);
-      for (let k = copied; k < at; k += 1) emitVerbatim(k);
-      emitSubstitution(at, FOLD.get(source.charAt(at)) ?? "");
-      copied = at + 1;
-    }
-    text += source.slice(copied);
-    for (let k = copied; k < source.length; k += 1) emitVerbatim(k);
-  }
+  });
   return { text, starts, ends };
 }
 
-/** How many characters `foldSourceLoose` drops by collapsing runs — the
- *  inverse of what `emitSpace` writes, so pass 1 sizes the map
- *  exactly. */
-function countCollapsedWhitespace(source: string): number {
-  let dropped = 0;
-  for (let k = 0; k < source.length; k += 1) {
-    if (!WHITESPACE.has(source.charAt(k))) continue;
-    let runEnd = k + 1;
-    while (runEnd < source.length && WHITESPACE.has(source.charAt(runEnd))) runEnd += 1;
-    dropped += runEnd - k - 1;
-    k = runEnd - 1;
+/** One unit of the fold: what to emit, and the source span it came
+ * from. `length` is what pass 1 counts, so it is `text.length` for every
+ * kind by construction. */
+interface FoldUnit {
+  /** `markup` is stripped markup: it emits nothing and covers the
+   *  delimiter run. It is its own kind rather than a zero-length
+   *  `verbatim` because pass 2 appends to the text for `verbatim` — a
+   *  shared kind silently re-inserted the delimiter while leaving the
+   *  map unadvanced, which is the round-3 review's NB1 all over again
+   *  in a different costume. */
+  readonly kind: "verbatim" | "substitution" | "space" | "markup";
+  /** The emitted characters. Empty for a DELETING substitution (a
+   *  backtick) and for stripped markup. */
+  readonly text: string;
+  readonly sourceStart: number;
+  /** Past the last contributing source character. */
+  readonly sourceEnd: number;
+  /** How many folded characters this unit produces. */
+  readonly length: number;
+}
+
+/**
+ * Walk `source` once, handing every unit to `visit`.
+ *
+ * Three cases, in priority order at each position: a `FOLD`
+ * substitution, a whitespace run (when collapsing), a Markdown markup
+ * delimiter (when stripping), else the character verbatim. Splitting it
+ * out is what makes pass 1 and pass 2 the same walk.
+ */
+function scanUnits(
+  source: string,
+  collapseWhitespace: boolean,
+  stripMarkup: boolean,
+  visit: (unit: FoldUnit) => void,
+): void {
+  for (let k = 0; k < source.length; ) {
+    const replacement = FOLD.get(source.charAt(k));
+    if (replacement !== undefined) {
+      // A DELETING substitution (a backtick) emits nothing: the folded
+      // cursor does not advance, so the next real character overwrites
+      // that slot with its own offsets. In `` `w` `` the folded `w`
+      // therefore maps to source [1, 2) — the span that carries the
+      // text, without the delimiters.
+      visit({ kind: "substitution", text: replacement, sourceStart: k, sourceEnd: k + 1, length: replacement.length });
+      k += 1;
+      continue;
+    }
+    if (collapseWhitespace && WHITESPACE.has(source.charAt(k))) {
+      const runStart = k;
+      while (k < source.length && WHITESPACE.has(source.charAt(k))) k += 1;
+      visit({ kind: "space", text: " ", sourceStart: runStart, sourceEnd: k, length: 1 });
+      continue;
+    }
+    if (stripMarkup) {
+      const delimiter = markupDelimiterAt(source, k);
+      if (delimiter !== undefined) {
+        // Stripped markup emits NOTHING and covers the whole run, so a
+        // hit that lands next to it maps back across it correctly.
+        visit({ kind: "markup", text: "", sourceStart: k, sourceEnd: k + delimiter, length: 0 });
+        k += delimiter;
+        continue;
+      }
+    }
+    visit({ kind: "verbatim", text: source.charAt(k), sourceStart: k, sourceEnd: k + 1, length: 1 });
+    k += 1;
   }
-  return dropped;
+}
+
+/**
+ * The length of the Markdown inline markup starting at `k`, or
+ * `undefined` when there is none.
+ *
+ * What the RENDERED page shows, and therefore what a browser's
+ * `selection.toString()` reports, for each construct (issue #113,
+ * PR #124 round 3 — the reviewer selects `really` out of `**really**`
+ * and the hint is `really`):
+ *
+ * | source | rendered text | stripped |
+ * |---|---|---|
+ * | `**really**` | `really` | `really` |
+ * | `*really*` | `really` | `really` |
+ * | `_really_` | `really` | `really` |
+ * | `` `gh` `` | `gh` | `gh` (the `FOLD` backtick already does this) |
+ * | `[the docs](https://x)` | `the docs` | `the docs` |
+ * | `![alt text](src)` | `alt text` | `alt text` |
+ * | `> quoted` | `quoted` | `quoted` |
+ * | `- item` | `item` | `item` |
+ * | `1. item` | `item` | `item` |
+ * | `~~struck~~` | `struck` | `struck` |
+ *
+ * Deliberately NOT handled, and why: FENCED code (``` ``` ```), because
+ * a fence is a block and issue #120 owns anchoring inside one;
+ * HTML/entity references, because the daemon does not hold the rendered
+ * HTML — `&amp;` stays literal, which is the #119 mapping; and
+ * reference-style links `[text][ref]`, whose definition can live outside
+ * the anchored range, so the `[`/`]` are stripped and the ref text stays
+ * (a coarser match than ideal, never a wrong one).
+ *
+ * `_` is only a delimiter when it is not INTRA-WORD (`snake_case_name`),
+ * matching the CommonMark rule this repo's renderer implements.
+ */
+function markupDelimiterAt(source: string, k: number): number | undefined {
+  const ch = source.charAt(k);
+  // Emphasis and strong, opening or closing: `**`, `__`, `*`, `_`.
+  if (ch === "*" || ch === "_") {
+    if (ch === "_" && isIntraWordUnderscore(source, k)) return undefined;
+    let run = 0;
+    while (source.charAt(k + run) === ch) run += 1;
+    // A run of 3+ is not emphasis this renderer emits (`***` is literal).
+    return run >= 3 ? undefined : run;
+  }
+  // `[text](url)`: the OPENING bracket and the CLOSING `](url)` are
+  // delimiters; the label between them is content the page shows, so it
+  // is scanned normally and can carry its own markup. Deleting the whole
+  // construct here instead would drop the label — which is most of what
+  // the reviewer selected.
+  if (ch === "[") return 1;
+  if (ch === "]" && source.charAt(k + 1) === "(") {
+    const paren = source.indexOf(")", k + 2);
+    return paren === -1 ? undefined : paren + 1 - k;
+  }
+  // `![alt](src)`: the `!` is part of the image syntax and never appears
+  // in the rendered text (the `alt` does, as the image's text).
+  if (ch === "!") return 1;
+  // A line-leading block marker: `> `, `- `, `* `, `+ `, or `1. ` / `1) `.
+  // The page shows a quote bar or a bullet from CSS, neither of which is
+  // in `textContent`.
+  if (ch === ">" || ch === "+" || (ch === "-" && isListMarkerAt(source, k))) {
+    let run = 0;
+    while (source.charAt(k + run) === ch) run += 1;
+    // Only when the marker is followed by whitespace, and only for a
+    // single marker character — `--` is an em dash's source form, and it
+    // is handled by `FOLD` before this ever sees it.
+    const after = source.charAt(k + run);
+    if (after !== " " && after !== "\t") return undefined;
+    let end = k + run;
+    while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
+    return end - k;
+  }
+  if (/[0-9]/.test(ch)) {
+    const ordered = /^[0-9]{1,9}[.)]( |\t)/.exec(source.slice(k));
+    if (ordered === null) return undefined;
+    let end = k + ordered[0].length;
+    while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
+    return end - k;
+  }
+  // An ATX heading's leading `#` run, with its trailing space.
+  if (ch === "#") {
+    let run = 0;
+    while (source.charAt(k + run) === "#") run += 1;
+    if (run > 6) return undefined;
+    const after = source.charAt(k + run);
+    if (after !== " " && after !== "\t") return undefined;
+    let end = k + run;
+    while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
+    return end - k;
+  }
+  // `~~struck~~`.
+  if (ch === "~" && source.charAt(k + 1) === "~") return 2;
+  return undefined;
+}
+
+/** Whether the `-` at `k` begins a bullet list item — which requires it
+ * to be the first non-space character on its line. Elsewhere a `-` is
+ * literal (a hyphen in prose, or the start of a `--` em dash, which
+ * `FOLD` has already handled by the time this runs). */
+function isListMarkerAt(source: string, k: number): boolean {
+  for (let i = k - 1; i >= 0; i -= 1) {
+    const ch = source.charAt(i);
+    if (ch === "\n") return true;
+    if (ch !== " " && ch !== "\t") return false;
+  }
+  return true;
+}
+
+/** Whether the `_` at `k` sits between two word characters, where
+ * CommonMark says it is literal text rather than emphasis. */
+function isIntraWordUnderscore(source: string, k: number): boolean {
+  const before = source.charAt(k - 1);
+  const after = source.charAt(k + 1);
+  if (before === "" || after === "") return false;
+  return /[\w]/.test(before) && /[\w]/.test(after);
 }
 
 /**
