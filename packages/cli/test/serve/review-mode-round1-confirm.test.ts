@@ -30,6 +30,7 @@ import {
   GitHubAdapter,
   reduceReviewState,
   revisionOf,
+  type GhReviewThread,
   type PrFile,
   type PrRef,
   type PullRequestSummary,
@@ -69,7 +70,7 @@ interface Ctx {
   cookie: string;
 }
 
-async function startCtx(): Promise<Ctx> {
+async function startCtx(options: { remoteThreads?: readonly GhReviewThread[] } = {}): Promise<Ctx> {
   const root = mkdtempSync(join(tmpdir(), "revkit-r1c-"));
   tempDirs.push(root);
   const dist = join(root, "dist");
@@ -94,6 +95,7 @@ async function startCtx(): Promise<Ctx> {
         headRepoFullName: "vig-os/revkit",
         baseRepoFullName: "vig-os/revkit",
         url: "https://github.com/vig-os/revkit/pull/42",
+        ...(options.remoteThreads !== undefined ? { threads: options.remoteThreads } : {}),
       },
     ],
     { pendingState: pending, viewerLogin: "test-reviewer" },
@@ -488,21 +490,86 @@ describe("R7 — reduceReviewState reads by seq", () => {
 // and the second call reports `importedSkipped` for the same rows.
 // ────────────────────────────────────────────────────────────────
 describe("R8 — B4 pull is idempotent (no echo)", () => {
-  test("two refreshes without any remote change: second call sees importedNew=0 and importedSkipped≥0", async () => {
-    const ctx = await startCtx();
+  const OTHER_REVIEWER = { login: "other-reviewer", type: "User" as const };
+
+  /** One remote review thread with a single comment, as the fake
+   * GitHub serves it. Anchored on `docs/index.md` line 2 — a path
+   * the daemon materialises on disk — so the import produces real
+   * anchored events rather than being refused. */
+  function remoteThread(commentNodeId: string): GhReviewThread {
+    return {
+      id: "PRT_r8",
+      isResolved: false,
+      isOutdated: false,
+      resolvedByLogin: null,
+      diffSide: "RIGHT" as const,
+      startDiffSide: null,
+      line: 2,
+      originalLine: 2,
+      startLine: null,
+      originalStartLine: null,
+      subjectType: "LINE" as const,
+      path: "docs/index.md",
+      comments: [
+        {
+          nodeId: commentNodeId,
+          databaseId: 10_000,
+          body: "please rename this",
+          authorLogin: OTHER_REVIEWER.login,
+          authorType: OTHER_REVIEWER.type,
+          createdAt: "2026-09-30T00:00:00Z",
+          url: "https://github.com/example/pull/1#discussion_r10000",
+          originalCommitOid: HEAD_A,
+          diffHunk: "@@ -1,3 +1,3 @@\n line1\n line2 with quote\n line3",
+        },
+      ],
+    };
+  }
+
+  test("two refreshes without any remote change: first imports the thread, second sees importedNew=0 and importedSkipped=1", async () => {
+    // Seeded with one remote thread carrying one comment, because an
+    // EMPTY remote makes both counters 0 on both calls — which is
+    // exactly what a refresh that imports nothing at all also
+    // reports, so the idempotency invariant could not fail. With a
+    // real remote comment the counters are forced to move: the first
+    // call must import, the second must skip.
+    //
+    // Exact expected values, measured against the round-2/3 code
+    // (`populateStoreFromPr`): one remote comment yields two store
+    // events (`comment.created` + `comment.linked`), so the first
+    // pass reports `importedNew: 2`.
+    //
+    // The second pass re-presents BOTH events, and only ONE of them is
+    // skipped. `comment.created` repeats the same deterministic
+    // comment id and is refused `duplicate-comment-id`, which
+    // `import-threads.ts:243` classifies as skipped. `comment.linked`
+    // repeats the same BACKEND link instead, so it is refused
+    // `duplicate-link` (`validator.ts:675`) — a kind that classifier
+    // does NOT recognise, so it lands in `refused`, not `skipped`.
+    // Hence `importedNew: 0, importedSkipped: 1` and a `refused: 1`
+    // the endpoint does not surface. That asymmetry is pre-existing
+    // and tracked in #114; it is why `importedSkipped` is 1 here and
+    // not 2, and this test pins the real numbers rather than the
+    // tidier-looking 2.
+    const ctx = await startCtx({ remoteThreads: [remoteThread("PRRC_r8_1")] });
     const cookieHdr = { cookie: ctx.cookie, origin: ctx.handle.url, "sec-fetch-site": "same-origin", "content-type": "application/json" } as const;
     const r1 = await fetch(`${ctx.handle.url}/api/review/refresh`, { method: "POST", headers: cookieHdr, body: "{}" });
     expect([200, 201]).toContain(r1.status);
-    const b1 = (await r1.json()) as { importedNew?: number; importedSkipped?: number };
+    // Both fields are asserted as REQUIRED members of the response
+    // (no `??` default): a renamed or dropped field is `undefined`,
+    // which fails these instead of being absorbed by a default.
+    const b1 = (await r1.json()) as { importedNew: number; importedSkipped: number };
+    expect(b1.importedNew).toBe(2);
+    expect(b1.importedSkipped).toBe(0);
     const r2 = await fetch(`${ctx.handle.url}/api/review/refresh`, { method: "POST", headers: cookieHdr, body: "{}" });
     expect([200, 201]).toContain(r2.status);
-    const b2 = (await r2.json()) as { importedNew?: number; importedSkipped?: number };
-    // On an empty remote (no live GitHub threads via the fake),
-    // both calls import zero. The invariant is that a second
-    // pass produces no NEW imports — no echo of already-imported
-    // rows back to GitHub.
-    expect(b1.importedNew ?? 0).toBe(0);
-    expect(b2.importedNew ?? 0).toBe(0);
+    const b2 = (await r2.json()) as { importedNew: number; importedSkipped: number };
+    // The idempotency invariant, and the point of the test name: the
+    // second pass appends nothing and reports one already-present
+    // event as skipped (see the note on `comment.linked` above) — no
+    // echo of already-imported rows back to GitHub.
+    expect(b2.importedNew).toBe(0);
+    expect(b2.importedSkipped).toBe(1);
     // No adapter writes fired: no drafts, no submits, no
     // replies, no resolutions.
     expect(ctx.fake.drafts.length).toBe(0);
