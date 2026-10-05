@@ -38,6 +38,16 @@
 //      writes for 500 ms after a burst) and then re-run `refresh`
 //      for every threaded path. Debounce = 500 ms.
 //
+//      **On Bun that watch is a `stat`-poll, not `fs.watch`** — see
+//      `buildWatchLeaksOnThisRuntime` below and issue #87. Bun 1.3.13
+//      does not release the descriptors `fs.watch` opens when the
+//      watcher is closed, so the poll trades up to
+//      `DEFAULT_BUILD_POLL_INTERVAL_MS` of detection latency for a
+//      leak-free teardown. The DEBOUNCE contract is unchanged: the
+//      settle timer restarts on every observed change and fires
+//      `refreshAll` once the tree has been quiet for
+//      `buildDebounceMs`.
+//
 // **Justification.** Lazy alone would leave the rail stale until
 // the next fetch; the watchers close that gap on the interactive
 // path. Watchers alone would leave the rail stale across a daemon
@@ -66,7 +76,7 @@
 // server and any future PR-adapter can display or hide these
 // events independently. See M2 item 5b's design note.
 
-import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
+import { existsSync, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
 import { basename as basenameOf, dirname, relative } from "node:path";
 import {
   isLineAnchor,
@@ -115,6 +125,83 @@ export const DEFAULT_POLL_INTERVAL_MS = 2_000;
  * poll interval so a common shape for both is exercised together. */
 export const DEFAULT_BUILD_REBIND_INTERVAL_MS = 2_000;
 
+/** Interval for the Bun-only `dist` `stat`-poll (issue #87).
+ *
+ * This is the ONLY mechanism standing between a `revkit serve`
+ * daemon and a `fs.watch(dist, {recursive: true})` that leaks one
+ * descriptor per output file on Bun (see
+ * `buildWatchLeaksOnThisRuntime`), so its cost is stated rather than
+ * tuned away:
+ *
+ *   - **Latency.** A build's change is noticed up to this interval
+ *     late, then `buildDebounceMs` (500 ms) of settle time elapses
+ *     before `refreshAll` runs — the SAME settle window the
+ *     `fs.watch` debounce used, so only the *detection* step is
+ *     added, not a second debounce. Worst case a rebuild surfaces
+ *     ~1 s later than it used to; the reviewer reloads and the lazy
+ *     trigger has usually already re-anchored by then.
+ *   - **CPU.** One `readdir`+`stat` walk of `dist/` per tick.
+ *     Measured on this host: 0.07 ms for 52 entries, 1.11 ms for
+ *     805, 11.4 ms for 6 409 (median of 25). At 1 s that is
+ *     ≤ 1.1% of one core for a realistic Astro `dist`, and it is
+ *     bounded by tree size, not by reviewer activity. (The same walk
+ *     is what a single `fs.watch` did for free — this is the real
+ *     price of the mitigation.)
+ *   - **What is given up.** Sub-second build-signal latency on Bun,
+ *     and the ability of a kernel-level watch to see a write that
+ *     lands between two ticks. Neither is load-bearing: trigger 1
+ *     (the lazy `refresh` before every `/api/threads` read) is the
+ *     correctness backstop and is untouched by this.
+ *   - **What is bought.** On Bun the recursive watch costs one
+ *     descriptor per file in the build output — measured at 103 for a
+ *     100-file `dist`, 403 for 400, 1003 for 1000 — paid at start-up
+ *     and again on every re-install after `rm -rf dist && just
+ *     build`. For a long review session that is thousands of
+ *     descriptors where there used to be one watcher.
+ *
+ * 1 s is deliberately shorter than the 2 s file-poll interval: a
+ * finished build is what the reviewer is waiting on, and the walk is
+ * two orders of magnitude cheaper than the poll it sits beside. */
+export const DEFAULT_BUILD_POLL_INTERVAL_MS = 1_000;
+
+/** Does `fs.watch` leak descriptors on THIS runtime?
+ *
+ * MEASURED on `bun 1.3.13` (Linux 6.8, ext4): closing a
+ * `watch(dir, {recursive: true})` handle leaks one real `open(2)`
+ * descriptor for every path its recursive walk opened before the
+ * `close()` landed — the directory, each file, each subdirectory, to
+ * whatever depth the (asynchronous) walk reached. It is NOT
+ * `anon_inode:inotify`: a live watcher holds exactly two descriptors
+ * (inotify + the directory) and the inotify one IS released by
+ * `close()`; the survivors are the plain `open(2)` ones, and each
+ * keeps its inode alive after the tree is deleted.
+ *
+ * The count therefore scales with the watched tree, which is the part
+ * that makes it matter. Over 20 `watch()`+`close()` pairs on a
+ * `dist/{index.html, _astro/}` fixture with N files under `_astro/`,
+ * closing 50 ms after `watch()` (i.e. after the walk finishes):
+ *
+ *     N=0 -> 3    N=10 -> 13    N=100 -> 103    N=400 -> 403    N=1000 -> 1003
+ *
+ * i.e. exactly one per file. Closing in the same tick as `watch()`
+ * leaks less (`1 + <immediate entries>` for this fixture: 3 rather
+ * than 4), because the walk has not descended yet — so the leak is
+ * scheduling-dependent but never absent. `recursive: false` behaves
+ * the same way on the directory and its immediate entries, so
+ * `recursive` is not the trigger and dropping it is not a workaround.
+ * `node v24.21.0` leaks 0 over the identical loop.
+ *
+ * Only the BUILD watcher is switched to polling, and only because it
+ * is the one that watches a whole tree recursively: for a real Astro
+ * `dist` that is one descriptor per output file, paid again on every
+ * re-install after `rm -rf dist && just build`. The per-DIRECTORY
+ * watchers below keep `fs.watch` on every runtime — they are bounded
+ * by `1 + <entries in that one directory>`, and issue #49's re-arm
+ * contract is asserted through `dirWatchMode()`, which only
+ * distinguishes `"watch"` from `"poll"`. Their residual leak is
+ * tracked in #103. */
+const buildWatchLeaksOnThisRuntime = process.versions.bun !== undefined;
+
 /** How many CONSECUTIVE clean observations of a rebound directory the
  * rebind probe must make before the daemon tries to re-arm `fs.watch`
  * on it (issue #49). "Clean" means: this tick performed no rebind, saw
@@ -157,6 +244,12 @@ export interface ReanchorDaemonOptions {
    * value so a probe-G reproduction settles inside a few hundred
    * ms. */
   readonly dirRebindIntervalMs?: number;
+  /** Interval for the Bun-only `dist` `stat`-poll that replaces
+   * `fs.watch(dist, {recursive: true})` on runtimes where closing a
+   * watcher leaks its descriptors (issue #87). Default
+   * `DEFAULT_BUILD_POLL_INTERVAL_MS`. Ignored on runtimes where
+   * `fs.watch` releases its descriptors (node). */
+  readonly buildPollIntervalMs?: number;
   /** Consecutive clean probe observations a rebound directory needs
    * before the daemon re-arms `fs.watch` on it. Default
    * `DEFAULT_DIR_STABLE_INTERVALS`. See that constant for the exact
@@ -246,6 +339,14 @@ export interface ReanchorDaemonHandle {
    * its thread is re-anchored, and the entry is inert by then, so
    * there is no behavioural proxy for "was it pruned?". */
   orphanMemoSize(): number;
+  /** How the `site/dist` build signal is currently served: `"watch"`
+   * (a live `fs.watch(dist, {recursive: true})`), `"poll"` (the Bun
+   * `stat`-poll of issue #87), or `undefined` when there is no
+   * `distDir` or the daemon is stopped. Diagnostic for tests only —
+   * without it, "which mechanism is carrying the build signal" is not
+   * observable, and the poll-vs-watch choice would be untestable on
+   * the runtime that has it. */
+  buildWatchMode(): "watch" | "poll" | undefined;
   stop(): Promise<void>;
 }
 
@@ -265,6 +366,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     buildDebounceMs = DEFAULT_BUILD_DEBOUNCE_MS,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     dirRebindIntervalMs = DEFAULT_BUILD_REBIND_INTERVAL_MS,
+    buildPollIntervalMs = DEFAULT_BUILD_POLL_INTERVAL_MS,
     dirStableIntervals = DEFAULT_DIR_STABLE_INTERVALS,
     watchFn = watch,
     postReadHook,
@@ -398,6 +500,11 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       return dw.poll !== undefined ? "poll" : undefined;
     },
     orphanMemoSize: () => orphanCheckRevision.size,
+    buildWatchMode: () => {
+      if (buildPoll !== undefined) return "poll";
+      if (buildWatcher !== undefined) return "watch";
+      return undefined;
+    },
     stop,
   };
 
@@ -1229,6 +1336,10 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * fresh watcher instead of dropping build signals forever. See PR
    * #45 round-2 nit. */
   let buildRebindTimer: ReturnType<typeof setInterval> | undefined;
+  /** Interval id of the Bun-only `dist` `stat`-poll. Mutually
+   * exclusive with `buildWatcher`/`buildRebindTimer`: exactly one of
+   * the three serves the build signal on a given runtime. */
+  let buildPoll: ReturnType<typeof setInterval> | undefined;
   /** Periodic probe that reinstalls a directory watcher whose parent
    * came back after being removed (probe G: `rmdir docs && mkdir
    * docs` while a thread is anchored under it). Same cadence as the
@@ -1244,6 +1355,15 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
   }
   function installBuildWatcher(): void {
     if (distDir === undefined || stopped) return;
+    // Issue #87: on a runtime whose `fs.watch` does not release the
+    // descriptors it opened, the recursive `dist` watch leaks one
+    // descriptor per file in the build output, on every teardown and
+    // every re-install. The poll below carries the same contract
+    // (settle, then `refreshAll`) with no descriptor at all.
+    if (buildWatchLeaksOnThisRuntime) {
+      installBuildPolling();
+      return;
+    }
     if (!existsSync(distDir)) {
       // dist/ does not exist yet — schedule a probe so we install
       // the watcher when the first build lands. Fire once now to
@@ -1292,6 +1412,46 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
   }
 
+  /** Bun-only stand-in for `fs.watch(dist, {recursive: true})`
+   * (issue #87 — see `buildWatchLeaksOnThisRuntime`). Holds NO
+   * descriptor: the signal is "the tree under `distDir` differs from
+   * the snapshot I took last tick", where a tree is a flat map of
+   * relative path → `mtimeMs:size` for every file and a `dir` marker
+   * for every directory, so additions, removals, in-place rewrites and
+   * a `dist` that appears or disappears are all one comparison.
+   *
+   * The debounce contract is deliberately identical to the watcher's:
+   * every observed change RESTARTS the settle timer, and
+   * `refreshAll` runs once the tree has been quiet for
+   * `buildDebounceMs`. That makes a poll tick indistinguishable from
+   * a burst of kernel events for everything downstream — including
+   * the `rm -rf dist && just build` shape, which the watcher served
+   * by erroring out and re-arming: here it is served by the snapshot
+   * emptying and refilling, so `armBuildRebind` is not needed on this
+   * path at all. */
+  function installBuildPolling(): void {
+    if (distDir === undefined || stopped || buildPoll !== undefined) return;
+    const dir = distDir;
+    let snapshot = snapshotTree(dir);
+    const interval = setInterval(() => {
+      if (stopped) return;
+      const next = snapshotTree(dir);
+      if (sameTree(snapshot, next)) return;
+      snapshot = next;
+      if (buildTimer !== undefined) clearTimeout(buildTimer);
+      buildTimer = setTimeout(() => {
+        buildTimer = undefined;
+        void refreshAll().catch((error) =>
+          logger.warn("reanchor.build.refresh.failed", {
+            errorKind: (error as Error).name,
+          }),
+        );
+      }, buildDebounceMs);
+    }, buildPollIntervalMs);
+    (interval as unknown as { unref?: () => void }).unref?.();
+    buildPoll = interval;
+  }
+
   function armBuildRebind(): void {
     if (buildRebindTimer !== undefined || stopped || distDir === undefined) return;
     buildRebindTimer = setInterval(() => {
@@ -1315,6 +1475,10 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     if (buildRebindTimer !== undefined) {
       clearInterval(buildRebindTimer);
       buildRebindTimer = undefined;
+    }
+    if (buildPoll !== undefined) {
+      clearInterval(buildPoll);
+      buildPoll = undefined;
     }
     if (dirRebindTimer !== undefined) {
       clearInterval(dirRebindTimer);
@@ -1347,6 +1511,56 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     logger.warn("reanchor.reconcile.failed", { errorKind: (error as Error).name }),
   );
   return handle;
+}
+
+/** A `dist` tree reduced to one comparable string per entry:
+ * `mtimeMs:size` for a file, the literal `"dir"` for a directory.
+ * Keys are rooted at `root`, so two snapshots of the same tree
+ * compare key-for-key regardless of walk order. Used only by the
+ * Bun build poll (issue #87). */
+type TreeSnapshot = Map<string, string>;
+
+/** Walk `root` into `out`. A missing/unreadable directory contributes
+ * no entries rather than throwing — that IS the signal the build poll
+ * needs for `rm -rf dist` (the snapshot empties) and for a `dist` that
+ * has not been built yet (the snapshot starts empty). Symlinks are
+ * recorded but never followed: a build does not rewrite through one,
+ * and following would walk outside `dist`. */
+function walkTree(root: string, prefix: string, out: TreeSnapshot): void {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const key = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      out.set(key, "dir");
+      walkTree(root + "/" + entry.name, key, out);
+      continue;
+    }
+    try {
+      const st = statSync(root + "/" + entry.name);
+      out.set(key, `${st.mtimeMs}:${st.size}`);
+    } catch {
+      // Vanished mid-walk (a build replacing it). Record it as gone so
+      // the next tick sees a difference rather than a silent stall.
+      out.set(key, "gone");
+    }
+  }
+}
+
+function snapshotTree(root: string): TreeSnapshot {
+  const out: TreeSnapshot = new Map();
+  walkTree(root, "", out);
+  return out;
+}
+
+function sameTree(a: TreeSnapshot, b: TreeSnapshot): boolean {
+  if (a.size !== b.size) return false;
+  for (const [key, value] of a) if (b.get(key) !== value) return false;
+  return true;
 }
 
 /** Sentinel revision string for `orphanAll`'s missing-source path.

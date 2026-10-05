@@ -6,7 +6,10 @@
 - Stories: A2, A6, A7, A8, B2, B4
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
-  export|import` CLI command.
+  export|import` CLI command; and the 2026-10-05 (issue #87) amendment — on
+  Bun, trigger 3's `dist` build signal is a `stat`-poll rather than a
+  recursive `fs.watch`, because that watch leaks one descriptor per file in
+  the build output.
 
 ## Context
 
@@ -258,3 +261,41 @@ exported with `exportArchive` and imported by a hosted `ThreadStore` — the
 library API, not a CLI verb — so a local review can be published to a hosted PR.
 No user-facing command is claimed, and none should be inferred from this ADR
 until one ships and this line is amended again.*
+
+## Amendment (2026-10-05, issue #87): the `dist` build watcher is a `stat`-poll on Bun
+
+Trigger 3 above ("**Build watcher on `site/dist`** (`fs.watch` recursive)") is the mechanism this amendment pins
+down. The layering it belongs to is unchanged and is restated here because that is the part that matters: trigger 1
+(the lazy `refresh` before every `/api/threads` read) remains the only trigger that is correct on its own, and
+nothing below makes it conditional. What changes is which mechanism carries trigger 3, on which runtime.
+
+**1. On a runtime whose `fs.watch` does not release its descriptors, trigger 3 is a `stat`-poll of the `dist` tree
+instead of a recursive watch.** Measured on `bun 1.3.13` (Linux 6.8, ext4), `close()` on a
+`watch(dir, {recursive: true})` handle leaks one real `open(2)` descriptor for every path the watch's recursive walk
+opened before the close landed — and it is **not** `anon_inode:inotify`, whose descriptor *is* released; a live
+watcher holds exactly two descriptors (inotify + the directory). Because the count scales with the watched tree, a
+single build watch over a build output costs one descriptor per output file: measured 3 / 13 / 103 / 403 / 1003
+descriptors per close for a `dist/{index.html, _astro/}` fixture carrying 0 / 10 / 100 / 400 / 1000 files under
+`_astro/`, paid again on every re-install after `rm -rf dist && just build`. `node v24.21.0` leaks 0 over the
+identical loop, so this is Bun's `fs.watch`, not inotify and not the kernel.
+
+The poll keeps the same contract, so nothing downstream can tell the difference: every observed change RESTARTS the
+existing settle timer, and `refreshAll` runs once the tree has been quiet for `buildDebounceMs` (500 ms) — the same
+debounce the watcher's events fed. `rm -rf dist && just build`, which the watcher served by erroring out and
+re-arming its probe, is served instead by the tree snapshot emptying and refilling, so the re-arm probe is not
+needed on this path at all.
+
+**The cost, stated rather than absorbed.** A build's change is noticed up to `DEFAULT_BUILD_POLL_INTERVAL_MS` (1 s)
+late, on top of the unchanged 500 ms settle — sub-second build-signal latency is traded away, and a write landing
+between two ticks is seen at the next tick. The price is one `readdir`+`stat` walk of `dist/` per tick: measured on
+this host at 0.07 ms for 52 entries, 1.11 ms for 805 and 11.4 ms for 6 409 (median of 25), i.e. ≤ 1.1% of one core
+at a 1 s interval for a realistic Astro `dist`, bounded by tree size rather than by reviewer activity. On `node` the
+recursive `fs.watch` is kept, because there it is correct and free.
+
+**2. Trigger 2 is deliberately NOT changed, and the cost of that is recorded.** The per-directory file watchers keep
+`fs.watch` on every runtime, so they still leak `1 + <immediate entries in that directory>` per directory per daemon
+and again on every re-arm (230 descriptors across a full suite run, against 738 from the build watches). Switching
+them to the poll on Bun would move the mechanism the #49 amendment's re-arm contract is asserted through
+(`dirWatchMode()`, which distinguishes only `"watch"` from `"poll"`), i.e. it would move pinned tests rather than add
+coverage. That is a behaviour change and belongs in its own change; it is tracked in #103. #87 therefore leaves a
+known, bounded, documented leak rather than an unmeasured one.

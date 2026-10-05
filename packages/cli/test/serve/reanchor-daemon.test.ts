@@ -91,6 +91,7 @@ async function bootDaemon(): Promise<DaemonCtx> {
       fileDebounceMs: 50,
       buildDebounceMs: 50,
       pollIntervalMs: 100,
+      buildPollIntervalMs: 100,
       dirRebindIntervalMs: 100,
     },
   });
@@ -617,6 +618,36 @@ describe("re-anchor daemon integration (M2 item 5b, story A8)", () => {
     // that closes the "silent regression on dist rebuild".
     const after = await listThreads(ctx, { path: SOURCE_REL_PATH });
     expect(after.threads.length).toBe(1);
+  });
+
+  // ── #87: the build signal, whatever carries it ───────────────────
+  test("a write under dist/ re-anchors every threaded path on its own", async () => {
+    // Trigger 3's contract, asserted through the contract and not
+    // through the mechanism: a build lands, and within one poll
+    // interval + settle window every threaded path is refreshed —
+    // with NO read of `/api/threads` in between. That has to hold on
+    // both runtimes, and the two carry the signal differently
+    // (`fs.watch(dist, {recursive: true})` on node, the `stat`-poll
+    // on bun, where closing the former leaks its descriptors), so a
+    // test pinned to one mechanism would pass on the runtime that has
+    // the other and prove nothing.
+    await createThread(ctx, "target phrase");
+    const before = await countReads(ctx);
+    writeFileSync(join(ctx.root, "dist", "built.html"), "<h1>a build landed</h1>");
+    await waitFor(
+      async () => (await countReads(ctx)) > before,
+      { timeoutMs: 5_000 },
+    );
+  });
+
+  test("the build signal is carried by exactly one mechanism, and it is named", async () => {
+    // #87 made the choice runtime-dependent, which means "which one"
+    // stopped being inferable from the code. `buildWatchMode()` is the
+    // only observable, so assert both the runtime-conditional
+    // expectation and the invariant behind it: never both, never
+    // neither.
+    const mode = ctx.daemon.reanchorDiagnostics.buildWatchMode();
+    expect(mode).toBe(process.versions.bun !== undefined ? "poll" : "watch");
   });
 });
 

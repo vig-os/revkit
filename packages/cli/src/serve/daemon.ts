@@ -257,6 +257,7 @@ export interface DaemonHandle {
     pipelineRunCount(): number;
     watchedPaths(): number;
     watchedDirs(): number;
+    buildWatchMode(): "watch" | "poll" | undefined;
   };
   stop(): Promise<void>;
 }
@@ -979,6 +980,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       pipelineRunCount: () => reanchor.pipelineRunCount(),
       watchedPaths: () => reanchor.watchedPaths(),
       watchedDirs: () => reanchor.watchedDirs(),
+      buildWatchMode: () => reanchor.buildWatchMode(),
     },
     async stop(): Promise<void> {
       if (stopped) return;
