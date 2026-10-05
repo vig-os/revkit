@@ -472,11 +472,15 @@ describe("buildQuoteForComment — hints over inline markup (NB2)", () => {
     expectSelectionOn("A well-known fact -- truly.\n", "well-known fact", "well-known fact");
   });
 
-  test("a selection that STRADDLES markup widens to the block, honestly", () => {
-    // `Read the docs` as plain text spans `Read [` and ` the docs` in the
-    // source. The mapped span's plain text still equals the selection, so it
-    // is kept — the stored quote's plain projection is the selection, which
-    // is the property that matters, and every byte is source text.
+  test("a selection that STRADDLES markup anchors a real slice, boundaries mid-markup", () => {
+    // CORRECTED in round 4. This test previously said "widens to the block",
+    // and round 3's code did try to do that — by re-projecting the mapped
+    // span and widening when the projection differed. That check was wrong:
+    // projecting a span in isolation loses what makes markup recognisable
+    // (the `]` of `[the docs](url)` is a link close in the block and a bare
+    // bracket in the slice), so it widened on hits that mapped perfectly
+    // well. It is gone, and the outcome is a real source slice whose
+    // boundaries fall inside the markup.
     const result = buildQuoteForComment(
       "Read [the docs](https://example.com/x) today.\n",
       1,
@@ -484,8 +488,18 @@ describe("buildQuoteForComment — hints over inline markup (NB2)", () => {
       "Read the docs",
     );
     if (!result.ok) throw new Error(`expected a quote, got ${result.reason}`);
-    expect(foldSourcePlain(result.quote.exact).text).toContain("Read the docs");
+    expect(result.quote.exact).toBe("Read [the docs");
     expect("Read [the docs](https://example.com/x) today.\n").toContain(result.quote.exact);
+    // Coarse, but honest: source text, inside the block the reviewer
+    // addressed, and therefore matchable by the engine — which compares
+    // quotes against SOURCE bytes through the typographic fold, so the
+    // stray `[` costs it nothing.
+    expect("Read [the docs](https://example.com/x) today.\n").toContain(result.quote.exact);
+    // Note what is deliberately NOT asserted: that this slice projects back to
+    // the selection. It does not — projecting `Read [the docs` in isolation
+    // leaves the `[`, because a bracket only reads as a link when a target
+    // follows it. That is the whole reason the round-3 re-projection check
+    // was removed: it widened on hits that map correctly.
   });
 
   test("the stale-build refusal SURVIVES markup stripping", () => {
@@ -501,5 +515,220 @@ describe("buildQuoteForComment — hints over inline markup (NB2)", () => {
     // The strip is per-range, so text from another block cannot leak in.
     const source = "First **block** here.\n\nSecond *block* there.\n";
     expectRefusal(buildQuoteForComment(source, 1, 1, "Second"), "hint-not-found");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #124 round 4 — the full probe table from the review, every row a test.
+//
+// BLOCKER: round 3's `markupDelimiterAt` stripped markers ANYWHERE in a line,
+// so ordinary prose lost its `!`, `>`, `+`, `.` and brackets. "Ship it!",
+// "x > 0", "1 + 1 = 2", "shipped in 2024. Then" and "[sic]" all became
+// `hint-not-found` — a regression against round 2, which matched them against
+// raw source. The fix gates each marker on where it can be markup:
+// `!` only before `[`, block markers only at the start of a line.
+//
+// Expected outcomes below are the review's own classification:
+//   `precise`      — anchors a source slice for the selection
+//   `slice`        — a real source slice whose boundaries fall inside markup
+//   `widened`      — the documented ambiguity rule (the text occurs twice)
+//   `400`          — refused; the rows the review marks acceptable, plus the
+//                    two constructs a delimiter scanner does not model
+// Every row asserts the STORED text, not merely that it did not 400, so a
+// change that starts returning a DIFFERENT wrong slice fails here.
+// ---------------------------------------------------------------------------
+
+type Outcome =
+  | { readonly kind: "precise" | "slice"; readonly exact: string }
+  | { readonly kind: "widened" }
+  | { readonly kind: "refused"; readonly reason: QuoteRefusal };
+
+interface ProbeRow {
+  readonly name: string;
+  readonly source: string;
+  readonly hint: string;
+  readonly endLine?: number;
+  readonly outcome: Outcome;
+}
+
+/** `precise`/`slice`: the stored span. `widened`: the block's whole range.
+ * `refused`: the reason, so a change that 400s for a different cause fails. */
+function assertOutcome(row: ProbeRow): void {
+  const result = buildQuoteForComment(row.source, 1, row.endLine ?? 1, row.hint);
+  if (row.outcome.kind === "refused") {
+    expectRefusal(result, row.outcome.reason);
+    return;
+  }
+  if (!result.ok) {
+    throw new Error(`${row.name}: expected ${row.outcome.kind}, got 400 ${result.reason}`);
+  }
+  if (row.outcome.kind === "widened") {
+    expect(result.quote.exact).toBe(row.source.replace(/\n$/, ""));
+    return;
+  }
+  expect(result.quote.exact).toBe(row.outcome.exact);
+  // The provenance invariant for every accepted row: source bytes, inside the
+  // block the reviewer commented on.
+  expect(row.source).toContain(result.quote.exact);
+}
+
+/** The review's probe table, verbatim fixtures. Grouped by outcome so a
+ * regression points at the class that broke rather than at a line. */
+const PROBE_ROWS: readonly ProbeRow[] = [
+  // --- NB1's regressions stay closed, including the non-ASCII fixtures the
+  // --- round-3 fix was built for. -------------------------------------
+  { name: "NB1 falsifier", source: "We decided — after much debate — to ship the release tomorrow.", hint: "release tomorrow", outcome: { kind: "precise", exact: "release tomorrow" } },
+  { name: "NB1 ellipsis", source: "Wait… then — finally — “ship” the release tomorrow…", hint: "release tomorrow", outcome: { kind: "precise", exact: "release tomorrow" } },
+  { name: "NB1 emoji + CJK", source: "日本語 🎉 — the café’s release tomorrow — done", hint: "café’s release", outcome: { kind: "precise", exact: "café’s release" } },
+  { name: "NB1 hint spans a dash", source: "A — B — release tomorrow", hint: "B — release", outcome: { kind: "precise", exact: "B — release" } },
+
+  // --- ordinary markup: a real source slice ----------------------------
+  { name: "bold", source: "We were **really** happy today.", hint: "were really happy", outcome: { kind: "precise", exact: "were **really** happy" } },
+  { name: "bold inner word", source: "We were **really** happy today.", hint: "really", outcome: { kind: "precise", exact: "really" } },
+  // A selection that runs past the closing `*`: the slice ends mid-markup.
+  { name: "emphasis, boundary inside the closing star", source: "An *important* point here.", hint: "important point", outcome: { kind: "slice", exact: "important* point" } },
+  { name: "inline code", source: "Run `gh pr view` now.", hint: "gh pr view", outcome: { kind: "precise", exact: "gh pr view" } },
+  // Boundaries land inside the link's brackets and target.
+  { name: "link, boundary inside the closing bracket", source: "See [the docs](https://x.io/a) for more.", hint: "the docs for", outcome: { kind: "slice", exact: "the docs](https://x.io/a) for" } },
+  { name: "link label alone", source: "See [the docs](https://x.io/a) for more.", hint: "the docs", outcome: { kind: "precise", exact: "the docs" } },
+  { name: "nested emphasis", source: "A **bold *em* bold** end", hint: "bold em bold", outcome: { kind: "slice", exact: "bold *em* bold" } },
+
+  // --- block-level constructs ------------------------------------------
+  { name: "list, two items, rendered spaces", source: "- first item\n- second item", hint: "first item second item", endLine: 2, outcome: { kind: "precise", exact: "first item\n- second item" } },
+  { name: "list, two items, rendered newline", source: "- first item\n- second item", hint: "first item\nsecond item", endLine: 2, outcome: { kind: "precise", exact: "first item\n- second item" } },
+  { name: "soft break", source: "line one ends\nline two starts", hint: "ends line two", endLine: 2, outcome: { kind: "precise", exact: "ends\nline two" } },
+  { name: "block quote", source: "> quoted text here", hint: "quoted text", outcome: { kind: "precise", exact: "quoted text" } },
+  { name: "ATX heading", source: "# Heading here", hint: "Heading", outcome: { kind: "precise", exact: "Heading" } },
+  { name: "ordered list item", source: "1. first thing", hint: "first thing", outcome: { kind: "precise", exact: "first thing" } },
+
+  // --- the review's "precise" cases that are not markup at all ---------
+  { name: "link whose label IS the url", source: "Go [https://a.io](https://a.io) now", hint: "https://a.io", outcome: { kind: "precise", exact: "https://a.io" } },
+  { name: "snake_case is not emphasis", source: "Call snake_case_name here.", hint: "snake_case_name", outcome: { kind: "precise", exact: "snake_case_name" } },
+  { name: "arithmetic asterisks are not emphasis", source: "Compute 2 * 3 * 4 now.", hint: "2 * 3 * 4", outcome: { kind: "precise", exact: "2 * 3 * 4" } },
+  { name: "arithmetic, a single factor", source: "Compute 2 * 3 * 4 now.", hint: "3", outcome: { kind: "precise", exact: "3" } },
+
+  // --- THE BLOCKER: prose the round-3 scanner ate ---------------------
+  // Each of these was a 400 on round 3 and must be a precise slice now.
+  { name: "PROSE: trailing exclamation", source: "Ship it! Then rest.", hint: "Ship it!", outcome: { kind: "precise", exact: "Ship it!" } },
+  { name: "PROSE: exclamation mid-sentence", source: "Hello world!", hint: "world!", outcome: { kind: "precise", exact: "world!" } },
+  { name: "PROSE: greater-than in a comparison", source: "Ensure x > 0 holds.", hint: "x > 0", outcome: { kind: "precise", exact: "x > 0" } },
+  { name: "PROSE: plus in arithmetic", source: "So 1 + 1 = 2 here.", hint: "1 + 1 = 2", outcome: { kind: "precise", exact: "1 + 1 = 2" } },
+  { name: "PROSE: sentence-ending number and period", source: "We shipped in 2024. Then we rested.", hint: "2024. Then", outcome: { kind: "precise", exact: "2024. Then" } },
+  { name: "PROSE: mid-sentence ordinal", source: "See step 2. Then go.", hint: "step 2. Then", outcome: { kind: "precise", exact: "step 2. Then" } },
+  { name: "PROSE: a bracketed aside", source: "He said [sic] it.", hint: "[sic] it", outcome: { kind: "precise", exact: "[sic] it" } },
+  { name: "PROSE: exclamation then a repeated phrase", source: "Wow! nice and Wow nice", hint: "Wow nice", outcome: { kind: "slice", exact: "Wow nice" } },
+
+  // --- ambiguity: the text really does occur twice in the block ---------
+  { name: "AMBIGUOUS: code span and a literal copy", source: "Run `snake_case` then see snake_case.", hint: "snake_case", outcome: { kind: "widened" } },
+  { name: "AMBIGUOUS: code span and a literal kwargs", source: "Use `**kwargs` and kwargs.", hint: "kwargs", outcome: { kind: "widened" } },
+  { name: "AMBIGUOUS: an html tag and a bare copy", source: "Press <kbd>x</kbd> or x", hint: "x", outcome: { kind: "widened" } },
+
+  // --- refused: the rows the review marks acceptable, and the two
+  // --- constructs a delimiter scanner does not model --------------------
+  { name: "REFUSED: triple-star (review-acceptable)", source: "A ***both*** and **_mix_** end", hint: "both and mix", outcome: { kind: "refused", reason: "hint-not-found" } },
+  { name: "REFUSED: backslash-escaped asterisks (review-acceptable)", source: "Say \\*not em\\* ok", hint: "*not em*", outcome: { kind: "refused", reason: "hint-not-found" } },
+  { name: "REFUSED: escaped text WITHOUT the escapes still resolves", source: "Say \\*not em\\* ok", hint: "not em", outcome: { kind: "precise", exact: "not em" } },
+  { name: "REFUSED: raw html tags (review-acceptable)", source: "Press <kbd>Ctrl</kbd> now", hint: "Press Ctrl now", outcome: { kind: "refused", reason: "hint-not-found" } },
+  { name: "REFUSED: text inside a raw html tag still resolves", source: "Press <kbd>Ctrl</kbd> now", hint: "Ctrl", outcome: { kind: "precise", exact: "Ctrl" } },
+  { name: "REFUSED: stars inside an inline code span", source: "Use `**kwargs` here", hint: "**kwargs", outcome: { kind: "refused", reason: "hint-not-found" } },
+
+  // --- the escape / entity duplicates: a known limit, asserted so it is
+  // --- pinned rather than discovered. See the PR body's open items. ------
+  { name: "LIMIT: escaped copy vs literal copy", source: "Use foo\\_bar or else foo_bar.", hint: "foo_bar", outcome: { kind: "precise", exact: "foo_bar" } },
+  { name: "LIMIT: entity vs literal ampersand", source: "A &amp; B, also A & B.", hint: "A & B", outcome: { kind: "precise", exact: "A & B" } },
+  { name: "LIMIT: a link whose target holds a comma", source: "x[0](a, b) then a, b", hint: "a, b", outcome: { kind: "precise", exact: "a, b" } },
+  { name: "LIMIT: comparison inside a code span", source: "Note: `a > b` and a b.", hint: "a b", outcome: { kind: "slice", exact: "a b" } },
+];
+
+describe("buildQuoteForComment — the review's full probe table (round 4)", () => {
+  for (const row of PROBE_ROWS) {
+    test(`${row.outcome.kind.toUpperCase()}: ${row.name}`, () => {
+      assertOutcome(row);
+    });
+  }
+
+  test("every probe row is covered — the table cannot shrink unnoticed", () => {
+    // A row deleted from the array would quietly remove a guarantee, so the
+    // count is pinned. If a row is added, this fails and asks for a new number.
+    expect(PROBE_ROWS).toHaveLength(42);
+  });
+
+  test("the prose rows are the ones that regressed in round 3", () => {
+    // Named explicitly because they are the BLOCKER: if this list and the
+    // `PROSE:`-prefixed rows ever disagree, one of them is lying.
+    const prose = PROBE_ROWS.filter((r) => r.name.startsWith("PROSE:")).map((r) => r.name);
+    expect(prose).toEqual([
+      "PROSE: trailing exclamation",
+      "PROSE: exclamation mid-sentence",
+      "PROSE: greater-than in a comparison",
+      "PROSE: plus in arithmetic",
+      "PROSE: sentence-ending number and period",
+      "PROSE: mid-sentence ordinal",
+      "PROSE: a bracketed aside",
+      "PROSE: exclamation then a repeated phrase",
+    ]);
+    // And none of them is a refusal: prose that 400s is the bug.
+    for (const row of PROBE_ROWS.filter((r) => r.name.startsWith("PROSE:"))) {
+      expect(row.outcome.kind).not.toBe("refused");
+    }
+  });
+});
+
+describe("foldSourcePlain — markers are markup only where they can be (round 4)", () => {
+  /** The rendered text of `source`, as the projection reports it. */
+  const plain = (source: string): string => foldSourcePlain(source).text.trim();
+
+  test("`!` is kept unless it precedes a `[`", () => {
+    expect(plain("Ship it! Then rest.")).toBe("Ship it! Then rest.");
+    expect(plain("Wow! nice")).toBe("Wow! nice");
+    expect(plain("![alt](src)")).toBe("alt");
+  });
+
+  test("`>` `+` `-` are kept mid-line and stripped at the start of one", () => {
+    expect(plain("x > 0")).toBe("x > 0");
+    expect(plain("1 + 1 = 2")).toBe("1 + 1 = 2");
+    expect(plain("a - b")).toBe("a - b");
+    expect(plain("> quote")).toBe("quote");
+    expect(plain("+ plus item")).toBe("plus item");
+    expect(plain("- bullet")).toBe("bullet");
+    // Indented markers still count: the page renders them too.
+    expect(plain("   - indented bullet")).toBe("indented bullet");
+  });
+
+  test("`N.` is kept mid-line and stripped at the start of one", () => {
+    expect(plain("shipped in 2024. Then")).toBe("shipped in 2024. Then");
+    expect(plain("See step 2. Then go.")).toBe("See step 2. Then go.");
+    expect(plain("1. item")).toBe("item");
+    expect(plain("12) item")).toBe("item");
+  });
+
+  test("brackets are kept unless a link follows", () => {
+    expect(plain("He said [sic] it.")).toBe("He said [sic] it.");
+    expect(plain("see [the docs](https://x.io) now")).toBe("see the docs now");
+  });
+
+  test("asterisks need a word on one side to be emphasis", () => {
+    expect(plain("2 * 3 * 4")).toBe("2 * 3 * 4");
+    expect(plain("a*b*c")).toBe("a*b*c");
+    expect(plain("An *important* point")).toBe("An important point");
+    // The `- ` opens the list item; the `*` that follows is then mid-line
+    // with spaces on both sides, so it is prose — which is what the page
+    // shows (`• * bullet`).
+    expect(plain("- * bullet")).toBe("* bullet");
+  });
+
+  test("a `#` run is a heading only at the start of a line", () => {
+    expect(plain("## A heading")).toBe("A heading");
+    expect(plain("C# 12 is fine")).toBe("C# 12 is fine");
+  });
+
+  test("the map stays consistent on the prose that used to break it", () => {
+    // NB1's invariant, re-asserted on the fixtures that made it matter: a
+    // marker that is NOT markup must not shift the map either.
+    for (const source of ["Ship it! Then rest.", "x > 0 holds", "So 1 + 1 = 2", "See step 2. Then"]) {
+      const folded = foldSourcePlain(source);
+      expect(folded.starts.length).toBe(folded.text.length);
+      expect(folded.ends.length).toBe(folded.text.length);
+    }
   });
 });

@@ -358,10 +358,18 @@ export function foldSourceLoose(source: string): FoldedSource {
  * there are.
  *
  * This is the projection that makes the hint comparable, so the comment
- * builder can search it and map a hit back to source offsets. When the
- * markup around a hit makes the mapping ambiguous, the caller widens to
- * the block's source range, which is honest and coarse; the alternative
- * is a span that claims to be the selection and is not.
+ * builder can search it and map a hit back to source offsets. A hit that
+ * crosses markup maps to a real source slice whose boundaries fall INSIDE
+ * that markup — `important* point`, `the docs](url) for` — which is a
+ * correct anchor, because the engine compares quotes against source.
+ *
+ * **A marker is stripped only where it can be markup.** `!` only before a
+ * `[`; `[` only when a link target follows it; `>` `+` `-` `#` `N.` `N)` only
+ * at the start of a line; `*` and `_` only when they touch a word on one side
+ * and are not intra-word. The first version of this scanner stripped them
+ * anywhere, which ate `Ship it!`, `x > 0`, `1 + 1 = 2`,
+ * `shipped in 2024. Then` and `[sic]`, and refused ordinary prose with a
+ * stale-build error (issue #113, PR #124 round 4).
  *
  * **Markup is stripped only here, never in `foldSource`.** The
  * re-anchoring engine compares a recorded quote against source bytes, so
@@ -581,76 +589,167 @@ function scanUnits(
  */
 function markupDelimiterAt(source: string, k: number): number | undefined {
   const ch = source.charAt(k);
-  // Emphasis and strong, opening or closing: `**`, `__`, `*`, `_`.
+
+  // **Emphasis is INLINE**, so it is recognised anywhere — but only where
+  // CommonMark says so, which means the delimiter must touch the word it
+  // marks. `2 * 3 * 4` has a space on both sides of each `*` and renders
+  // literally; `*important*` does not. Without this, arithmetic in prose
+  // loses its asterisks and the reviewer's hint stops matching (round-4
+  // blocker). `*` is ALSO a list marker, which is line-leading only — that
+  // case is handled by the block-marker branch below.
   if (ch === "*" || ch === "_") {
-    if (ch === "_" && isIntraWordUnderscore(source, k)) return undefined;
+    if (!isEmphasisDelimiter(source, k, ch)) return undefined;
     let run = 0;
     while (source.charAt(k + run) === ch) run += 1;
-    // A run of 3+ is not emphasis this renderer emits (`***` is literal).
+    // A run of 3+ is not emphasis this renderer emits (`***both***` is
+    // literal text, and the review accepts a 400 for it).
     return run >= 3 ? undefined : run;
   }
+
   // `[text](url)`: the OPENING bracket and the CLOSING `](url)` are
   // delimiters; the label between them is content the page shows, so it
   // is scanned normally and can carry its own markup. Deleting the whole
   // construct here instead would drop the label — which is most of what
   // the reviewer selected.
-  if (ch === "[") return 1;
-  if (ch === "]" && source.charAt(k + 1) === "(") {
-    const paren = source.indexOf(")", k + 2);
-    return paren === -1 ? undefined : paren + 1 - k;
+  //
+  // A bracket is only a delimiter when a link or image actually FOLLOWS
+  // it. `[sic]` is prose — the page shows the brackets — and round 3
+  // stripped them, so a selection containing `[sic]` could not be matched
+  // at all (round-4 blocker).
+  if (ch === "[") return hasLinkTarget(source, k) ? 1 : undefined;
+  if (ch === "]") {
+    // The LENGTH of `](target)`, counted from the bracket — a negative
+    // length here would rewind the scan and never terminate.
+    const length = linkTargetLength(source, k);
+    return length;
   }
-  // `![alt](src)`: the `!` is part of the image syntax and never appears
-  // in the rendered text (the `alt` does, as the image's text).
-  if (ch === "!") return 1;
-  // A line-leading block marker: `> `, `- `, `* `, `+ `, or `1. ` / `1) `.
-  // The page shows a quote bar or a bullet from CSS, neither of which is
-  // in `textContent`.
-  if (ch === ">" || ch === "+" || (ch === "-" && isListMarkerAt(source, k))) {
+  // `![alt](src)`: the `!` is part of the image syntax and never appears in
+  // the rendered text (the `alt` does, as the image's text). ONLY there:
+  // `Ship it!` and `world!` are prose, and stripping the `!` made both
+  // unmatchable (round-4 blocker).
+  if (ch === "!") return source.charAt(k + 1) === "[" ? 1 : undefined;
+
+  // **Block markers are LINE-LEADING only.** `> `, `+ `, `- `, `* `, an
+  // ATX `#` run, and `1. ` / `1) ` open a block; the page renders them as a
+  // quote bar, a bullet or a heading, none of which is in `textContent`.
+  // Mid-line they are ordinary characters: `x > 0`, `1 + 1 = 2`,
+  // `shipped in 2024. Then`, `C# 12 is fine` are all prose that the round-3
+  // scanner silently ate (round-4 blocker).
+  if (ch === ">" || ch === "+" || ch === "-" || ch === "#" || /[0-9]/.test(ch)) {
+    if (!isBlockMarkerPosition(source, k)) return undefined;
+    if (ch === "#") {
+      let run = 0;
+      while (source.charAt(k + run) === "#") run += 1;
+      // CommonMark allows at most six.
+      if (run > 6) return undefined;
+      return markerEnd(source, k + run, k);
+    }
+    if (/[0-9]/.test(ch)) {
+      const ordered = /^[0-9]{1,9}[.)]/.exec(source.slice(k));
+      if (ordered === null) return undefined;
+      return markerEnd(source, k + ordered[0].length, k);
+    }
+    // `>` may nest (`>> quote`), and `- - -` is not a bullet — but a
+    // doubled marker is only meaningful for the quote, so allow a run for
+    // `>` and require a single character for the bullet markers.
     let run = 0;
     while (source.charAt(k + run) === ch) run += 1;
-    // Only when the marker is followed by whitespace, and only for a
-    // single marker character — `--` is an em dash's source form, and it
-    // is handled by `FOLD` before this ever sees it.
-    const after = source.charAt(k + run);
-    if (after !== " " && after !== "\t") return undefined;
-    let end = k + run;
-    while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
-    return end - k;
-  }
-  if (/[0-9]/.test(ch)) {
-    const ordered = /^[0-9]{1,9}[.)]( |\t)/.exec(source.slice(k));
-    if (ordered === null) return undefined;
-    let end = k + ordered[0].length;
-    while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
-    return end - k;
-  }
-  // An ATX heading's leading `#` run, with its trailing space.
-  if (ch === "#") {
-    let run = 0;
-    while (source.charAt(k + run) === "#") run += 1;
-    if (run > 6) return undefined;
-    const after = source.charAt(k + run);
-    if (after !== " " && after !== "\t") return undefined;
-    let end = k + run;
-    while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
-    return end - k;
+    if (ch !== ">" && run > 1) return undefined;
+    return markerEnd(source, k + run, k);
   }
   // `~~struck~~`.
   if (ch === "~" && source.charAt(k + 1) === "~") return 2;
   return undefined;
 }
 
-/** Whether the `-` at `k` begins a bullet list item — which requires it
- * to be the first non-space character on its line. Elsewhere a `-` is
- * literal (a hyphen in prose, or the start of a `--` em dash, which
- * `FOLD` has already handled by the time this runs). */
-function isListMarkerAt(source: string, k: number): boolean {
+/** Whether the `[` at `openBracket` opens a link or image — i.e. a `]`
+ * followed by `(` follows it before the line ends. Anchored on the opening
+ * bracket, so `x[0](a, b)` is a link and a bare `[sic]` is prose. */
+function hasLinkTarget(source: string, openBracket: number): boolean {
+  const close = source.indexOf("]", openBracket + 1);
+  if (close === -1) return false;
+  return source.charAt(close + 1) === "(";
+}
+
+/** The length of the `](target)` run closing at `closeBracket`, or
+ * `undefined` when that bracket does not close a link.
+ *
+ * Found by walking BACK to the nearest unclosed `[` on the same line: the
+ * scan is left to right and stateless, so by the time it reaches `]` it
+ * cannot remember where the pair began. */
+function linkTargetLength(source: string, closeBracket: number): number | undefined {
+  if (source.charAt(closeBracket + 1) !== "(") return undefined;
+  for (let i = closeBracket - 1; i >= 0; i -= 1) {
+    const ch = source.charAt(i);
+    if (ch === "\n" || ch === "]") return undefined;
+    if (ch !== "[") continue;
+    if (!hasLinkTarget(source, i)) return undefined;
+    const close = source.indexOf(")", closeBracket + 2);
+    return close === -1 ? undefined : close + 1 - closeBracket;
+  }
+  return undefined;
+}
+
+/** The length of a block marker at `k`: the marker character(s) plus the
+ * whitespace that must follow them, or `undefined` when no whitespace
+ * follows (which makes it prose — `x>0`, `C#`).
+ *
+ * `--` never reaches here: `FOLD` maps the em dash's source form first, and
+ * `- - -` is rejected as a doubled bullet above. */
+function markerEnd(source: string, afterMarker: number, start: number): number | undefined {
+  const next = source.charAt(afterMarker);
+  if (next !== " " && next !== "\t") return undefined;
+  let end = afterMarker;
+  while (source.charAt(end) === " " || source.charAt(end) === "\t") end += 1;
+  return end - start;
+}
+
+/**
+ * Whether the `*` or `_` at `k` is an EMPHASIS delimiter.
+ *
+ * Two of CommonMark's flanking conditions, in the form that matters here:
+ * the delimiter must touch a non-space character, and `_` additionally must
+ * not sit between two word characters (so `snake_case_name` is literal).
+ * That is enough to separate `*important*` and `2 * 3 * 4`, and to leave
+ * `snake_case_name` alone, without implementing left/right-flanking in
+ * full — a construct this gets wrong yields a hint that does not resolve,
+ * which is a 400 saying "reload", never a wrong anchor.
+ */
+function isEmphasisDelimiter(source: string, k: number, ch: string): boolean {
+  if (ch === "_" && isIntraWordUnderscore(source, k)) return false;
+  const before = source.charAt(k - 1);
+  const after = source.charAt(k + 1);
+  // Whitespace on BOTH sides: `2 * 3 * 4`, and the marker is arithmetic,
+  // not emphasis. This is the case round 3 got wrong by stripping it.
+  if (isSpace(before) && isSpace(after)) return false;
+  // Word characters on BOTH sides: `snake_case_name`, `a*b*c`. CommonMark
+  // disallows intra-word emphasis for both markers.
+  if (isWordish(before) && isWordish(after)) return false;
+  // Otherwise the marker touches its word on one side — an opener when that
+  // is the right, a closer when it is the left. An opening `**` is
+  // preceded by the space that ends the previous word, so "not preceded by
+  // a word" must not disqualify it.
+  return !isSpace(before) || !isSpace(after);
+}
+
+/** Whether `k` is the start of a line, ignoring indentation. The gate every
+ * block marker goes through: `- item`, `> quote`, `1. item`, `## heading`
+ * are markup; `x - y`, `a > b`, `see 2. above` are prose. */
+function isBlockMarkerPosition(source: string, k: number): boolean {
   for (let i = k - 1; i >= 0; i -= 1) {
     const ch = source.charAt(i);
     if (ch === "\n") return true;
     if (ch !== " " && ch !== "\t") return false;
   }
   return true;
+}
+
+function isSpace(ch: string): boolean {
+  return ch === " " || ch === "\t" || ch === "\n";
+}
+
+function isWordish(ch: string): boolean {
+  return /[\w]/.test(ch);
 }
 
 /** Whether the `_` at `k` sits between two word characters, where

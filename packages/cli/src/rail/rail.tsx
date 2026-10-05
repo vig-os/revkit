@@ -1423,13 +1423,14 @@ function Rail(): JSX.Element {
       // source bytes it lands on.
       //
       // What the daemon does when it cannot place the hint (issue #113,
-      // PR #124 rounds 2-3): a hint that is in neither the source nor
+      // PR #124 rounds 2-4): a hint that is in neither the source nor
       // the range's RENDERED PLAIN TEXT is a stale build and comes back
       // as a 400 — so `refusalReason` below shows the daemon's reason
       // ("reload the page") rather than a bare status. A hint it CAN
-      // place but not map to one source span (the selection straddles
-      // inline markup, say) widens to the whole block, which is honest
-      // and coarse; it never widens on a hint it could not find.
+      // place becomes a source slice, which may straddle inline markup
+      // and so have its boundaries inside it (`important* point`); a hint
+      // that occurs twice in the block widens to the whole block. Neither
+      // stores text from outside the block the reviewer commented on.
       //
       // `quoteFromBlock`, which used to cut `anchor.quote` out of
       // `block.textContent` right here, is gone with the defect.

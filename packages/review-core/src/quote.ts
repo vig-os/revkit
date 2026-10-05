@@ -196,13 +196,16 @@ function trimTrailingNewline(source: string, startOffset: number, endOffset: num
  *   trust.
  *
  * `selectionHint` narrows the quote to a span rather than taking the
- * whole line range. The narrowing searches the SOURCE slice, not the
- * needle, and stores the source bytes it lands on — so the needle can
- * only ever change WHICH source span is quoted, never WHAT is quoted.
+ * whole line range. The narrowing searches the range's PLAIN-TEXT
+ * projection (see `foldSourcePlain`) rather than the needle's own
+ * spelling, and stores the SOURCE bytes the hit maps to — so the needle
+ * can only ever change WHICH source span is quoted, never WHAT is quoted.
  * Two needles are handled without guessing: one that matches more than
  * once widens to the whole block (a coarse but truthful anchor, and the
  * block IS what the reviewer commented on — see the ambiguity note
- * below), and one that matches nothing is refused.
+ * below), and one that matches nothing is refused. A hit that crosses
+ * inline markup maps to a source slice whose boundaries fall inside that
+ * markup; that is the intended outcome, not a defect to widen away.
  *
  * Returns a `QuoteBuild` rather than a `TextQuote`: the caller is a
  * request handler that has to turn a refusal into a response, and a
@@ -271,21 +274,31 @@ export function buildQuoteForComment(
     // inside the block the reviewer addressed.
     return { ok: true, quote: wholeRange };
   }
-  // Map the hit back to source offsets and KEEP IT ONLY IF the mapped
-  // span's own plain text is the selection. That is the precision test
-  // (issue #113, PR #124 round 3): when markup sits inside the span,
-  // the source between the two boundaries holds characters the rendered
-  // page never showed — `**`, a link target — and quoting it would
-  // store text the reviewer did not select, which is the failure this
-  // whole path exists to prevent. When the span straddles markup, widen
-  // to the block's full source range: honest and coarse beats precise
-  // and wrong.
+  // Map the hit back to source offsets. The result is a REAL slice of the
+  // source, inside the block the reviewer commented on — and when the
+  // selection crossed inline markup, its boundaries fall INSIDE that
+  // markup, so the slice can read `important* point` or
+  // `the docs](https://x.io/a) for` rather than the selection verbatim.
+  //
+  // That is the intended outcome, not a defect to be tidied away (issue
+  // #113, PR #124 round 4 — a review nit recorded here because rounds 2-3
+  // both described this case as "widens to the block", which is not what
+  // the code does). Round 3 tried to detect the straddling case and widen
+  // instead, by re-projecting the mapped span; that check was both wrong
+  // and pointless. It was wrong because projecting a span in isolation
+  // loses the context that makes markup recognisable — the `]` of
+  // `[the docs](url)` is a link close in the block and a bare bracket in
+  // the slice — so it widened on hits that mapped perfectly well. It was
+  // pointless because the slice is already safe: it is source bytes, it is
+  // inside the block, and the engine compares quotes against source, so
+  // the fold makes `important* point` match the same span the reviewer
+  // selected. An honest, slightly coarse anchor beats a widened one.
+  //
+  // The two cases that DO widen are unchanged: a hint matching more than
+  // once (above), and no hint at all. The two that refuse are a range that
+  // does not exist and a hint in neither the source nor the plain text.
   const sourceStart = blockStart + hit.start;
   const sourceEnd = blockStart + hit.end;
-  const mapped = lf.slice(sourceStart, sourceEnd);
-  if (sourceEnd <= sourceStart || foldSourcePlain(mapped).text !== foldedHint) {
-    return { ok: true, quote: wholeRange };
-  }
   return { ok: true, quote: buildQuoteFromOffsets(lf, sourceStart, sourceEnd, options) };
 }
 

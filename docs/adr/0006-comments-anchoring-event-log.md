@@ -510,25 +510,53 @@ which is not a substring of the source, and round 2 answered that with a
 source range: the typographic fold, collapsed whitespace runs, and inline
 markup deleted. Each of the three is there because the browser's text differs
 from the source in exactly that way — `“hi”` for `"hi"`, a space for a soft
-break's newline, no `**` for bold. Stripped constructs: strong, emphasis
-(intra-word `_` excluded, per CommonMark), link brackets and targets (the
-label is kept — it is usually most of the selection), image `!` and alt text,
-`~~strikethrough~~`, ATX heading runs, and blockquote / bullet / ordered list
-markers. Not handled, deliberately: fenced code (a block, and #120 owns
-anchoring inside one), HTML and entity references (the daemon never holds the
-rendered HTML — that mapping is #119), and reference-style link definitions
-(a `[ref]` label strips its brackets and keeps the text, which is coarser than
-ideal and never wrong).
+break's newline, no `**` for bold. Stripped constructs: strong, emphasis, link
+brackets and targets (the label is kept — it is usually most of the selection),
+image `!` and alt text, `~~strikethrough~~`, ATX heading runs, and blockquote /
+bullet / ordered list markers.
 
-**A hit that maps cleanly is anchored precisely. A hit that straddles markup
-widens to the block.** The mapped span is kept only when its OWN plain-text
-projection is the selection; otherwise the source between the two boundaries
-holds characters the page never showed — `**`, a URL — and quoting it would
-store text the reviewer did not select, which is the failure this whole path
-exists to prevent. Widening there is honest and coarse, and it is bounded by
-the block the reviewer commented on. This is the same line §3 draws between
-"ambiguous" (widen: we know the block, not the span) and "absent" (refuse:
-we know neither).
+**A marker is markup only where it can be one** (round-4 review — the first
+version of this rule stripped markers *anywhere*, which ate ordinary prose and
+regressed `hint-not-found` onto text that had worked in round 2):
+
+| marker | markup when |
+|---|---|
+| `!` | immediately before a `[` — so `![alt](src)` loses it and `Ship it!` keeps it |
+| `[` `]` | a link or image target actually follows, so `[sic]` keeps its brackets |
+| `*` `_` | emphasis touches a word on one side and is not intra-word: `*important*` yes, `2 * 3 * 4` and `snake_case_name` no |
+| `>` `+` `-` `#` `N.` `N)` | at the START of a line, after optional indentation — so `x > 0`, `1 + 1 = 2` and `shipped in 2024. Then` keep their punctuation |
+
+Not handled, deliberately: fenced code (a block, and #120 owns anchoring inside
+one), raw HTML and entity references (the daemon never holds the rendered HTML
+— that mapping is #119), backslash escapes, and reference-style link
+definitions (a `[ref]` label keeps its text: coarser than ideal, never wrong).
+Backslash escapes and entities have one measured consequence worth recording:
+a block holding BOTH an escaped copy and a literal copy of the same phrase
+renders two identical spans but projects to two different ones, so a selection
+of it anchors to the literal copy rather than widening. That is a
+same-block mis-preference, not a wrong-block anchor, and it is pinned by a test
+so it stays visible.
+
+**A hit is anchored as a real slice of the source, and a hit that crosses
+markup has its boundaries inside that markup.** Selecting `important point`
+out of `An *important* point here.` yields the source slice `important* point`;
+selecting `the docs for` out of `See [the docs](https://x.io/a) for more.`
+yields `the docs](https://x.io/a) for`. Both are real source bytes inside the
+block the reviewer commented on, and both are correct anchors: the engine
+compares a quote against SOURCE, so the stray delimiter costs it nothing and
+the fold makes the slice match the span the reviewer selected.
+
+This is worth stating precisely because two earlier drafts of this amendment
+described it wrongly. Round 3 claimed the straddling case "widens to the
+block", and tried to implement that by re-projecting the mapped span and
+widening when the projection differed. That check was **wrong**: projecting a
+span in isolation destroys what makes markup recognisable — the `]` of
+`[the docs](url)` is a link close in the block and a bare bracket in the
+slice — so it widened on hits that mapped perfectly well. It was also
+unnecessary, because the slice is already safe. It is gone. What remains is
+the same line §3 draws, with the two ends intact: **more than one hit** widens
+to the block (we know the block, not the span), and **no hit at all** is
+refused (we know neither).
 
 **The offset maps are sized by the walk that fills them.** Both passes of the
 fold run one `scanUnits` walk, so they cannot disagree about the folded
