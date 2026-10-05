@@ -1440,8 +1440,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // back into a full sweep (and must not quietly drop anchors a
       // caller believed it had asked for). Same discipline as
       // `status` above.
-      const fieldsParam = url.searchParams.get("fields");
-      if (fieldsParam !== null && fieldsParam !== "id") {
+      //
+      // A REPEATED parameter is also a 400, and that is a separate
+      // hazard from a typo: `searchParams.get` is first-wins, so
+      // `?fields=id&fields=anchor` would answer ids-only and skip the
+      // trigger while silently discarding the `fields=anchor` the
+      // caller also wrote — one request growing a second meaning
+      // without anyone editing it. This is the same rule the hosted
+      // router applies to a repeated `since` (`since-repeated`), for
+      // the same reason.
+      const fieldsValues = url.searchParams.getAll("fields");
+      if (fieldsValues.length > 1) {
+        return badRequest([{ code: "custom", path: ["fields"], message: "fields must not be repeated" }]);
+      }
+      const fieldsParam = fieldsValues[0];
+      if (fieldsParam !== undefined && fieldsParam !== "id") {
         return badRequest([{ code: "custom", path: ["fields"], message: "fields must be 'id' when present" }]);
       }
       const idsOnly = fieldsParam === "id";

@@ -102,6 +102,31 @@ export const REANCHOR_ACTOR_ID = "revkit-reanchor";
 const TRACKED_STATUSES: NonNullable<ThreadFilter["status"]> = ["open", "orphaned"];
 const TRACKED_STATUS_SET: ReadonlySet<ThreadStatus> = new Set(TRACKED_STATUSES);
 
+/** One path's tracked threads, plus the log head they were read at.
+ *
+ * `refreshAll` reads the log ONCE for the whole sweep (issue #67) and
+ * groups it by `anchor.path`; this is that grouping. `head` is what
+ * makes the grouping safe to hand down: **a sweep only tracks the
+ * threads that existed at its own read**, so a thread that BECOMES
+ * tracked while the sweep is running — a `thread.reopened`, a
+ * `comment.created`, a `thread.resolved` flipping a sibling — would be
+ * invisible to the bucket, and the sweep would pass over its path
+ * without re-anchoring it. Before the grouping, each `doRefresh`
+ * asked the store at its OWN time, so it saw the write. Comparing
+ * `head` against `store.head()` restores exactly that: one integer
+ * compare on the hot path (a quiescent log), and the original query on
+ * the slow path (the log moved). Nothing is traded away, because the
+ * query is what the code did before this grouping existed.
+ *
+ * Read `head` BEFORE the read it describes (see `refreshAll`), so a
+ * write that lands mid-read makes `head` too low and therefore fails
+ * the comparison — the safe direction. The reverse order could make a
+ * stale bucket look current. */
+interface TrackedSnapshot {
+  readonly head: number;
+  readonly threads: readonly Thread[];
+}
+
 /** Debounce for the anchored-file watcher. A single edit fires 2–3
  * OS-level events (write, stat, close); 300 ms coalesces them into
  * one re-anchor pass without noticeably delaying the interactive
@@ -293,6 +318,18 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     run: Promise<void>;
     pending?: { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void };
     dirty: boolean;
+    /** The sweep bucket this path's current run was handed, carried
+     * onto the coalesced RERUN. `doRefresh` re-validates it against
+     * `store.head()` on every run, so carrying it cannot serve a stale
+     * tracked set — and NOT carrying it is expensive: two overlapping
+     * sweeps (the `/events` prime and a concurrent thread read both
+     * call `refreshAll`) make every path take the join path, and a
+     * rerun without a bucket falls back to the per-path
+     * `store.threads({ path })`, which is the O(P x events) cost the
+     * grouping exists to remove. Measured on this branch at P = 400:
+     * an overlapping pair cost 741 ms of fan-out on ~1 mount in 5,
+     * against 13 ms for a sweep that did not overlap. */
+    known?: TrackedSnapshot;
   }
   const inflight = new Map<string, InflightState>();
   /** Per-orphaned-thread record of the revision at which the
@@ -421,30 +458,36 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     return refreshWith(path);
   }
 
-  /** `refresh` for a caller that already holds the path's open +
-   * orphaned threads (`refreshAll`'s single log read, grouped by
-   * `anchor.path` — issue #67). Same mutex, same coalescing, same
-   * guarantee; the only difference is that `doRefresh` is handed the
-   * thread list instead of re-querying it per path. A coalesced RERUN
-   * deliberately drops the list: the log may have moved since the
-   * caller's read, so the rerun asks the store itself.
+  /** `refresh` for a caller that already holds the path's tracked
+   * threads (`refreshAll`'s single log read, grouped by `anchor.path` —
+   * issue #67). Same mutex, same coalescing; the difference is that
+   * `doRefresh` may be handed the thread list instead of re-querying
+   * it — and only while `known.head` is still `store.head()`, which is
+   * what keeps a sweep that races a write as correct as the per-path
+   * query it replaced. A coalesced RERUN deliberately drops it: the log
+   * may have moved since the caller's read, so the rerun asks the
+   * store itself.
    *
    * NOT exposed on the handle: `known` is only ever a regrouping of a
    * read this module already performed, so a public caller could only
    * get it wrong. */
-  async function refreshWith(path: string, known?: readonly Thread[]): Promise<void> {
+  async function refreshWith(path: string, known?: TrackedSnapshot): Promise<void> {
     if (stopped) return;
     const existing = inflight.get(path);
     if (existing === undefined) {
       // Fresh run.
       const run = doRefresh(path, known).finally(() => onRunFinished(path));
-      inflight.set(path, { run, dirty: false });
+      inflight.set(path, { run, dirty: false, known });
       return run;
     }
     // A run is already in flight. Mark dirty so the completion path
     // launches a coalesced rerun, then hand back the pending promise
     // (creating one if this is the first joiner of the current run).
     existing.dirty = true;
+    // Prefer a bucket we do not have: the rerun can use either (the
+    // head check decides), and a bucket is strictly cheaper than the
+    // query it replaces.
+    existing.known ??= known;
     if (existing.pending === undefined) {
       let resolveFn: () => void = () => {};
       let rejectFn: (error: unknown) => void = () => {};
@@ -474,7 +517,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     state.dirty = false;
     const pending = state.pending;
     state.pending = undefined;
-    const next = doRefresh(path).finally(() => onRunFinished(path));
+    const next = doRefresh(path, state.known).finally(() => onRunFinished(path));
     state.run = next;
     if (pending !== undefined) {
       // Route the pending joiners' promise to THIS coalesced run's
@@ -484,7 +527,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     }
   }
 
-  async function doRefresh(path: string, known?: readonly Thread[]): Promise<void> {
+  async function doRefresh(path: string, known?: TrackedSnapshot): Promise<void> {
     // Read the on-disk source under the containment helper — this
     // is the SAME resolver the POST /api/threads path uses, so a
     // path that snuck onto a thread despite the anchor check (or a
@@ -533,10 +576,20 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // `store.threads()` it already reads (issue #67). It is only ever
     // passed with the SAME filter — the caller groups by
     // `anchor.path` and keeps `open` + `orphaned` — so it is the same
-    // list, not a weaker one. Without it the query below runs, which
-    // is `since(0)` + a full reduce PER PATH: one sweep over P paths
-    // costs O(P x events) and that is the whole cost of the fan-out.
-    const threads = known ?? (await store.threads({ path, status: TRACKED_STATUSES }));
+    // list, not a weaker one.
+    //
+    // It is also only usable while the log is where it was: if ANY
+    // event landed since `known.head` was taken, a thread on this path
+    // may have become tracked (or stopped being tracked) and the
+    // bucket cannot know. Then the query below runs, which is what
+    // this code did before the grouping existed — so a sweep that
+    // races a write is exactly as correct as before, and a sweep over
+    // a quiescent log is the one that skips the per-path query (which
+    // is `since(0)` + a full reduce, i.e. O(P x events) for a sweep).
+    const threads =
+      known !== undefined && known.head === store.head()
+        ? known.threads
+        : await store.threads({ path, status: TRACKED_STATUSES });
     if (threads.length === 0) {
       // Nothing to do; ensure the snapshot for the new revision is
       // stored anyway so a subsequent POST does not re-read the file.
@@ -790,6 +843,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     // read we are already paying for by `anchor.path` and hand each
     // path its bucket. Same filter (`open` + `orphaned`), same list —
     // see `doRefresh`'s `known` parameter.
+    //
+    // **`head` is read BEFORE the read it stamps.** A write landing
+    // between the two then leaves `head` too low, which fails
+    // `known.head === store.head()` and sends the affected paths back
+    // to the store. Reading it after would let a stale bucket pass as
+    // current. See `TrackedSnapshot`.
+    const head = store.head();
     const all = await store.threads();
     const byPath = new Map<string, Thread[]>();
     for (const thread of all) {
@@ -803,7 +863,9 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       if (!isLineAnchor(thread.anchor)) continue;
       paths.add(thread.anchor.path);
     }
-    await Promise.all([...paths].map((path) => refreshWith(path, byPath.get(path) ?? [])));
+    await Promise.all(
+      [...paths].map((path) => refreshWith(path, { head, threads: byPath.get(path) ?? [] })),
+    );
   }
 
   async function gcOnce(): Promise<void> {
