@@ -957,20 +957,25 @@ export interface InviteScope {
  *
  * ── `!==` here is load-bearing, and mint-time canonicalisation did not change it ──
  *
- * **`target.repo` comes from the URL and is NEVER folded.** A case-differing
- * path names a different review — its own log key, its own R2 prefix — and it is
- * refused here, exactly as it was before `mintInvite` began storing the
- * canonical spelling. The two halves are canonical on ONE side only, and this
- * function is the reason that is sufficient: the invite's stored value is the
- * canonical form (`mintInvite`), so an invite admits the one canonical URL and
- * no other, and the comparison itself is a plain exact match.
+ * **`target.repo` is never folded, here or anywhere downstream.** The stored
+ * side is canonical (`mintInvite`), so an invite admits the one canonical URL
+ * and no other, and the comparison itself is a plain exact match.
+ *
+ * **Since #96 a case-differing path does not reach this function at all.**
+ * `parsePreviewPath` refuses a repo segment that is not already
+ * `canonicalRepoName(segment) === segment`, so `/Revkit/pr-7` is not a preview,
+ * names no scope, and classifies `unknown` — a 404 before the gate runs. This
+ * function still compares with `!==`, and still refuses a non-canonical target
+ * it is handed directly (which is why `test/invites.test.ts` can drive it with
+ * a hand-built scope), but the enforcement point moved UP to the parser and that
+ * is deliberate: see below.
  *
  * **So the admitted set has one member, not two.** Folding the target as well
  * would make `/REVKIT/` and `/revkit/` both cover the same invite — two
  * spellings of one path resolving to one review, which `parsePreviewPath`
  * refuses for doubled slashes and for `%2e` and which would move the log key.
- * Refusing here is also the fail-closed direction: an unrecognised spelling
- * denies rather than admits.
+ * Refusing a non-canonical spelling is the fail-closed direction either way: an
+ * unrecognised spelling denies rather than admits.
  *
  * ── The target is REQUIRED, and that is slice 5's fix ────────────────────
  *

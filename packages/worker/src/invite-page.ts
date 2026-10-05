@@ -256,6 +256,22 @@ export interface RedeemFormInput {
  * submits exactly as they would have before this slice. The script is an
  * enhancement here, never the mechanism — which is also why a browser dropping
  * it costs the guest nothing but the address bar.
+ *
+ * **The closing sentence promises nothing, because nothing here runs (#96).** It
+ * used to say the name "is deleted 30 days after this link is revoked or
+ * expires", which was ADR-0015's rule quoted as if this deployment were
+ * applying it. It is not: `wrangler.jsonc` declares no `triggers.crons` — that
+ * deferral is ADR-0015's own and `test/worker-config.test.ts` pins it — so
+ * `purgeStaleGuests` never fires and guests are retained indefinitely. It was
+ * also wrong about the WHAT: the sweep ANONYMISES (`display_name` → `deleted
+ * user`, `email` → NULL, row kept), it does not delete. A guest reading a promise
+ * the deployment cannot keep is worse than a guest reading no promise, so the
+ * sentence states only what is true now: nothing removes it automatically, and a
+ * person can be asked to. It deliberately does not name
+ * `revkit data delete --identity <id>` — ADR-0015 **plans** that command and it
+ * does not exist, so pointing a guest at it would be the same false claim in a
+ * different key. `test/invites.test.ts` asserts the page and `wrangler.jsonc`
+ * agree, so the sentence cannot quietly become a claim again.
  */
 export function redeemFormPage(input: RedeemFormInput): string {
   const scope = input.pr === null ? `all pull requests in ${input.repo}` : `${input.repo} pull request #${input.pr}`;
@@ -279,7 +295,7 @@ export function redeemFormPage(input: RedeemFormInput): string {
 <button type="submit">Accept and open the review</button>
 </p>
 </form>
-<p>Your name is shown beside your comments and is deleted 30 days after this link is revoked or expires.</p>`,
+<p>Your name is shown beside your comments. Nothing here removes it automatically — ask whoever sent this link if you want it taken down.</p>`,
   });
 }
 

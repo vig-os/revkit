@@ -28,7 +28,9 @@
 
 /** A parsed preview path. */
 export interface PreviewRef {
-  /** The repository segment, as it appeared in the path. */
+  /** The repository segment — which is always its canonical, lowercase form:
+   * `parsePreviewPath` refuses a segment that is not, so "as it appeared in the
+   * path" and "canonical" are the same string here (#96). */
   readonly repo: string;
   /** The PR number, as a positive integer. */
   readonly pr: number;
@@ -82,6 +84,15 @@ const REPO_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
  * rule. Two patterns would leave inputs that one side accepts and the other
  * rejects, and a scope check that misses those is a cross-repo read.
  *
+ * **It says nothing about case, and that is deliberate.** `isRepoName` admits
+ * `A-Za-z0-9`, because MINT takes whatever an operator typed and folds it
+ * (`canonicalRepoName`) — refusing `Revkit` at the mint would be refusing the
+ * operator's own spelling of a repository GitHub itself treats as
+ * case-insensitive. The READ side is where the case rule lives, and it lives in
+ * `parsePreviewPath` (#96): a non-canonical segment is not a preview. So the two
+ * consumers differ by one step, in one direction, and neither side of a scope
+ * comparison can be a spelling the other does not hold.
+ *
  * Exported rather than re-implemented in `src/invites.ts`, and re-implemented
  * is exactly what this avoids: a copy would also be a second thing to widen.
  */
@@ -103,16 +114,17 @@ export function isRepoName(value: string): boolean {
  * so it was an inconvenience rather than a hole — but it is the operator's own
  * review, and they cannot serve it.
  *
- * ── Why it is applied at MINT and never at READ ──────────────────────────
+ * ── Why it is applied at MINT, and the READ side REFUSES rather than folds ──
  *
  * The other side of the comparison is the URL, and folding that would be the
- * actual defect. `parsePreviewPath` returns `segments[1]` verbatim, so today
- * `/REVKIT/pr-7` and `/revkit/pr-7` are two reviews with two log keys and two
- * R2 prefixes. Folding the read side would collapse them into one — the
- * "two spellings of one path must not both resolve" rule this file already
- * enforces for doubled slashes and for `%2e` — and it would MOVE the log key,
- * which is the R2 partition. So the stored side moves to the canonical form and
- * the URL side stays exact.
+ * actual defect. `parsePreviewPath` does NOT fold what a caller sent: it REFUSES
+ * a repo segment that is not already canonical (#96), so `/REVKIT/pr-7` is not a
+ * preview of anything while `/revkit/pr-7` is one review with one log key and one
+ * R2 prefix. Folding the read side instead would have collapsed the two onto one
+ * — the "two spellings of one path must not both resolve" rule this file already
+ * enforces for doubled slashes, for `%2e` and for leading zeros — and it would
+ * MOVE the log key, which is the R2 partition. So the stored side moves to the
+ * canonical form and the URL side is exact or nothing.
  *
  * **That makes the comparison's semantics unchanged and its arithmetic
  * different.** `inviteCovers` still compares with `!==`; what changes is that
@@ -140,7 +152,10 @@ export function isRepoName(value: string): boolean {
  * admitted character class to keep that a measurement rather than a claim.
  *
  * **It is a canonicaliser, not a validator.** Callers still apply
- * `isRepoName`; this function says nothing about whether a name is servable.
+ * `isRepoName`; this function says nothing about whether a name is servable. The
+ * one caller that applies it to a REQUEST rather than to stored data is
+ * `parsePreviewPath`, which compares the result against the input and refuses a
+ * segment that is not already fixed — a fixed-point test, not a rewrite.
  */
 export function canonicalRepoName(value: string): string {
   return value.toLowerCase();
@@ -268,6 +283,28 @@ export function parsePreviewPath(pathname: string): PreviewRef | undefined {
   if (repo === undefined || prSegment === undefined) return undefined;
   if (repo === "" || repo === REVKIT_SEGMENT || repo === API_SEGMENT) return undefined;
   if (!isRepoName(repo)) return undefined;
+  // ── The repo segment must ALREADY be canonical (#96) ───────────────────
+  //
+  // `isRepoName` admits `A-Za-z0-9`, so `/Revkit/pr-7` is a well-shaped repo
+  // name — and before this check it parsed, which meant two spellings of one
+  // repository were two reviews: two log keys, two R2 prefixes, two entries in
+  // the access log. A guest invite covers exactly one of them, because the
+  // stored side is folded at mint (`canonicalRepoName`), so the split was
+  // invisible from the invite and visible from everywhere else.
+  //
+  // **Refused here, at the PARSER, rather than folded in `inviteCovers`.** The
+  // scope check is the wrong place for it: folding there would make one stored
+  // value admit two URLs, which is the "two spellings of one path must not both
+  // resolve" rule this function already enforces for `//`, for `%2e` and for
+  // leading zeros. Refusing here makes a non-canonical segment "not a preview"
+  // — a 404 — so exactly one spelling of a preview exists, and the refusal is
+  // the same answer a caller gets for `/API/pr-7`.
+  //
+  // The folded side is what makes this lose nothing: `mintInvite` writes
+  // `canonicalRepoName(input.repo)` and the redemption redirects to
+  // `previewScopePath(invite.repo, …)`, so the spelling a guest is SENT is the
+  // only spelling that resolves.
+  if (canonicalRepoName(repo) !== repo) return undefined;
   const match = PR_SEGMENT.exec(prSegment);
   if (match === null) return undefined;
   const pr = Number.parseInt(match[1] as string, 10);

@@ -366,7 +366,10 @@ interface PathRoute {
   readonly guestScopeExempt: boolean;
   /** Does this path answer `verb` as `kind`? Anything else becomes
    * `method-not-allowed` with the fields below preserved. A predicate rather
-   * than a set because one path accepts EVERY verb — see `ANY_VERB`. */
+   * than a set because TWO paths accept EVERY verb — `unknown` and
+   * `revkit-bundle`, both ungated, where the verb cannot change the answer; see
+   * `ANY_VERB`. Every GATED path takes a read or a write predicate, so a wrong
+   * verb on one is a 405 rather than a route that quietly accepts it. */
   readonly acceptsVerb: (verb: string) => boolean;
   /**
    * The one path that answers DIFFERENTLY per verb: `<repo>/pr-<n>/api/threads`
@@ -384,13 +387,20 @@ interface PathRoute {
     | undefined;
 }
 
-/** Every verb. A preview path is one of them because slice 2 classified any
- * verb on `<repo>/pr-<n>/…` as `preview` — a gated 501 — and slice 5 does not
- * change what a preview answers, only what the API inside it answers. Narrowing
- * it to a read would be a behaviour change this slice has no reason to make,
- * and ADR-0012 does not specify a verb policy for previews: it specifies a
- * media-type allowlist. The surface that serves them is still 501, and it is
- * still behind the gate on every verb either way. */
+/** Every verb — for the two UNGATED kinds only, where the verb changes nothing
+ * because there is no route for the answer to be about (`/_revkit/…`, `unknown`).
+ *
+ * **A preview path is deliberately NOT one of them (#96).** Slice 2 let any verb
+ * on `<repo>/pr-<n>/…` classify as `preview` and justified it as "the handler is
+ * 501 anyway". That justification described the handler and not the GATE:
+ * `stateChanging: false` is precisely the flag that makes `authorizeRequest`
+ * SKIP the CSRF and `application/json` checks, so POST/PUT/DELETE on a preview
+ * path passed with neither. Nothing observable today, because the handler is 501
+ * — but the day R2 serving lands the first write handler there inherits a CSRF
+ * hole, and a gate default that silently widens when a handler changes is not a
+ * gate default. So the preview arm accepts `READ_VERB`, like every other
+ * read-only route, and a wrong verb becomes `method-not-allowed`: still behind the
+ * gate, answered 405. */
 const ANY_VERB = (): boolean => true;
 const READ_VERB = (verb: string): boolean => READ_METHODS.has(verb);
 const POST_VERB = (verb: string): boolean => verb === "POST";
@@ -500,7 +510,12 @@ function classifyPath(pathname: string): PathRoute {
   }
   const preview = parsePreviewPath(pathname);
   if (preview !== undefined) {
-    return path({ kind: "preview", requiresSession: true, scope: toScope(preview), acceptsVerb: ANY_VERB });
+    // `READ_VERB`, not `ANY_VERB` (#96): a preview serves bytes and nothing else,
+    // so a verb that is not a read has no route to reach. `stateChanging` stays
+    // false because nothing here writes — the refusals are the verb's, made by
+    // `classifyRoute`'s `method-not-allowed` relabel, which keeps this path's
+    // scope so a guest is refused `invite-scope-mismatch` before it is told 405.
+    return path({ kind: "preview", requiresSession: true, scope: toScope(preview), acceptsVerb: READ_VERB });
   }
   // `unknown` and `revkit-bundle` accept EVERY verb, and both are ungated, so
   // the verb changes nothing: there is no route for the answer to be about.
