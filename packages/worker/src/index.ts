@@ -19,9 +19,14 @@
 //                                      (slice 5b), content-addressed; every
 //                                      OTHER name under /_revkit/ is 404 and
 //                                      NONE of them redirects (ADR-0012)
-//   GET|HEAD <repo>/pr-<n>/…        501 — behind the gate; R2 serving is slice 5's
-//                                      other half. Any OTHER verb on the same
-//                                      path is 405 (#96): reads only.
+//   GET|HEAD <repo>/pr-<n>/…        200 — behind the gate, one object from the
+//                                      R2 `PREVIEWS` binding, typed from the
+//                                      PATH's extension against the allowlist in
+//                                      `src/preview-assets.ts` (ADR-0012). A
+//                                      refused extension, a missing object and a
+//                                      missing preview are ONE 404 with NO body
+//                                      and no R2 read. Any OTHER verb on the
+//                                      same path is 405 (#96): reads only.
 //   ANY    <REPO>/pr-<n>/…          404 — a repo segment that is not lowercase
 //                                      is not a preview, so exactly one spelling
 //                                      of a preview path resolves (#96)
@@ -59,6 +64,37 @@
 //
 // A `POST /api/session` would still be the thing not to build: it hands a
 // credential to whoever asks with no token to present.
+//
+// ── The preview surface, and the one binding it adds ───────────────────────
+//
+// `<repo>/pr-<n>/…` serves one object out of the `PREVIEWS` R2 binding, behind
+// the same gate and the same scope check as the thread read — `Route.scope` is
+// `parsePreviewPath`'s `(repo, pr)`, so the invite comparison and the R2 prefix
+// are derived from ONE string in ONE place (`previewScopePath`), and a guest
+// scoped to `revkit/pr-7` cannot name another review's key.
+//
+// **Three properties are the security content of this route, and each has a
+// test in `test/preview.test.ts`:**
+//
+//   1. **`Content-Type` comes from the REQUEST PATH, never from the object.**
+//      `src/preview-assets.ts` decides from the path alone, and the handler
+//      never reads `httpMetadata` or `customMetadata` — a hostile
+//      `contentType` planted on a real object changes nothing, because there is
+//      no code here that would look at it. `nosniff` is what makes the
+//      derived type load-bearing rather than advisory.
+//   2. **A refused extension never reaches R2.** The decision is made before a
+//      key exists, so `.js`, `.mjs`, `.css`, `.wasm`, a double extension, a
+//      case variant, a trailing dot and a name with no extension are all 404 with
+//      no body and no bucket read — proven with a counting binding rather than
+//      by reading the order of two statements.
+//   3. **The key layout is DESIGN-0001 §6.1's**: `<repo>/pr-<n>/<path>`, the
+//      scope path with the built site's path appended, so one review's objects
+//      cannot share a prefix with another's.
+//
+// **There is no upload side.** Nothing in this Worker writes to the bucket:
+// CI writing PR-head builds, the bucket's provisioning and the credentials that
+// could do either are all out of scope and tracked separately, so this surface
+// serves whatever is in the bucket and the operator puts it there.
 //
 // ── ADR-0012's per-request authorization gate ─────────────────────────────
 //
@@ -154,6 +190,7 @@ import {
   applyAuthHeaders,
   applyHtmlHeaders,
   applyJsonHeaders,
+  applySvgHeaders,
   applyTextHeaders,
   REQUEST_ID_HEADER,
   requestOrigin,
@@ -176,6 +213,7 @@ import {
   redeemInvite,
 } from "./invites.ts";
 import { createLogger, newRequestId, type Logger } from "./logger.ts";
+import { previewTargetFor, type PreviewObjectKind, type PreviewObjectTarget } from "./preview-assets.ts";
 import { parseThreadsQuery, previewScopePath } from "./router.ts";
 import {
   INVITE_TOKEN_HMAC_KEY,
@@ -231,6 +269,29 @@ export interface Env {
    * there.
    */
   readonly INVITE_TOKEN_HMAC_KEY: string;
+  /**
+   * The preview bucket: one built site per `<repo>/pr-<n>/`, keys shaped by
+   * `src/preview-assets.ts` (`previewScopePath` + the built site's path).
+   *
+   * Declared in `wrangler.jsonc` as an `r2_buckets` entry so the binding NAME is
+   * a tested contract (`test/worker-config.test.ts`), and provisioned by
+   * whatever eventually runs `wrangler r2 bucket create` — owner-gated and out
+   * of scope here, so **the bucket name is a declaration and not a resource this
+   * repo has created**. The offline harness binds an in-memory one and seeds it
+   * per test.
+   *
+   * **Read-only in this Worker, and that is the whole trust story.** Nothing
+   * here calls `put`/`delete`, so whatever controls the bucket's contents is
+   * whoever runs the build pipeline — and ADR-0012's guarantee does not depend on
+   * that being careful: the bytes are typed by the REQUEST PATH's extension, so
+   * a PR that ships its own `text/javascript` metadata still gets served as the
+   * type its name asks for, or not at all.
+   *
+   * A deployment with the binding MISSING answers 500 on preview paths and
+   * nothing else: no route outside `servePreviewObject` reads it, so the absence
+   * cannot be mistaken for a healthy surface that simply has no previews in it.
+   */
+  readonly PREVIEWS: R2Bucket;
 }
 
 /** The allowlist's digests, de-duplicated and sorted — the same
@@ -478,7 +539,7 @@ export default {
       // `test/authorization.test.ts` asserts the partition against behaviour over
       // the derived probe product.
       if (!isGatedRouteKind(route.kind)) return unreachable(route);
-      const response = await handleAuthorized(route, decision.authorized, request, env, keys, scope, url);
+      const response = await handleAuthorized(route, decision.authorized, request, env, scope, url);
       status = response.status;
       return response;
     } catch (error) {
@@ -588,14 +649,21 @@ async function handleOpen(
  *
  * ADR-0012 says the bundle path is "deployed by revkit's own release". The
  * honest state of that is that there is no release pipeline for this surface
- * yet: there is no R2 binding, and `revkit deploy init` — which would provision
- * one — is slice 8 and owner-gated (#34). So the bytes are compiled INTO the
+ * yet: `revkit deploy init` — which would provision one — is slice 8 and
+ * owner-gated (#34). So the bytes are compiled INTO the
  * Worker (`src/client-script.ts`) and served from the bundle path, which keeps
  * the property ADR-0012 actually cares about: **the script comes from the
  * running revkit version, never from a PR artefact.** Whoever controls the
  * artefact controls the `<script>` tag in it; the digest in the filename is
  * computed from the same string this handler writes to the body, in the same
  * request, so a page and the asset it names cannot disagree.
+ *
+ * **The `PREVIEWS` R2 binding does not change this, and the difference is the
+ * point.** There IS an R2 bucket now (issue #101), and it holds PR-controlled
+ * content — so the reason the bundle is not in it is not "there is nowhere to
+ * put it". It is that a bundle's bytes must come from the running version, and
+ * a bucket whose contents are whatever CI last wrote is the wrong home for them
+ * however convenient it would be.
  *
  * ── The three properties this handler is responsible for ───────────────────
  *
@@ -1107,7 +1175,6 @@ async function handleAuthorized(
   authorized: AuthorizedSession,
   request: Request,
   env: Env,
-  keys: InviteTokenHasher,
   scope: RequestScope,
   url: URL,
 ): Promise<Response> {
@@ -1120,8 +1187,7 @@ async function handleAuthorized(
     case "session-refresh":
       return refreshSession(authorized, env, scope);
     case "preview":
-      void keys;
-      return json({ error: "not-implemented", enabledIn: "M4 slice 5 (R2 preview serving)" }, 501, scope);
+      return servePreviewObject(env, scope, route, url);
     case "method-not-allowed":
       return json({ error: "method-not-allowed" }, 405, scope);
     default:
@@ -1271,6 +1337,132 @@ function appendDisabled(scope: RequestScope): Response {
     501,
     scope,
   );
+}
+
+// ── the preview surface: one object per request, typed by its PATH ────────
+
+/** Every preview response is `no-store`, and that is a property of the KEY
+ *  rather than of the bytes.
+ *
+ * The revkit-owned bundle path can be `immutable` because its name is the hash
+ * of its content. A preview object cannot: `revkit/pr-7/index.html` is a
+ * different document after every push, and a cache that had seen the previous
+ * one would show a reviewer the PREVIOUS PR head while the thread read beside it
+ * described the current one. So nothing on this surface is cacheable, and the
+ * value is set here — the shared policy sets `Cache-Control` only for `json` and
+ * `auth`, so an `html`, `svg` or `asset` preview would otherwise ship with none.
+ */
+const PREVIEW_CACHE_CONTROL = "no-store";
+
+/**
+ * `GET|HEAD <repo>/pr-<n>/…` — one preview object, behind the gate.
+ *
+ * The order is the security shape, and there are only three steps:
+ *
+ *   1. **Decide from the path, before anything is read.** `previewTargetFor`
+ *      takes `route.scope.logKey` and the request's own pathname and returns
+ *      either an object to read or a refusal. A refusal returns HERE — no key
+ *      exists yet, so there is nothing to read, and the request never becomes an
+ *      R2 operation at all. `.js`, `.mjs`, `.css`, `.wasm`, `.html.js`, `X.JS`,
+ *      `index.html.`, `%2e`, a doubled slash and a name with no extension are
+ *      all in that set.
+ *   2. **Read that one key.** `get` returns `null` for a missing object, which
+ *      is the same 404 as a refusal: a caller learns that it did not get bytes,
+ *      and nothing about which of the two it was.
+ *   3. **Answer through the shared policy** with the kind the extension decided:
+ *      `html` → the full ADR-0012 CSP, `svg` → minimal CSP + `sandbox` +
+ *      `Content-Disposition: inline`, `json` and `asset` → theirs.
+ *
+ * **The object's metadata is never read, and there is no line here that could.**
+ * The response's `Content-Type` comes from `target.contentType`, which came from
+ * the extension table; `writeHttpMetadata` — the API that would copy an object's
+ * `httpMetadata` onto a response — is not called, and neither is `customMetadata`.
+ * That is asserted over workerd against an object whose stored `contentType` is
+ * `text/javascript`, in `test/preview.test.ts`.
+ *
+ * `route` is a parameter rather than `route.scope` so the `unreachable` below can
+ * prove the scope is present: a `preview` classification without a scope cannot
+ * happen, and if one ever did it is a 500 rather than a read of a key derived
+ * from nothing.
+ */
+async function servePreviewObject(env: Env, scope: RequestScope, route: Route, url: URL): Promise<Response> {
+  const logKey = route.scope?.logKey;
+  if (logKey === undefined) return unreachable(route);
+  const decision = previewTargetFor(logKey, url.pathname);
+  if (decision.kind === "refused") {
+    // The reason is one of `preview-assets.ts`'s closed vocabulary, so no part
+    // of the request reaches the log line — and the object path is deliberately
+    // NOT a field, because `request.end` already carries the pathname.
+    scope.logger.log("info", "preview.refused", { reason: decision.reason });
+    return previewNotFound(scope);
+  }
+  const target = decision.target;
+  const object = await env.PREVIEWS.get(target.key);
+  if (object === null) {
+    scope.logger.log("info", "preview.miss", { objectKind: target.kind });
+    return previewNotFound(scope);
+  }
+  scope.logger.log("info", "preview.served", { objectKind: target.kind });
+  return previewObject(object.body, target, scope);
+}
+
+/**
+ * A preview object as a response, through the ONE header policy.
+ *
+ * The switch is the whole point: there is no per-kind header written here, so a
+ * served SVG cannot grow a `script-src` and a served PNG cannot grow a CSP of
+ * its own (which would deny the document's own load of it). `kind` and
+ * `contentType` come as a PAIR from the extension table, so they cannot disagree
+ * about what a `.svg` is.
+ *
+ * `no-store` is set before the policy runs because the shared policy sets
+ * `Cache-Control` only for `json` and `auth` — and for `json` it sets the same
+ * value, so no header is ever set twice.
+ */
+function previewObject(body: ReadableStream, target: PreviewObjectTarget, scope: RequestScope): Response {
+  const response = new Response(body, { status: 200 });
+  response.headers.set("cache-control", PREVIEW_CACHE_CONTROL);
+  return withExtra(previewPolicyHeaders(response, target.kind, target.contentType, scope.headers), scope);
+}
+
+function previewPolicyHeaders(
+  response: Response,
+  kind: PreviewObjectKind,
+  contentType: string,
+  ctx: HeaderContext,
+): Response {
+  switch (kind) {
+    case "html":
+      return applyHtmlHeaders(response, ctx);
+    case "json":
+      return applyJsonHeaders(response, ctx, contentType);
+    case "svg":
+      return applySvgHeaders(response, ctx);
+    case "asset":
+      return applyAssetHeaders(response, ctx, contentType);
+  }
+}
+
+/**
+ * The preview surface's ONE 404: a refused path, a missing object and a review
+ * with nothing built in it are indistinguishable from outside.
+ *
+ * **No body, and that is the requirement rather than an omission.** A body here
+ * would be the only place on this surface where a caller-supplied name could
+ * travel, and the three cases have nothing to tell a caller that the status does
+ * not already say. `text` is the shared policy's kind for "an answer that is not
+ * a representation of anything", and it carries the hygiene quartet and
+ * `Permissions-Policy` like every other response — a 404 is a response a browser
+ * renders.
+ *
+ * `no-store` is set for the same reason as on a served object: an intermediary
+ * that cached this would keep answering it after a push that published the
+ * object.
+ */
+function previewNotFound(scope: RequestScope): Response {
+  const response = new Response(null, { status: 404 });
+  response.headers.set("cache-control", PREVIEW_CACHE_CONTROL);
+  return withExtra(applyTextHeaders(response, scope.headers), scope);
 }
 
 /**

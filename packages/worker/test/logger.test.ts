@@ -121,6 +121,14 @@ describe("structured logger", () => {
       "invite.opened",
       "invite.redeem.denied",
       "invite.redeem.ok",
+      // Issue #101's three, for the preview surface: a path the allowlist
+      // refused, an allowlisted object that is not in the bucket, and an object
+      // that was served. All three answer the caller with ONE 404-or-200 pair, so
+      // the log is where the distinction lives — and `preview.refused` is the one
+      // that says no read happened. Constant fields only.
+      "preview.miss",
+      "preview.refused",
+      "preview.served",
       "rate.limit.hit",
       "request.end",
       "request.error",

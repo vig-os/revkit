@@ -179,6 +179,24 @@ describe("wrangler.jsonc", () => {
     expect(bindings[0]?.database_id).not.toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-/i);
   });
 
+  // ── the preview bucket: the binding NAME is a contract, the resource is not ──
+  test("`PREVIEWS` is declared, once, and nothing writes to it", () => {
+    // The half of the preview surface that can be wrong offline is the BINDING
+    // NAME: `src/index.ts` reads `env.PREVIEWS.get`, so a rename here is a 500 on
+    // every preview path in a deployment that looks correct in review. Asserted
+    // the way the D1 binding is — by name, from the parsed file, not from prose.
+    const buckets = CONFIG["r2_buckets"] as { binding: string; bucket_name: string }[];
+    expect(buckets).toHaveLength(1);
+    expect(buckets[0]?.binding).toBe("PREVIEWS");
+    expect(buckets[0]?.bucket_name).toBe("revkit-previews");
+    // `bucket_name` is a NAME rather than an id, so there is no id to be an
+    // obvious placeholder — and **nothing has created a bucket with it.** That is
+    // deliberate and out of scope: provisioning is `wrangler r2 bucket create`,
+    // which needs an account (#130). A deployment whose bucket does not exist
+    // fails loudly at the binding, and one whose bucket is empty answers 404 on
+    // every preview path — the honest answer for a review nothing was built for.
+  });
+
   // ── ADR-0021: one version ─────────────────────────────────────────────
   test("the invite-token HMAC key is NAMED but never DECLARED", async () => {
     // ADR-0012's "stored as HMAC" needs a key, and ADR-0014 says no secret goes
