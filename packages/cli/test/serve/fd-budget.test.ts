@@ -33,12 +33,30 @@
 // refused, the recipe warns and continues at 1024, and the suite would
 // still die of `EMFILE`. It only helps in the soft-low/hard-high case.
 //
-// WHAT ACTUALLY PROTECTS CI is `scripts/fd-budget.sh`'s GROWTH check — and
-// this file's own header previously claimed the absolute peak ceiling did
-// it, which was wrong. The leg is ~3384 fixed module-load descriptors plus
-// ~1065 of leak, so a doubling of the leak reaches only ~5514: under the
-// 8192 ceiling. The ceiling is a runaway backstop and is blind to the first
-// doubling; measuring growth across post-warm-up samples is what sees it.
+// WHAT ACTUALLY PROTECTS CI, CORRECTED (#86). This header previously said the
+// growth check in `scripts/fd-budget.sh` did, on the grounds that the absolute
+// peak ceiling was blind to the first doubling. The second half was right; the
+// first half is now retracted, and it is retracted rather than softened because
+// this file's own rate test became the ONLY active guard as a result.
+//
+// The growth check is NOT applied to the `packages/cli` leg on CI. That leg is
+// where this budget was derived from — ~3.4k fixed module-load descriptors plus
+// ~1k of leak — and on the CI runner its ramp extends past the warm-up, so
+// `scripts/fd-budget.sh` declines to report a growth figure and prints
+// `baseline settled: no ... growth unmeasured` (measured twice: floor
+// 3966/3971 against an opening probe of 3497/3431). The growth check still
+// bounds growth across the whole process tree on the legs whose window IS
+// settled (`packages/worker`, `site/playwright`).
+//
+// So: against a descriptor leak on CI, the guard that is actually active is
+// the `per-cycle` test BELOW — and its scope is exactly one code path,
+// `startDaemon` + `handle.stop()`, 10 cycles. It does not cover a new watcher,
+// a child-process handle, a sqlite fd or a test helper, any of which the
+// process-tree poller would have seen. What the absolute ceiling covers, and
+// what it does not, is unchanged: the leg is ~3.4k fixed plus ~1k of leak, so a
+// doubling reaches only ~5.5k, under the 8192 ceiling — the ceiling is a runaway
+// backstop and is blind to the first doubling. The quantified band left
+// unguarded is tracked with #86.
 //
 // WHAT EACH TEST COVERS, HONESTLY.
 //
@@ -99,16 +117,18 @@ const CYCLES = 10;
 
 /** Absolute ceiling on this process's descriptor count.
  *
- * MEASURED peak 4449 over a full `packages/cli` run on
- * `bun 1.3.13`. Of that, ~3384 is a one-time module-load cost and the
- * remaining ~1065 is the watcher leak across the suite's daemon cycles.
- * The fixed cost is the leg's post-warm-up FLOOR (4449 minus the 1065 of
- * growth that `scripts/fd-budget.sh` measures); two narrower probes give
- * 52 for a bare `bun test` and 3268 for one importing only
+ * MEASURED peak 4454 over a full `packages/cli` run on
+ * `bun 1.3.13`. Of that, ~3433 is a one-time module-load cost and the
+ * remaining ~1021 is the watcher leak across the suite's daemon cycles.
+ * The fixed cost is the leg's post-warm-up FLOOR, read as the p10 of the
+ * post-warm-up window (412 samples, loadavg ~3); the older `min`-based
+ * reading of the same quantity was 3384 local / 3403 on CI. Two narrower
+ * probes give 52 for a bare `bun test` and 3268 for one importing only
  * `serve/daemon.ts`. None of it grows, so none of it is a leak.
  * Budgeted at 8192 so the constant dominates and the
  * assertion stays a backstop rather than a tripwire; test 1 is what
- * actually tracks the leak. */
+ * actually tracks the leak, and per this file's header it is now the only
+ * active leak guard on CI — see there for the scope that implies. */
 const SUITE_FD_CEILING = 8192;
 
 function openFdCount(): number {
