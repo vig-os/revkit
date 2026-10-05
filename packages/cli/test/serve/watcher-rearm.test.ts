@@ -652,7 +652,7 @@ describe("issue #49 nit 2 — prune the orphan memo on thread.reanchored", () =>
     writeFileSync(f, sib({ alpha: true, beta: false, filler: 4 }));
     await env.rd.refresh("docs/same.md");
 
-expect(await threadStatus(env.store, MOVER)).toBe("open");
+    expect(await threadStatus(env.store, MOVER)).toBe("open");
     expect(await threadStatus(env.store, ORPHAN)).toBe("orphaned");
     // The mover's entry is gone; the orphan's survives its sibling's
     // re-anchor even though it was visited FIRST in the same pass.
@@ -675,6 +675,21 @@ expect(await threadStatus(env.store, MOVER)).toBe("open");
 // The invariant pinned here: **every tracked directory is always in
 // exactly one of watch or poll, never neither** (`expectWatchXorPoll`).
 describe("issue #69 — a directory that vanishes inside the watcher callback falls back to polling", () => {
+  /** The debounce the vanish branch's OWN fan-out runs on
+   * (`reanchor-daemon.ts`: `for (const p of dw.basenames.values())
+   * fireForPath(p)` fires every tracked path when it sees the directory
+   * disappear). Both scenarios wait `FANOUT_QUIESCE_MS` for that
+   * fan-out to flush while the directory is STILL GONE, and assert the
+   * thread is orphaned before bringing the directory back.
+   *
+   * Without that wait the second half of each scenario is not a test of
+   * this fix at all: the fan-out's debounced refresh would run after the
+   * directory and its file were back, re-anchor the thread, and go green
+   * on src that installs no poll whatsoever. Quiesced, the only mechanism
+   * that can re-anchor is the poll the fix installs. */
+  const FILE_DEBOUNCE_MS = 20;
+  const FANOUT_QUIESCE_MS = FILE_DEBOUNCE_MS * 3;
+
   test("it is POLLED the moment the callback returns, and an edit after the dir returns is picked up", async () => {
     // The rebind probe interval is deliberately set past this test's
     // lifetime: `stepDirRebind`'s `needsRebind` branch is the ONLY
@@ -684,7 +699,7 @@ describe("issue #69 — a directory that vanishes inside the watcher callback fa
     const cap = capturingWatch();
     const env = await setup({
       watchFn: cap.watchFn,
-      fileDebounceMs: 20,
+      fileDebounceMs: FILE_DEBOUNCE_MS,
       pollIntervalMs: 40,
       dirRebindIntervalMs: 10_000,
     });
@@ -706,7 +721,13 @@ describe("issue #69 — a directory that vanishes inside the watcher callback fa
     expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
     expectWatchXorPoll(env.rd, [env.dir]);
 
-    // The directory comes back carrying an edit. The poll serves it.
+    // Let the callback's own fan-out flush against a directory that is
+    // still gone, so the re-anchor below has exactly one possible cause.
+    await new Promise((r) => setTimeout(r, FANOUT_QUIESCE_MS));
+    expect(await threadStatus(env.store, T)).toBe("orphaned");
+
+    // The directory comes back carrying an edit. Only the poll can
+    // serve it: the rebind probe is 10 s away and the fan-out has run.
     mkdirSync(env.dir);
     const rev = await revisionOf(mk(3));
     writeFileSync(f, mk(3));
@@ -729,7 +750,7 @@ describe("issue #69 — a directory that vanishes inside the watcher callback fa
     const cap = capturingWatch();
     const env = await setup({
       watchFn: cap.watchFn,
-      fileDebounceMs: 20,
+      fileDebounceMs: FILE_DEBOUNCE_MS,
       pollIntervalMs: 40,
       dirRebindIntervalMs: 40,
       dirStableIntervals: 2,
@@ -747,11 +768,29 @@ describe("issue #69 — a directory that vanishes inside the watcher callback fa
     expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
     expectWatchXorPoll(env.rd, [env.dir]);
 
-    // The directory returns, with an edit in it, and stays returned for
-    // several probe ticks and stability windows. Every sample across
-    // that window must be watch or poll — `undefined` at any instant is
-    // the regression, whatever the probe happens to be doing.
+    // Same quiesce as scenario 1, so the callback's own fan-out is not
+    // a candidate explanation for anything below. Here the probe IS
+    // running (40 ms), and it declines to act on a directory that is
+    // still absent — which is why this wait cannot install a poll on
+    // its own.
+    await new Promise((r) => setTimeout(r, FANOUT_QUIESCE_MS));
+    expect(await threadStatus(env.store, T)).toBe("orphaned");
+
+    // The directory returns. Read synchronously, before the probe's
+    // next tick: the poll is STILL carrying this directory across its
+    // return. On src with no fallback installed the mode here is
+    // `undefined` — the probe would rescue it a tick later, but the
+    // rescue is not what this asserts.
     mkdirSync(env.dir);
+    expect(env.rd.dirWatchMode(env.dir)).toBe("poll");
+    expectWatchXorPoll(env.rd, [env.dir]);
+
+    // It stays returned for several probe ticks and stability windows.
+    // Every sample across that window must be watch or poll —
+    // `undefined` at any instant is the regression. The sampler shares
+    // an event loop with the daemon, so it can only see gaps that span
+    // a macrotask; a gap narrower than that is unobservable here (the
+    // one #69 fixed was persistent, which is why this catches it).
     const rev = await revisionOf(mk(2));
     writeFileSync(f, mk(2));
     const samples = await sampleDirWatchMode(env.rd, env.dir, 400);
@@ -759,7 +798,9 @@ describe("issue #69 — a directory that vanishes inside the watcher callback fa
     expectWatchXorPoll(env.rd, [env.dir]);
 
     // The poll never stopped working, and the gate kept it (no re-arm:
-    // the swap-damaged-path case is terminal by design).
+    // the swap-damaged-path case is terminal by design). Coverage, not
+    // a discriminator: once the directory is back, the probe would
+    // install a poll on src without the fix either.
     const settled = await waitFor(async () => {
       const all = await env.store.threads();
       const t = all.find((x) => x.id === T);
