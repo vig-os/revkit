@@ -456,9 +456,26 @@ test_fd_budget_stable := "8192"
 test_fd_budget_playwright := "16384"
 
 # Descriptor GROWTH budget per leg, measured after a warm-up so the FIXED
-# module-load cost is excluded. This is the budget that can actually see the
-# leak, and it exists because of an arithmetic problem with the absolute
-# ceiling.
+# module-load cost is excluded. It exists because of an arithmetic problem with
+# the absolute ceiling: the ceiling is blind to the first doubling of the leak.
+#
+# SCOPE CORRECTION, #86. This budget used to be described as "the budget that
+# can actually see the leak". That is no longer true and the claim is retracted
+# rather than softened. On CI the `packages/cli` leg DECLINES to produce a growth
+# figure at all — that runner's module-load ramp extends past the warm-up, and
+# the settledness test refuses the number (measured twice: floor 3966/3971
+# against an opening probe of 3497/3431, deficit 469/540, printed as
+# `baseline settled: no ... growth unmeasured`). So the leg this budget was
+# derived from is the leg it does not judge, and on CI the only active guard
+# against a descriptor leak is the in-process per-cycle test in
+# `packages/cli/test/serve/fd-budget.test.ts` — which measures `startDaemon` +
+# `handle.stop()` and nothing else.
+#
+# What this budget still does, on the legs whose window IS settled
+# (`packages/worker`, `site/playwright`): it bounds growth across the whole
+# process tree, which the per-cycle test does not. What it no longer does:
+# reliably bound growth on `packages/cli` anywhere. Both the coverage gap and
+# the fix that would restore it are tracked with #86.
 #
 # THE FIXED COST, and which measurement each number is. Three distinct
 # quantities were previously conflated into one figure, so to be explicit:
@@ -493,12 +510,44 @@ test_fd_budget_playwright := "16384"
 # RE-DERIVED FROM RAMP-FREE MEASUREMENTS, and the number did not move. Local
 # `packages/cli` growth is 965 and 1021 on two runs of the p10 statistic
 # (loadavg 3-9); CI's clean runs measured 1284 (run 37117007176) and 1279 (run
-# 37117515667) under `min`, which OVERSTATES growth by up to 10%, so CI's
-# ramp-free figure is 1150-1284. So 1800 is ~1.4x the worst environment
-# measured and a doubling trips it — 2300-2570 on CI against an 1800 budget,
-# and 1930 locally. It is NOT raised: the honest reason to revisit it is a
-# measured shift, and none has occurred. Raising it on a ramp-contaminated
-# measurement is precisely what #86 exists to prevent.
+# 37117515667) under `min`, which OVERSTATES growth, so CI's ramp-free figure is
+# at or below those.
+#
+# HOW MUCH p10 UNDERSTATES, measured, because it sets the margin. p10 reads
+# exactly 0.900x the `max - min` figure for a leak starting at the window's
+# opening (1018 -> 917, 2037 -> 1834, 1280 -> 1153) and exactly 1.000x for one
+# starting >=10% in, which is the real leg's shape (1018 -> 1018). So a leak
+# that begins late is measured at full size and one that begins at the opening
+# at 90% of it.
+#
+# 1800 therefore sits between the measured growth and a doubling of it. The
+# doubling's p10 figure is:
+#
+#   local, onset at the opening:  0.900 x 2 x 1018 = 1832
+#   local, onset >=10% in:       1.000 x 2 x 1018 = 2036
+#   CI,    onset at the opening:  0.900 x 2 x 1284 = 2311
+#   CI,    onset >=10% in:       1.000 x 2 x 1284 = 2568
+#
+# The worst case is the local one at 1832, which clears 1800 by 32 descriptors
+# (1.8%). MEASURED on the actual test trace in
+# `packages/cli/test/serve/fd-budget.test.ts` ("a planted leak on a settled
+# baseline still trips the growth budget"): growth 1834 against the budget, so
+# 34 descriptors, 1.9%.
+#
+# CORRECTION. An earlier revision of this comment justified leaving 1800 alone
+# with "a doubling trips it — 2300-2570 on CI against an 1800 budget, and 1930
+# locally". Those were all `min`-based figures, and they overstated the margin
+# by up to 10%. The conclusion is unchanged — leaving 1800 alone is right — but
+# the reason is now stated in the statistic the gate actually computes, and the
+# honest margin is 1.9% rather than the ~19% the old numbers implied. That thin
+# margin is a consequence of p10 under-reporting a monotone leak, which is
+# documented as a limit in `scripts/fd-budget-verdict.sh`.
+#
+# It is NOT raised. Raising it on a ramp-contaminated measurement is precisely
+# what #86 exists to prevent, and the only measured evidence of a shift since
+# then is 961-987 across five local runs. A leg reporting `unmeasured` rather
+# than a number is not a licence to raise the budget either — see the note on
+# what to watch below.
 #
 # WHAT TO WATCH, AND WHY THE OLD NOTE WAS NOT ACTIONABLE. The old note here read
 # "if CI growth ever drifts another 40% the budget needs re-deriving", which

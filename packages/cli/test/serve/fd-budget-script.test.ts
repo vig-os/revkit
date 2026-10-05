@@ -63,12 +63,14 @@ const CEILING = 8192;
 // 1800 - 1284 = 516 of growth on CI and 8192 - 4695 = 3497 of peak, against
 // perturbations of at most TRANSIENT_BURST below.
 
-/** Transient size for the peak-only test, against its ceiling of 3. A `bash`
- * process holds ~7 descriptors on its own, so 3 fails on the shell alone with
- * no burst at all — which is the point: the ceiling must not need a leak to
- * demonstrate it bites. */
+/** Transient size for the peak-only test, against its ceiling of 3.
+ *
+ * NO BURST. A bare `bash` child of this script already peaks at 4-5
+ * descriptors, so a ceiling of 3 fails on the shell alone — which is the
+ * point being made, and an earlier revision of this test opened 60 more to
+ * "prove" it, which drove nothing and contradicted the note above about every
+ * burst being the smallest that carries its verdict. */
 const CEILING_TEST_CEILING = 3;
-const CEILING_BURST = 60;
 
 /** A steady planted leak of ~480 over 8s, ~320 of it post-warm-up, against a
  * budget of 60. Wide enough that the verdict cannot depend on poll timing. */
@@ -85,11 +87,63 @@ const LEAK_TEST_BUDGET = 60;
  * expires, so the low portion is ~3% of the window whether or not a poll lands
  * in it.
  *
+ * RESIDUAL DEPENDENCY, stated rather than implied, because it is not the offset
+ * that matters — it is WHERE IN THE WINDOW the burst lands, and the useful zone
+ * is narrower than it looks. `probe` is the p10 of the window's first DECILE
+ * and `floor` its p10, so:
+ *
+ *   burst at window index 1     the whole first decile is post-burst, so
+ *                               probe == floor, deficit 0, settled YES. This
+ *                               is what an over-eager burst produces and it is
+ *                               the reason the unsettled test below needs the
+ *                               burst a little way in rather than immediately.
+ *   burst inside the first      probe is low, floor is the plateau, deficit is
+ *   decile but before its 10%   the full burst — which is the zone both tests
+ *   mark (indices ~2-30 of ~380) want.
+ *   burst past the 10% mark     floor moves onto the low samples and the
+ *                               transient is charged as growth. This is the
+ *                               failure mode: an earlier revision using a 6s
+ *                               window went red under `bun test` with
+ *                               `growth 102` because the burst landed ~0.5s
+ *                               late, which on 110 samples is past 10%.
+ *
+ * Script start-up under load is not bounded by anything this test controls, so
+ * the window is 24s: at the measured ~60ms per poll its 10% mark is ~2.3s after
+ * the warm-up, against a burst intended to land ~0.5s in. Verified stable across
+ * burst offsets 2.3 / 2.5 / 2.7. If a runner ever delays child start-up beyond
+ * ~1.8s this test goes red with `growth ~102` instead of `growth 0` — a false
+ * negative on the TEST, not on the gate, which is entitled to the `unmeasured`
+ * in that case. The same property is proven deterministically in the arithmetic
+ * suite above, where the trace is available to both statistics.
+ *
+ * `exec {fd}>` rather than `eval exec N</dev/null`, for the same reason as the
+ * unsettled test: the latter aborts bash above ~240 descriptors on this host.
+ * Note it opens the descriptors close-on-exec-false, so the `sleep` child
+ * inherits them and the poller's tree walk counts them twice — a burst of 51
+ * reads as a step of ~102. The assertions account for that.
+ *
  * Must exceed TRANSIENT_BUDGET for `max - min` to have failed on it (that is
  * the whole point), and stay under FDV_SLACK so the settled verdict is a clean
  * pass: 51 <= 200, which is the assertion the test then makes exactly. */
 const TRANSIENT_BURST = 51;
 const TRANSIENT_BUDGET = 40;
+
+/** A count still climbing when the measurement window opens, sized so the
+ * settledness test refuses it.
+ *
+ * The deficit this produces is `SETTLED_BURST - 7` — the child's own
+ * descriptors are the baseline — against a tolerance of `FDV_SLACK` (200) plus
+ * 10% of a growth that is ~0 once the count is flat. So 260 gives a deficit of
+ * ~253 against a tolerance of ~200: a 53-descriptor margin, and crucially an
+ * EXACT one, because the deficit is set by the burst size and not by poll
+ * timing. It has to exceed ~208 for this to fire at all, which is why it is not
+ * a small number.
+ *
+ * Opened with `exec {fd}>` in a loop rather than one `eval exec N</dev/null`:
+ * the loop form is both faster (220 descriptors in 4ms measured) and lifts a
+ * far higher ceiling, where a single `eval exec` aborts bash above ~240 with a
+ * heap corruption on this host. */
+const SETTLED_BURST = 260;
 
 /** A verdict output, or `""` for one the library left UNSET.
  *
@@ -421,9 +475,7 @@ describe.skipIf(!hasProcFd)("fd-budget verdicts, end to end over a real child (#
   }, 60_000);
 
   test("verdict: absolute-ceiling failure, with growth comfortably inside its budget", async () => {
-    const child = `for _ in $(seq 1 ${CEILING_BURST}); do exec {fd}>/dev/null; done
-sleep 3
-`;
+    const child = "sleep 3\n";
     const r = await runScript(CEILING_TEST_CEILING, 1_000_000, child);
     expect(r.output).toContain(`exceeds the ceiling of ${CEILING_TEST_CEILING}`);
     expect(r.output).not.toContain("descriptor growth of");
@@ -468,6 +520,41 @@ sleep 2
     expect(r.code, r.output).toBe(1);
   }, 60_000);
 
+  test("verdict: unsettled — a leak-shaped ramp declines rather than passing", async () => {
+    // The FIFTH verdict, and the one CI's `packages/cli` leg prints on every
+    // run. Until this test existed, `fd-budget.sh`'s `settled=no` branch — the
+    // exact diagnostic above, with its own distinct wording from the
+    // too-short branch — was never executed by any test: every other assertion
+    // read the pure function's `v.settled` or grepped for an absence.
+    //
+    // The shape has to be one the gate REFUSES, so it is the settledness test's
+    // own blind spot rather than a passing case: a count that is still climbing
+    // when the window opens, by more than the tolerance. SETTLED_BURST makes
+    // that deficit ~253 against a tolerance of ~200.
+    //
+    // Opened with `exec {fd}>` rather than `eval exec` because the latter aborts
+    // bash above ~240 descriptors on this host (heap corruption, exit 134/139),
+    // which is below what this test needs.
+    const child = `sleep 2.5
+for _ in $(seq 1 ${SETTLED_BURST}); do exec {fd}>/dev/null; done
+sleep 24
+`;
+    const r = await runScript(1_000_000, DELTA_BUDGET, child);
+    expect(r.output, r.output).toContain("baseline settled: no");
+    expect(r.output, r.output).toContain("had not settled when the window opened");
+    expect(r.output, r.output).toContain("growth NOT MEASURED");
+    // The growth budget must be explicitly NOT applied, and stated as a
+    // declined measurement rather than a pass.
+    expect(r.output).toContain("the growth budget was NOT applied to this run");
+    expect(r.output).toContain("NOT a pass on the leak");
+    // The too-short branch's wording must not be reused here: it is a
+    // different reason to have no figure, and conflating them would be the
+    // same class of mistake as #86's own message.
+    expect(r.output).not.toContain("the leg finished inside the");
+    expect(r.output, "an unsettled baseline must not be reported as a pass").not.toContain("FAILED");
+    expect(r.code, r.output).toBe(0);
+  }, 90_000);
+
   test("verdict: a step inside the window is absorbed by the floor, not charged as growth", async () => {
     // #86 end to end, and the sharpest form of it: the reported growth must be
     // ZERO, not merely under budget. The window opens on a process holding ~7
@@ -480,9 +567,9 @@ sleep 2
     // deterministic proof that `max - min` does fail on this shape is in the
     // arithmetic suite above, where the same trace is available to both
     // statistics.
-    const child = `sleep 2.15
-eval "exec $(i=10; while [ $i -le $((10 + TRANSIENT_BURST - 1)) ]; do printf '%d</dev/null ' "$i"; i=$((i+1)); done)"
-sleep 6
+    const child = `sleep 2.5
+for _ in $(seq 1 ${TRANSIENT_BURST}); do exec {fd}>/dev/null; done
+sleep 24
 `;
     const r = await runScript(1_000_000, TRANSIENT_BUDGET, child);
     expect(r.output).not.toContain("FAILED");
@@ -494,9 +581,7 @@ sleep 6
   }, 90_000);
 
   test("the failure message reports the numbers and does not assert a cause", async () => {
-    const child = `for _ in $(seq 1 ${CEILING_BURST}); do exec {fd}>/dev/null; done
-sleep 3
-`;
+    const child = "sleep 3\n";
     const r = await runScript(CEILING_TEST_CEILING, 1_000_000, child);
     expect(r.output).toContain("CAUSE NOT ESTABLISHED");
     expect(r.output).toContain("bun test test/serve/fd-budget.test.ts");
@@ -524,9 +609,25 @@ sleep 3
   }, 30_000);
 
   test("no flag or environment variable can substitute samples for a measurement", async () => {
-    // The seam has to be unabusable, so assert the absence of the shapes that
-    // would make it abusable: a way to feed the gate numbers, and a way to skip
-    // the check. If a future revision adds one, this fails.
+    // WHAT THIS ACTUALLY ENFORCES, stated precisely, because an earlier version
+    // of this comment overclaimed. It enforces the ABSENCE of flag-shaped and
+    // env-shaped bypasses — a way to hand the gate numbers, and a way to skip
+    // the check — plus the PRESENCE of the production call site.
+    //
+    // It does NOT enforce that the verdict cannot be subverted by editing the
+    // script: two assignments inserted after the call (`fdv_settled=1`,
+    // `fdv_growth=0`) pass all eight regexes below AND the presence assertion,
+    // and would turn a declined run into a pass. That is a code-review-visible
+    // change rather than an environment bypass, which is a materially different
+    // risk — but it is a real one, and claiming otherwise here would be the
+    // same mistake #86 made with a number that looked derived and was not.
+    //
+    // The seam itself held every attack actually tried: no flag, no environment
+    // variable (the `FDV_*` names are unconditional assignments in the library,
+    // so exporting them changes nothing on the real script), and no PATH or cwd
+    // substitution (bash resolves `BASH_SOURCE[0]` to an absolute path before
+    // the library is sourced). The exit-status contract is unchanged on all four
+    // paths, including a child that segfaults propagating 139.
     const source = await Bun.file(SCRIPT).text();
     for (const bypass of [
       /--samples/,

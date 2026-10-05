@@ -62,13 +62,17 @@
 # answer is `unmeasured` — which is why this gate reports no growth figure at
 # all rather than a number it cannot defend, and why the ABSOLUTE CEILING
 # stays in force. #86's own acceptance criterion allows either a stable verdict
-# or a declined one, so the failure direction here is deliberately the safe one:
-# a false `unmeasured` costs a blind run (the ceiling and the per-cycle test
-# still apply), while a false `settled` costs a false CI failure, which is the
-# bug this issue exists to fix.
+# or a declined one.
 #
-# THE TWO MECHANISMS COMPOSE INTO ONE PROPERTY, which is the reason both are
-# here rather than either alone. A ramp occupying fraction r of the window:
+# THE FAILURE DIRECTION IS THE SAFE ONE, and that is a choice, not a proof. A
+# false `unmeasured` costs a blind run — the absolute ceiling and the in-process
+# per-cycle test both still apply. A false `settled` costs either a false CI
+# failure, which is the bug #86 exists to fix, or — see the limit below — a
+# leak reported as a passing number, which is worse than either.
+#
+# THE TWO MECHANISMS COMPOSE INTO ONE PROPERTY for RAMPS, which is the reason
+# both are here rather than either alone. A ramp occupying fraction r of the
+# window:
 #
 #   r <= 10%   the p10 floor excludes it entirely — floor and growth are sound —
 #              and the probe still sits inside the ramp, so the verdict is
@@ -76,14 +80,40 @@
 #   10% < r    the floor is depressed AND the probe is inside the ramp, so the
 #              verdict is `unmeasured`.
 #   r ~= 50%+  the probe's deficit falls back inside FDV_SLACK and the ramp is
-#              reported as growth. THIS IS THE KNOWN LIMIT and it is not
-#              worked around, because at that point a stretched ramp and a leak
-#              are the same measurement: a monotone rise over the whole window.
-#              What still catches such a run is the absolute ceiling, the
-#              per-cycle rate, and the deficit printed on the summary line
-#              above — which is why the numbers are printed even on success.
+#              reported as growth. This is the ramp limit, and it is not worked
+#              around, because at that point a stretched ramp and a leak are the
+#              same measurement: a monotone rise over the whole window.
 #
 # In short: no ramp this gate can still be confused by is one it will report.
+# Swept over ramp fractions 0.02 -> 0.90 on the reconstructed CI failure, every
+# ramp the gate DOES report comes with an INFLATED growth figure that exceeds the
+# budget — never a passing one.
+#
+# THE LIMIT ON THE OTHER SIDE: A FRONT-LOADED LEAK IS REPORTED AS A PASSING
+# NUMBER, and this is the more dangerous of the two limits. The settledness test
+# asks whether the count was at its floor when the window opened, and a leak
+# that is still climbing at that moment looks exactly like a ramp that has not
+# finished. The composition property above does NOT cover it, and neither does
+# any threshold here: the two are the same measurement. Measured consequences,
+# all on windows of 412 samples:
+#
+#   leak 2054 over the first 70% of the window, then flat:
+#     floor 325, probe 61, deficit 264, settled YES, growth 1762 -> PASS.
+#     A leak of twice #74's, invisible.
+#   sweep of leak x ramp fraction: the largest front-loaded leak that still
+#     passes a budget of 1800 is ~2000-2100 descriptors.
+#   and p10 UNDER-REPORTS any monotone leak by 11-19% on top of that, because
+#     it excludes the lowest tenth of the rise by construction (measured
+#     0.900x the `max - min` figure for a leak starting at the window's
+#     opening, against 1.000x for one starting >=10% in).
+#
+# So the honest statement of what this gate can see is narrower than "the
+# growth": it sees a leak that accumulates across the window, not one that
+# completes in the window's opening tenth, and it under-reports by up to ~19%
+# when the leak is monotone. What covers the rest is named in
+# `packages/cli/test/serve/fd-budget.test.ts` (the in-process per-cycle rate,
+# `startDaemon`/`stop` only) and the absolute ceiling. See the coverage issue
+# filed with #86 for the quantified band this leaves unguarded.
 #
 # WHAT IS *NOT* CLAIMED. This file decides whether descriptors grew and by how
 # much. It does not decide why, and nothing here names a cause — see the
@@ -97,22 +127,37 @@ FDV_FLOOR_PCTL=10
 # Fraction of growth the floor-to-probe deficit may reach before the baseline is
 # called unsettled, in percent (integer arithmetic, no float in the gate).
 #
-# DERIVED, not chosen, and forced from both sides. For a window that is a steady
-# leak from a settled floor, p10 of the window sits 10% of the way up and the
-# probe 1% of the way up, so the deficit is 9% of the window's spread against a
-# growth of 90% of it — a ratio of 0.100 analytically. MEASURED on the reference
-# run the deficit was 0 against a growth of 1021, because that leg's leak does
-# not begin until the third decile; 0.100 is therefore the WORST case, not the
+# DERIVED, not chosen. For a window that is a steady leak from a settled floor,
+# p10 of the window sits 10% of the way up and the probe 1% of the way up, so
+# the deficit is 9% of the window's spread against a growth of 90% of it — a
+# ratio of 0.100 analytically. Measured across 30 combinations of leak size
+# (500-20000), window length (100/412/1500) and plateau (3433/3966), the largest
+# deficit/growth ratio observed was 0.1003 and NO steady leak was ever called
+# unsettled. On the reference run the ratio was 0.000, because that leg's leak
+# does not begin until the third decile; 0.100 is the worst case, not the
 # typical one.
 #
-# That makes 10 the only defensible value, and it is forced from both ends:
+# FORCED FROM ABOVE, and only from above. An earlier revision of this comment
+# claimed 10 was "forced from both sides", which was half false and worth
+# correcting precisely because #86 was caused by a number that looked derived
+# and was not:
 #
-#   TOL < 10   the tolerance is below the analytic ratio of a steady leak, so a
-#              large leak is declared "unsettled" — the gate goes BLIND to the
-#              regression it exists for. The margin is a flat FDV_SLACK
-#              descriptors at any leak size, not a ratio.
-#   TOL > 10   more ramp is absorbed per sample, but so is more of a front-
-#              loaded leak, which is the false-`unmeasured` direction.
+#   TOL > 10   too much of a front-loaded leak is tolerated and it is reported
+#              as a passing number (see the limit above). The bound is tight:
+#              at TOL=5 a front-loaded 2054-descriptor leak is refused, at TOL=10
+#              it is reported and passes. So the ceiling on this constant is
+#              what sets it, and it is close.
+#   TOL < 10   the claim that this also protects a steady leak is NOT true. The
+#              margin is the ADDITIVE FDV_SLACK, not a ratio, so lowering TOL
+#              does not monotonically endanger a leak: at TOL=0 a steady
+#              2042-descriptor leak is still `settled` (deficit 184 against a
+#              bare 200 allowance). TOL only starts refusing steady leaks once
+#              0.1 x growth exceeds that allowance, i.e. above ~2200
+#              descriptors of growth — measured at TOL=0, where a steady
+#              20000-descriptor leak IS refused.
+#
+# So: 10 is correct, and the upper bound is what forces it. The lower margin
+# against sampling noise is FDV_SLACK's job, not this constant's.
 FDV_TOL_PCT=10
 
 # Absolute allowance, in descriptors, on top of FDV_TOL_PCT% of growth. It
@@ -122,6 +167,20 @@ FDV_TOL_PCT=10
 # descriptors of jitter. 200 is ~5.8% of the measured 3433 plateau — large
 # against sampler noise, far below the 815-deficit of a ramp occupying the
 # first 30% of the window on the CI run that failed.
+#
+# IT ALSO SETS THE SMALLEST LEAK THIS GATE CAN SEE, which is the consequence
+# that is easy to miss and is stated here so the number is not read as only a
+# noise allowance. A leak that completes inside the window's opening tenth
+# reaches the plateau before p10 does, so p10 returns the plateau and the leak
+# is charged NOTHING. Measured, on a 412-sample window:
+#
+#   front-loaded leak of 220  ->  deficit 199, growth 0, settled yes  ->  PASS
+#
+# 220 descriptors of leak, entirely invisible, and `growth 0` is the most
+# confident possible lie this gate can tell. FDV_SLACK is therefore not only a
+# noise allowance; it is the detectability floor, and the two uses are the same
+# number for the same reason — both are "how much departure from the floor can
+# this gate absorb before it has to admit it saw something".
 FDV_SLACK=200
 
 # Number of leading samples, as a percentage of the window, that the opening

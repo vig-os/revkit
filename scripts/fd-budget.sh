@@ -21,8 +21,24 @@
 #
 # TWO BUDGETS, and why one is not enough.
 #
-#   --budget N        absolute peak. A runaway backstop.
-#   --delta-budget N  growth after a warm-up. The one that can SEE the leak.
+#   --budget N        absolute peak. A runaway backstop. The only one of the two
+#                     that is active on every leg of every run.
+#   --delta-budget N  growth after a warm-up. Retracted claim, corrected here:
+#                     it used to read "The one that can SEE the leak", and on CI
+#                     that is false. The `packages/cli` leg — the one this budget
+#                     was derived from — DECLINES to produce a growth figure on
+#                     CI, because that runner's module-load ramp extends past
+#                     the warm-up (measured twice: floor 3966/3971 against an
+#                     opening probe of 3497/3431, deficit 469/540). So on CI the
+#                     growth check is not applied to the leg it was built for,
+#                     and the in-process per-cycle test in
+#                     `packages/cli/test/serve/fd-budget.test.ts` is the only
+#                     active guard against a descriptor leak — and it covers
+#                     `startDaemon`/`stop` alone, not the whole process tree
+#                     this script watches. What the growth budget still buys is
+#                     a cross-process total on the legs whose window IS settled
+#                     (`packages/worker`, `site/playwright`) and a hard refusal
+#                     to report a figure it cannot defend. Tracked with #86.
 #
 # The `packages/cli` leg breaks down as ~3433 fixed plus ~1020 of leak, and
 # the fixed part is a module-load cost rather than a leak. Three separate
@@ -366,8 +382,11 @@ if [ "$fdv_measured" -eq 0 ] || [ "$fdv_settled" -eq 0 ]; then
     printf '\nfd-budget: growth NOT MEASURED, so the growth budget was NOT applied to this run.\n' >&2
     printf 'fd-budget:   The descriptor count had not settled when the window opened: floor %s against an\n' \
       "$fdv_floor" >&2
-    printf 'fd-budget:   opening probe of %s, a deficit of %s against a measured spread of %s.\n' \
-      "$fdv_probe" "$fdv_deficit" "$fdv_growth" >&2
+    printf 'fd-budget:   opening probe of %s — a deficit of %s. For scale, the growth that figure would\n' \
+      "$fdv_probe" "$fdv_deficit" >&2
+    printf 'fd-budget:   have produced is %s, so a deficit LARGER than that is expected here rather than\n' \
+      "$fdv_growth" >&2
+    printf 'fd-budget:   a symptom: the ramp simply climbed past the opening sample.\n' >&2
     printf 'fd-budget:   Within one window, "the baseline had not finished settling" and "a leak is\n' >&2
     printf 'fd-budget:   accumulating" are the same shape, and this gate counts descriptors rather than\n' >&2
     printf 'fd-budget:   daemon cycles, so it declines to report a growth figure it cannot defend.\n' >&2
@@ -413,10 +432,14 @@ EOF
     if [ "$fdv_growth_exceeded" -ne 0 ]; then
       cat >&2 <<'EOF'
 
-For a growth failure there is a specific ambiguity worth naming: within one
-measurement window a genuine leak and a baseline that had not finished settling
-are the same shape — a monotone rise — and the growth figure above is the same
-either way.
+For a growth failure there is a specific ambiguity worth naming. This gate has
+already established that the baseline had settled — "baseline settled: yes"
+above — so it is NOT confusing this with module load, which is the mistake
+issue #86 was about. What it cannot exclude is a leak that was ALREADY
+accumulating when the window opened: that is the same shape as the ramp it just
+ruled out, and settling is decided by a threshold rather than observed. The
+measured size of that blind spot is in `scripts/fd-budget-verdict.sh`; a leak
+completing inside the window's opening tenth is charged nothing at all.
 EOF
     else
       cat >&2 <<'EOF'
