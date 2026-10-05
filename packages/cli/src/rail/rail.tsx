@@ -97,6 +97,18 @@ interface RailUnanchoredAnchor {
   readonly originalEndLine?: number;
 }
 type RailAnchor = RailLineAnchor | RailUnanchoredAnchor;
+/** The anchor the rail posts for a NEW comment (issue #113): the
+ * stamped block's source coordinates and nothing else. No `quote` —
+ * the rail reads rendered text and the stored quote must be source
+ * text, so the daemon derives it. `revision` is a placeholder the
+ * daemon overrides with `revisionOf(source)`, exactly as it does for
+ * every client. */
+interface RailNewThreadAnchor {
+  readonly path: string;
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly revision: string;
+}
 /** True when `anchor` carries `startLine`/`endLine`/`quote` — i.e.
  * a line-anchored thread. `kind === "unanchored"` (or the
  * absence of `startLine`) puts a thread in the file-level path,
@@ -346,23 +358,6 @@ async function refreshReviewPr(): Promise<{ moved: boolean; stale: boolean; curr
   return (await response.json()) as { moved: boolean; stale: boolean; currentHeadSha: string };
 }
 
-/** Build the SHA-256 hex digest of the LF-normalised body — the
- * `revision` field on the anchor. `revisionOf` in review-core does the
- * same for the server; the rail computes its own locally so a new
- * thread's revision matches the block it points at. Uses WebCrypto
- * (`crypto.subtle`), available in every evergreen browser (ADR-0018). */
-async function revisionHex(text: string): Promise<string> {
-  const normalised = text.replace(/\r\n/g, "\n");
-  const bytes = new TextEncoder().encode(normalised);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  const hex: string[] = [];
-  const view = new Uint8Array(digest);
-  for (let i = 0; i < view.length; i++) {
-    hex.push(view[i]!.toString(16).padStart(2, "0"));
-  }
-  return hex.join("");
-}
-
 /** Fetch review threads for the source paths visible on THIS page.
  * The rail walks every `[data-src]` on load, collects the distinct
  * `path` values, and asks the daemon for each — a large repo with
@@ -442,9 +437,16 @@ function collectPagePaths(): string[] {
 }
 
 /** Body a `POST /api/threads` accepts. Kept in step with the daemon's
- * `createThreadRequestSchema` (packages/cli/src/serve/api-schemas.ts). */
+ * `createThreadRequestSchema` (packages/cli/src/serve/api-schemas.ts).
+ *
+ * `anchor` carries only what the browser can know honestly: the
+ * stamped block's path and line range, plus a revision placeholder the
+ * daemon overrides. No `quote` — the daemon derives it from the source
+ * (issue #113). `selectionHint` is the rendered selection, used to
+ * narrow WHICH source span is quoted and never stored. */
 interface CreateThreadBody {
-  readonly anchor: RailAnchor;
+  readonly anchor: RailNewThreadAnchor;
+  readonly selectionHint?: string;
   readonly body: string;
 }
 async function createThread(body: CreateThreadBody): Promise<void> {
@@ -547,24 +549,6 @@ async function fetchAllThreadIds(): Promise<readonly string[] | undefined> {
  * back to collapsed-with-pill. Tuned so a colleague opening a
  * page with a long agent backlog can still scan the list. */
 const UNREAD_EXPANDED_LIMIT = 5;
-
-/** Compute the source-quote context for a selected text range. The
- * daemon's schema requires `exact` non-empty; `prefix` / `suffix` may
- * be empty at start/end of a block. We take a small window (32 chars)
- * so the ADR-0006 re-anchoring pipeline has something to fuzzy-match
- * against later. */
-function quoteFromBlock(block: Element, selected: string): {
-  readonly exact: string;
-  readonly prefix: string;
-  readonly suffix: string;
-} {
-  const full = block.textContent ?? "";
-  const idx = full.indexOf(selected);
-  if (idx < 0) return { exact: selected, prefix: "", suffix: "" };
-  const prefix = full.slice(Math.max(0, idx - 32), idx);
-  const suffix = full.slice(idx + selected.length, idx + selected.length + 32);
-  return { exact: selected, prefix, suffix };
-}
 
 /** Find the nearest ancestor of `node` that carries a `data-src` attr.
  * The rail anchors on that ancestor's stamp, so a selection inside a
@@ -990,12 +974,12 @@ function Rail(): JSX.Element {
     setPresence(next);
   };
   // The composer builds a fresh line anchor from the reviewer's
-  // selection; nothing in this path is ever unanchored. Type as
-  // `RailLineAnchor` so `.startLine` / `.endLine` type-check
-  // without narrowing.
+  // selection; nothing on this path is ever unanchored. Typed as
+  // `RailNewThreadAnchor` because that is what a NEW comment posts —
+  // coordinates only, no quote (issue #113).
   const [composerAnchor, setComposerAnchor] = createSignal<{
     readonly element: HTMLElement;
-    readonly anchor: RailLineAnchor;
+    readonly anchor: RailNewThreadAnchor;
     readonly quote: string;
   } | undefined>(undefined);
   const [error, setError] = createSignal<string | undefined>(undefined);
@@ -1271,7 +1255,7 @@ function Rail(): JSX.Element {
   // range in the DOM — nothing on this path is ever unanchored.
   const [selection, setSelection] = createSignal<{
     readonly block: HTMLElement;
-    readonly anchor: RailLineAnchor;
+    readonly anchor: RailNewThreadAnchor;
     readonly quote: string;
     readonly rect: { readonly top: number; readonly left: number; readonly width: number; readonly height: number };
   } | undefined>(undefined);
@@ -1309,20 +1293,22 @@ function Rail(): JSX.Element {
       setSelection(undefined);
       return;
     }
-    const quoteParts = quoteFromBlock(block, text);
     const range = sel.getRangeAt(0);
     const box = range.getBoundingClientRect();
     setSelection({
       block,
+      // Only the block's SOURCE coordinates. No `quote`: the rendered
+      // text is not the source (issue #113), and the daemon derives
+      // the quote from the file.
       anchor: {
         path: parsed.path,
         startLine: parsed.startLine,
         endLine: parsed.endLine,
-        quote: quoteParts,
-        // The rail computes a revision from the block's rendered
-        // text, which is the closest surrogate for the rendered
-        // fragment available client-side. Server re-validates the
-        // shape (64-hex lower); a mismatch is not a security issue.
+        // The rail has no honest revision: it cannot hash the source
+        // it has never read. The daemon overrides this with
+        // `revisionOf(source)`, as it already did for every client
+        // (PR #38). A shape-valid placeholder keeps the request
+        // schema happy without claiming anything.
         revision: "0".repeat(64),
       },
       quote: text,
@@ -1338,11 +1324,18 @@ function Rail(): JSX.Element {
     document.removeEventListener("selectionchange", readSelection);
   });
 
-  const openComposer = async (candidate: NonNullable<ReturnType<typeof selection>>): Promise<void> => {
-    const revision = await revisionHex(candidate.block.textContent ?? "");
+  // Synchronous since issue #113: the composer used to await
+  // `revisionHex(block.textContent)` — a hash of the RENDERED text, as
+  // a "closest surrogate for the rendered fragment available
+  // client-side". The daemon has always overridden the revision with
+  // `revisionOf(source)` (PR #38), so the hash was inert, and it hashed
+  // the one string the rail must not treat as the source. The anchor
+  // carries a shape-valid placeholder and the daemon supplies the real
+  // revision and the real quote.
+  const openComposer = (candidate: NonNullable<ReturnType<typeof selection>>): void => {
     setComposerAnchor({
       element: candidate.block,
-      anchor: { ...candidate.anchor, revision },
+      anchor: candidate.anchor,
       quote: candidate.quote,
     });
     setSelection(undefined);
@@ -1361,7 +1354,7 @@ function Rail(): JSX.Element {
     const pending = selection();
     if (pending === undefined) return;
     event.preventDefault();
-    void openComposer(pending);
+    openComposer(pending);
   };
   document.addEventListener("keydown", onKeyDown);
   onCleanup(() => document.removeEventListener("keydown", onKeyDown));
@@ -1390,7 +1383,23 @@ function Rail(): JSX.Element {
     if (composed === undefined) return;
     setError(undefined);
     try {
-      await createThread({ anchor: composed.anchor, body: bodyText });
+      // `selectionHint` is the RENDERED selection — the string the
+      // browser reported, which is NOT the source (ADR-0006
+      // amendment, issue #113: this repo's pipeline runs
+      // `remark-smartypants`, so `“hi”` stands where the source says
+      // `"hi"`, and an inline-code span has lost its backticks). It
+      // rides along as a hint about WHICH source span to quote; the
+      // daemon matches it against the file and stores the source
+      // bytes it lands on. A hint it cannot resolve widens the quote
+      // to the whole line range.
+      //
+      // `quoteFromBlock`, which used to cut `anchor.quote` out of
+      // `block.textContent` right here, is gone with the defect.
+      await createThread({
+        anchor: composed.anchor,
+        selectionHint: composed.quote,
+        body: bodyText,
+      });
       setComposerAnchor(undefined);
       await refetch();
     } catch (cause) {
@@ -1482,7 +1491,7 @@ function Rail(): JSX.Element {
                 // sees `undefined` because the click collapsed the
                 // range.
                 event.preventDefault();
-                void openComposer(sel);
+                openComposer(sel);
               }}
               aria-label={`Comment on "${sel.quote.slice(0, 40)}" — shortcut: c`}
             >Comment</button>
@@ -1970,7 +1979,7 @@ function Rail(): JSX.Element {
             type="button"
             class="revkit-rail__new"
             data-testid="revkit-rail-new"
-            onClick={() => void openComposer(selection()!)}
+            onClick={() => openComposer(selection()!)}
           >comment on selection</button>
         </div>
       </Show>

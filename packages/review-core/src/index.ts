@@ -10,6 +10,7 @@
 
 export {
   anchorPathSchema,
+  anchorRequestSchema,
   anchorSchema,
   anyAnchorSchema,
   isLineAnchor,
@@ -17,6 +18,7 @@ export {
   textQuoteSchema,
   unanchoredAnchorSchema,
   type Anchor,
+  type AnchorRequest,
   type AnyAnchor,
   type TextQuote,
   type UnanchoredAnchor,
@@ -80,12 +82,24 @@ export {
   type HunkLineKind,
 } from "./patch.ts";
 export {
+  buildQuoteForComment,
   buildQuoteFromLines,
   buildQuoteFromOffsets,
   DEFAULT_QUOTE_CONTEXT_CHARS,
   lineStartsOf,
   type BuildQuoteOptions,
 } from "./quote.ts";
+export {
+  findFolded,
+  foldPair,
+  foldSource,
+  foldedEquals,
+  foldedHasHitFrom,
+  foldedOffsetFromSource,
+  foldTypography,
+  sourceOffsetInFoldedMatch,
+  type FoldedSource,
+} from "./typography.ts";
 export { redactTokenInMessage, type TokenSource } from "./token-source.ts";
 export { ID_REGEX, idSchema, isValidId } from "./id.ts";
 export { isValidRepoRelativePath } from "./path.ts";

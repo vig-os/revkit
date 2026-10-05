@@ -21,7 +21,8 @@
 //                        modified is mixed EQUAL and DELETE,
 //                        deleted is entirely in DELETE segments.
 //   (4a) unchanged   — map through `diff_xIndex`, verify the new text
-//                      equals the exact quote, and return
+//                      equals the exact quote THROUGH the typography
+//                      fold (`foldedEquals`), and return
 //                      `quote-exact`. No search.
 //   (4b) modified    — search ONLY inside a local hunk window
 //                      (enclosing changed segments plus a small slack,
@@ -42,6 +43,9 @@
 //                      stops at the second hit. Exactly one match →
 //                      `quote-exact` (moved); zero or several →
 //                      orphan. Never a fuzzy or quote-alone fallback.
+//                      The search folds first, so a moved block whose
+//                      stored quote came from the rendered DOM is found
+//                      at its source offsets.
 //
 // Coherent-anchor guarantee: every non-orphaned result carries the
 // NEW text at the matched location as `quote.exact`, `prefix`/`suffix`
@@ -54,6 +58,18 @@
 // precomputed index. Fixture perf tests pin < 200 ms on the 20 k
 // `- item` list and the pathological 200 k `a` case.
 //
+// Typographic fold (ADR-0006 amendment, issue #113): every
+// comparison of a RECORDED quote against SOURCE text goes through
+// `foldedEquals` (`src/typography.ts`), and every SEARCH folds both
+// the haystack and the needle first, mapping the hit back to a
+// source offset through `FoldedSource.starts`. The fold is what makes
+// a quote stored from the RENDERED DOM — which is what the rail
+// captured before the daemon took quote provenance, and which
+// `remark-smartypants` guarantees differs from the source on ~43 % of
+// this repo's blocks — re-anchor instead of orphaning on the first
+// edit. A source quote folds to itself, so the common case is still a
+// byte-for-byte comparison.
+//
 // Runtime-neutral: no `node:*` / `bun:*` imports; the only dependency
 // beyond the workspace is `diff-match-patch` (pure JS, browser-safe),
 // wrapped in a narrow typed shim (`src/vendor/dmp.ts`) so no ambient
@@ -62,6 +78,16 @@ import { anchorSchema, type Anchor, type TextQuote } from "./anchor.ts";
 import { authorSchema, type Author } from "./author.ts";
 import { type ReviewEventInput } from "./events.ts";
 import { revisionOf } from "./revision.ts";
+import {
+  findFolded,
+  foldPair,
+  foldedEquals,
+  foldedHasHitFrom,
+  foldTypography,
+  foldedOffsetFromSource,
+  sourceOffsetInFoldedMatch,
+  type FoldedSource,
+} from "./typography.ts";
 import { DiffMatchPatch, type Diff } from "./vendor/dmp.ts";
 
 /** How the re-anchor arrived at the returned anchor. `unchanged` is
@@ -173,6 +199,13 @@ export interface ReanchorContext {
   readonly diffs: readonly Diff[];
   readonly oldLineIndex: readonly number[];
   readonly newLineIndex: readonly number[];
+  /** Typographic fold of `oldLF` / `newLF` with the offset maps back
+   * to source coordinates (ADR-0006 amendment, issue #113). Computed
+   * ONCE here, alongside the diff, for the same reason the diff is:
+   * it is per-file-pair shared work, and every anchor on the file
+   * needs it. See `foldPair` in `typography.ts` for the measurement
+   * that put it here rather than in a per-anchor call. */
+  readonly folded: { readonly old: FoldedSource; readonly new: FoldedSource };
 }
 
 // ---------- Line-offset index (perf) ----------
@@ -415,8 +448,14 @@ function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
 /**
  * Try to detect a MOVE for a fully-deleted or heavily-modified
  * anchor: find `prefix + exact + suffix` verbatim in the new source.
- * Returns the new offset (start of `exact`) or `null` on zero,
- * ambiguous, or insufficient-context cases.
+ * Returns the new SOURCE offsets `[start, end)` of the quote's
+ * `exact`, or `null` on zero, ambiguous, or insufficient-context
+ * cases. A refusal carries `start: -1, end: -1`. The `end` is
+ * returned alongside the `start` so a caller cuts the source text this
+ * anchor now covers rather than re-deriving a length from
+ * `quote.exact` — which is rendered text for any quote the rail
+ * captured before the daemon took quote provenance, and whose length
+ * is then not the length of the source span it maps to.
  *
  * Requires the pattern to be unique in BOTH the new AND the old
  * source. Round-3 review blocker: without the OLD-side uniqueness
@@ -432,40 +471,73 @@ function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
  *
  * Uses linear `indexOf` loops that stop at the second hit — no
  * O(n·m) scan on either side.
+ *
+ * **The search is folded (ADR-0006 amendment, issue #113).** Both
+ * sides go through `foldSource` first, so a `prefix + exact + suffix`
+ * captured from the RENDERED DOM still finds its counterpart in the
+ * source. A verbatim-only search could not: `“hi”` is not a substring
+ * of `"hi"`, so every move detection on such a quote failed and the
+ * thread orphaned even when the block had merely shifted. The returned
+ * offsets are SOURCE offsets (mapped back through
+ * `FoldedSource.starts`), and the caller slices the source text at
+ * them, so a re-anchored quote is source text from then on.
  */
 export function tryMove(
   oldSource: string,
   newSource: string,
   quote: TextQuote,
   minContext: number = DEFAULT_MIN_MOVE_CONTEXT,
-): { start: number; reason?: string } | null {
+  folded: { readonly old: FoldedSource; readonly new: FoldedSource } = foldPair(oldSource, newSource),
+): { start: number; end: number; reason?: string } | null {
   if (!sufficientContext(quote, minContext)) {
-    return { start: -1, reason: "insufficient context for move detection" };
+    return { start: -1, end: -1, reason: "insufficient context for move detection" };
   }
   const pattern = quote.prefix + quote.exact + quote.suffix;
-  if (pattern.length === 0) return { start: -1, reason: "empty context pattern" };
+  if (pattern.length === 0) return { start: -1, end: -1, reason: "empty context pattern" };
+  const foldedPattern = foldTypography(pattern);
+  if (foldedPattern.length === 0) return { start: -1, end: -1, reason: "empty context pattern" };
+  // Where `exact` starts and ends inside the pattern, in folded
+  // coordinates (see the header note on why the source lengths of the
+  // prefix and the exact cannot be used here).
+  const exactAt = foldTypography(quote.prefix).length;
+  const exactEndAt = exactAt + foldTypography(quote.exact).length;
   // OLD-side uniqueness. If the pattern appeared twice in the old
   // snapshot, the anchor is on ONE of the copies — deletion of one
   // and preservation of the other in `newSource` looks like a
   // unique move, but the "correct" destination is undefined.
-  const oldFirst = oldSource.indexOf(pattern);
-  if (oldFirst < 0) {
-    return { start: -1, reason: "prefix+exact+suffix not found in the old snapshot" };
+  const oldFirst = findFolded(folded.old, foldedPattern);
+  if (oldFirst === null) {
+    return { start: -1, end: -1, reason: "prefix+exact+suffix not found in the old snapshot" };
   }
-  const oldSecond = oldSource.indexOf(pattern, oldFirst + 1);
-  if (oldSecond >= 0) {
+  // A second occurrence, searched from just past the first hit in
+  // FOLDED coordinates. The fold never reorders characters, so a
+  // later hit in folded space is a later hit in source space too —
+  // but the index to continue from is a folded one, so the two
+  // coordinate systems are not mixed here.
+  if (foldedHasHitFrom(folded.old, foldedPattern, oldFirst.foldedAt + foldedPattern.length)) {
     return {
       start: -1,
+      end: -1,
       reason: "ambiguous move (prefix+exact+suffix was not unique in the old snapshot)",
     };
   }
-  const first = newSource.indexOf(pattern);
-  if (first < 0) return null;
-  const second = newSource.indexOf(pattern, first + 1);
-  if (second >= 0) {
-    return { start: -1, reason: "ambiguous move (multiple exact-context matches in new)" };
+  const first = findFolded(folded.new, foldedPattern);
+  if (first === null) return null;
+  if (foldedHasHitFrom(folded.new, foldedPattern, first.foldedAt + foldedPattern.length)) {
+    return { start: -1, end: -1, reason: "ambiguous move (multiple exact-context matches in new)" };
   }
-  return { start: first + quote.prefix.length };
+  // The pattern matched as one unit, so the `exact` span inside it
+  // sits between the FOLDED lengths of `prefix` and
+  // `prefix + exact` — not their source lengths, which differ
+  // wherever either holds a backtick or an em dash. Resolving both
+  // boundaries through the map keeps the returned offsets in source
+  // coordinates for every caller, and returns the `end` so a caller
+  // can cut the source text this anchor now covers rather than
+  // re-deriving a length from a possibly-rendered quote.
+  return {
+    start: sourceOffsetInFoldedMatch(folded.new, first.foldedAt, exactAt),
+    end: sourceOffsetInFoldedMatch(folded.new, first.foldedAt, exactEndAt),
+  };
 }
 
 /** Whether `quote` carries enough context on both sides to allow a
@@ -502,6 +574,49 @@ function similarity(a: string, b: string): number {
   const distance = dmp.diff_levenshtein(diffs);
   const denom = Math.max(a.length, b.length);
   return denom === 0 ? 1 : 1 - distance / denom;
+}
+
+// ---------- Orphan-reason classification (unchanged path) ----------
+
+/**
+ * The orphan reason for the UNCHANGED path that found no move. The
+ * diff said the span survived unchanged, the mapped slice did not
+ * satisfy 4a, and `tryMove` declined — so one of two things is true
+ * and the reason must say WHICH, because they are different failures
+ * with different fixes.
+ *
+ * - The mapped text matches the quote through the fold but the
+ *   BOUNDARY class differs: a genuine substring accident (E3). The old
+ *   quote's edges sat at line boundaries, the new location's sit
+ *   mid-sentence. Naming this precisely is the point — issue #113
+ *   recorded a reason that said "substring accident" on a case where
+ *   nothing was a substring accident, which sent the reader looking
+ *   for a collision that did not exist.
+ * - The mapped text does not match the quote even folded: the diff
+ *   aligned a span it should not have (the source at that offset
+ *   carries different words), and `tryMove` could not find the block
+ *   with intact context anywhere. That is a real content difference
+ *   the diff mis-classified as unchanged, not an accident of
+ *   embedding.
+ *
+ * `moveResult` is threaded in so the second case can still surface
+ * WHY the move was refused — an ambiguity or an insufficient-context
+ * refusal is information the reader needs and would otherwise lose.
+ */
+function unchangedSpanOrphanReason(
+  mapped: string,
+  exact: string,
+  moveResult: { start: number; reason?: string } | null,
+): string {
+  if (foldedEquals(mapped, exact)) {
+    return "diff reports unchanged and the quote still matches, but the block's surroundings differ (substring accident) and no move detected.";
+  }
+  const moveDetail = moveResult === null ? "no move detected" : `move detection: ${moveResult.reason ?? "no unique match"}`;
+  return (
+    "diff reports unchanged, but the text at the mapped position differs from the quote " +
+    "beyond typographic folding (the diff aligned a span whose content had changed) " +
+    `and ${moveDetail}.`
+  );
 }
 
 // ---------- Boundary-class check (unchanged path) ----------
@@ -552,38 +667,82 @@ function sameBoundaryClass(a: number, b: number): boolean {
  * to the recorded line-start offset and searches nearby. Returns
  * `null` when the anchor cannot be located at all (a snapshot bug
  * the caller should refuse). */
-function locateOldSpan(oldLF: string, anchor: Anchor, oldLineIndex: readonly number[]): { start: number; end: number } | null {
+function locateOldSpan(
+  oldLF: string,
+  anchor: Anchor,
+  oldLineIndex: readonly number[],
+  foldedOld: FoldedSource,
+): { start: number; end: number } | null {
   const pattern = anchor.quote.prefix + anchor.quote.exact + anchor.quote.suffix;
   const expectedStart = lineToOffset(oldLineIndex, anchor.startLine);
+  // Where `exact` starts and ends INSIDE the pattern, in folded
+  // coordinates. Both are needed because the recorded quote may be
+  // rendered text, whose length differs from the source span it maps
+  // to: adding `quote.exact.length` to a source offset would cut the
+  // span short by exactly the punctuation the renderer rewrote.
+  const exactAt = foldTypography(anchor.quote.prefix).length;
+  const exactEndAt = exactAt + foldTypography(anchor.quote.exact).length;
   if (pattern.length > 0) {
-    const first = oldLF.indexOf(pattern);
-    if (first >= 0) {
-      const second = oldLF.indexOf(pattern, first + 1);
-      if (second < 0) {
-        return { start: first + anchor.quote.prefix.length, end: first + anchor.quote.prefix.length + anchor.quote.exact.length };
-      }
-      // Multiple matches — pick the one nearest the recorded line
-      // offset (deterministic by construction).
-      let best = first;
-      let bestDist = Math.abs(first - expectedStart);
-      let searchFrom = second;
-      while (searchFrom >= 0) {
-        const dist = Math.abs(searchFrom - expectedStart);
-        if (dist < bestDist) {
-          bestDist = dist;
-          best = searchFrom;
+    // Folded search (ADR-0006 amendment, issue #113). A quote the
+    // rail captured from the RENDERED DOM holds `“ ”` where the
+    // source holds `"`, so a verbatim `indexOf` found nothing and the
+    // span locator gave up with "old anchor span not found in
+    // snapshot (malformed anchor)" — the first place the defect
+    // surfaced, before the diff was ever consulted. Folding both
+    // sides finds the span; the offsets are mapped back to source
+    // coordinates, so `classifySpan` and `diff_xIndex` keep working in
+    // the coordinate system they are defined in.
+    const foldedPattern = foldTypography(pattern);
+    if (foldedPattern.length > 0) {
+      /** The `exact` span inside a hit at folded offset `foldedAt`. */
+      const exactSpanAt = (foldedAt: number): { start: number; end: number } => ({
+        start: sourceOffsetInFoldedMatch(foldedOld, foldedAt, exactAt),
+        end: sourceOffsetInFoldedMatch(foldedOld, foldedAt, exactEndAt),
+      });
+      const first = findFolded(foldedOld, foldedPattern);
+      if (first !== null) {
+        if (!foldedHasHitFrom(foldedOld, foldedPattern, first.foldedAt + foldedPattern.length)) {
+          return exactSpanAt(first.foldedAt);
         }
-        searchFrom = oldLF.indexOf(pattern, searchFrom + 1);
+        // Multiple matches — pick the one nearest the recorded line
+        // offset (deterministic by construction). Enumerated in
+        // FOLDED space and scored by SOURCE offset, so the
+        // "nearest the recorded line" rule is the same one the
+        // verbatim search applied.
+        let best = first.foldedAt;
+        let bestDist = Math.abs(first.start - expectedStart);
+        let searchFrom = first.foldedAt + 1;
+        for (;;) {
+          const later = foldedOld.text.indexOf(foldedPattern, searchFrom);
+          if (later < 0) break;
+          const at = foldedOld.starts[later] ?? 0;
+          const dist = Math.abs(at - expectedStart);
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = later;
+          }
+          searchFrom = later + 1;
+        }
+        return exactSpanAt(best);
       }
-      return { start: best + anchor.quote.prefix.length, end: best + anchor.quote.prefix.length + anchor.quote.exact.length };
     }
   }
   // No context or context not found — look for the exact alone at
-  // the recorded line.
+  // the recorded line, folded for the same reason. The ±200-char
+  // window around the recorded line offset is preserved from the
+  // verbatim search, expressed through `foldedOffsetFromSource` so
+  // the window stays anchored to the recorded LINE rather than to a
+  // folded index.
   if (anchor.quote.exact.length === 0) return null;
-  const idx = oldLF.indexOf(anchor.quote.exact, Math.max(0, expectedStart - 200));
-  if (idx < 0) return null;
-  return { start: idx, end: idx + anchor.quote.exact.length };
+  const foldedExact = foldTypography(anchor.quote.exact);
+  if (foldedExact.length === 0) return null;
+  const windowStart = Math.max(0, expectedStart - 200);
+  const at = foldedOld.text.indexOf(foldedExact, foldedOffsetFromSource(foldedOld, windowStart));
+  if (at < 0) return null;
+  return {
+    start: sourceOffsetInFoldedMatch(foldedOld, at, 0),
+    end: sourceOffsetInFoldedMatch(foldedOld, at, foldedExact.length),
+  };
 }
 
 // ---------- The composed pipeline ----------
@@ -627,6 +786,14 @@ export async function prepareReanchor(
   const newLineIndex = Object.freeze(buildLineStartIndex(newLF));
   for (const diff of diffs) Object.freeze(diff);
   Object.freeze(diffs);
+  // The typographic fold (issue #113) is the same kind of shared,
+  // per-file-pair work as the diff: computed once here, read by every
+  // anchor on the file. `FoldedSource.starts` is a typed array, which
+  // cannot be frozen (a frozen typed array with elements throws), so
+  // the pair is frozen at the object level and the arrays are treated
+  // as read-only by the pipeline — the same contract the diff tuples
+  // have, minus the runtime assertion the freeze would give.
+  const folded = foldPair(oldLF, newLF);
   return Object.freeze({
     oldLF,
     newLF,
@@ -635,6 +802,7 @@ export async function prepareReanchor(
     diffs,
     oldLineIndex,
     newLineIndex,
+    folded,
   });
 }
 
@@ -643,7 +811,7 @@ export async function prepareReanchor(
  * O(anchor.quote.length) or O(diff-length), no O(oldLF) work.
  */
 export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promise<ReanchorResult> {
-  const { oldLF, newLF, oldRevision, newRevision, diffs, oldLineIndex, newLineIndex } = ctx;
+  const { oldLF, newLF, oldRevision, newRevision, diffs, oldLineIndex, newLineIndex, folded } = ctx;
 
   // (0) Identity.
   if (anchor.revision === newRevision) {
@@ -659,12 +827,13 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     };
   }
 
-  const oldSpan = locateOldSpan(oldLF, anchor, oldLineIndex);
+  const oldSpan = locateOldSpan(oldLF, anchor, oldLineIndex, folded.old);
   if (oldSpan === null) {
     return {
       kind: "orphaned",
       revision: newRevision,
-      reason: "old anchor span not found in snapshot (malformed anchor).",
+      reason:
+        "old anchor span not found in snapshot (the recorded quote matches no text in the snapshot, verbatim or after typographic folding).",
     };
   }
 
@@ -685,31 +854,27 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     const newStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
     const newEnd = dmp.diff_xIndex(diffs as Diff[], oldSpan.end - 1) + 1;
     const mapped = newLF.slice(newStart, newEnd);
+    // The quote comparison folds typography (issue #113). `mapped` is
+    // always NEW-SOURCE text, so the rebuilt anchor below is cut from
+    // the source even when the recorded quote was rendered text.
     if (
-      mapped === anchor.quote.exact &&
+      foldedEquals(mapped, anchor.quote.exact) &&
       boundariesMatch(oldLF, oldSpan.start, oldSpan.end, newLF, newStart, newEnd)
     ) {
-      const rebuilt = await buildAnchor(
-        anchor,
-        newLF,
-        newLineIndex,
-        newStart,
-        anchor.quote.exact,
-        newRevision,
-      );
+      const rebuilt = await buildAnchor(anchor, newLF, newLineIndex, newStart, mapped, newRevision);
       return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
     }
-    // Boundary mismatch or exact slice mismatch: fall through to
+    // Boundary mismatch or quote mismatch: fall through to
     // move detection. If the block truly moved to a new position
     // with intact context, tryMove will find it; otherwise orphan.
-    const moveResult = tryMove(oldLF, newLF, anchor.quote);
+    const moveResult = tryMove(oldLF, newLF, anchor.quote, DEFAULT_MIN_MOVE_CONTEXT, folded);
     if (moveResult !== null && moveResult.start >= 0) {
       const rebuilt = await buildAnchor(
         anchor,
         newLF,
         newLineIndex,
         moveResult.start,
-        anchor.quote.exact,
+        newLF.slice(moveResult.start, moveResult.end),
         newRevision,
       );
       return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
@@ -717,8 +882,7 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     return {
       kind: "orphaned",
       revision: newRevision,
-      reason:
-        "diff reports unchanged, but the block's surroundings differ (substring accident) and no move detected.",
+      reason: unchangedSpanOrphanReason(mapped, anchor.quote.exact, moveResult),
     };
   }
 
@@ -733,14 +897,14 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     spanLen > 0 &&
     cls.equalChars / spanLen < DEFAULT_MIN_MODIFIED_EQUAL_FRACTION
   ) {
-    const moveResult = tryMove(oldLF, newLF, anchor.quote);
+    const moveResult = tryMove(oldLF, newLF, anchor.quote, DEFAULT_MIN_MOVE_CONTEXT, folded);
     if (moveResult !== null && moveResult.start >= 0) {
       const rebuilt = await buildAnchor(
         anchor,
         newLF,
         newLineIndex,
         moveResult.start,
-        anchor.quote.exact,
+        newLF.slice(moveResult.start, moveResult.end),
         newRevision,
       );
       return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
@@ -757,14 +921,14 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
 
   // (4c) Deleted — try move detection. NO fuzzy fallback.
   if (cls.kind === "deleted") {
-    const moveResult = tryMove(oldLF, newLF, anchor.quote);
+    const moveResult = tryMove(oldLF, newLF, anchor.quote, DEFAULT_MIN_MOVE_CONTEXT, folded);
     if (moveResult !== null && moveResult.start >= 0) {
       const rebuilt = await buildAnchor(
         anchor,
         newLF,
         newLineIndex,
         moveResult.start,
-        anchor.quote.exact,
+        newLF.slice(moveResult.start, moveResult.end),
         newRevision,
       );
       return { kind: "moved", anchor: rebuilt, method: "quote-exact" };
@@ -791,10 +955,20 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
   const hunkWindow = findHunkWindow(diffs, oldSpan.start, oldSpan.end, newLF.length);
   const mappedStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
   const clampedStart = Math.max(hunkWindow.start, Math.min(hunkWindow.end, mappedStart));
+  // Alignment runs on the RAW quote: `alignMatchedText` returns SOURCE
+  // offsets, so its target must be source-shaped text. For a quote
+  // stored from the rendered DOM the recorded text is the rendered
+  // form, which is within a character or two of the source at this
+  // position — the walker is a diff, so it absorbs that, and the
+  // similarity gate below is folded so the residual punctuation
+  // difference is not scored as an edit.
   const aligned = alignMatchedText(anchor.quote.exact, newLF, clampedStart, {
     trailingContext: anchor.quote.suffix,
   });
-  const score = similarity(anchor.quote.exact, aligned.matchedText);
+  // Folded on BOTH sides (issue #113), so a quote whose only
+  // difference from the source is typographic punctuation is not
+  // charged for it in the modified path either.
+  const score = similarity(foldTypography(anchor.quote.exact), foldTypography(aligned.matchedText));
   if (score < DEFAULT_MIN_QUOTE_SCORE) {
     return {
       kind: "orphaned",

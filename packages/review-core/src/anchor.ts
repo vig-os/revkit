@@ -45,34 +45,80 @@ export const anchorPathSchema = z
       "no control chars, no `:`/`*`/`?`/`<`/`>`/`|`/`\"`, no leading `/`, no backslash.",
   });
 
+/** The fields of an anchor, as one object so two schemas can share them.
+ * `quote` is spelled per-schema below; everything else is identical, and
+ * a change to an anchor field must change both. */
+const anchorFields = {
+  path: anchorPathSchema,
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().positive(),
+  revision: z
+    .string()
+    .regex(SHA256_HEX_REGEX, "revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
+  commit: z
+    .string()
+    .regex(
+      GIT_COMMIT_HEX_REGEX,
+      "commit must be a lowercase git commit id — 40 hex (SHA-1) or 64 hex (SHA-256 repos) — (ADR-0025 M3 head-pinning).",
+    )
+    .optional(),
+};
+
+/** `endLine >= startLine`, shared by both anchor schemas so the message
+ * and the `path` are identical on either. A fresh object per call
+ * because zod types `path` as a mutable array, so a shared frozen
+ * literal does not typecheck against it. */
+const anchorLineOrder = (): { message: string; path: PropertyKey[] } => ({
+  message: "anchor: endLine must be >= startLine (1-indexed, inclusive).",
+  path: ["endLine"],
+});
+
 /** An anchor: file path plus 1-indexed inclusive line range, the text-quote
  * selector for the range, and the revision it was captured on. Refined so
  * `endLine >= startLine`. Line numbers are 1-based (matching editors and
  * `data-src="<file>#L<n>-L<m>"`). */
 export const anchorSchema = z
   .object({
-    path: anchorPathSchema,
-    startLine: z.number().int().positive(),
-    endLine: z.number().int().positive(),
+    ...anchorFields,
     quote: textQuoteSchema,
-    revision: z
-      .string()
-      .regex(SHA256_HEX_REGEX, "revision must be a lowercase 64-char SHA-256 hex string (see revisionOf)."),
-    commit: z
-      .string()
-      .regex(
-        GIT_COMMIT_HEX_REGEX,
-        "commit must be a lowercase git commit id — 40 hex (SHA-1) or 64 hex (SHA-256 repos) — (ADR-0025 M3 head-pinning).",
-      )
-      .optional(),
   })
   .strict()
-  .refine((a) => a.endLine >= a.startLine, {
-    message: "anchor: endLine must be >= startLine (1-indexed, inclusive).",
-    path: ["endLine"],
-  });
+  .refine((a) => a.endLine >= a.startLine, anchorLineOrder());
 
 export type Anchor = z.infer<typeof anchorSchema>;
+
+/**
+ * `anchorSchema` with `quote` OPTIONAL — the shape a comment-CREATE
+ * request may carry (ADR-0006 amendment, issue #113).
+ *
+ * A stored anchor always has a quote: the re-anchoring engine reads it,
+ * and `anchorSchema` is what every event and thread is validated
+ * against. A comment being CREATED is different — the client has no
+ * honest quote to send, because the rail reads RENDERED text and this
+ * repo's markdown pipeline runs `remark-smartypants`, so the rendered
+ * text differs from the source on ~43 % of blocks and such a quote
+ * orphaned on the first edit. The daemon derives the quote from the
+ * source it reads for the anchor's revision, so the request does not
+ * need one.
+ *
+ * `quote` stays ACCEPTED here rather than removed: an already-deployed
+ * rail bundle still posts one, and the wire is backwards-compatible in
+ * both directions. The daemon ignores its contents.
+ *
+ * Composed from the same `anchorFields` and the same line-order
+ * refinement as `anchorSchema` rather than by `.safeExtend`, which
+ * TypeScript cannot type on a schema carrying a refinement (the
+ * extended key infers as `never`).
+ */
+export const anchorRequestSchema = z
+  .object({
+    ...anchorFields,
+    quote: textQuoteSchema.optional(),
+  })
+  .strict()
+  .refine((a) => a.endLine >= a.startLine, anchorLineOrder());
+
+export type AnchorRequest = z.infer<typeof anchorRequestSchema>;
 
 /** An imported thread whose source content we couldn't fetch (blob
  * deleted / binary / truncated / diffHunk mismatch) is emitted with

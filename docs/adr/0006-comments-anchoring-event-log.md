@@ -6,8 +6,10 @@
 - Stories: A2, A6, A7, A8, B2, B4
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
-  export|import` CLI command; and the 2026-10-05 (issue #73) amendment — an
-  `import` lands only in an empty store, judged against the log the store holds.
+  export|import` CLI command; the 2026-10-05 (issue #73) amendment — an
+  `import` lands only in an empty store, judged against the log the store holds;
+  and the 2026-10-05 (issue #113) amendment — quote provenance (the SOURCE is
+  the authority) and the typography fold the engine compares through.
 
 ## Context
 
@@ -290,3 +292,107 @@ refusal to test). `import` is also a read-then-write, so its commit is guarded
 against a writer that moves the head in between: one guard row inside the same
 `batch()`, gating every archive row, so a stale head writes nothing rather than
 something. Refs: #73, #107, #108
+
+## Amendment (2026-10-05, issue #113): quote provenance, and the typography fold
+
+The Decision above says a comment stores "the source range, a text-quote selector
+and the revision". It did not say **whose** text the selector holds, and the
+implementation let the browser answer: the rail built `anchor.quote` from
+`block.textContent` and the daemon stored it verbatim. That is not the source.
+
+Astro's markdown pipeline runs `remark-smartypants` by default
+(`@astrojs/internal-helpers/dist/markdown.js`: `smartypants: true`) and
+`site/src/lib/markdown-processor.ts` never disables it, so a rendered block's
+text is not its source text: `"` renders `“ ”`, `'` renders `‘ ’`, `--` renders
+`—`, `...` renders `…`, and an inline-code span's rendered value carries no
+backticks. Measured over this repo's own `docs/**`, 3263 of 7533 rendered blocks
+outside code fences (43.3 %) differ from the source at their own offset. Every
+comment created that way held a quote the engine could never match, so it
+orphaned on the first edit of the file — which, for a live doc under a watcher,
+is routine rather than exceptional.
+
+### 1. The SOURCE is the authority for the quote
+
+**`anchor.quote` is a slice of the source file. A client's own quote text is
+never stored.** The daemon already reads the anchored source to compute the
+revision (the PR #38 override); it now reads it to compute the quote too, and
+overrides any client value, for the same reason: a client value that disagrees
+with the file silently breaks the pipeline. `POST /api/threads` takes an
+optional `selectionHint` — the rendered text the reviewer selected — and uses it
+to decide **which source span** to quote, never **what** to quote: the hint is
+matched (folded, below) against the source slice, and the bytes stored are the
+source's. A hint that matches nothing, or matches more than once, widens the
+quote to the whole anchored line range; a wrong span is worse than a wide one.
+
+The wire stays compatible in both directions. `anchor.quote` is **accepted and
+ignored** on create (an already-deployed rail bundle still posts one) and
+**optional** (`anchorRequestSchema`; a stored `Anchor` still requires a quote,
+because the engine reads it). One fallback remains, and it is deliberate: if the
+anchor's line range resolves to no source text at all — the ordinary shape of a
+stale build, since `data-src` stamps come from the BUILT output — the client's
+quote is kept rather than refusing the reviewer's comment with a 400. That
+anchor is an honest dead end that orphans on the first rebuild. Whenever the
+source has text for the range, the derived quote wins.
+
+**This also fixes the inline-code variant for free.** A `<code>` node's
+`position.start.offset` points at the *opening* backtick, so slicing source at
+that offset yields `` `w `` against a rendered `w`, and the short values scored
+below the similarity gate. No offset nudge is introduced anywhere: the producer
+never uses a node offset, and the fold maps a rendered `gh` onto the source span
+that carries it, so the stored span and the comparison are both source text.
+
+### 2. The engine compares through ONE typographic fold
+
+The log is append-only, so the quotes the defect already wrote are still in it.
+They re-anchor instead of orphaning, and they converge: a legacy rendered quote
+that re-anchors is rebuilt with the **new source text**, so the next comparison
+is like-for-like and the comment does not orphan on the rebuild after that.
+
+Every comparison of a recorded quote against source text goes through one shared
+helper (`packages/review-core/src/typography.ts`), applied **symmetrically** —
+both sides folded — and every search folds the haystack and the needle and maps
+the hit back to a source offset through `FoldedSource.starts` / `.ends`. The four
+sites are `locateOldSpan` (the old span, which is where the defect surfaced
+first, as "old anchor span not found in snapshot"), path 4a's
+`mapped === quote.exact`, `tryMove`'s exact-context search, and path 4b's
+similarity gate.
+
+**The table is exactly the substitutions the renderer performs**, measured
+against `createMarkdownProcessor` rather than assumed: `“ ” „ → "`,
+`‘ ’ → '`, `— → --`, `– → -`, `… → ...`, `` ` `` → *deleted*. `---` is
+deliberately absent — the pipeline leaves a three-dash run alone, so folding it
+would invent an equivalence the renderer does not have. The backtick entry
+deletes rather than substitutes because an inline-code span's rendered text node
+carries no delimiter; deleting on both sides is what makes the source `` `gh` ``
+and the rendered `gh` fold to the same string.
+
+**What the equivalence class is, and is not.** It is "text that renders
+identically", which is the right granularity for this purpose: the quote
+identifies *which text a comment is about*, and text that renders the same
+identifies the same thing. It is also one equivalence class narrower than
+byte-equality and no wider than the renderer: a per-character substitution with
+no cross-character context cannot normalise a rewrite away, so a span that
+differs in a WORD is still a different span, still fails path 4a, and still takes
+the modified path's similarity gate (`packages/cli/test/serve/
+quote-provenance.test.ts` proves this through the real pipeline, and
+`packages/review-core/test/typography.test.ts` pins it at the unit level). The
+one consequence a reader should know: a source edit that swaps `--` for a
+literal `—` is *inside* the class and is not reported as a change. The
+reviewer's view is byte-identical either way.
+
+**Smartypants stays on.** Turning it off would also have made the strings equal,
+but it changes rendered output for every document in the repo —
+`packages/cli/test/serve/publish-equivalence.test.ts` pins the smartypants
+behaviour deliberately — so it is a visible product change, out of scope here.
+
+### 3. The orphan reason no longer lies
+
+Path 4a's refusal used one sentence for two different failures: *"diff reports
+unchanged, but the block's surroundings differ (substring accident) and no move
+detected."* Issue #113 recorded that sentence on a case where the text had not
+changed and nothing was a substring accident — the browser had merely reported
+typographic punctuation — which sent the reader hunting for a collision that did
+not exist. The reason now distinguishes them: a boundary-class mismatch is a real
+substring accident and says so; a mapped position whose text differs from the
+quote *beyond* the fold is a diff that aligned a span whose content had changed,
+and says that, carrying `tryMove`'s reason when there was one.

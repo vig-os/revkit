@@ -83,10 +83,21 @@ async function bootDaemon(): Promise<DaemonCtx> {
   // an anchor whose file doesn't exist in the repo (PR #38 review).
   const seedRelPath = "docs/adr/0003-content-model-mdx-typed-data.md";
   mkdirSync(join(root, dirname(seedRelPath)), { recursive: true });
-  // 6 lines so the fixture anchor at line 5 is inside the file.
+  // Line 5 (the blank line after the title counts as line 2) carries
+  // the FIXTURE paragraph, matching the `data-src` stamp the fixture
+  // page renders.
+  //
+  // Line 5 must BE the paragraph the fixture page renders, because
+  // the daemon derives `anchor.quote` from the SOURCE (issue #113) —
+  // it reads the file at `anchor.path:startLine-endLine` and slices
+  // the quote out of it, ignoring the rendered text the browser
+  // reports. A placeholder line here would make the stored quote
+  // `line 5` and the test below would (correctly) fail: the rendered
+  // page and the source it claims to come from must agree, which is
+  // exactly the invariant `data-src` + quote provenance now rests on.
   writeFileSync(
     join(root, seedRelPath),
-    "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    `# Title\n\nline 2\nline 3\n${FIXTURE_PARAGRAPH_TEXT}\nline 6\n`,
     "utf8",
   );
   const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {

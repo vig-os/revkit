@@ -15,10 +15,37 @@
 // Ids are optional so the browser can post without minting them; the
 // daemon uses `randomUUID()` when the client omits them. A client that
 // wants a specific id (test harness, replay) passes one in.
+//
+// `POST /api/threads` additionally accepts an optional
+// `selectionHint` (the reviewer's rendered selection) and treats the
+// anchor's `quote` as optional-and-ignored: both are inputs to
+// deriving the quote from the source, not the quote itself. See
+// `anchorRequestSchema` in review-core for why (ADR-0006
+// amendment, issue #113).
 
 import { z } from "zod";
-import { anchorSchema, askAnswerSchema, askSchema, idSchema, reviewSubmitEventSchema } from "@revkit/review-core";
+import {
+  anchorRequestSchema,
+  askAnswerSchema,
+  askSchema,
+  idSchema,
+  reviewSubmitEventSchema,
+} from "@revkit/review-core";
 import { PUBLISH_ARRAY_SHAPE_MAX } from "./publish.ts";
+
+/**
+ * The reviewer's selected RENDERED text, as the browser reported it.
+ *
+ * This is a HINT about which span of the anchored line range to quote,
+ * never the quote itself: the daemon searches the SOURCE slice for it
+ * (folded, so a rendered `“hi”` finds its source `"hi"`) and stores
+ * the source bytes it lands on. An unmatched or ambiguous hint widens
+ * the quote to the whole line range; neither outcome can turn the
+ * client's text into the stored quote. See `anchorRequestSchema` in
+ * review-core for why the client has no quote to send at all
+ * (ADR-0006 amendment, issue #113).
+ */
+const selectionHintSchema = z.string().min(1);
 
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
@@ -26,7 +53,11 @@ export const createThreadRequestSchema = z
   .object({
     threadId: idSchema.optional(),
     commentId: idSchema.optional(),
-    anchor: anchorSchema,
+    // `anchorRequestSchema`, not `anchorSchema`: a comment-create
+    // request may omit the quote (the daemon derives it from the
+    // source), but may still carry one — an older rail does.
+    anchor: anchorRequestSchema,
+    selectionHint: selectionHintSchema.optional(),
     body: z.string().min(1),
   })
   .strict();

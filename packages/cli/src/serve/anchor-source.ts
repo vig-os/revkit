@@ -3,9 +3,14 @@
 // Two paths call these helpers:
 //
 //   1. `POST /api/threads` in `daemon.ts` — the server-side anchor
-//      authority overrides any client-supplied `revision` with
-//      `revisionOf(source)` and refuses an anchor whose path is not
-//      a file under the repo root (PR #38 review).
+//      authority. It refuses an anchor whose path is not a file under
+//      the repo root (PR #38 review) and overrides any client-supplied
+//      `revision` with `revisionOf(source)`; since issue #113 it also
+//      overrides any client-supplied `quote` with a slice of the source
+//      it returns here (ADR-0006 amendment). It calls
+//      `resolveSourceUnderRoot` rather than `resolveAnchorSource`
+//      because a create request's anchor may omit the quote, and this
+//      module only ever reads `path`.
 //   2. `reanchor-daemon.ts` (M2 item 5b) — the re-anchor service
 //      reads the same source when a rebuild fires so the pipeline
 //      classifies the anchor against the actual file bytes.

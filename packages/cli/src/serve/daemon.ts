@@ -30,6 +30,7 @@ import { z } from "zod";
 import {
   askSchema,
   askStatusSchema,
+  buildQuoteForComment,
   isPendingReviewStale,
   isValidId,
   reduceReviewState,
@@ -66,7 +67,7 @@ import { IngestGapError, openDeliveryAdapter, parseMode, type DeliveryAdapter } 
 import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
 import { openStaticServer } from "./static-server.ts";
-import { resolveAnchorSource } from "./anchor-source.ts";
+import { resolveAnchorSource, resolveSourceUnderRoot } from "./anchor-source.ts";
 import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
 import { contentTypeForExtension } from "./mime.ts";
 import { createAsyncMutex } from "./review-operation-mutex.ts";
@@ -1452,12 +1453,68 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // the actual file bytes at thread creation, so a client
       // value (rail's textContent hash) would fail the pipeline
       // silently. PR #38 review.
-      const anchorResolution = await resolveAnchorSource(parsed.data.anchor, options.repoRoot);
+      // `resolveAnchorSource` needs only the `path`; it is typed on a
+      // full `Anchor` because that is what every stored anchor is.
+      // A create request's anchor may omit the quote (the daemon is
+      // about to derive it), so pass the path explicitly rather than
+      // fabricate a quote the request did not carry.
+      const anchorResolution = await resolveSourceUnderRoot(parsed.data.anchor.path, options.repoRoot);
       if (!anchorResolution.ok) {
         return badRequest([{ code: "custom", path: ["anchor", "path"], message: anchorResolution.reason }]);
       }
+      // Quote provenance (ADR-0006 amendment, issue #113): the quote
+      // is OVERRIDDEN from the source, on the same principle as the
+      // revision above. The rail can only offer RENDERED text, and
+      // this repo's pipeline runs `remark-smartypants`, so a rendered
+      // quote differs from the source on ~43 % of blocks and orphaned
+      // on the first edit. `selectionHint` (the reviewer's rendered
+      // selection) only narrows WHICH source span gets quoted; the
+      // stored bytes always come from the file.
+      const derivedQuote = buildQuoteForComment(
+        anchorResolution.source,
+        parsed.data.anchor.startLine,
+        parsed.data.anchor.endLine,
+        // The reviewer's selection narrows the quote. A client that
+        // sends no `selectionHint` but does send a `quote` (an older
+        // rail bundle, a scripted client) has its `quote.exact` used
+        // as the needle instead, so it keeps the span it asked for —
+        // resolved against the source, not trusted. Either way the
+        // needle only chooses WHICH source span to quote; the stored
+        // bytes are the source's.
+        parsed.data.selectionHint ?? parsed.data.anchor.quote?.exact,
+      );
+      // One fallback, and it is deliberate: an anchor whose line range
+      // resolves to NO source text (the document shrank since the page
+      // was built — `data-src` stamps come from the BUILT output, so a
+      // stale build is the ordinary way to get here) has nothing to
+      // slice. Rather than refuse the reviewer's comment with a 400,
+      // the client's own quote is kept. That keeps the create path
+      // total, and the anchor it produces is an honest dead end: there
+      // is no text at those lines for the re-anchoring engine to match,
+      // so the thread orphans on the first rebuild and the reviewer
+      // sees why. Refusing instead would lose the comment outright.
+      //
+      // The fallback is reachable ONLY on an empty slice: whenever the
+      // source has text for the range, the derived quote wins and the
+      // client's is discarded. That ordering is the provenance rule.
+      const quote =
+        derivedQuote.exact.length > 0 ? derivedQuote : parsed.data.anchor.quote;
+      if (quote === undefined) {
+        // No source text and no client quote: there is nothing to
+        // anchor to, and `anchorSchema` would refuse an empty `exact`
+        // anyway. Say so instead of failing later with `invalid-shape`.
+        return badRequest([
+          {
+            code: "custom",
+            path: ["anchor", "startLine"],
+            message:
+              "anchor.startLine..endLine resolves to no text in the source file and the request carries no quote to fall back on",
+          },
+        ]);
+      }
       const anchorWithServerRevision: Anchor = {
         ...parsed.data.anchor,
+        quote,
         revision: anchorResolution.revision,
       };
       // Snapshot the source under this revision so the re-anchoring
