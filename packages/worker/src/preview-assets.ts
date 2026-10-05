@@ -34,6 +34,21 @@
 //      directory of what this surface can serve is readable without running
 //      anything. ADR-0012's list is the table; nothing here widens it.
 //
+// ── The shape refusals are a SECOND line, not the line that holds ───────────
+//
+// `previewTargetFor` refuses a `..` segment, a doubled slash, an encoded
+// separator, a trailing dot and a key over R2's byte limit. The first three are
+// the same rules `parsePreviewPath` applies, restated here so a caller that got
+// here another way cannot skip them — and they are **unreachable over HTTP**,
+// because the grammar refuses them first. `test/preview.test.ts` says so in a
+// test rather than leaving a reader to work it out.
+//
+// **What holds either way is the PREFIX.** An R2 key is an opaque byte string, so
+// the key this module produces cannot denote anything outside `scopePath`'s
+// prefix no matter what characters it contains, and the gate compared that same
+// prefix against the caller's invite. See the function's own header for what a
+// `serve` decision does and does not claim.
+//
 // ── Why the lookup is a `Map` and not a property read ────────────────────────
 //
 // An extension comes from a REQUEST PATH, so it is attacker-chosen, and
@@ -127,8 +142,8 @@ export const PREVIEW_INDEX_OBJECT = "index.html";
 /** Every reason the preview surface can refuse a path, as one closed list, and
  * `PreviewRefusal` derived from it — so a new reason cannot be produced without
  * being registered, and it cannot reach a response body or a log line from
- * request content. Every member is a property of the PATH's shape, never of a
- * file's existence. */
+ * request content. Every member is a property of the PATH's shape or of the KEY
+ * it would produce, never of a file's existence. */
 export const PREVIEW_REFUSALS = [
   /** The pathname does not sit under the scope path it was classified with.
    * Unreachable over HTTP (`previewScopePath` is a literal prefix of every path
@@ -154,9 +169,48 @@ export const PREVIEW_REFUSALS = [
    * `.wasm`, `.HTML` and every double extension land (`x.html.js`'s extension
    * IS `js`). */
   "extension-not-allowlisted",
+  /** The key this path would produce is over R2's own limit
+   * (`MAX_R2_KEY_BYTES`). **This is a platform limit, not revkit's**, so it
+   * cannot be widened by a table row — and a request-chosen path could reach it,
+   * because the object path is caller-supplied. Refused here, before the key is
+   * handed over, so the answer is the surface's own bodyless 404 rather than the
+   * platform's exception. */
+  "key-too-long",
 ] as const;
 
 export type PreviewRefusal = (typeof PREVIEW_REFUSALS)[number];
+
+/**
+ * R2's limit on an object key, in **UTF-8 bytes**.
+ *
+ * **Measured on the platform rather than quoted, because the direction of the
+ * error matters.** miniflare 4.20260518.0 / workerd 2026-05-18, through
+ * `env.PREVIEWS.get`: a 1024-byte key answers `null` (a miss), and a 1025-byte
+ * key **throws** `get: The specified object name is not valid. (10020)`. So the
+ * limit is inclusive and one byte over it is an exception, not a miss — which is
+ * why this had to be a refusal and not a shrug: an uncaught throw leaves the
+ * handler and the shared error boundary answers `500 internal error` **with a
+ * body and without `Cache-Control`**, which is the exact shape
+ * `test/authorization.test.ts` records a dropped `case` producing once already
+ * (#133).
+ *
+ * **Bytes and not string length, and the honest reason is R2's contract rather
+ * than a clever input.** R2 counts bytes, so this measures bytes. Over HTTP the
+ * two coincide for nearly every request — a WHATWG path parser percent-encodes
+ * every non-ASCII code point, so the pathname this module is handed is ASCII —
+ * and it is worth saying that plainly rather than inventing a scarier story: the
+ * `"600 é is 600 characters and 1200 bytes"` divergence is reachable by a caller
+ * that did not get its string from `new URL`, not by a URL. A check that is
+ * correct only for the one caller that happens to agree is not the check the
+ * platform's contract describes.
+ *
+ * **What IS reachable over HTTP is the encoding itself**: a multibyte name
+ * arrives LONGER than it was written (one `é` is six characters of `%C3%A9`),
+ * so a preview path can cross 1024 bytes without any single segment looking long.
+ * `test/preview.test.ts` computes its multibyte boundary from the encoded
+ * spelling and asserts the key R2 is asked for.
+ */
+export const MAX_R2_KEY_BYTES = 1024;
 
 /** One object to read, and how to type it. Produced only on the serve path. */
 export interface PreviewObjectTarget {
@@ -194,6 +248,35 @@ export type PreviewTargetDecision =
  * **Total, pure, and it reads no object.** That is the whole security argument:
  * a PR-controlled artefact cannot get its own bytes typed as anything, because
  * nothing here has seen the artefact.
+ *
+ * ── WHAT A `serve` DECISION DOES AND DOES NOT MEAN ─────────────────────────
+ *
+ * **`serve` means: this path's extension is allowlisted, and the key it produces
+ * is confined to `scopePath`'s prefix. It does NOT mean "this path is
+ * traversal-free",** and the two are different claims. The checks below reject a
+ * `..` segment, a doubled slash and an encoded separator — the same three rules
+ * `parsePreviewPath` applies — and a path can still reach `serve` while
+ * containing a character that *looks* like one of those things:
+ *
+ *   - `%252e%252e/pr-8/index.html` — a DOUBLE-encoded `%2e`. `ENCODED_SEPARATOR`
+ *     is `/%2e|%2f|%5c/i`, which cannot match inside `%252e`, so the literal six
+ *     characters end up in the key.
+ *   - `x%00.png`, `x;y.html`, `x。html` (an ideographic full stop) — none of these
+ *     is a dot segment, and a full stop that is not `.` is not an extension
+ *     separator either, so they are refused as `no-extension` rather than
+ *     reaching R2 at all.
+ *
+ * **None of it is exploitable, and the reason is worth stating precisely rather
+ * than leaving to a reader's imagination: an R2 key is an OPAQUE byte string.**
+ * A key holding the literal characters `%252e%252e` addresses exactly one
+ * object — the one stored under those characters — and it is still prefixed with
+ * `revkit/pr-7/`, so it cannot reach another review's objects. The confinement
+ * comes from `scopePath`, which is a literal prefix of every path
+ * `parsePreviewPath` accepted, and the scope check runs against that same
+ * `scopePath`. **The defence-in-depth checks are a second line for a caller that
+ * got here another way, not the line that holds** — and the line that holds is
+ * the prefix, which is why the traversal checks below may look "more complete
+ * than they read" and are still not the control.
  */
 export function previewTargetFor(scopePath: string, pathname: string): PreviewTargetDecision {
   const prefix = `${scopePath}/`;
@@ -201,22 +284,52 @@ export function previewTargetFor(scopePath: string, pathname: string): PreviewTa
   const requested = pathname.slice(prefix.length);
   if (requested.includes("//")) return refused("doubled-slash");
   if (ENCODED_SEPARATOR.test(requested)) return refused("encoded-separator");
+  // Whole SEGMENTS, so a literal `\` or a NUL inside a segment is not a dot
+  // segment and does not match here. `docs\index.html` is therefore not refused
+  // by this loop — the URL parser has already folded that backslash into a
+  // separator by the time a pathname arrives, and `..\pr-8\index.html` is a
+  // request for pr-8 that the scope check follows. Both are pinned in
+  // `test/preview.test.ts`.
   for (const segment of requested.split("/")) {
     if (segment === "." || segment === "..") return refused("traversal");
   }
   const objectPath = requested === "" ? PREVIEW_INDEX_OBJECT : requested;
-  // The NAME, not the path: `docs/` and `docs` are both refused here, and a
-  // directory with an extension in an earlier segment (`docs.js/index.html`) is
-  // not — the extension that decides the type is the one on the file.
+  // The NAME, not the path: `docs/` and `docs` are both refused here, while a
+  // directory whose name looks executable (`docs.js/guide.html`) is not — the
+  // extension that decides the type is the one on the FILE.
   const name = objectPath.slice(objectPath.lastIndexOf("/") + 1);
   if (name.endsWith(".")) return refused("trailing-dot");
+  // **`lastIndexOf`, and that is load-bearing in both directions.** `dot === -1`
+  // is "no extension"; `dot === 0` is a name that is nothing but one (`.html`),
+  // which has no name to attach a type to and is refused with the same reason
+  // rather than served as the document it resembles. And because this is the LAST
+  // dot rather than the first, an executable-SHAPED name with an allowed last
+  // extension (`x.js.png`, `x.js.html`, `.index.html`) is **served**, typed by
+  // that last extension under `nosniff`. Swapping this for `indexOf(".")` would
+  // reject all three, which is why `test/preview.test.ts` asserts this direction
+  // as well as the `page.html.js` one: a PR's `.js` renamed to `.js.png` is an
+  // image, and the reverse — an `.html` named `x.js.html` — is a document that
+  // loads no script, because the CSP on it names only `/_revkit/<version>/`.
   const dot = name.lastIndexOf(".");
-  // `dot === -1` is "no extension"; `dot === 0` is a name that is nothing but
-  // one (`.html`), which has no name to attach a type to and is refused with the
-  // same reason rather than served as the document it looks like.
   if (dot <= 0) return refused("no-extension");
   const media = MEDIA_TYPES.get(name.slice(dot + 1));
   if (media === undefined) return refused("extension-not-allowlisted");
+  // LAST, because this one is a property of the KEY rather than of the name: a
+  // path that is both over-long and `.js` is reported as the executable extension
+  // it is, which is the more informative of the two facts, and both answer the
+  // same bodyless 404.
+  //
+  // **The key's byte length is the SUM of the two parts',** which is not a trick
+  // but arithmetic: the key is `scopePath` with its leading slash dropped and one
+  // joining slash put back, and a slash is one UTF-8 byte either way, so the two
+  // cancel. **It was off by one for one commit** — the first cut measured
+  // `` `${scopePath}/${objectPath}` ``, which is the key with a slash it does not
+  // have, and therefore refused a legal 1024-byte key. `test/preview.test.ts`
+  // pins the identity `byteLength(key) === byteLength(scopePath) +
+  // byteLength(objectPath)` against the real key, so the cancellation cannot go
+  // stale.
+  const keyBytes = utf8ByteLength(scopePath) + utf8ByteLength(objectPath);
+  if (keyBytes > MAX_R2_KEY_BYTES) return refused("key-too-long");
   return {
     kind: "serve",
     target: {
@@ -232,8 +345,20 @@ export function previewTargetFor(scopePath: string, pathname: string): PreviewTa
  * treats a backslash as a separator — so all three are a second spelling of a
  * traversal. Matched case-insensitively because the hex digits are, and because
  * `parsePreviewPath` matches them the same way: this is the same rule, not a
- * second one. */
+ * second one. It cannot match inside a DOUBLE-encoded `%252e`, which is what
+ * this function's header says a `serve` decision does not claim. */
 const ENCODED_SEPARATOR = /%2e|%2f|%5c/i;
+
+/** A string's length in UTF-8 BYTES, which is what R2 counts.
+ *
+ * `TextEncoder` is a web-standard global rather than a Node one, so it exists in
+ * workerd with `compatibility_flags: []` — **measured inside the Worker**, not
+ * assumed from the test process, because `wrangler.jsonc` pins the flag list
+ * empty and the whole ADR-0025 discipline is that a missing global should be a
+ * runtime fact rather than a lint's opinion. */
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
 
 function refused(reason: PreviewRefusal): PreviewTargetDecision {
   return { kind: "refused", reason };

@@ -14,7 +14,11 @@
   route is a read route and a repository name has one spelling in a path; and
   the 2026-10-05 (issue #101) amendment last: the **first Decision bullet** —
   "preview paths never serve executable content" — is implemented, tested on
-  responses, and narrower than its own sentence in four recorded places.
+  responses, and narrower than its own sentence in four recorded places. That
+  amendment also records **two accepted residual risks of serving PR HTML on the
+  shared origin** (a meta-refresh navigation, and login CSRF against the
+  form-encoded invite redemption) and the structural answer to both — a separate
+  preview origin, #135.
 
 ## Context
 
@@ -706,14 +710,17 @@ half of that argument rather than the first.
    request that does not end in a slash (`…/pr-7/docs`) is still refused, because
    inventing `docs/index.html` would make "no extension" mean "whatever a build
    happened to emit".
-3. **A refused path, a missing object and a review with nothing built in it are
-   ONE answer: 404, and it carries no body at all.** The clause says "refused"
-   without naming a status, and one indistinguishable answer is the stronger
-   reading: a caller learns that it did not get bytes and nothing about which of
-   the three it was. A body would be the only place on this surface where a
-   caller-supplied name could travel. The hygiene quartet and `Permissions-Policy`
-   are still on the 404 — it is a response a browser renders — and `Cache-Control:
-   no-store` is set on it, which the shared policy does not do for this kind.
+3. **A refused path, a missing object, a review with nothing built in it, and a
+   key over R2's byte limit are ONE answer: 404, and it carries no body at all.**
+   The clause says "refused" without naming a status, and one indistinguishable
+   answer is the stronger reading: a caller learns that it did not get bytes and
+   nothing about which of the four it was. A body would be the only place on this
+   surface where a caller-supplied name could travel. The hygiene quartet and
+   `Permissions-Policy` are still on the 404 — it is a response a browser renders
+   — and `Cache-Control: no-store` is set on it, which the shared policy does not
+   do for this kind. **The fourth case is in that list because leaving it out
+   would have been the bug**: before it, an over-long key escaped as a `500` with a
+   body and no `Cache-Control` (see the platform-limit section below).
 4. **`Cache-Control` is `no-store` on every preview response, and no preview
    response is cacheable.** Not stated above, and it follows from the key: the
    revkit-owned bundle path can be `immutable` because its name is the hash of its
@@ -729,21 +736,92 @@ holding one built site per `<repo>/pr-<n>/`") and not a new convention: the key 
 prefix and the D1 log partition come from ONE string**, and one review's objects
 cannot share a prefix with another's.
 
-**`%2e%2e` normalises onto a different review, and that is measured rather than
-assumed.** A WHATWG path parser decodes `%2e` inside a segment far enough to
-recognise a dot segment, so `/revkit/pr-7/%2e%2e/pr-8/index.html` **is a request
-for pr-8** by the time anything in this Worker sees it. `src/router.ts` previously
-carried a comment claiming workerd does not decode the pathname before the
-grammar runs; that is true of a lone `%2e`, a `%2f` or a `%5c` and **false of a
-whole `%2e%2e` segment**, and the comment is corrected. The behaviour is safe, and
-for a reason worth recording: **the scope travels with the normalised path.**
-`Route.scope` and the R2 key are derived from the same string, so the gate checks
-pr-8, the key is pr-8's, and a guest scoped to pr-7 is refused
-`403 invite-scope-mismatch` on that spelling. It is asserted in both directions.
-Two further spellings — `./index.html`, `docs/./index.html`, `docs\index.html` —
-normalise onto a real path and serve **byte-identical** content under one key,
-which is inert for the same reason and is asserted the way `/_revkit/`'s aliases
-are.
+**A traversal spelling normalises onto a different review, and that is measured
+rather than assumed. It has THREE spellings, and a reader who knows only one of
+them will guess wrong about the others.**
+
+| spelling | normalises onto | one key, byte-identical? |
+|---|---|---|
+| `%2e%2e/pr-8/index.html` | `/revkit/pr-8/index.html` | no — a **different review** |
+| `..\pr-8\index.html` | `/revkit/pr-8/index.html` | no — a **different review** |
+| `./index.html`, `docs/./index.html`, `docs\index.html` | the same path | yes — the same review |
+
+- **The first row.** A WHATWG path parser decodes `%2e` inside a segment far
+  enough to recognise a dot segment, so `/revkit/pr-7/%2e%2e/pr-8/index.html` **is
+  a request for pr-8** by the time anything in this Worker sees it.
+  `src/router.ts` previously carried a comment claiming workerd does not decode
+  the pathname before the grammar runs; that is true of a lone `%2e`, a `%2f` or a
+  `%5c` and **false of a whole `%2e%2e` segment**, and the comment is corrected.
+- **The second row is the same alias by the spelling an attacker reaches for
+  first on Windows**, and it is the one this amendment originally failed to name.
+  A WHATWG path treats `\` as a separator, so `..\pr-8\index.html` resolves
+  exactly as `%2e%2e/pr-8/index.html` does — same review, same key, same answer.
+  It is the **only** alias in this class the "byte-identical" row does not already
+  cover, because `docs\index.html` does not cross a review boundary while
+  `..\pr-8\index.html` does. Both crossing spellings are now asserted in one
+  loop, in both directions, rather than one of them being asserted and the other
+  left to a reader's imagination.
+- **The third row** normalises onto a real path in the SAME review and serves
+  **byte-identical** content under one key, which is inert for the same reason and
+  is asserted the way `/_revkit/`'s aliases are.
+
+**Why crossing a review boundary by a traversal spelling is safe here, and what
+would break it.** The reason is one sentence: **the scope travels with the
+normalised path.** `Route.scope` and the R2 key are derived from the same string,
+so the gate checks pr-8, the key is pr-8's, and a guest scoped to pr-7 is refused
+`403 invite-scope-mismatch` with **no R2 read at all** — asserted for both
+spellings. What would NOT be safe is a scope derived from the spelling and a key
+derived from the normalisation, and no code path here does that.
+
+**And what a `serve` decision does NOT claim.** `previewTargetFor` refuses a `..`
+segment, a doubled slash and an encoded separator — the same three rules
+`parsePreviewPath` applies — and a path can still reach `serve` while containing
+something that looks like one of them: `%252e%252e` is a *double*-encoded `%2e`,
+which the encoded-separator pattern cannot match, so the literal six characters
+end up in the key. **That is inert, and the reason is worth recording rather than
+leaving implied: an R2 key is an OPAQUE byte string.** A key holding the literal
+characters `%252e%252e` addresses exactly the one object stored under those
+characters, and it is still prefixed with the review's scope, so it cannot reach
+another review's objects. **The line that holds is the PREFIX, not the pattern** —
+which is also why the three shape refusals are described in
+`src/preview-assets.ts` as a second line for a caller that arrived another way
+rather than as the control. Measured and asserted: `%252e%252e/pr-8/index.html` is
+a `serve`, its key is `revkit/pr-7/%252e%252e/pr-8/index.html`, and it is a miss
+rather than pr-8's document.
+
+### A platform limit, refused as one of ours: the R2 key's 1024 bytes
+
+**A request-chosen path could reach a platform EXCEPTION, and it did.** The object
+path is caller-supplied, so a preview path long enough to push the key past R2's
+own limit produced `get: The specified object name is not valid. (10020)` — a
+**throw**, not a miss. An uncaught throw leaves the handler, so the shared error
+boundary answered `500 internal error`, **with a body and without the
+`Cache-Control` every other answer on this surface carries**. That is the same
+defect shape `test/authorization.test.ts` records a dropped `case` producing once
+already, and it was new in this slice: before it, preview paths never touched R2,
+so no request-chosen input could reach a platform error here.
+
+**Measured, not quoted, and the limit is INCLUSIVE.** On miniflare 4.20260518.0
+through `env.PREVIEWS.get`: a **1024**-byte key answers `null`, a **1025**-byte key
+throws. `MAX_R2_KEY_BYTES` is that measured boundary and the check is `>` because of
+it, so the largest legal key is served and the first illegal one is refused — both
+asserted, with the counting binding at 1 and at 0 respectively.
+
+**Bytes, not string length, and the honest reason is R2's contract rather than a
+scary input.** Over HTTP the two coincide for nearly every request — a WHATWG path
+parser percent-encodes every non-ASCII code point, so the pathname is ASCII — and
+that is worth stating rather than dressing up. What **is** reachable over HTTP is
+the encoding itself: a name of 200 `é` arrives as 1200 characters of `%C3%A9` and
+its key is 1217 bytes, so a preview path can cross the limit without any segment
+looking long. And a caller that did not get its string from `new URL` can hand this
+module a non-ASCII pathname, where the two lengths genuinely differ; the check
+measures bytes because that is what the platform counts.
+
+**The refusal is this surface's own bodyless 404**, not a status of its own: a
+refused path, an over-long key and a missing object are one answer, so a caller
+cannot tell "too long" from "not there", and the log line carries
+`preview.refused { reason: "key-too-long" }` for the operator who has to tell them
+apart.
 
 ### What this amendment does NOT close
 
@@ -763,7 +841,15 @@ are.
   this is the same missing clause covering one more resource rather than a new
   hole — but "the unscoped kind can now read PR-controlled bytes as well as
   comments" is the honest sentence, and the audit target is still
-  `src/authz.ts`'s one `if (resolved.principal.kind === "invite")`.
+  `src/authz.ts`'s one `if (resolved.principal.kind === "invite")`. **Tracked with
+  a code issue in #134**, which asks for the two things that are genuinely
+  missing — a *code* tracker for this clause (#34 tracks only the owner action),
+  and a deliberate answer on whether a built site and a fork preview are in scope
+  for the eventual repo-access check. **No principal gained a capability it
+  lacked**: the set of principals that could read any review's comment log is
+  exactly the set that can now read any review's built site, over the same
+  per-request gate.
+
 - **`worker-src` is still empty**, so a stored HTML cannot start a Web Worker from
   any path on the origin. A preview document now exists, which is the first time
   that default has had anything to protect.
@@ -772,3 +858,45 @@ are.
   preview route takes read verbs only (`#96`), which is what stops the first write
   handler under a preview path from inheriting a hole in a route whose
   `stateChanging` is false — a prediction `#96` recorded and this slice fulfils.
+
+### Two residual risks of serving PR HTML on the SHARED origin — accepted, not solved
+
+ADR-0008 chose a path-based preview on one origin, and this ADR's Consequences
+already accept "isolation weaker than per-subdomain origins … in exchange for zero
+certificate cost". Serving a PR's own HTML on that origin makes two consequences
+**reachable** that were previously theoretical, because there is finally content
+there to trigger them. **Neither is closed by anything in this slice, both are
+accepted for v1, and both are recorded here so that "the CSP is the control" is not
+read as "the origin is not shared with anything an attacker controls".**
+
+1. **A `<meta http-equiv="refresh">` in a PR's HTML navigates the tab off-site,
+   and nothing on this surface stops it.** CSP has no directive for it:
+   `navigate-to` is a CSP3 draft no browser ships and `form-action` covers form
+   submissions only, and a meta refresh is neither. The referrer is `no-referrer`, which is why this
+   is a *navigate-my-tab* primitive rather than an *exfiltrate-the-review* one —
+   and `frame-ancestors 'none'` means it cannot be used to frame the real review
+   surface either. **What actually bounds it is the same thing that bounds
+   everything else here: the document's script is confined to `/_revkit/<version>/`,
+   so the page cannot read the review it was opened from, cannot call the API with
+   the session cookie, and cannot do anything with the user's authenticated state
+   before the browser leaves.**
+2. **Login CSRF against `POST /invite/redeem`.** That route is deliberately
+   ungated (a guest from a mail client has no session), accepts
+   `application/x-www-form-urlencoded` because the Worker SHIPS a form
+   (`src/invite-page.ts` emits no `enctype`), and carries no CSRF check because a
+   CSRF token binds a state change to an *existing* session and that caller has
+   none. So an attacker who can get a victim's browser to POST that route can spend
+   a redemption slot on an attacker-chosen `displayName`. **What bounds it: single
+   use per browser, `max_browsers`, and a per-invite rate limit** — so the damage
+   is a burned slot and a name the attacker chose, not a session the attacker
+   holds, and not a read of anything. It is recorded because the trade was made for
+   a reason (the alternative was a page nobody could submit) and the reason does
+   not make the residual disappear.
+
+**The structural answer to both is a separate origin for preview content, tracked
+in #135.** ADR-0008's Consequences already say to revisit per-subdomain isolation
+"if third-party (non-org) repos are ever onboarded"; a PR from a fork is
+third-party content by construction, so #135 is that revisit, and it is the answer
+that would remove both residuals rather than bound them. Until then the honest
+summary is: **the type, the script source and the framing are controls; the ORIGIN
+is shared, and two things follow from that which no header fixes.**

@@ -47,6 +47,7 @@ import { classifyRoute } from "../src/authz.ts";
 import { BROWSER_COOKIE_NAME, mintInvite, redeemInvite } from "../src/invites.ts";
 import {
   ALLOWED_PREVIEW_EXTENSIONS,
+  MAX_R2_KEY_BYTES,
   PREVIEW_INDEX_OBJECT,
   PREVIEW_MEDIA_TYPES,
   PREVIEW_REFUSALS,
@@ -295,6 +296,7 @@ describe("a refused path is a 404 with no body, and the bucket is never read", (
       "doubled-slash",
       "encoded-separator",
       "extension-not-allowlisted",
+      "key-too-long",
       "no-extension",
       "scope-mismatch",
       "trailing-dot",
@@ -370,34 +372,355 @@ describe("a refused path is a 404 with no body, and the bucket is never read", (
     }
   });
 
-  test("`%2e%2e` normalises onto ANOTHER review, and the scope check follows it there", async () => {
-    // **The alias that is not inert-looking, so it gets its own case.** A URL
-    // spec decodes `%2e` inside a path segment far enough to recognise `..`, so
-    // `/revkit/pr-7/%2e%2e/pr-8/index.html` is a request for **pr-8** by the time
-    // anything in this Worker sees it. That is safe because the scope travels
-    // WITH the normalised path — `Route.scope` is derived from the same string the
-    // key is — so a guest scoped to pr-7 is refused on the pr-8 spelling and an
-    // operator reads pr-8's object. What would NOT be safe is a scope derived from
-    // the spelling and a key derived from the normalisation, and this case pins
-    // that both come from the same one.
+  test("a traversal alias normalises onto ANOTHER review — `%2e%2e` AND `..\\` — and the scope check follows it there", async () => {
+    // **The alias that is not inert-looking, so it gets its own case, and it has
+    // TWO spellings.** A URL spec decodes `%2e` inside a path segment far enough
+    // to recognise `..`, so `/revkit/pr-7/%2e%2e/pr-8/index.html` is a request
+    // for **pr-8**; and a WHATWG path treats `\` as a separator, so
+    // `/revkit/pr-7/..\pr-8\index.html` is the same request by the spelling an
+    // attacker would reach for first on Windows. `docs\index.html` in the case
+    // above is the non-crossing backslash; THIS is the crossing one, and it is
+    // the only alias in this class the loop above does not already cover.
+    //
+    // Both are safe because the scope travels WITH the normalised path —
+    // `Route.scope` is derived from the same string the key is — so a guest
+    // scoped to pr-7 is refused on the pr-8 spelling and an operator reads pr-8's
+    // object. What would NOT be safe is a scope derived from the spelling and a
+    // key derived from the normalisation, and this case pins that both come from
+    // the same one — for every spelling, which is the point of the loop.
     const issued = await issueTestSession(harness.db);
     await seedPreview(`${REPO}/pr-8/index.html`, "PR-8-MARKER");
     await seedPreview(INDEX_KEY, DOCUMENT);
-    const aliased = await get(previewUrl("%2e%2e/pr-8/index.html"), authHeaders(issued));
-    expect(aliased.status).toBe(200);
-    expect(await aliased.text()).toBe("PR-8-MARKER");
-    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-8/index.html`] });
+    const CROSSING = ["%2e%2e/pr-8/index.html", "..\\pr-8\\index.html"];
 
-    // And a guest scoped to pr-7 is refused on it, so the alias is not a way
-    // around the scope gate.
+    for (const alias of CROSSING) {
+      await resetSpy();
+      const aliased = await get(previewUrl(alias), authHeaders(issued));
+      expect(aliased.status, alias).toBe(200);
+      expect(await aliased.text(), alias).toBe("PR-8-MARKER");
+      // **The key is pr-8's own**, which is the confinement stated as an
+      // observation: normalisation changed which review is addressed, and the key
+      // moved with it.
+      expect(await spyReads(), alias).toEqual({ reads: 1, keys: [`${REPO}/pr-8/index.html`] });
+
+      // And a guest scoped to pr-7 is refused on it, so no spelling of the alias
+      // is a way around the scope gate.
+      await resetSpy();
+      const guest = await guestFor(REPO, PR);
+      const refused = await get(previewUrl(alias), { cookie: guest });
+      expect(refused.status, alias).toBe(403);
+      expect(await refused.json(), alias).toMatchObject({ reason: "invite-scope-mismatch" });
+      expect(await spyReads(), alias).toEqual({ reads: 0, keys: [] });
+    }
+  });
+
+  test("a DOUBLE-encoded separator reaches `serve` and the key stays inside this review's prefix", async () => {
+    // **What a `serve` decision does NOT claim, pinned.** `%252e` is a literal
+    // `%25` followed by `2e`, so `ENCODED_SEPARATOR` cannot match it and the
+    // traversal loop sees no `..` segment. The decision is `serve` — and the key
+    // holds the literal characters `%252e%252e`, still prefixed `revkit/pr-7/`.
+    // An R2 key is an opaque byte string, so that key addresses exactly the one
+    // object stored under those characters and cannot reach pr-8's. Asserted
+    // here rather than left to the reader's imagination, because the module's own
+    // header now says this in words.
+    const issued = await issueTestSession(harness.db);
+    await seedPreview(`${REPO}/pr-8/index.html`, "PR-8-MARKER");
+    const decision = previewTargetFor(SCOPE, `${SCOPE}/%252e%252e/pr-8/index.html`);
+    expect(decision.kind).toBe("serve");
+    if (decision.kind !== "serve") return;
+    expect(decision.target.key).toBe(`${REPO}/pr-${PR}/%252e%252e/pr-8/index.html`);
+    expect(decision.target.key.startsWith(`${REPO}/pr-${PR}/`)).toBe(true);
+
+    const response = await get(previewUrl("%252e%252e/pr-8/index.html"), authHeaders(issued));
+    // A miss — nothing is stored under those literal characters — and NOT pr-8's
+    // document, which is the whole point.
+    expect(response.status).toBe(404);
+    expect(await response.text()).not.toContain("PR-8-MARKER");
+    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/%252e%252e/pr-8/index.html`] });
+
+    // And a guest scoped to pr-7 is not refused here — this spelling is genuinely
+    // a request for THIS review — while the object it addresses is still this
+    // review's prefix. The scope check is not weakened by the encoding; it is
+    // being applied to what the path actually names.
     await resetSpy();
     const guest = await guestFor(REPO, PR);
-    const refused = await get(previewUrl("%2e%2e/pr-8/index.html"), { cookie: guest });
-    expect(refused.status).toBe(403);
-    expect(await refused.json()).toMatchObject({ reason: "invite-scope-mismatch" });
+    expect((await get(previewUrl("%252e%252e/pr-8/index.html"), { cookie: guest })).status).toBe(404);
+    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/%252e%252e/pr-8/index.html`] });
+  });
+});
+
+// ── F5: the OTHER direction of the extension lookup ────────────────────────
+
+describe("an executable-SHAPED name with an allowed LAST extension is served as THAT extension", () => {
+  // **The mirror image of the `page.html.js` row, and the direction with no
+  // coverage until now.** `previewTargetFor` uses `lastIndexOf(".")` on the file
+  // name, so:
+  //
+  //   `x.js.html`  ->  serve, typed `text/html`
+  //   `x.js.png`   ->  serve, typed `image/png`
+  //   `.index.html` ->  serve, typed `text/html`  (a dotfile: `lastIndexOf` is 6)
+  //   `x.html.js`  ->  REFUSED, typed nothing     (the same rule, other direction)
+  //
+  // **Why this is not a hole and why it must be pinned anyway.** A PR's script
+  // renamed to `x.js.png` is an IMAGE: the type comes from the path, the response
+  // carries `nosniff`, and the bytes are decoded by the browser as PNG rather than
+  // parsed as JavaScript. `X-Content-Type-Options: nosniff` is what makes the
+  // derived type load-bearing rather than advisory. Conversely `x.js.html` is a
+  // DOCUMENT that loads no script, because the CSP on it names only
+  // `/_revkit/<version>/` — which is ADR-0012's second Decision bullet doing the
+  // work, not the extension's shape.
+  //
+  // **And the reason it is a test rather than a comment:** swapping
+  // `lastIndexOf(".")` for `indexOf(".")` would reject all three of these, and a
+  // PR whose whole claim is "the allowlist is a table" should pin both directions
+  // of the lookup.
+
+  const CASES: readonly (readonly [string, string, string])[] = [
+    ["x.js.html", "text/html; charset=utf-8", "a document named after a script"],
+    ["x.js.png", "image/png", "a PR's script renamed to an image"],
+    ["x.mjs.woff2", "font/woff2", "a module script named after a font"],
+    ["x.wasm.svg", "image/svg+xml", "a wasm module named after an SVG"],
+    [".index.html", "text/html; charset=utf-8", "a dotfile whose extension is html"],
+    ["x.css.json", "application/json; charset=utf-8", "a stylesheet named after JSON"],
+  ];
+
+  for (const [name, contentType, why] of CASES) {
+    test(`${name} — ${why}`, async () => {
+      const decision = previewTargetFor(SCOPE, `${SCOPE}/${name}`);
+      expect(decision.kind, name).toBe("serve");
+      if (decision.kind !== "serve") return;
+      expect(decision.target.contentType, name).toBe(contentType);
+      await seedPreview(`${REPO}/pr-${PR}/${name}`, "EXECUTABLE-SHAPED-BYTES");
+      const issued = await issueTestSession(harness.db);
+      const response = await get(previewUrl(name), authHeaders(issued));
+      expect(response.status, name).toBe(200);
+      expect(response.headers.get("content-type"), name).toBe(contentType);
+      // **`nosniff` on every one**, and it is the reason the derived type is a
+      // control rather than a hint: without it a browser may sniff `x.js.html` as
+      // something else.
+      expect(response.headers.get("x-content-type-options"), name).toBe("nosniff");
+      // And the kind decides the POLICY, so an SVG-shaped name still gets
+      // `sandbox` and an HTML-shaped one still gets the full CSP.
+      if (contentType === "image/svg+xml") {
+        expect(response.headers.get("content-security-policy"), name).toBe("default-src 'none'; frame-ancestors 'none'; sandbox");
+      } else if (contentType.startsWith("text/html")) {
+        expect(response.headers.get("content-security-policy"), name).toContain("default-src 'none'");
+        expect(directive(response.headers.get("content-security-policy") ?? "", "script-src"), name).not.toContain("'unsafe-inline'");
+      } else {
+        expect(response.headers.get("content-security-policy"), name).toBeNull();
+      }
+      expect(response.headers.get("cache-control"), name).toBe("no-store");
+      expect(await spyReads(), name).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/${name}`] });
+    });
+  }
+
+  test("and the same rule refuses the mirror image: `x.html.js` is not an HTML document", async () => {
+    // Repeated from the refusal table on purpose. A table of acceptances with no
+    // refusal beside it is how "the extension that decides is the last one"
+    // becomes "the extension that decides is any of them".
+    const issued = await issueTestSession(harness.db);
+    await seedPreview(`${REPO}/pr-${PR}/x.html.js`, "SHOULD-NEVER-BE-SERVED");
+    const response = await get(previewUrl("x.html.js"), authHeaders(issued));
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("");
+    expect(await spyReads()).toEqual({ reads: 0, keys: [] });
+  });
+
+  test("a `.js`-shaped DIRECTORY is not a reason to refuse the file inside it", async () => {
+    // The other half of the rule: `previewTargetFor` looks at the last segment's
+    // extension, and a directory's name never decides a file's type. `docs.js`
+    // is an ordinary directory here — and it cannot be used to smuggle a script,
+    // because the file inside it is still typed by ITS extension.
+    const issued = await issueTestSession(harness.db);
+    await seedPreview(`${REPO}/pr-${PR}/docs.js/guide.html`, DOCUMENT);
+    const served = await get(previewUrl("docs.js/guide.html"), authHeaders(issued));
+    expect(served.status).toBe(200);
+    expect(served.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/docs.js/guide.html`] });
+    // And a script beside it is still refused, directory name notwithstanding.
+    await resetSpy();
+    await seedPreview(`${REPO}/pr-${PR}/docs.js/app.js`, "SHOULD-NEVER-BE-SERVED");
+    expect((await get(previewUrl("docs.js/app.js"), authHeaders(issued))).status).toBe(404);
     expect(await spyReads()).toEqual({ reads: 0, keys: [] });
   });
 });
+
+// ── the key's own byte limit: a PLATFORM limit, refused as one of ours ──────
+
+describe("a key over R2's 1024-byte limit is refused before the read (#133)", () => {
+  // **This is a 500 with a body until it was a refusal.** R2 rejects a key over
+  // 1024 bytes by THROWING (`get: The specified object name is not valid.
+  // (10020)`), and an uncaught throw leaves the handler, so the shared error
+  // boundary answered `500 internal error` — with a body, and without the
+  // `Cache-Control` every other answer on this surface carries. The path is
+  // caller-chosen (`GET /revkit/pr-7/<1100 d's>.html`), so before #101 preview
+  // paths never touched R2 and no request-chosen input could reach a platform
+  // error here. It is new, and it is now the surface's own bodyless 404.
+  //
+  // **The boundary is measured, not quoted**, and the limit is INCLUSIVE: 1024
+  // bytes answers a miss, 1025 throws. `MAX_R2_KEY_BYTES` is the measured
+  // boundary, and the check is `>` rather than `>=` because of it.
+
+  test("1022 bytes — under the limit, so the bucket IS read", async () => {
+    const objectPath = objectPathOfKeyBytes(1022);
+    const decision = previewTargetFor(SCOPE, `${SCOPE}/${objectPath}`);
+    expect(decision.kind).toBe("serve");
+    const issued = await issueTestSession(harness.db);
+    const response = await get(previewUrl(objectPath), authHeaders(issued));
+    // A miss, not a refusal: the answer is the surface's 404 and the counter
+    // moved. The distinction between these two is the whole case.
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("");
+    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/${objectPath}`] });
+  });
+
+  test("1024 bytes — the last byte R2 accepts, so the bucket IS read", async () => {
+    const objectPath = objectPathOfKeyBytes(MAX_R2_KEY_BYTES);
+    expect(utf8ByteLength(`${REPO}/pr-${PR}/${objectPath}`)).toBe(1024);
+    const issued = await issueTestSession(harness.db);
+    const response = await get(previewUrl(objectPath), authHeaders(issued));
+    expect(response.status).toBe(404);
+    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/${objectPath}`] });
+  });
+
+  test("1025 bytes — one over, refused, and the bucket is NOT read", async () => {
+    const objectPath = objectPathOfKeyBytes(1025);
+    expect(utf8ByteLength(`${REPO}/pr-${PR}/${objectPath}`)).toBe(1025);
+    expect(previewTargetFor(SCOPE, `${SCOPE}/${objectPath}`)).toEqual({ kind: "refused", reason: "key-too-long" });
+    const issued = await issueTestSession(harness.db);
+    const response = await get(previewUrl(objectPath), authHeaders(issued));
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("");
+    // **And the shape a 500 lost:** the bodyless 404 still carries the full
+    // hygiene set and `no-store`.
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("permissions-policy")).toContain("camera=()");
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await spyReads()).toEqual({ reads: 0, keys: [] });
+  });
+
+  test("a MULTIBYTE name arrives percent-encoded, so it can cross the limit looking short", async () => {
+    // **The mechanism, stated precisely rather than as a scarier story.** A
+    // WHATWG path parser percent-encodes every non-ASCII code point, so a name of
+    // 200 `é` arrives as 1200 characters of `%C3%A9` — and the key R2 is asked for
+    // is 1217 bytes. Nothing in the request looks long; the length only exists
+    // after normalisation, which is why the check runs on the pathname the Worker
+    // received and not on anything the caller wrote.
+    const written = `${"é".repeat(200)}.html`;
+    const arrived = new URL(`http://localhost${SCOPE}/${written}`).pathname;
+    expect(written.length, "what the caller wrote").toBe(205);
+    // `arrived` is the whole PATHNAME, so the key is the scope prefix plus what
+    // follows it — the same derivation `previewTargetFor` uses.
+    const key = `${REPO}/pr-${PR}${arrived.slice(SCOPE.length)}`;
+    expect(utf8ByteLength(key), "what the key becomes").toBe(1217);
+    expect(previewTargetFor(SCOPE, arrived)).toEqual({ kind: "refused", reason: "key-too-long" });
+    const issued = await issueTestSession(harness.db);
+    const response = await get(previewUrl(written), authHeaders(issued));
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("");
+    expect(await spyReads()).toEqual({ reads: 0, keys: [] });
+  });
+
+  test("a multibyte path UNDER the byte limit is served — the check is not the RAW NAME's length", async () => {
+    // The other direction, so the fix cannot be "refuse anything multi-byte".
+    // 150 `é` is 905 bytes once encoded, so the key is 917 and the object is
+    // served — under the full CSP, as HTML.
+    const written = `${"é".repeat(150)}.html`;
+    const arrived = new URL(`http://localhost${SCOPE}/${written}`).pathname;
+    const key = `${REPO}/pr-${PR}${arrived.slice(SCOPE.length)}`;
+    expect(utf8ByteLength(key)).toBe(917);
+    await seedPreview(key, DOCUMENT);
+    const issued = await issueTestSession(harness.db);
+    const response = await get(previewUrl(written), authHeaders(issued));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(await response.text()).toBe(DOCUMENT);
+    expect(await spyReads()).toEqual({ reads: 1, keys: [key] });
+  });
+
+  test("and the pure function measures BYTES for a caller that hands it a raw string", async () => {
+    // **Where bytes and string length genuinely diverge**, pinned so the module's
+    // contract is the one it documents: a `pathname` that did not come from
+    // `new URL`. 600 `é` is 600 characters and 1205 bytes, so a `.length` check
+    // would wave it through and R2 would throw. Not reachable over HTTP — which
+    // is why the two cases above compute from the encoded spelling instead — and
+    // pinned anyway, because a check that is only right for its one caller is not
+    // the check R2's limit describes.
+    const raw = `${"é".repeat(600)}.html`;
+    expect(raw.length).toBe(605);
+    expect(utf8ByteLength(raw)).toBe(1205);
+    expect(previewTargetFor(SCOPE, `${SCOPE}/${raw}`)).toEqual({ kind: "refused", reason: "key-too-long" });
+    // And the same shape that FITS: 500 `é` is 1005 bytes, under the limit.
+    expect(previewTargetFor(SCOPE, `${SCOPE}/${"é".repeat(500)}.html`).kind).toBe("serve");
+  });
+
+  test("an over-long path that is ALSO `.js` is reported as the executable extension it is", async () => {
+    // The order, stated: the length check is LAST, because it is a property of
+    // the KEY rather than of the name, and `extension-not-allowlisted` is the
+    // more informative of the two facts. Both answer the same bodyless 404, so
+    // this is about which reason an operator reads in the log.
+    const objectPath = objectPathOfKeyBytes(1025, "js");
+    expect(objectPath.endsWith(".js")).toBe(true);
+    expect(utf8ByteLength(`${REPO}/pr-${PR}/${objectPath}`)).toBe(1025);
+    expect(previewTargetFor(SCOPE, `${SCOPE}/${objectPath}`)).toEqual({
+      kind: "refused",
+      reason: "extension-not-allowlisted",
+    });
+  });
+
+  test("the review's OWN scope length is inside the key budget, so the object gets the rest", async () => {
+    // The limit is on the KEY, not on the object path, and the prefix is part of
+    // it: `revkit/pr-7/` is 12 bytes, so an object path over 1012 bytes is
+    // already over. Asserted from the other side so the arithmetic above is
+    // checkable.
+    expect(KEY_PREFIX_BYTES).toBe(12);
+    // 12 + 1007 + 5 = 1024 (the last accepted key) and 12 + 1008 + 5 = 1025 (the
+    // first refused one). Adjacent on purpose, so a change to the prefix length
+    // cannot make both pass.
+    expect(previewTargetFor(SCOPE, `${SCOPE}/${"a".repeat(1007)}.html`).kind).toBe("serve");
+    expect(previewTargetFor(SCOPE, `${SCOPE}/${"a".repeat(1008)}.html`)).toEqual({ kind: "refused", reason: "key-too-long" });
+  });
+
+  test("the byte length the module uses IS the key's, checked against the real key", async () => {
+    // **The identity behind the arithmetic in `previewTargetFor`**, pinned rather
+    // than trusted: the key is `scopePath` minus its leading slash plus one
+    // joining slash, and the module measures the SUM of the two parts. An earlier
+    // cut measured `` `${scopePath}/${objectPath}` `` instead — the key with a
+    // slash it does not have — and refused a legal 1024-byte key. This case is
+    // what makes that class of slip a red test rather than a silent one byte.
+    const objectPath = objectPathOfKeyBytes(MAX_R2_KEY_BYTES);
+    const key = `${REPO}/pr-${PR}/${objectPath}`;
+    expect(utf8ByteLength(key)).toBe(MAX_R2_KEY_BYTES);
+    expect(utf8ByteLength(SCOPE) + utf8ByteLength(objectPath)).toBe(utf8ByteLength(key));
+    // And through the platform, so it is not only arithmetic agreeing with itself:
+    // a 1024-byte key is READ (a miss) and a 1025-byte one never reaches the
+    // binding at all.
+    const issued = await issueTestSession(harness.db);
+    expect((await get(previewUrl(objectPath), authHeaders(issued))).status).toBe(404);
+    expect(await spyReads()).toEqual({ reads: 1, keys: [key] });
+    await resetSpy();
+    expect((await get(previewUrl(objectPathOfKeyBytes(MAX_R2_KEY_BYTES + 1)), authHeaders(issued))).status).toBe(404);
+    expect(await spyReads()).toEqual({ reads: 0, keys: [] });
+  });
+});
+
+/** The review's prefix inside an R2 key: `revkit/pr-7/`. **Measured, not
+ *  assumed** — the boundary cases below are only meaningful if the arithmetic is
+ *  right, and `previewTargetFor` measures the KEY, prefix included. */
+const KEY_PREFIX_BYTES = utf8ByteLength(`${REPO}/pr-${PR}/`);
+
+/** An object path whose resulting KEY is exactly `keyBytes` UTF-8 bytes long,
+ *  ending in `.${extension}` so the extension resolves. */
+function objectPathOfKeyBytes(keyBytes: number, extension = "html"): string {
+  return `${"a".repeat(keyBytes - KEY_PREFIX_BYTES - extension.length - 1)}.${extension}`;
+}
+
+/** `TextEncoder` in the TEST process, which is a different runtime from the one
+ *  the Worker runs in — and the point of the multibyte cases is that both agree,
+ *  so the measurement the assertions make is the same one the module makes. */
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
 
 // ── ADR-0012: the type comes from the PATH, never from the object ──────────
 
@@ -530,15 +853,28 @@ describe("a served SVG carries `sandbox` AND `Content-Disposition: inline`", () 
     // `Content-Disposition: inline` so it can't run script." Both — and on a
     // response that really is an SVG, where `applySvgHeaders` had exactly one
     // reference in the package before this slice: its own definition.
+    //
+    // **The header is asserted as an EXACT string, not by `toContain("sandbox")`.**
+    // `sandbox` is a directive whose value is a list of tokens, and the tokens
+    // `allow-scripts`, `allow-same-origin`, `allow-forms`, `allow-popups` and
+    // `allow-top-navigation` are each one *removal* from the sandbox this rule
+    // exists for. `toContain("sandbox")` passes on
+    // `default-src 'none'; frame-ancestors 'none'; sandbox allow-scripts
+    // allow-same-origin` — which is a sandbox in the way a word is a substring of
+    // a sentence. The exact comparison is what makes "so it can't run script"
+    // testable, and the second assertion below is what keeps the full HTML
+    // policy off this response.
     const csp = response.headers.get("content-security-policy") ?? "";
-    expect(csp).toContain("default-src 'none'");
-    expect(csp).toContain("frame-ancestors 'none'");
-    expect(csp).toContain("sandbox");
-    expect(response.headers.get("content-disposition")).toBe("inline");
+    expect(csp).toBe("default-src 'none'; frame-ancestors 'none'; sandbox");
+    expect(csp).not.toContain("allow-scripts");
+    expect(csp).not.toContain("allow-same-origin");
+    expect(csp).not.toContain("allow-top-navigation");
+    expect(csp).not.toContain("allow-forms");
     // The MINIMAL policy, deliberately: the full ADR-0012 CSP on an SVG would
     // name `script-src`, which is not a relaxation but is not what this rule is
     // for, and the minimal one is what carries `sandbox`.
     expect(csp).not.toContain("script-src");
+    expect(response.headers.get("content-disposition")).toBe("inline");
     // The bytes carry a `<script>` — the reason the case exists is that they can.
     expect(await response.text()).toContain("<script>alert(1)</script>");
     expect(response.headers.get("cache-control")).toBe("no-store");

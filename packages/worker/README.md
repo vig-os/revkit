@@ -284,20 +284,56 @@ having no extension. The lookup is a `Map` rather than a property read, because
 `MEDIA_TYPES["constructor"]` on a plain object is `Object`'s own constructor: a
 hit for an extension nobody allowlisted.
 
-**6. Two aliases normalise ONTO a real path, and both are inert.** A WHATWG path
-removes single-dot segments and treats `\` as a separator, so `./index.html`,
-`docs/./index.html` and `docs\index.html` all read ONE key and serve
-byte-identical content. `%2e%2e` is the interesting one: a URL spec decodes `%2e`
-far enough to recognise a dot segment, so `/revkit/pr-7/%2e%2e/pr-8/index.html`
-**is a request for pr-8** by the time anything here sees it. That is safe because
-the scope travels with the normalised path — `Route.scope` and the key come from
-the same string — and it is asserted in both directions: an operator reads pr-8's
-object, and a guest scoped to pr-7 is refused `403 invite-scope-mismatch` on that
-spelling. A lone `%2e`, `%2f` or `%5c` cannot survive as itself;
-`parsePreviewPath` refuses those and `src/preview-assets.ts` refuses them again at
-the place the key is built.
+**6. A traversal alias normalises onto ANOTHER review, and it has three
+spellings.** Two of them cross a review boundary and one does not, and the
+distinction is the whole point:
 
-**7. Nothing here writes.** No `put`, no `delete`, no R2 credential in this repo.
+| spelling | lands on | reads |
+|---|---|---|
+| `%2e%2e/pr-8/index.html` | `/revkit/pr-8/index.html` | **pr-8's object** |
+| `..\pr-8\index.html` | `/revkit/pr-8/index.html` | **pr-8's object** |
+| `./index.html`, `docs/./index.html`, `docs\index.html` | the same path | ONE key, byte-identical |
+
+A URL spec decodes `%2e` far enough to recognise a dot segment, and a WHATWG path
+treats `\` as a separator — so the first two rows are the same cross-review
+request, and the backslash form is the one an attacker reaches for first on
+Windows. It is safe because the scope travels with the **normalised** path:
+`Route.scope` and the key come from the same string. Both crossing spellings are
+asserted in one loop, in both directions — an operator reads pr-8's object, and a
+guest scoped to pr-7 is refused `403 invite-scope-mismatch` with `reads === 0` on
+each. The third row does not cross a boundary, so it is inert for the same reason
+and is asserted byte-for-byte.
+
+A lone `%2e`, `%2f` or `%5c` cannot survive as itself: `parsePreviewPath` refuses
+those and `src/preview-assets.ts` refuses them again at the place the key is
+built. **A double-encoded `%252e%252e` does reach `serve`, and that is what a
+`serve` decision does not claim** — see `src/preview-assets.ts`'s header. It is
+inert because an R2 key is an opaque byte string, so the key addresses exactly
+the object stored under those literal characters and is still prefixed with the
+review's scope.
+
+**7. A key over R2's 1024-byte limit is refused, not thrown at.** R2 *throws* on a
+key over 1024 bytes rather than returning a miss, and the object path is
+caller-supplied, so an over-long preview path used to escape as a `500 internal
+error` **with a body and without `Cache-Control`** (#133). `MAX_R2_KEY_BYTES` is
+the boundary measured on the platform — 1024 answers a miss, 1025 throws — and the
+check is `>` because of it, so the largest legal key is served and the first
+illegal one is the surface's own bodyless 404. It is measured in UTF-8 **bytes**
+because that is what R2 counts, which matters over HTTP in one reachable way: a
+pathname is percent-encoded, so a name of 200 `é` arrives as 1200 characters and
+its key is 1217 bytes — a path can cross the limit without any segment looking
+long.
+
+**8. The extension that decides the type is the LAST one, in both directions.**
+`x.js.png` is served as `image/png` and `x.js.html` as `text/html`, while
+`x.html.js` is refused — the same rule, opposite direction, and both are pinned,
+because swapping `lastIndexOf(".")` for `indexOf(".")` would reject the first two
+and no comment would notice. What makes the accepted direction safe is
+`nosniff` plus the CSP: a PR's script renamed `.js.png` is decoded as an image,
+and a document named `x.js.html` loads no script because `script-src` names only
+`/_revkit/<version>/`.
+
+**9. Nothing here writes.** No `put`, no `delete`, no R2 credential in this repo.
 The upload side — CI publishing a PR-head build, provisioning the bucket,
 ADR-0014's fork approval — is tracked separately, so whoever controls the bucket's
 contents is whoever runs the build pipeline, and ADR-0012's guarantee does not
@@ -307,6 +343,16 @@ depend on that being careful: the bytes are typed by the path.
 route outside this one reads the binding, so a deployment without it cannot be
 mistaken for a healthy surface that simply has no previews in it.
 `test/worker-config.test.ts` asserts `wrangler.jsonc` declares the binding.
+
+**Two residual risks of serving PR HTML on this origin are accepted, not solved,
+and they are in ADR-0012's amendment rather than only here**: a PR's
+`<meta http-equiv="refresh">` can navigate the tab off-site (no CSP directive
+covers it), and `POST /invite/redeem` is reachable by a cross-site form post
+because it is deliberately ungated and has no CSRF check — bounded by single use,
+`max_browsers` and the rate limit, not prevented. The structural answer to both is
+a separate preview origin (#135). Read that section before describing this surface
+as isolated: **the type, the script source and the framing are controls; the
+ORIGIN is shared with PR-controlled content.**
 
 ### A GUEST session is a session plus four more checks
 
