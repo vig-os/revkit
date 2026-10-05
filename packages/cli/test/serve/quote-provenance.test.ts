@@ -188,3 +188,140 @@ describe("issue #113 — a comment on a smart-quoted paragraph does not orphan",
     expect(result.kind).toBe("orphaned");
   });
 });
+
+// ---------- F1 (review of #124): the modified path must align on SOURCE text ----------
+//
+// A whole-paragraph selection is the common legacy shape: the pre-fix
+// `quoteFromBlock` cut `exact` as the whole rendered paragraph and
+// left `prefix` / `suffix` EMPTY. Nothing about that quote is source-
+// shaped, and on a line where the renderer collapses runs the two
+// lengths are far apart — every `...` renders as a single `…`, so the
+// rendered paragraph is a third of the source line's length.
+//
+// That matters on the MODIFIED path (`reanchor.ts` 4b), where
+// `alignMatchedText` is given the recorded quote as its alignment
+// target. The walker returns SOURCE offsets, so a target that is not
+// source-shaped overruns its window and lands on the wrong span. The
+// reviewer measured the consequence: `lines 3-5`, ending mid-word and
+// swallowing the next paragraph, persisted through `thread.reanchored`
+// — where the rail then looks for a `[data-src="…:3-5"]` no page
+// carries, so the thread's anchor button is a silent no-op. A silent
+// wrong anchor is worse than the honest orphan this PR set out to
+// remove, which is why it is fixed here rather than filed alone.
+//
+// The source-quote path never had the problem: its quote IS source
+// text. These fixtures pin that the two paths now agree byte for byte.
+
+/** A line of SEVEN collapsing runs: each `...` renders as one `…`, so
+ * the rendered paragraph is 22 characters shorter than the source. */
+const COLLAPSE_OLD = `# T
+
+Wait... what... really... ok... fine... yes... done...
+
+Tail paragraph.
+`;
+
+const COLLAPSE_NEW = COLLAPSE_OLD.replace("fine", "wrong");
+
+const COLLAPSE_SOURCE_LINE_3 = COLLAPSE_OLD.split("\n")[2] ?? "";
+
+/** The rendered text of the line-3 block, i.e. the whole-paragraph
+ * legacy quote: rendered text, empty prefix, empty suffix. */
+async function renderedCollapseParagraph(): Promise<string> {
+  const html = await render(COLLAPSE_OLD);
+  const m = html.match(/<p data-src="docs\/x\.md:3-3">([\s\S]*?)<\/p>/);
+  if (m === null || m[1] === undefined) {
+    throw new Error(`fixture broke: no docs/x.md:3-3 block in:\n${html}`);
+  }
+  return m[1].replace(/<[^>]+>/g, "");
+}
+
+/** The source-quote anchor for line 3 of the collapse fixture. */
+async function collapseSourceQuoteAnchor(): Promise<Anchor> {
+  return {
+    path: "docs/x.md",
+    startLine: 3,
+    endLine: 3,
+    quote: { exact: COLLAPSE_SOURCE_LINE_3, prefix: "# T\n\n", suffix: "\n\nTail paragraph." },
+    revision: await revisionOf(COLLAPSE_OLD),
+  };
+}
+
+/** The LEGACY whole-block anchor: rendered paragraph, no context. */
+async function collapseLegacyRenderedQuoteAnchor(): Promise<Anchor> {
+  return {
+    path: "docs/x.md",
+    startLine: 3,
+    endLine: 3,
+    quote: { exact: await renderedCollapseParagraph(), prefix: "", suffix: "" },
+    revision: await revisionOf(COLLAPSE_OLD),
+  };
+}
+
+describe("issue #113 F1 — a legacy whole-block quote aligns on the source span it was resolved to", () => {
+  test("the fixture's rendered paragraph is far shorter than its source line", async () => {
+    // The premise. Without it these fixtures would be vacuous.
+    const rendered = await renderedCollapseParagraph();
+    expect(rendered).toBe("Wait… what… really… ok… fine… yes… done…");
+    expect(COLLAPSE_SOURCE_LINE_3).toBe("Wait... what... really... ok... fine... yes... done...");
+    expect(rendered.length).toBe(COLLAPSE_SOURCE_LINE_3.length - 14);
+  });
+
+  test("the SOURCE-quote path anchors to line 3 and carries the edited sentence", async () => {
+    const result = await reanchor(await collapseSourceQuoteAnchor(), COLLAPSE_OLD, COLLAPSE_NEW);
+    if (result.kind === "orphaned") {
+      throw new Error(`expected the source-quote path to re-anchor, got orphaned: ${result.reason}`);
+    }
+    expect(result.anchor.startLine).toBe(3);
+    expect(result.anchor.endLine).toBe(3);
+    expect(result.anchor.quote.exact).toBe(COLLAPSE_NEW.split("\n")[2]);
+  });
+
+  test("the LEGACY rendered quote lands on the SAME line range as the source-quote path", async () => {
+    // THE repro. On the unfixed head this returns `lines 3-5` with
+    // `exact` ending mid-word and swallowing the next paragraph: a
+    // silent wrong anchor, persisted through `thread.reanchored`.
+    const legacy = await reanchor(
+      await collapseLegacyRenderedQuoteAnchor(),
+      COLLAPSE_OLD,
+      COLLAPSE_NEW,
+    );
+    if (legacy.kind === "orphaned") {
+      throw new Error(`expected the legacy quote to re-anchor, got orphaned: ${legacy.reason}`);
+    }
+    expect(legacy.anchor.startLine).toBe(3);
+    expect(legacy.anchor.endLine).toBe(3);
+  });
+
+  test("the LEGACY path's result is byte-identical to the SOURCE path's", async () => {
+    // Not just "both anchored": the same anchor. The alignment input
+    // must be the SOURCE span `locateOldSpan` already resolved, so
+    // which quote happens to be recorded cannot move the result.
+    const legacy = await reanchor(
+      await collapseLegacyRenderedQuoteAnchor(),
+      COLLAPSE_OLD,
+      COLLAPSE_NEW,
+    );
+    const source = await reanchor(await collapseSourceQuoteAnchor(), COLLAPSE_OLD, COLLAPSE_NEW);
+    if (legacy.kind === "orphaned" || source.kind === "orphaned") {
+      throw new Error(`expected both paths to re-anchor; got ${legacy.kind} / ${source.kind}`);
+    }
+    expect(legacy.anchor).toEqual(source.anchor);
+    expect(legacy.anchor.quote.exact).toBe(COLLAPSE_NEW.split("\n")[2]);
+  });
+
+  test("the edited sentence is in the quote — the edit is not silently dropped", async () => {
+    // The milder variant the reviewer saw on other shapes: a truncated
+    // span that omits the edit entirely. Asserting the edited words
+    // are present catches that as well as the overrun.
+    const legacy = await reanchor(
+      await collapseLegacyRenderedQuoteAnchor(),
+      COLLAPSE_OLD,
+      COLLAPSE_NEW,
+    );
+    if (legacy.kind === "orphaned") {
+      throw new Error(`expected the legacy quote to re-anchor, got orphaned: ${legacy.reason}`);
+    }
+    expect(legacy.anchor.quote.exact).toContain("ok... wrong... yes...");
+  });
+});

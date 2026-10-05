@@ -357,14 +357,23 @@ first, as "old anchor span not found in snapshot"), path 4a's
 `mapped === quote.exact`, `tryMove`'s exact-context search, and path 4b's
 similarity gate.
 
-**The table is exactly the substitutions the renderer performs**, measured
-against `createMarkdownProcessor` rather than assumed: `“ ” „ → "`,
-`‘ ’ → '`, `— → --`, `– → -`, `… → ...`, `` ` `` → *deleted*. `---` is
-deliberately absent — the pipeline leaves a three-dash run alone, so folding it
-would invent an equivalence the renderer does not have. The backtick entry
-deletes rather than substitutes because an inline-code span's rendered text node
-carries no delimiter; deleting on both sides is what makes the source `` `gh` ``
-and the rendered `gh` fold to the same string.
+**The table is the substitutions the renderer performs**, measured against
+`createMarkdownProcessor` rather than assumed: `“ ” „ → "`, `‘ ’ → '`,
+`— → --`, `– → -`, `… → ...`, `` ` `` → *deleted*. `---` is deliberately absent —
+the pipeline leaves a three-dash run alone, so folding it would invent an
+equivalence the renderer does not have. The backtick entry deletes rather than
+substitutes because an inline-code span's rendered text node carries no
+delimiter; deleting on both sides is what makes the source `` `gh` `` and the
+rendered `gh` fold to the same string.
+
+The table is a *superset* of the renderer's own substitutions in one place and a
+*subset* in another, both measured rather than assumed, and both tracked in
+#127: a dot run of **four or more** also collapses to a single `…`, which
+`… → ...` does not reverse, so a legacy quote on such a line still orphans at
+`locateOldSpan`; and three entries (the backtick, `–`, `„`) are not
+renders-identical, which the paragraph below quantifies. The table is unchanged
+by that review — the remedy there is a narrower table, and narrowing it is #127's
+decision, not this amendment's.
 
 **What the equivalence class is, and is not.** It is "text that renders
 identically", which is the right granularity for this purpose: the quote
@@ -375,10 +384,29 @@ no cross-character context cannot normalise a rewrite away, so a span that
 differs in a WORD is still a different span, still fails path 4a, and still takes
 the modified path's similarity gate (`packages/cli/test/serve/
 quote-provenance.test.ts` proves this through the real pipeline, and
-`packages/review-core/test/typography.test.ts` pins it at the unit level). The
-one consequence a reader should know: a source edit that swaps `--` for a
-literal `—` is *inside* the class and is not reported as a change. The
-reviewer's view is byte-identical either way.
+`packages/review-core/test/typography.test.ts` pins it at the unit level).
+
+**Measured consequence, stated precisely.** Take a source edit that swaps `--`
+for a literal `—`: the two render identically, so it is *inside* the class. It
+is still **reported as a change**, and the report is the honest one — measured
+result `method=fuzzy`, carrying the new source text. The mechanism is worth
+naming because it is not the fold's equality test: the diff runs on RAW source,
+so the edit classifies as `modified`, path 4a is never reached, and what the
+fold buys is only that 4b's similarity gate does not charge for the
+punctuation. What the class would suppress is 4a's byte comparison on an
+`unchanged`-classified span — and a raw-source diff cannot classify a
+`--`→`—` edit as unchanged, because the bytes did change. So the practical
+exposure is the class's effect on 4b's SCORE, never on 4a's verdict.
+
+Three entries in the table are *not* renders-identical, and the review of this
+change measured their consequences rather than assuming them: the backtick entry
+(adding or removing inline code leaves the words alone and changes the styling —
+reported `fuzzy` carrying the new text, but in one direction a legacy quote can
+be accepted as `quote-exact`), `–` → `-` (a spaced hyphen is left alone, so a
+spaced en dash and a spaced hyphen render *differently* and the fold is wider
+than the renderer there), and `„` → `"`. Those are tracked in #127 together
+with the residual under-fold: any dot run of four or more also collapses to a
+single `…`, so `… → ...` reverses only the three-dot case.
 
 **Smartypants stays on.** Turning it off would also have made the strings equal,
 but it changes rendered output for every document in the repo —

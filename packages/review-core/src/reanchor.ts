@@ -955,19 +955,37 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
   const hunkWindow = findHunkWindow(diffs, oldSpan.start, oldSpan.end, newLF.length);
   const mappedStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
   const clampedStart = Math.max(hunkWindow.start, Math.min(hunkWindow.end, mappedStart));
-  // Alignment runs on the RAW quote: `alignMatchedText` returns SOURCE
-  // offsets, so its target must be source-shaped text. For a quote
-  // stored from the rendered DOM the recorded text is the rendered
-  // form, which is within a character or two of the source at this
-  // position — the walker is a diff, so it absorbs that, and the
-  // similarity gate below is folded so the residual punctuation
-  // difference is not scored as an edit.
-  const aligned = alignMatchedText(anchor.quote.exact, newLF, clampedStart, {
-    trailingContext: anchor.quote.suffix,
+  // Alignment runs on the SOURCE span `locateOldSpan` already
+  // resolved — never on the recorded quote. `alignMatchedText` returns
+  // SOURCE offsets and sizes its search window from the target's
+  // length, so a target that is not source-shaped overruns that window
+  // and lands on the wrong span. That is not a rounding detail: for a
+  // whole-paragraph legacy quote on a line of collapsing runs
+  // (`Wait... what... …` renders as `Wait… what… …`, so the rendered
+  // paragraph is a third of the source line's length) the unfixed head
+  // returned `lines 3-5`, ending mid-word and swallowing the next
+  // paragraph — a silent wrong anchor, persisted through
+  // `thread.reanchored`, where the rail then looks for a
+  // `[data-src="…:3-5"]` that no page carries. The source-quote path
+  // never had the problem because its quote IS source text; slicing
+  // the resolved span makes the two paths identical by construction
+  // (`test/serve/quote-provenance.test.ts`, F1).
+  const sourceExact = oldLF.slice(oldSpan.start, oldSpan.end);
+  // The trailing context bounds the walker's INSERT, so it must be
+  // source-shaped too. It is read at the recorded `suffix` LENGTH
+  // because that length is the context window the producer cut; the
+  // bytes come from the source, which is what the walker diffs
+  // against.
+  const sourceTrailingContext = oldLF.slice(oldSpan.end, oldSpan.end + anchor.quote.suffix.length);
+  const aligned = alignMatchedText(sourceExact, newLF, clampedStart, {
+    trailingContext: sourceTrailingContext,
   });
-  // Folded on BOTH sides (issue #113), so a quote whose only
-  // difference from the source is typographic punctuation is not
-  // charged for it in the modified path either.
+  // The similarity gate still compares the RECORDED quote, folded on
+  // both sides (issue #113): that is the question the gate asks —
+  // "is the text the reviewer commented about still recognisably here"
+  // — and for a legacy quote the recorded text is the rendered form,
+  // so folding it keeps a punctuation-only difference from being
+  // scored as an edit. For a source quote the fold is the identity.
   const score = similarity(foldTypography(anchor.quote.exact), foldTypography(aligned.matchedText));
   if (score < DEFAULT_MIN_QUOTE_SCORE) {
     return {

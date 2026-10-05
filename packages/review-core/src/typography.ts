@@ -74,6 +74,25 @@
  * `„` and `–` are included defensively — this configuration does not
  * emit them, but a document may contain them literally, and folding a
  * literal character back is the same substitution in reverse.
+ *
+ * **What this table does NOT claim, measured (ADR-0006 amendment,
+ * issue #113, review of PR #124; tracked as #127).** It is not
+ * "exactly what the renderer performs", in either direction:
+ *
+ * - A dot run of FOUR or more also collapses to a single `…`
+ *   (`....`, `.....` all render `…`), so `… → ...` reverses only the
+ *   three-dot case and a legacy quote on such a line still orphans at
+ *   `locateOldSpan` — an under-fold.
+ * - Three entries are not renders-identical: the backtick (adding or
+ *   removing inline code leaves the words alone and changes the
+ *   styling), `–` (a spaced hyphen is left alone, so a spaced en dash
+ *   and a spaced hyphen render *differently*) and `„`. Measured
+ *   consequences are bounded — the rebuilt anchor always carries the NEW
+ *   source text — but an over-fold is an over-fold.
+ *
+ * The table is unchanged by that review on purpose: narrowing it is
+ * #127's decision, and narrowing it here would re-orphan every legacy
+ * quote the over-fold currently rescues.
  */
 const FOLD: ReadonlyMap<string, string> = new Map([
   ["“", '"'],
