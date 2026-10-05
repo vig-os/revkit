@@ -19,8 +19,12 @@
 //                                      (slice 5b), content-addressed; every
 //                                      OTHER name under /_revkit/ is 404 and
 //                                      NONE of them redirects (ADR-0012)
-//   ANY    <repo>/pr-<n>/…          501 — behind the gate; R2 serving is slice 5's
-//                                      other half
+//   GET|HEAD <repo>/pr-<n>/…        501 — behind the gate; R2 serving is slice 5's
+//                                      other half. Any OTHER verb on the same
+//                                      path is 405 (#96): reads only.
+//   ANY    <REPO>/pr-<n>/…          404 — a repo segment that is not lowercase
+//                                      is not a preview, so exactly one spelling
+//                                      of a preview path resolves (#96)
 //   ANY    anything else            404
 //
 // ── Two ungated readers of `env.DB`, and what that means for the invariant ──

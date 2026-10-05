@@ -109,6 +109,11 @@ async function seedLog(db: D1Database, logKey: string = LOG_KEY, prefix = "th-se
 
 const VERBS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
 
+/** Every verb that is NOT a read, derived from `VERBS` rather than re-spelled,
+ * so a verb added to the surface cannot be left out of a matrix that claims to
+ * cover "the verbs that are not reads". */
+const WRITING_VERBS = VERBS.filter((verb) => verb !== "GET" && verb !== "HEAD");
+
 /**
  * The probe set for the route-table invariants, DERIVED from the grammar rather
  * than written out.
@@ -341,7 +346,18 @@ describe("ADR-0012's per-request gate", () => {
         [`${SESSION_REFRESH_PATH} PUT`]: "method-not-allowed",
         [`${SESSION_REFRESH_PATH} OPTIONS`]: "method-not-allowed",
         ["/revkit/pr-7/index.html GET"]: "preview",
-        ["/revkit/pr-7/index.html POST"]: "preview",
+        ["/revkit/pr-7/index.html HEAD"]: "preview",
+        // Reads only (#96). A preview serves bytes; a verb that is not a read has
+        // no route to reach, so it is a 405 BEHIND the gate — not a 501 that
+        // happens to have no CSRF check.
+        ["/revkit/pr-7/index.html POST"]: "method-not-allowed",
+        ["/revkit/pr-7/index.html PUT"]: "method-not-allowed",
+        ["/revkit/pr-7/index.html DELETE"]: "method-not-allowed",
+        // And a repo segment that is not the canonical spelling is not a preview
+        // at all — one spelling per review, so the case variant is a 404 (#96).
+        ["/Revkit/pr-7/index.html GET"]: "unknown",
+        ["/REVKIT/pr-7/api/threads GET"]: "unknown",
+        ["/API/pr-7/index.html GET"]: "unknown",
         ["/_revkit/0.0.0/rail.js GET"]: "revkit-bundle",
         ["/revkit/pr-7/api/threads GET"]: "threads-read",
         ["/revkit/pr-7/api/threads POST"]: "threads-append",
@@ -366,10 +382,13 @@ describe("ADR-0012's per-request gate", () => {
     test("the gated paths are exactly the three that can carry data", () => {
       // The invariant, stated so a reviewer does not have to read the table
       // above to know the blast radius: `/api/threads`, `/api/session/refresh`
-      // and ADR-0008's `<repo>/pr-<n>/` preview paths are gated on every verb.
-      // `/healthz` (a probe that reads no database), `/_revkit/` (ADR-0012's
-      // never-redirecting static path) and everything unrecognised are not,
-      // because none of them can return review data.
+      // and ADR-0008's `<repo>/pr-<n>/` preview paths are gated on every verb
+      // they answer — including the ones they refuse (#96: a preview is a
+      // read-only route, so a wrong verb is a gated 405 and an unauthenticated
+      // caller still gets 401 first). `/healthz` (a probe that reads no
+      // database), `/_revkit/` (ADR-0012's never-redirecting static path) and
+      // everything unrecognised are not, because none of them can return review
+      // data.
       //
       // The policy is expressed PATH-side on purpose. Asserting it through
       // `RouteKind` cannot work — `method-not-allowed` is gated or not
@@ -404,6 +423,120 @@ describe("ADR-0012's per-request gate", () => {
       const route = classifyRoute("/revkit/pr-7/index.html", "GET");
       expect(route.requiresSession).toBe(true);
       expect(route.stateChanging).toBe(false);
+    });
+
+    // ── #96 fix 1: the preview route accepts READ verbs only ───────────────
+    test("a preview path takes reads only, and a write verb is a 405 BEHIND the gate", async () => {
+      // **What this closes.** The preview arm was `acceptsVerb: ANY_VERB` with
+      // `stateChanging: false`, so POST/PUT/DELETE on `<repo>/pr-<n>/…` classified
+      // as `preview` and passed the gate with NO CSRF check and NO
+      // `application/json` precondition — `stateChanging: false` is the flag
+      // that makes `authorizeRequest` skip both. The reason recorded for it was
+      // that the handler answers 501, which describes the HANDLER and not the
+      // GATE: the first write handler added under a preview path would have
+      // inherited the hole. The argument for closing it is not today's
+      // exploitability; it is that a gate default which widens when a handler
+      // changes is not a gate default.
+      //
+      // The order a reviewer will want them: the classification, the obligations
+      // it does and does not carry, then the answer end to end.
+      for (const verb of WRITING_VERBS) {
+        const route = classifyRoute("/revkit/pr-7/index.html", verb);
+        expect(route.kind, verb).toBe("method-not-allowed");
+        // Gated — so an unauthorized caller learns "unauthorized", never "that
+        // route exists and you may not use this verb".
+        expect(route.requiresSession, verb).toBe(true);
+        // And it carries no obligation it will not honour: `classifyRoute`
+        // drops `stateChanging` on a wrong verb so the caller is not told about
+        // a CSRF mechanism on a request that was never going to be authorized.
+        expect(route.stateChanging, verb).toBe(false);
+        expect(route.unsupportedMethod, verb).toBe(true);
+        // The path's SCOPE survives the relabel, so a guest is refused for the
+        // scope rather than for the verb — the same reason a wrong verb on the
+        // scoped read is a 405 in that scope.
+        expect(route.scope?.logKey, verb).toBe("/revkit/pr-7");
+      }
+      // GET and HEAD are unaffected: they are the verbs R2 serving will answer.
+      for (const verb of ["GET", "HEAD"] as const) {
+        expect(classifyRoute("/revkit/pr-7/index.html", verb).kind, verb).toBe("preview");
+      }
+      // End to end, through workerd. A session WITHOUT a CSRF token and WITHOUT
+      // `application/json` — the pair every state-changing route demands — is the
+      // request the old table let through. It answers 405, and it answers 405 for
+      // the right reason: there is no CSRF refusal in the body.
+      const issued = await issueTestSession(harness.db);
+      for (const verb of WRITING_VERBS) {
+        const response = await harness.dispatch("http://localhost/revkit/pr-7/index.html", {
+          method: verb,
+          headers: { cookie: cookieHeader(issued.sessionId) },
+        });
+        const raw = await response.text();
+        expect(response.status, `${verb}: ${raw}`).toBe(405);
+        expect(JSON.parse(raw) as { error?: string; reason?: string }, verb).toEqual({
+          error: "method-not-allowed",
+        });
+      }
+      // And the refusal ORDER: no session is a 401 even on a write verb, so the
+      // 405 is not something an anonymous caller can read off the surface.
+      expect((await harness.dispatch("http://localhost/revkit/pr-7/index.html", { method: "POST" })).status).toBe(401);
+    });
+
+    // ── #96 fix 2: one spelling per review ─────────────────────────────────
+    test("a repo segment that is not its canonical spelling is not a preview at all", async () => {
+      // `/Revkit/pr-7` and `/revkit/pr-7` used to be TWO reviews — two log keys,
+      // two R2 prefixes, two lines in the access log — while a guest invite
+      // covered exactly one of them, because the stored side is folded at mint.
+      // The fold is at MINT on purpose (`router.ts`'s `canonicalRepoName`), so
+      // the read side cannot be folded too: that would collapse two spellings of
+      // one path onto one review, which is the aliasing this grammar already
+      // refuses for `//`, for `%2e` and for a leading zero.
+      //
+      // So the parser refuses, and "not a preview" is the same answer a caller
+      // gets for `/API/pr-7`. Exactly one spelling resolves.
+      for (const spelling of ["Revkit", "REVKIT", "rEvKiT", "Revkit2", "vig-OS.revkit", "API", "_REVKIT"]) {
+        expect(parsePreviewPath(`/${spelling}/pr-7`), spelling).toBeUndefined();
+        expect(parseScopedThreadsPath(scopedThreadsPath(spelling, 7)), spelling).toBeUndefined();
+        // Not a preview, so not a gated path, so not a scope — 404 for everyone.
+        const route = classifyRoute(`/${spelling}/pr-7/index.html`, "GET");
+        expect(route.kind, spelling).toBe("unknown");
+        expect(route.requiresSession, spelling).toBe(false);
+        expect(route.scope, spelling).toBeUndefined();
+      }
+      // And the canonical spelling is untouched: the same paths parse, and their
+      // repo segment is already the stored spelling, so a minted invite and a
+      // served URL still meet.
+      for (const spelling of ["revkit", "vig-os.revkit", "a", "a_b-c.d0", "revkit.pr-7"]) {
+        const preview = parsePreviewPath(`/${spelling}/pr-7`);
+        expect(preview?.repo, spelling).toBe(spelling);
+        expect(preview?.logKey, spelling).toBe(`/${spelling}/pr-7`);
+      }
+      // End to end: an `operator` session — the one identity the gate does not
+      // scope-check, and so the one that would have READ `/REVKIT/pr-7`'s empty
+      // log before — now gets a 404, and the canonical path still works.
+      const issued = await issueTestSession(harness.db);
+      const shouted = await harness.dispatch("http://localhost/REVKIT/pr-7/api/threads", {
+        headers: { cookie: cookieHeader(issued.sessionId) },
+      });
+      expect(shouted.status).toBe(404);
+      expect(await shouted.text()).not.toContain("th-seed");
+      const canonical = await harness.dispatch("http://localhost/revkit/pr-7/api/threads", {
+        headers: { cookie: cookieHeader(issued.sessionId) },
+      });
+      expect(canonical.status).toBe(200);
+      // The invariant as a SWEEP rather than as the spellings above: over the
+      // whole admitted character class, a repo segment is servable at the
+      // canonical spelling and is a 404 at every other one, so "two spellings of
+      // one path must not both resolve" holds for every name rather than for the
+      // seven a fixture happened to spell.
+      let canonicals = 0;
+      for (let code = 0x61; code <= 0x7a; code += 1) {
+        const lower = String.fromCharCode(code);
+        const upper = lower.toUpperCase();
+        expect(parsePreviewPath(`/${lower}/pr-7`) !== undefined, lower).toBe(true);
+        expect(parsePreviewPath(`/${upper}/pr-7`) !== undefined, upper).toBe(false);
+        canonicals += 1;
+      }
+      expect(canonicals).toBe(26);
     });
 
     // ── slice 5: the scope invariant, and the read it moved ───────────────
@@ -1647,20 +1780,24 @@ describe("ADR-0012's per-request gate", () => {
             expect(raw, label).not.toContain("theirs-");
           }
         }
-        // The PATH is case-SENSITIVE, so `/REVKIT/pr-7/api/threads` names a
-        // DIFFERENT review — the empty log `/REVKIT/pr-7` — and this session is an
-        // `operator`, which the gate does not scope-check (see `authz.ts`: the only
-        // unscoped kind in `RECOGNISED_IDENTITY_KINDS` today is `operator`). So the
-        // answer is 200 on an EMPTY log, and the assertions are about CONTENT:
-        // neither this review's threads nor the other populated one.
+        // The PATH is case-SENSITIVE, and since #96 a non-canonical repo segment
+        // is not a preview at all: `/REVKIT/pr-7/api/threads` names nothing, so
+        // it is a 404. Before that it named a DIFFERENT review — the empty log
+        // `/REVKIT/pr-7` — which this session could read, because an
+        // `operator` is the one identity kind the gate does not scope-check (see
+        // `authz.ts`). "Two spellings of one review, one of them empty and
+        // readable by anyone with a session" was not a hole, but it was a second
+        // review nobody created. The content assertions stay, because the point
+        // is still CONTENT: neither this review's threads nor the other
+        // populated one.
         const shouty = await harness.dispatch("http://localhost/REVKIT/pr-7/api/threads", {
           headers: { cookie: cookieHeader(issued.sessionId) },
         });
-        expect(shouty.status).toBe(200);
+        expect(shouty.status).toBe(404);
         const shoutyRaw = await shouty.text();
         expect(shoutyRaw).not.toContain("theirs-");
         expect(shoutyRaw).not.toContain("th-seed");
-        expect(JSON.parse(shoutyRaw) as { head: number; threads: unknown[] }).toMatchObject({ head: 0, threads: [] });
+        expect(shoutyRaw).not.toContain(SEED_BODY);
       } finally {
         await harness.db.prepare("DELETE FROM review_logs WHERE log_key = ?").bind(otherKey).run();
       }

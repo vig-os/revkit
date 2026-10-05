@@ -21,6 +21,7 @@ import {
   parsePreviewPath,
   parseScopedThreadsPath,
   previewScopePath,
+  scopedThreadsPath,
 } from "../src/router.ts";
 
 describe("parsePreviewPath — accepted", () => {
@@ -205,17 +206,47 @@ describe("canonicalRepoName — the ONE stored spelling of a repository name", (
     expect(isRepoName("k"), "and k is servable — so order decides the outcome").toBe(true);
   });
 
-  test("the ROUTE is untouched: a path's repo segment is still verbatim", () => {
-    // The half of the fix that must NOT exist. `parsePreviewPath` returns
-    // `segments[1]` as it appeared, so two spellings of one path stay two
-    // reviews — and folding the read side would have collapsed them.
-    expect(parsePreviewPath("/Revkit/pr-7")?.repo).toBe("Revkit");
-    expect(parsePreviewPath("/REVKIT/pr-7")?.repo).toBe("REVKIT");
-    expect(parsePreviewPath("/Revkit/pr-7")?.logKey).toBe("/Revkit/pr-7");
-    // The canonical form is the one `canonicalRepoName` agrees with, and it is
-    // reachable — so a mint and a canonical URL do meet.
-    expect(canonicalRepoName(parsePreviewPath("/Revkit/pr-7")?.repo ?? "")).toBe("revkit");
-    expect(parsePreviewPath(`/revkit/pr-7`)?.logKey).toBe(canonicalRepoName("/Revkit/pr-7"));
+  // ── #96: the READ side refuses a non-canonical segment instead of folding ──
+  test("the READ side refuses a non-canonical repo segment — one spelling per review (#96)", () => {
+    // **This replaced a case that asserted the opposite** — that
+    // `parsePreviewPath("/Revkit/pr-7")?.repo === "Revkit"`. That was true, and
+    // it meant `/Revkit/pr-7` and `/revkit/pr-7` were two reviews: two log keys,
+    // two R2 prefixes, two log lines, and an invite that covers exactly one of
+    // them because the stored side is folded at MINT.
+    //
+    // The rule now is a FIXED POINT rather than a rewrite: a repo segment is
+    // servable only if `canonicalRepoName(segment) === segment`. Folding here
+    // instead would have been the actual defect — one stored value admitting two
+    // URLs is the "two spellings of one path must not both resolve" aliasing this
+    // file already refuses for `//`, for `%2e` and for a leading zero. A refusal
+    // is the same answer a caller gets for `/API/pr-7`, so the case variant has
+    // no spelling at all.
+    for (const spelling of ["Revkit", "REVKIT", "rEvKiT", "Rev-Kit", "vig-OS.revkit", "_REVKIT", "API"]) {
+      expect(parsePreviewPath(`/${spelling}/pr-7`), spelling).toBeUndefined();
+      expect(parseScopedThreadsPath(scopedThreadsPath(spelling, 7)), spelling).toBeUndefined();
+    }
+    // And the canonical spelling still parses, with the segment unchanged: the
+    // parser does not REWRITE a path, it declines the ones it will not serve.
+    // So the log key is still built from exactly what was requested.
+    for (const spelling of ["revkit", "vig-os.revkit", "a", "a_b-c.d0", "revkit.pr-7", "0abc"]) {
+      const parsed = parsePreviewPath(`/${spelling}/pr-7`);
+      expect(parsed?.repo, spelling).toBe(spelling);
+      expect(parsed?.logKey, spelling).toBe(`/${spelling}/pr-7`);
+      expect(canonicalRepoName(parsed?.repo ?? ""), spelling).toBe(spelling);
+    }
+    // The sweep, so the rule is a property of the character class rather than of
+    // the spellings a fixture picked: for every admitted letter, lowercase serves
+    // and uppercase does not. `isRepoName` still ACCEPTS `Revkit` — mint does,
+    // and folds it — which is the difference between the two sides.
+    let served = 0;
+    for (let code = 0x61; code <= 0x7a; code += 1) {
+      const lower = String.fromCharCode(code);
+      expect(parsePreviewPath(`/${lower}/pr-7`) !== undefined, lower).toBe(true);
+      expect(isRepoName(lower.toUpperCase()), `${lower}: the MINT still accepts it`).toBe(true);
+      expect(parsePreviewPath(`/${lower.toUpperCase()}/pr-7`) !== undefined, lower).toBe(false);
+      served += 1;
+    }
+    expect(served).toBe(26);
   });
 });
 

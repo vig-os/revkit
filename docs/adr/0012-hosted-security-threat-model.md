@@ -610,3 +610,37 @@ page, which itself loads the script, so the token survived in the address bar of
 exactly the visit a guest is most likely to back out of and screenshot. A constant
 rewrite target has no such failure mode: no input can produce a URL naming the
 token.
+
+## Amendment (2026-10-05, issue #96) — the preview route is a READ route, and a
+## repository name has ONE spelling in a path
+
+Two gate defaults were latent rather than exploited: nothing on this surface was
+bypassable at `dev 40d1f53e`. Both are recorded because the argument that
+justified them described a HANDLER rather than the gate.
+
+**The preview path takes read verbs only.** `<repo>/pr-<n>/…` was classified
+`preview` on *every* verb with `stateChanging: false`, so POST/PUT/DELETE on a
+preview path passed this ADR's gate with **no CSRF token and no
+`application/json` precondition** — the two controls above, which are stated
+"on state-changing verbs only". The recorded reason was that the handler answers
+501; but a route that changes no state is precisely the route whose obligations
+are skipped, so the first write handler under a preview path inherits the hole.
+The route is now `READ_VERB` like every other read-only route, and a wrong verb is
+`method-not-allowed` — still **behind the gate**, so an unauthorized caller learns
+"unauthorized", never "that route exists and you may not use this verb". This
+changes the wording in "Still deferred" above: the R2 preview surface is a 501 on
+`GET`/`HEAD`, and 405 on every other verb.
+
+**A repo segment is canonical or the path is not a preview.** `parsePreviewPath`
+returned `segments[1]` verbatim while `mintInvite` stores
+`canonicalRepoName(repo)`, so `/Revkit/pr-7` and `/revkit/pr-7` were two reviews
+— two log keys, two R2 prefixes, two access-log lines — and an invite covered
+exactly one of them. The read side is now **refused**, not folded: the parser
+returns undefined for a segment where `canonicalRepoName(segment) !== segment`.
+Folding there would have been the actual defect, because one stored value
+admitting two URLs is the "two spellings of one path must not both resolve"
+aliasing this ADR already applies to `/_revkit/` and to doubled slashes. So
+`/Revkit/pr-7` is a 404 — the same answer as `/API/pr-7` — and
+`inviteCovers` still compares with `!==`, so nothing in the scope check became
+case-insensitive. `isRepoName` still accepts `Revkit` at MINT; the two sides
+differ by exactly this one step, in one direction.

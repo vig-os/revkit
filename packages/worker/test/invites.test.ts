@@ -893,16 +893,18 @@ describe("invite mechanics (ADR-0009) against D1", () => {
   // case-SENSITIVE. So an operator who mints `repo = "Revkit"` and serves the
   // canonical `/revkit/` spelling refuses that guest their own review. Before
   // this normalisation that was fail-closed and pinned (see
-  // `test/authorization.test.ts`'s "or path case" case, which asserts
-  // `/REVKIT/pr-7/api/threads` answers a DIFFERENT, empty log), so it was an
-  // inconvenience rather than a hole. Slice 5b located the fix at mint time and
-  // this is that fix.
+  // `test/authorization.test.ts`'s "or path case" case, which asserted
+  // `/REVKIT/pr-7/api/threads` answered a DIFFERENT, empty log — and answers 404
+  // since #96, because the parser no longer produces that second review), so it
+  // was an inconvenience rather than a hole. Slice 5b located the fix at mint
+  // time and this is that fix.
   //
   // **The URL side is deliberately NOT normalised, and that is the whole
   // argument rather than an omission.** `inviteCovers` still compares with
-  // `!==`, so a mixed-case path still names a different review and still fails
-  // closed against a canonical invite. What moves is the STORED side, from
-  // whatever the operator typed to the one canonical spelling — which means
+  // `!==`, so a mixed-case scope still fails closed against a canonical invite —
+  // and since #96 a mixed-case PATH never reaches it, because `parsePreviewPath`
+  // refuses a repo segment that is not canonical. What moved is the STORED side,
+  // from whatever the operator typed to the one canonical spelling — which means
   // exactly ONE spelling of a URL grants, before and after. The set of admitted
   // URLs has the same cardinality; only its member changed. A case-fold on both
   // sides would have made `/REVKIT/` and `/revkit/` name ONE log, which is the
@@ -1067,13 +1069,25 @@ describe("invite mechanics (ADR-0009) against D1", () => {
           headers: authedHeaders(browser, null),
         })).status,
       ).toBe(403);
-      // And the mixed-case path for ITS OWN review is refused too — the fold did
-      // not make the comparison case-insensitive.
+      // And the mixed-case path for ITS OWN review is refused too — but since
+      // #96 it is refused by the ROUTER, not by the gate: a repo segment that is
+      // not canonical is not a preview, so there is no scope for the gate to
+      // compare and the answer is 404. The grant did not widen; the spelling
+      // stopped existing. The 403 for the two refusals above is still the GATE's,
+      // and that difference is the point: a case variant is now indistinguishable
+      // from a typo.
       const shouted = await harness.dispatch(`http://localhost${scopedThreadsPath("REVKIT", PR)}`, {
         headers: authedHeaders(browser, null),
       });
-      expect(shouted.status).toBe(403);
-      expect(await json(shouted)).toMatchObject({ error: "forbidden", reason: "invite-scope-mismatch" });
+      expect(shouted.status).toBe(404);
+      expect(await json(shouted)).not.toHaveProperty("reason");
+      // The canonical spelling of the SAME review is still served, so this is a
+      // refusal of the spelling rather than of the guest.
+      expect(
+        (await harness.dispatch(`http://localhost${scopedThreadsPath(REPO, PR)}`, {
+          headers: authedHeaders(browser, null),
+        })).status,
+      ).toBe(200);
     });
 
     test("the stored repo never reaches a log key — the key is derived from the PATH alone", async () => {
@@ -1084,10 +1098,12 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       // halves come from.
       const canonical = parseScopedThreadsPath(scopedThreadsPath(REPO, PR));
       expect(canonical?.logKey).toBe(`/${REPO}/pr-${PR}`);
-      // The one spelling an invite cannot buy: `/REVKIT/` is its own review.
-      const shouted = parseScopedThreadsPath(scopedThreadsPath("REVKIT", PR));
-      expect(shouted?.logKey).toBe("/REVKIT/pr-7");
-      expect(shouted?.logKey).not.toBe(canonical?.logKey);
+      // Since #96 `/REVKIT/` is not a spelling of anything: the parser refuses a
+      // non-canonical repo segment, so it cannot produce a log key to compare —
+      // and could not produce one that MOVED an invite's key if it tried. The
+      // invite's column is not an input to `logKey` either way, and now the only
+      // way to name this review is the name the invite stores.
+      expect(parseScopedThreadsPath(scopedThreadsPath("REVKIT", PR))).toBeUndefined();
     });
 
     test("normalisation is FORWARD-ONLY, and the schema says a migration has nothing to converge", async () => {
@@ -2047,6 +2063,49 @@ const PAGE_ELEMENTS = [
         const personalHtml = await (await open(harness, personal.minted.token)).response.text();
         expect(personalHtml).toContain("can comment");
         expect(personalHtml).not.toContain("read-only");
+      });
+
+      // ── #96 fix 3: the page promises nothing the deployment does not do ────
+      test("the page makes no automatic-deletion promise, and the CONFIG is why", async () => {
+        // **This is the fix, stated as an assertion about two files at once.**
+        // The form used to end "…is deleted 30 days after this link is revoked or
+        // expires" — ADR-0015's rule quoted to a guest as if this deployment were
+        // applying it. It is not: `wrangler.jsonc` declares no `triggers`, which
+        // is ADR-0015's own recorded deferral (a Cron Trigger cannot be exercised
+        // by this offline harness, so declaring one would be a claim no test
+        // could check), and `test/worker-config.test.ts` pins that key's absence.
+        // So `purgeStaleGuests` never runs and a guest is retained indefinitely.
+        //
+        // It was also wrong about the WHAT: the sweep ANONYMISES (`display_name` →
+        // `deleted user`, `email` → NULL, row kept — `test/invites.test.ts` proves
+        // that above), so "deleted" was never going to be the word even once the
+        // schedule exists.
+        //
+        // **Why the assertion is coupled to the config rather than to a literal.**
+        // A test asserting "the page does not contain '30 days'" passes today and
+        // says nothing about the day someone wires the trigger — at which point
+        // the honest sentence becomes a stale one, silently. Reading the same
+        // `wrangler.jsonc` the Worker is built from means the two go red together
+        // if they ever disagree, which is the same pairing `test/worker-config.test.ts`
+        // already makes for the other half of this decision.
+        const config = readWranglerConfig();
+        const sweepIsScheduled = Object.keys(config).includes("triggers");
+        const minted = await mintInvite(harness.db, { repo: REPO }, { keys });
+        if (!minted.ok) throw new Error("mint failed");
+        const html = await (await open(harness, minted.minted.token)).response.text();
+
+        // The direction that holds for any deployment: the page never claims a
+        // deletion this build does not perform. Anchored so a page that merely
+        // dropped the sentence would not pass.
+        expect(html).toContain("Nothing here removes it automatically");
+        expect(html).not.toMatch(/is deleted\b/i);
+        expect(html).not.toMatch(/\bdeleted \d+ days?\b/i);
+        // And the coupling: with no schedule wired, that sentence is the truth.
+        // When `triggers` lands, this assertion fails and the sentence has to be
+        // re-argued against ADR-0015 rather than left describing a job nobody runs.
+        // The sweep itself is real — it is driven by "ADR-0015's 30-day guest
+        // clock" above — so what is missing is the INVOCATION, not the mechanism.
+        expect(sweepIsScheduled, "no cron is wired, so the page must not promise a sweep").toBe(false);
       });
 
       test("a repo-scoped invite says \"all pull requests\"; a PR-scoped one names the PR", async () => {
