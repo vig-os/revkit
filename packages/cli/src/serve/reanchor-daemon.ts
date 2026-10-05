@@ -464,9 +464,17 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * `doRefresh` may be handed the thread list instead of re-querying
    * it — and only while `known.head` is still `store.head()`, which is
    * what keeps a sweep that races a write as correct as the per-path
-   * query it replaced. A coalesced RERUN deliberately drops it: the log
-   * may have moved since the caller's read, so the rerun asks the
-   * store itself.
+   * query it replaced.
+   *
+   * A coalesced RERUN **carries** the bucket rather than dropping it
+   * (`existing.known ??= known` on join, `state.known` on the rerun),
+   * because dropping it made every path of an OVERLAPPING pair of
+   * sweeps re-query on the rerun — the O(P x events) cost the grouping
+   * exists to remove, on exactly the mounts that overlap. Carrying is
+   * not a weakening: `doRefresh` re-evaluates
+   * `known.head === store.head()` on the rerun as well, so a bucket
+   * that is no longer current is rejected there too, and the worst a
+   * wrong bucket can cost is one wasted query.
    *
    * NOT exposed on the handle: `known` is only ever a regrouping of a
    * read this module already performed, so a public caller could only

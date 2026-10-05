@@ -202,7 +202,6 @@ describe("issue #67 — the unscoped read", () => {
     // window is only about not racing a POST's own bookkeeping.
     await Bun.sleep(250);
     const readsBefore = reads(ctx);
-    const pipelinesBefore = pipelines(ctx);
 
     const res = await api(ctx, "/api/threads?fields=id&status=open,resolved,orphaned");
     expect(res.status).toBe(200);
@@ -217,15 +216,15 @@ describe("issue #67 — the unscoped read", () => {
     // THE REGRESSION ASSERTION. On origin/dev this read called
     // `refreshAll()`, which read every one of the 40 sources.
     expect(reads(ctx) - readsBefore).toBe(0);
-    // No `pipelineRunCount` assertion here, and the reason is worth
-    // recording: on an UNCHANGED store the state-derived skip returns
-    // before the pipeline counter is ever touched, so "0 pipeline runs"
-    // is what a read that DID sweep also reports (measured on
-    // origin/dev: an unscoped GET on an unchanged 5-path store, 5 file
-    // reads and 0 pipeline runs). It would pass on the old code and
-    // prove nothing. Test 4 is where the pipeline counter is
-    // load-bearing, because there a file really did change.
-    expect(pipelines(ctx)).toBe(pipelinesBefore);
+    // Deliberately NO `pipelineRunCount` assertion here, and the reason
+    // is worth recording: on an UNCHANGED store the state-derived skip
+    // returns before the pipeline counter is ever touched, so "0
+    // pipeline runs" is what a read that DID sweep also reports
+    // (measured on origin/dev: an unscoped GET on an unchanged 5-path
+    // store, 5 file reads and 0 pipeline runs). Such an assertion would
+    // pass on the old code and prove nothing. Test 4 is where the
+    // pipeline counter is load-bearing, because there a file really did
+    // change and the skip cannot fire.
   });
 
   test("2. REGRESSION: a sweep reads the log ONCE, whatever the path count", async () => {
@@ -575,6 +574,109 @@ describe("issue #67 — the unscoped read", () => {
     // And the coalescing itself is untouched: every path ran once for
     // the first sweep and once for the rerun, never more.
     expect(rd.fileReadCount()).toBe(2 * paths);
+  });
+
+  test("9. B2 DIRECTION: the sweep's head stamp is taken BEFORE the read it describes", async () => {
+    // Test 7 pins that the head check EXISTS: a write inside the sweep
+    // makes it fail. This pins its DIRECTION, which is the half that can
+    // silently regress.
+    //
+    // `refreshAll` stamps `head` and then reads the log. If the stamp
+    // came AFTER the read instead, a write landing between the two would
+    // be inside the stamp — the stamp would match `store.head()`, the
+    // check would pass, and the sweep would use a bucket taken before
+    // the write. That is the exact window B2 was about, reopened.
+    //
+    // So the write is injected from INSIDE the sweep's own unfiltered
+    // read, immediately AFTER the rows have been read and BEFORE the
+    // call returns:
+    //
+    //   stamp, then read -> write lands after the stamp -> stamp is too
+    //     low -> the compare fails -> the path re-queries -> sees the
+    //     reopened thread -> re-anchors it.   (this branch: line 9)
+    //   read, then stamp -> write lands before the stamp -> stamp matches
+    //     -> the compare passes -> the bucket (taken before the write) is
+    //     used -> the reopened thread is invisible -> line 5.
+    //
+    // Verified by mutation: with the stamp moved after the read, this
+    // test fails with `Expected: 9, Received: 5`.
+    const paths = ["docs/f0.md", "docs/f1.md"];
+    const root = mkdtempSync(join(tmpdir(), "revkit-b67stamp-"));
+    mkdirSync(join(root, "docs"), { recursive: true });
+    const store = SqliteThreadStore.open({ filename: ":memory:" });
+    for (let i = 0; i < paths.length; i += 1) writeFileSync(join(root, paths[i]!), sourceFor(i));
+    for (let i = 0; i < paths.length; i += 1) {
+      const source = sourceFor(i);
+      const anchor: Anchor = {
+        path: paths[i]!,
+        startLine: 5,
+        endLine: 5,
+        quote: { exact: source.split("\n")[4]!, prefix: source.split("\n")[3]!, suffix: source.split("\n")[5]! },
+        revision: await revisionOf(source),
+      };
+      store.putSnapshot(anchor.revision, source);
+      await store.append({
+        kind: "comment.created",
+        actor: { kind: "local", id: "u" },
+        threadId: `t-${i}`,
+        commentId: `c-${i}`,
+        anchor,
+        body: "x",
+      });
+    }
+    await store.append({ kind: "thread.resolved", actor: { kind: "local", id: "u" }, threadId: "t-1" });
+    for (let i = 0; i < paths.length; i += 1) writeFileSync(join(root, paths[i]!), editedSourceFor(i));
+
+    let armed = false;
+    let injected = false;
+    let perPathQueries = 0;
+    const injector = new Proxy(store, {
+      get(target, prop): unknown {
+        if (prop === "threads") {
+          return async (filter?: { path?: string }): Promise<unknown> => {
+            // Only the sweep's own UNFILTERED read carries the write.
+            if (filter !== undefined) perPathQueries += 1;
+            const rows = await target.threads(filter);
+            if (armed && filter === undefined && !injected) {
+              injected = true;
+              await target.append({ kind: "thread.reopened", actor: { kind: "local", id: "u" }, threadId: "t-1" });
+            }
+            return rows;
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const rd = startReanchorDaemon({
+      store: injector as unknown as SqliteThreadStore,
+      bus: new EventBus(),
+      repoRoot: root,
+      logger: makeLogger({ sink: { write: () => {} } }),
+      fileDebounceMs: 60_000,
+      buildDebounceMs: 60_000,
+    });
+    booted.push({ rd, store, root });
+    // The startup `reconcileWatchers()` reads the log unfiltered too.
+    // Let it land before arming, or it would consume the injection.
+    await Bun.sleep(50);
+    perPathQueries = 0;
+    armed = true;
+
+    await rd.refreshAll();
+
+    expect(injected).toBe(true);
+    // The consequence first, because it is the one that matters: with
+    // the stamp taken before the read, the write lands after it, the
+    // compare fails, and the reopened thread is re-anchored. With the
+    // stamp taken after the read, the stamp swallows the write, the
+    // bucket passes, and the thread stays where it was.
+    const reopened = await threadOf(store, "t-1");
+    expect(reopened.status).toBe("open");
+    expect(lineStartOf(reopened)).toBe(9);
+    // And the mechanism behind it: the stamp was too low, so BOTH paths
+    // rejected the bucket and re-read their tracked set.
+    expect(perPathQueries).toBe(paths.length);
   });
 
   test("6. an unrecognised or REPEATED `fields` is a 400, not a silent read", async () => {
