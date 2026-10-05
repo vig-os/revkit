@@ -58,10 +58,19 @@ const CEILING = 8192;
 // 6022 against a budget of 1800: this file was the leak it was written to detect.
 //
 // So every burst below is the SMALLEST that still drives its verdict past the
-// matching budget with margin, and each is one to three orders of magnitude
-// under the leg's own 4454 peak / 1021 growth. The headroom being spent is
-// 1800 - 1284 = 516 of growth on CI and 8192 - 4695 = 3497 of peak, against
-// perturbations of at most TRANSIENT_BURST below.
+// matching budget with margin, and each is orders of magnitude under the leg's
+// own ~4450 peak / ~970 growth. The headroom being spent is 1800 - 1284 = 516 of
+// growth on CI and 8192 - 4695 = 3497 of peak, against a perturbation of
+// SETTLED_BURST below — the only burst this file still opens.
+//
+// A second, larger burst (51) used to sit here for a test of a step inside the
+// measurement window. It was CUT rather than repaired, and the reason is worth
+// recording because it is the failure mode this file already hit once: all four
+// of its assertions passed whether or not the burst fired, because `growth 0`
+// and `baseline settled: yes` are both what a child that opens NOTHING also
+// produces. Deleting the burst line left the test green. A test that cannot fail
+// when its subject is removed is not worth a 24-second window, and its property
+// is already proven deterministically in the arithmetic suite above.
 
 /** Transient size for the peak-only test, against its ceiling of 3.
  *
@@ -76,68 +85,21 @@ const CEILING_TEST_CEILING = 3;
  * budget of 60. Wide enough that the verdict cannot depend on poll timing. */
 const LEAK_TEST_BUDGET = 60;
 
-/** A step inside the measurement window, against a budget of 40.
- *
- * Two constraints make this deterministic rather than racy, and both were found
- * the hard way. First, the burst is ONE `exec` with 51 redirections rather than
- * 51 `exec` calls: the loop form takes ~1.5s under load, which pushed the
- * pre-burst portion past p10's 10% exclusion and made the floor land on the low
- * samples — the run then reported growth 240 and failed, intermittently, on the
- * same box minutes apart. Second, the burst fires 0.15s after the warm-up
- * expires, so the low portion is ~3% of the window whether or not a poll lands
- * in it.
- *
- * RESIDUAL DEPENDENCY, stated rather than implied, because it is not the offset
- * that matters — it is WHERE IN THE WINDOW the burst lands, and the useful zone
- * is narrower than it looks. `probe` is the p10 of the window's first DECILE
- * and `floor` its p10, so:
- *
- *   burst at window index 1     the whole first decile is post-burst, so
- *                               probe == floor, deficit 0, settled YES. This
- *                               is what an over-eager burst produces and it is
- *                               the reason the unsettled test below needs the
- *                               burst a little way in rather than immediately.
- *   burst inside the first      probe is low, floor is the plateau, deficit is
- *   decile but before its 10%   the full burst — which is the zone both tests
- *   mark (indices ~2-30 of ~380) want.
- *   burst past the 10% mark     floor moves onto the low samples and the
- *                               transient is charged as growth. This is the
- *                               failure mode: an earlier revision using a 6s
- *                               window went red under `bun test` with
- *                               `growth 102` because the burst landed ~0.5s
- *                               late, which on 110 samples is past 10%.
- *
- * Script start-up under load is not bounded by anything this test controls, so
- * the window is 24s: at the measured ~60ms per poll its 10% mark is ~2.3s after
- * the warm-up, against a burst intended to land ~0.5s in. Verified stable across
- * burst offsets 2.3 / 2.5 / 2.7. If a runner ever delays child start-up beyond
- * ~1.8s this test goes red with `growth ~102` instead of `growth 0` — a false
- * negative on the TEST, not on the gate, which is entitled to the `unmeasured`
- * in that case. The same property is proven deterministically in the arithmetic
- * suite above, where the trace is available to both statistics.
- *
- * `exec {fd}>` rather than `eval exec N</dev/null`, for the same reason as the
- * unsettled test: the latter aborts bash above ~240 descriptors on this host.
- * Note it opens the descriptors close-on-exec-false, so the `sleep` child
- * inherits them and the poller's tree walk counts them twice — a burst of 51
- * reads as a step of ~102. The assertions account for that.
- *
- * Must exceed TRANSIENT_BUDGET for `max - min` to have failed on it (that is
- * the whole point), and stay under FDV_SLACK so the settled verdict is a clean
- * pass: 51 <= 200, which is the assertion the test then makes exactly. */
-const TRANSIENT_BURST = 51;
-const TRANSIENT_BUDGET = 40;
-
 /** A count still climbing when the measurement window opens, sized so the
  * settledness test refuses it.
  *
- * The deficit this produces is `SETTLED_BURST - 7` — the child's own
- * descriptors are the baseline — against a tolerance of `FDV_SLACK` (200) plus
- * 10% of a growth that is ~0 once the count is flat. So 260 gives a deficit of
- * ~253 against a tolerance of ~200: a 53-descriptor margin, and crucially an
- * EXACT one, because the deficit is set by the burst size and not by poll
- * timing. It has to exceed ~208 for this to fire at all, which is why it is not
- * a small number.
+ * The MEASURED deficit is 520, not `SETTLED_BURST - 7`. The ×2 is real and is
+ * the same close-on-exec-false inheritance this file documents below: `exec
+ * {fd}>` opens the descriptors without O_CLOEXEC, so the child's own `sleep`
+ * inherits all 260 and the poller's whole-tree walk counts them twice —
+ * 260 + 260 + the shell's own 7. Two earlier revisions of this comment said
+ * `SETTLED_BURST - 7` and then "~253", both of which are the arithmetic before
+ * the doubling was understood; the figure that matters is the measured one.
+ *
+ * 520 sits against a tolerance of `FDV_SLACK` (200) plus 10% of a growth that is
+ * ~0 once the count is flat, i.e. ~200: a 320-descriptor margin, and an EXACT
+ * one because the deficit is set by the burst size rather than by poll timing.
+ * It has to exceed ~208 to fire at all, which is why it is not a small number.
  *
  * Opened with `exec {fd}>` in a loop rather than one `eval exec N</dev/null`:
  * the loop form is both faster (220 descriptors in 4ms measured) and lifts a
@@ -529,8 +491,9 @@ sleep 2
     //
     // The shape has to be one the gate REFUSES, so it is the settledness test's
     // own blind spot rather than a passing case: a count that is still climbing
-    // when the window opens, by more than the tolerance. SETTLED_BURST makes
-    // that deficit ~253 against a tolerance of ~200.
+    // when the window opens, by more than the tolerance. SETTLED_BURST of 260
+    // produces a MEASURED deficit of 520 against a tolerance of ~200 — the ×2 is
+    // the close-on-exec-false inheritance, see the constant's doc comment.
     //
     // Opened with `exec {fd}>` rather than `eval exec` because the latter aborts
     // bash above ~240 descriptors on this host (heap corruption, exit 134/139),
@@ -540,6 +503,20 @@ for _ in $(seq 1 ${SETTLED_BURST}); do exec {fd}>/dev/null; done
 sleep 24
 `;
     const r = await runScript(1_000_000, DELTA_BUDGET, child);
+    // THE ANTI-VACUITY ASSERTION, and it is here because this file already had
+    // one test that could not fail (see the note on the burst sizes above).
+    // `baseline settled: no` on its own does not prove the burst ran, because
+    // the absence of any burst is not the only way to get here — so the deficit
+    // is parsed and required to exceed FDV_SLACK. Without the burst line the
+    // measured deficit is 0 and this fails first. Exact-number assertion would
+    // be stronger still but would break on the ×2 inheritance changing; "> 200"
+    // proves the subject ran without pinning the mechanism.
+    const deficit = /opening probe of \d+ — a deficit of (-?\d+)/.exec(r.output);
+    expect(deficit, `no deficit on the summary line:\n${r.output}`).not.toBeNull();
+    expect(
+      Number(deficit![1]),
+      `deficit ${deficit![1]} did not exceed FDV_SLACK, so the burst did not fire:\n${r.output}`,
+    ).toBeGreaterThan(200);
     expect(r.output, r.output).toContain("baseline settled: no");
     expect(r.output, r.output).toContain("had not settled when the window opened");
     expect(r.output, r.output).toContain("growth NOT MEASURED");
@@ -552,31 +529,6 @@ sleep 24
     // same class of mistake as #86's own message.
     expect(r.output).not.toContain("the leg finished inside the");
     expect(r.output, "an unsettled baseline must not be reported as a pass").not.toContain("FAILED");
-    expect(r.code, r.output).toBe(0);
-  }, 90_000);
-
-  test("verdict: a step inside the window is absorbed by the floor, not charged as growth", async () => {
-    // #86 end to end, and the sharpest form of it: the reported growth must be
-    // ZERO, not merely under budget. The window opens on a process holding ~7
-    // descriptors and 0.15s later the same process holds ~56. Under `max - min`
-    // those low samples define the floor and growth reads ~49 against a budget
-    // of 40 — a false failure. Under p10 they cannot, so growth is 0.
-    //
-    // A weaker "did not exceed the budget" assertion would pass even if the
-    // floor were wrong, which is why this one is exact. The complementary
-    // deterministic proof that `max - min` does fail on this shape is in the
-    // arithmetic suite above, where the same trace is available to both
-    // statistics.
-    const child = `sleep 2.5
-for _ in $(seq 1 ${TRANSIENT_BURST}); do exec {fd}>/dev/null; done
-sleep 24
-`;
-    const r = await runScript(1_000_000, TRANSIENT_BUDGET, child);
-    expect(r.output).not.toContain("FAILED");
-    expect(r.output, r.output).toContain("baseline settled: yes");
-    expect(r.output, `the low samples defined the floor:\n${r.output}`).toContain(
-      `growth 0 (budget ${TRANSIENT_BUDGET})`,
-    );
     expect(r.code, r.output).toBe(0);
   }, 90_000);
 
