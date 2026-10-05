@@ -70,7 +70,7 @@
 import {
   cloneLogState,
   emptyLogState,
-  parseArchive,
+  prepareImport,
   reduce,
   reduceAsks,
   reviewEventSchema,
@@ -78,7 +78,6 @@ import {
   selectThreads,
   validateNext,
   ThreadStoreAppendError,
-  ThreadStoreImportError,
   type AskFilter,
   type AskRecord,
   type Clock,
@@ -384,35 +383,22 @@ export class D1ThreadStore implements ThreadStore {
 
   private async importNow(archive: ThreadArchive): Promise<void> {
     // Same guarantees as `InMemoryThreadStore.import` and
-    // `SqliteThreadStore.import`: `parseArchive` ran the Zod shape and
-    // `validateNext` from empty at the byte boundary; re-parse so a
-    // caller handing us an in-memory object hits the same check; the
-    // archive's first seq must be strictly greater than our head; and
-    // the whole sequence is dry-run against a DEEP COPY so a refusal
-    // leaves nothing half-imported.
-    const validated = parseArchive(archive);
-    if (validated.events.length === 0) return;
-    const firstSeq = validated.events[0]?.seq ?? 0;
-    if (firstSeq <= this.#head) {
-      throw new ThreadStoreImportError(
-        `import: archive's first seq ${firstSeq} is not strictly greater than the store's head ${this.#head}.`,
-      );
-    }
-    const shadow = cloneLogState(this.#logState);
-    for (const event of validated.events) {
-      const result = validateNext(shadow, event);
-      if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
-    }
-    // Every event passed on the shadow. The rows go in ONE batch, so a
-    // PK collision mid-archive writes none of them (measured: D1
-    // refuses the whole batch) and the store is left exactly as it was.
+    // `SqliteThreadStore.import`, for the same reason:
+    // `prepareImport` (review-core) owns the parse, the head
+    // precondition and the dry run against a DEEP COPY of this store's
+    // state, and raises `ThreadStoreImportError` for every refusal. Here
+    // we only COMMIT, in ONE batch, so a PK collision mid-archive writes
+    // none of the events (measured: D1 refuses the whole batch) and the
+    // store is left exactly as it was.
+    const events = prepareImport(archive, this.#logState, this.#head);
+    if (events.length === 0) return;
     await this.#db.batch(
-      validated.events.map((event) =>
+      events.map((event) =>
         this.#db.prepare(INSERT_ARCHIVE_SQL).bind(this.#logKey, event.seq, event.ts, JSON.stringify(event)),
       ),
     );
-    for (const event of validated.events) {
-      // Cannot fail — the shadow accepted this exact sequence.
+    for (const event of events) {
+      // Cannot fail — the dry run accepted this exact sequence.
       validateNext(this.#logState, event);
       this.#head = event.seq;
     }

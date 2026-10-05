@@ -26,9 +26,8 @@
 
 import { Database } from "bun:sqlite";
 import {
-  cloneLogState,
   emptyLogState,
-  parseArchive,
+  prepareImport,
   reduce,
   reduceAsks,
   reviewEventSchema,
@@ -46,7 +45,7 @@ import {
   type ThreadFilter,
   type ThreadStore,
 } from "@revkit/review-core";
-import { ThreadStoreAppendError, ThreadStoreImportError } from "@revkit/review-core";
+import { ThreadStoreAppendError } from "@revkit/review-core";
 
 const wallClock: Clock = () => new Date().toISOString();
 
@@ -244,38 +243,22 @@ export class SqliteThreadStore implements ThreadStore {
   }
 
   async import(archive: ThreadArchive): Promise<void> {
-    // Same guarantees as `InMemoryThreadStore.import`: parse the archive
-    // (Zod shape + `validateNext` from empty), refuse it as a whole if
-    // its first seq is not strictly greater than the store's head, and
-    // then re-play through `validateNext` against THIS store's state to
-    // catch a boundary conflict (a duplicated commentId across the two
-    // sides). Nothing lands unless the whole batch validates.
-    const validated = parseArchive(archive);
-    if (validated.events.length === 0) return;
-    const firstSeq = validated.events[0]?.seq ?? 0;
-    if (firstSeq <= this.#head) {
-      throw new ThreadStoreImportError(
-        `import: archive's first seq ${firstSeq} is not strictly greater than the store's head ${this.#head}.`,
-      );
-    }
-    // Dry-run every event through a scratch copy of the state so the
-    // real state stays untouched on a rejection.
-    const scratch = cloneLogState(this.#logState);
-    for (const event of validated.events) {
-      const result = validateNext(scratch, event);
-      if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
-    }
-    // All events pass: commit them in one transaction and update the
-    // real state alongside so a mid-batch crash leaves the store empty
-    // of this import.
+    // Same guarantees as `InMemoryThreadStore.import`, and the same
+    // guarantees for the same reason: `prepareImport` (review-core) owns
+    // the parse, the head precondition and the dry run against a DEEP
+    // COPY of this store's state, and raises `ThreadStoreImportError` for
+    // every refusal. This method only COMMITS — and commits in one
+    // transaction, so a mid-batch failure leaves nothing half-imported.
+    const events = prepareImport(archive, this.#logState, this.#head);
+    if (events.length === 0) return;
     const insert = this.#db.prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)");
     this.#db.transaction(() => {
-      for (const event of validated.events) {
+      for (const event of events) {
         insert.run(event.seq, event.ts, JSON.stringify(event));
       }
     })();
-    for (const event of validated.events) {
-      // Cannot fail — scratch already accepted this exact sequence.
+    for (const event of events) {
+      // Cannot fail — the dry run accepted this exact sequence.
       validateNext(this.#logState, event);
       this.#head = event.seq;
     }
