@@ -870,6 +870,30 @@
   opacity: 0.5;
   cursor: wait;
 }
+/* Issue #70 round 3 — the reviewer's own resolve/reopen that a later
+ * lifecycle change superseded. Deliberately NOT an alert: nothing is
+ * broken and nothing needs a decision, it is a notice that a change did
+ * not reach GitHub. `role="status"` announces it politely. */
+.revkit-rail__dropped-intents {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #b45309;
+  background: color-mix(in srgb, #b45309 8%, transparent);
+}
+.revkit-rail__dropped-intents-summary {
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__dropped-intents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--revkit-rail-muted);
+}
 .revkit-rail__review-submit {
   display: flex;
   flex-direction: column;

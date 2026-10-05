@@ -7,7 +7,9 @@
 - Amends: [ADR-0009](0009-auth-github-app-invite-links.md)
 - Amended by: the 2026-10-05 (issue #70) amendment below — on the LOCAL surface,
   an agent-authored reply / resolve reaches GitHub only through an explicit
-  reviewer promotion, so it is a human act like every other GitHub write.
+  reviewer promotion, so it is a human act like every other GitHub write. The
+  subject of that claim is the agent BEARER, not the agent as a process: a
+  same-user agent holding a reviewer session is out of the model (see #55).
 
 ## Context
 
@@ -207,7 +209,7 @@ existing BYTE-EXACT test in `packages/cli/test/serve/headers.test.ts` was not
 edited. The daemon's public module surface is unchanged too, so `daemon.ts` and its
 tests are untouched.
 
-## Amendment (2026-10-05, issue #70) — the local surface promotes agent drafts, never the agent
+## Amendment (2026-10-05, issue #70) — the local surface promotes agent drafts through a reviewer session, never the bearer
 
 **"Comments accumulate in the pending review, as the reviewer"** (Decision,
 surface (b)) is unchanged for everything the reviewer authors. This amendment
@@ -256,6 +258,12 @@ stale target, and no reconcile resolves it. The rule is one derivation in
 `@revkit/review-core` (`reduceThreadLifecycleStates`) read by the rail's draft
 list, the route and the reconciler alike, and it is enforced in the log's
 validator too — the writer is not allowed a different answer than the UI.
+
+**The reviewer is told when their own resolve is superseded.** An agent's later
+change retires a reviewer's outstanding resolve or reopen before it reaches GitHub
+(above). The reconciler correctly refuses to fire it, and the rail says so — naming
+the thread — rather than leaving the reviewer to believe their click posted. This is
+a notice, not a prompt: nothing is stuck and nothing needs a decision.
 
 **Promotion pins the text it approves.** The event records the promoted comment's
 authoring `seq` and the SHA-256 of its body at promotion time, and a comment whose

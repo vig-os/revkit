@@ -362,6 +362,7 @@ interface StateBody {
     readonly terminal: ReadonlyArray<{ readonly reviewNodeId: string; readonly outcome: { readonly kind: string; readonly reason?: string } }>;
     readonly unsyncedCommentIds?: readonly string[];
     readonly agentDrafts: ReadonlyArray<{ readonly threadId: string; readonly target: string; readonly commentId?: string; readonly path: string }>;
+    readonly droppedReviewerIntents?: ReadonlyArray<{ readonly threadId: string; readonly target: string; readonly path: string }>;
   };
 }
 
@@ -418,6 +419,18 @@ function importedThread(id: string, isResolved = false): GhReviewThread {
       },
     ],
   };
+}
+
+/** Did the AGENT's text ever reach the fake? The write counters are not
+ * monotonic across a submit or a discard (the fake clears its draft
+ * ledger when a review is submitted or deleted), so the honest
+ * assertion after a terminal transition is on the text, not the count. */
+function agentBodyReached(ctx: Ctx, text: string): boolean {
+  return (
+    ctx.fake.drafts.some((draft) => draft.body.includes(text)) ||
+    ctx.fake.replies.some((reply) => reply.body.includes(text)) ||
+    ctx.fake.resolutions.some((resolution) => JSON.stringify(resolution).includes(text))
+  );
 }
 
 /** Every mutation the fake recorded — the "was anything written?"
@@ -1155,5 +1168,230 @@ describe("#70 round 2 — N3: the invariant behind intentRecordedFor", () => {
       );
       expect(intent !== undefined && intent.seq < event.seq).toBe(true);
     }
+  });
+});
+
+// ── Round 3 ────────────────────────────────────────────────────────────
+// The re-check's H1/H5/H6: the heal must respect the route's
+// open-pending-review rule, a dropped reviewer intent must be visible,
+// and the unpinned-promotion paths must be pinned.
+
+describe("#70 round 3 — the heal never composes what the route would refuse (H1)", () => {
+  /** End the pending review with the daemon running, THEN leave an
+   * incomplete promotion in the log, then restart.
+   *
+   * The order matters and is the honest shape of the state: a promotion
+   * whose intent append was lost, left behind a review that has since
+   * gone terminal (submitted, discarded, or abandoned by the head-move
+   * reanchor — which terminates a review WITHOUT going through the
+   * promote route). The route would refuse to create such a promotion
+   * today, so the heal must be at least as conservative as the route:
+   * composing here would repair an intent into a review the reviewer
+   * has already closed, and the next reconcile would open a fresh one
+   * and post into it. */
+  async function terminalReviewWithIncompletePromotion(
+    endPending: (ctx: Ctx) => Promise<Response>,
+  ): Promise<{ readonly ctx: Ctx }> {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "late")).status).toBe(201);
+    // The fake clears its draft ledger on submit AND on discard, so the
+    // baseline for "nothing new was written" is taken here rather than
+    // after the review is closed.
+    expect((await endPending(ctx)).status).toBe(201);
+
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find(
+      (event) => event.kind === "comment.created" && event.commentId === "c-late",
+    );
+    if (authored === undefined) throw new Error("no authored event");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted",
+      actor: { kind: "local", id: "p70-user" },
+      threadId: "th-late",
+      target: "comment",
+      commentId: "c-late",
+      commentSeq: authored.seq,
+      bodyHash: await revisionOf("agent draft body"),
+    });
+    return { ctx: await restartCtx(ctx) };
+  }
+
+  const submit = async (ctx: Ctx): Promise<Response> =>
+    await fetch(`${ctx.handle.url}/api/review/submit`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: JSON.stringify({ event: "COMMENT" }),
+    });
+
+  const discard = async (ctx: Ctx): Promise<Response> =>
+    await fetch(`${ctx.handle.url}/api/review/discard`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: JSON.stringify({ reason: "user-discarded" }),
+    });
+
+  test("heal-after-submit: no intent is composed and nothing is written", async () => {
+    const { ctx: restarted } = await terminalReviewWithIncompletePromotion(submit);
+    await Bun.sleep(120);
+    const log = await readRawEvents(restarted.sqlitePath);
+    expect(log.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-late")).toBe(false);
+    expect(agentBodyReached(restarted, "agent draft body")).toBe(false);
+    // Exactly one submit — the reviewer's own, nothing reopened.
+    expect(restarted.fake.submits).toHaveLength(1);
+    // And a cookie reconcile cannot smuggle it through either: there is
+    // no intent for the reconciler to act on.
+    const reconcile = await fetch(`${restarted.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: restarted.handle.url, "sec-fetch-site": "same-origin", cookie: restarted.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(agentBodyReached(restarted, "agent draft body")).toBe(false);
+    expect(restarted.fake.drafts).toHaveLength(0);
+    expect(restarted.fake.submits).toHaveLength(1);
+    // The route refuses it too, with the same reason.
+    const refused = await promote(restarted, { threadId: "th-late", target: "comment", commentId: "c-late" });
+    expect(refused.status).toBe(409);
+    expect(((await refused.json()) as { error: string }).error).toBe("no-open-pending-review");
+  });
+
+  test("heal-after-discard: no intent is composed and no review is reopened", async () => {
+    const { ctx: restarted } = await terminalReviewWithIncompletePromotion(discard);
+    await Bun.sleep(120);
+    const log = await readRawEvents(restarted.sqlitePath);
+    expect(log.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-late")).toBe(false);
+    // The discarded review is NOT quietly reopened behind the reviewer.
+    expect(restarted.fake.reviewNodeId).toBeNull();
+    expect(agentBodyReached(restarted, "agent draft body")).toBe(false);
+    const reconcile = await fetch(`${restarted.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: restarted.handle.url, "sec-fetch-site": "same-origin", cookie: restarted.cookie },
+      body: "{}",
+    });
+    expect(reconcile.status).toBe(201);
+    expect(restarted.fake.reviewNodeId).toBeNull();
+    expect(agentBodyReached(restarted, "agent draft body")).toBe(false);
+    expect(restarted.fake.drafts).toHaveLength(0);
+  });
+});
+
+describe("#70 round 3 — the unpinned promotion paths (H6)", () => {
+  /** A promotion carrying NO content pin — the shape a log written
+   * before the pin existed has, reachable today only through a
+   * hand-built event. */
+  async function appendUnpinnedPromotion(ctx: Ctx, commentId: string, threadId: string): Promise<void> {
+    await ctx.handle.stop();
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted",
+      actor: { kind: "local", id: "p70-user" },
+      threadId,
+      target: "comment",
+      commentId,
+    });
+  }
+
+  test("the heal does NOT compose an intent for an unpinned promotion", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "unpinned")).status).toBe(201);
+    await appendUnpinnedPromotion(ctx, "c-unpinned", "th-unpinned");
+
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const log = await readRawEvents(restarted.sqlitePath);
+    // No intent was composed: the heal cannot show the current text is
+    // the approved text, so it leaves the promotion alone.
+    expect(log.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-unpinned")).toBe(false);
+    expect(restarted.fake.drafts).toHaveLength(1);
+    // The promotion still stands as the record of what was attempted.
+    expect(log.some((event) => event.kind === "draft.promoted")).toBe(true);
+  });
+
+  test("re-promoting over an unpinned promotion is refused (promoted-body-changed)", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer first", "own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "agent draft body", "unpinned")).status).toBe(201);
+    await appendUnpinnedPromotion(ctx, "c-unpinned", "th-unpinned");
+
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const draftsBefore = restarted.fake.drafts.length;
+    const refusal = await promote(restarted, { threadId: "th-unpinned", target: "comment", commentId: "c-unpinned" });
+    expect(refusal.status).toBe(409);
+    const body = (await refusal.json()) as { error: string };
+    expect(body.error).toBe("promoted-body-changed");
+    expect(restarted.fake.drafts.length).toBe(draftsBefore);
+    // And the refusal writes nothing: no second promotion, no intent.
+    const log = await readRawEvents(restarted.sqlitePath);
+    expect(log.filter((event) => event.kind === "draft.promoted")).toHaveLength(1);
+    expect(log.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-unpinned")).toBe(false);
+  });
+});
+
+describe("#70 round 3 — a dropped reviewer intent is visible (H5)", () => {
+  test("a reviewer resolve superseded by an agent reopen is reported, not silent", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_dropped")], failBeforeOnce: "ResolveReviewThread" });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+
+    // The reviewer's resolve, whose write fails.
+    const reviewResolve = await fetch(`${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reviewResolve.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+
+    // Still outstanding, so nothing is reported yet — the reconciler
+    // still owes it.
+    expect((await readState(ctx)).state.droppedReviewerIntents ?? []).toEqual([]);
+
+    // The agent reopens, which supersedes it.
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+    const state = await readState(ctx);
+    expect(state.state.droppedReviewerIntents).toEqual([
+      { threadId: imported.id, target: "resolve", path: "docs/index.md" },
+    ]);
+    // Still no write: the notice is not the mechanism, the supersession is.
+    expect(ctx.fake.resolutions).toHaveLength(0);
+  });
+
+  test("a reviewer resolve that COMPLETED is never reported as dropped", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_completed")] });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+    const reviewResolve = await fetch(`${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reviewResolve.status).toBe(201);
+    expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_completed", op: "resolve" }]);
+    // Then the agent reopens. The resolve reached GitHub, so there is
+    // nothing dropped to report.
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+    expect((await readState(ctx)).state.droppedReviewerIntents ?? []).toEqual([]);
+  });
+
+  test("a dropped reviewer reopen is reported too", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_dropped_reopen", true)], failBeforeOnce: "UnresolveReviewThread" });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens the review", "own")).status).toBe(201);
+    const reviewReopen = await fetch(`${ctx.handle.url}/api/threads/${encodeURIComponent(imported.id)}/reopen`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(reviewReopen.status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(0);
+    // The agent resolves, superseding the reviewer's reopen.
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+    const state = await readState(ctx);
+    expect(state.state.droppedReviewerIntents).toEqual([
+      { threadId: imported.id, target: "reopen", path: "docs/index.md" },
+    ]);
+    expect(ctx.fake.resolutions).toHaveLength(0);
   });
 });

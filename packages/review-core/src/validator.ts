@@ -58,8 +58,11 @@
 //   draft.promoted   — issue #70: a reviewer attached an AGENT-
 //                      authored draft to their own pending review.
 //                      The actor must be `local` (`invalid-actor`) —
-//                      the agent bearer can author a draft but can
-//                      never record that it was promoted — the named
+//                      over HTTP, the bearer is refused the promote
+//                      route and its requests are identified as
+//                      `agent`, so it cannot author a promotion; a
+//                      same-user agent holding a REVIEWER SESSION is a
+//                      different question, owned on #55 — the named
 //                      draft must actually be agent-authored
 //                      (`not-an-agent-draft`), so the event can never
 //                      claim a human's own comment was promoted, and a
@@ -121,11 +124,13 @@ export interface LogState {
    * draft an agent wrote — a reviewer's own comment mirrors itself,
    * so promoting it would be a claim the log cannot support. */
   readonly commentAuthors: Map<string, ReviewEvent["actor"]>;
-  /** commentId → the `seq` of the event that authored it. Issue #70
-   * round 2: `draft.promoted` PINS the version it approves via
-   * `commentSeq`, so a comment edited between one promotion and a
-   * later one is refused rather than promoting text the reviewer did
-   * not read. */
+  /** commentId → the `seq` of the event that AUTHORED it, fixed at
+   * creation (`comment.edited` does not advance it). Issue #70 round 2:
+   * `draft.promoted.commentSeq` records the version a reviewer
+   * approved, and this is what makes that field checkable at append
+   * time. It is provenance, not a currentness guard — the currentness
+   * guard is `bodyHash`, compared against the live body outside the
+   * validator. */
   readonly commentSeqs: Map<string, number>;
   /** askId → { spec, status }. The FULL spec is kept so
    * `ask.answered` can validate the answer's SHAPE against the
@@ -848,14 +853,18 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
             },
           };
         }
-        // Issue #70 round 2: the content pin must name the version of
-        // the comment that is CURRENT. An append-time check only: the
-        // rule is "this promotion approves THIS text", and at append
-        // time the log's own history is the whole world available. A
-        // comment edited AFTER a promotion is caught by the route
-        // (`promoted-body-changed`) and by the reconciler, which both
-        // re-read the body; here we refuse the shape that can never be
-        // right — a pin naming a seq this log has never issued.
+        // Issue #70 round 2: `commentSeq` must name a version this log
+        // actually issued. This is an APPEND-time check on
+        // PROVENANCE, not on currentness: the comment's authoring seq is
+        // stable for the life of the log (`comment.edited` does not
+        // advance it), so this cannot detect a body swapped after the
+        // fact. Detecting that is `bodyHash`'s job, and it happens
+        // outside the validator — `findDraftToPromote` compares the
+        // CURRENT body against the pin and refuses
+        // (`promoted-body-changed`), and the reconciler separately
+        // refuses a `body-drift` retry against the INTENT's bodyHash.
+        // What is refused HERE is the shape that can never be right: a
+        // promotion claiming to approve a version that does not exist.
         if (event.commentSeq !== undefined && state.commentSeqs.get(commentId) !== event.commentSeq) {
           return {
             ok: false,

@@ -274,6 +274,13 @@ interface RailReviewState {
       readonly commentId?: string;
       readonly path: string;
     }>;
+    /** Issue #70 round 3: the reviewer's OWN resolve/reopen that a
+     * later lifecycle change superseded, so it never reached GitHub. */
+    readonly droppedReviewerIntents?: ReadonlyArray<{
+      readonly threadId: string;
+      readonly target: "resolve" | "reopen";
+      readonly path: string;
+    }>;
   };
   readonly stale: boolean;
 }
@@ -281,6 +288,10 @@ interface RailReviewState {
 /** One agent-authored draft awaiting the reviewer's promotion
  * (issue #70). Same shape the daemon's `/api/review/state` reports. */
 type RailAgentDraft = NonNullable<RailReviewState["state"]["agentDrafts"]>[number];
+
+/** One of the reviewer's own resolve/reopen that a later lifecycle
+ * change superseded, so it never reached GitHub (issue #70 round 3). */
+type RailDroppedIntent = NonNullable<RailReviewState["state"]["droppedReviewerIntents"]>[number];
 
 /** Fetch review-mode state. Returns null when the daemon is not in
  * review mode (`/api/review/state` returns 404). Any other error
@@ -411,6 +422,8 @@ function promoteRefusalMessage(error: string | undefined, status: number): strin
       return "Cannot promote: that was your own comment or resolve, not the agent's draft.";
     case "stale-lifecycle-draft":
       return "Cannot promote: the agent has since changed this thread's resolve state, so that draft is no longer current.";
+    case "promoted-body-changed":
+      return "Cannot promote: this comment's text changed since you promoted it, so promoting now would publish text you have not read. Read the current text and promote it again.";
     case "unknown-thread":
     case "unknown-comment":
       return "Cannot promote: that draft is no longer on this page.";
@@ -1903,6 +1916,42 @@ function Rail(): JSX.Element {
                   })();
                 }}
               >Retry sync</button>
+            </div>
+          </Show>
+          {/* Issue #70 round 3: the reviewer resolved or reopened a
+              thread, then the agent changed it again. The reconciler
+              correctly refuses to fire the superseded change, so this
+              says so — otherwise their click looks like it posted. */}
+          <Show when={(reviewState()!.state.droppedReviewerIntents ?? []).length > 0}>
+            <div
+              class="revkit-rail__dropped-intents"
+              data-testid="revkit-rail-dropped-intents"
+              role="status"
+            >
+              <p class="revkit-rail__dropped-intents-summary">
+                {(reviewState()!.state.droppedReviewerIntents ?? []).length} of your{" "}
+                {(reviewState()!.state.droppedReviewerIntents ?? []).length === 1 ? "resolve or reopen was" : "resolves or reopens were"}{" "}
+                superseded before reaching GitHub
+                {(reviewState()!.state.droppedReviewerIntents ?? []).length === 1 ? "" : "s"} — the agent
+                changed {""}
+                {(reviewState()!.state.droppedReviewerIntents ?? []).length === 1 ? "that thread" : "those threads"} after you.
+                Nothing was sent to GitHub for{" "}
+                {(reviewState()!.state.droppedReviewerIntents ?? []).length === 1 ? "it" : "them"}.
+              </p>
+              <ul class="revkit-rail__dropped-intents-list">
+                <For each={reviewState()!.state.droppedReviewerIntents ?? []}>
+                  {(dropped: RailDroppedIntent) => (
+                    <li
+                      class="revkit-rail__dropped-intent"
+                      data-testid="revkit-rail-dropped-intent"
+                      data-thread-id={dropped.threadId}
+                      data-target={dropped.target}
+                    >
+                      your {dropped.target} on <code>{dropped.path}</code> — not sent to GitHub
+                    </li>
+                  )}
+                </For>
+              </ul>
             </div>
           </Show>
           <Show when={(reviewState()!.state.agentDrafts ?? []).length > 0}>

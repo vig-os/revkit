@@ -358,3 +358,69 @@ describe("reduceThreadLifecycleStates — the ONE supersession rule (issue #70 r
     expect(reduceThreadLifecycleStates(events).get("th-1")?.promotedAtSeq).toBeUndefined();
   });
 });
+
+describe("reduceReviewState — droppedReviewerIntents (issue #70 round 3)", () => {
+  const resolved = (seq: number, actor: ReviewEvent["actor"]): ReviewEvent => ({
+    seq, ts: t, actor, kind: "thread.resolved", threadId: "th-1",
+  });
+  const reopened = (seq: number, actor: ReviewEvent["actor"]): ReviewEvent => ({
+    seq, ts: t, actor, kind: "thread.reopened", threadId: "th-1",
+  });
+  const synced = (seq: number, intentSeq: number, resolvedFlag: boolean): ReviewEvent => ({
+    seq, ts: t, actor: localActor, kind: "thread.external_synced", threadId: "th-1", resolved: resolvedFlag, intentSeq,
+  });
+
+  test("a reviewer resolve superseded by a later change is dropped", () => {
+    const state = reduceReviewState([
+      localComment(1, "th-1", "c-1"),
+      resolved(2, localActor),
+      reopened(3, agentActor),
+    ]);
+    expect(state.droppedReviewerIntents).toEqual([
+      { threadId: "th-1", target: "resolve", path: "docs/index.md" },
+    ]);
+  });
+
+  test("a reviewer resolve that COMPLETED is not reported", () => {
+    const state = reduceReviewState([
+      localComment(1, "th-1", "c-1"),
+      resolved(2, localActor),
+      synced(3, 2, true),
+      reopened(4, agentActor),
+    ]);
+    expect(state.droppedReviewerIntents).toEqual([]);
+  });
+
+  test("an outstanding reviewer resolve the reconciler still owes is NOT dropped", () => {
+    // Current and unsatisfied means "in flight", not "lost" — reporting
+    // this would be a false alarm on every pending sync.
+    const state = reduceReviewState([
+      localComment(1, "th-1", "c-1"),
+      resolved(2, localActor),
+    ]);
+    expect(state.droppedReviewerIntents).toEqual([]);
+  });
+
+  test("only LOCAL changes are ever reported; an agent's unpromoted draft is a draft, not a drop", () => {
+    const state = reduceReviewState([
+      localComment(1, "th-1", "c-1"),
+      resolved(2, agentActor),
+      reopened(3, agentActor),
+    ]);
+    // The agent's superseded resolve is simply gone; the reopen is the
+    // live draft. Nothing was promised to a human, so nothing is dropped.
+    expect(state.droppedReviewerIntents).toEqual([]);
+    expect(state.agentDrafts).toEqual([{ threadId: "th-1", target: "reopen", path: "docs/index.md" }]);
+  });
+
+  test("both directions are covered: a reviewer reopen superseded by a resolve", () => {
+    const state = reduceReviewState([
+      localComment(1, "th-1", "c-1"),
+      reopened(2, localActor),
+      resolved(3, agentActor),
+    ]);
+    expect(state.droppedReviewerIntents).toEqual([
+      { threadId: "th-1", target: "reopen", path: "docs/index.md" },
+    ]);
+  });
+});

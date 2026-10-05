@@ -536,25 +536,36 @@ const commentSyncCancelledPayload = {
  * validator.ts `draft.promoted`, and the limit of that claim in the
  * ADR-0006 amendment).
  *
- * `commentSeq` and `bodyHash` PIN the content the reviewer approved:
- * the `seq` of the `comment.created` / `comment.replied` that authored
- * the draft, and `revisionOf(body)` of its text at promotion time.
- * Without them the event would name a comment id and leave *which
- * text* open — so a later edit of the same comment (there is no edit
- * route today) could swap the body between the reviewer's approval and
- * the reconciler's write, and the intent would fingerprint the NEW text
- * while the promotion recorded the human act on the OLD. With the pin,
- * a comment whose current body no longer hashes to `bodyHash` is not
- * promoted at all (`promoted-body-changed`).
+ * `commentSeq` and `bodyHash` record WHICH version and WHICH text the
+ * reviewer approved: the `seq` of the `comment.created` /
+ * `comment.replied` that authored the draft, and `revisionOf(body)` of
+ * its body at promotion time. Without them the event names a comment id
+ * and leaves the text open, so a later edit of that comment (no edit
+ * route exists today) could swap the body between the reviewer's
+ * approval and the write.
+ *
+ * What each one actually does, precisely:
+ *   - `bodyHash` is the pin that HOLDS. `findDraftToPromote` refuses to
+ *     promote a comment whose current body no longer hashes to it
+ *     (`promoted-body-changed`), and refuses to promote again on top of
+ *     a promotion carrying no pin at all. The boot heal composes
+ *     through the same check.
+ *   - `commentSeq` records the version and is checked at APPEND time
+ *     only: `validateNext` refuses one the log never issued. It does NOT
+ *     track later edits — `comment.edited` does not advance
+ *     `commentSeqs`, so the authoring event's seq is stable for the life
+ *     of the log — which means it cannot by itself detect a swapped
+ *     body. The enforcement is `bodyHash`'s; `commentSeq` is the
+ *     provenance of it ("this is the version that was on the page"), and
+ *     it is what makes the pin checkable at all at append time.
  *
  * Both are OPTIONAL, because a log written before they existed must
  * still validate (ADR-0006: `validateNext` is a state machine over
  * appends, so a stricter rule than the log's own history is a boot
  * failure). They are not optional in practice: the route always writes
- * them for a comment promotion, and the reconciler treats a promotion
- * that lacks them as pinning nothing — which is exactly the old,
- * weaker behaviour, and is why the route is the place that must write
- * them. */
+ * them for a comment promotion, and a promotion that lacks them is
+ * treated as pinning nothing — which is exactly the old, weaker
+ * behaviour, and is why the route is the place that must write them. */
 const draftPromotedPayload = {
   kind: z.literal("draft.promoted"),
   threadId: idSchema,

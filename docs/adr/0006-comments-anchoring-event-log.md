@@ -367,6 +367,20 @@ the route refuses (`no-open-pending-review`) rather than opening a fresh review
 behind the reviewer's back — a discarded review stays discarded until the
 reviewer opens a new one deliberately.
 
+**What the pin is, precisely — `bodyHash` holds, `commentSeq` is provenance.**
+`bodyHash` is the enforcement: `findDraftToPromote` refuses to promote a comment
+whose current body no longer hashes to the recorded value
+(`promoted-body-changed`), and refuses to promote *again* on top of a promotion
+carrying no pin; the boot heal composes through the same check, so nothing is
+repaired into unpinned text. `commentSeq` records WHICH version was approved and is
+checked at **append** time only — that it names an authoring event the log actually
+issued. It is **not** a currentness guard: `comment.edited` does not advance the
+authoring seq, so it is fixed for the life of the log; it is what makes the pin
+checkable at append time at all, and it is the provenance of the hash rather than a
+second independent lock on the text. The reconciler separately refuses a
+`body-drift` retry by comparing the live body against the **intent's** `bodyHash`
+(the intent is composed from the pinned text, so both must agree).
+
 **A refusal writes nothing.** Every check above, plus the ones the route makes
 about the world (`no-github-thread`, `stale-lifecycle-draft`,
 `promote-mapping-orphan`), is decided **before the first append**. This is
@@ -410,6 +424,26 @@ appends and a stricter rule than the log's own history is a boot failure. A
 promotion carrying neither pin is the old, weaker shape, and `findDraftToPromote`
 refuses to promote *again* on top of one (`promoted-body-changed`: the current text
 cannot be shown to be the approved text). The route always writes the pin.
+
+**The heal never composes what the route would refuse.** In particular it applies
+the same open-pending-review rule. Without it, a promotion left incomplete by a
+submit (or a discard, or a head-move reanchor's abandon — none of which go through
+the promote route) would be repaired into an intent that the next
+cookie-authenticated reconcile posts into a **fresh** pending review: reopening,
+automatically and after the fact, a review the reviewer had already closed. The
+route refuses that with `no-open-pending-review`, so a repair that composed it
+anyway would be the one path that publishes into a closed review.
+
+**A dropped reviewer intent is visible, not silent.** The supersession rule below
+applies to the reviewer's own change, so their click can be superseded by a later
+lifecycle event before the reconciler fires it. Refusing to fire it is correct;
+leaving the reviewer to believe it posted is not. `reduceReviewState` therefore also
+derives `droppedReviewerIntents`: a `local` resolve/reopen that carries **no**
+completing `thread.external_synced` and is **not** the thread's current change. A
+change that is current and merely unsatisfied is not reported — it is in flight, and
+reporting it would be a false alarm on every pending sync. The rail shows the list
+as a notice (not an alert: nothing is broken, and no decision is needed) naming the
+thread and which of the two it was.
 
 **A crash between the promotion and its intent is healed on the next start.**
 Promotion is two adjacent appends, and nothing fallible sits between them — but a

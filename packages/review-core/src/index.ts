@@ -143,6 +143,7 @@ export {
   reduceThreadLifecycleStates,
   type AgentDraft,
   type CommentSyncState,
+  type DroppedReviewerIntent,
   type OpenPendingReview,
   type PendingReviewComment as DerivedPendingReviewComment,
   type ReviewState,

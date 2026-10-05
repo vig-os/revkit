@@ -240,6 +240,20 @@ export interface ReviewState {
   /** Issue #70: agent-authored drafts awaiting a reviewer's explicit
    * promotion. Never mirrored without one. */
   readonly agentDrafts: readonly AgentDraft[];
+  /** Issue #70 round 3: a REVIEWER's own resolve/reopen that the log
+   * shows as neither completed nor current — it was superseded by a
+   * later lifecycle change (of either kind) and so never reached
+   * GitHub. Derived, not held, so the rail can say so rather than
+   * leaving the reviewer to notice that their click did nothing. */
+  readonly droppedReviewerIntents: readonly DroppedReviewerIntent[];
+}
+
+/** One reviewer's lifecycle intent the log shows as dropped. */
+export interface DroppedReviewerIntent {
+  readonly threadId: string;
+  /** The change the reviewer made. */
+  readonly target: "resolve" | "reopen";
+  readonly path: string;
 }
 
 /** Pure reducer: `events → ReviewState`. Called by the daemon on
@@ -275,6 +289,7 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
   // derivation the daemon's reconciler and promote route read, so one
   // rule has one implementation.
   const commentDrafts = new Map<string, { readonly atSeq: number; readonly draft: AgentDraft }>();
+  const dropped: DroppedReviewerIntent[] = [];
   // threadId → the path its opening comment anchored on. A reply and a
   // resolve/reopen all belong to that thread, so all three inherit it.
   const threadPath = new Map<string, string>();
@@ -543,6 +558,33 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
     return rest;
   });
 
+  // Issue #70 round 3: a reviewer's own lifecycle change that neither
+  // completed (`thread.external_synced` carries its intentSeq) nor
+  // survived as the thread's current change. This is the visible half of
+  // the supersession rule: the reconciler correctly refuses to fire it,
+  // but silence would leave the reviewer thinking their click posted.
+  const completedIntents = new Set<number>();
+  for (const event of ordered) {
+    if (event.kind === "thread.external_synced" && event.intentSeq !== undefined) {
+      completedIntents.add(event.intentSeq);
+    }
+  }
+  const currentLifecycle = reduceThreadLifecycleStates(ordered);
+  for (const event of ordered) {
+    if (event.kind !== "thread.resolved" && event.kind !== "thread.reopened") continue;
+    if (event.actor.kind !== "local") continue;
+    if (completedIntents.has(event.seq)) continue;
+    const current = currentLifecycle.get(event.threadId);
+    // Current and unsatisfied means the reconciler still owes it, not
+    // that it was dropped — only a LATER change makes it moot.
+    if (current !== undefined && current.atSeq === event.seq) continue;
+    dropped.push({
+      threadId: event.threadId,
+      target: event.kind === "thread.resolved" ? "resolve" : "reopen",
+      path: threadPath.get(event.threadId) ?? "",
+    });
+  }
+
   // Issue #70: lifecycle drafts come from the SHARED derivation, so a
   // superseded resolve is gone here for the same reason the daemon's
   // reconciler will not fire it (issue #70 review, finding 2).
@@ -572,6 +614,7 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
     commentSync: syncState,
     unsyncedCommentIds,
     agentDrafts: allDrafts.map((entry) => entry.draft),
+    droppedReviewerIntents: dropped,
   };
 }
 

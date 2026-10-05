@@ -2487,11 +2487,25 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    * The composition goes through the same `findDraftToPromote` the route
    * uses, so a body that no longer matches the promotion's pin is
    * refused here too (`promoted-body-changed`) rather than healed into
-   * text the reviewer did not approve. */
+   * text the reviewer did not approve.
+   *
+   * It also applies the route's OPEN-PENDING-REVIEW check, and that is
+   * not belt-and-braces: without it, a promotion left incomplete by a
+   * submit would be repaired into an intent that the next
+   * cookie-authenticated reconcile posts into a FRESH pending review —
+   * reopening, automatically and after the fact, the review the
+   * reviewer had already submitted or discarded. The route refuses that
+   * with `no-open-pending-review`, so the heal must refuse it too, or it
+   * would compose exactly what the route will not. */
   async function healMissingPromotionIntents(
     review: ReviewModeHandle,
     requestId: string,
   ): Promise<number> {
+    const open = (await review.readState(store)).openPending;
+    if (open === null) {
+      logger.info("review.boot.promotion-intent.no-pending-review", { requestId });
+      return 0;
+    }
     const events = await store.since(0);
     const incomplete = new Map<string, string>();
     for (const event of events) {
@@ -2812,6 +2826,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // the promote action; nothing here is ever mirrored without
           // that action.
           agentDrafts: state.agentDrafts,
+          // Issue #70 round 3: the reviewer's own resolve/reopen that
+          // a later lifecycle change superseded, so they know their
+          // click did not reach GitHub rather than finding out later.
+          droppedReviewerIntents: state.droppedReviewerIntents,
         },
         stale,
       });
