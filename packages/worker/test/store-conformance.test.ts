@@ -38,6 +38,16 @@ describe("D1ThreadStore (hosted, miniflare D1)", () => {
     async make(): Promise<ThreadStore> {
       return new D1ThreadStore({ db: harness.db, logKey: previewScopePath("revkit", 7), clock: fixedClock() });
     },
+    // The hosted lane's production shape, verbatim: `src/index.ts` builds
+    // `new D1ThreadStore({ db: env.DB, logKey })` per request, so the
+    // instance that judges an archive is never the instance that wrote the
+    // log. Before #107's fix that meant a per-instance `#head` of 0 and an
+    // empty `#logState`, and the shared cases passed anyway — because the
+    // suite handed every case ONE instance and that instance did the
+    // appends too.
+    async reopen(): Promise<ThreadStore> {
+      return new D1ThreadStore({ db: harness.db, logKey: previewScopePath("revkit", 7), clock: fixedClock() });
+    },
     async reset(): Promise<void> {
       for (const table of ["review_logs", "snapshots"]) {
         await harness.db.prepare(`DELETE FROM ${table}`).run();

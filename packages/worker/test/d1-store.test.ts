@@ -22,6 +22,7 @@ import {
   CURRENT_SCHEMA_VERSION,
   InMemoryThreadStore,
   ThreadStoreAppendError,
+  ThreadStoreImportError,
   exportArchive,
   isUnanchoredAnchor,
   revisionOf,
@@ -416,10 +417,12 @@ describe("D1ThreadStore — D1 concurrency model", () => {
 
   test("A11(b): two stores importing the SAME archive — the loser writes nothing", async () => {
     // The scenario the bridge actually has: `revkit threads publish` runs
-    // twice, or two Worker isolates both pull the same local log. The
-    // second import's head-monotone rule passes (its own head is 0) and
-    // its batch then collides on the PK, which must roll the WHOLE batch
-    // back rather than half-apply it.
+    // twice, or two Worker isolates both pull the same local log. Since
+    // #107 the loser does not even reach its batch: it reconciles first,
+    // sees the winner's rows, and its own `prepareImport` refuses
+    // (`head-not-monotone` — the archive starts at seq 1 and the log it
+    // was going to write into is at seq 2). Either way the requirement is
+    // the same and stronger than before: the loser writes NOTHING.
     const publisher = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock(0) });
     await publisher.append(createThread("th-pub-1", "c-pub-1"));
     await publisher.append(createThread("th-pub-2", "c-pub-2"));
@@ -433,6 +436,106 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     // The winner's payloads are intact — the loser's batch overwrote none
     // of them, which a per-statement commit would have done.
     expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-pub-1");
+  });
+
+  // ── I6: `import`'s read-then-write window (#107's second half) ───────
+  //
+  // `append` reads its head INSIDE the batch that writes, so nothing can
+  // move between the two. `import` cannot: it must read the log, run the
+  // whole `prepareImport` dry run in JS, and only then write. So its
+  // commit is guarded, and these cases are the proof the guard holds —
+  // one per way an unguarded commit fails, plus one for the guard being a
+  // single statement for the WHOLE archive (a per-row guard writes the
+  // first row of a three-row archive and silently drops the rest, which is
+  // what the SQL comment in `d1-store.ts` records as measured).
+
+  test("I6: an import whose log GREW between its read and its write writes nothing (colliding seq)", async () => {
+    const { archive, store, raced } = await raceOnSecondBatch({
+      db: harness.db,
+      logKey: LOG,
+      competitor: { threadId: "th-race-1", commentId: "c-race-1" },
+    });
+
+    // The import refuses, and it refuses LOUDLY and TYPED — the guard is
+    // not a silent skip.
+    let thrown: unknown;
+    try {
+      await store.import(archive);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(raced()).toBe(true);
+    expect(thrown).toBeInstanceOf(ThreadStoreImportError);
+
+    // Nothing of the archive landed — not one row of the three. The
+    // competitor holds seq 1, so an UNGUARDED commit collides on the
+    // archive's own first row: the batch throws a raw D1 PK error and the
+    // log ends up holding the competitor's row and none of the archive's.
+    // The guard replaces that with a refusal and the same empty outcome.
+    expect(await seqsIn(harness.db, LOG)).toEqual([1]);
+    const rows = await rowsIn(harness.db, LOG);
+    expect(JSON.parse(rows[0]?.payload ?? "{}").threadId).toBe("th-race-1");
+  });
+
+  test("I6: …and writes nothing when the racing seq is one the archive does NOT claim", async () => {
+    // The variant the colliding case cannot see. Here the competitor holds
+    // seq 4 — past the archive's 1, 2, 3 — so an unguarded commit would
+    // write **all three** of the archive's rows with nothing to collide
+    // with: no error, no refusal, a log holding four events, three of them
+    // from an archive validated against a log that no longer existed. That
+    // is the failure the guard exists for, and it is SILENT, so it cannot
+    // be asserted by "the import threw" — only by what the log holds.
+    const { archive, store, raced } = await raceOnSecondBatch({
+      db: harness.db,
+      logKey: LOG,
+      competitor: { threadId: "th-race-4", commentId: "c-race-4" },
+      competitorSeq: 4,
+    });
+
+    let thrown: unknown;
+    try {
+      await store.import(archive);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(raced()).toBe(true);
+    expect(thrown).toBeInstanceOf(ThreadStoreImportError);
+
+    // The log holds the competitor's row and NOTHING else — the archive
+    // contributed no seq, so no half-import and no silent graft.
+    expect(await seqsIn(harness.db, LOG)).toEqual([4]);
+    expect(JSON.parse((await rowsIn(harness.db, LOG))[0]?.payload ?? "{}").threadId).toBe("th-race-4");
+    // …and the store agrees about what it holds, so a later read is not
+    // handed the archive's rows either.
+    expect((await store.since(0)).map((event) => event.seq)).toEqual([4]);
+  });
+
+  test("I6: the guard is ONE statement for the whole archive, not one per row", async () => {
+    // Kills the per-row mutant. A per-row `… WHERE MAX(seq) = <validated
+    // head>` guard looks correct and is not: the first row's own insert
+    // raises MAX(seq), so every later row's guard then fails. Measured on
+    // this build: three rows guarded that way into an empty log come back
+    // `meta.changes = [1, 0, 0]` and the log holds one row. So a
+    // MULTI-event archive is the case that tells the two apart — which is
+    // why this is a three-event archive and not one.
+    const publisher = new D1ThreadStore({ db: harness.db, logKey: OTHER_LOG, clock: fixedClock(0) });
+    await publisher.append(createThread("th-all-1", "c-all-1"));
+    await publisher.append(createThread("th-all-2", "c-all-2"));
+    await publisher.append(createThread("th-all-3", "c-all-3"));
+    const archive = await exportArchive(publisher);
+
+    const store = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
+    await store.import(archive);
+    expect(await seqsIn(harness.db, LOG)).toEqual([1, 2, 3]);
+    // All three payloads, so a partial commit cannot pass as a count.
+    const rows = await rowsIn(harness.db, LOG);
+    expect(rows.map((r) => JSON.parse(r.payload).threadId)).toEqual(["th-all-1", "th-all-2", "th-all-3"]);
+    // And no guard row survived. `since(0)` parses every payload through
+    // `reviewEventSchema`, so a leftover marker row (empty payload) would
+    // make the read below THROW rather than quietly return — which is why
+    // this assertion is about the public read and not about SQL.
+    expect((await store.since(0)).map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(await countIn(harness.db, LOG)).toBe(3);
   });
 
   // ── head() on a NON-EMPTY log (the #76 review's I1) ──────────────────
@@ -816,4 +919,62 @@ function proxyDb(db: D1Database, onBatch: () => Promise<void>): D1Database {
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+/**
+ * Open `import`'s read-then-write window and hand back a store whose next
+ * `import` will race it.
+ *
+ * The proxy commits `competitor` into `logKey` just before the SECOND batch
+ * the store issues — which is exactly the gap a concurrent request's
+ * `append` lands in: batch 1 is `import`'s reconcile read (it sees an EMPTY
+ * log), batch 2 is the guarded commit. Same technique as A10's "the
+ * compare-and-swap retry path runs" case, aimed at `import`, and it is why
+ * the assertion `raced()` exists: an implementation with no second batch has
+ * no window, and a test that did not check would pass against one.
+ *
+ * `competitorSeq` is what makes the two cases different. At seq 1 an
+ * unguarded commit COLLIDES with the archive's own first row and the batch
+ * throws a raw D1 PK error. Past the archive's top it collides with nothing
+ * and an unguarded commit writes every archive row in silence — so only the
+ * log's contents can catch that one.
+ *
+ * The archive is three `comment.created`s from a DIFFERENT log, so it is a
+ * well-formed full log and the store under test is looking at an empty one.
+ */
+async function raceOnSecondBatch(options: {
+  readonly db: D1Database;
+  readonly logKey: string;
+  readonly competitor: { readonly threadId: string; readonly commentId: string };
+  readonly competitorSeq?: number;
+}): Promise<{
+  archive: ThreadArchive;
+  store: D1ThreadStore;
+  raced: () => boolean;
+}> {
+  const { db, logKey, competitor, competitorSeq = 1 } = options;
+  // A source log of its own, so the archive names a different review's
+  // threads — exactly what a diverged foreign archive looks like.
+  const source = new D1ThreadStore({ db, logKey: OTHER_LOG, clock: fixedClock(0) });
+  await source.append(createThread("th-race-1", "c-race-1"));
+  await source.append(createThread("th-race-2", "c-race-2"));
+  await source.append(createThread("th-race-3", "c-race-3"));
+  const archive = await exportArchive(source);
+
+  const event: ReviewEvent = {
+    seq: competitorSeq,
+    ts: "2026-10-03T12:00:00Z",
+    ...createThread(competitor.threadId, competitor.commentId),
+  } as ReviewEvent;
+
+  let batches = 0;
+  let raced = false;
+  const racingDb = proxyDb(db, async () => {
+    batches += 1;
+    if (batches !== 2) return;
+    raced = true;
+    await db.prepare(INSERT_FOR).bind(logKey, competitorSeq, event.ts, JSON.stringify(event)).run();
+  });
+
+  return { archive, store: new D1ThreadStore({ db: racingDb, logKey, clock: fixedClock() }), raced: () => raced };
 }

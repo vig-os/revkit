@@ -15,31 +15,58 @@
 // to skip the case: `storeConformance` has no skip mechanism to reach for.
 
 import { afterEach, describe } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ThreadStore } from "@revkit/review-core";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 import { fixedClock, storeConformance, type StoreFactory } from "../../../review-core/test/store-conformance.ts";
 
 describe("store conformance — SqliteThreadStore (daemon's bun:sqlite backing)", () => {
   const open: SqliteThreadStore[] = [];
+  const dirs: string[] = [];
+  /** The file `make()` opened this case, so `reopen()` can open the SAME
+   * storage. `:memory:` cannot do this — a second `:memory:` connection is
+   * a different, empty database — and this lane's whole reason for being
+   * the daemon's shipped backing is that the daemon REOPENS its file
+   * across restarts (`SqliteThreadStore.open` rehydrates head + state from
+   * it). */
+  let currentFile: string | undefined;
 
   const factory: StoreFactory = {
     name: "SqliteThreadStore (daemon's bun:sqlite backing)",
     async make(): Promise<ThreadStore> {
-      // `:memory:` so each case gets a private database and the suite stays
-      // order-independent; the tracked list exists only so `afterEach` can
-      // close them, which keeps bun from complaining about open handles.
-      const store = SqliteThreadStore.open({ filename: ":memory:", clock: fixedClock() });
+      // A fresh temp file per case, which keeps the suite
+      // order-independent exactly as `:memory:` did, and `afterEach`
+      // removes it.
+      const dir = mkdtempSync(join(tmpdir(), "revkit-conformance-sqlite-"));
+      dirs.push(dir);
+      currentFile = join(dir, "threads.sqlite");
+      const store = SqliteThreadStore.open({ filename: currentFile, clock: fixedClock() });
+      open.push(store);
+      return store;
+    },
+    async reopen(): Promise<ThreadStore> {
+      if (currentFile === undefined) {
+        throw new Error("reopen() before make(): the suite opens the storage before reopening it.");
+      }
+      const store = SqliteThreadStore.open({ filename: currentFile, clock: fixedClock() });
       open.push(store);
       return store;
     },
     async reset(): Promise<void> {
-      // Nothing to drop — `make()` opens a fresh `:memory:` database per
-      // case, which is what makes them independent.
+      // Nothing to drop — `make()` opens a fresh file per case, which is
+      // what makes them independent.
     },
   };
 
   afterEach(() => {
     while (open.length > 0) open.pop()?.close();
+    currentFile = undefined;
+    while (dirs.length > 0) {
+      const dir = dirs.pop();
+      if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   storeConformance(factory);

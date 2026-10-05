@@ -6,7 +6,8 @@
 - Stories: A2, A6, A7, A8, B2, B4
 - Amended by: the 2026-10-04 (issue #9) amendment below — the hosted physical
   schema carries a hosted-only `log_key`, and there is no `revkit threads
-  export|import` CLI command.
+  export|import` CLI command; and the 2026-10-05 (issue #73) amendment — an
+  `import` lands only in an empty store, judged against the log the store holds.
 
 ## Context
 
@@ -258,3 +259,34 @@ exported with `exportArchive` and imported by a hosted `ThreadStore` — the
 library API, not a CLI verb — so a local review can be published to a hosted PR.
 No user-facing command is claimed, and none should be inferred from this ADR
 until one ships and this line is amended again.*
+
+## Amendment (2026-10-05, issue #73): an import lands only in an empty store
+
+**`ThreadStore.import` accepts an archive only in a store whose log is empty.**
+`parseArchive` plays every archive through `validateNext` from an *empty* state,
+and the store's dry run refuses an archive whose ids collide with its own, so
+after those two checks an archive can only be a self-contained log — nothing in
+it can be shown to continue the store's existing log, and a foreign log's tail
+arriving at `head + 1` used to be accepted silently and then handed to
+`since(lastSeen)` callers as this log's next event. Until the local↔hosted
+bridge designs the deep comparison that would settle it (#35), a store holding a
+log refuses every archive (`divergent-archive`, or `seq-gap` when the archive
+starts above `head + 1`); an empty store still accepts any archive, which is the
+one shape `exportArchive` — the only producer — emits.
+
+**Both of those sentences are about the log the STORE holds, and that is a
+commitment each backing has to earn** — "its own" is not the instance's
+in-memory state. `bun:sqlite` rehydrates head and validator state in `open`;
+`D1ThreadStore` holds neither at construction and `src/index.ts` builds a fresh
+store per request, so until #107's fix it compared every archive against an
+empty state — the guard could not fire and a colliding archive committed. A
+backing that judges an archive against anything other than the stored log
+breaks this amendment, so the property is asserted per backing: on the two
+whose log outlives the instance — `bun:sqlite` and D1 — through a second store
+instance over the same storage (`StoreFactory.reopen`), and on the in-memory
+reference, whose log IS its instance, by the single-instance cases (a second
+handle there would be a new empty store, which is the honest answer and not a
+refusal to test). `import` is also a read-then-write, so its commit is guarded
+against a writer that moves the head in between: one guard row inside the same
+`batch()`, gating every archive row, so a stale head writes nothing rather than
+something. Refs: #73, #107, #108
