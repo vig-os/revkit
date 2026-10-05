@@ -10,7 +10,6 @@ import { describe, expect, test } from "bun:test";
 import {
   CURRENT_SCHEMA_VERSION,
   InMemoryThreadStore,
-  ThreadStoreAppendError,
   ThreadStoreImportError,
   exportArchive,
   parseArchive,
@@ -254,7 +253,8 @@ describe("import — propagates validateNext rejections", () => {
     // Two archives that are each self-consistent (both create thread
     // 'th-1' at seq 1) but conflict when imported into the SAME store —
     // the second import's create hits `duplicate-thread`, which the
-    // shared `validateNext` catches via `ThreadStoreAppendError`.
+    // shared `validateNext` catches and `import` reports as a
+    // `ThreadStoreImportError` (#72).
     const source = await seed(); // seqs 1..3, thread 'th-1'
     const archive = await exportArchive(source);
     const target = new InMemoryThreadStore({ clock: fixedClock() });
@@ -277,9 +277,13 @@ describe("import — propagates validateNext rejections", () => {
       await target.import(bumped);
       throw new Error("import should have been refused");
     } catch (error) {
-      expect(error).toBeInstanceOf(ThreadStoreAppendError);
-      if (error instanceof ThreadStoreAppendError) {
-        expect(error.rejection.kind).toBe("duplicate-thread");
+      // #72: an `import` refusal is ALWAYS a `ThreadStoreImportError`; the
+      // per-event `validateNext` rejection rides on its typed `rejection`
+      // field, so the kind is still branchable without parsing a message.
+      expect(error).toBeInstanceOf(ThreadStoreImportError);
+      if (error instanceof ThreadStoreImportError) {
+        expect(error.rejection?.kind).toBe("duplicate-thread");
+        expect(error.rejection?.transition?.kind).toBe("duplicate-thread");
       }
     }
   });
@@ -346,9 +350,11 @@ describe("import — atomic commit (all-or-nothing)", () => {
       await store.import(badArchive);
       throw new Error("import should have been refused");
     } catch (error) {
-      expect(error).toBeInstanceOf(ThreadStoreAppendError);
-      if (error instanceof ThreadStoreAppendError) {
-        rejection = error.rejection.kind;
+      // #72: the class is `ThreadStoreImportError` now; the kind is
+      // unchanged and still readable off the typed field.
+      expect(error).toBeInstanceOf(ThreadStoreImportError);
+      if (error instanceof ThreadStoreImportError) {
+        rejection = error.rejection?.transition?.kind ?? null;
       }
     }
     expect(rejection).toBe("duplicate-comment-id");

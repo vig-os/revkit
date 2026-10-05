@@ -57,10 +57,21 @@ export const threadArchiveSchema = z
     for (const [index, event] of archive.events.entries()) {
       const result = validateNext(state, event);
       if (!result.ok) {
+        // `transition` rides on the issue as STRUCTURED data, not just as
+        // text in `message`. A refusal that reached the store boundary
+        // through this issue has to report the same `kind` the store's own
+        // dry run would report for the same invariant, or a caller
+        // branching on `ThreadStoreImportError.rejection.kind` sees
+        // `invalid-shape` for an archive that is semantically broken
+        // rather than malformed. `prepareImport` (see `store.ts`) reads
+        // this field; without it, the only way to recover the kind would be
+        // parsing `message`, which is exactly what the typed `rejection`
+        // field exists to avoid (#72).
         ctx.addIssue({
           code: "custom",
           path: ["events", index],
           message: `log invariant: ${result.rejection.kind} — ${result.rejection.message}`,
+          transition: result.rejection,
         });
         return;
       }

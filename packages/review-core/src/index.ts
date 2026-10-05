@@ -183,11 +183,13 @@ export {
 export {
   InMemoryThreadStore,
   matchesFilter,
+  prepareImport,
   selectThreads,
   ThreadStoreAppendError,
   ThreadStoreImportError,
   type AppendRejection,
   type Clock,
+  type ImportRejection,
   type ThreadStore,
 } from "./store.ts";
 export {

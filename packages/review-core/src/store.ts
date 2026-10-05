@@ -85,14 +85,190 @@ export class ThreadStoreAppendError extends Error {
   }
 }
 
-/** Thrown by `ThreadStore.import` when the archive would break the log's
- * append-only, monotone-seq invariants (independent of the per-event
- * `validateNext` check, which raises `ThreadStoreAppendError`). */
+/** What an `import` refusal carries for a caller that has to branch on
+ * it. `kind` reuses the `validateNext` vocabulary, so a caller that
+ * already branches on `ThreadStoreAppendError.rejection.kind` branches
+ * the same way here. `head-not-monotone` is import-only: the store-local
+ * precondition that an archive starts strictly above the head, which
+ * `append` cannot express (it assigns the seq).
+ *
+ * `"invalid-shape"` means the archive's bytes are wrong — a field the
+ * schema refuses, a duplicate `seq`, an out-of-order `seq`. An archive
+ * that is SHAPE-VALID but semantically broken (the issue #72 repro: a
+ * `comment.replied` naming a thread the archive itself never opened)
+ * reports the real invariant kind, e.g. `"unknown-thread"` — the same
+ * kind the store's own dry run reports for the same invariant, because
+ * the archive's `superRefine` play-through carries it out structurally
+ * (see `export.ts`). */
+export type ImportRejection = {
+  /** Which invariant failed. Stable across implementations. */
+  readonly kind: AppendRejection["kind"] | "head-not-monotone";
+  /** The `seq` of the offending archive event, when the failure named
+   * one. `undefined` only for a failure that names no event at all: a bad
+   * `schemaVersion`, an `events` that is not an array, a `null` archive.
+   * A head-precondition refusal DOES name an event — `events[0]`, whose
+   * seq is the one that failed the check. */
+  readonly seq: number | undefined;
+  /** Index into `archive.events`, when the failure named one event. */
+  readonly index: number | undefined;
+  /** The `validateNext` rejection verbatim, when the refusal came from a
+   * transition rule — the archive's own play-through at the byte boundary
+   * or this store's dry run. `undefined` when the archive's SHAPE is what
+   * failed, where the Zod issues are on `cause` instead. Named
+   * `transition` rather than `rejection` so it does not read as
+   * `err.rejection.rejection`; `cause` is the same value on the
+   * transition path, and stays an `Error` on the shape path. */
+  readonly transition: AppendRejection | undefined;
+};
+
+/** Thrown by `ThreadStore.import` for EVERY refusal — an archive that
+ * fails the schema, one that starts at or below the store's head, and
+ * one whose events break a `validateNext` transition against this
+ * store's state. A caller can therefore branch on this one class at the
+ * store boundary; nothing about an import escapes as a raw `ZodError`,
+ * and nothing escapes as the `ThreadStoreAppendError` that the
+ * per-event check would have raised on its own.
+ *
+ * `rejection` carries the machine-readable reason (the offending event's
+ * `seq`/`index` plus the invariant's `kind`) so a caller never has to
+ * parse `.message`. `cause` is set only on the shape path, where it is
+ * the `ZodError` from `parseArchive` — so `cause instanceof Error`
+ * always holds when `cause` is present at all. On the transition path
+ * the reason is the structured `rejection.transition` instead, which is
+ * why no `cause` is set there: an `AppendRejection` is not an `Error`,
+ * and a `cause` that is sometimes an `Error` and sometimes a plain
+ * object is a trap for the caller that reaches for it. */
 export class ThreadStoreImportError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly rejection: ImportRejection | undefined;
+
+  constructor(message: string, options: { readonly rejection?: ImportRejection; readonly cause?: unknown } = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "ThreadStoreImportError";
+    this.rejection = options.rejection;
   }
+}
+
+/** The `seq` of the event at `index` in a raw (not yet validated)
+ * archive, or `undefined` when the archive is not shaped well enough to
+ * carry one. Used only to name the offending event in a refusal
+ * message. */
+function seqAt(raw: ThreadArchive, index: number): number | undefined {
+  const events = (raw as { readonly events?: unknown }).events;
+  if (!Array.isArray(events)) return undefined;
+  const seq = (events[index] as { readonly seq?: unknown } | undefined)?.seq;
+  return typeof seq === "number" ? seq : undefined;
+}
+
+/** A `threadArchiveSchema` issue, as far as `importSchemaError` reads
+ * it. `transition` is present only on an issue the archive's own
+ * `validateNext` play-through added (`export.ts`), and it carries the
+ * `AppendRejection` STRUCTURALLY — the kind is read from here, never
+ * parsed back out of `message`. */
+interface ArchiveIssue {
+  readonly path: readonly PropertyKey[];
+  readonly message: string;
+  readonly transition?: AppendRejection;
+}
+
+/** Turn a `parseArchive` failure into a `ThreadStoreImportError` whose
+ * message names the offending event and the invariant it broke, in one
+ * line — the raw Zod message for a shape failure is a path/multi-line
+ * blob, and a caller's log gets one unhandled `ZodError` today. */
+function importSchemaError(raw: ThreadArchive, cause: unknown): ThreadStoreImportError {
+  // Read the issues structurally rather than with `instanceof`: the
+  // ZodError that escaped came from whichever copy of zod `parseArchive`
+  // bound, and a caller must not be told "schema failure" just because
+  // two bundles hold two zods.
+  const issues = (cause as { readonly issues?: readonly ArchiveIssue[] }).issues;
+  const first = Array.isArray(issues) ? issues[0] : undefined;
+  if (first === undefined) {
+    return new ThreadStoreImportError("import: archive refused — it is not a valid revkit thread archive.", { cause });
+  }
+  const [root, maybeIndex] = first.path;
+  const index = root === "events" && typeof maybeIndex === "number" ? maybeIndex : undefined;
+  const seq = index === undefined ? undefined : seqAt(raw, index);
+  // A `superRefine` issue already names the invariant in its message
+  // ("log invariant: unknown-thread — …"); a plain Zod issue names a
+  // field, so print the path under the event to say which one.
+  const field = index === undefined ? first.path.join(".") : first.path.slice(2).join(".");
+  const where =
+    index === undefined
+      ? first.path.length === 0
+        ? "the archive itself"
+        : `archive field '${field}'`
+      : `event ${index}${seq === undefined ? "" : ` (seq ${seq})`}${field === "" ? "" : ` field '${field}'`}`;
+  // The archive failed its OWN `validateNext` play-through, so the
+  // invariant's real kind is available and is what the store's dry run
+  // would have reported for the same archive. Only a genuine shape
+  // failure (a refused field, a duplicate or out-of-order `seq`) is
+  // `invalid-shape` (#72: the two must not be indistinguishable).
+  const transition = first.transition;
+  return new ThreadStoreImportError(
+    `import: archive refused at ${where}: ${first.message}`,
+    {
+      rejection: {
+        kind: transition?.kind ?? "invalid-shape",
+        seq,
+        index,
+        transition,
+      },
+      cause,
+    },
+  );
+}
+
+/** Every check a `ThreadStore.import` performs before it is allowed to
+ * write anything, in one place: `parseArchive` (the Zod shape and a
+ * `validateNext` play-through from empty), the head-monotonicity
+ * precondition, and a dry run of the whole sequence against a DEEP COPY
+ * of the caller's state. Returns the archive's events on success, in
+ * `seq` order; throws `ThreadStoreImportError` — and only that class —
+ * on any refusal.
+ *
+ * All three backings call this, so the taxonomy is one contract rather
+ * than three (near-identical) copies: `InMemoryThreadStore`,
+ * `SqliteThreadStore` and `D1ThreadStore` differ in how they COMMIT the
+ * events, not in what they accept or how they say no. The dry run is why
+ * a refusal leaves nothing half-imported — the caller only starts writing
+ * once this has returned.
+ */
+export function prepareImport(archive: ThreadArchive, state: LogState, head: number): readonly ReviewEvent[] {
+  // `parseArchive` already ran once at the byte boundary. Re-parse here
+  // so a caller that hands us an in-memory object (never JSON) still
+  // hits the same shape check, and so this store can trust the events
+  // without re-checking each one — except the head-monotone rule, which
+  // is store-local.
+  let validated: ThreadArchive;
+  try {
+    validated = parseArchive(archive);
+  } catch (error) {
+    throw importSchemaError(archive, error);
+  }
+  if (validated.events.length === 0) return [];
+  const firstSeq = validated.events[0]?.seq ?? 0;
+  if (firstSeq <= head) {
+    throw new ThreadStoreImportError(
+      `import: archive's first seq ${firstSeq} is not strictly greater than the store's head ${head}.`,
+      { rejection: { kind: "head-not-monotone", seq: firstSeq, index: 0, transition: undefined } },
+    );
+  }
+  // Atomic commit — the documented behaviour. Dry-run the whole sequence
+  // against a DEEP COPY of the store's state; if any event is refused,
+  // throw before the caller touches the real state so a retry with a
+  // corrected archive still sees the same starting point. A one-by-one
+  // commit would half-import the archive up to the rejected event, and a
+  // bun:sqlite / D1 backing that copied that shape would inherit the bug.
+  const shadow = cloneLogState(state);
+  for (const [index, event] of validated.events.entries()) {
+    const result = validateNext(shadow, event);
+    if (!result.ok) {
+      throw new ThreadStoreImportError(
+        `import: archive refused at event ${index} (seq ${event.seq}): ${result.rejection.kind} — ${result.rejection.message}`,
+        { rejection: { kind: result.rejection.kind, seq: event.seq, index, transition: result.rejection } },
+      );
+    }
+  }
+  return validated.events;
 }
 
 export { type AppendRejection };
@@ -131,36 +307,13 @@ export class InMemoryThreadStore implements ThreadStore {
   }
 
   async import(archive: ThreadArchive): Promise<void> {
-    // `parseArchive` already ran once at the byte boundary and enforced
-    // both the Zod shape and `validateNext` starting from an empty state.
-    // Re-parse here so a caller that hands us an in-memory object (never
-    // JSON) still hits the same shape check, and so this store can trust
-    // the events without re-checking each one — except the head-monotone
-    // rule, which is store-local.
-    const validated = parseArchive(archive);
-    if (validated.events.length === 0) return;
-    const firstSeq = validated.events[0]?.seq ?? 0;
-    if (firstSeq <= this.#head) {
-      throw new ThreadStoreImportError(
-        `import: archive's first seq ${firstSeq} is not strictly greater than the store's head ${this.#head}.`,
-      );
-    }
-    // Atomic commit — the documented behaviour. Dry-run the whole
-    // sequence against a DEEP COPY of the store's state; if any event
-    // is refused, throw before touching the real state so a retry with
-    // a corrected archive still sees the same starting point. A
-    // one-by-one commit would half-import the archive up to the
-    // rejected event, and a bun:sqlite / D1 backing that copied that
-    // shape would inherit the bug.
-    const shadow = cloneLogState(this.#logState);
-    for (const event of validated.events) {
-      const result = validateNext(shadow, event);
-      if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
-    }
-    // Every event passed on the shadow — the real state is structurally
-    // identical to the shadow's starting point, so replaying the same
-    // events on it is guaranteed to succeed. Commit as one step.
-    for (const event of validated.events) {
+    // `prepareImport` owns every check and every message — see its doc
+    // for why all three backings share it. Here we only COMMIT what it
+    // already proved, which cannot fail: the same sequence was accepted
+    // against a deep copy of the state we are about to mutate, so the
+    // real state ends up structurally identical to that copy.
+    const events = prepareImport(archive, this.#logState, this.#head);
+    for (const event of events) {
       validateNext(this.#logState, event);
       this.#events.push(event);
       this.#head = event.seq;
