@@ -611,6 +611,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     displayName: `review-${pr.owner}-${pr.repo}-${pr.pullNumber}`,
   });
   let populate: PopulateOutcome;
+  const importRefusalLogs: string[] = [];
   // Files list (from listPullRequestFiles) — the daemon's review-mode
   // needs it for anchor-map. Cache what `importThreads` already fetched
   // by making an explicit call here (dedupe by using the adapter's
@@ -629,6 +630,9 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
       adapter,
       materializedRoot,
       store,
+      onRefused: (event, error) => {
+        importRefusalLogs.push(`import.refused: ${event.kind} (${error.rejection.kind})`);
+      },
       // Rename-aware old-path mapping so LEFT-side threads on a
       // renamed file read the merge-base at their original name.
       oldPathOf: (currentPath) =>
@@ -647,9 +651,16 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     store.close();
   }
   stdoutLines.push(
-    `import: ${populate.appended} new PR thread events, ${populate.skipped} already-present` +
-      (populate.refused > 0 ? `, ${populate.refused} refused (see logs)` : ""),
+    `import: ${populate.appended} new PR thread events, ${populate.skipped} already-present`,
   );
+  if (populate.refused > 0) {
+    return {
+      exitCode: 1,
+      stdout: `${stdoutLines.join("\n")}\n`,
+      stderr: `${importRefusalLogs.join("\n")}\n` +
+        `revkit review: ${populate.refused} PR thread event(s) refused; see import.refused logs above.\n`,
+    };
+  }
 
   // Serve.
   if (!parsed.serve || env.startServe === undefined) {

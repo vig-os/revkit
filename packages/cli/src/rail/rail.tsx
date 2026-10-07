@@ -25,6 +25,7 @@
 import { createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
+import type { ReviewRefreshResponse } from "../serve/daemon.ts";
 import {
   createSeqGate,
   readPageRenderHead,
@@ -359,7 +360,7 @@ async function reanchorPendingReview(): Promise<{
   };
 }
 
-async function refreshReviewPr(): Promise<{ moved: boolean; stale: boolean; currentHeadSha: string }> {
+async function refreshReviewPr(): Promise<ReviewRefreshResponse> {
   const response = await fetch("/api/review/refresh", {
     method: "POST",
     credentials: "same-origin",
@@ -367,7 +368,7 @@ async function refreshReviewPr(): Promise<{ moved: boolean; stale: boolean; curr
     body: "{}",
   });
   if (!response.ok) throw new Error(`refresh failed: ${response.status}`);
-  return (await response.json()) as { moved: boolean; stale: boolean; currentHeadSha: string };
+  return (await response.json()) as ReviewRefreshResponse;
 }
 
 /** Issue #70: the reviewer's promotion of an agent-authored draft

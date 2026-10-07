@@ -68,6 +68,7 @@ interface Ctx {
   fakeFetch: typeof fetch;
   root: string;
   cookie: string;
+  logs: string[];
 }
 
 async function startCtx(options: { remoteThreads?: readonly GhReviewThread[] } = {}): Promise<Ctx> {
@@ -142,7 +143,7 @@ async function startCtx(options: { remoteThreads?: readonly GhReviewThread[] } =
   const authResponse = await fetch(url, { redirect: "manual" });
   const setCookie = authResponse.headers.get("set-cookie")!;
   const cookie = setCookie.slice(0, setCookie.indexOf(";"));
-  return { handle, fake: pending, fakeFetch, root, cookie };
+  return { handle, fake: pending, fakeFetch, root, cookie, logs };
 }
 
 async function postComment(ctx: Ctx, body: string, suffix: string, auth: "cookie" | "bearer" = "cookie"): Promise<Response> {
@@ -526,7 +527,7 @@ describe("R8 — B4 pull is idempotent (no echo)", () => {
     };
   }
 
-  test("two refreshes without any remote change: first imports the thread, second sees importedNew=0 and importedSkipped=1", async () => {
+  test("two refreshes without any remote change: first imports the thread, second sees importedNew=0, importedSkipped=2 and refused=0", async () => {
     // Seeded with one remote thread carrying one comment, because an
     // EMPTY remote makes both counters 0 on both calls — which is
     // exactly what a refresh that imports nothing at all also
@@ -534,47 +535,55 @@ describe("R8 — B4 pull is idempotent (no echo)", () => {
     // real remote comment the counters are forced to move: the first
     // call must import, the second must skip.
     //
-    // Exact expected values, measured against the round-2/3 code
-    // (`populateStoreFromPr`): one remote comment yields two store
-    // events (`comment.created` + `comment.linked`), so the first
-    // pass reports `importedNew: 2`.
-    //
-    // The second pass re-presents BOTH events, and only ONE of them is
-    // skipped. `comment.created` repeats the same deterministic
-    // comment id and is refused `duplicate-comment-id`, which
-    // `import-threads.ts:243` classifies as skipped. `comment.linked`
-    // repeats the same BACKEND link instead, so it is refused
-    // `duplicate-link` (`validator.ts:675`) — a kind that classifier
-    // does NOT recognise, so it lands in `refused`, not `skipped`.
-    // Hence `importedNew: 0, importedSkipped: 1` and a `refused: 1`
-    // the endpoint does not surface. That asymmetry is pre-existing
-    // and tracked in #114; it is why `importedSkipped` is 1 here and
-    // not 2, and this test pins the real numbers rather than the
-    // tidier-looking 2.
+    // Counters count EVENTS, not comments. One remote comment emits
+    // a comment creation and a GitHub link. The first import appends
+    // both; the second skips both as identical re-presentations (#114).
     const ctx = await startCtx({ remoteThreads: [remoteThread("PRRC_r8_1")] });
     const cookieHdr = { cookie: ctx.cookie, origin: ctx.handle.url, "sec-fetch-site": "same-origin", "content-type": "application/json" } as const;
     const r1 = await fetch(`${ctx.handle.url}/api/review/refresh`, { method: "POST", headers: cookieHdr, body: "{}" });
     expect([200, 201]).toContain(r1.status);
-    // Both fields are asserted as REQUIRED members of the response
+    // Counters are asserted as REQUIRED members of the response
     // (no `??` default): a renamed or dropped field is `undefined`,
     // which fails these instead of being absorbed by a default.
-    const b1 = (await r1.json()) as { importedNew: number; importedSkipped: number };
+    const b1 = (await r1.json()) as { importedNew: number; importedSkipped: number; refused: number };
     expect(b1.importedNew).toBe(2);
     expect(b1.importedSkipped).toBe(0);
+    expect(b1.refused).toBe(0);
     const r2 = await fetch(`${ctx.handle.url}/api/review/refresh`, { method: "POST", headers: cookieHdr, body: "{}" });
     expect([200, 201]).toContain(r2.status);
-    const b2 = (await r2.json()) as { importedNew: number; importedSkipped: number };
-    // The idempotency invariant, and the point of the test name: the
-    // second pass appends nothing and reports one already-present
-    // event as skipped (see the note on `comment.linked` above) — no
-    // echo of already-imported rows back to GitHub.
+    const b2 = (await r2.json()) as { importedNew: number; importedSkipped: number; refused: number };
     expect(b2.importedNew).toBe(0);
-    expect(b2.importedSkipped).toBe(1);
+    expect(b2.importedSkipped).toBe(2);
+    expect(b2.refused).toBe(0);
     // No adapter writes fired: no drafts, no submits, no
     // replies, no resolutions.
     expect(ctx.fake.drafts.length).toBe(0);
     expect(ctx.fake.submits.length).toBe(0);
     expect(ctx.fake.replies.length).toBe(0);
     expect(ctx.fake.resolutions.length).toBe(0);
+  });
+
+  test("a malformed imported link remains visible as refused: 1 in an HTTP 200 refresh", async () => {
+    const remote = remoteThread("PRRC_r8_bad");
+    const malformed = { ...remote, comments: remote.comments.map((c) => ({ ...c, databaseId: 0 })) };
+    const ctx = await startCtx({ remoteThreads: [malformed] });
+    const response = await fetch(`${ctx.handle.url}/api/review/refresh`, {
+      method: "POST",
+      headers: { cookie: ctx.cookie, origin: ctx.handle.url, "sec-fetch-site": "same-origin", "content-type": "application/json" },
+      body: "{}",
+    });
+    // Summary refresh succeeds even though the link fails schema validation.
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { importedNew: number; importedSkipped: number; refused: number };
+    expect(body.importedNew).toBe(1);
+    expect(body.importedSkipped).toBe(0);
+    expect(body.refused).toBe(1);
+    const diagnostics = ctx.logs.map((line) => JSON.parse(line) as { event: string; reason?: string; errorKind?: string });
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: "review.refresh.import-refused", reason: "comment.linked", errorKind: "invalid-shape",
+    }));
+    expect(ctx.logs.join("\n")).not.toContain(remote.comments[0]!.body);
+    expect(ctx.fake.drafts).toHaveLength(0);
+    expect(ctx.fake.submits).toHaveLength(0);
   });
 });
