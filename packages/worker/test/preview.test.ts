@@ -574,14 +574,52 @@ describe("a key over R2's 1024-byte limit is refused before the read (#133)", ()
     expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/${objectPath}`] });
   });
 
-  test("1024 bytes — the last byte R2 accepts, so the bucket IS read", async () => {
+  test("1024 bytes — the largest servable key returns its stored bytes", async () => {
     const objectPath = objectPathOfKeyBytes(MAX_R2_KEY_BYTES);
+    const key = `${REPO}/pr-${PR}/${objectPath}`;
     expect(utf8ByteLength(`${REPO}/pr-${PR}/${objectPath}`)).toBe(1024);
+    await seedPreview(key, DOCUMENT);
     const issued = await issueTestSession(harness.db);
     const response = await get(previewUrl(objectPath), authHeaders(issued));
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(DOCUMENT);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
     expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/${objectPath}`] });
   });
+
+  for (const principal of ["operator", "guest"] as const) {
+    for (const [label, objectPath, multibyte] of [
+      ["one byte over the key limit", objectPathOfKeyBytes(1025), false],
+      ["multibyte name below 1024 UTF-16 units but over 1024 UTF-8 bytes", `${"é".repeat(600)}.html`, true],
+    ] as const) {
+      test(`${principal}: ${label} returns a bodyless 404 with full hygiene and no read`, async () => {
+        if (multibyte) {
+          const rawKey = `${REPO}/pr-${PR}/${objectPath}`;
+          expect(rawKey.length).toBeLessThan(1024);
+          expect(utf8ByteLength(rawKey)).toBeGreaterThan(1024);
+        }
+        // URL normalisation percent-encodes the multibyte name, making the
+        // actual R2 key longer still. Count the key the Worker receives.
+        const key = new URL(previewUrl(objectPath)).pathname.slice(1);
+        expect(utf8ByteLength(key)).toBeGreaterThan(1024);
+        const headers = principal === "guest"
+          ? { cookie: await guestFor(REPO, PR) }
+          : authHeaders(await issueTestSession(harness.db));
+        const response = await get(previewUrl(objectPath), headers);
+        expect(response.status).toBe(404);
+        expect(await response.text()).toBe("");
+        expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+        expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+        expect(response.headers.get("cross-origin-opener-policy")).toBe("same-origin");
+        expect(response.headers.get("cross-origin-resource-policy")).toBe("same-origin");
+        expect(response.headers.get("permissions-policy")).toContain("camera=()");
+        expect(response.headers.get("x-revkit-request-id")).toMatch(/^[0-9a-f-]{36}$/);
+        expect(response.headers.get("cache-control")).toBe("no-store");
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        expect(await spyReads()).toEqual({ reads: 0, keys: [] });
+      });
+    }
+  }
 
   test("1025 bytes — one over, refused, and the bucket is NOT read", async () => {
     const objectPath = objectPathOfKeyBytes(1025);
