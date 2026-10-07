@@ -8,8 +8,8 @@
 //
 // **This runs on BUILT output.** Lesson from PR #38: anchor tests
 // must exercise the rehype-data-src pipeline as it ships, not a
-// hand-written HTML fixture. The seeded source file is `docs/adr/
-// 0006-*.md`, the built page is `site/dist/adr/0006-*/index.html`
+// hand-written HTML fixture. The frozen Markdown fixture is seeded
+// as `docs/adr/rail-reanchor.md` in a temp repo and built with Astro
 // (Astro + rehype-data-src stamps every block with a `data-src`),
 // and the rail's anchor lookup uses those real stamps. If the
 // build shape changes, this spec goes red.
@@ -29,11 +29,11 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 /** Wait for a rail element count to be STABLE at `expected` across a
  * window, rather than to be `expected` at some instant.
@@ -88,18 +88,15 @@ async function expectStableCount(
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
-const DIST = resolve(__dirname, "..", "dist");
-const REPO_ROOT = resolve(__dirname, "..", "..");
+const SITE = resolve(__dirname, "..");
+const FIXTURE = resolve(__dirname, "fixtures", "rail-reanchor", "rail-reanchor.md");
+const execFileAsync = promisify(execFile);
 
-// Anchor onto a real block in the BUILT page for ADR-0006. The
-// source is `docs/adr/0006-comments-anchoring-event-log.md`; the
-// built page is `/adr/0006-comments-anchoring-event-log/`. The
-// daemon serves the site's dist AND resolves anchors against a
-// temp copy of the source (so tests never edit the real repo file).
-const SOURCE_REL_PATH = "docs/adr/0006-comments-anchoring-event-log.md";
-const BUILT_PAGE_PATH = "/adr/0006-comments-anchoring-event-log/";
-// The context paragraph in ADR-0006 starts with this text (line 9
-// of the source at time of writing). The rail selects a substring
+// Both the built page and the daemon's source come from the frozen
+// fixture. The site's repo-docs loader renders docs/<slug>.md at /<slug>/.
+const SOURCE_REL_PATH = "docs/adr/rail-reanchor.md";
+const BUILT_PAGE_PATH = `/${SOURCE_REL_PATH.slice("docs/".length, -".md".length)}/`;
+// The fixture retains ADR-0006's Context paragraph. The rail selects a substring
 // of a stamped block; the daemon computes prefix/suffix from the
 // SOURCE file. Both must line up for the anchor to survive the
 // re-anchor pipeline.
@@ -114,19 +111,53 @@ interface DaemonCtx {
   readonly port: number;
 }
 
-/** Boot a daemon serving the SITE's built dist AND rooted on a
- * temp repo that carries a copy of the ADR-0006 source file. Tests
+/** Boot a daemon serving a real build of the frozen fixture AND rooted on a
+ * temp repo that carries the same source file. Tests
  * edit the temp copy; the built HTML stays as-is (that's the "runs
  * on built output" property). */
 async function bootDaemon(): Promise<DaemonCtx> {
-  if (!existsSync(DIST)) throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
-  const realSource = readFileSync(join(REPO_ROOT, SOURCE_REL_PATH), "utf8");
-  const root = mkdtempSync(join(tmpdir(), "revkit-rrt-"));
+  const fixtureSource = readFileSync(FIXTURE, "utf8");
+  // Keep the build beneath the trusted site so Astro's dependency resolver
+  // can find the installed stack, as in the review build's staging layout.
+  const scratch = join(SITE, ".revkit-review");
+  mkdirSync(scratch, { recursive: true });
+  const root = mkdtempSync(join(scratch, "rail-reanchor-"));
   mkdirSync(join(root, ".revkit"), { recursive: true });
   writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
   mkdirSync(join(root, dirname(SOURCE_REL_PATH)), { recursive: true });
-  writeFileSync(join(root, SOURCE_REL_PATH), realSource, "utf8");
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
+  writeFileSync(join(root, SOURCE_REL_PATH), fixtureSource, "utf8");
+  const dist = join(root, ".revkit", "dist");
+  try {
+    const site = join(root, "site");
+    // Stage the real build tooling, with no live documentation. The repo-docs
+    // loader needs its usual directories and matrix; the other collections
+    // can be empty. Every file carrying the target quote is frozen input.
+    cpSync(join(SITE, "src"), join(site, "src"), {
+      recursive: true,
+      filter: (path) => path !== join(SITE, "src", "content", "docs"),
+    });
+    for (const name of ["astro.config.mjs", "package.json", "tsconfig.json"]) {
+      cpSync(join(SITE, name), join(site, name));
+    }
+    symlinkSync(resolve(SITE, "..", "packages"), join(root, "packages"), "dir");
+    symlinkSync(join(SITE, "node_modules"), join(site, "node_modules"), "dir");
+    mkdirSync(join(root, "docs", "designs"), { recursive: true });
+    writeFileSync(join(root, "docs", "FEATURE-MATRIX.md"), "# Fixture matrix\n");
+    mkdirSync(join(root, "vocab"), { recursive: true });
+    writeFileSync(join(root, "vocab", "terms.yaml"), "schemaVersion: 1\nentries: []\n");
+    mkdirSync(join(root, "plots"), { recursive: true });
+    mkdirSync(join(root, ".revkit", "asks"), { recursive: true });
+    mkdirSync(join(site, "src", "content", "docs"), { recursive: true });
+    await execFileAsync(join(SITE, "node_modules", ".bin", "astro"), ["build", "--outDir", dist], {
+      cwd: site,
+      env: process.env,
+    });
+    await execFileAsync("bun", [REVKIT_BIN, "check-dist", dist], { cwd: root, env: process.env });
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", dist], {
     cwd: root,
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
@@ -195,7 +226,7 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
 
 /** Drive a real DOM text selection over a substring found in ANY
  * stamped block on the page. The selection anchors on whichever
- * `[data-src]` element contains the substring — for the ADR-0006
+ * `[data-src]` element contains the substring — for the fixture
  * page, that's the paragraph carrying the "Comments must survive"
  * sentence. */
 async function selectAndComment(page: Page, quote: string, body: string): Promise<void> {
@@ -209,6 +240,9 @@ async function selectAndComment(page: Page, quote: string, body: string): Promis
       }
     }
     if (hit === undefined) throw new Error(`no stamped block contains ${JSON.stringify(needle)}`);
+    // Bring the block into view as a reviewer would before selecting it,
+    // so the floating Comment button is placed inside the viewport.
+    hit.scrollIntoView({ block: "center" });
     // Find the text node inside `hit` whose content carries the
     // substring. Prose blocks (paragraphs) often have exactly one
     // text node child; walk defensively.
@@ -252,7 +286,7 @@ test.describe("rail re-anchor round-trip @chromium-only", () => {
     try {
       // Launch flow — sets the session cookie.
       await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
-      // Real built page — served from site/dist.
+      // Real built page — served from the temp repo's .revkit/dist.
       await page.goto(`${daemon.url}${BUILT_PAGE_PATH}`);
       await expect(page.getByTestId("revkit-rail")).toBeVisible();
 
@@ -285,8 +319,7 @@ test.describe("rail re-anchor round-trip @chromium-only", () => {
       await page.locator(".revkit-rail__refresh").click();
       // The line label should now be higher up (shifted by 6 lines).
       // We assert the label changed rather than pinning an exact
-      // line number, so a documentation edit above ## Context does
-      // not silently break this spec.
+      // line number, so this checks movement relative to the initial anchor.
       await expect(async () => {
         const labelNow = await page
           .locator(".revkit-rail__thread-lines")
@@ -421,7 +454,7 @@ test.describe("rail re-anchor round-trip @chromium-only", () => {
       // After the redirects, the page lands on the canonical origin.
       expect(page.url()).toContain(`127.0.0.1:${daemon.port}`);
 
-      // Open the built ADR-0006 page through the localhost URL —
+      // Open the built fixture page through the localhost URL —
       // same 307, same canonicalisation.
       await page.goto(`http://localhost:${daemon.port}${BUILT_PAGE_PATH}`);
       await expect(page.getByTestId("revkit-rail")).toBeVisible();
