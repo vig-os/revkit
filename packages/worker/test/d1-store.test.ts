@@ -106,6 +106,30 @@ describe("D1ThreadStore — D1 concurrency model", () => {
     await harness.db.prepare("DELETE FROM review_logs").run();
   });
 
+  for (const payload of ["{", "{}", JSON.stringify({
+    seq: 7, ts: "2026-10-03T12:00:00Z", actor: { kind: "local", id: "u1" },
+    kind: "thread.resolved", threadId: "missing",
+  })]) {
+    test(`#98-r1: import catch-up refuses ${payload} as a typed persisted-row error`, async () => {
+      await harness.db.prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+        .bind(LOG, 7, "2026-10-03T12:00:00Z", payload).run();
+      const store = new D1ThreadStore({ db: harness.db, logKey: LOG, clock: fixedClock() });
+      const error = await store.import({ schemaVersion: CURRENT_SCHEMA_VERSION, events: [] }).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(ThreadStoreImportError);
+      const refusal = error as ThreadStoreImportError;
+      expect(refusal.rejection?.kind).toBe("invalid-shape");
+      // This seq belongs to the persisted log, not to an archive event.
+      expect(refusal.rejection?.seq).toBeUndefined();
+      expect(refusal.rejection?.index).toBeUndefined();
+      expect(refusal.message).toContain("seq 7");
+      expect(refusal.message).toContain('field "');
+      expect(refusal.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+      expect(refusal.message.length).toBeLessThan(1200);
+      if (payload === "{" || payload === "{}") expect(refusal.cause).toBeInstanceOf(Error);
+      expect(await countIn(harness.db, LOG)).toBe(1);
+    });
+  }
+
   // ── the mutation guard for A10 ────────────────────────────────────────
   test("MUTATION GUARD: the naive read-then-write A10 forbids really does collide", async () => {
     // Exactly what `D1ThreadStore.append` must NOT do: read the head

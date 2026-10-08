@@ -206,6 +206,40 @@ export function storeConformance(factory: StoreFactory): void {
       });
     }
 
+    for (const operation of ["append", "import"] as const) {
+      for (const example of ["rank", "reviewNodeId"] as const) {
+        test(`#98-r1: ${operation} bounds a million-character ${example} diagnostic`, async () => {
+          const large = "x".repeat(1_000_000);
+          const events: ReviewEventInput[] = example === "rank" ? [
+            { actor: agent, kind: "ask.created", askId: "ask-rank",
+              spec: { schemaVersion: 1, kind: "rank", title: "Rank", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] } },
+            { actor: human, kind: "ask.answered", askId: "ask-rank", answer: { kind: "rank", ranking: [large, "b"] } },
+          ] : [
+            { actor: human, kind: "review.submitted", reviewNodeId: large, event: "COMMENT" },
+          ];
+          let error: unknown;
+          if (operation === "append") {
+            for (const event of events.slice(0, -1)) await store.append(event);
+            const last = events[events.length - 1];
+            if (last === undefined) throw new Error("missing example");
+            error = await store.append(last).catch((error: unknown) => error);
+            expect(error).toBeInstanceOf(ThreadStoreAppendError);
+          } else {
+            error = await store.import({ schemaVersion: CURRENT_SCHEMA_VERSION,
+              events: events.map((event, index) => ({ ...event, seq: index + 1, ts: "2026-10-03T12:00:00Z" })),
+            } as ThreadArchive).catch((error: unknown) => error);
+            expect(error).toBeInstanceOf(ThreadStoreImportError);
+          }
+          const refusal = error as ThreadStoreAppendError | ThreadStoreImportError;
+          expect(refusal.rejection?.kind).toBe(example === "rank" ? "answer-shape-mismatch" : "review-not-pending");
+          expect(refusal.message.length).toBeLessThan(1200);
+          expect(refusal.message).toContain(example === "rank" ? 'field "answer.ranking[0]"' : 'field "reviewNodeId"');
+          expect(refusal.message).toContain("…(+");
+          expect(refusal.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+        });
+      }
+    }
+
     // ── A5 ────────────────────────────────────────────────────────────────
     test("A5: append returns seq 1 first, then strictly increasing, with no gaps", async () => {
       expect(await store.append(createThread("th-a5", "c-a5-1"))).toBe(1);
@@ -877,4 +911,41 @@ async function buildGappedArchive(seqs: readonly number[]): Promise<ThreadArchiv
     body: `gap ${seq}`,
   }));
   return parseArchive({ schemaVersion: CURRENT_SCHEMA_VERSION, events });
+}
+
+/** Persisted backings can receive foreign rows; the memory store has no row
+ * parser or foreign writer. Both SQLite and D1 run these cases unchanged. */
+export function persistedAppendConformance(factory: StoreFactory, seed: (row: { seq: number; payload: string }) => Promise<void>): void {
+  describe(`persisted append conformance — ${factory.name}`, () => {
+    let store: ThreadStore;
+    beforeEach(async () => {
+      await factory.reset();
+      store = await factory.make();
+    });
+
+    for (const payload of ["{", "{}", JSON.stringify({
+      seq: 7, ts: "2026-10-03T12:00:00Z", actor: human,
+      kind: "thread.resolved", threadId: "missing",
+    })]) {
+      test(`#98-r1: catch-up refuses ${payload} with a shared typed persisted-row diagnostic`, async () => {
+        await seed({ seq: 7, payload });
+        const error = await store.append(commentCreated("th-next", "c-next")).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(ThreadStoreAppendError);
+        const refusal = error as ThreadStoreAppendError;
+        expect(refusal.rejection.kind).toBe("invalid-shape");
+        expect(refusal.message).toContain("seq 7");
+        expect(refusal.message).toStartWith("append: event refused at persisted event");
+        expect(refusal.message.match(/append:/g)).toHaveLength(1);
+        expect(refusal.message).toContain('field "');
+        expect(refusal.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+        expect(refusal.message.length).toBeLessThan(1200);
+        if (payload.startsWith('{"')) {
+          expect(refusal.message).toContain('field "threadId": invalid-shape');
+          expect(refusal.message).toContain("persisted event violates unknown-thread");
+        } else {
+          expect(refusal.cause).toBeInstanceOf(Error);
+        }
+      });
+    }
+  });
 }

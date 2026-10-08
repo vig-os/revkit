@@ -45,7 +45,7 @@ import {
   type ThreadFilter,
   type ThreadStore,
 } from "@revkit/review-core";
-import { ThreadStoreAppendError, ThreadStoreOpenError } from "@revkit/review-core";
+import { ThreadStoreAppendError, parsePersistedEvent, persistedLogError, quoteStoreDiagnostic } from "@revkit/review-core";
 
 const wallClock: Clock = () => new Date().toISOString();
 
@@ -139,39 +139,43 @@ export class SqliteThreadStore implements ThreadStore {
    * …) is still fatal — those signal real log corruption. */
   static open(options: SqliteThreadStoreOptions): SqliteThreadStore {
     const db = new Database(options.filename, { create: true });
-    db.exec(SCHEMA_SQL);
-    const rows = db
-      .query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC")
-      .all();
-    const state = emptyLogState();
-    let head = 0;
-    for (const row of rows) {
-      const event = reviewEventSchema.parse(JSON.parse(row.payload));
-      const result = validateNext(state, event);
-      if (!result.ok) {
-        if (result.rejection.kind === "answer-shape-mismatch" && event.kind === "ask.answered") {
-          // Log and advance state to `answered` — the reducer
-          // already projects the answer, and refusing to start
-          // over a historical answer is worse than accepting
-          // it. Uses stderr since the store has no logger
-          // handle at this call site; the daemon logs the count
-          // once it has a logger.
-          process.stderr.write(
-            `SqliteThreadStore.open: accepting historical ask.answered on ask '${event.askId}' whose value fails the current answer-shape check ` +
-              `(${result.rejection.field}: ${result.rejection.message}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
-          );
-          const ask = state.asks.get(event.askId);
-          if (ask !== undefined) ask.status = "answered";
-          if (event.seq > head) head = event.seq;
-          continue;
+    try {
+      db.exec(SCHEMA_SQL);
+      const rows = db
+        .query<{ seq: number; payload: string }, []>("SELECT seq, payload FROM events ORDER BY seq ASC")
+        .all();
+      const state = emptyLogState();
+      let head = 0;
+      for (const row of rows) {
+        const event = parsePersistedEvent(row, "open", options.displayName ?? options.filename);
+        const result = validateNext(state, event);
+        if (!result.ok) {
+          if (result.rejection.kind === "answer-shape-mismatch" && event.kind === "ask.answered") {
+            // Log and advance state to `answered` — the reducer
+            // already projects the answer, and refusing to start
+            // over a historical answer is worse than accepting
+            // it. Uses stderr since the store has no logger
+            // handle at this call site; the daemon logs the count
+            // once it has a logger.
+            process.stderr.write(
+              `SqliteThreadStore.open: accepting historical ask.answered on ask ${quoteStoreDiagnostic(event.askId)} whose value fails the current answer-shape check ` +
+                `(${quoteStoreDiagnostic(result.rejection.field)}: ${quoteStoreDiagnostic(result.rejection.message)}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
+            );
+            const ask = state.asks.get(event.askId);
+            if (ask !== undefined) ask.status = "answered";
+            if (event.seq > head) head = event.seq;
+            continue;
+          }
+          // Any other rejection is real corruption — refuse loudly.
+          throw persistedLogError("open", row.seq, result.rejection, { displayName: options.displayName ?? options.filename });
         }
-        // Any other rejection is real corruption — refuse loudly.
-        db.close();
-        throw new ThreadStoreOpenError(result.rejection, options.displayName ?? options.filename);
+        if (event.seq > head) head = event.seq;
       }
-      if (event.seq > head) head = event.seq;
+      return new SqliteThreadStore(db, options.clock ?? wallClock, state, head);
+    } catch (error) {
+      db.close();
+      throw error;
     }
-    return new SqliteThreadStore(db, options.clock ?? wallClock, state, head);
   }
 
   /** Close the underlying database. Idempotent. */
@@ -193,8 +197,8 @@ export class SqliteThreadStore implements ThreadStore {
     // the transaction back — the log is unchanged.
     const ts = this.#clock();
     const insertStmt = this.#db.prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)");
-    const catchUpStmt = this.#db.query<{ payload: string }, [number]>(
-      "SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC",
+    const catchUpStmt = this.#db.query<{ seq: number; payload: string }, [number]>(
+      "SELECT seq, payload FROM events WHERE seq > ? ORDER BY seq ASC",
     );
     const maxSeqStmt = this.#db.query<{ seq: number | null }, []>("SELECT MAX(seq) AS seq FROM events");
 
@@ -204,13 +208,10 @@ export class SqliteThreadStore implements ThreadStore {
       // Catch up on any events another writer appended.
       const catchUp = catchUpStmt.all(this.#head);
       for (const row of catchUp) {
-        const foreign = reviewEventSchema.parse(JSON.parse(row.payload));
+        const foreign = parsePersistedEvent(row, "append");
         const result = validateNext(this.#logState, foreign);
         if (!result.ok) {
-          throw new ThreadStoreAppendError({
-            kind: "invalid-shape",
-            message: `append: on-disk event seq=${foreign.seq} broke the local log state (${result.rejection.kind}: ${result.rejection.message}).`,
-          });
+          throw persistedLogError("append", row.seq, result.rejection);
         }
         if (foreign.seq > this.#head) this.#head = foreign.seq;
       }

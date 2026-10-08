@@ -78,7 +78,9 @@ import {
   selectThreads,
   validateNext,
   ThreadStoreAppendError,
-  ThreadStoreImportError,
+  parsePersistedEvent,
+  persistedLogError,
+  type PersistedEventRow,
   type AskFilter,
   type AskRecord,
   type Clock,
@@ -177,7 +179,7 @@ const HEAD_SQL = "SELECT COALESCE(MAX(seq), 0) AS head FROM review_logs WHERE lo
  * `validateNext`, and another review's events are a different log with
  * colliding `threadId`s — feeding them to this store's validator would raise
  * `duplicate-thread` from somebody else's comment. */
-const CATCH_UP_SQL = "SELECT payload FROM review_logs WHERE log_key = ? AND seq > ? ORDER BY seq ASC";
+const CATCH_UP_SQL = "SELECT seq, payload FROM review_logs WHERE log_key = ? AND seq > ? ORDER BY seq ASC";
 
 /** The append, guarded. `SELECT … WHERE MAX(seq) = ?` is the CAS: the insert
  * happens only if THIS LOG's head is still the one this attempt validated
@@ -448,7 +450,7 @@ export class D1ThreadStore implements ThreadStore {
       const result = validateNext(shadow, event);
       if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
 
-      const batched = await this.#db.batch<{ payload: string }>([
+      const batched = await this.#db.batch<PersistedEventRow>([
         this.#db.prepare(HEAD_SQL).bind(this.#logKey),
         this.#db.prepare(CATCH_UP_SQL).bind(this.#logKey, expected),
         this.#db.prepare(INSERT_SQL).bind(this.#logKey, seq, ts, JSON.stringify(event), this.#logKey, expected),
@@ -457,7 +459,7 @@ export class D1ThreadStore implements ThreadStore {
       // Whatever another writer committed is durable, so it belongs in
       // the real state whether or not our own insert landed — the next
       // attempt must validate against it, not against a stale state.
-      absorbCatchUp(this.#logState, readPayloads(batched[1]), appendInconsistency);
+      absorbCatchUp(this.#logState, readRows(batched[1]), "append");
       if (this.#head < dbHead) this.#head = dbHead;
       if ((batched[2]?.meta?.changes ?? 0) > 0) {
         // The CAS held, which means `MAX(seq)` was still `expected`, which
@@ -502,11 +504,11 @@ export class D1ThreadStore implements ThreadStore {
       // rows' read could claim seqs this state never absorbed. The bound is
       // `seq > this.#head`, so a retry never re-absorbs a row it already
       // folded in (which would come back as `duplicate-thread`).
-      const snapshot = await this.#db.batch<{ payload: string }>([
+      const snapshot = await this.#db.batch<PersistedEventRow>([
         this.#db.prepare(HEAD_SQL).bind(this.#logKey),
         this.#db.prepare(CATCH_UP_SQL).bind(this.#logKey, this.#head),
       ]);
-      absorbCatchUp(this.#logState, readPayloads(snapshot[1]), importInconsistency);
+      absorbCatchUp(this.#logState, readRows(snapshot[1]), "import");
       const dbHead = readHead(snapshot[0]);
       if (this.#head < dbHead) this.#head = dbHead;
 
@@ -597,47 +599,19 @@ function readHead(statement: D1Result<unknown> | undefined): number {
   return typeof head === "number" ? head : 0;
 }
 
-function readPayloads(statement: D1Result<{ payload: string }> | undefined): string[] {
-  return (statement?.results ?? []).map((row) => row.payload);
+function readRows(statement: D1Result<PersistedEventRow> | undefined): readonly PersistedEventRow[] {
+  return statement?.results ?? [];
 }
 
-/** Replay rows another writer committed into this store's validator
- * state. A refusal here means the log is genuinely inconsistent with the
- * shared rules — surface it in the CALLER's error taxonomy rather than
- * letting our own event ride on top of a state we could not build.
- *
- * `refuse` exists because `import` must not answer with
- * `ThreadStoreAppendError`: #72's promise is that EVERY `import` refusal
- * leaves the store boundary as a `ThreadStoreImportError`, and before
- * `import` reconciled at all this path was `append`'s alone. `import`
- * cannot pass a `transition` (the event that broke the state is another
- * writer's, not an archive event), so it reports `invalid-shape` with no
- * `seq`/`index`. */
+/** Replay foreign rows through the shared operation-specific parse/error gate. */
 function absorbCatchUp(
   state: LogState,
-  payloads: readonly string[],
-  refuse: (message: string) => Error,
+  rows: readonly PersistedEventRow[],
+  operation: "append" | "import",
 ): void {
-  for (const payload of payloads) {
-    const foreign = reviewEventSchema.parse(JSON.parse(payload));
+  for (const row of rows) {
+    const foreign = parsePersistedEvent(row, operation);
     const result = validateNext(state, foreign);
-    if (!result.ok) {
-      throw refuse(
-        `another writer's event seq=${foreign.seq} broke the local log state (${result.rejection.kind}: ${result.rejection.message}).`,
-      );
-    }
+    if (!result.ok) throw persistedLogError(operation, row.seq, result.rejection);
   }
-}
-
-/** The `append` half of `absorbCatchUp`'s taxonomy. */
-function appendInconsistency(message: string): ThreadStoreAppendError {
-  return new ThreadStoreAppendError({ kind: "invalid-shape", message });
-}
-
-/** The `import` half: same condition, the class #72 promised, and no
- * `cause` — there is no `ZodError` behind a log that will not replay. */
-function importInconsistency(message: string): ThreadStoreImportError {
-  return new ThreadStoreImportError(message, {
-    rejection: { kind: "invalid-shape", seq: undefined, index: undefined, transition: undefined },
-  });
 }

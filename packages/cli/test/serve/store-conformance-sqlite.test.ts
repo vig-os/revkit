@@ -14,13 +14,14 @@
 // A case that fails HERE is a finding about the daemon's store, not a reason
 // to skip the case: `storeConformance` has no skip mechanism to reach for.
 
+import { Database } from "bun:sqlite";
 import { afterEach, describe } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ThreadStore } from "@revkit/review-core";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
-import { fixedClock, storeConformance, type StoreFactory } from "../../../review-core/test/store-conformance.ts";
+import { fixedClock, storeConformance, persistedAppendConformance, type StoreFactory } from "../../../review-core/test/store-conformance.ts";
 
 describe("store conformance — SqliteThreadStore (daemon's bun:sqlite backing)", () => {
   const open: SqliteThreadStore[] = [];
@@ -70,4 +71,13 @@ describe("store conformance — SqliteThreadStore (daemon's bun:sqlite backing)"
   });
 
   storeConformance(factory);
+  persistedAppendConformance(factory, async (row) => {
+    if (currentFile === undefined) throw new Error("seed before make");
+    const db = new Database(currentFile);
+    try {
+      db.query("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)").run(row.seq, "2026-10-03T12:00:00Z", row.payload);
+    } finally {
+      db.close();
+    }
+  });
 });
