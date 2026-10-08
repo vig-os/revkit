@@ -108,7 +108,6 @@ interface IndexedText {
   readonly start: number;
   readonly end: number;
   readonly map?: LeafMap;
-  readonly block?: IndexedBlock;
   readonly invalidBefore: number;
   readonly invalidThrough: number;
 }
@@ -121,6 +120,7 @@ interface IndexedBlock {
 
 interface LegacyIndex {
   readonly revision: string;
+  readonly source: string;
   readonly lines: ReturnType<typeof buildLineStartIndex>;
   readonly text: string;
   readonly entries: readonly IndexedText[];
@@ -128,15 +128,21 @@ interface LegacyIndex {
 }
 
 // A rendered snapshot is immutable. The digest binds its source line index.
-// weak ownership releases the DOM/index when its rebuild bucket is finished.
+// Weak ownership releases the DOM/index when its rebuild bucket is finished.
 const legacyIndexes = new WeakMap<RenderedProvenance, LegacyIndex>();
 
-/** One iterative top-down pass assigns innermost block/leaf membership.
+/** One iterative top-down pass assigns innermost leaf membership.
  * Block ranges share ONE text stream: even equal-stamped nested containers
  * never duplicate text or walk their descendants again. */
 function legacyIndex(rendered: RenderedProvenance, source: string, revision: string): LegacyIndex {
   const cached = legacyIndexes.get(rendered);
-  if (cached?.revision === revision) return cached;
+  if (cached) {
+    // Reusing a digest with different text must never reuse stale lines or
+    // offsets. Immutable string equality is cheap for the shared snapshot
+    // reference and also accepts an equal copy without recomputing a hash.
+    if (cached.revision !== revision || cached.source.length !== source.length || cached.source !== source) throw new Error("Rendered snapshot source or revision mismatch");
+    return cached;
+  }
   const entries: IndexedText[] = [];
   const blocks: IndexedBlock[] = [];
   const parts: string[] = [];
@@ -146,7 +152,6 @@ function legacyIndex(rendered: RenderedProvenance, source: string, revision: str
     readonly node: Node;
     readonly leaf?: Element;
     readonly map?: LeafMap;
-    readonly block?: IndexedBlock;
     readonly close?: IndexedBlock;
   }
   const stack: Frame[] = [{ node: rendered.document }];
@@ -154,13 +159,13 @@ function legacyIndex(rendered: RenderedProvenance, source: string, revision: str
     const frame = stack.pop()!;
     if (frame.close) { frame.close.end = length; continue; }
     const { node } = frame;
-    let { leaf, map, block } = frame;
+    let { leaf, map } = frame;
     if (node.nodeType === 1) {
       const element = node as Element;
       const stamp = element.getAttribute("data-src");
       const bounds = stamp && rendered.blocks.has(stamp) ? parseDataSrc(stamp) : undefined;
       if (bounds) {
-        block = { start: length, end: length, bounds };
+        const block = { start: length, end: length, bounds };
         blocks.push(block);
         stack.push({ node, close: block });
       }
@@ -175,13 +180,13 @@ function legacyIndex(rendered: RenderedProvenance, source: string, revision: str
       const value = node.textContent ?? "";
       const before = invalid;
       if (!map && (leaf || value.trim())) invalid++;
-      entries.push({ start: length, end: length + value.length, map, block, invalidBefore: before, invalidThrough: invalid });
+      entries.push({ start: length, end: length + value.length, map, invalidBefore: before, invalidThrough: invalid });
       parts.push(value);
       length += value.length;
     }
-    for (let child = node.lastChild; child !== null; child = child.previousSibling) stack.push({ node: child, leaf, map, block });
+    for (let child = node.lastChild; child !== null; child = child.previousSibling) stack.push({ node: child, leaf, map });
   }
-  const index: LegacyIndex = { revision, lines: buildLineStartIndex(source), text: parts.join(""), entries, blocks };
+  const index: LegacyIndex = { revision, source, lines: buildLineStartIndex(source), text: parts.join(""), entries, blocks };
   legacyIndexes.set(rendered, index);
   return index;
 }
@@ -212,7 +217,10 @@ function* matches(text: string, pattern: string, table: Uint32Array, start = 0, 
 }
 
 /** Matches arrive in text order. Each endpoint cursor visits each text
- * entry and lossy interval at most once, including rejected candidates. */
+ * entry and lossy interval at most once, including rejected candidates.
+ * Keep these boundary/delta rules identical to sourceEndpoint in
+ * text-provenance.ts: token interiors include the whole lossy source atom,
+ * while token boundaries retain half-open endpoint semantics. */
 function endpointCursor(entries: readonly IndexedText[], side: "start" | "end") {
   let at = 0;
   let interval = 0;
