@@ -98,3 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     CI (a retry re-runs `beforeAll` and gets a fresh code).
 
 ### Security
+
+- Invite display names reject C0/C1 controls and DEL before D1, returning the
+  documented refusal with cache headers and preserving browser slots ([#145](https://github.com/vig-os/revkit/issues/145)).

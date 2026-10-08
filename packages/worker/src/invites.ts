@@ -656,8 +656,12 @@ export type RedeemResult =
  * (ADR-0009). An unbounded name is an unbounded mirror, so it is capped here
  * and refused rather than truncated: a silent truncation would change what a
  * guest is called without telling them. Leading/trailing whitespace is trimmed
- * because `"  "` passes the CHECK's `length(trim(x)) > 0` only if the trim
- * leaves something, and a name of `"Ada  "` would be stored with the padding.
+ * before measuring or storing the name. JS `trim()` covers SQLite's default
+ * U+0020 trim as well as Unicode whitespace. Refuse C0, DEL and C1 controls in
+ * the ORIGINAL input, including tabs/newlines that trimming would otherwise
+ * erase. In particular, SQLite TEXT `length()` stops at NUL, so allowing one
+ * would let D1's CHECK be the first refusal and turn it into a server error.
+ * With controls excluded, Unicode code points match SQLite's length measure.
  */
 /**
  * The guarded INSERT that claims a browser slot: statement 1 of the redemption
@@ -714,7 +718,10 @@ export async function redeemInvite(
 ): Promise<RedeemResult> {
   const now = (options.now ?? Date.now)();
   const displayName = input.displayName.trim();
-  if (displayName.length === 0 || displayName.length > MAX_DISPLAY_NAME_CHARS) {
+  if (
+    /[\u0000-\u001f\u007f-\u009f]/.test(input.displayName) ||
+    displayName.length === 0 || Array.from(displayName).length > MAX_DISPLAY_NAME_CHARS
+  ) {
     return { ok: false, refusal: "display-name-rejected" };
   }
   // The binding is what identifies the browser. Refusing a malformed one here

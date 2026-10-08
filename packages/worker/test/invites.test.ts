@@ -708,6 +708,20 @@ describe("invite mechanics (ADR-0009) against D1", () => {
       expect((await db().prepare("SELECT display_name FROM guests ORDER BY created_at DESC, rowid DESC").first<{ display_name: string }>())?.display_name).toBe(NAME);
     });
 
+    test("display-name validation (#145): every C0/C1 control and DEL is refused before D1", async () => {
+      const { token } = await mint(db(), { repo: REPO, kind: "personal" });
+      const binding = mintToken();
+      const controls = [...Array.from({ length: 32 }, (_, i) => i), 0x7f,
+        ...Array.from({ length: 32 }, (_, i) => 0x80 + i)];
+      for (const code of controls) {
+        const result = await redeem(token, { binding, displayName: `a${String.fromCharCode(code)}b` });
+        expect(result.ok, `U+${code.toString(16).padStart(4, "0")}`).toBe(false);
+        if (!result.ok) expect(result.refusal).toBe("display-name-rejected");
+      }
+      expect((await db().prepare("SELECT COUNT(*) AS n FROM invite_redemptions").first<{ n: number }>())?.n).toBe(0);
+      expect((await redeem(token, { binding })).ok).toBe(true);
+    });
+
     test("the display name is stored in `guests`, never in the session row", async () => {
       // ADR-0020: `sessions.identity_id` is an opaque id, and it is the reason a
       // session row is a pseudonymous record rather than a personal one.
@@ -2779,6 +2793,72 @@ const PAGE_ELEMENTS = [
     // ── redemption ────────────────────────────────────────────────────────
 
     describe("POST /invite/redeem", () => {
+      describe("display-name validation (#145)", () => {
+        const rejectedNames: readonly (readonly [string, string])[] = [
+          ["NUL only", "\u0000"],
+          ["NUL prefix", "\u0000abc"],
+          ["NUL interior", "a\u0000b"],
+          ["tab only", "\t"],
+          ["NBSP only", "\u00a0"],
+          ["ideographic space only", "\u3000"],
+          ["non-ASCII whitespace only", "\u00a0\u3000"],
+          ["U+0085 only", "\u0085"],
+          ["leading tab", "\tAda"],
+          ["trailing newline", "Ada\n"],
+          ["C0 upper boundary", "a\u001fb"],
+          ["DEL", "a\u007fb"],
+          ["C1 lower boundary", "a\u0080b"],
+          ["C1 upper boundary", "a\u009fb"],
+        ];
+        for (const [encoding, submit] of [["JSON", redeem], ["form", redeemUrlEncoded]] as const) {
+          for (const [label, displayName] of rejectedNames) {
+            test(`${encoding}: ${label} is display-name-rejected without consuming a browser slot`, async () => {
+              const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
+              if (!minted.ok) throw new Error("mint failed");
+              const token = minted.minted.token;
+              const { browser } = await open(harness, token);
+              const lines: string[] = [];
+              const original = console.log;
+              console.log = (line: unknown) => { lines.push(String(line)); };
+              try {
+                // URLSearchParams encodes NUL as %00 for the form cases.
+                const refused = await submit(harness, browser, token, { displayName });
+                expect(refused.status).toBe(410);
+                expect(refused.headers.get("cache-control")).toBe("no-store");
+                expect(refused.headers.get("set-cookie")).toBeNull();
+                expect(await refused.text()).toBe(inviteClosedPage(clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest())));
+                const denials = lines.map((line) => JSON.parse(line) as Record<string, unknown>)
+                  .filter((line) => line["msg"] === "invite.redeem.denied");
+                expect(denials.map((line) => line["reason"])).toEqual(["display-name-rejected"]);
+                for (const table of ["invite_redemptions", "guests", "sessions"]) {
+                  expect((await harness.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>())?.n, table).toBe(0);
+                }
+                expect((await submit(harness, browser, token, { displayName: NAME })).status).toBe(303);
+                expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM invite_redemptions WHERE invite_id = ?")
+                  .bind(minted.minted.invite.id).first<{ n: number }>())?.n).toBe(1);
+              } finally {
+                console.log = original;
+              }
+            });
+          }
+
+          test(`${encoding}: the display-name cap counts normalized Unicode code points`, async () => {
+            const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
+            if (!minted.ok) throw new Error("mint failed");
+            const token = minted.minted.token;
+            const { browser } = await open(harness, token);
+            const name = "😀".repeat(MAX_DISPLAY_NAME_CHARS);
+            const tooLong = await submit(harness, browser, token, { displayName: `${name}😀` });
+            expect(tooLong.status).toBe(410);
+            expect(tooLong.headers.get("cache-control")).toBe("no-store");
+            expect((await submit(harness, browser, token, { displayName: ` \u00a0${name}\u3000 ` })).status).toBe(303);
+            const stored = await harness.db.prepare("SELECT display_name, length(trim(display_name)) AS n FROM guests")
+              .first<{ display_name: string; n: number }>();
+            expect(stored).toEqual({ display_name: name, n: MAX_DISPLAY_NAME_CHARS });
+          });
+        }
+      });
+
       test("a live invite answers 303 to a TOKEN-FREE path and sets both cookies", async () => {
         const { browser, response } = await onboard(harness, { repo: REPO, pr: 42 });
         expect(response.status).toBe(303);
