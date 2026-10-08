@@ -108,3 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     CI (a retry re-runs `beforeAll` and gets a fresh code).
 
 ### Security
+
+- Invite display names reject controls, malformed Unicode, bidi overrides and
+  names without visible content before D1, returning the documented refusal
+  without consuming the invite's browser slot. The cap counts Unicode code points,
+  and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).

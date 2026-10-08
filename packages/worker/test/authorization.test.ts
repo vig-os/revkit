@@ -37,6 +37,7 @@ import {
   type RouteKind,
 } from "../src/authz.ts";
 import { D1ThreadStore } from "../src/d1-store.ts";
+import { BROWSER_COOKIE_NAME, mintInvite } from "../src/invites.ts";
 import {
   CSRF_HEADER,
   SESSION_COOKIE_NAME,
@@ -59,6 +60,7 @@ import {
   issueTestSession,
   seedLogEvents,
   stripTsComments,
+  testTokenHasher,
   JSON_HEADERS,
   startWorker,
   type Harness,
@@ -1857,8 +1859,26 @@ describe("ADR-0012's per-request gate", () => {
         readonly init?: (issued: Awaited<ReturnType<typeof issueTestSession>>) => DispatchInit | undefined;
         readonly expected: number;
       };
+      const invite = await mintInvite(harness.db, { repo: REVIEW.repo, kind: "personal" }, { keys: await testTokenHasher() });
+      if (!invite.ok) throw new Error("mint failed");
+      const opened = await harness.dispatch(`http://localhost/invite/${invite.minted.token}`);
+      const bindingCookie = opened.headers.getSetCookie()
+        .find((cookie) => cookie.startsWith(`${BROWSER_COOKIE_NAME}=`))?.split(";")[0];
+      expect(bindingCookie).toBeDefined();
       const steps: Step[] = [
         { label: "health 200", path: HEALTH_PATH, expected: 200 },
+        // #145: a valid invite and binding with a NUL display name must reach
+        // the documented 410 refusal and its headers, before D1's CHECK.
+        {
+          label: "invite 410 (control character in display name)",
+          path: "/invite/redeem",
+          init: () => ({
+            method: "POST",
+            headers: { ...JSON_HEADERS, cookie: bindingCookie ?? "" },
+            body: JSON.stringify({ token: invite.minted.token, displayName: "\u0000abc" }),
+          }),
+          expected: 410,
+        },
         // A wrong verb on the probe. This is the case that caught a REAL
         // regression: `classifyRoute` sends a wrong-verb `/healthz` to
         // `method-not-allowed`, which is UNGATED, and the ungated dispatcher

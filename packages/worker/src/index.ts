@@ -1056,7 +1056,7 @@ async function readRedeemBody(
   const read = await readBoundedText(request);
   if (read.kind === "too-large") return { kind: "too-large" };
   if (read.kind === "unreadable") return undefined;
-  const record = type === FORM_MEDIA_TYPE ? formFields(read.text) : jsonFields(parseJson(read.text));
+  const record = type === FORM_MEDIA_TYPE ? formFields(read.text) : jsonFields(read.text);
   if (record === undefined) return undefined;
   const { token, displayName } = record;
   if (typeof token !== "string" || !TOKEN_SHAPE.test(token)) return undefined;
@@ -1122,16 +1122,6 @@ async function readBoundedText(
   return { kind: "text", text: new TextDecoder().decode(bytes) };
 }
 
-/** `JSON.parse` that answers `undefined` instead of throwing, so the caller has
- * one "unreadable" path rather than two. */
-function parseJson(text: string): unknown {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Form-encoded fields, with a repeat refused. `URLSearchParams` decodes
  * `+` and `%XX`; it does not, and must not, decide which of two `token`s wins. */
 function formFields(body: string): Record<string, unknown> | undefined {
@@ -1148,8 +1138,32 @@ function formFields(body: string): Record<string, unknown> | undefined {
  * silently keeps the last, so the check is done on the RAW text rather than on
  * the parsed object — otherwise this function would accept a repeated `token`
  * on one media type and refuse it on the other. */
-function jsonFields(parsed: unknown): Record<string, unknown> | undefined {
+function jsonFields(body: string): Record<string, unknown> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body) as unknown;
+  } catch {
+    return undefined;
+  }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  // JSON.parse already checked syntax. Scan complete string tokens and nesting
+  // punctuation, so escaped key spellings compare equal while strings and
+  // nested objects cannot be mistaken for top-level fields.
+  const names = new Set<string>();
+  let depth = 0;
+  for (const match of body.matchAll(/"(?:[^"\\]|\\[\s\S])*"|[{}\[\]]/g)) {
+    const token = match[0];
+    if (token === "{" || token === "[") depth++;
+    else if (token === "}" || token === "]") depth--;
+    else if (depth === 1) {
+      let next = match.index + token.length;
+      while (/\s/.test(body[next] ?? "") && next < body.length) next++;
+      if (body[next] !== ":") continue;
+      const name = JSON.parse(token) as string;
+      if (names.has(name)) return undefined;
+      names.add(name);
+    }
+  }
   return parsed as Record<string, unknown>;
 }
 
