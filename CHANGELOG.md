@@ -88,8 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Consumer `revkit build` now preserves transitive dependency resolution and
-  conflicting versions with Bun’s isolated workspace install
+- **Consumer `revkit build` now preserves transitive dependency resolution and
+  conflicting versions with Bun’s isolated workspace install**
   ([#141](https://github.com/vig-os/revkit/issues/141)).
 
 - **`ask-page` Playwright suite no longer fails 5 of 11 tests at CI's `workers: 1`** ([#74](https://github.com/vig-os/revkit/issues/74))

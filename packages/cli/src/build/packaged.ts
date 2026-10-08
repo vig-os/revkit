@@ -54,7 +54,7 @@ import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnAstroBuild, type SpawnLike } from "../review/build.ts";
 import { unlinkStale } from "../review/build.ts";
-import { stageIsolatedDependencies } from "./stage-dependencies.ts";
+import { stageHoistedDependencies, stageIsolatedDependencies } from "./stage-dependencies.ts";
 
 /** Input to `runPackagedBuild`. */
 export interface RunPackagedBuildOptions {
@@ -411,25 +411,9 @@ export function stageAstroRoot(options: {
   const stagingNodeModules = join(stagingDir, "node_modules");
   mkdirSync(stagingNodeModules, { recursive: true, mode: 0o755 });
   if (trustedStack.layout === "isolated") {
-    stageIsolatedDependencies(packagedNodeModules, stagingNodeModules);
+    stageIsolatedDependencies(packagedNodeModules, stagingNodeModules, packageRoot);
   } else {
-    for (const name of readdirSync(packagedNodeModules)) {
-      const from = join(packagedNodeModules, name);
-      const to = join(stagingNodeModules, name);
-      // `@scope` — real dir, per-package symlinks inside.
-      if (name.startsWith("@") && statSync(from).isDirectory()) {
-        mkdirSync(to, { recursive: true, mode: 0o755 });
-        for (const pkgName of readdirSync(from)) {
-          const pkgFrom = join(from, pkgName);
-          const pkgTo = join(to, pkgName);
-          unlinkStale(pkgTo);
-          symlinkSync(pkgFrom, pkgTo);
-        }
-      } else {
-        unlinkStale(to);
-        symlinkSync(from, to);
-      }
-    }
+    stageHoistedDependencies(packagedNodeModules, stagingNodeModules);
   }
 
   // Optional consumer data trees. The site's content.config.ts
