@@ -93,6 +93,8 @@ async function run(...args: string[]) {
   // A killed/stalled command must FAIL the test, never satisfy a refusal check.
   if (child.signal || child.status === 124 || child.status === 137) throw new Error("cf test: fixture deadline exceeded");
   if (child.error || child.status === null) throw new Error("cf test: fixture subprocess failed");
+  // Let Miniflare's background I/O run between short synchronous commands.
+  await Bun.sleep(0);
   return { code: child.status, output: child.stdout + child.stderr };
 }
 
