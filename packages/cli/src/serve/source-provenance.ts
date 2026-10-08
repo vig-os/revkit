@@ -104,117 +104,187 @@ export function selectionAnchor(
   return { path: request.path, startLine, endLine, revision, quote: buildQuoteFromOffsets(source, start, end) };
 }
 
-/** Inverse bounds for locating only the rendered text that overlaps a
- * recorded source window. Lossy atoms are included, then validated exactly. */
-function renderedBound(map: LeafMap, sourceOffset: number, side: "start" | "end"): number {
-  if (sourceOffset <= map.start) return 0;
-  if (sourceOffset >= map.end) return map.length;
-  let delta = map.start;
-  for (const [r0, r1, s0, s1] of map.intervals ?? []) {
-    if (sourceOffset <= s0) return sourceOffset - delta;
-    if (sourceOffset < s1) return side === "start" ? r0 : r1;
-    delta = s1 - r1;
-  }
-  return sourceOffset - delta;
-}
-
 interface IndexedText {
   readonly start: number;
   readonly end: number;
   readonly map?: LeafMap;
+  readonly block?: IndexedBlock;
   readonly invalidBefore: number;
   readonly invalidThrough: number;
 }
 
-/** Recover legacy quotes using unique renderer candidates inside their
- * recorded lines. Build text/line indexes once; never validate a candidate
- * by walking its entire containing block. */
-export function recoverLegacyAnchor(rendered: RenderedProvenance, source: string, anchor: Anchor): Anchor | undefined {
-  const candidates = new Map<string, Anchor>();
-  const lines = buildLineStartIndex(source);
-  const windowStart = lines[anchor.startLine - 1];
-  const last = lines[anchor.endLine - 1];
-  if (windowStart === undefined || last === undefined || anchor.quote.exact.length === 0) return undefined;
-  // A terminating newline belongs to the preceding line under the
-  // engine's end-1 line convention. Keep it inside the legacy window.
-  const windowEnd = lines[anchor.endLine] ?? source.length;
-  const add = (start: number, end: number): void => {
-    if (start < windowStart || end > windowEnd || start >= end) return;
-    candidates.set(`${start}:${end}`, { ...anchor, startLine: offsetToLine(lines, start), endLine: offsetToLine(lines, end - 1), quote: buildQuoteFromOffsets(source, start, end) });
-  };
-  // Search a bounded slice, not the remainder of the document. Context
-  // may extend beyond the recorded lines and is checked against source.
-  const sourceWindow = source.slice(windowStart, windowEnd);
-  let cursor = 0;
-  while (cursor < sourceWindow.length) {
-    const hit = sourceWindow.indexOf(anchor.quote.exact, cursor);
-    if (hit < 0) break;
-    const start = windowStart + hit;
-    if (source.slice(Math.max(0, start - anchor.quote.prefix.length), start).endsWith(anchor.quote.prefix) && source.startsWith(anchor.quote.suffix, start + anchor.quote.exact.length)) add(start, start + anchor.quote.exact.length);
-    if (candidates.size > 1) return undefined;
-    cursor = hit + 1;
+interface IndexedBlock {
+  readonly start: number;
+  end: number;
+  readonly bounds: NonNullable<ReturnType<typeof parseDataSrc>>;
+}
+
+interface LegacyIndex {
+  readonly revision: string;
+  readonly lines: ReturnType<typeof buildLineStartIndex>;
+  readonly text: string;
+  readonly entries: readonly IndexedText[];
+  readonly blocks: readonly IndexedBlock[];
+}
+
+// A rendered snapshot is immutable. The digest binds its source line index.
+// weak ownership releases the DOM/index when its rebuild bucket is finished.
+const legacyIndexes = new WeakMap<RenderedProvenance, LegacyIndex>();
+
+/** One iterative top-down pass assigns innermost block/leaf membership.
+ * Block ranges share ONE text stream: even equal-stamped nested containers
+ * never duplicate text or walk their descendants again. */
+function legacyIndex(rendered: RenderedProvenance, source: string, revision: string): LegacyIndex {
+  const cached = legacyIndexes.get(rendered);
+  if (cached?.revision === revision) return cached;
+  const entries: IndexedText[] = [];
+  const blocks: IndexedBlock[] = [];
+  const parts: string[] = [];
+  let length = 0;
+  let invalid = 0;
+  interface Frame {
+    readonly node: Node;
+    readonly leaf?: Element;
+    readonly map?: LeafMap;
+    readonly block?: IndexedBlock;
+    readonly close?: IndexedBlock;
   }
-  for (const block of rendered.document.querySelectorAll("[data-src]")) {
-    const stamp = block.getAttribute("data-src")!;
-    const bounds = parseDataSrc(stamp);
-    if (!rendered.blocks.has(stamp) || !bounds || bounds.path !== anchor.path || bounds.startLine > anchor.startLine || bounds.endLine < anchor.endLine) continue;
-    const entries: IndexedText[] = [];
-    const parts: string[] = [];
-    let length = 0;
-    let invalid = 0;
-    let low = Infinity;
-    let high = 0;
-    const walk = (node: Node): void => {
-      if (node.nodeType === 3) {
-        const value = node.textContent ?? "";
-        const leaf = node.parentElement?.closest("[data-revkit-leaf]");
-        const record = leaf ? rendered.leaves.get(leaf.getAttribute("data-revkit-leaf")!) : undefined;
-        const map = record && record.element === leaf ? record.map : undefined;
-        const before = invalid;
-        if (!map && (leaf || value.trim())) invalid++;
-        entries.push({ start: length, end: length + value.length, map, invalidBefore: before, invalidThrough: invalid });
-        if (map && map.end > windowStart && map.start < windowEnd) {
-          low = Math.min(low, length + renderedBound(map, windowStart, "start"));
-          high = Math.max(high, length + renderedBound(map, windowEnd, "end"));
-        }
-        length += value.length;
-        parts.push(value);
+  const stack: Frame[] = [{ node: rendered.document }];
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.close) { frame.close.end = length; continue; }
+    const { node } = frame;
+    let { leaf, map, block } = frame;
+    if (node.nodeType === 1) {
+      const element = node as Element;
+      const stamp = element.getAttribute("data-src");
+      const bounds = stamp && rendered.blocks.has(stamp) ? parseDataSrc(stamp) : undefined;
+      if (bounds) {
+        block = { start: length, end: length, bounds };
+        blocks.push(block);
+        stack.push({ node, close: block });
       }
-      for (const child of node.childNodes) walk(child);
-    };
-    walk(block);
-    if (low >= high) continue;
-    const text = parts.join("");
-    const textWindow = text.slice(low, high);
-    // Binary endpoint lookup and prefix counts make validation depend on
-    // the selected range, rather than all later text nodes or leaves.
-    const locate = (offset: number, side: "start" | "end"): IndexedText | undefined => {
-      let lo = 0;
-      let hi = entries.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >>> 1;
-        if (side === "start" ? entries[mid]!.end <= offset : entries[mid]!.end < offset) lo = mid + 1;
-        else hi = mid;
+      const id = element.getAttribute("data-revkit-leaf");
+      if (id !== null) {
+        leaf = element;
+        const record = rendered.leaves.get(id);
+        map = record?.element === element ? record.map : undefined;
       }
-      const entry = entries[lo];
-      return entry && (side === "start" ? offset >= entry.start && offset < entry.end : offset > entry.start && offset <= entry.end) ? entry : undefined;
-    };
-    let from = 0;
-    while (from < textWindow.length) {
-      const hit = textWindow.indexOf(anchor.quote.exact, from);
-      if (hit < 0) break;
-      from = hit + 1;
-      const begin = low + hit;
-      const finish = begin + anchor.quote.exact.length;
-      if (!text.slice(Math.max(0, begin - anchor.quote.prefix.length), begin).endsWith(anchor.quote.prefix) || !text.startsWith(anchor.quote.suffix, finish)) continue;
-      const a = locate(begin, "start");
-      const b = locate(finish, "end");
-      if (!a?.map || !b?.map || b.invalidThrough !== a.invalidBefore) continue;
-      const sa = sourceEndpoint(a.map, begin - a.start, "start");
-      const sb = sourceEndpoint(b.map, finish - b.start, "end");
-      if (sa !== undefined && sb !== undefined) add(sa, sb);
-      if (candidates.size > 1) return undefined;
+    }
+    if (node.nodeType === 3) {
+      const value = node.textContent ?? "";
+      const before = invalid;
+      if (!map && (leaf || value.trim())) invalid++;
+      entries.push({ start: length, end: length + value.length, map, block, invalidBefore: before, invalidThrough: invalid });
+      parts.push(value);
+      length += value.length;
+    }
+    for (let child = node.lastChild; child !== null; child = child.previousSibling) stack.push({ node: child, leaf, map, block });
+  }
+  const index: LegacyIndex = { revision, lines: buildLineStartIndex(source), text: parts.join(""), entries, blocks };
+  legacyIndexes.set(rendered, index);
+  return index;
+}
+
+/** KMP includes prefix/suffix in the pattern, so rejecting overlapping
+ * exact-quote hits never compares the quote or context again. */
+function failureTable(pattern: string): Uint32Array {
+  const table = new Uint32Array(pattern.length);
+  let matched = 0;
+  for (let i = 1; i < pattern.length; i++) {
+    while (matched > 0 && pattern[i] !== pattern[matched]) matched = table[matched - 1]!;
+    if (pattern[i] === pattern[matched]) matched++;
+    table[i] = matched;
+  }
+  return table;
+}
+
+function* matches(text: string, pattern: string, table: Uint32Array, start = 0, end = text.length): Generator<number> {
+  let matched = 0;
+  for (let i = start; i < end; i++) {
+    while (matched > 0 && text[i] !== pattern[matched]) matched = table[matched - 1]!;
+    if (text[i] === pattern[matched]) matched++;
+    if (matched === pattern.length) {
+      yield i + 1 - pattern.length;
+      matched = table[matched - 1]!;
     }
   }
-  return candidates.size === 1 ? [...candidates.values()][0] : undefined;
+}
+
+/** Matches arrive in text order. Each endpoint cursor visits each text
+ * entry and lossy interval at most once, including rejected candidates. */
+function endpointCursor(entries: readonly IndexedText[], side: "start" | "end") {
+  let at = 0;
+  let interval = 0;
+  let delta: number | undefined;
+  return (offset: number): { entry: IndexedText; source: number } | undefined => {
+    while (at < entries.length && (side === "start" ? entries[at]!.end <= offset : entries[at]!.end < offset)) {
+      at++;
+      interval = 0;
+      delta = undefined;
+    }
+    const entry = entries[at];
+    if (!entry?.map || (side === "start" ? offset < entry.start || offset >= entry.end : offset <= entry.start || offset > entry.end)) return undefined;
+    const local = offset - entry.start;
+    if (local > entry.map.length) return undefined;
+    delta ??= entry.map.start;
+    const intervals = entry.map.intervals ?? [];
+    while (interval < intervals.length) {
+      const [r0, r1, s0, s1] = intervals[interval]!;
+      if (local <= r0) return { entry, source: local + delta };
+      if (local < r1) return { entry, source: side === "start" ? s0 : s1 };
+      delta = s1 - r1;
+      interval++;
+    }
+    return { entry, source: local + delta };
+  };
+}
+
+/** Recover unique source/rendered candidates inside the recorded lines.
+ * Indexing and candidate search are linear in document plus quote/context
+ * size, independent of nesting depth and overlapping exact-quote hits. */
+export function recoverLegacyAnchor(rendered: RenderedProvenance, source: string, anchor: Anchor): Anchor | undefined {
+  if (anchor.quote.exact.length === 0) return undefined;
+  const { lines, text, entries, blocks } = legacyIndex(rendered, source, anchor.revision);
+  const windowStart = lines[anchor.startLine - 1];
+  const last = lines[anchor.endLine - 1];
+  if (windowStart === undefined || last === undefined) return undefined;
+  // A terminating newline belongs to the preceding line (end-1).
+  const windowEnd = lines[anchor.endLine] ?? source.length;
+  const candidates = new Map<string, Anchor>();
+  const add = (start: number, end: number): void => {
+    if (start < windowStart || end > windowEnd || start >= end) return;
+    const key = `${start}:${end}`;
+    if (candidates.has(key)) return;
+    candidates.set(key, { ...anchor, startLine: offsetToLine(lines, start), endLine: offsetToLine(lines, end - 1), quote: buildQuoteFromOffsets(source, start, end) });
+  };
+  const { exact, prefix, suffix } = anchor.quote;
+  const pattern = prefix + exact + suffix;
+  const table = failureTable(pattern);
+  // Context may extend outside the recorded lines; only the exact range
+  // must fit them. Scan this expanded window without copying its text.
+  for (const hit of matches(source, pattern, table, Math.max(0, windowStart - prefix.length), Math.min(source.length, windowEnd + suffix.length))) {
+    add(hit + prefix.length, hit + prefix.length + exact.length);
+    if (candidates.size > 1) return undefined;
+  }
+  const eligible = blocks.filter(({ bounds }) => bounds.path === anchor.path && bounds.startLine <= anchor.startLine && bounds.endLine >= anchor.endLine);
+  let blockAt = 0;
+  let containingEnd = -1;
+  const startEndpoint = endpointCursor(entries, "start");
+  const endEndpoint = endpointCursor(entries, "end");
+  for (const hit of matches(text, pattern, table)) {
+    // Preorder block starts and KMP hits are monotonic. An ancestor must
+    // contain the FULL pattern: context cannot spill into a sibling block.
+    while (blockAt < eligible.length && eligible[blockAt]!.start <= hit) {
+      containingEnd = Math.max(containingEnd, eligible[blockAt]!.end);
+      blockAt++;
+    }
+    if (containingEnd < hit + pattern.length) continue;
+    const a = startEndpoint(hit + prefix.length);
+    const b = endEndpoint(hit + prefix.length + exact.length);
+    if (!a || !b || b.entry.invalidThrough !== a.entry.invalidBefore) continue;
+    add(a.source, b.source);
+    if (candidates.size > 1) return undefined;
+  }
+  return candidates.size === 1 ? candidates.values().next().value : undefined;
 }

@@ -88,6 +88,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Legacy quote recovery stays linear on deeply nested blocks and
+  repetitive text**, and rebuilds yield between threads to keep the local
+  review daemon responsive
+  ([#161](https://github.com/vig-os/revkit/issues/161),
+  [#162](https://github.com/vig-os/revkit/issues/162)).
+
 - **Consumer `revkit build` now preserves transitive dependency resolution and
   conflicting versions with Bun’s isolated workspace install**
   ([#141](https://github.com/vig-os/revkit/issues/141)).

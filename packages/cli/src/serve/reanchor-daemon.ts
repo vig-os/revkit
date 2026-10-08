@@ -733,6 +733,10 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       let rendered: RenderedProvenance | undefined;
       try { rendered = await renderProvenance(repoRoot, path, oldSource); } catch { /* Fail closed below. */ }
       for (const thread of bucket) {
+        // Store/diff awaits can settle entirely through microtasks. A real
+        // event-loop turn between threads keeps HTTP and timers responsive
+        // even when a rebuild recovers many quotes from one snapshot.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         const recovered = rendered === undefined ? undefined : recoverLegacyAnchor(rendered, oldSource, thread.anchor);
         const result = recovered === undefined
           ? { kind: "orphaned" as const, revision: newRevision, reason: "The snapshot quote has no unique source provenance." }
