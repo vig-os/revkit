@@ -67,6 +67,7 @@ import {
   type ReviewModeOptions,
 } from "./review-mode.ts";
 import { populateStoreFromPr } from "../review/import-threads.ts";
+import type { ReviewRefreshResponse } from "../review/api-types.ts";
 import { IngestGapError, openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
 import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
@@ -3273,6 +3274,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // already-present events — no echo back to GitHub.
         let importedNew = 0;
         let importedSkipped = 0;
+        let refused = 0;
         try {
           const remoteThreads = await reviewMode.options.adapter.listReviewThreads(reviewMode.options.pr);
           const populate = await populateStoreFromPr({
@@ -3283,11 +3285,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
             adapter: reviewMode.options.adapter,
             materializedRoot: options.repoRoot,
             store,
+            onRefused: (event, error) => {
+              logger.warn("review.refresh.import-refused", {
+                requestId, reason: event.kind, errorKind: error.rejection.kind,
+              });
+            },
             oldPathOf: (currentPath) =>
               nextFiles.find((f) => f.filename === currentPath)?.previousFilename,
           });
           importedNew = populate.appended;
           importedSkipped = populate.skipped;
+          refused = populate.refused;
         } catch (error) {
           logger.warn("review.refresh.import-failed", {
             requestId,
@@ -3327,8 +3335,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           openPendingReviewNodeId: state.openPending?.reviewNodeId ?? null,
           importedNew,
           importedSkipped,
+          // HTTP 200 reflects the refreshed summary. Import can
+          // partially succeed; its refusals stay visible in this field.
+          refused,
           ...(reconcileOutcome !== undefined ? { reconcile: { newlySynced: reconcileOutcome.newlySynced, newlyFailed: [...reconcileOutcome.newlyFailed] } } : {}),
-        });
+        } satisfies ReviewRefreshResponse);
       } catch (error) {
         logger.warn("review.refresh.adapter-failed", {
           requestId,

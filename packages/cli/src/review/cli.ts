@@ -611,6 +611,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     displayName: `review-${pr.owner}-${pr.repo}-${pr.pullNumber}`,
   });
   let populate: PopulateOutcome;
+  const importRefusalLogs: string[] = [];
   // Files list (from listPullRequestFiles) — the daemon's review-mode
   // needs it for anchor-map. Cache what `importThreads` already fetched
   // by making an explicit call here (dedupe by using the adapter's
@@ -629,6 +630,9 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
       adapter,
       materializedRoot,
       store,
+      onRefused: (event, error) => {
+        importRefusalLogs.push(`import.refused: ${event.kind} (${error.rejection.kind})`);
+      },
       // Rename-aware old-path mapping so LEFT-side threads on a
       // renamed file read the merge-base at their original name.
       oldPathOf: (currentPath) =>
@@ -647,9 +651,21 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     store.close();
   }
   stdoutLines.push(
-    `import: ${populate.appended} new PR thread events, ${populate.skipped} already-present` +
-      (populate.refused > 0 ? `, ${populate.refused} refused (see logs)` : ""),
+    `import: ${populate.appended} new PR thread events, ${populate.skipped} already-present`,
   );
+  const willServe = parsed.serve && env.startServe !== undefined;
+  const importRefusalStderr = populate.refused > 0
+    ? `${importRefusalLogs.join("\n")}\n` + (willServe
+      ? `revkit review: WARNING: ${populate.refused} PR thread event(s) refused; these GitHub comments were not imported; see import.refused logs above.\n`
+      : `revkit review: ${populate.refused} PR thread event(s) refused; see import.refused logs above.\n`)
+    : "";
+  if (populate.refused > 0 && !willServe) {
+    return {
+      exitCode: 1,
+      stdout: `${stdoutLines.join("\n")}\n`,
+      stderr: importRefusalStderr,
+    };
+  }
 
   // Serve.
   if (!parsed.serve || env.startServe === undefined) {
@@ -677,7 +693,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     return {
       exitCode: 1,
       stdout: `${stdoutLines.join("\n")}\n`,
-      stderr: `revkit review: failed to look up viewer login: ${(error as Error).message}\n`,
+      stderr: importRefusalStderr + `revkit review: failed to look up viewer login: ${(error as Error).message}\n`,
     };
   }
 
@@ -701,9 +717,9 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   stdoutLines.push(`  launch: ${serveHandle.launchUrl}   (single-use)`);
   stdoutLines.push(`  reviewing PR #${pr.pullNumber}`);
   return {
-    exitCode: 0,
+    exitCode: populate.refused > 0 ? 1 : 0,
     stdout: `${stdoutLines.join("\n")}\n`,
-    stderr: "",
+    stderr: importRefusalStderr,
     blockForever: serveHandle.blockForever,
   };
 }

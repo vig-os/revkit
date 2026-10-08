@@ -182,6 +182,8 @@ export type PreviewRefusal = (typeof PREVIEW_REFUSALS)[number];
 
 /**
  * R2's limit on an object key, in **UTF-8 bytes**.
+ * Cloudflare documents a maximum object key length of 1,024 bytes:
+ * https://developers.cloudflare.com/r2/platform/limits/
  *
  * **Measured on the platform rather than quoted, because the direction of the
  * error matters.** miniflare 4.20260518.0 / workerd 2026-05-18, through
@@ -208,7 +210,7 @@ export type PreviewRefusal = (typeof PREVIEW_REFUSALS)[number];
  * arrives LONGER than it was written (one `é` is six characters of `%C3%A9`),
  * so a preview path can cross 1024 bytes without any single segment looking long.
  * `test/preview.test.ts` computes its multibyte boundary from the encoded
- * spelling and asserts the key R2 is asked for.
+ * spelling and proves that over-limit keys cause no R2 read.
  */
 export const MAX_R2_KEY_BYTES = 1024;
 
@@ -319,22 +321,16 @@ export function previewTargetFor(scopePath: string, pathname: string): PreviewTa
   // it is, which is the more informative of the two facts, and both answer the
   // same bodyless 404.
   //
-  // **The key's byte length is the SUM of the two parts',** which is not a trick
-  // but arithmetic: the key is `scopePath` with its leading slash dropped and one
-  // joining slash put back, and a slash is one UTF-8 byte either way, so the two
-  // cancel. **It was off by one for one commit** — the first cut measured
-  // `` `${scopePath}/${objectPath}` ``, which is the key with a slash it does not
-  // have, and therefore refused a legal 1024-byte key. `test/preview.test.ts`
-  // pins the identity `byteLength(key) === byteLength(scopePath) +
-  // byteLength(objectPath)` against the real key, so the cancellation cannot go
-  // stale.
-  const keyBytes = utf8ByteLength(scopePath) + utf8ByteLength(objectPath);
+  // Measure the full key, including its review prefix and joining slash, without
+  // the pathname's leading slash. R2 accepts exactly 1024 bytes; only > throws.
+  const key = `${scopePath.slice(1)}/${objectPath}`;
+  const keyBytes = utf8ByteLength(key);
   if (keyBytes > MAX_R2_KEY_BYTES) return refused("key-too-long");
   return {
     kind: "serve",
     target: {
       objectPath,
-      key: `${scopePath.slice(1)}/${objectPath}`,
+      key,
       contentType: media.contentType,
       kind: media.kind,
     },
