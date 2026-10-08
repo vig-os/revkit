@@ -193,6 +193,7 @@ export {
   ThreadStoreImportError,
   ThreadStoreOpenError,
   storeRejectionMessage,
+  STORE_OPERATION_LABELS,
   quoteStoreDiagnostic,
   persistedLogError,
   parsePersistedEvent,

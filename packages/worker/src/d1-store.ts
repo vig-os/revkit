@@ -80,6 +80,7 @@ import {
   ThreadStoreAppendError,
   parsePersistedEvent,
   persistedLogError,
+  STORE_OPERATION_LABELS,
   type PersistedEventRow,
   type AskFilter,
   type AskRecord,
@@ -508,7 +509,7 @@ export class D1ThreadStore implements ThreadStore {
         this.#db.prepare(HEAD_SQL).bind(this.#logKey),
         this.#db.prepare(CATCH_UP_SQL).bind(this.#logKey, this.#head),
       ]);
-      absorbCatchUp(this.#logState, readRows(snapshot[1]), "import");
+      absorbCatchUp(this.#logState, readRows(snapshot[1]), STORE_OPERATION_LABELS.import);
       const dbHead = readHead(snapshot[0]);
       if (this.#head < dbHead) this.#head = dbHead;
 

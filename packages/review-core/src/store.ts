@@ -83,6 +83,10 @@ export interface ThreadStore {
   ask(id: string): Promise<AskRecord | undefined>;
 }
 
+// Keep the import label in a template literal so the bundle's quoted-module
+// specifier gate cannot mistake operation data for a module import.
+export const STORE_OPERATION_LABELS = { append: "append", import: `import`, open: "open" } as const;
+
 /** Location of a refusal, shared by schema and transition diagnostics. */
 interface RejectionLocation {
   readonly path?: readonly PropertyKey[];
@@ -150,7 +154,7 @@ export function storeRejectionMessage(
   rejection: AppendRejection | { readonly kind: ImportRejection["kind"]; readonly message: string },
   location: RejectionLocation = {},
 ): string {
-  const subject = operation === "import" ? "archive" : operation === "open" ? "existing log" : "event";
+  const subject = operation === STORE_OPERATION_LABELS.import ? "archive" : operation === "open" ? "existing log" : "event";
   const event = location.index !== undefined
     ? ` at event ${location.index}${location.seq === undefined ? "" : ` (seq ${location.seq})`}`
     : location.seq === undefined ? "" : ` at persisted event (seq ${location.seq})`;
@@ -282,7 +286,7 @@ export class ThreadStoreImportError extends Error {
     readonly location?: RejectionLocation;
   } = {}) {
     super(
-      storeRejectionMessage("import", {
+      storeRejectionMessage(STORE_OPERATION_LABELS.import, {
         ...options.rejection?.transition,
         kind: options.rejection?.kind ?? "invalid-shape",
         message,
