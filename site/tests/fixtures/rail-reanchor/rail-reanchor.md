@@ -31,6 +31,8 @@ The paragraphs above keep the target below the fold to exercise scrolling.
 
 ## Context
 
+<!-- Keep the next sentence verbatim: rail-reanchor.spec.ts selects and replaces it. -->
+
 Comments must survive edits and rebuilds (A8), map to PR lines (B2) and never be lost.
 
 ## After the anchor

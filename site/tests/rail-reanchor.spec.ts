@@ -31,6 +31,7 @@ import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -96,7 +97,8 @@ const execFileAsync = promisify(execFile);
 // fixture. The site's repo-docs loader renders docs/<slug>.md at /<slug>/.
 const SOURCE_REL_PATH = "docs/adr/rail-reanchor.md";
 const BUILT_PAGE_PATH = `/${SOURCE_REL_PATH.slice("docs/".length, -".md".length)}/`;
-// The fixture retains ADR-0006's Context paragraph. The rail selects a substring
+// fixtures/rail-reanchor/rail-reanchor.md retains ADR-0006's Context sentence
+// verbatim. The rail selects a substring
 // of a stamped block; the daemon computes prefix/suffix from the
 // SOURCE file. Both must line up for the anchor to survive the
 // re-anchor pipeline.
@@ -111,11 +113,13 @@ interface DaemonCtx {
   readonly port: number;
 }
 
-/** Boot a daemon serving a real build of the frozen fixture AND rooted on a
- * temp repo that carries the same source file. Tests
- * edit the temp copy; the built HTML stays as-is (that's the "runs
- * on built output" property). */
-async function bootDaemon(): Promise<DaemonCtx> {
+interface FixtureBuild {
+  readonly root: string;
+  readonly dist: string;
+}
+
+/** Build the frozen fixture once, with caches owned by this build. */
+async function buildFixture(): Promise<FixtureBuild> {
   const fixtureSource = readFileSync(FIXTURE, "utf8");
   // Keep the build beneath the trusted site so Astro's dependency resolver
   // can find the installed stack, as in the review build's staging layout.
@@ -150,14 +154,32 @@ async function bootDaemon(): Promise<DaemonCtx> {
     mkdirSync(join(site, "src", "content", "docs"), { recursive: true });
     await execFileAsync(join(SITE, "node_modules", ".bin", "astro"), ["build", "--outDir", dist], {
       cwd: site,
-      env: process.env,
+      env: {
+        ...process.env,
+        REVKIT_ASTRO_CACHE_DIR: join(root, ".revkit", "cache", "astro"),
+        REVKIT_VITE_CACHE_DIR: join(root, ".revkit", "cache", "vite"),
+      },
     });
     await execFileAsync("bun", [REVKIT_BIN, "check-dist", dist], { cwd: root, env: process.env });
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
     throw error;
   }
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", dist], {
+  return { root, dist };
+}
+
+let fixtureBuild: FixtureBuild | undefined;
+
+/** Each daemon gets a fresh source repo; all serve the same frozen build.
+ * Tests edit their own source copy while the built HTML stays as-is. */
+async function bootDaemon(): Promise<DaemonCtx> {
+  if (fixtureBuild === undefined) throw new Error("the frozen fixture must be built before booting a daemon");
+  const root = mkdtempSync(join(tmpdir(), "revkit-rrt-"));
+  mkdirSync(join(root, ".revkit"), { recursive: true });
+  writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
+  mkdirSync(join(root, dirname(SOURCE_REL_PATH)), { recursive: true });
+  writeFileSync(join(root, SOURCE_REL_PATH), readFileSync(FIXTURE, "utf8"), "utf8");
+  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", fixtureBuild.dist], {
     cwd: root,
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
@@ -189,7 +211,7 @@ async function bootDaemon(): Promise<DaemonCtx> {
     await new Promise((r) => setTimeout(r, 50));
   }
   if (state === undefined) {
-    child.kill("SIGTERM");
+    await shutdown({ child, root });
     throw new Error(
       `revkit serve did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
     );
@@ -201,13 +223,13 @@ async function bootDaemon(): Promise<DaemonCtx> {
   }
   const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
   if (launchUrl === undefined) {
-    child.kill("SIGTERM");
+    await shutdown({ child, root });
     throw new Error(`daemon started but never printed 'launch:' line — stdout: ${stdoutChunks.join("")}`);
   }
   return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
 }
 
-async function shutdown(ctx: DaemonCtx): Promise<void> {
+async function shutdown(ctx: Pick<DaemonCtx, "child" | "root">): Promise<void> {
   try {
     ctx.child.kill("SIGTERM");
   } catch {
@@ -218,7 +240,7 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
   // suite ends, otherwise daemon-hygiene flags a survivor.
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    if (ctx.child.killed || ctx.child.exitCode !== null) break;
+    if (ctx.child.exitCode !== null || ctx.child.signalCode !== null) break;
     await new Promise((r) => setTimeout(r, 25));
   }
   rmSync(ctx.root, { recursive: true, force: true });
@@ -278,15 +300,27 @@ async function selectAndComment(page: Page, quote: string, body: string): Promis
 }
 
 test.describe("rail re-anchor round-trip @chromium-only", () => {
+  test.describe.configure({ mode: "serial" });
   test.skip(({ browserName }) => browserName !== "chromium", "chromium-only");
   test.setTimeout(120_000);
+
+  test.beforeAll(async () => {
+    fixtureBuild = await buildFixture();
+  });
+
+  test.afterAll(() => {
+    if (fixtureBuild !== undefined) {
+      rmSync(fixtureBuild.root, { recursive: true, force: true });
+      fixtureBuild = undefined;
+    }
+  });
 
   test("edit source → thread moves in the rail without a reload; delete quote → orphan panel; axe clean", async ({ page }) => {
     const daemon = await bootDaemon();
     try {
       // Launch flow — sets the session cookie.
       await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
-      // Real built page — served from the temp repo's .revkit/dist.
+      // Real built page — served from the file's shared frozen build.
       await page.goto(`${daemon.url}${BUILT_PAGE_PATH}`);
       await expect(page.getByTestId("revkit-rail")).toBeVisible();
 
