@@ -76,7 +76,15 @@ export function alignLeaf(
     let text = atom.value;
     if (!inlineCode && (text === "." || text === "-" || text === "'" || text === "`")) {
       let run = 1;
+      const individual: Substitution[] = [];
+      const remember = (item: typeof atom, offset: number): void => {
+        if (slice.slice(item.start - sourceStart, item.end - sourceStart) !== item.value) {
+          individual.push([offset, offset + item.value.length, item.start, item.end]);
+        }
+      };
+      remember(atom, out);
       while (!next.done && next.value.value === atom.value) {
+        remember(next.value, out + run);
         run++;
         end = next.value.end;
         next = decoded.next();
@@ -84,7 +92,15 @@ export function alignLeaf(
       if (text === "." && run >= 3 && value[out] === "…") text = "…";
       else if (text === "-" && run === 2 && value[out] === "—") text = "—";
       else if ((text === "'" || text === "`") && run === 2 && (value[out] === "“" || value[out] === "”")) text = value[out]!;
-      else text = text.repeat(run);
+      else if (run > 1) {
+        // An unchanged run still contains independently selectable atoms.
+        // Only a real typography collapse may combine their intervals.
+        text = text.repeat(run);
+        if (!value.startsWith(text, out)) return undefined;
+        for (const interval of individual) intervals.push(interval);
+        out += text.length;
+        continue;
+      }
     }
     if (!inlineCode) {
       if (text === '"' && (value[out] === "“" || value[out] === "”")) text = value[out]!;

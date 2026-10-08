@@ -2,6 +2,7 @@
 // RED run reaches the old strict request schema rather than failing imports.
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { revisionOf, type Anchor } from "@revkit/review-core";
@@ -19,9 +20,10 @@ test("leaf endpoints without client quote select the second rendered entity/lite
     const launch = await fetch(daemon.launchUrl, { redirect: "manual" });
     const cookie = launch.headers.get("set-cookie")!.split(";")[0]!;
     const revision = await revisionOf(source);
+    const leaf = `v1-${createHash("sha256").update("docs/probe.md\0" + source).digest("hex")}-0-19`;
     const response = await fetch(`${daemon.url}/api/threads`, {
       method: "POST", headers: { cookie, origin: daemon.url, "content-type": "application/json" },
-      body: JSON.stringify({ anchor: { path: "docs/probe.md", startLine: 1, endLine: 1, revision }, body: "The second copy", selection: { kind: "range", version: 1, revision, start: { leaf: "v1-0-19", offset: 10 }, end: { leaf: "v1-0-19", offset: 15 } } }),
+      body: JSON.stringify({ anchor: { path: "docs/probe.md", startLine: 1, endLine: 1, revision }, body: "The second copy", selection: { kind: "range", version: 1, revision, start: { leaf, offset: 10 }, end: { leaf, offset: 15 } } }),
     });
     expect(response.status).toBe(201);
     const { event } = await response.json() as { event: { anchor: Anchor } };

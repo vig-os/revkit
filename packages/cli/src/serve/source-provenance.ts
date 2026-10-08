@@ -104,58 +104,116 @@ export function selectionAnchor(
   return { path: request.path, startLine, endLine, revision, quote: buildQuoteFromOffsets(source, start, end) };
 }
 
+/** Inverse bounds for locating only the rendered text that overlaps a
+ * recorded source window. Lossy atoms are included, then validated exactly. */
+function renderedBound(map: LeafMap, sourceOffset: number, side: "start" | "end"): number {
+  if (sourceOffset <= map.start) return 0;
+  if (sourceOffset >= map.end) return map.length;
+  let delta = map.start;
+  for (const [r0, r1, s0, s1] of map.intervals ?? []) {
+    if (sourceOffset <= s0) return sourceOffset - delta;
+    if (sourceOffset < s1) return side === "start" ? r0 : r1;
+    delta = s1 - r1;
+  }
+  return sourceOffset - delta;
+}
+
+interface IndexedText {
+  readonly start: number;
+  readonly end: number;
+  readonly map?: LeafMap;
+  readonly invalidBefore: number;
+  readonly invalidThrough: number;
+}
+
 /** Recover legacy quotes using unique renderer candidates inside their
- * recorded block. Source-shaped and rendered candidates must agree. */
+ * recorded lines. Build text/line indexes once; never validate a candidate
+ * by walking its entire containing block. */
 export function recoverLegacyAnchor(rendered: RenderedProvenance, source: string, anchor: Anchor): Anchor | undefined {
   const candidates = new Map<string, Anchor>();
   const lines = buildLineStartIndex(source);
+  const windowStart = lines[anchor.startLine - 1];
+  const last = lines[anchor.endLine - 1];
+  if (windowStart === undefined || last === undefined || anchor.quote.exact.length === 0) return undefined;
+  // A terminating newline belongs to the preceding line under the
+  // engine's end-1 line convention. Keep it inside the legacy window.
+  const windowEnd = lines[anchor.endLine] ?? source.length;
   const add = (start: number, end: number): void => {
-    if (offsetToLine(lines, start) < anchor.startLine || offsetToLine(lines, end - 1) > anchor.endLine) return;
+    if (start < windowStart || end > windowEnd || start >= end) return;
     candidates.set(`${start}:${end}`, { ...anchor, startLine: offsetToLine(lines, start), endLine: offsetToLine(lines, end - 1), quote: buildQuoteFromOffsets(source, start, end) });
   };
+  // Search a bounded slice, not the remainder of the document. Context
+  // may extend beyond the recorded lines and is checked against source.
+  const sourceWindow = source.slice(windowStart, windowEnd);
   let cursor = 0;
-  while (cursor < source.length) {
-    const hit = source.indexOf(anchor.quote.exact, cursor);
+  while (cursor < sourceWindow.length) {
+    const hit = sourceWindow.indexOf(anchor.quote.exact, cursor);
     if (hit < 0) break;
-    if (source.slice(Math.max(0, hit - anchor.quote.prefix.length), hit).endsWith(anchor.quote.prefix) && source.startsWith(anchor.quote.suffix, hit + anchor.quote.exact.length)) add(hit, hit + anchor.quote.exact.length);
+    const start = windowStart + hit;
+    if (source.slice(Math.max(0, start - anchor.quote.prefix.length), start).endsWith(anchor.quote.prefix) && source.startsWith(anchor.quote.suffix, start + anchor.quote.exact.length)) add(start, start + anchor.quote.exact.length);
     if (candidates.size > 1) return undefined;
     cursor = hit + 1;
   }
   for (const block of rendered.document.querySelectorAll("[data-src]")) {
-    const bounds = parseDataSrc(block.getAttribute("data-src")!);
-    if (!bounds || bounds.path !== anchor.path || bounds.startLine > anchor.startLine || bounds.endLine < anchor.endLine) continue;
-    const textNodes: Text[] = [];
-    const walk = (node: Node): void => { if (node.nodeType === 3) textNodes.push(node as Text); for (const child of node.childNodes) walk(child); };
+    const stamp = block.getAttribute("data-src")!;
+    const bounds = parseDataSrc(stamp);
+    if (!rendered.blocks.has(stamp) || !bounds || bounds.path !== anchor.path || bounds.startLine > anchor.startLine || bounds.endLine < anchor.endLine) continue;
+    const entries: IndexedText[] = [];
+    const parts: string[] = [];
+    let length = 0;
+    let invalid = 0;
+    let low = Infinity;
+    let high = 0;
+    const walk = (node: Node): void => {
+      if (node.nodeType === 3) {
+        const value = node.textContent ?? "";
+        const leaf = node.parentElement?.closest("[data-revkit-leaf]");
+        const record = leaf ? rendered.leaves.get(leaf.getAttribute("data-revkit-leaf")!) : undefined;
+        const map = record && record.element === leaf ? record.map : undefined;
+        const before = invalid;
+        if (!map && (leaf || value.trim())) invalid++;
+        entries.push({ start: length, end: length + value.length, map, invalidBefore: before, invalidThrough: invalid });
+        if (map && map.end > windowStart && map.start < windowEnd) {
+          low = Math.min(low, length + renderedBound(map, windowStart, "start"));
+          high = Math.max(high, length + renderedBound(map, windowEnd, "end"));
+        }
+        length += value.length;
+        parts.push(value);
+      }
+      for (const child of node.childNodes) walk(child);
+    };
     walk(block);
-    const text = textNodes.map((n) => n.data).join("");
-    const pattern = anchor.quote.prefix + anchor.quote.exact + anchor.quote.suffix;
+    if (low >= high) continue;
+    const text = parts.join("");
+    const textWindow = text.slice(low, high);
+    // Binary endpoint lookup and prefix counts make validation depend on
+    // the selected range, rather than all later text nodes or leaves.
+    const locate = (offset: number, side: "start" | "end"): IndexedText | undefined => {
+      let lo = 0;
+      let hi = entries.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (side === "start" ? entries[mid]!.end <= offset : entries[mid]!.end < offset) lo = mid + 1;
+        else hi = mid;
+      }
+      const entry = entries[lo];
+      return entry && (side === "start" ? offset >= entry.start && offset < entry.end : offset > entry.start && offset <= entry.end) ? entry : undefined;
+    };
     let from = 0;
-    while (from <= text.length) {
-      const hit = text.indexOf(pattern, from);
+    while (from < textWindow.length) {
+      const hit = textWindow.indexOf(anchor.quote.exact, from);
       if (hit < 0) break;
-      const begin = hit + anchor.quote.prefix.length;
-      const finish = begin + anchor.quote.exact.length;
-      let length = 0;
-      let a: { leaf: string; offset: number } | undefined;
-      let b: { leaf: string; offset: number } | undefined;
-      for (const node of textNodes) {
-        const leaf = node.parentElement?.closest("[data-revkit-leaf]")?.getAttribute("data-revkit-leaf");
-        if (leaf) {
-          if (begin >= length && begin < length + node.length) a = { leaf, offset: begin - length };
-          if (finish > length && finish <= length + node.length) b = { leaf, offset: finish - length };
-        }
-        length += node.length;
-      }
-      if (a && b) {
-        const resolved = selectionAnchor(rendered, source, bounds, { kind: "range", version: PROVENANCE_VERSION, revision: anchor.revision, start: a, end: b }, anchor.revision);
-        if (resolved) {
-          const sa = sourceEndpoint(rendered.leaves.get(a.leaf)!.map, a.offset, "start")!;
-          const sb = sourceEndpoint(rendered.leaves.get(b.leaf)!.map, b.offset, "end")!;
-          add(sa, sb);
-          if (candidates.size > 1) return undefined;
-        }
-      }
       from = hit + 1;
+      const begin = low + hit;
+      const finish = begin + anchor.quote.exact.length;
+      if (!text.slice(Math.max(0, begin - anchor.quote.prefix.length), begin).endsWith(anchor.quote.prefix) || !text.startsWith(anchor.quote.suffix, finish)) continue;
+      const a = locate(begin, "start");
+      const b = locate(finish, "end");
+      if (!a?.map || !b?.map || b.invalidThrough !== a.invalidBefore) continue;
+      const sa = sourceEndpoint(a.map, begin - a.start, "start");
+      const sb = sourceEndpoint(b.map, finish - b.start, "end");
+      if (sa !== undefined && sb !== undefined) add(sa, sb);
+      if (candidates.size > 1) return undefined;
     }
   }
   return candidates.size === 1 ? [...candidates.values()][0] : undefined;

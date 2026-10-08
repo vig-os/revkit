@@ -21,6 +21,11 @@ import { anchorSchema, textQuoteSchema, SHA256_HEX_REGEX, askAnswerSchema, askSc
 import { PUBLISH_ARRAY_SHAPE_MAX } from "./publish.ts";
 import { PROVENANCE_VERSION } from "../provenance-format.ts";
 
+const leafEndpointSchema = z.object({
+  leaf: z.string().min(1).max(128),
+  offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict();
+
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
 export const createThreadRequestSchema = z
@@ -30,8 +35,8 @@ export const createThreadRequestSchema = z
     anchor: z.object({ ...anchorSchema.shape, quote: textQuoteSchema.optional() }).strict().refine((a) => a.endLine >= a.startLine),
     selection: z.discriminatedUnion("kind", [
       z.object({ kind: z.literal("range"), version: z.literal(PROVENANCE_VERSION), revision: z.string().regex(SHA256_HEX_REGEX),
-        start: z.object({ leaf: z.string().min(1).max(128), offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict(),
-        end: z.object({ leaf: z.string().min(1).max(128), offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict(),
+        start: leafEndpointSchema,
+        end: leafEndpointSchema,
       }).strict(),
       z.object({ kind: z.literal("block"), version: z.literal(PROVENANCE_VERSION), revision: z.string().regex(SHA256_HEX_REGEX) }).strict(),
     ]).optional(),

@@ -112,6 +112,11 @@ for (const [source, needle, occurrence, exact, sourceAt] of [
   ["first line\r\nsecond line 🎉", "line\nsecond", 0, "line\nsecond", 6],
   ["Use ` a\nb ` here", "a b", 0, "a\nb", 6],
   ["x &NotEqualTilde; y", "≂̸", 0, "&NotEqualTilde;", 2],
+  ["a.&#46;b", ".", 0, ".", 1],
+  ["a-&#45;-b", "-", 0, "-", 1],
+  ["a&#39;''b", "'", 0, "&#39;", 1],
+  ["a&#46;.b", ".", 0, "&#46;", 1],
+  ["a&#46;&#46;b", ".", 0, "&#46;", 1],
 ] as const) test(`real browser selection: ${JSON.stringify(source)} / occurrence ${occurrence}`, async ({ page }) => {
   const env = await boot(source);
   try {

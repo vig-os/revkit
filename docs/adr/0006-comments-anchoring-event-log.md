@@ -707,3 +707,19 @@ trailing context, including when a legacy whole-block quote recorded empty
 context, preventing the paragraph overruns in #126 and #146. Refs: #113, #126,
 #127, #146. This establishes source quote provenance for A6; suggested edits
 remain planned.
+
+## Amendment (2026-10-08, issue #113, PR #157 fix round): preserve atoms and scope leaf identities
+
+An unchanged punctuation run retains each decoded atom's interval. Only an
+actual typography collapse may combine the atoms; selecting one dot, dash or
+apostrophe cannot include an unchanged neighbor. Leaf identifiers now include
+a digest of the remapped file path and LF-normalized snapshot, preventing
+identical offsets in another file or revision from identifying a current leaf.
+
+Legacy recovery bounds source and rendered searches to the recorded lines
+before validating candidates. A terminating newline remains part of its source
+line. Line and text-node indexes, inverse interval bounds and counts of unmapped
+text avoid rescanning an entire block for each occurrence. The independent
+browser interval oracle is permanent; its full-size manual run reports agreement,
+refusals and wrong intervals separately. Renderer exceptions emit a debug event
+with the allowlisted error kind, without source or exception-message content.

@@ -51,9 +51,10 @@ export function endpoints(rendered: RenderedProvenance, needle: string, occurren
   return { start: start!, end: end! };
 }
 
-async function setup(source: string) {
+async function setup(source: string, durable = false) {
   const root = rootWith(source);
-  const daemon = await startDaemon({ dir: join(root, "dist"), repoRoot: root, port: 0, sqlitePath: ":memory:", version: "0.0.0-test", localUserId: "u", installSignalHandlers: false, logSink: { write: () => {} } });
+  const sqlitePath = durable ? join(root, "test.sqlite") : ":memory:";
+  const daemon = await startDaemon({ dir: join(root, "dist"), repoRoot: root, port: 0, sqlitePath, version: "0.0.0-test", localUserId: "u", installSignalHandlers: false, logSink: { write: () => {} } });
   daemons.push(daemon);
   const launch = await fetch(daemon.launchUrl, { redirect: "manual" });
   const cookie = launch.headers.get("set-cookie")!.split(";")[0]!;
@@ -63,8 +64,26 @@ async function setup(source: string) {
     method: "POST", headers: { cookie, origin: daemon.url, "content-type": "application/json" },
     body: JSON.stringify({ anchor: { path: PATH, startLine: lines[0], endLine: lines[1], revision, ...(quote ? { quote } : {}) }, selection, body: "Review this selection" }),
   });
-  return { root, daemon, cookie, revision, rendered, post };
+  return { root, daemon, cookie, revision, rendered, post, sqlitePath };
 }
+
+for (const forgery of ["other-file", "other-revision", "beyond-length", "reversed", "stale-version"] as const) test(`crafted ${forgery} endpoints are refused before events or snapshots`, async () => {
+  const source = "same **words** here";
+  const env = await setup(source, true);
+  let range = endpoints(env.rendered, "words");
+  if (forgery === "other-file") range = endpoints(await renderProvenance(env.root, "docs/other.md", source), "words");
+  if (forgery === "other-revision") range = endpoints(await renderProvenance(env.root, PATH, source.replace("same", "some")), "words");
+  if (forgery === "beyond-length") range = { ...range, end: { ...range.end, offset: 6 } };
+  if (forgery === "reversed") range = { start: range.end, end: range.start };
+  const response = await env.post({ kind: "range", version: forgery === "stale-version" ? 0 : 1, revision: env.revision, ...range });
+  expect(response.status).toBe(400);
+  const observer = SqliteThreadStore.open({ filename: env.sqlitePath });
+  try {
+    expect(observer.head()).toBe(0);
+    expect(await observer.threads()).toHaveLength(0);
+    expect(observer.getSnapshot(env.revision)).toBeUndefined();
+  } finally { observer.close(); }
+});
 
 test("endpoint requests store source quote, lines and context; hostile rendered quote is ignored", async () => {
   const source = '🎉 first &quot;hi&quot; -- now...... and `**kwargs` here';
@@ -145,6 +164,15 @@ test("legacy ambiguous source/rendered candidates orphan, never pick a literal c
   expect(recoverLegacyAnchor(rendered, source, anchor)).toBeUndefined();
   const env = await setup(source);
   expect((await env.post(undefined, anchor.quote)).status).toBe(400);
+});
+
+test("bounded legacy recovery preserves the final newline belonging to its recorded line", async () => {
+  const source = "a...\nnext line";
+  const rendered = await renderProvenance("/repo", PATH, source);
+  const anchor = { path: PATH, startLine: 1, endLine: 1, revision: await revisionOf(source), quote: { exact: "a…\n", prefix: "", suffix: "" } };
+  const recovered = recoverLegacyAnchor(rendered, source, anchor);
+  expect(recovered?.quote).toEqual({ exact: "a...\n", prefix: "", suffix: "next line" });
+  expect([recovered?.startLine, recovered?.endLine]).toEqual([1, 1]);
 });
 
 for (const line of [

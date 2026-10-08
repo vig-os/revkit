@@ -23,6 +23,7 @@
 // plugin against a fixture tree — no Astro needed).
 
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 import type { Root, Element, RootContent, ElementContent, Properties } from "hast";
 import { formatDataSrc } from "./data-src-format.ts";
 import { filePathOf, repoRelativePosix, type VFileLike } from "./rehype-vfile.ts";
@@ -243,6 +244,9 @@ export interface ProvenanceRecords {
 }
 
 export function stampLeafProvenance(tree: Root, source: string, path: string): ProvenanceRecords {
+  // Positions alone collide across files and revisions. Bind the ID to
+  // the remapped source path and normalized snapshot, once per render.
+  const scope = createHash("sha256").update(path).update("\0").update(source).digest("hex");
   const leaves = new Map<string, { map: LeafMap; value: string }>();
   const blocks = new Set<string>();
   const lines = [0];
@@ -268,7 +272,7 @@ export function stampLeafProvenance(tree: Root, source: string, path: string): P
       const wrapper: Element = {
         type: "element", tagName: "span",
         properties: {
-          dataRevkitLeaf: `v${PROVENANCE_VERSION}-${start}-${end}`,
+          dataRevkitLeaf: `v${PROVENANCE_VERSION}-${scope}-${start}-${end}`,
           dataRevkitMap: map === undefined ? "unmapped" : JSON.stringify(map),
         },
         children: [child],

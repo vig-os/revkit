@@ -1602,8 +1602,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         } else if (parsed.data.anchor.quote !== undefined) {
           anchorWithServerRevision = recoverLegacyAnchor(rendered, anchorResolution.source, { ...parsed.data.anchor, quote: parsed.data.anchor.quote, revision: anchorResolution.revision });
         }
-      } catch {
+      } catch (error) {
         // A renderer failure is a refusal; no comment/snapshot is appended.
+        logger.debug("anchor.render.failed", { requestId, errorKind: error instanceof Error ? error.name : "UnknownError" });
       }
       if (anchorWithServerRevision === undefined) {
         return badRequest([{ code: "custom", path: ["selection"], message: "The selection cannot be mapped to this source revision. Reload the page, or explicitly comment on the whole block." }]);
