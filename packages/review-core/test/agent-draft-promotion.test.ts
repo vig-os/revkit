@@ -444,14 +444,14 @@ describe("#136 — draft.promoted review binding", () => {
     expect(validateNext(withValidated([agentComment(1, "th-1", "c-1"), opened]), bound).ok).toBe(true);
     const missing = validateNext(withValidated([agentComment(1, "th-1", "c-1")]), bound);
     expect(missing.ok).toBe(false);
-    if (!missing.ok) expect(missing.rejection.kind).toBe("promotion-review-mismatch");
+    if (!missing.ok) expect(missing.rejection.kind).toBe("promotion-review-not-pending");
     for (const terminal of [
       { seq: 3, ts: t, actor: localActor, kind: "review.submitted", reviewNodeId: "PRR_A", event: "COMMENT" },
       { seq: 3, ts: t, actor: localActor, kind: "review.abandoned", reviewNodeId: "PRR_A", reason: "user-discarded" },
     ] as const) {
       const result = validateNext(withValidated([agentComment(1, "th-1", "c-1"), opened, terminal]), { ...bound, seq: 4 });
       expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.rejection.kind).toBe("promotion-review-mismatch");
+      if (!result.ok) expect(result.rejection.kind).toBe("promotion-review-not-pending");
     }
   });
 });

@@ -619,3 +619,47 @@ left as historical records; recovery never guesses their target review from the
 currently open review.
 
 Refs: #136, #123, #70
+
+
+### Round 1 (issue #136): enforce the binding at the destination
+
+Promoted comments and replies are posted only into the bound review, enforced
+at the destination in `reconcile`. Each agent-authored comment's latest machine
+intent resolves to the most recent comment promotion preceding that intent in
+the ordered event log. A later promotion cannot retroactively authorize an old
+intent. This derivation covers existing and boot-healed intents without adding
+a new event field or migrating historical logs.
+
+Before either comment/reply mutation or fingerprint completion, reconciliation
+requires that the resolved binding equal its actual destination review node id.
+A terminal binding fails with `promotion-review-not-pending`; a different
+review fails with `promotion-review-mismatch`; missing/legacy authorization
+fails with `promotion-review-unbound`. The failure is recorded as
+`comment.sync_failed`, preserving the intent for explicit reviewer recovery.
+The transition validator also uses the distinct `promotion-review-not-pending`
+rejection when a bound promotion names an unknown or terminal review.
+Reviewer-authored machine intents retain their normal reconciliation behavior.
+
+The route and boot heal keep their fast guards. Boot healing still precedes the
+remote read: correctness relies on the destination check, which also records a
+failure when the read observes a remote submit or deletion. A remote submission
+between the route's guard and reconciliation cannot authorize a post into a
+replacement review. The destination node id remains fixed for the mutation;
+GitHub refuses a mutation if that review has become terminal meanwhile.
+
+A fresh promotion explicitly names the review currently shown to the reviewer
+in `POST /api/review/promote`'s optional `reviewNodeId`. When replacing a binding,
+the route appends both a new `draft.promoted` and a new `comment.sync_requested`.
+It never rewrites the old binding. Requests without the field keep their retry
+semantics and refuse a different review. A stale explicit review id is refused.
+The content-pin check continues to apply. Crash healing and retry count an intent
+as present only if it follows the promotion being recovered, so an old A intent
+cannot hide the missing intent for a fresh promotion into B.
+
+The rail displays the typed sync failure as a request to promote the draft into
+the current review and offers an explicit "Promote to this review" action.
+Ordinary "Retry sync" never changes the binding. A missing promotion record is
+an internal log inconsistency (`promotion-record-missing`, HTTP 500), distinct
+from a historical event without a binding.
+
+Refs: #136, #148

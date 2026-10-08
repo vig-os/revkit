@@ -74,7 +74,8 @@ import { openStaticServer } from "./static-server.ts";
 import { resolveAnchorSource } from "./anchor-source.ts";
 import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
 import { contentTypeForExtension } from "./mime.ts";
-import { guardPromotionReview } from "./promotion-review-guard.ts";
+import { promotionAtSeq } from "./promotion-provenance.ts";
+import { guardPromotionDestination, guardPromotionReview } from "./promotion-review-guard.ts";
 import { createAsyncMutex } from "./review-operation-mutex.ts";
 import {
   AuthState,
@@ -2408,16 +2409,24 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       throw new PromoteRefused(409, found.error, found.detail);
     }
     const draft = found.draft;
-    const promoted = draft.promotedAtSeq === undefined;
+    let promoted = draft.promotedAtSeq === undefined;
+    if (request.reviewNodeId !== undefined) {
+      const requested = guardPromotionDestination(open.review.reviewNodeId, { reviewNodeId: request.reviewNodeId });
+      if (!requested.ok) throw new PromoteRefused(409, requested.error, requested.detail);
+    }
     if (draft.promotedAtSeq !== undefined) {
-      const promotion = (await store.since(draft.promotedAtSeq - 1)).find(
-        (event) => event.seq === draft.promotedAtSeq && event.kind === "draft.promoted",
-      );
-      if (promotion === undefined || promotion.kind !== "draft.promoted") {
-        throw new PromoteRefused(409, "promotion-review-unbound", "the recorded promotion could not be found in the log.");
+      const promotion = await promotionAtSeq(store, draft.promotedAtSeq);
+      if (promotion === undefined) {
+        throw new PromoteRefused(500, "promotion-record-missing", "the recorded promotion could not be found in the log.");
       }
-      const guard = guardPromotionReview(state.openPending, promotion);
-      if (!guard.ok) throw new PromoteRefused(409, guard.error, guard.detail);
+      // A retry cannot change reviews. A fresh cookie-authenticated
+      // click naming the current review records a NEW authorization
+      // and a NEW intent; ordinary reconcile can never do this.
+      promoted = request.reviewNodeId !== undefined && request.reviewNodeId !== promotion.reviewNodeId;
+      if (!promoted) {
+        const guard = guardPromotionReview(state.openPending, promotion);
+        if (!guard.ok) throw new PromoteRefused(409, guard.error, guard.detail);
+      }
     }
 
     // (c) Build the machine intent BEFORE any append. Everything that
@@ -2489,7 +2498,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         reviewNodeId: open.review.reviewNodeId,
       };
     }
-    if (intent !== undefined && !draft.intentRecorded) {
+    if (intent !== undefined && (promoted || !draft.intentRecorded)) {
       await appendReviewLifecycleEvent(intent, requestId);
     }
     const outcome = await reconcile({
@@ -2563,7 +2572,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const hasIntent = events.some(
         (candidate) =>
           (candidate.kind === "comment.sync_requested" || candidate.kind === "comment.linked") &&
-          candidate.commentId === commentId,
+          candidate.commentId === commentId && candidate.seq > event.seq,
       );
       if (!hasIntent) incomplete.set(commentId, event);
     }

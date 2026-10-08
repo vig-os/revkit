@@ -182,6 +182,9 @@ export const promoteAgentDraftRequestSchema = z
     threadId: idSchema,
     target: z.enum(["comment", "resolve", "reopen"]),
     commentId: idSchema.optional(),
+    /** An explicit fresh promotion names the review the reviewer sees.
+     * Omitting it keeps the existing retry semantics. */
+    reviewNodeId: idSchema.optional(),
   })
   .strict()
   .superRefine((value, ctx) => {

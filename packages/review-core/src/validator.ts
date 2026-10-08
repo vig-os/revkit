@@ -275,7 +275,7 @@ export type AppendRejection =
   | { kind: "not-an-agent-draft"; threadId: string; commentId?: string; message: string }
   /** A bound promotion must name a pending review at append time.
    * Legacy unbound events still replay; daemon recovery refuses them. */
-  | { kind: "promotion-review-mismatch"; reviewNodeId: string; message: string }
+  | { kind: "promotion-review-not-pending"; reviewNodeId: string; message: string }
   | { kind: "cross-file-reanchor"; threadId: string; fromPath: string; toPath: string; message: string }
   /** M3 part 2b: `review.opened` for a `reviewNodeId` that already
    * exists in the log (with any status). GitHub allows at most one
@@ -802,9 +802,8 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       return { ok: true };
     }
     case "draft.promoted": {
-      // Issue #70. Three independent guarantees, all enforced HERE so
-      // they hold for every store backing and every writer — not only
-      // for the daemon route that happens to check them first.
+      // Issues #70 and #136: authorship, content, and pending-review
+      // guarantees apply to every store backing and writer.
       if (event.actor.kind !== "local") {
         return {
           ok: false,
@@ -821,7 +820,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
         return {
           ok: false,
           rejection: {
-            kind: "promotion-review-mismatch",
+            kind: "promotion-review-not-pending",
             reviewNodeId: event.reviewNodeId,
             message: `draft.promoted: review '${event.reviewNodeId}' is not pending — a promotion must name its open review.`,
           },
