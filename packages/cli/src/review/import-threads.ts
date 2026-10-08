@@ -20,6 +20,7 @@
 import { createHash } from "node:crypto";
 import {
   GitHubAdapter,
+  type ExternalRef,
   type GhReviewThread,
   type PrRef,
   type ReviewEventInput,
@@ -36,8 +37,9 @@ export interface PopulateOutcome {
   readonly appended: number;
   /** Number of events skipped as already-present. */
   readonly skipped: number;
-  /** Number of events refused with an unexpected error kind — a
-   * non-zero value fails the review command. */
+  /** Number of events refused as invalid or conflicting rather than
+   * already-present. A non-zero value fails prepare-only/--no-serve;
+   * serving warns, stays available, and exits non-zero after shutdown. */
   readonly refused: number;
   /** Distinct thread ids that were touched (appended or already
    * present). */
@@ -77,6 +79,8 @@ export interface PopulateOptions {
    * `listPullRequestFiles`). Used by `importThreads` for LEFT-side
    * renamed files. */
   readonly oldPathOf?: (currentPath: string) => string | undefined;
+  /** Report unexpected refusals to the consumer's diagnostic logs. */
+  readonly onRefused?: (event: ReviewEventInput, error: ThreadStoreAppendError) => void;
 }
 
 /**
@@ -182,14 +186,19 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
   // `commentIdOf` factory used below returns the LOCAL id when
   // a nodeId is already linked, so importThreads' events line up
   // with the store's existing rows and the duplicate hits
-  // `duplicate-comment-id` (counted as `skipped`, not `refused`).
+  // `duplicate-comment-id`. Its identical `comment.linked` is also
+  // skipped, but a conflicting external id must remain refused.
   const nodeIdToLocalCommentId = new Map<string, string>();
+  const githubLinks = new Map<string, NonNullable<ExternalRef["github"]>>();
   {
     const existingEvents = await options.store.since(0);
     for (const evt of existingEvents) {
       if (evt.kind !== "comment.linked") continue;
       const gh = evt.external.github;
       if (gh === undefined) continue;
+      // Keep the latest link: a terminal pending review may have
+      // been re-anchored to a different external comment id.
+      githubLinks.set(evt.commentId, gh);
       const nid = gh.nodeId;
       if (nid === undefined) continue;
       // Prefer the FIRST link (locally-authored comment). A later
@@ -234,17 +243,27 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
     try {
       await options.store.append(event);
       appended++;
+      if (event.kind === "comment.linked" && event.external.github !== undefined) {
+        githubLinks.set(event.commentId, event.external.github);
+      }
     } catch (err) {
       if (err instanceof ThreadStoreAppendError) {
-        // A duplicate commentId means we've already imported this
-        // event on a previous run (deterministic ids). That's the
-        // idempotent-import case and NOT a refusal.
+        // Duplicate deterministic ids are already imported. A
+        // duplicate-link only names the comment and backend, so
+        // also check the external id before treating it as skipped.
         const msg = err.rejection.kind;
-        if (msg === "duplicate-comment-id" || msg === "duplicate-thread") {
+        const gh = event.kind === "comment.linked" ? event.external.github : undefined;
+        const existing = event.kind === "comment.linked" ? githubLinks.get(event.commentId) : undefined;
+        // A missing nodeId still re-presents the same backend/database id.
+        const sameLink = msg === "duplicate-link" && err.rejection.backend === "github" &&
+          gh !== undefined && existing !== undefined && gh.commentId === existing.commentId &&
+          (gh.nodeId === undefined || existing.nodeId === undefined || gh.nodeId === existing.nodeId);
+        if (msg === "duplicate-comment-id" || msg === "duplicate-thread" || sameLink) {
           skipped++;
           continue;
         }
         refused++;
+        options.onRefused?.(event, err);
         continue;
       }
       throw err;
