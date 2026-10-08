@@ -32,6 +32,7 @@ import {
   type ReviewEventInput,
   type TokenSource,
 } from "@revkit/review-core";
+import { makeReviewModeHandle, reanchorPendingReviewAtNewHead } from "../../src/serve/review-mode.ts";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 import type { LineSink } from "../../src/serve/logger.ts";
@@ -61,6 +62,8 @@ interface Ctx {
   root: string;
   sqlitePath: string;
   cookie: string;
+  logs: string[];
+  hooks: { beforeGetReviewById?: () => Promise<void> };
 }
 
 const SOURCE = "line1\nline2 with quote\nline3\n";
@@ -109,9 +112,15 @@ async function startCtx(overrides?: {
     ],
     { pendingState: pending, viewerLogin: "test-reviewer" },
   );
+  const hooks: Ctx["hooks"] = {};
   let injected = false;
   const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const body = typeof init?.body === "string" ? init.body : "";
+    if (body.includes("query GetReviewById") && hooks.beforeGetReviewById !== undefined) {
+      const hook = hooks.beforeGetReviewById;
+      delete hooks.beforeGetReviewById;
+      await hook();
+    }
     const operation = overrides?.loseResponseOnce ?? overrides?.failBeforeOnce;
     if (!injected && operation !== undefined && body.includes(`mutation ${operation}`)) {
       injected = true;
@@ -150,6 +159,8 @@ async function startCtx(overrides?: {
   const setCookie = authResponse.headers.get("set-cookie")!;
   return {
     handle,
+    logs,
+    hooks,
     fake: pending,
     fakeFetch,
     root,
@@ -210,16 +221,17 @@ function rewriteCommentBody(sqlitePath: string, commentId: string, body: string)
  * The two appends are adjacent in the code and nothing fallible sits
  * between them, so this is byte-for-byte what a process death leaves
  * behind. */
-async function appendPromotionOnly(ctx: Ctx, event: ReviewEventInput): Promise<void> {
+async function appendPromotionOnly(ctx: Ctx, event: ReviewEventInput, legacy = false): Promise<void> {
   const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
   try {
-    await store.append(event);
+    const opened = (await store.since(0)).filter((entry) => entry.kind === "review.opened").at(-1);
+    await store.append({ ...event, ...(!legacy && opened?.kind === "review.opened" ? { reviewNodeId: opened.reviewNodeId } : {}) });
   } finally {
     store.close();
   }
 }
 
-async function restartCtx(ctx: Ctx): Promise<Ctx> {
+async function restartCtx(ctx: Ctx, headSha = HEAD_A): Promise<Ctx> {
   await ctx.handle.stop();
   const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
   const handle = await startDaemon({
@@ -230,13 +242,13 @@ async function restartCtx(ctx: Ctx): Promise<Ctx> {
     version: "0.0.0-test",
     localUserId: "p70-user",
     installSignalHandlers: false,
-    logSink: { write: () => {} },
+    logSink: { write: (line) => ctx.logs.push(line) },
     reviewMode: {
       adapter,
       pr: { owner: "vig-os", repo: "revkit", pullNumber: 42 },
       summary: {
         number: 42, nodeId: "PR_42", title: "promote PR", state: "open", draft: false,
-        headSha: HEAD_A, headRef: "test-head", baseSha: "b".repeat(40), baseRef: "main",
+        headSha, headRef: "test-head", baseSha: "b".repeat(40), baseRef: "main",
         headRepoFullName: "vig-os/revkit", baseRepoFullName: "vig-os/revkit",
         url: "https://github.com/vig-os/revkit/pull/42",
       },
@@ -1177,18 +1189,10 @@ describe("#70 round 2 — N3: the invariant behind intentRecordedFor", () => {
 // and the unpinned-promotion paths must be pinned.
 
 describe("#70 round 3 — the heal never composes what the route would refuse (H1)", () => {
-  /** End the pending review with the daemon running, THEN leave an
-   * incomplete promotion in the log, then restart.
-   *
-   * The order matters and is the honest shape of the state: a promotion
-   * whose intent append was lost, left behind a review that has since
-   * gone terminal (submitted, discarded, or abandoned by the head-move
-   * reanchor — which terminates a review WITHOUT going through the
-   * promote route). The route would refuse to create such a promotion
-   * today, so the heal must be at least as conservative as the route:
-   * composing here would repair an intent into a review the reviewer
-   * has already closed, and the next reconcile would open a fresh one
-   * and post into it. */
+  /** End the pending review, stop the daemon, then append an incomplete
+   * promotion fixture for that terminal review and restart. This
+   * deliberately simulates the persisted crash state; the route itself
+   * would refuse to append a promotion after the review has closed. */
   async function terminalReviewWithIncompletePromotion(
     endPending: (ctx: Ctx) => Promise<Response>,
   ): Promise<{ readonly ctx: Ctx }> {
@@ -1213,7 +1217,7 @@ describe("#70 round 3 — the heal never composes what the route would refuse (H
       commentId: "c-late",
       commentSeq: authored.seq,
       bodyHash: await revisionOf("agent draft body"),
-    });
+    }, true);
     return { ctx: await restartCtx(ctx) };
   }
 
@@ -1393,5 +1397,340 @@ describe("#70 round 3 — a dropped reviewer intent is visible (H5)", () => {
       { threadId: imported.id, target: "reopen", path: "docs/index.md" },
     ]);
     expect(ctx.fake.resolutions).toHaveLength(0);
+  });
+});
+
+describe("#136 — promotions stay bound to the review the reviewer approved", () => {
+  async function incomplete(ctx: Ctx, legacy = false): Promise<string> {
+    expect((await postComment(ctx, "review A", "binding-own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, "bound agent text", "binding")).status).toBe(201);
+    const reviewNodeId = ctx.fake.reviewNodeId;
+    if (reviewNodeId === null) throw new Error("no review A");
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find(
+      (event) => event.kind === "comment.created" && event.commentId === "c-binding",
+    );
+    if (authored === undefined) throw new Error("no agent draft");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted", actor: { kind: "local", id: "p70-user" },
+      threadId: "th-binding", target: "comment", commentId: "c-binding",
+      commentSeq: authored.seq, bodyHash: await revisionOf("bound agent text"),
+    }, legacy);
+    return reviewNodeId;
+  }
+
+  async function openNextReview(ctx: Ctx, headSha = HEAD_A): Promise<string> {
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    const next = await adapter.findOrCreatePendingReview({
+      pullRequestNodeId: "PR_42", commitOid: headSha, viewerLogin: "test-reviewer",
+    });
+    if (next.kind === "stale") throw new Error("no review B");
+    const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+    try {
+      await store.append({ kind: "review.opened", actor: { kind: "local", id: "p70-user" }, reviewNodeId: next.review.id, headSha });
+    } finally { store.close(); }
+    return next.review.id;
+  }
+
+  async function submittedThenOpened(ctx: Ctx, reviewNodeId: string): Promise<string> {
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    await adapter.submitReview({ reviewId: reviewNodeId, event: "COMMENT", body: "review A submitted" });
+    const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+    try {
+      await store.append({ kind: "review.submitted", actor: { kind: "local", id: "p70-user" }, reviewNodeId, event: "COMMENT" });
+    } finally { store.close(); }
+    return await openNextReview(ctx);
+  }
+
+  async function assertNoHealOrPost(ctx: Ctx, reason: string): Promise<void> {
+    await Bun.sleep(120);
+    const log = await readRawEvents(ctx.sqlitePath);
+    expect(log.some((event) => event.kind === "comment.sync_requested" && event.commentId === "c-binding")).toBe(false);
+    expect(ctx.logs.some((line) => {
+      const entry = JSON.parse(line) as { event: string; reason?: string; commentId?: string };
+      return entry.event === "review.boot.promotion-intent.refused" && entry.reason === reason && entry.commentId === "c-binding";
+    })).toBe(true);
+    const before = writes(ctx);
+    const response = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(response.status).toBe(201);
+    expect(writes(ctx)).toBe(before);
+    expect(agentBodyReached(ctx, "bound agent text")).toBe(false);
+  }
+
+  test("incomplete promotion → A submitted → B opened → restart never heals or posts into B", async () => {
+    const ctx = await startCtx();
+    const reviewA = await incomplete(ctx);
+    const reviewB = await submittedThenOpened(ctx, reviewA);
+    expect(reviewB).not.toBe(reviewA);
+    const restarted = await restartCtx(ctx);
+    expect((await readState(restarted)).state.openPending?.reviewNodeId).toBe(reviewB);
+    await assertNoHealOrPost(restarted, "promotion-review-mismatch");
+    expect(restarted.fake.reviewNodeId).toBe(reviewB);
+    expect(restarted.fake.submits).toHaveLength(1);
+  });
+
+  test("the route refuses a promotion retry when the open review differs, without appends or writes", async () => {
+    const ctx = await startCtx();
+    const reviewA = await incomplete(ctx);
+    await submittedThenOpened(ctx, reviewA);
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const before = await readRawEvents(restarted.sqlitePath);
+    const writesBefore = writes(restarted);
+    const response = await promote(restarted, { threadId: "th-binding", target: "comment", commentId: "c-binding" });
+    expect(response.status).toBe(409);
+    const body = await response.json() as { error: string; reason: string };
+    expect(body.error).toBe("promotion-review-mismatch");
+    expect(body.reason).toContain(reviewA);
+    expect(await readRawEvents(restarted.sqlitePath)).toEqual(before);
+    expect(writes(restarted)).toBe(writesBefore);
+  });
+
+  test("a legacy promotion with a content pin but no review binding loads and is refused by heal and route", async () => {
+    const ctx = await startCtx();
+    const reviewA = await incomplete(ctx, true);
+    const restarted = await restartCtx(ctx);
+    expect((await readState(restarted)).state.openPending?.reviewNodeId).toBe(reviewA);
+    await assertNoHealOrPost(restarted, "promotion-review-unbound");
+    const before = await readRawEvents(restarted.sqlitePath);
+    const response = await promote(restarted, { threadId: "th-binding", target: "comment", commentId: "c-binding" });
+    expect(response.status).toBe(409);
+    expect((await response.json() as { error: string }).error).toBe("promotion-review-unbound");
+    expect(await readRawEvents(restarted.sqlitePath)).toEqual(before);
+  });
+
+  test("head-move reanchor abandons A; opening B cannot revive A's incomplete promotion", async () => {
+    const ctx = await startCtx();
+    const reviewA = await incomplete(ctx);
+    const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    const headB = "d".repeat(40);
+    try {
+      const summary = await adapter.getPullRequest({ owner: "vig-os", repo: "revkit", pullNumber: 42 });
+      const review = makeReviewModeHandle({
+        adapter, pr: { owner: "vig-os", repo: "revkit", pullNumber: 42 },
+        summary: { ...summary, headSha: headB }, viewerLogin: "test-reviewer", files: [],
+      });
+      await reanchorPendingReviewAtNewHead({
+        review, store, actor: { kind: "local", id: "p70-user" },
+        appendAndPublish: async (event) => { const seq = await store.append(event); return (await store.since(seq - 1))[0]; },
+      });
+    } finally { store.close(); }
+    expect(ctx.fake.reviewNodeId).toBeNull();
+    const abandoned = (await readRawEvents(ctx.sqlitePath)).find((event) => event.kind === "review.abandoned");
+    expect(abandoned).toMatchObject({ kind: "review.abandoned", reviewNodeId: reviewA, reason: "head-moved" });
+    const reviewB = await openNextReview(ctx, headB);
+    const restarted = await restartCtx(ctx, headB);
+    await assertNoHealOrPost(restarted, "promotion-review-mismatch");
+    expect(restarted.fake.reviewNodeId).toBe(reviewB);
+  });
+
+  test("the route refuses to retry an accepted lifecycle promotion from A in review B", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_binding_retry")] });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "review A", "binding-own")).status).toBe(201);
+    const reviewA = ctx.fake.reviewNodeId;
+    if (reviewA === null) throw new Error("no review A");
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+    expect((await promote(ctx, { threadId: imported.id, target: "resolve" })).status).toBe(201);
+    expect(ctx.fake.resolutions).toHaveLength(1);
+    await ctx.handle.stop();
+    await submittedThenOpened(ctx, reviewA);
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const before = await readRawEvents(restarted.sqlitePath);
+    const response = await promote(restarted, { threadId: imported.id, target: "resolve" });
+    expect(response.status).toBe(409);
+    expect((await response.json() as { error: string }).error).toBe("promotion-review-mismatch");
+    expect(await readRawEvents(restarted.sqlitePath)).toEqual(before);
+    expect(restarted.fake.resolutions).toHaveLength(1);
+  });
+
+  test("new comment and lifecycle promotions record the same pending review identity", async () => {
+    const ctx = await startCtx({ threads: [importedThread("PRT_binding")] });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "reviewer opens A", "binding-own")).status).toBe(201);
+    const reviewA = ctx.fake.reviewNodeId;
+    if (reviewA === null) throw new Error("no review A");
+    expect((await postCommentAsAgent(ctx, "agent draft", "binding")).status).toBe(201);
+    expect((await promote(ctx, { threadId: "th-binding", target: "comment", commentId: "c-binding" })).status).toBe(201);
+    expect((await agentLifecycle(ctx, imported.id, "resolve", {})).status).toBe(201);
+    expect((await promote(ctx, { threadId: imported.id, target: "resolve" })).status).toBe(201);
+    expect((await agentLifecycle(ctx, imported.id, "reopen", {})).status).toBe(201);
+    expect((await promote(ctx, { threadId: imported.id, target: "reopen" })).status).toBe(201);
+    const promotions = (await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "draft.promoted");
+    expect(promotions).toHaveLength(3);
+    for (const promotion of promotions) expect(promotion.reviewNodeId).toBe(reviewA);
+  });
+});
+
+
+describe("#136 R1 — promotion binding is enforced at the destination", () => {
+  const body = "agent text authorized only in review A";
+  const commentId = "c-destination";
+
+  async function draft(kind: "comment" | "reply"): Promise<{ ctx: Ctx; threadId: string; reviewA: string }> {
+    const ctx = await startCtx(kind === "reply" ? { threads: [importedThread("PRT_destination")] } : undefined);
+    const imported = kind === "reply" ? await refreshAndReadImportedThread(ctx) : undefined;
+    expect((await postComment(ctx, "reviewer opens A", "destination-own")).status).toBe(201);
+    const reviewA = ctx.fake.reviewNodeId;
+    if (reviewA === null) throw new Error("no review A");
+    const response = imported === undefined
+      ? await postCommentAsAgent(ctx, body, "destination")
+      : await agentLifecycle(ctx, imported.id, "replies", { commentId, parentId: imported.parentId, body });
+    expect(response.status).toBe(201);
+    return { ctx, threadId: imported?.id ?? "th-destination", reviewA };
+  }
+
+  async function submitRemotely(ctx: Ctx, reviewA: string): Promise<void> {
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    await adapter.submitReview({ reviewId: reviewA, event: "COMMENT", body: "submitted by another client" });
+  }
+
+  async function reconcileAsReviewer(ctx: Ctx): Promise<{ reviewNodeId: string | null; newlyFailed: { commentId: string; reason: string }[] }> {
+    const response = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(response.status).toBe(201);
+    return await response.json() as { reviewNodeId: string | null; newlyFailed: { commentId: string; reason: string }[] };
+  }
+
+  async function refusedThenFresh(ctx: Ctx, threadId: string, reviewA: string, kind: "comment" | "reply"): Promise<void> {
+    const outcome = await reconcileAsReviewer(ctx);
+    const reviewB = outcome.reviewNodeId;
+    expect(reviewB).not.toBeNull();
+    if (reviewB === null) throw new Error("no review B");
+    expect(reviewB).not.toBe(reviewA);
+    expect(agentBodyReached(ctx, body)).toBe(false);
+    expect(outcome.newlyFailed).toContainEqual({ commentId, reason: "promotion-review-not-pending" });
+    expect((await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "comment.sync_failed")).toContainEqual(
+      expect.objectContaining({ kind: "comment.sync_failed", commentId, reason: "promotion-review-not-pending" }),
+    );
+
+    // A normal reviewer comment still syncs into B, even while this
+    // promotion is refused. It cannot carry the agent intent with it.
+    expect((await postComment(ctx, "reviewer's new comment in B", "destination-control")).status).toBe(201);
+    expect(ctx.fake.drafts.some((entry) => entry.body === "reviewer's new comment in B")).toBe(true);
+    expect(ctx.fake.reviewNodeId).toBe(reviewB);
+    await reconcileAsReviewer(ctx);
+    expect(agentBodyReached(ctx, body)).toBe(false);
+
+    // Only a new, explicit approval naming B may replace the old
+    // authorization. Ordinary reconcile never rebinds it.
+    const beforeStaleClick = await readRawEvents(ctx.sqlitePath);
+    const staleClick = await promote(ctx, { threadId, target: "comment", commentId, reviewNodeId: reviewA });
+    expect(staleClick.status).toBe(409);
+    expect((await staleClick.json() as { error: string }).error).toBe("promotion-review-mismatch");
+    expect(await readRawEvents(ctx.sqlitePath)).toEqual(beforeStaleClick);
+    const request = { threadId, target: "comment", commentId, reviewNodeId: reviewB };
+    const fresh = await promote(ctx, request);
+    expect(fresh.status).toBe(201);
+    expect(agentBodyReached(ctx, body)).toBe(true);
+    const promotions = (await readRawEvents(ctx.sqlitePath)).filter((event): event is Extract<ReviewEvent, { kind: "draft.promoted" }> => event.kind === "draft.promoted" && event.commentId === commentId);
+    expect(promotions.map((event) => event.reviewNodeId)).toEqual([reviewA, reviewB]);
+    if (kind === "reply") {
+      expect(ctx.fake.replies.filter((entry) => entry.body === body)).toHaveLength(1);
+      expect(ctx.fake.replies.find((entry) => entry.body === body)?.pendingReviewId).toBe(reviewB);
+    } else {
+      expect(ctx.fake.drafts.filter((entry) => entry.body === body)).toHaveLength(1);
+      const linked = (await readRawEvents(ctx.sqlitePath)).filter((event): event is Extract<ReviewEvent, { kind: "comment.linked" }> => event.kind === "comment.linked" && event.commentId === commentId).at(-1);
+      expect(linked?.external.github?.reviewNodeId).toBe(reviewB);
+    }
+    expect((await promote(ctx, request)).status).toBe(200);
+    await reconcileAsReviewer(ctx);
+    expect(kind === "reply" ? ctx.fake.replies.filter((entry) => entry.body === body).length : ctx.fake.drafts.filter((entry) => entry.body === body).length).toBe(1);
+  }
+
+  for (const kind of ["comment", "reply"] as const) {
+    test(`remote submit before restart → boot heals → B opened: ${kind} stays blocked until fresh promotion`, async () => {
+      const { ctx, threadId, reviewA } = await draft(kind);
+      await ctx.handle.stop();
+      const authored = (await readRawEvents(ctx.sqlitePath)).find((event) =>
+        (event.kind === "comment.created" || event.kind === "comment.replied") && event.commentId === commentId,
+      );
+      if (authored === undefined) throw new Error("no agent draft event");
+      await appendPromotionOnly(ctx, {
+        kind: "draft.promoted", actor: { kind: "local", id: "p70-user" }, threadId,
+        target: "comment", commentId, commentSeq: authored.seq, bodyHash: await revisionOf(body),
+      });
+      await submitRemotely(ctx, reviewA);
+      const restarted = await restartCtx(ctx);
+      await Bun.sleep(120);
+      const log = await readRawEvents(restarted.sqlitePath);
+      expect(log.filter((event) => event.kind === "comment.sync_requested" && event.commentId === commentId)).toHaveLength(1);
+      expect(log.some((event) => event.kind === "review.submitted" && event.reviewNodeId === reviewA)).toBe(true);
+      expect(agentBodyReached(restarted, body)).toBe(false);
+      await refusedThenFresh(restarted, threadId, reviewA, kind);
+    });
+
+    test(`remote submit at GetReviewById after the route guard: ${kind} cannot post into B`, async () => {
+      const { ctx, threadId, reviewA } = await draft(kind);
+      ctx.hooks.beforeGetReviewById = async () => await submitRemotely(ctx, reviewA);
+      const response = await promote(ctx, { threadId, target: "comment", commentId });
+      expect(response.status).toBe(201);
+      expect((await response.json() as { reviewNodeId: string | null }).reviewNodeId).toBeNull();
+      expect(ctx.fake.submits).toHaveLength(1);
+      expect(agentBodyReached(ctx, body)).toBe(false);
+      await refusedThenFresh(ctx, threadId, reviewA, kind);
+    });
+  }
+
+  test("an existing legacy machine intent without a bound review is failed, never posted", async () => {
+    const { ctx, threadId } = await draft("comment");
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find((event) => event.kind === "comment.created" && event.commentId === commentId);
+    if (authored === undefined) throw new Error("no agent draft event");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted", actor: { kind: "local", id: "p70-user" }, threadId,
+      target: "comment", commentId, commentSeq: authored.seq, bodyHash: await revisionOf(body),
+    }, true);
+    const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+    try {
+      await store.append({ kind: "comment.sync_requested", actor: { kind: "local", id: "p70-user" }, commentId,
+        path: "docs/index.md", subjectType: "LINE", line: 2, side: "RIGHT", bodyHash: await revisionOf(body) });
+    } finally { store.close(); }
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const outcome = await reconcileAsReviewer(restarted);
+    expect(agentBodyReached(restarted, body)).toBe(false);
+    expect(outcome.newlyFailed).toContainEqual({ commentId, reason: "promotion-review-unbound" });
+    const failed = (await readRawEvents(restarted.sqlitePath)).filter((event): event is Extract<ReviewEvent, { kind: "comment.sync_failed" }> => event.kind === "comment.sync_failed" && event.commentId === commentId);
+    expect(failed.at(-1)?.reason).toBe("promotion-review-unbound");
+  });
+
+  test("a crash after fresh promotion into B heals B's intent even when an old A intent exists", async () => {
+    const ctx = await startCtx();
+    expect((await postComment(ctx, "reviewer opens A", "destination-own")).status).toBe(201);
+    expect((await postCommentAsAgent(ctx, body, "destination")).status).toBe(201);
+    const reviewA = ctx.fake.reviewNodeId;
+    if (reviewA === null) throw new Error("no review A");
+    ctx.hooks.beforeGetReviewById = async () => await submitRemotely(ctx, reviewA);
+    expect((await promote(ctx, { threadId: "th-destination", target: "comment", commentId })).status).toBe(201);
+    const outcome = await reconcileAsReviewer(ctx);
+    const reviewB = outcome.reviewNodeId;
+    if (reviewB === null) throw new Error("no review B");
+    await ctx.handle.stop();
+    const authored = (await readRawEvents(ctx.sqlitePath)).find((event) => event.kind === "comment.created" && event.commentId === commentId);
+    if (authored === undefined) throw new Error("no authored draft");
+    await appendPromotionOnly(ctx, {
+      kind: "draft.promoted", actor: { kind: "local", id: "p70-user" }, threadId: "th-destination",
+      target: "comment", commentId, commentSeq: authored.seq, bodyHash: await revisionOf(body),
+    });
+    const restarted = await restartCtx(ctx);
+    await Bun.sleep(120);
+    const intents = (await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "comment.sync_requested" && event.commentId === commentId);
+    expect(intents).toHaveLength(2);
+    expect(agentBodyReached(restarted, body)).toBe(false);
+    const retry = await promote(restarted, { threadId: "th-destination", target: "comment", commentId });
+    expect(retry.status).toBe(200);
+    expect(agentBodyReached(restarted, body)).toBe(true);
+    expect(restarted.fake.reviewNodeId).toBe(reviewB);
+    expect(restarted.fake.drafts.filter((entry) => entry.body === body)).toHaveLength(1);
   });
 });

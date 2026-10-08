@@ -285,4 +285,50 @@ test.describe("rail agent-draft promotion @chromium-only", () => {
       await shutdown(daemon);
     }
   });
+
+  test("a failed promotion from discarded A needs a new click naming B", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const fixture = writeFixtureHtml();
+    try {
+      await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      const cookie = await cookieHeader(page);
+      expect((await postComment(daemon, { threadId: "th-own-A", commentId: "c-own-A", line: 3, text: "review A" }, "cookie", cookie)).status).toBe(201);
+      expect((await postComment(daemon, { threadId: "th-fresh", commentId: "c-fresh", line: 4, text: "agent needs fresh promotion" }, "agent", cookie)).status).toBe(201);
+      const headers = { "content-type": "application/json", origin: daemon.url, "sec-fetch-site": "same-origin", cookie };
+      const reviewA = (await readPending(daemon.controlUrl)).reviewNodeId;
+      await fetch(`${daemon.controlUrl}/control/inject`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mutation: "AddThread" }) });
+      const first = await fetch(`${daemon.url}/api/review/promote`, { method: "POST", headers,
+        body: JSON.stringify({ threadId: "th-fresh", target: "comment", commentId: "c-fresh" }) });
+      expect(first.status).toBe(201);
+      expect((await readPending(daemon.controlUrl)).drafts).toHaveLength(1);
+      expect((await fetch(`${daemon.url}/api/review/discard`, { method: "POST", headers, body: JSON.stringify({ reason: "user-discarded" }) })).status).toBe(201);
+      expect((await postComment(daemon, { threadId: "th-own-B", commentId: "c-own-B", line: 3, text: "review B" }, "cookie", cookie)).status).toBe(201);
+      const pendingB = await readPending(daemon.controlUrl);
+      expect(pendingB.reviewNodeId).not.toBe(reviewA);
+      expect(pendingB.drafts).toHaveLength(1);
+      expect(pendingB.drafts.some((entry) => entry.body.includes("agent needs fresh promotion"))).toBe(false);
+
+      await page.reload();
+      const row = page.getByTestId("revkit-rail-review-unsynced-item").filter({ has: page.locator('code', { hasText: "c-fresh" }) });
+      await expect(row).toContainText("This agent draft needs a fresh promotion into your current review.");
+      const fresh = row.getByTestId("revkit-rail-review-fresh-promote");
+      await expect(fresh).toBeEnabled();
+      await assertAxeClean(page);
+      const [request] = await Promise.all([
+        page.waitForRequest((candidate) => candidate.url().includes("/api/review/promote") && candidate.method() === "POST", { timeout: 15_000 }),
+        fresh.click(),
+      ]);
+      expect(JSON.parse(request.postData() ?? "{}")).toEqual({ threadId: "th-fresh", target: "comment", commentId: "c-fresh", reviewNodeId: pendingB.reviewNodeId });
+      expect(request.headers().authorization).toBeUndefined();
+      await expect.poll(async () => (await readPending(daemon.controlUrl)).drafts.length, { timeout: 15_000 }).toBe(2);
+      await expect(page.getByTestId("revkit-rail-review-unsynced")).toBeHidden();
+      expect((await readPending(daemon.controlUrl)).reviewNodeId).toBe(pendingB.reviewNodeId);
+      await assertAxeClean(page);
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
 });

@@ -288,3 +288,40 @@ hosted draft until that surface designs the same act — and because
 `reduceReviewState`'s `agentDrafts` is a derivation over the shared core, the
 hosted surface gets the same *view* of the draft list for free if it wants it.
 Refs: #70, #59, #8
+
+
+## Amendment (2026-10-08, issue #136): promotion recovery preserves review identity
+
+The local promotion route records the pending review's GitHub node id in
+`draft.promoted.reviewNodeId`. Both route retries and boot intent recovery use the
+same guard: the recorded review must still be the open pending review. A newer
+review cannot inherit an incomplete promotion from a submitted, discarded, or
+head-move-abandoned review. The route returns HTTP 409 with
+`promotion-review-mismatch`; recovery skips and logs it.
+
+Historical promotions without a review binding still load, but cannot be retried
+or healed (`promotion-review-unbound`). ADR-0006's issue #136 amendment defines
+the backward-compatible schema and validator rule. Boot recovery remains a local
+append followed by read-only remote reconciliation. The hosted promotion surface
+remains outside this amendment.
+
+Refs: #136, #123, #70
+
+
+### Round 1 (issue #136): destination enforcement and explicit recovery
+
+Promoted comments and replies are posted only into the bound review, enforced at
+the destination by reconciliation. Machine intents resolve their authorization
+from the promotion preceding them in the event log. Terminal, mismatched, and
+missing bindings record a typed sync failure and cause no comment/reply post,
+including when another client submitted the review before boot or during a
+promotion request. Reviewer-authored intents still post normally.
+
+Boot healing retains its ordering before remote reconciliation; the destination
+check is the guarantee. Recovery in the rail requires a fresh reviewer action
+naming the current review. The route records a new promotion and intent for that
+review, and boot can heal a missing new intent even if the previous review's
+intent remains in the log. Ordinary reconciliation never rebinds a promotion.
+ADR-0006's round-one addition specifies the error vocabulary and request shape.
+
+Refs: #136, #148

@@ -570,6 +570,10 @@ const draftPromotedPayload = {
   kind: z.literal("draft.promoted"),
   threadId: idSchema,
   target: z.enum(["comment", "resolve", "reopen"]),
+  /** GitHub node id of the review the reviewer attached this draft to.
+   * Stable across restarts and remote reconcile. Optional only so old
+   * logs load; an unbound promotion cannot be retried or healed. */
+  reviewNodeId: idSchema.optional(),
   commentId: idSchema.optional(),
   /** `seq` of the authoring event, pinning WHICH version of the
    * comment the reviewer approved. Paired with `bodyHash`. */

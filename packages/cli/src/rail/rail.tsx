@@ -381,6 +381,7 @@ async function promoteAgentDraft(input: {
   threadId: string;
   target: "comment" | "resolve" | "reopen";
   commentId?: string;
+  reviewNodeId?: string;
 }): Promise<{ ok: boolean; promoted: boolean; reason?: string; error?: string }> {
   const response = await fetch("/api/review/promote", {
     method: "POST",
@@ -390,6 +391,7 @@ async function promoteAgentDraft(input: {
       threadId: input.threadId,
       target: input.target,
       ...(input.commentId !== undefined ? { commentId: input.commentId } : {}),
+      ...(input.reviewNodeId !== undefined ? { reviewNodeId: input.reviewNodeId } : {}),
     }),
   });
   const body = (await response.json().catch(() => ({}))) as {
@@ -431,6 +433,16 @@ function promoteRefusalMessage(error: string | undefined, status: number): strin
     default:
       return `promote refused: ${error ?? status}`;
   }
+}
+
+function needsFreshPromotion(reason: string | undefined): boolean {
+  return reason === "promotion-review-mismatch" || reason === "promotion-review-not-pending" || reason === "promotion-review-unbound";
+}
+
+function syncFailureMessage(reason: string): string {
+  return needsFreshPromotion(reason)
+    ? "This agent draft needs a fresh promotion into your current review."
+    : reason;
 }
 
 /** Build the SHA-256 hex digest of the LF-normalised body — the
@@ -1893,7 +1905,33 @@ function Rail(): JSX.Element {
                       <code>{entry.commentId.slice(0, 12)}</code>{" "}
                       <span class="revkit-rail__review-unsynced-kind">{entry.state.kind}</span>
                       <Show when={entry.state.reason !== undefined}>
-                        <span class="revkit-rail__review-unsynced-reason"> — {entry.state.reason}</span>
+                        <span class="revkit-rail__review-unsynced-reason"> — {syncFailureMessage(entry.state.reason!)}</span>
+                      </Show>
+                      <Show when={needsFreshPromotion(entry.state.reason)}>
+                        <button
+                          type="button"
+                          class="revkit-rail__agent-draft-promote"
+                          data-testid="revkit-rail-review-fresh-promote"
+                          disabled={reviewBusy() || reviewState()!.state.openPending === null || !threads()?.threads.some((thread) => thread.comments.some((comment) => comment.id === entry.commentId))}
+                          onClick={() => {
+                            const reviewNodeId = reviewState()?.state.openPending?.reviewNodeId;
+                            const thread = threads()?.threads.find((candidate) => candidate.comments.some((comment) => comment.id === entry.commentId));
+                            if (reviewNodeId === undefined || thread === undefined) return;
+                            void (async () => {
+                              setReviewBusy(true);
+                              setError(undefined);
+                              try {
+                                await promoteAgentDraft({ threadId: thread.id, target: "comment", commentId: entry.commentId, reviewNodeId });
+                                await refetchReview();
+                                await refetch();
+                              } catch (cause) {
+                                setError((cause as Error).message);
+                              } finally {
+                                setReviewBusy(false);
+                              }
+                            })();
+                          }}
+                        >Promote to this review</button>
                       </Show>
                     </li>
                   )}
