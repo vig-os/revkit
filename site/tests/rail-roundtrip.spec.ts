@@ -104,8 +104,9 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
  * `data-src`-anchored, and this fixture guarantees we know what
  * `path:startLine-endLine` to expect on the anchor without depending
  * on Astro's per-page layout. */
+let fixtureCounter = 0;
 async function writeFixtureHtml(): Promise<{ relPath: string; cleanup: () => void }> {
-  const relPath = "rail-fixture.html";
+  const relPath = `rail-fixture-${process.pid}-${fixtureCounter++}.html`;
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,
@@ -161,6 +162,24 @@ async function selectSubstring(page: Page, substring: string): Promise<{ x: numb
 test.describe("rail round-trip @chromium-only", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "chromium-only");
   test.setTimeout(120_000);
+
+  test("fixture teardown cannot remove another test's page", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const first = await writeFixtureHtml();
+    const second = await writeFixtureHtml();
+    try {
+      // Reproduce overlapping workers: B writes its page, then A tears down.
+      first.cleanup();
+      await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      const response = await page.goto(`${daemon.url}/${second.relPath}`);
+      expect(response?.status()).toBe(200);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+    } finally {
+      first.cleanup();
+      second.cleanup();
+      await shutdown(daemon);
+    }
+  });
 
   test("select → floating Comment → compose → assert anchor → MCP notif → MCP reply → rail update → resolve → axe", async ({ page }) => {
     const daemon = await bootDaemon();

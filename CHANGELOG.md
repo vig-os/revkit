@@ -90,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **E2E daemon boot uses one observable readiness helper, and the rail
   bundle is ready before the daemon advertises startup**, avoiding a
-  first-page compilation race under contention without extending timeouts
+  first-page compilation race under contention; concurrent rail specs use
+  independent fixture paths, without extending timeouts
   ([#150](https://github.com/vig-os/revkit/issues/150),
   [#138](https://github.com/vig-os/revkit/issues/138)).
 

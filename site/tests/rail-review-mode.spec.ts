@@ -84,8 +84,9 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
   try { rmSync(ctx.root, { recursive: true, force: true }); } catch { /* fine */ }
 }
 
+let fixtureCounter = 0;
 async function writeFixtureHtml(): Promise<{ relPath: string; cleanup: () => void }> {
-  const relPath = "rail-review-fixture.html";
+  const relPath = `rail-review-fixture-${process.pid}-${fixtureCounter++}.html`;
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,
