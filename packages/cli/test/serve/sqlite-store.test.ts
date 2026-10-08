@@ -3,7 +3,7 @@
 // path (a temporary sqlite file), not the in-memory one, so
 // persistence across restart is a real assertion.
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,6 +15,7 @@ import {
   exportArchive,
   isLineAnchor,
 } from "@revkit/review-core";
+import * as reviewCore from "@revkit/review-core";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 
 const anchor: Anchor = {
@@ -31,6 +32,100 @@ function tmpDb(): string {
 }
 
 describe("SqliteThreadStore", () => {
+  for (const payload of ["{", "{}"]) {
+    test(`#99-r1: open wraps persisted ${payload} and closes its handle`, () => {
+      const filename = tmpDb();
+      SqliteThreadStore.open({ filename }).close();
+      const db = new Database(filename);
+      db.query("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)").run(7, "2026-10-03T12:00:00Z", payload);
+      db.close();
+      const close = spyOn(Database.prototype, "close");
+      let error: unknown;
+      try {
+        SqliteThreadStore.open({ filename });
+      } catch (caught) {
+        error = caught;
+      }
+      try {
+        expect(error).toBeInstanceOf(reviewCore.ThreadStoreOpenError);
+        const refusal = error as reviewCore.ThreadStoreOpenError;
+        expect(refusal.rejection.kind).toBe("invalid-shape");
+        expect(refusal.cause).toBeInstanceOf(Error);
+        expect(refusal.message).toContain("seq 7");
+        expect(refusal.message).toContain('field "');
+        expect(refusal.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+        expect(refusal.message.length).toBeLessThan(1200);
+        expect(close).toHaveBeenCalledTimes(1);
+      } finally {
+        close.mockRestore();
+        rmSync(filename, { force: true });
+      }
+    });
+  }
+
+  test("#99-r1: accepted historical answer warning escapes the falsifier payload and has one newline", async () => {
+    const filename = tmpDb();
+    SqliteThreadStore.open({ filename }).close();
+    const db = new Database(filename);
+    const events = [
+      { seq: 1, ts: "2026-10-03T12:00:00Z", actor: { kind: "agent", id: "a1" }, kind: "ask.created", askId: "ask-1",
+        spec: { schemaVersion: 1, kind: "choice", title: "Which?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }], allowOther: false, multi: false } },
+      { seq: 2, ts: "2026-10-03T12:00:00Z", actor: { kind: "local", id: "u1" }, kind: "ask.answered", askId: "ask-1",
+        answer: { kind: "choice", value: "bad\n\r\u2028\u0085\u001b[2J\u0000\ud800" } },
+    ];
+    for (const event of events) db.query("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)").run(event.seq, event.ts, JSON.stringify(event));
+    db.close();
+    const warnings: string[] = [];
+    const stderr = spyOn(process.stderr, "write").mockImplementation((chunk: unknown) => { warnings.push(String(chunk)); return true; });
+    let store: SqliteThreadStore | undefined;
+    try {
+      store = SqliteThreadStore.open({ filename });
+      expect((await store.ask("ask-1"))?.status).toBe("answered");
+      expect(store.head()).toBe(2);
+      expect(warnings).toHaveLength(1);
+      const warning = warnings[0] ?? "";
+      expect(warning).toContain("accepting historical ask.answered");
+      expect(warning).toContain("ask-1");
+      expect(warning).toContain("bad\\n");
+      expect(warning.match(/\n/g)).toHaveLength(1);
+      expect(warning).toEndWith("\n");
+      expect(warning.slice(0, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+      expect(warning.length).toBeLessThan(1200);
+    } finally {
+      stderr.mockRestore();
+      store?.close();
+      rmSync(filename, { force: true });
+    }
+  });
+
+  test("#99: opening a corrupt log throws the shared typed open error and kind", () => {
+    const filename = tmpDb();
+    SqliteThreadStore.open({ filename }).close();
+    const db = new Database(filename);
+    const event = {
+      seq: 1, ts: "2026-10-03T12:00:00Z", actor: { kind: "local", id: "u1" },
+      kind: "thread.resolved", threadId: "missing",
+    };
+    db.query("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)").run(event.seq, event.ts, JSON.stringify(event));
+    db.close();
+    let error: unknown;
+    try {
+      SqliteThreadStore.open({ filename, displayName: "threads\nforged.sqlite" });
+    } catch (caught) {
+      error = caught;
+    } finally {
+      rmSync(filename, { force: true });
+    }
+    expect((error as Error).name).toBe("ThreadStoreOpenError");
+    expect(error).toBeInstanceOf(reviewCore.ThreadStoreOpenError);
+    const refusal = error as reviewCore.ThreadStoreOpenError;
+    expect(refusal.rejection.kind).toBe("unknown-thread");
+    expect(refusal.rejection).toMatchObject({ threadId: "missing" });
+    expect(refusal.message).toContain("Archive");
+    expect(refusal.message).toContain("threads\\nforged.sqlite");
+    expect(refusal.message).not.toMatch(/[\r\n]/);
+  });
+
   test("appends a comment.created and returns seq=1", async () => {
     const filename = tmpDb();
     const store = SqliteThreadStore.open({ filename });
