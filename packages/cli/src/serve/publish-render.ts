@@ -206,7 +206,7 @@ export async function renderDocFragment(options: RenderDocOptions): Promise<Rend
   }
   const processor = await processorPromise;
   const fileUrl = pathToFileURL(`${options.repoRoot}/${options.path}`);
-  const result = await processor.render(options.source, { fileURL: fileUrl });
+  const result = await processor.render(options.source.replace(/\r\n?/g, "\n"), { fileURL: fileUrl });
   const html = result.code;
   const dataSrcCount = countOccurrences(html, ` data-src="`);
   return { html, dataSrcCount };
