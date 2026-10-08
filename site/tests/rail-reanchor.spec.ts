@@ -27,10 +27,11 @@
 // scenario opens the daemon on `http://localhost:<port>/` and
 // asserts the 307 canonicalisation + rail flow.
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { expect, test, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFile, type ChildProcess } from "node:child_process";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -179,70 +180,12 @@ async function bootDaemon(): Promise<DaemonCtx> {
   writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
   mkdirSync(join(root, dirname(SOURCE_REL_PATH)), { recursive: true });
   writeFileSync(join(root, SOURCE_REL_PATH), readFileSync(FIXTURE, "utf8"), "utf8");
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", fixtureBuild.dist], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString("utf8")));
-  child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk.toString("utf8")));
-  child.on("exit", (code, signal) => {
-    if (code !== 0 && code !== null) {
-      process.stderr.write(
-        `[rail-rt] daemon exited ${code}/${signal}\nstderr:\n${stderrChunks.join("")}\nstdout:\n${stdoutChunks.join("")}\n`,
-      );
-    }
-  });
-  const deadline = Date.now() + 15_000;
-  let state: { readonly pid: number; readonly port: number; readonly url: string; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch {
-        // Mid-write; retry.
-      }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    await shutdown({ child, root });
-    throw new Error(
-      `revkit serve did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  const deadline2 = Date.now() + 2000;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
-    await shutdown({ child, root });
-    throw new Error(`daemon started but never printed 'launch:' line — stdout: ${stdoutChunks.join("")}`);
-  }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--dir", fixtureBuild.dist] });
+  return ctx;
 }
 
 async function shutdown(ctx: Pick<DaemonCtx, "child" | "root">): Promise<void> {
-  try {
-    ctx.child.kill("SIGTERM");
-  } catch {
-    // Already dead.
-  }
-  // Wait for the process to actually exit — lesson from prior PRs:
-  // a test that spawns a daemon must ensure it is dead before the
-  // suite ends, otherwise daemon-hygiene flags a survivor.
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    if (ctx.child.exitCode !== null || ctx.child.signalCode !== null) break;
-    await new Promise((r) => setTimeout(r, 25));
-  }
+  await stopDaemon(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 

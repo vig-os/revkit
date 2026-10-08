@@ -460,6 +460,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
   const requestedPort = options.port ?? 0;
 
+  // ADR-0013: the injected rail must be usable when serve.json and
+  // the launch announcement advertise readiness. Compile before opening
+  // stores, watchers or sockets so a build failure leaves no live daemon.
+  const railBuildStarted = performance.now();
+  const railBundle = await buildRailBundle();
+  logger.info("rail.build.ready", { durationMs: Math.round(performance.now() - railBuildStarted) });
+
   // `.revkit/` mode is owned by `ensureRevkitDir` in serve-state.ts
   // (one owner, one place — round-4 review nit). Call it here so the
   // sqlite file's parent exists before `SqliteThreadStore.open`,
@@ -1305,7 +1312,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // stance as the static branch below.
     if (url.pathname === RAIL_JS_PATH || url.pathname === RAIL_CSS_PATH) {
       if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
-      return handleRailAsset(url, method, requestId);
+      return handleRailAsset(url, method);
     }
 
     // Ask page bundle — mirrors the rail asset shape. Public, no
@@ -3999,18 +4006,9 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     });
   }
 
-  /** Serve the rail bundle (`/-/rail.js` and `/-/rail.css`). Built
-   * once with `Bun.build` on first request, then held in memory for
-   * the daemon's lifetime — the bundle is deterministic in the
-   * package's source tree. */
-  async function handleRailAsset(url: URL, method: string, requestId: string): Promise<Response> {
-    let bundle;
-    try {
-      bundle = await buildRailBundle();
-    } catch (error) {
-      logger.error("rail.build.failed", { requestId, errorKind: (error as Error).name });
-      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text", "text/plain; charset=utf-8");
-    }
+  /** Serve the rail bytes compiled before startup advertised readiness. */
+  async function handleRailAsset(url: URL, method: string): Promise<Response> {
+    const bundle = railBundle;
     const isJs = url.pathname === RAIL_JS_PATH;
     const body = isJs ? bundle.js : bundle.css;
     const contentType = isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";

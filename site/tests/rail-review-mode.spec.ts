@@ -20,10 +20,11 @@
 //           discard two-step; axe clean.
 //   Test 2: stale-head → re-anchor with orphan panel; axe clean.
 
+import { bootReviewDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -65,9 +66,9 @@ async function bootDaemon(): Promise<DaemonCtx> {
     `# Rail review-mode fixture\n\n${FIXTURE_PARAGRAPH_TEXT}\ntail line\n`,
     "utf8",
   );
-  const child = spawn(
-    "bun",
-    [
+  return await bootReviewDaemon<BootInfo>({
+    root,
+    args: [
       BOOT_SCRIPT,
       "--dir", DIST,
       "--repo-root", root,
@@ -75,48 +76,11 @@ async function bootDaemon(): Promise<DaemonCtx> {
       "--head-a", FIXTURE_HEAD_A,
       "--control-port", "0",
     ],
-    { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env },
-  );
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (b: Buffer) => {
-    const s = b.toString("utf8");
-    stderrChunks.push(s);
-    if (process.env.REVKIT_E2E_LOG === "1") process.stderr.write(`[boot.stderr] ${s}`);
   });
-  child.stdout?.on("data", (b: Buffer) => stdoutChunks.push(b.toString("utf8")));
-  child.on("exit", (code, sig) => {
-    if (code !== 0 && code !== null) {
-      process.stderr.write(
-        `[rail-rm] daemon exited ${code}/${sig}\nstderr:\n${stderrChunks.join("")}\nstdout:\n${stdoutChunks.join("")}\n`,
-      );
-    }
-  });
-  const deadline = Date.now() + 30_000;
-  let info: BootInfo | undefined;
-  while (Date.now() < deadline) {
-    const joined = stdoutChunks.join("");
-    const line = joined.split("\n").find((l) => l.trim().startsWith("{"));
-    if (line !== undefined) {
-      try {
-        info = JSON.parse(line) as BootInfo;
-        break;
-      } catch { /* mid-write */ }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (info === undefined) {
-    try { child.kill("SIGTERM"); } catch { /* fine */ }
-    throw new Error(
-      `boot did not print a JSON info line within 30s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  return { ...info, child, root };
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try { ctx.child.kill("SIGTERM"); } catch { /* fine */ }
-  await new Promise((r) => setTimeout(r, 200));
+  await stopDaemon(ctx.child);
   try { rmSync(ctx.root, { recursive: true, force: true }); } catch { /* fine */ }
 }
 

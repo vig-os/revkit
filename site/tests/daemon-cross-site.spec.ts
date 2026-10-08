@@ -12,13 +12,12 @@
 // different loopback port. The attacker page tries the hijack; the
 // spec waits for the browser to report the outcome and asserts the
 // WebSocket did NOT open.
+import { bootDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { expect, test } from "@playwright/test";
-import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ChildProcess } from "node:child_process";
 import type { AddressInfo } from "node:net";
 
 test.describe("cross-site WebSocket hijack", () => {
@@ -36,15 +35,15 @@ test.describe("cross-site WebSocket hijack", () => {
     writeFileSync(join(root, "package.json"), JSON.stringify({ name: "revkit", private: true, type: "module" }));
 
     const cliBin = resolve(import.meta.dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
-    const daemon = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", dist], {
-      cwd: root,
-      stdio: ["ignore", "pipe", "pipe"],
+    const info = await bootDaemon({
+      root, args: [cliBin, "serve", "--port", "0", "--dir", dist], timeoutMs: 10_000,
     });
+    const daemon = info.child;
 
     let daemonPort = 0;
     let launchUrl = "";
     try {
-      const daemonInfo = await waitForDaemon(daemon);
+      const daemonInfo = info;
       daemonPort = daemonInfo.port;
       launchUrl = daemonInfo.launchUrl;
 
@@ -94,9 +93,7 @@ test.describe("cross-site WebSocket hijack", () => {
         await new Promise<void>((r) => attacker.server.close(() => r()));
       }
     } finally {
-      daemon.kill("SIGTERM");
-      // Give the daemon time to clean up `.revkit/serve.json`.
-      await new Promise((r) => setTimeout(r, 200));
+      await stopDaemon(daemon);
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -114,39 +111,4 @@ async function startAttackerServer(html: string): Promise<{ server: HttpServer; 
   const address = server.address() as AddressInfo | null;
   if (address === null) throw new Error("attacker server bound to no address");
   return { server, port: address.port };
-}
-
-/** Wait for `revkit serve` to print its listen line and pluck the
- * port + launch URL out of stdout. Times out after 10 s. */
-async function waitForDaemon(child: ChildProcess): Promise<{ port: number; launchUrl: string }> {
-  return new Promise((resolveOuter, rejectOuter) => {
-    let stdout = "";
-    let stderr = "";
-    const stdoutStream = child.stdout;
-    const stderrStream = child.stderr;
-    if (stdoutStream === null || stderrStream === null) {
-      rejectOuter(new Error("daemon stdio not piped"));
-      return;
-    }
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      rejectOuter(new Error(`daemon startup timeout. stdout:\n${stdout}\nstderr:\n${stderr}`));
-    }, 10_000);
-    stdoutStream.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-      const listen = stdout.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
-      const launch = stdout.match(/launch:\s+(http:\/\/[^ \n]+)/);
-      if (listen !== null && launch !== null) {
-        clearTimeout(timer);
-        resolveOuter({ port: Number.parseInt(listen[1] ?? "0", 10), launchUrl: launch[1] ?? "" });
-      }
-    });
-    stderrStream.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      rejectOuter(new Error(`daemon exited early (${code}). stdout:\n${stdout}\nstderr:\n${stderr}`));
-    });
-  });
 }

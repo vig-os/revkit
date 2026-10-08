@@ -21,10 +21,11 @@
 // Chromium-only (WebKit is #19). axe gate at each of the three
 // states: collapsed, expanded, unread.
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -71,69 +72,12 @@ async function bootDaemon(opts: { root?: string; port?: number } = {}): Promise<
   }
   const args = [REVKIT_BIN, "serve", "--dir", DIST];
   if (opts.port !== undefined) args.push("--port", String(opts.port));
-  const child = spawn("bun", args, {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString("utf8")));
-  child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk.toString("utf8")));
-  child.on("exit", (code, signal) => {
-    if (code !== 0 && code !== null) {
-      process.stderr.write(
-        `[rail-60] daemon exited ${code}/${signal}\nstderr:\n${stderrChunks.join("")}\nstdout:\n${stdoutChunks.join("")}\n`,
-      );
-    }
-  });
-  const deadline = Date.now() + 15_000;
-  let state: { readonly pid: number; readonly port: number; readonly url: string; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch {
-        // Mid-write; retry.
-      }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(
-      `revkit serve did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  const deadline2 = Date.now() + 2000;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(`daemon started but never printed 'launch:' — stdout: ${stdoutChunks.join("")}`);
-  }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  const ctx = await startTestDaemon({ root, args });
+  return ctx;
 }
 
 async function shutdown(ctx: DaemonCtx, opts: { keepRoot?: boolean } = {}): Promise<void> {
-  try {
-    ctx.child.kill("SIGTERM");
-  } catch {
-    // Already dead.
-  }
-  // Wait for the child to actually exit, so `.revkit/daemon.lock`
-  // is released before a follow-on restart tries to acquire it.
-  await new Promise<void>((r) => {
-    ctx.child.on("exit", () => r());
-    // Fallback: 800 ms is well past `SIGTERM → onCleanup → exit`.
-    setTimeout(() => r(), 800);
-  });
+  await stopDaemon(ctx.child);
   if (opts.keepRoot !== true) {
     rmSync(ctx.root, { recursive: true, force: true });
   }

@@ -22,8 +22,9 @@
 // 5 of 11 tests with a 403 from `/-/auth`; `retries: 2` masked every
 // one of them. See #74.
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
+import { type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,115 +44,17 @@ interface DaemonCtx {
   readonly agentToken: string;
 }
 
-/** Set of daemon child PIDs the process spawned but has not
- * yet cleanly torn down. Used by the process-exit / SIGINT /
- * SIGTERM handlers below to kill leaked daemons if the Playwright
- * worker itself is interrupted (Ctrl-C, an unhandled rejection,
- * or a Playwright timeout that ends the process without running
- * `afterAll`).
- *
- * PR #52 round-3 review — an earlier interrupted debug run of
- * this suite left a daemon rooted in a stray `revkit-debug-*`
- * temp dir, matching what this spec spawns. The signal handlers
- * make interrupted runs self-cleaning without depending on the
- * `daemon-registry.ts` helper (which is a Bun-test in-process
- * Set and cannot survive a Playwright worker exit). */
-const LIVE_CHILDREN = new Set<import("node:child_process").ChildProcess>();
-let signalHandlersInstalled = false;
-function installSignalHandlersOnce(): void {
-  if (signalHandlersInstalled) return;
-  signalHandlersInstalled = true;
-  const kill = (signal: NodeJS.Signals): void => {
-    for (const c of LIVE_CHILDREN) {
-      try { c.kill(signal); } catch { /* dead */ }
-    }
-  };
-  // Best-effort: SIGTERM on any exit signal the worker receives.
-  // `process.on("exit")` runs synchronously in the last tick, so
-  // SIGTERM here is the last thing the child sees.
-  process.on("exit", () => kill("SIGTERM"));
-  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-    process.once(sig, () => {
-      kill(sig);
-      // Re-raise so the exit code reflects the signal.
-      process.exit(128 + (sig === "SIGINT" ? 2 : sig === "SIGTERM" ? 15 : 1));
-    });
-  }
-}
-
 async function bootDaemon(): Promise<DaemonCtx> {
-  installSignalHandlersOnce();
   if (!existsSync(DIST)) throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
   const root = mkdtempSync(join(tmpdir(), "revkit-ask-page-"));
   mkdirSync(join(root, ".revkit"), { recursive: true });
   writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  LIVE_CHILDREN.add(child);
-  child.once("exit", () => LIVE_CHILDREN.delete(child));
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString("utf8")));
-  child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk.toString("utf8")));
-  child.on("exit", (code, signal) => {
-    if (code !== 0 && code !== null) {
-      process.stderr.write(`[ask-page] daemon exited ${code}/${signal}\nstderr:\n${stderrChunks.join("")}\n`);
-    }
-  });
-  const deadline = Date.now() + 15_000;
-  let state: { readonly port: number; readonly url: string; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch { /* mid-write */ }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(`daemon did not write serve.json within 15s`);
-  }
-  // Readiness gate: the daemon prints its `launch:` line once it is
-  // bound and about to serve. We deliberately do NOT keep that URL —
-  // the code in it is single-use (see `fixtures/launch-code.ts`), so
-  // every test mints its own. Asserting the line appeared keeps the
-  // "daemon finished starting" signal the wait used to provide.
-  const deadline2 = Date.now() + 3000;
-  let announcedLaunch = false;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/) !== null) { announcedLaunch = true; break; }
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  if (!announcedLaunch) {
-    child.kill("SIGTERM");
-    throw new Error(`daemon printed no launch: line`);
-  }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--dir", DIST] });
+  return ctx;
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try { ctx.child.kill("SIGTERM"); } catch { /* dead */ }
-  // Wait for the child to actually exit (up to 3 s) so a
-  // subsequent teardown-race doesn't leave a zombie the signal
-  // handlers then double-kill on process exit. Falls back to
-  // SIGKILL if SIGTERM is ignored.
-  const exited = await new Promise<boolean>((resolveOuter) => {
-    if (ctx.child.exitCode !== null || ctx.child.killed) return resolveOuter(true);
-    const timer = setTimeout(() => resolveOuter(false), 3000);
-    ctx.child.once("exit", () => { clearTimeout(timer); resolveOuter(true); });
-  });
-  if (!exited) {
-    try { ctx.child.kill("SIGKILL"); } catch { /* dead */ }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  LIVE_CHILDREN.delete(ctx.child);
+  await stopDaemon(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 
