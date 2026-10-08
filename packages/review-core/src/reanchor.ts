@@ -339,6 +339,10 @@ export function alignMatchedText(
   const window = newSource.slice(startOffset, windowEnd);
   const dmp = new DiffMatchPatch();
   const diffs = dmp.diff_main(alignmentTarget, window) as Diff[];
+  // As in prepareReanchor, discard incidental equal letters inside a
+  // replacement. Otherwise wrong → right ends on an EQUAL "g" and the
+  // endpoint walker omits the inserted "ht" at the quote boundary (#127).
+  dmp.diff_cleanupSemantic(diffs);
   // Walk to position oldQuote.length (the boundary between the
   // block and the trailing context we appended). The trailing
   // context bounds the diff so the walker does not overrun the
