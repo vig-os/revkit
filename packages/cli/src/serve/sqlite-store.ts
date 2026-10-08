@@ -1,7 +1,7 @@
 // `SqliteThreadStore` — the daemon's `bun:sqlite` implementation of
 // `@revkit/review-core`'s `ThreadStore` (ADR-0006).
 //
-// One table: `events(seq INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+// Source of truth: `events(seq INTEGER PRIMARY KEY, ts TEXT NOT NULL,
 // payload TEXT NOT NULL)`. `payload` is the full `ReviewEvent` as JSON,
 // including `seq` and `ts`, so a query returns a row that
 // `reviewEventSchema.parse` accepts unchanged. Two columns are stored
@@ -48,6 +48,70 @@ import {
 import { ThreadStoreAppendError } from "@revkit/review-core";
 
 const wallClock: Clock = () => new Date().toISOString();
+
+// These projections contain only routing keys, never Thread state. Comment
+// ownership handles comment.edited / comment.linked, which have no threadId.
+// All reducer state is local to a thread (including lifecycle intent seqs).
+// Triggers cover append, import and another connection's inserts atomically.
+const THREAD_INDEX_SQL = `
+CREATE TABLE IF NOT EXISTS thread_paths (
+  thread_id TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  anchor_seq INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_paths_path ON thread_paths (path, thread_id);
+CREATE TABLE IF NOT EXISTS comment_threads (
+  comment_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS thread_events (
+  seq INTEGER PRIMARY KEY,
+  thread_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread_id, seq);
+CREATE TRIGGER IF NOT EXISTS events_thread_index AFTER INSERT ON events BEGIN
+  INSERT INTO comment_threads (comment_id, thread_id)
+    SELECT json_extract(NEW.payload, '$.commentId'), json_extract(NEW.payload, '$.threadId')
+    WHERE json_extract(NEW.payload, '$.kind') IN ('comment.created', 'comment.replied');
+  INSERT INTO thread_events (seq, thread_id)
+    SELECT NEW.seq, COALESCE(json_extract(NEW.payload, '$.threadId'),
+      (SELECT thread_id FROM comment_threads
+       WHERE comment_id = json_extract(NEW.payload, '$.commentId')))
+    WHERE COALESCE(json_extract(NEW.payload, '$.threadId'),
+      (SELECT thread_id FROM comment_threads
+       WHERE comment_id = json_extract(NEW.payload, '$.commentId'))) IS NOT NULL;
+  INSERT INTO thread_paths (thread_id, path, anchor_seq)
+    SELECT json_extract(NEW.payload, '$.threadId'),
+      json_extract(NEW.payload, '$.anchor.path'), NEW.seq
+    WHERE json_extract(NEW.payload, '$.kind') IN ('comment.created', 'thread.reanchored')
+    ON CONFLICT(thread_id) DO UPDATE SET path = excluded.path, anchor_seq = excluded.anchor_seq
+      WHERE excluded.anchor_seq > thread_paths.anchor_seq;
+END;
+`;
+
+// Rebuilt on EVERY open, even if the projections already exist. Old databases
+// need no events-table alteration; discarded/damaged routing rows are recoverable
+// from the log. A single write transaction gives other connections an atomic view.
+const REBUILD_THREAD_INDEX_SQL = `
+DELETE FROM thread_events;
+DELETE FROM comment_threads;
+DELETE FROM thread_paths;
+INSERT INTO comment_threads (comment_id, thread_id)
+  SELECT json_extract(payload, '$.commentId'), json_extract(payload, '$.threadId')
+  FROM events WHERE json_extract(payload, '$.kind') IN ('comment.created', 'comment.replied');
+INSERT INTO thread_paths (thread_id, path, anchor_seq)
+  SELECT thread_id, path, seq FROM (
+    SELECT json_extract(payload, '$.threadId') AS thread_id,
+      json_extract(payload, '$.anchor.path') AS path, seq,
+      ROW_NUMBER() OVER (PARTITION BY json_extract(payload, '$.threadId') ORDER BY seq DESC) AS rank
+    FROM events WHERE json_extract(payload, '$.kind') IN ('comment.created', 'thread.reanchored')
+  ) WHERE rank = 1;
+INSERT INTO thread_events (seq, thread_id)
+  SELECT events.seq, COALESCE(json_extract(events.payload, '$.threadId'), comment_threads.thread_id)
+  FROM events LEFT JOIN comment_threads
+    ON comment_threads.comment_id = json_extract(events.payload, '$.commentId')
+  WHERE COALESCE(json_extract(events.payload, '$.threadId'), comment_threads.thread_id) IS NOT NULL;
+`;
 
 /** SQL to bring a database up to the current schema. `journal_mode =
  * WAL` gives concurrent readers alongside a single writer, which the
@@ -173,6 +237,10 @@ export class SqliteThreadStore implements ThreadStore {
       }
       if (event.seq > head) head = event.seq;
     }
+    db.transaction(() => {
+      db.exec(THREAD_INDEX_SQL);
+      db.exec(REBUILD_THREAD_INDEX_SQL);
+    }).immediate();
     return new SqliteThreadStore(db, options.clock ?? wallClock, state, head);
   }
 
@@ -275,7 +343,21 @@ export class SqliteThreadStore implements ThreadStore {
     // review-core owns the reduce → sort → filter sequence in
     // `selectThreads` so a new filter rule shows up on this store and
     // on `InMemoryThreadStore` at once, without a copy-paste.
-    const events = await this.since(0);
+    if (filter?.path === undefined) return selectThreads(await this.since(0), filter);
+    // Select by CURRENT path, then retrieve the COMPLETE histories of those
+    // threads, including comment-only edits/links and earlier anchors. IN drives
+    // primary-key event lookups rather than scanning the events table. Keep
+    // selectThreads as the owner of result ordering and status filtering.
+    const rows = this.#db
+      .query<{ payload: string }, [string]>(`
+        SELECT payload FROM events WHERE seq IN (
+          SELECT thread_events.seq FROM thread_paths
+          JOIN thread_events ON thread_events.thread_id = thread_paths.thread_id
+          WHERE thread_paths.path = ?
+        ) ORDER BY seq ASC
+      `)
+      .all(filter.path);
+    const events = rows.map((row) => reviewEventSchema.parse(JSON.parse(row.payload)));
     return selectThreads(events, filter);
   }
 
