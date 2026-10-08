@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEV_ACCOUNT, DEV_BUCKET, DEV_WORKER, generateDevConfig, readBaseConfig, validateDevState } from "./cf-dev-config.ts";
 import type { DevState } from "./cf-dev-config.ts";
+import { devArguments } from "./cf-dev-args.ts";
+import { confirmArguments } from "./cf-confirm.ts";
+import { isMissingWorker } from "./cf-wrangler-contract.ts";
 
 const repo = join(import.meta.dir, "..");
 const workerDir = join(repo, "packages/worker");
@@ -35,11 +38,11 @@ async function relay(stream: ReadableStream<Uint8Array>, output: NodeJS.WriteStr
 }
 async function wrangler(args: string[], config?: string, options: { capture?: boolean; secret?: string; allowMissingWorker?: boolean } = {}): Promise<string> {
   const secrets = options.secret ? [...credentials, options.secret] : credentials;
-  const child = Bun.spawn(["wrangler", ...args, ...(config ? ["--config", config] : [])], {
+  const child = Bun.spawn(["wrangler", ...(config ? ["--config", config] : []), ...args], {
     cwd: config ? workerDir : repo,
     env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_LOG_PATH: logPath,
       WRANGLER_LOG: "log", NO_COLOR: "1", CLOUDFLARE_ENV: "" },
-    stdin: options.secret ? new Blob([options.secret + "\n"]) : "inherit", stdout: "pipe", stderr: "pipe",
+    stdin: options.secret ? new Blob([options.secret + "\n"]) : "ignore", stdout: "pipe", stderr: "pipe",
   });
   const forwardSignal = (signal: NodeJS.Signals) => child.kill(signal);
   const onInterrupt = () => forwardSignal("SIGINT");
@@ -54,7 +57,7 @@ async function wrangler(args: string[], config?: string, options: { capture?: bo
   const code = await child.exited;
   process.removeListener("SIGINT", onInterrupt); process.removeListener("SIGTERM", onTerminate);
   if (code !== 0) {
-    if (options.allowMissingWorker && capturedError.includes(`Worker "${DEV_WORKER}" not found.`)) {
+    if (options.allowMissingWorker && isMissingWorker(capturedError, DEV_WORKER)) {
       // A fresh Worker must inherit the security settings before secrets are put.
       await wrangler(["deploy"], config);
       return "[]";
@@ -114,19 +117,16 @@ async function init(rotate: boolean): Promise<void> {
 async function main(): Promise<void> {
   const [mode, ...args] = process.argv.slice(2);
   if (!process.env.CLOUDFLARE_API_TOKEN) throw new Error("cf: missing local Cloudflare API token; use scripts/cf-credentials.sh");
-  if (mode === "cf") { await wrangler(args); return; }
+  if (mode === "cf") { await wrangler(confirmArguments(args)); return; }
   if (process.env.CLOUDFLARE_ACCOUNT_ID !== DEV_ACCOUNT) throw new Error("cf-dev: credentials must select the authorized dev account");
   if (mode === "init") {
     if (args.length > 1 || (args.length === 1 && args[0] !== "--rotate")) throw new Error("usage: just cf-dev-init [--rotate]");
     await init(args[0] === "--rotate"); return;
   }
   if (mode !== "dev") throw new Error("cf: unknown recipe mode");
-  // All calls use this config; overrides would bypass its account/security checks.
-  if (args.some((arg) => /^--(?:config|cwd|env|env-file|name|account-id)(?:=|$)/.test(arg) || /^-[ce]/.test(arg))) {
-    throw new Error("cf-dev: Wrangler target overrides are forbidden; use the generated dev config");
-  }
+  const validatedArgs = devArguments(confirmArguments(args), repo);
   generateDevConfig(readBaseConfig(join(workerDir, "wrangler.jsonc")), readState(), devConfigPath);
-  await wrangler(args, devConfigPath);
+  await wrangler(validatedArgs, devConfigPath);
 }
 try { await main(); } catch (error) {
   // JSON/file errors can include source text. Only our own static errors are safe.

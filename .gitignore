@@ -100,10 +100,10 @@ playwright/.cache/
 # always local; hosted mode uses D1 and Durable Objects instead.
 .revkit/
 
-# flake-hooks opt-in (#1092): the generated .pre-commit-config.yaml is a
-# /nix/store symlink — never commit it.
-.pre-commit-config.yaml
-
 # Cloudflare local state and generated dev config (ADR-0014)
 packages/worker/.wrangler/
 packages/worker/wrangler.dev.jsonc
+
+# flake-hooks opt-in (#1092): the generated .pre-commit-config.yaml is a
+# /nix/store symlink — never commit it.
+.pre-commit-config.yaml

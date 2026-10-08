@@ -18,16 +18,13 @@ if [[ -n "${REVKIT_CF_SOPS:-}" ]]; then
   sops_source="$REVKIT_CF_SOPS"
   [[ "$sops_source" == /* ]] || sops_source="$PWD/$sops_source"
   ln -s "$sops_source" "$sops_dir/credentials.env"
+  set +e
   sops exec-env "$sops_dir/credentials.env" "$cf_command"
-  exit 0
+  exit $?
 fi
 env_file="${REVKIT_CF_ENV:-$HOME/.config/revkit/cf.env}"
 [[ -f "$env_file" ]] || { echo 'cf: missing credentials; see docs/cloudflare-dev.md' >&2; exit 1; }
 [[ "$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file")" == 600 ]] || {
   echo 'cf: plaintext credentials must be mode 600' >&2; exit 1;
 }
-set -a
-# shellcheck disable=SC1090
-source "$env_file"
-set +a
-exec bun "$script_dir/cf.ts" "$@"
+exec bun "$script_dir/cf-load-env.ts" "$env_file" "$@"

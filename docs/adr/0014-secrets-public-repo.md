@@ -68,3 +68,20 @@ the production deployment process above are unchanged. This tooling provisions t
 it does not implement the owner-gated GitHub App and production deployment train (#34).
 
 The operator workflow and overrides are documented in [Cloudflare development tooling](../cloudflare-dev.md).
+
+## Amendment — 2026-10-08: dev tooling input and confirmation hardening (#160)
+
+The dev wrapper uses a per-command allowlist for commands, resource arguments and flags, with its generated config
+placed before user arguments. Unknown commands/flags, aliases, a bare `--` and security-setting overrides are
+refused. File arguments resolve from the repository root. The operator documentation enumerates the supported
+workflow; destructive operations remain outside its dev allowlist.
+
+Both `cf` and `cf-dev` require an explicit `--yes-really` plus an independent TTY confirmation before any destructive
+verb can reach Wrangler. Piped Wrangler output otherwise causes its own prompts to auto-confirm. Ordinary calls
+receive closed stdin; generated secrets are supplied explicitly. These changes do not grant agents permission to
+delete resources or change the owner's reachability settings.
+
+Local credential files are parsed as data by a shared dotenv parser, never sourced as shell code. Malformed input
+reports only a line number and key, with no value fragments. The credential helper preserves unrelated entries
+and keeps the newest five mode-600 backups named `cf.env.bak.<UTC timestamp>.<unique suffix>`. The encrypted copy
+uses the same parsed values. Production and the account boundary remain unchanged.

@@ -32,12 +32,7 @@ if [[ -n "$SOPS_OUT" ]]; then
   mkdir -p "$(dirname "$SOPS_OUT")"
   sops_tmp="$(mktemp "${SOPS_OUT}.XXXXXX")"
   trap 'rm -f "$sops_tmp"' EXIT
-  # The fallback file is shell-quoted; SOPS dotenv values are literal strings.
-  # Load the quoted file and encrypt canonical dotenv values privately on stdin.
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
+  # Parse the local dotenv as data and encrypt canonical values on stdin.
   CF_ENV_FILE="$ENV_FILE" CF_AGE_RECIPIENT="$AGE_RECIPIENT" \
     bun "$(dirname "${BASH_SOURCE[0]}")/cf-credentials-write.ts" encrypt > "$sops_tmp"
   mv "$sops_tmp" "$SOPS_OUT"

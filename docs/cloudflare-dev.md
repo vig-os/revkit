@@ -17,7 +17,8 @@ nix develop -c just cf whoami
 ```
 
 The helper asks silently for the Cloudflare API token, R2 S3 Access Key ID and R2 S3 Secret Access Key. Enter keeps
-an existing value. It writes `~/.config/revkit/cf.env` and its backup with mode 600, preserving unrelated lines.
+an existing value. It writes `~/.config/revkit/cf.env` with mode 600, preserving unrelated lines. Before each update it saves a
+mode-600 backup named `cf.env.bak.<UTC timestamp>.<unique suffix>`, keeping the newest five backups.
 R2 values use `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3` (derived from the account) and
 `AWS_REGION=auto`. No secret belongs in a command argument or this repository.
 
@@ -25,7 +26,9 @@ R2 values use `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3
 public recipient with `REVKIT_CF_AGE_RECIPIENT`; configure SOPS's age identity locally for decryption. `just cf`
 prefers `REVKIT_CF_SOPS` and decrypts it per call with `sops exec-env`. If unset, it uses `REVKIT_CF_ENV` or
 `~/.config/revkit/cf.env` and requires mode 600. A configured SOPS file that cannot decrypt fails without fallback.
-Both wrappers redact credential values from output and discard Wrangler's persistent debug logs. Credentials
+Plaintext files are parsed as `KEY=VALUE` data, with optional `export` and quoted/backslash-escaped values; shell
+expansions and commands never run. Invalid lines report only their line number and key. The loader and credential
+helper share this parser. Both wrappers redact credential values from output and discard Wrangler's persistent debug logs. Credentials
 stay in each invocation's process tree, never in the parent shell.
 
 ## Initialize, deploy and inspect
@@ -58,3 +61,37 @@ rejects Wrangler target overrides such as `--config`, `--env`, `--name` and `--c
 `cf-dev-deploy` deploys the current worktree through that config. Local Wrangler state and the generated config
 are gitignored. For remote platform testing, an authorized operator may run `just cf-dev dev --remote`; the
 production environment and any public dev URL remain separate owner decisions.
+
+## Allowed dev commands and destructive operations
+
+`cf-dev` places its generated `--config` before the validated user arguments and accepts only these commands and
+flags. Database arguments must be `revkit-review-dev` or `DB`; bucket arguments must be `revkit-previews-dev`, and
+object paths must start with `revkit-previews-dev/`. All `--file` paths resolve from the repository root, including
+`--file=path` syntax.
+
+| Command | Allowed flags |
+| --- | --- |
+| `whoami`, `versions list`, `deployments list` | none |
+| `deploy` | `--dry-run` |
+| `dev` | `--remote`, `--port <1–65535>` |
+| `d1 list`, `d1 info <database>` | `--json` |
+| `d1 migrations list/apply <database>` | `--remote` |
+| `d1 execute <database>` | `--remote`, `--file <path>`, `--json` |
+| `r2 bucket list` | none |
+| `r2 bucket info <bucket>` | `--json` |
+| `r2 object get/put <object>` | `--remote`, `--file <path>` |
+| `secret list` | `--format json/pretty` |
+
+Everything else is refused, including a bare `--`, alias/abbreviated/camel-case flags and flags that override the
+account, config, environment, name, routes, domains, compatibility settings, variables, triggers, dispatch
+namespace, secrets file or assets. Init performs its own fixed provisioning operations.
+
+Wrangler's output is piped for redaction, so its confirmation prompts cannot protect destructive operations.
+Both wrappers independently refuse `delete`, `rollback` and `time-travel restore` unless `--yes-really` is supplied
+and the operator types `DELETE` at the wrapper's own terminal prompt. Non-interactive calls are refused even with
+that flag; a cancellation never starts Wrangler. `--yes-really` is consumed by the wrapper. Destructive operations
+remain outside the `cf-dev` allowlist even after confirmation; an authorized operator uses the general `cf`
+wrapper for them. Ordinary Wrangler calls receive no stdin; init supplies generated secrets explicitly on stdin.
+
+The missing-Worker bootstrap error is pinned to the installed Nix Wrangler version and CLI source by a test.
+Review that error contract when updating Wrangler; an authentication error never triggers bootstrap.

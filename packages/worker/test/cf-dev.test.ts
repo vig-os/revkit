@@ -13,6 +13,11 @@ const dev = {
 const token = "fake-cf-token-for-output-test";
 const r2Key = "fake-r2-access-key";
 const r2Secret = "fake-r2-secret-key";
+const missingWorker = [
+  'Worker "revkit-review-dev" not found.', "",
+  "If this is a new Worker, run `wrangler deploy` first to create it.",
+  "Otherwise, check that the Worker name is correct and you're logged into the right account.",
+].join("\n");
 let root: string;
 let env: Record<string, string | undefined>;
 const configPath = () => join(root, "packages/worker/wrangler.jsonc");
@@ -36,6 +41,7 @@ appendFileSync(process.env.CF_TEST_CALLS, JSON.stringify(args) + "\\n");
 if (process.env.WRANGLER_SEND_METRICS !== "false") process.exit(11);
 if (!process.env.WRANGLER_LOG_PATH.endsWith(".log")) process.exit(12);
 const command = args.filter((a, i) => a !== "--config" && args[i - 1] !== "--config");
+if (process.env.CF_TEST_READ_STDIN) await Bun.stdin.text();
 if (process.env.CF_TEST_ECHO) {
   const token = process.env.CLOUDFLARE_API_TOKEN;
   process.stdout.write(token.slice(0, 7));
@@ -52,7 +58,7 @@ else if (command[0] === "d1" && command[1] === "create") {
 else if (command[0] === "r2" && command[2] === "list") console.log(process.env.CF_TEST_ABSENT ? "Listing buckets..." : "name: revkit-previews-dev\\ncreation_date: today");
 else if (command[0] === "d1" && command[1] === "migrations") console.log(process.env.CF_TEST_PENDING ? "Migrations to be applied:\\n0004_test.sql" : "✅ No migrations to apply!");
 else if (command[0] === "secret" && command[1] === "list") {
-  if (process.env.CF_TEST_MISSING_WORKER) { console.error('Worker "revkit-review-dev" not found.'); process.exit(1); }
+  if (process.env.CF_TEST_MISSING_WORKER) { console.error(${JSON.stringify(missingWorker)}); process.exit(1); }
   if (process.env.CF_TEST_AUTH_FAILURE) { console.error("Authentication error"); process.exit(1); }
   console.log(JSON.stringify(process.env.CF_TEST_ABSENT ? [] : [{name: "INVITE_TOKEN_HMAC_KEY", type: "secret_text"}]));
 }
@@ -224,10 +230,13 @@ test("credential helper preserves blank secrets, quotes replacements and writes 
   const child = Bun.spawn(["bun", join(root, "scripts/cf-credentials-write.ts")], { cwd: root, env: helperEnv, stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   expect(code).toBe(0); expect(out + err).not.toContain(replacement);
-  expect(statSync(path).mode & 0o777).toBe(0o600); expect(statSync(path + ".bak").mode & 0o777).toBe(0o600);
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+  const { readdirSync } = await import("node:fs");
+  const backups = readdirSync(root).filter((name) => name.startsWith("cf.env.bak."));
+  expect(backups).toHaveLength(1); expect(statSync(join(root, backups[0]!)).mode & 0o777).toBe(0o600);
   expect(readFileSync(path, "utf8")).toContain("UNRELATED='keep me'");
   expect(readFileSync(path, "utf8")).toContain("AWS_SECRET_ACCESS_KEY='old-fake-s3-secret'");
-  const verify = Bun.spawn(["bash", "-c", 'set -a; source "$REVKIT_CF_ENV"; [[ "$CLOUDFLARE_API_TOKEN" == "$CF_TOKEN" && "$AWS_REGION" == auto && "$AWS_ENDPOINT_URL_S3" == "https://$CF_ACCOUNT.r2.cloudflarestorage.com" ]]'], { cwd: root, env: helperEnv, stdout: "pipe", stderr: "pipe" });
+  const verify = Bun.spawn(["bun", "-e", 'const {parseDotenv, dotenvValues} = await import("./scripts/cf-dotenv.ts"); const v = dotenvValues(parseDotenv(await Bun.file(process.env.REVKIT_CF_ENV).text())); if (v.CLOUDFLARE_API_TOKEN !== process.env.CF_TOKEN || v.AWS_REGION !== "auto" || v.AWS_ENDPOINT_URL_S3 !== "https://" + process.env.CF_ACCOUNT + ".r2.cloudflarestorage.com") process.exit(1);'], { cwd: root, env: helperEnv, stdout: "pipe", stderr: "pipe" });
   expect(await verify.exited).toBe(0); expect(existsSync(join(root, "should-not-exist"))).toBe(false);
 });
 
@@ -241,6 +250,12 @@ test("real SOPS reads encrypted dotenv with .sops suffix and preserves shell-spe
   expect(await pub.exited).toBe(0);
   const specialToken = "fake'\"$(touch should-not-exist)";
   writeFileSync(join(root, "cf.env"), "CLOUDFLARE_ACCOUNT_ID=placeholder\nCLOUDFLARE_API_TOKEN=placeholder\nAWS_ACCESS_KEY_ID=placeholder\nAWS_SECRET_ACCESS_KEY=placeholder\n");
+  const prepare = Bun.spawn(["bun", join(root, "scripts/cf-credentials-write.ts")], {
+    env: { ...env, CF_ENV_FILE: join(root, "cf.env"), CF_ACCOUNT: account, CF_TOKEN: specialToken, CF_R2_KEY: r2Key, CF_R2_SEC: r2Secret },
+    stdout: "pipe", stderr: "pipe",
+  });
+  await Promise.all([new Response(prepare.stdout).text(), new Response(prepare.stderr).text()]);
+  expect(await prepare.exited).toBe(0);
   const encryptedPath = join(root, "encrypted.env.sops");
   const encryption = Bun.spawn(["bash", "-c", 'bun scripts/cf-credentials-write.ts encrypt > "$CF_TEST_ENCRYPTED"'], {
     cwd: root, env: { ...env, CF_ENV_FILE: join(root, "cf.env"), CF_AGE_RECIPIENT: recipient,
@@ -251,7 +266,7 @@ test("real SOPS reads encrypted dotenv with .sops suffix and preserves shell-spe
   expect(await encryption.exited, error).toBe(0);
   env.SOPS_AGE_KEY_FILE = identity; env.REVKIT_CF_SOPS = encryptedPath; env.CF_TEST_ECHO = "1";
   rmSync(join(root, "cf.env"));
-  const result = await run("cf-dev", "whoami", "literal 'quoted'\n$(touch should-not-exist)");
+  const result = await run("cf", "whoami", "literal 'quoted'\n$(touch should-not-exist)");
   expect(result.code).toBe(0); expect(result.output).toContain("[REDACTED]");
   expect(result.output).not.toContain(specialToken); expect(result.output).not.toContain(r2Secret);
   expect(result.output).toContain("literal 'quoted'\n$(touch should-not-exist)");
@@ -266,4 +281,159 @@ test("missing API token fails before Wrangler can attempt interactive login", as
     expect(result.code).not.toBe(0); expect(result.output).toContain("missing local Cloudflare API token");
   }
   expect(calls()).toEqual([]);
+});
+
+
+// Fix-round reproductions use only the fake Wrangler installed above.
+for (const [label, args] of [
+  ["trailing separator", ["deploy", "--dry-run", "--"]],
+  ["routes", ["deploy", "--routes", "example.invalid/*"]],
+  ["domain", ["deploy", "--domain", "example.invalid"]],
+  ["environment alias", ["deploy", "--e=production"]],
+  ["compatibility flags", ["deploy", "--compatibility-flags", "nodejs_compat"]],
+  ["camel-case env file", ["deploy", "--envFile=other.env"]],
+  ["unknown command", ["queues", "list"]],
+  ["unknown flag", ["deploy", "--unexpected"]],
+] as const) {
+  test(`r1: allowlist refuses ${label} before Wrangler`, async () => {
+    const result = await run("cf-dev", ...args);
+    expect(result.code).not.toBe(0); expect(result.output).toContain("not allowed"); expect(calls()).toEqual([]);
+  });
+}
+
+for (const flag of ["--route", "--routes", "--domain", "--domains", "--compatibility-flag", "--compatibility-flags",
+  "--compatibility-date", "--var", "--triggers", "--dispatch-namespace", "--secrets-file", "--assets",
+  "--env", "--env-file", "--name", "--config", "--cwd", "--account-id", "--e", "--envFile", "-e", "-c"]) {
+  test(`r1: allowlist rejects all forms of ${flag}`, async () => {
+    for (const suffix of ["", "=unsafe"]) {
+      const result = await run("cf-dev", "deploy", flag + suffix, ...(suffix ? [] : ["unsafe"]));
+      expect(result.code).not.toBe(0); expect(result.output).toContain("not allowed");
+    }
+    expect(calls()).toEqual([]);
+  });
+}
+
+test("r1: generated config precedes every user argument", async () => {
+  expect((await run("cf-dev", "deploy", "--dry-run")).code).toBe(0);
+  expect(calls()[0]?.slice(0, 2)).toEqual(["--config", join(root, "packages/worker/wrangler.dev.jsonc")]);
+});
+
+test("r1: deploy finishes even while caller stdin remains open", async () => {
+  env.CF_TEST_READ_STDIN = "1";
+  const child = Bun.spawn(["just", "cf-dev-deploy"], { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const finished = await Promise.race([child.exited.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 2500); })]);
+  clearTimeout(timer);
+  child.stdin.end();
+  expect(await child.exited).toBe(0); await output;
+  expect(finished).toBe(true);
+});
+
+for (const args of [["delete"], ["d1", "delete", "revkit-review-dev"], ["r2", "bucket", "delete", "revkit-previews-dev"],
+  ["d1", "time-travel", "restore", "revkit-review-dev"], ["rollback"], ["secret", "delete", "INVITE_TOKEN_HMAC_KEY"],
+  ["versions", "delete", "fake-version"]]) {
+  for (const recipe of ["cf", "cf-dev"]) {
+    test(`r1: ${recipe} refuses destructive ${args.join(" ")} without its own TTY confirmation`, async () => {
+      for (const flags of [[], ["--yes-really"]]) {
+        const result = await run(recipe, ...args, ...flags);
+        expect(result.code).not.toBe(0); expect(result.output).toContain("TTY confirmation");
+      }
+      expect(calls()).toEqual([]);
+    });
+  }
+}
+
+test("r1: plaintext parsing rejects executable shell syntax without running it", async () => {
+  writeFileSync(join(root, "cf.env"), readFileSync(join(root, "cf.env"), "utf8") + 'UNRELATED=$(touch "$HOME/executed")\n');
+  const result = await run("cf", "whoami");
+  expect(existsSync(join(root, "executed"))).toBe(false); expect(calls()).toEqual([]);
+  expect(result.code).not.toBe(0); expect(result.output).toContain("line 5 (UNRELATED)");
+});
+
+test("r1: malformed plaintext reports line and key without value fragments", async () => {
+  writeFileSync(join(root, "cf.env"), `CLOUDFLARE_ACCOUNT_ID=${account}\nCLOUDFLARE_API_TOKEN=FAKETOKEN_part1 FAKETOKEN_part2\n`);
+  const result = await run("cf", "whoami");
+  expect(result.code).not.toBe(0); expect(result.output).toContain("line 2 (CLOUDFLARE_API_TOKEN)");
+  expect(result.output).not.toContain("FAKETOKEN_part1"); expect(result.output).not.toContain("FAKETOKEN_part2");
+  expect(calls()).toEqual([]);
+});
+
+test("r1: credential helper retains the newest five private UTC backups", async () => {
+  const path = join(root, "cf.env");
+  for (let i = 0; i < 7; i++) {
+    const helper = Bun.spawn(["bun", join(root, "scripts/cf-credentials-write.ts")], {
+      env: { ...env, CF_ENV_FILE: path, CF_ACCOUNT: account, CF_TOKEN: `fake-generation-${i}`, CF_R2_KEY: "", CF_R2_SEC: "" },
+      stdout: "pipe", stderr: "pipe",
+    });
+    await Promise.all([new Response(helper.stdout).text(), new Response(helper.stderr).text()]);
+    expect(await helper.exited).toBe(0);
+  }
+  const { readdirSync } = await import("node:fs");
+  const backups = readdirSync(root).filter((name) => name.startsWith("cf.env.bak.")).sort();
+  expect(backups).toHaveLength(5);
+  for (const [index, name] of backups.entries()) {
+    expect(name).toMatch(/^cf\.env\.bak\.\d{4}-\d{2}-\d{2}T.*Z\./);
+    expect(statSync(join(root, name)).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(root, name), "utf8")).toContain(`fake-generation-${index + 1}`);
+  }
+});
+
+test("r1: --file inputs are resolved from the repository root", async () => {
+  expect((await run("cf-dev", "d1", "execute", "revkit-review-dev", "--remote", "--file", "fixtures/query.sql")).code).toBe(0);
+  expect(calls()[0]).toContain(join(root, "fixtures/query.sql"));
+});
+
+
+for (const reply of ["DELETE", "cancel"]) {
+  test(`r1: destructive cf command with --yes-really requires TTY response ${reply}`, async () => {
+    env.CF_TEST_ECHO = "1";
+    const argv = process.platform === "darwin"
+      ? ["script", "-q", "/dev/null", "just", "cf", "secret", "delete", "INVITE_TOKEN_HMAC_KEY", "--yes-really"]
+      : ["script", "-qefc", "just cf secret delete INVITE_TOKEN_HMAC_KEY --yes-really", "/dev/null"];
+    const child = Bun.spawn(argv, { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    let output = "";
+    let answered = false;
+    const read = async () => {
+      const reader = child.stdout.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { value, done } = await reader.read();
+        output += decoder.decode(value, { stream: !done });
+        if (!answered && output.includes("Type DELETE to confirm:")) {
+          answered = true; child.stdin.write(reply + "\n"); child.stdin.flush();
+        }
+        if (done) break;
+      }
+    };
+    await Promise.all([read(), new Response(child.stderr).text()]);
+    const code = await child.exited;
+    child.stdin.end();
+    expect(answered).toBe(true);
+    if (reply === "DELETE") {
+      expect(code).toBe(0); expect(calls()).toHaveLength(1);
+      expect(calls()[0]).not.toContain("--yes-really"); expect(output).toContain("[REDACTED]");
+    } else { expect(code).not.toBe(0); expect(calls()).toEqual([]); }
+    for (const value of [token, r2Key, r2Secret]) expect(output).not.toContain(value);
+  });
+}
+
+test("r1: missing-Worker detection is pinned to the installed Wrangler source and version", async () => {
+  const { dirname, resolve } = await import("node:path");
+  const { realpathSync } = await import("node:fs");
+  const installed = realpathSync(Bun.which("wrangler")!);
+  // The Nix wrapper and npm's CLI symlink have different layouts.
+  const nix = join(dirname(installed), "../lib/packages/wrangler");
+  const pkg = existsSync(join(nix, "package.json")) ? nix : resolve(dirname(installed), "..");
+  const manifest = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
+  const source = readFileSync(join(pkg, "wrangler-dist/cli.js"), "utf8");
+  const check = Bun.spawn(["bun", "-e", 'const c = await import("./scripts/cf-wrangler-contract.ts"); const version = JSON.parse(await Bun.file(process.env.CF_TEST_PACKAGE).text()).version; if (c.WRANGLER_CONTRACT_VERSION !== version || c.missingWorkerMessage("revkit-review-dev") !== process.env.CF_TEST_MESSAGE || !c.isMissingWorker(process.env.CF_TEST_MESSAGE, "revkit-review-dev") || c.isMissingWorker("Authentication error", "revkit-review-dev")) process.exit(1);'], {
+    cwd: root, env: { ...env, CF_TEST_PACKAGE: join(pkg, "package.json"), CF_TEST_MESSAGE: missingWorker }, stdout: "pipe", stderr: "pipe",
+  });
+  await Promise.all([new Response(check.stdout).text(), new Response(check.stderr).text()]);
+  expect(await check.exited).toBe(0); expect(manifest.version).toBe("4.93.0");
+  for (const line of missingWorker.split("\n").filter(Boolean).slice(1)) {
+    expect(source.includes(line.replaceAll("`", "\\`")), "installed Wrangler missing-Worker wording changed").toBe(true);
+  }
+  expect(source.includes('Worker "${scriptName}"${args.env ?'), "installed Wrangler Worker-name template changed").toBe(true);
 });
