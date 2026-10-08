@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -78,5 +78,33 @@ describe("#114 import refusal contract", () => {
     expect([outcome.appended, outcome.skipped, outcome.refused]).toEqual([1, 0, 1]);
     expect(diagnostics).toEqual(["comment.linked:invalid-shape"]);
     expect(await opts.store.since(0)).toHaveLength(1);
+  });
+
+  test("a stored node id and an absent remote link node id still skip the same external comment", async () => {
+    const opts = { ...options(), threads: [remoteThread()] };
+    await populateStoreFromPr(opts);
+    const before = await opts.store.since(0);
+    expect(before[1]?.kind).toBe("comment.linked");
+    if (before[1]?.kind !== "comment.linked") throw new Error("missing stored link");
+    expect(before[1].external.github?.nodeId).toBe("PRRC_114");
+    const mapThreads = GitHubAdapter.mapThreadsToEvents;
+    // Keep comment identity intact; emulate an import carrying only
+    // the backend's database id on its link event.
+    const mapper = spyOn(GitHubAdapter, "mapThreadsToEvents").mockImplementation(async (input) => {
+      const result = await mapThreads(input);
+      return { ...result, events: result.events.map((event) => {
+        if (event.kind !== "comment.linked" || event.external.github === undefined) return event;
+        const { nodeId: _nodeId, ...github } = event.external.github;
+        expect(github).not.toHaveProperty("nodeId");
+        return { ...event, external: { github } };
+      }) };
+    });
+    try {
+      const repeated = await populateStoreFromPr(opts);
+      expect([repeated.appended, repeated.skipped, repeated.refused]).toEqual([0, 2, 0]);
+      expect(await opts.store.since(0)).toEqual(before);
+    } finally {
+      mapper.mockRestore();
+    }
   });
 });

@@ -38,7 +38,8 @@ export interface PopulateOutcome {
   /** Number of events skipped as already-present. */
   readonly skipped: number;
   /** Number of events refused as invalid or conflicting rather than
-   * already-present — a non-zero value fails the review command. */
+   * already-present. A non-zero value fails prepare-only/--no-serve;
+   * serving warns, stays available, and exits non-zero after shutdown. */
   readonly refused: number;
   /** Distinct thread ids that were touched (appended or already
    * present). */
@@ -253,6 +254,7 @@ export async function populateStoreFromPr(options: PopulateOptions): Promise<Pop
         const msg = err.rejection.kind;
         const gh = event.kind === "comment.linked" ? event.external.github : undefined;
         const existing = event.kind === "comment.linked" ? githubLinks.get(event.commentId) : undefined;
+        // A missing nodeId still re-presents the same backend/database id.
         const sameLink = msg === "duplicate-link" && err.rejection.backend === "github" &&
           gh !== undefined && existing !== undefined && gh.commentId === existing.commentId &&
           (gh.nodeId === undefined || existing.nodeId === undefined || gh.nodeId === existing.nodeId);

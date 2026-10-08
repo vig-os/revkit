@@ -653,12 +653,17 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   stdoutLines.push(
     `import: ${populate.appended} new PR thread events, ${populate.skipped} already-present`,
   );
-  if (populate.refused > 0) {
+  const willServe = parsed.serve && env.startServe !== undefined;
+  const importRefusalStderr = populate.refused > 0
+    ? `${importRefusalLogs.join("\n")}\n` + (willServe
+      ? `revkit review: WARNING: ${populate.refused} PR thread event(s) refused; these GitHub comments were not imported; see import.refused logs above.\n`
+      : `revkit review: ${populate.refused} PR thread event(s) refused; see import.refused logs above.\n`)
+    : "";
+  if (populate.refused > 0 && !willServe) {
     return {
       exitCode: 1,
       stdout: `${stdoutLines.join("\n")}\n`,
-      stderr: `${importRefusalLogs.join("\n")}\n` +
-        `revkit review: ${populate.refused} PR thread event(s) refused; see import.refused logs above.\n`,
+      stderr: importRefusalStderr,
     };
   }
 
@@ -688,7 +693,7 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
     return {
       exitCode: 1,
       stdout: `${stdoutLines.join("\n")}\n`,
-      stderr: `revkit review: failed to look up viewer login: ${(error as Error).message}\n`,
+      stderr: importRefusalStderr + `revkit review: failed to look up viewer login: ${(error as Error).message}\n`,
     };
   }
 
@@ -712,9 +717,9 @@ export async function runReviewCommand(args: readonly string[], env: RunReviewEn
   stdoutLines.push(`  launch: ${serveHandle.launchUrl}   (single-use)`);
   stdoutLines.push(`  reviewing PR #${pr.pullNumber}`);
   return {
-    exitCode: 0,
+    exitCode: populate.refused > 0 ? 1 : 0,
     stdout: `${stdoutLines.join("\n")}\n`,
-    stderr: "",
+    stderr: importRefusalStderr,
     blockForever: serveHandle.blockForever,
   };
 }

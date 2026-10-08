@@ -67,6 +67,7 @@ import {
   type ReviewModeOptions,
 } from "./review-mode.ts";
 import { populateStoreFromPr } from "../review/import-threads.ts";
+import type { ReviewRefreshResponse } from "../review/api-types.ts";
 import { IngestGapError, openDeliveryAdapter, parseMode, type DeliveryAdapter } from "./delivery-modes.ts";
 import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
@@ -266,23 +267,6 @@ export interface DaemonHandle {
     watchedDirs(): number;
   };
   stop(): Promise<void>;
-}
-
-/** Successful summary refresh; import refusals are reported separately. */
-export interface ReviewRefreshResponse {
-  readonly ok: true;
-  readonly moved: boolean;
-  readonly previousHeadSha: string;
-  readonly currentHeadSha: string;
-  readonly stale: boolean;
-  readonly openPendingReviewNodeId: string | null;
-  readonly importedNew: number;
-  readonly importedSkipped: number;
-  readonly refused: number;
-  readonly reconcile?: {
-    readonly newlySynced: readonly string[];
-    readonly newlyFailed: ReadonlyArray<{ readonly commentId: string; readonly reason: string }>;
-  };
 }
 
 /** Data attached to each WebSocket connection: which subscriber the

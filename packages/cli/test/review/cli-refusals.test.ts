@@ -92,9 +92,9 @@ function makeEnv(fixtureCwd: string, prs: readonly FakePr[]): Parameters<typeof 
  * `findRepoRootByPackageJson` accepts it. */
 const BASE_PKG_JSON = JSON.stringify({ name: "revkit", private: true }, null, 2);
 
-describe("#114 — refused imports fail review before serving", () => {
+describe("#114 — refused imports fail preparation but keep serving available", () => {
   for (const serve of [false, true]) {
-    test(`a malformed GitHub link fails ${serve ? "with serving enabled" : "--no-serve"}`, async () => {
+    test(`a malformed GitHub link ${serve ? "serves with a warning and a final failure code" : "fails --no-serve"}`, async () => {
       const fixture = await makeFixtureRepo({
         base: { message: "base", files: [
           { kind: "file", path: "package.json", content: BASE_PKG_JSON },
@@ -135,14 +135,24 @@ describe("#114 — refused imports fail review before serving", () => {
       };
       const result = await runReview(fixture.repoDir, serve ? ["114"] : ["114", "--no-serve"], env, [pr]);
       expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain("1 PR thread event(s) refused");
+      if (serve) {
+        expect(starts).toBe(1);
+        expect(result.stdout).toContain("revkit serve: listening on http://127.0.0.1:1");
+        expect(result.stderr).toContain("WARNING: 1 PR thread event(s) refused; these GitHub comments were not imported");
+        expect(result.blockForever).toBeDefined();
+        await result.blockForever;
+      } else {
+        expect(starts).toBe(0);
+        expect(result.stderr).toContain("1 PR thread event(s) refused");
+        expect(result.stdout).not.toContain("revkit serve: listening");
+        expect(result.blockForever).toBeUndefined();
+      }
       expect(result.stderr).toContain("see import.refused logs above");
       expect(result.stderr).toContain("comment.linked");
       expect(result.stderr).toContain("invalid-shape");
       expect(result.stderr).not.toContain(remote.comments[0]!.body);
       expect(result.stdout).toContain("import: 1 new PR thread events, 0 already-present");
       expect(result.stdout).not.toContain("Prepared review");
-      expect(starts).toBe(0);
     });
   }
 });

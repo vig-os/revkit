@@ -25,7 +25,7 @@
 import { createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
-import type { ReviewRefreshResponse } from "../serve/daemon.ts";
+import type { ReviewRefreshResponse } from "../review/api-types.ts";
 import {
   createSeqGate,
   readPageRenderHead,
