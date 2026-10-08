@@ -31,7 +31,6 @@ test("#98-r1: every declared rejection kind has a bounded escaped field diagnost
     "duplicate-review": { kind: "duplicate-review", reviewNodeId: "r", message },
     "promotion-review-not-pending": { kind: "promotion-review-not-pending", reviewNodeId: "r", message },
     "review-not-pending": { kind: "review-not-pending", reviewNodeId: "r", currentStatus: "submitted", attempted: "submitted", message },
-    "promotion-review-not-pending": { kind: "promotion-review-not-pending", reviewNodeId: "r", message },
   };
   const paths: Record<AppendRejection["kind"], string> = {
     "invalid-shape": "event",
