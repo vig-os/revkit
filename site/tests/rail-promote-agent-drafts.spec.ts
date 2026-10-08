@@ -49,7 +49,7 @@ interface DaemonCtx extends BootInfo {
   readonly root: string;
 }
 
-async function bootDaemon(): Promise<DaemonCtx> {
+async function bootDaemon(lifecycleTarget?: "resolve" | "reopen"): Promise<DaemonCtx> {
   if (!existsSync(DIST)) {
     throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
   }
@@ -67,6 +67,7 @@ async function bootDaemon(): Promise<DaemonCtx> {
       "--fixture-path", FIXTURE_REL_PATH,
       "--head-a", FIXTURE_HEAD,
       "--control-port", "0",
+      ...(lifecycleTarget === undefined ? [] : ["--lifecycle-thread", lifecycleTarget]),
     ],
     { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env },
   );
@@ -331,4 +332,63 @@ test.describe("rail agent-draft promotion @chromium-only", () => {
       await shutdown(daemon);
     }
   });
+});
+
+
+test.describe("#155 lifecycle refusal rail @chromium-only", () => {
+  test.skip(({ browserName }) => browserName !== "chromium", "chromium-only");
+  test.setTimeout(120_000);
+  for (const target of ["resolve", "reopen"] as const) {
+    test(`${target} refusal offers a fresh promotion into B`, async ({ page }) => {
+      const daemon = await bootDaemon(target);
+      try {
+        await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+        // Use the built site's registered components, with the daemon's rail.
+        await page.goto(daemon.url);
+        await expect(page.getByTestId("revkit-rail")).toBeVisible();
+        const cookie = await cookieHeader(page);
+        const headers = { "content-type": "application/json", origin: daemon.url, "sec-fetch-site": "same-origin", cookie };
+        expect((await fetch(`${daemon.url}/api/review/refresh`, { method: "POST", headers, body: "{}" })).status).toBe(200);
+        const threads = await (await fetch(`${daemon.url}/api/threads`, { headers })).json() as { threads: { id: string; external?: { threadId: string } }[] };
+        const threadId = threads.threads.find((thread) => thread.external?.threadId === "PRT_lifecycle")!.id;
+        expect((await postComment(daemon, { threadId: "th-lifecycle-own-A", commentId: "c-lifecycle-own-A", line: 3, text: "open A" }, "cookie", cookie)).status).toBe(201);
+        const reviewA = (await readPending(daemon.controlUrl)).reviewNodeId;
+        expect((await fetch(`${daemon.url}/api/threads/${threadId}/${target}`, { method: "POST",
+          headers: { ...headers, cookie: "", authorization: `Bearer ${daemon.agentToken}` }, body: "{}" })).status).toBe(201);
+        await fetch(`${daemon.controlUrl}/control/inject`, { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mutation: target === "resolve" ? "ResolveReviewThread" : "UnresolveReviewThread" }) });
+        expect((await fetch(`${daemon.url}/api/review/promote`, { method: "POST", headers, body: JSON.stringify({ threadId, target }) })).status).toBe(500);
+        expect((await readPending(daemon.controlUrl)).resolutions).toHaveLength(0);
+        expect((await fetch(`${daemon.url}/api/review/discard`, { method: "POST", headers, body: JSON.stringify({ reason: "user-discarded" }) })).status).toBe(201);
+        expect((await fetch(`${daemon.url}/api/review/reconcile`, { method: "POST", headers, body: "{}" })).status).toBe(201);
+        expect((await readPending(daemon.controlUrl)).resolutions).toHaveLength(0);
+        await page.reload();
+        const row = page.getByTestId("revkit-rail-lifecycle-failure");
+        await expect(row).toContainText("This agent draft needs a fresh promotion into your current review.");
+        await expect(row).toHaveAttribute("data-target", target);
+        const fresh = row.getByRole("button", { name: "Promote to this review" });
+        await expect(fresh).toBeDisabled();
+        await assertAxeClean(page);
+        expect((await postComment(daemon, { threadId: "th-lifecycle-own-B", commentId: "c-lifecycle-own-B", line: 3, text: "open B" }, "cookie", cookie)).status).toBe(201);
+        expect((await fetch(`${daemon.url}/api/review/reconcile`, { method: "POST", headers, body: "{}" })).status).toBe(201);
+        const reviewB = (await readPending(daemon.controlUrl)).reviewNodeId;
+        expect(reviewB).not.toBe(reviewA);
+        expect((await readPending(daemon.controlUrl)).resolutions).toHaveLength(0);
+        await expect(fresh).toBeEnabled();
+        const [request] = await Promise.all([
+          page.waitForRequest((candidate) => candidate.url().includes("/api/review/promote") && candidate.method() === "POST", { timeout: 15_000 }),
+          fresh.click(),
+        ]);
+        expect(JSON.parse(request.postData() ?? "{}")).toEqual({ threadId, target, reviewNodeId: reviewB });
+        expect(request.headers().authorization).toBeUndefined();
+        await expect.poll(async () => (await readPending(daemon.controlUrl)).resolutions.length, { timeout: 15_000 }).toBe(1);
+        await expect(row).toBeHidden();
+        await assertAxeClean(page);
+        expect((await fetch(`${daemon.url}/api/review/reconcile`, { method: "POST", headers, body: "{}" })).status).toBe(201);
+        expect((await readPending(daemon.controlUrl)).resolutions).toHaveLength(1);
+      } finally {
+        await shutdown(daemon);
+      }
+    });
+  }
 });

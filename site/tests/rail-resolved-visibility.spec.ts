@@ -21,6 +21,7 @@
 // Chromium-only (WebKit is #19). axe gate at each of the three
 // states: collapsed, expanded, unread.
 
+import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -35,7 +36,6 @@ const DIST = resolve(__dirname, "..", "dist");
 
 const FIXTURE_REL_PATH = "docs/adr/0003-content-model-mdx-typed-data.md";
 const FIXTURE_START_LINE = 5;
-const FIXTURE_END_LINE = 5;
 const FIXTURE_PARAGRAPH_TEXT = "The rail selects text inside a stamped block and opens the composer.";
 const FIXTURE_SELECTED_QUOTE = "rail selects text inside a stamped block";
 
@@ -65,7 +65,7 @@ async function bootDaemon(opts: { root?: string; port?: number } = {}): Promise<
     mkdirSync(join(root, dirname(seedRelPath)), { recursive: true });
     writeFileSync(
       join(root, seedRelPath),
-      "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+      `# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`,
       "utf8",
     );
   }
@@ -144,19 +144,13 @@ async function shutdown(ctx: DaemonCtx, opts: { keepRoot?: boolean } = {}): Prom
  * unique suffix keeps the file per-test so `fullyParallel: true`
  * runs cannot race on the same dist path. */
 let fixtureCounter = 0;
-function writeFixtureHtml(): { relPath: string; cleanup: () => void } {
+async function writeFixtureHtml(): Promise<{ relPath: string; cleanup: () => void }> {
   fixtureCounter += 1;
   const relPath = `rail-60-fixture-${process.pid}-${fixtureCounter}.html`;
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail 60 fixture</title></head>
-     <body>
-       <main>
-         <h1 data-src="${FIXTURE_REL_PATH}:1-1">Rail issue #60 fixture</h1>
-         <p id="target" data-src="${FIXTURE_REL_PATH}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
-       </main>
-     </body></html>`,
+    await provenanceFixture(`# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`, FIXTURE_REL_PATH, FIXTURE_START_LINE),
     "utf8",
   );
   return {
@@ -209,7 +203,7 @@ async function selectSubstring(page: Page, substring: string): Promise<void> {
   await page.evaluate((needle: string): void => {
     const paragraph = document.getElementById("target");
     if (paragraph === null) throw new Error("no #target paragraph");
-    const textNode = paragraph.firstChild;
+    const textNode = paragraph.querySelector("[data-revkit-leaf]")?.firstChild ?? null;
     if (textNode === null || textNode.nodeType !== Node.TEXT_NODE) {
       throw new Error("target has no text node");
     }
@@ -233,7 +227,7 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
 
   test("agent replies then resolves in a tight window; reply stays visible and is marked unread", async ({ page }) => {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     try {
       // Step 1 — launch flow, then open the fixture.
       const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
@@ -400,12 +394,12 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
    * the follow-up steps. */
   async function setUpAckedThread(page: Page): Promise<{
     daemon: DaemonCtx;
-    fixture: ReturnType<typeof writeFixtureHtml>;
+    fixture: Awaited<ReturnType<typeof writeFixtureHtml>>;
     threadId: string;
     cleanup: () => Promise<void>;
   }> {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     let cleanedUp = false;
     const cleanup = async (): Promise<void> => {
       if (cleanedUp) return;
@@ -593,7 +587,7 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
 
   test("PR #62 review nit: 'Mark all seen' clears the pill on every unread thread at once", async ({ page }) => {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     try {
       const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
       expect(nav?.status()).toBeLessThan(400);
@@ -665,7 +659,7 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
     // Two fixtures on DIFFERENT source paths: the threads on each
     // page have distinct `data-src` anchors, and `fetchThreads`
     // asks the daemon for threads on the current page's paths.
-    const pageA = writeFixtureHtml();
+    const pageA = await writeFixtureHtml();
     const pageB = writeSecondFixtureHtml();
     try {
       const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
@@ -729,7 +723,7 @@ test.describe("rail resolved-thread visibility (issue #60) @chromium-only", () =
     // again. The fix keys by the persistent `.revkit/repo-id`,
     // which survives the restart.
     let daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     try {
       const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
       expect(nav?.status()).toBeLessThan(400);
@@ -825,7 +819,7 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
     mkdirSync(join(root, dirname(sourceRelPath)), { recursive: true });
     writeFileSync(
       join(root, sourceRelPath),
-      "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+      `# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`,
       "utf8",
     );
     return root;
@@ -833,19 +827,13 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
 
   /** A served page whose stamped block anchors at `sourceRelPath`, so
    * repo X's page only ever lists repo X's threads. */
-  function writeRepoPage(sourceRelPath: string): { relPath: string; cleanup: () => void } {
+  async function writeRepoPage(sourceRelPath: string): Promise<{ relPath: string; cleanup: () => void }> {
     fixtureCounter += 1;
     const relPath = `rail-63-fixture-${process.pid}-${fixtureCounter}.html`;
     const abs = join(DIST, relPath);
     writeFileSync(
       abs,
-      `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail 63 fixture</title></head>
-       <body>
-         <main>
-           <h1 data-src="${sourceRelPath}:1-1">Rail issue #63 fixture</h1>
-           <p id="target" data-src="${sourceRelPath}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
-         </main>
-       </body></html>`,
+      await provenanceFixture(`# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`, sourceRelPath, FIXTURE_START_LINE),
       "utf8",
     );
     return {
@@ -981,8 +969,8 @@ test.describe("rail seen-state across two repos on one origin (issue #63) @chrom
     const sourceY = "docs/adr/9002-repo-y.md";
     const rootX = seedRepoRoot("repo-x", sourceX);
     const rootY = seedRepoRoot("repo-y", sourceY);
-    const pageX = writeRepoPage(sourceX);
-    const pageY = writeRepoPage(sourceY);
+    const pageX = await writeRepoPage(sourceX);
+    const pageY = await writeRepoPage(sourceY);
     // Boot repo X on an ephemeral port, then reuse THAT number for the
     // other two boots — same origin, therefore same localStorage.
     let daemon = await bootDaemon({ root: rootX });

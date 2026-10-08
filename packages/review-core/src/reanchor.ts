@@ -791,10 +791,13 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
   const hunkWindow = findHunkWindow(diffs, oldSpan.start, oldSpan.end, newLF.length);
   const mappedStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
   const clampedStart = Math.max(hunkWindow.start, Math.min(hunkWindow.end, mappedStart));
-  const aligned = alignMatchedText(anchor.quote.exact, newLF, clampedStart, {
-    trailingContext: anchor.quote.suffix,
+  const sourceQuote = oldLF.slice(oldSpan.start, oldSpan.end);
+  const aligned = alignMatchedText(sourceQuote, newLF, clampedStart, {
+    // Snapshot context bounds the alignment even for legacy whole-block
+    // quotes that recorded no DOM context (#126, #146).
+    trailingContext: oldLF.slice(oldSpan.end, oldSpan.end + DEFAULT_ANCHOR_CONTEXT_CHARS),
   });
-  const score = similarity(anchor.quote.exact, aligned.matchedText);
+  const score = similarity(sourceQuote, aligned.matchedText);
   if (score < DEFAULT_MIN_QUOTE_SCORE) {
     return {
       kind: "orphaned",

@@ -20,6 +20,7 @@
 //           discard two-step; axe clean.
 //   Test 2: stale-head → re-anchor with orphan panel; axe clean.
 
+import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -119,19 +120,12 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
   try { rmSync(ctx.root, { recursive: true, force: true }); } catch { /* fine */ }
 }
 
-function writeFixtureHtml(): { relPath: string; cleanup: () => void } {
+async function writeFixtureHtml(): Promise<{ relPath: string; cleanup: () => void }> {
   const relPath = "rail-review-fixture.html";
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail review fixture</title></head>
-     <body>
-       <main>
-         <h1 data-src="${FIXTURE_REL_PATH}:1-1">Rail review-mode fixture</h1>
-         <p id="target" data-src="${FIXTURE_REL_PATH}:3-3">${FIXTURE_PARAGRAPH_TEXT}</p>
-         <p id="target2" data-src="${FIXTURE_REL_PATH}:4-4">tail line</p>
-       </main>
-     </body></html>`,
+    await provenanceFixture(`# Rail review-mode fixture\n\n${FIXTURE_PARAGRAPH_TEXT}\ntail line\n`, FIXTURE_REL_PATH, 3, 4),
     "utf8",
   );
   return {
@@ -147,7 +141,7 @@ async function selectSubstring(page: Page, targetId: string, substring: string):
     ({ id, needle }: { id: string; needle: string }) => {
       const el = document.getElementById(id);
       if (el === null) throw new Error(`no #${id}`);
-      const textNode = el.firstChild;
+      const textNode = (el.matches("[data-revkit-leaf]") ? el : el.querySelector("[data-revkit-leaf]"))?.firstChild ?? null;
       if (textNode === null || textNode.nodeType !== Node.TEXT_NODE) {
         throw new Error(`${id} has no text node`);
       }
@@ -221,7 +215,7 @@ test.describe("rail review-mode @chromium-only", () => {
 
   test("comment → pending; injected AddThread failure → Retry syncs; submit gated on unsynced; discard two-step; axe clean", async ({ page }) => {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     try {
       const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
       expect(nav?.status()).toBeLessThan(400);
@@ -290,7 +284,7 @@ test.describe("rail review-mode @chromium-only", () => {
 
   test("stale-head → re-anchor abandons old pending, moves survivors, orphans dead quotes; axe clean", async ({ page }) => {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     try {
       const nav = await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
       expect(nav?.status()).toBeLessThan(400);

@@ -83,6 +83,7 @@ import {
   type ThreadStatus,
 } from "@revkit/review-core";
 import type { EventBus } from "./event-bus.ts";
+import { renderProvenance, recoverLegacyAnchor, type RenderedProvenance } from "./source-provenance.ts";
 import type { Logger } from "./logger.ts";
 import type { SqliteThreadStore } from "./sqlite-store.ts";
 import { REANCHOR_SOURCE_MAX_BYTES, resolveSourceUnderRoot } from "./anchor-source.ts";
@@ -729,8 +730,13 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         continue;
       }
 
+      let rendered: RenderedProvenance | undefined;
+      try { rendered = await renderProvenance(repoRoot, path, oldSource); } catch { /* Fail closed below. */ }
       for (const thread of bucket) {
-        const result = await reanchorWith(ctx, thread.anchor);
+        const recovered = rendered === undefined ? undefined : recoverLegacyAnchor(rendered, oldSource, thread.anchor);
+        const result = recovered === undefined
+          ? { kind: "orphaned" as const, revision: newRevision, reason: "The snapshot quote has no unique source provenance." }
+          : await reanchorWith(ctx, recovered);
         if (result.kind === "anchored") continue;
         if (result.kind === "orphaned" && thread.status === "orphaned") {
           // Already orphaned and still orphaned — no event, but

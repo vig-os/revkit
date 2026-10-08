@@ -63,7 +63,8 @@ interface Ctx {
   sqlitePath: string;
   cookie: string;
   logs: string[];
-  hooks: { beforeGetReviewById?: () => Promise<void> };
+  hooks: { beforeGetReviewById?: () => Promise<void>; beforeThreadMutation?: () => Promise<void>;
+    rejectRead?: string; reviewReads?: string[] };
 }
 
 const SOURCE = "line1\nline2 with quote\nline3\n";
@@ -116,6 +117,13 @@ async function startCtx(overrides?: {
   let injected = false;
   const fakeFetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const body = typeof init?.body === "string" ? init.body : "";
+    if (hooks.rejectRead !== undefined && body.includes(`query ${hooks.rejectRead}`)) throw new Error("injected-read-failure");
+    if (body.includes("query GetReviewById")) hooks.reviewReads?.push((JSON.parse(body) as { variables: { id: string } }).variables.id);
+    if ((body.includes("mutation ResolveReviewThread") || body.includes("mutation UnresolveReviewThread")) && hooks.beforeThreadMutation !== undefined) {
+      const hook = hooks.beforeThreadMutation;
+      delete hooks.beforeThreadMutation;
+      await hook();
+    }
     if (body.includes("query GetReviewById") && hooks.beforeGetReviewById !== undefined) {
       const hook = hooks.beforeGetReviewById;
       delete hooks.beforeGetReviewById;
@@ -1608,10 +1616,10 @@ describe("#136 R1 — promotion binding is enforced at the destination", () => {
     if (reviewB === null) throw new Error("no review B");
     expect(reviewB).not.toBe(reviewA);
     expect(agentBodyReached(ctx, body)).toBe(false);
-    expect(outcome.newlyFailed).toContainEqual({ commentId, reason: "promotion-review-not-pending" });
-    expect((await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "comment.sync_failed")).toContainEqual(
+    expect(outcome.newlyFailed.filter((entry) => entry.commentId === commentId)).toEqual([{ commentId, reason: "promotion-review-not-pending" }]);
+    expect((await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "comment.sync_failed" && event.commentId === commentId && event.reason === "promotion-review-not-pending")).toEqual([
       expect.objectContaining({ kind: "comment.sync_failed", commentId, reason: "promotion-review-not-pending" }),
-    );
+    ]);
 
     // A normal reviewer comment still syncs into B, even while this
     // promotion is refused. It cannot carry the agent intent with it.
@@ -1699,7 +1707,7 @@ describe("#136 R1 — promotion binding is enforced at the destination", () => {
     await Bun.sleep(120);
     const outcome = await reconcileAsReviewer(restarted);
     expect(agentBodyReached(restarted, body)).toBe(false);
-    expect(outcome.newlyFailed).toContainEqual({ commentId, reason: "promotion-review-unbound" });
+    expect(outcome.newlyFailed.filter((entry) => entry.commentId === commentId)).toEqual([{ commentId, reason: "promotion-review-unbound" }]);
     const failed = (await readRawEvents(restarted.sqlitePath)).filter((event): event is Extract<ReviewEvent, { kind: "comment.sync_failed" }> => event.kind === "comment.sync_failed" && event.commentId === commentId);
     expect(failed.at(-1)?.reason).toBe("promotion-review-unbound");
   });
@@ -1733,4 +1741,226 @@ describe("#136 R1 — promotion binding is enforced at the destination", () => {
     expect(restarted.fake.reviewNodeId).toBe(reviewB);
     expect(restarted.fake.drafts.filter((entry) => entry.body === body)).toHaveLength(1);
   });
+});
+
+// #155: immediate lifecycle mutations obey the same review binding as comments.
+describe("#155 — lifecycle promotion review binding", () => {
+  async function reconcileLifecycle(ctx: Ctx): Promise<void> {
+    const response = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(response.status).toBe(201);
+  }
+
+  async function failedPromotion(target: "resolve" | "reopen", loseResponse = false) {
+    const operation = target === "resolve" ? "ResolveReviewThread" : "UnresolveReviewThread";
+    const ctx = await startCtx({ threads: [importedThread("PRT_binding", target === "reopen"), importedThread("PRT_control")],
+      ...(loseResponse ? { loseResponseOnce: operation } : { failBeforeOnce: operation }) });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "open review A", "lifecycle-A")).status).toBe(201);
+    const reviewA = ctx.fake.reviewNodeId!;
+    expect((await agentLifecycle(ctx, imported.id, target, {})).status).toBe(201);
+    expect((await promote(ctx, { threadId: imported.id, target })).status).toBe(500);
+    expect(ctx.fake.resolutions).toHaveLength(loseResponse ? 1 : 0);
+    return { ctx, threadId: imported.id, reviewA };
+  }
+
+  async function submitA(ctx: Ctx, reviewA: string) {
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    await adapter.submitReview({ reviewId: reviewA, event: "COMMENT" });
+  }
+
+  async function assertRefused(ctx: Ctx, threadId: string, reason: string) {
+    const events = await readRawEvents(ctx.sqlitePath);
+    const promotion = [...events].reverse().find((event) => event.kind === "draft.promoted" && event.threadId === threadId)!;
+    expect(events.filter((event) => event.kind === "thread.external_synced" && event.threadId === threadId)).toHaveLength(0);
+    expect(events.filter((event) => event.kind === "thread.sync_failed" && event.threadId === threadId)).toEqual([
+      expect.objectContaining({ kind: "thread.sync_failed", threadId, intentSeq: promotion.seq, reason }),
+    ]);
+    const response = await fetch(`${ctx.handle.url}/api/review/state`, { headers: { cookie: ctx.cookie, "sec-fetch-site": "same-origin" } });
+    const body = await response.json() as { state: { lifecycleFailures: { threadId: string }[] } };
+    expect(body.state.lifecycleFailures.filter((entry) => entry.threadId === threadId)).toEqual([expect.objectContaining({ threadId, reason })]);
+  }
+
+  for (const target of ["resolve", "reopen"] as const) {
+    test(`${target}: A submitted remotely refuses replay`, async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion(target);
+      await submitA(ctx, reviewA);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+    });
+
+    test(`${target}: B open refuses A; independent reviewer intent runs; fresh B promotion applies once`, async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion(target);
+      await submitA(ctx, reviewA);
+      expect((await postComment(ctx, "observe submitted A", "lifecycle-observe")).status).toBe(201);
+      expect((await postComment(ctx, "open B", "lifecycle-B")).status).toBe(201);
+      const reviewB = ctx.fake.reviewNodeId!;
+      expect(reviewB).not.toBe(reviewA);
+      const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+      try {
+        const control = (await store.threads()).find((thread) => thread.external?.provider === "github" && thread.external.threadId === "PRT_control")!;
+        await store.append({ kind: "thread.resolved", actor: { kind: "local", id: "p70-user" }, threadId: control.id });
+      } finally { store.close(); }
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_control", op: "resolve" }]);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+      const request = { threadId, target, reviewNodeId: reviewB };
+      expect((await promote(ctx, request)).status).toBe(201);
+      expect((await promote(ctx, request)).status).toBe(200);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions.filter((entry) => entry.threadNodeId === "PRT_binding")).toEqual([{ threadNodeId: "PRT_binding", op: target === "resolve" ? "resolve" : "unresolve" }]);
+      const state = await (await fetch(`${ctx.handle.url}/api/review/state`, { headers: { cookie: ctx.cookie, "sec-fetch-site": "same-origin" } })).json() as { state: { lifecycleFailures: unknown[] } };
+      expect(state.state.lifecycleFailures).toEqual([]);
+    });
+
+    test(`${target}: legacy unbound promotion is refused after restart`, async () => {
+      let { ctx, threadId } = await failedPromotion(target);
+      await ctx.handle.stop();
+      const db = new Database(ctx.sqlitePath);
+      try {
+        for (const row of db.query<{ seq: number; payload: string }, []>("SELECT seq, payload FROM events").all()) {
+          const event = JSON.parse(row.payload);
+          if (event.kind !== "draft.promoted") continue;
+          delete event.reviewNodeId;
+          db.query("UPDATE events SET payload = ? WHERE seq = ?").run(JSON.stringify(event), row.seq);
+        }
+      } finally { db.close(); }
+      ctx = await restartCtx(ctx);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+      await assertRefused(ctx, threadId, "promotion-review-unbound");
+    });
+
+    test(`${target}: matching remote state cannot heal completion after A ends`, async () => {
+      let { ctx, threadId, reviewA } = await failedPromotion(target, true);
+      await submitA(ctx, reviewA);
+      ctx = await restartCtx(ctx);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(1);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+    });
+
+    test(`${target}: remote submit after comment reconciliation is observed before mutation`, async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion(target);
+      ctx.hooks.beforeGetReviewById = async () => {
+        ctx.hooks.beforeGetReviewById = async () => { await submitA(ctx, reviewA); };
+      };
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+    });
+  }
+
+  describe("#155 R1 — truthful completions and unchanged refusals", () => {
+    for (const target of ["resolve", "reopen"] as const) {
+      test(`${target}: two reconciles of an unchanged refusal append one failure`, async () => {
+        const { ctx, threadId, reviewA } = await failedPromotion(target);
+        await submitA(ctx, reviewA);
+        await reconcileLifecycle(ctx);
+        await reconcileLifecycle(ctx);
+        await assertRefused(ctx, threadId, "promotion-review-not-pending");
+        expect(ctx.fake.resolutions).toHaveLength(0);
+      });
+
+      test(`${target}: submit between pending read and mutation is detected, logged, and completed truthfully`, async () => {
+        const { ctx, threadId, reviewA } = await failedPromotion(target);
+        ctx.hooks.beforeThreadMutation = async () => { await submitA(ctx, reviewA); };
+        await reconcileLifecycle(ctx);
+        expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_binding", op: target === "resolve" ? "resolve" : "unresolve" }]);
+        const events = await readRawEvents(ctx.sqlitePath);
+        const promotion = events.filter((event) => event.kind === "draft.promoted" && event.threadId === threadId).at(-1)!;
+        expect(events.filter((event) => event.kind === "thread.external_synced" && event.threadId === threadId)).toEqual([
+          expect.objectContaining({ threadId, intentSeq: promotion.seq, resolved: target === "resolve" }),
+        ]);
+        expect(events.filter((event) => event.kind === "thread.sync_failed" && event.threadId === threadId)).toEqual([]);
+        expect(ctx.logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === "review.thread-promotion-race")).toEqual([
+          expect.objectContaining({ level: "warn", threadId, intentSeq: promotion.seq, reviewNodeId: reviewA,
+            reason: "promotion-review-ended-during-write", from: "PENDING", to: "COMMENTED" }),
+        ]);
+        await reconcileLifecycle(ctx);
+        expect(ctx.fake.resolutions).toHaveLength(1);
+      });
+    }
+
+    test("a failed post-write review read warns without losing the accepted completion", async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion("resolve");
+      ctx.hooks.beforeThreadMutation = async () => { ctx.hooks.rejectRead = "GetReviewById"; };
+      await reconcileLifecycle(ctx);
+      const events = await readRawEvents(ctx.sqlitePath);
+      const promotion = events.filter((event) => event.kind === "draft.promoted" && event.threadId === threadId).at(-1)!;
+      expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_binding", op: "resolve" }]);
+      expect(events.filter((event) => event.kind === "thread.external_synced" && event.threadId === threadId)).toEqual([
+        expect.objectContaining({ threadId, intentSeq: promotion.seq, resolved: true }),
+      ]);
+      expect(ctx.logs.map((line) => JSON.parse(line)).filter((entry) => entry.event === "review.thread-promotion-race")).toEqual([
+        expect.objectContaining({ level: "warn", threadId, intentSeq: promotion.seq, reviewNodeId: reviewA,
+          reason: "post-write-review-read-failed", errorKind: "GitHubApiError" }),
+      ]);
+      delete ctx.hooks.rejectRead;
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(1);
+    });
+
+    test("multiple refused lifecycle promotions in A share one remote read per pass", async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion("resolve");
+      const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+      try {
+        const control = (await store.threads()).find((thread) => thread.external?.provider === "github" && thread.external.threadId === "PRT_control")!;
+        await store.append({ kind: "thread.resolved", actor: { kind: "agent", id: "agent" }, threadId: control.id });
+        await store.append({ kind: "draft.promoted", actor: { kind: "local", id: "p70-user" }, threadId: control.id, target: "resolve", reviewNodeId: reviewA });
+      } finally { store.close(); }
+      await submitA(ctx, reviewA);
+      expect((await postComment(ctx, "observe A", "r1-observe")).status).toBe(201);
+      expect((await postComment(ctx, "open B", "r1-open-B")).status).toBe(201);
+      ctx.hooks.reviewReads = [];
+      await reconcileLifecycle(ctx);
+      expect(ctx.hooks.reviewReads.filter((id) => id === reviewA)).toEqual([reviewA]);
+      await reconcileLifecycle(ctx);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+      expect((await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "thread.sync_failed")).toHaveLength(2);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+    });
+
+    test("#154: two reconciles of an unchanged comment promotion refusal append one failure", async () => {
+      const ctx = await startCtx();
+      expect((await postComment(ctx, "opens A", "r1-comment-A")).status).toBe(201);
+      expect((await postCommentAsAgent(ctx, "agent comment", "r1-comment")).status).toBe(201);
+      // Legacy machine intent: exactly the unbound state reconciliation must refuse.
+      const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+      try {
+        await store.append({ kind: "comment.sync_requested", actor: { kind: "local", id: "p70-user" }, commentId: "c-r1-comment",
+          path: "docs/index.md", subjectType: "LINE", side: "RIGHT", line: 2, bodyHash: await revisionOf("agent comment") });
+      } finally { store.close(); }
+      await reconcileLifecycle(ctx);
+      await reconcileLifecycle(ctx);
+      expect((await readRawEvents(ctx.sqlitePath)).filter((event) => event.kind === "comment.sync_failed" && event.commentId === "c-r1-comment")).toEqual([
+        expect.objectContaining({ reason: "promotion-review-unbound" }),
+      ]);
+    });
+
+    test("#154: repeated list-drafts failure is deduplicated, but a new intent records its own failure", async () => {
+      const ctx = await startCtx({ failBeforeOnce: "AddThread" });
+      expect((await postComment(ctx, "reviewer draft", "r1-list")).status).toBe(201);
+      ctx.hooks.rejectRead = "ReviewComments";
+      await reconcileLifecycle(ctx);
+      await reconcileLifecycle(ctx);
+      const failures = () => readRawEvents(ctx.sqlitePath).then((events) => events.filter((event) => event.kind === "comment.sync_failed" && event.commentId === "c-r1-list" && event.reason.startsWith("list-drafts-failed:")));
+      expect(await failures()).toHaveLength(1);
+      const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+      try {
+        const previous = (await store.since(0)).find((event) => event.kind === "comment.sync_requested" && event.commentId === "c-r1-list")!;
+        if (previous.kind !== "comment.sync_requested") throw new Error("missing intent");
+        const { seq: _seq, ts: _ts, ...input } = previous;
+        await store.append(input);
+      } finally { store.close(); }
+      await reconcileLifecycle(ctx);
+      await reconcileLifecycle(ctx);
+      expect(await failures()).toHaveLength(2);
+    });
+  });
+
 });

@@ -48,6 +48,7 @@ const pending: FakePendingState = makePendingState();
 let currentHead = headA;
 let injectAddThreadOnce = false;
 let injectReplyOnce = false;
+let injectLifecycleOnce: string | undefined;
 
 const staticToken: TokenSource = { async getToken() { return "ghp_" + "a".repeat(40); } };
 const pr: PrRef = { owner: "vig-os", repo: "revkit", pullNumber: 42 };
@@ -97,11 +98,27 @@ const prs: FakePr[] = [
   },
 ];
 
+if (args.has("lifecycle-thread")) {
+  prs[0] = { ...prs[0]!, files, threads: [{
+    id: "PRT_lifecycle", path: fixturePath, isResolved: args.get("lifecycle-thread") === "reopen",
+    isOutdated: false, line: 3, startLine: null, originalLine: 3, originalStartLine: null,
+    diffSide: "RIGHT", startDiffSide: null, subjectType: "LINE", resolvedByLogin: null,
+    comments: [{ nodeId: "PRC_lifecycle", databaseId: 700, body: "remote lifecycle thread",
+      authorLogin: "other-reviewer", authorType: "User", createdAt: "2026-10-01T00:00:00Z",
+      url: "https://github.com/vig-os/revkit/pull/42#discussion_r700", originalCommitOid: headA,
+      diffHunk: files[0]!.patch! }],
+  }] };
+}
+
 const rawFetch = makeFakeGithubFetch(prs, { pendingState: pending, viewerLogin: "test-reviewer" });
 const wrappedFetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
   const bodyText = init !== undefined && init.body !== undefined ? String(init.body) : "";
   if (url.endsWith("/graphql")) {
+    if (injectLifecycleOnce !== undefined && bodyText.includes(`mutation ${injectLifecycleOnce}`)) {
+      injectLifecycleOnce = undefined;
+      throw new Error("injected lifecycle failure");
+    }
     if (injectAddThreadOnce && bodyText.includes("mutation AddThread")) {
       injectAddThreadOnce = false;
       throw new Error("injected AddThread failure");
@@ -158,11 +175,13 @@ const control = Bun.serve({
       const body = (await req.json()) as { mutation: string };
       if (body.mutation === "AddThread") injectAddThreadOnce = true;
       else if (body.mutation === "AddReviewThreadReply") injectReplyOnce = true;
+      else if (body.mutation === "ResolveReviewThread" || body.mutation === "UnresolveReviewThread") injectLifecycleOnce = body.mutation;
       return new Response("{}", { headers: { "content-type": "application/json" } });
     }
     if (url.pathname === "/control/clear-inject" && req.method === "POST") {
       injectAddThreadOnce = false;
       injectReplyOnce = false;
+      injectLifecycleOnce = undefined;
       return new Response("{}", { headers: { "content-type": "application/json" } });
     }
     if (url.pathname === "/control/set-head" && req.method === "POST") {

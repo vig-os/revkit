@@ -25,6 +25,8 @@
 import { createMemo, createResource, createSignal, For, onCleanup, Show, type JSX } from "solid-js";
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
+import { PROVENANCE_VERSION, type SourceSelection } from "../provenance-format.ts";
+import { containingBlock, rangeBlock, rangeSelection, type CommentTarget } from "./selection-provenance.ts";
 import type { ReviewRefreshResponse } from "../review/api-types.ts";
 import {
   createSeqGate,
@@ -275,6 +277,14 @@ interface RailReviewState {
       readonly commentId?: string;
       readonly path: string;
     }>;
+    /** Current promoted lifecycle intents refused by their review binding. */
+    readonly lifecycleFailures?: ReadonlyArray<{
+      readonly threadId: string;
+      readonly target: "resolve" | "reopen";
+      readonly path: string;
+      readonly intentSeq: number;
+      readonly reason: string;
+    }>;
     /** Issue #70 round 3: the reviewer's OWN resolve/reopen that a
      * later lifecycle change superseded, so it never reached GitHub. */
     readonly droppedReviewerIntents?: ReadonlyArray<{
@@ -445,23 +455,6 @@ function syncFailureMessage(reason: string): string {
     : reason;
 }
 
-/** Build the SHA-256 hex digest of the LF-normalised body — the
- * `revision` field on the anchor. `revisionOf` in review-core does the
- * same for the server; the rail computes its own locally so a new
- * thread's revision matches the block it points at. Uses WebCrypto
- * (`crypto.subtle`), available in every evergreen browser (ADR-0018). */
-async function revisionHex(text: string): Promise<string> {
-  const normalised = text.replace(/\r\n/g, "\n");
-  const bytes = new TextEncoder().encode(normalised);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  const hex: string[] = [];
-  const view = new Uint8Array(digest);
-  for (let i = 0; i < view.length; i++) {
-    hex.push(view[i]!.toString(16).padStart(2, "0"));
-  }
-  return hex.join("");
-}
-
 /** Fetch review threads for the source paths visible on THIS page.
  * The rail walks every `[data-src]` on load, collects the distinct
  * `path` values, and asks the daemon for each — a large repo with
@@ -543,7 +536,8 @@ function collectPagePaths(): string[] {
 /** Body a `POST /api/threads` accepts. Kept in step with the daemon's
  * `createThreadRequestSchema` (packages/cli/src/serve/api-schemas.ts). */
 interface CreateThreadBody {
-  readonly anchor: RailAnchor;
+  readonly anchor: CommentTarget;
+  readonly selection: SourceSelection;
   readonly body: string;
 }
 async function createThread(body: CreateThreadBody): Promise<void> {
@@ -553,7 +547,7 @@ async function createThread(body: CreateThreadBody): Promise<void> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(`POST /api/threads failed: ${response.status}`);
+  if (!response.ok) throw new Error("The selection could not be mapped to the current source. Reload the page and try again; your draft is still here.");
 }
 
 async function replyToThread(threadId: string, parentId: string, body: string): Promise<void> {
@@ -654,41 +648,6 @@ async function fetchAllThreadIds(): Promise<readonly string[] | undefined> {
  * back to collapsed-with-pill. Tuned so a colleague opening a
  * page with a long agent backlog can still scan the list. */
 const UNREAD_EXPANDED_LIMIT = 5;
-
-/** Compute the source-quote context for a selected text range. The
- * daemon's schema requires `exact` non-empty; `prefix` / `suffix` may
- * be empty at start/end of a block. We take a small window (32 chars)
- * so the ADR-0006 re-anchoring pipeline has something to fuzzy-match
- * against later. */
-function quoteFromBlock(block: Element, selected: string): {
-  readonly exact: string;
-  readonly prefix: string;
-  readonly suffix: string;
-} {
-  const full = block.textContent ?? "";
-  const idx = full.indexOf(selected);
-  if (idx < 0) return { exact: selected, prefix: "", suffix: "" };
-  const prefix = full.slice(Math.max(0, idx - 32), idx);
-  const suffix = full.slice(idx + selected.length, idx + selected.length + 32);
-  return { exact: selected, prefix, suffix };
-}
-
-/** Find the nearest ancestor of `node` that carries a `data-src` attr.
- * The rail anchors on that ancestor's stamp, so a selection inside a
- * paragraph re-uses the paragraph's `data-src` regardless of where the
- * selection begins. Returns undefined if the node is not inside a
- * stamped ancestor (a plain HTML page with no rehype-stamped blocks). */
-function nearestAnchorAncestor(node: Node | null): HTMLElement | undefined {
-  let cursor = node;
-  while (cursor !== null) {
-    if (cursor.nodeType === Node.ELEMENT_NODE) {
-      const el = cursor as HTMLElement;
-      if (el.hasAttribute("data-src")) return el;
-    }
-    cursor = cursor.parentNode;
-  }
-  return undefined;
-}
 
 function normaliseCurrentRoute(pathname: string): string {
   let path = pathname;
@@ -861,6 +820,9 @@ function subscribeEvents(
           event.kind === "comment.linked" ||
           event.kind === "comment.sync_requested" ||
           event.kind === "comment.sync_failed" ||
+          event.kind === "thread.sync_failed" ||
+          event.kind === "thread.external_synced" ||
+          event.kind === "draft.promoted" ||
           event.kind === "review.opened" ||
           event.kind === "review.submitted" ||
           event.kind === "review.abandoned"
@@ -998,17 +960,7 @@ function findBlockForAnchor(anchor: RailAnchor): HTMLElement | undefined {
   // nothing on the page to scroll to. Skip the DOM lookup rather
   // than emit `docs/x.mdx:undefined-undefined`.
   if (!isRailLineAnchor(anchor)) return undefined;
-  const wanted = `${anchor.path}:${anchor.startLine}-${anchor.endLine}`;
-  const el = document.querySelector<HTMLElement>(`[data-src="${cssEscape(wanted)}"]`);
-  return el ?? undefined;
-}
-
-/** Tiny CSS.escape polyfill — we run in evergreen browsers (ADR-0018)
- * that ship it, but a defensive fallback keeps the rail working in an
- * embedded webview that lacks it. */
-function cssEscape(value: string): string {
-  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") return CSS.escape(value);
-  return value.replace(/["\\]/g, "\\$&");
+  return containingBlock(anchor);
 }
 
 /** The floating rail root — one panel pinned to the right edge of the
@@ -1110,11 +1062,12 @@ function Rail(): JSX.Element {
   };
   // The composer builds a fresh line anchor from the reviewer's
   // selection; nothing in this path is ever unanchored. Type as
-  // `RailLineAnchor` so `.startLine` / `.endLine` type-check
+  // `CommentTarget` so `.startLine` / `.endLine` type-check
   // without narrowing.
   const [composerAnchor, setComposerAnchor] = createSignal<{
     readonly element: HTMLElement;
-    readonly anchor: RailLineAnchor;
+    readonly anchor: CommentTarget;
+    readonly sourceSelection: SourceSelection;
     readonly quote: string;
   } | undefined>(undefined);
   const [error, setError] = createSignal<string | undefined>(undefined);
@@ -1354,11 +1307,16 @@ function Rail(): JSX.Element {
         event.kind === "comment.linked" ||
         event.kind === "comment.sync_requested" ||
         event.kind === "comment.sync_failed" ||
+        event.kind === "thread.sync_failed" ||
+        event.kind === "thread.external_synced" ||
+        event.kind === "draft.promoted" ||
         event.kind === "review.opened" ||
         event.kind === "review.submitted" ||
         event.kind === "review.abandoned" ||
         event.kind === "thread.reanchored" ||
-        event.kind === "thread.orphaned"
+        event.kind === "thread.orphaned" ||
+        event.kind === "thread.resolved" ||
+        event.kind === "thread.reopened"
       ) {
         void refetchReview();
       }
@@ -1390,7 +1348,8 @@ function Rail(): JSX.Element {
   // range in the DOM — nothing on this path is ever unanchored.
   const [selection, setSelection] = createSignal<{
     readonly block: HTMLElement;
-    readonly anchor: RailLineAnchor;
+    readonly anchor: CommentTarget;
+    readonly sourceSelection: SourceSelection;
     readonly quote: string;
     readonly rect: { readonly top: number; readonly left: number; readonly width: number; readonly height: number };
   } | undefined>(undefined);
@@ -1405,8 +1364,8 @@ function Rail(): JSX.Element {
       setSelection(undefined);
       return;
     }
-    const anchorNode = sel.anchorNode;
-    const block = nearestAnchorAncestor(anchorNode);
+    const range = sel.getRangeAt(0);
+    const block = rangeBlock(range);
     if (block === undefined) {
       setSelection(undefined);
       return;
@@ -1428,22 +1387,14 @@ function Rail(): JSX.Element {
       setSelection(undefined);
       return;
     }
-    const quoteParts = quoteFromBlock(block, text);
-    const range = sel.getRangeAt(0);
+    const revision = document.querySelector("[data-revkit-revision]")?.getAttribute("data-revkit-revision");
+    if (revision === undefined || revision === null) { setSelection(undefined); return; }
+    const sourceSelection = rangeSelection(range, block, revision) ?? { kind: "block" as const, version: PROVENANCE_VERSION, revision };
     const box = range.getBoundingClientRect();
     setSelection({
       block,
-      anchor: {
-        path: parsed.path,
-        startLine: parsed.startLine,
-        endLine: parsed.endLine,
-        quote: quoteParts,
-        // The rail computes a revision from the block's rendered
-        // text, which is the closest surrogate for the rendered
-        // fragment available client-side. Server re-validates the
-        // shape (64-hex lower); a mismatch is not a security issue.
-        revision: "0".repeat(64),
-      },
+      anchor: { ...parsed, revision },
+      sourceSelection,
       quote: text,
       rect: { top: box.top, left: box.left, width: box.width, height: box.height },
     });
@@ -1458,11 +1409,11 @@ function Rail(): JSX.Element {
   });
 
   const openComposer = async (candidate: NonNullable<ReturnType<typeof selection>>): Promise<void> => {
-    const revision = await revisionHex(candidate.block.textContent ?? "");
     setComposerAnchor({
       element: candidate.block,
-      anchor: { ...candidate.anchor, revision },
-      quote: candidate.quote,
+      anchor: candidate.anchor,
+      sourceSelection: candidate.sourceSelection,
+      quote: candidate.sourceSelection.kind === "block" ? candidate.block.textContent ?? "" : candidate.quote,
     });
     setSelection(undefined);
   };
@@ -1509,7 +1460,7 @@ function Rail(): JSX.Element {
     if (composed === undefined) return;
     setError(undefined);
     try {
-      await createThread({ anchor: composed.anchor, body: bodyText });
+      await createThread({ anchor: composed.anchor, selection: composed.sourceSelection, body: bodyText });
       setComposerAnchor(undefined);
       await refetch();
     } catch (cause) {
@@ -1603,8 +1554,8 @@ function Rail(): JSX.Element {
                 event.preventDefault();
                 void openComposer(sel);
               }}
-              aria-label={`Comment on "${sel.quote.slice(0, 40)}" — shortcut: c`}
-            >Comment</button>
+              aria-label={sel.sourceSelection.kind === "block" ? "Comment on whole block — shortcut: c" : `Comment on "${sel.quote.slice(0, 40)}" — shortcut: c`}
+            >{sel.sourceSelection.kind === "block" ? "Comment on whole block" : "Comment"}</button>
           );
         })()}
       </Show>
@@ -2001,6 +1952,41 @@ function Rail(): JSX.Element {
               </ul>
             </div>
           </Show>
+          <Show when={(reviewState()!.state.lifecycleFailures ?? []).length > 0}>
+            <div class="revkit-rail__review-unsynced" data-testid="revkit-rail-lifecycle-failures" role="alert">
+              <ul class="revkit-rail__review-unsynced-list">
+                <For each={reviewState()!.state.lifecycleFailures ?? []}>
+                  {(entry) => (
+                    <li class="revkit-rail__review-unsynced-item" data-testid="revkit-rail-lifecycle-failure"
+                      data-thread-id={entry.threadId} data-target={entry.target}>
+                      <span>{entry.target} on <code>{entry.path}</code> — {syncFailureMessage(entry.reason)}</span>
+                      <button type="button" class="revkit-rail__agent-draft-promote"
+                        data-testid="revkit-rail-lifecycle-fresh-promote"
+                        disabled={reviewBusy() || reviewState()!.state.openPending === null}
+                        onClick={() => {
+                          const reviewNodeId = reviewState()?.state.openPending?.reviewNodeId;
+                          if (reviewNodeId === undefined) return;
+                          void (async () => {
+                            setReviewBusy(true);
+                            setError(undefined);
+                            try {
+                              await promoteAgentDraft({ threadId: entry.threadId, target: entry.target, reviewNodeId });
+                              await refetchReview();
+                              await refetch();
+                            } catch (cause) {
+                              setError((cause as Error).message);
+                            } finally {
+                              setReviewBusy(false);
+                            }
+                          })();
+                        }}
+                      >Promote to this review</button>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </div>
+          </Show>
           <Show when={(reviewState()!.state.agentDrafts ?? []).length > 0}>
             {/* Issue #70 (B6, option B): the agent's reply / resolve /
                 reopen is a LOCAL draft until the reviewer attaches it
@@ -2219,7 +2205,7 @@ function Rail(): JSX.Element {
             class="revkit-rail__new"
             data-testid="revkit-rail-new"
             onClick={() => void openComposer(selection()!)}
-          >comment on selection</button>
+          >{selection()!.sourceSelection.kind === "block" ? "comment on whole block" : "comment on selection"}</button>
         </div>
       </Show>
       <Show when={composerAnchor() !== undefined}>

@@ -28,6 +28,8 @@ export interface LogFields {
   readonly commentId?: string;
   readonly askId?: string;
   readonly seq?: number;
+  /** Lifecycle promotion whose write raced a remote review transition. */
+  readonly intentSeq?: number;
   readonly host?: string;
   readonly origin?: string;
   readonly for?: string;
@@ -108,11 +110,11 @@ export function defaultSink(): LineSink {
   };
 }
 
-/** Log levels. Only three — a daemon this small does not need more,
- * and a smaller enum keeps the no-secrets contract easier to eyeball. */
-export type Level = "info" | "warn" | "error";
+/** Debug diagnostics use the same field allowlist as other levels. */
+export type Level = "debug" | "info" | "warn" | "error";
 
 export interface Logger {
+  debug(event: string, fields?: LogFields): void;
   info(event: string, fields?: LogFields): void;
   warn(event: string, fields?: LogFields): void;
   error(event: string, fields?: LogFields): void;
@@ -152,6 +154,9 @@ export function makeLogger(options: { readonly sink?: LineSink; readonly clock?:
     sink.write(JSON.stringify(record));
   };
   return {
+    debug(event, fields) {
+      write("debug", event, fields);
+    },
     info(event, fields) {
       write("info", event, fields);
     },
@@ -182,6 +187,7 @@ const ALLOWED_KEYS = [
   "commentId",
   "askId",
   "seq",
+  "intentSeq",
   "host",
   "origin",
   "for",

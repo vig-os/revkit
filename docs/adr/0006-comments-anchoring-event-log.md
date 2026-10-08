@@ -663,3 +663,117 @@ an internal log inconsistency (`promotion-record-missing`, HTTP 500), distinct
 from a historical event without a binding.
 
 Refs: #136, #148
+
+
+## Amendment (issue #155): lifecycle promotions carry review provenance
+
+An agent action reaches GitHub only within the review the reviewer approved it
+in. Resolve/reopen intents resolve their exact `draft.promoted` event through the
+same provenance module as comments. The shared lifecycle derivation still decides
+which change is current and whether a later change supersedes it.
+
+Before each promoted resolve/unresolve mutation or completion healing, including
+read-only boot healing, the daemon reads the bound review from GitHub. The binding
+must name the current review and its remote state must be `PENDING`. A submitted,
+deleted, or otherwise terminal review yields `promotion-review-not-pending`; a
+pending binding to another current review yields `promotion-review-mismatch`;
+legacy promotions without a review identity yield `promotion-review-unbound`.
+No mutation or completion is recorded for a refused intent. A refusal never
+prevents independent reviewer-authored lifecycle intents in the pass from running.
+
+`thread.sync_failed(threadId, intentSeq, reason)` is the smallest new event:
+comment failures cannot identify a lifecycle intent. Its reason is restricted to
+these three promotion refusals. The schema requires a positive intent sequence;
+the validator requires a known thread. The event changes no thread baseline.
+The review view exposes failures only for the current intent, clearing them on
+supersession, a new promotion, or correlated completion. Historical promotions
+continue to load, but unbound lifecycle promotions never replay.
+
+The rail explains the refusal and offers "Promote to this review", disabled until
+there is a current review. This cookie-authenticated action explicitly names the
+current review and appends a fresh bound promotion. Reconciliation never rebinds
+an intent. Existing completion correlation makes repeated promotion/reconcile
+apply that approved lifecycle change once.
+
+Refs: #155, #136, #148
+
+Lifecycle promotions are checked immediately before each write; a submit landing
+between the check and the write is detected and logged, not prevented. GitHub has
+no conditional resolve/unresolve mutation. The daemon re-reads the bound review
+immediately after an accepted mutation and logs `review.thread-promotion-race`
+with the thread, intent sequence, review, and observed transition if it ended.
+It still records `thread.external_synced`, because the mutation happened, and
+never auto-reverts it. A failed post-write read also produces a structured warning
+without discarding the accepted completion.
+
+Unchanged lifecycle and comment refusals append no additional sync-failure event
+when the current intent sequence and reason already match. Both reconcilers use
+one shared comparison rule; a new intent or changed reason remains observable
+(#154). The lifecycle pass reads local review state once and caches remote
+refusals per review, while allowed writes and completion healing retain fresh
+pending observations. Sync failures require a local reviewer actor. External
+sync completions require a local reviewer or the legitimate `gh-user` import
+actor; agent-authored outcomes are rejected by the shared validator.
+
+Refs: #155, #154, #151
+
+## Amendment (2026-10-08, issue #113): quotes come from renderer provenance
+
+Stories A2 and A8 require a stored quote to identify the source addressed by a
+reviewer's rendered selection. Typography, entities, escapes and inline-code
+padding make DOM character arithmetic insufficient. The shared site/CLI
+pipeline therefore stamps each positioned text leaf with a stable, versioned
+identifier and its source interval. Offsets are UTF-16 and half-open; source
+and browser-visible leaf values use LF line endings. Identity runs are implicit.
+Only changed runs carry interval entries.
+
+The owner chose design **(b′)**: a linear walk over each leaf's own positioned
+source slice, decoding a finite substitution table and composing those decoded
+atoms with smart quotes, dash and ellipsis runs. The aligner consumes literal
+star/bracket/dot runs once and never parses emphasis, links or Markdown blocks.
+An unexplained mismatch makes the whole leaf unmapped. Generated text without
+positions remains untouched, including KaTeX's MathML and highlighted code.
+MDX leaves are currently unmapped: legacy recovery never evaluates components.
+Wrapped list/blockquote prefixes and other unexplained source gaps also fail
+closed. The real renderer/browser differential suite guards renderer drift.
+
+The rail sends leaf identifiers and DOM Range offsets, map version, and the
+rendered source revision. It does not send a rendered quote or text-search hint.
+Repeated phrases use the selected occurrence's endpoints. A selection touching
+unmapped content offers an explicit **comment on whole block** action. A refused
+submission keeps the composer draft. Source quotes inside larger blocks use a
+containing-block lookup for navigation.
+
+The daemon reads a confined source, checks the rendered revision, renders that
+snapshot through the shared pipeline and captures maps directly from the
+renderer callback. It does not trust maps embedded in authored HTML. Both
+endpoints, their order, containment and intervening content must validate.
+Lossy-token endpoints include the complete source token; ranges crossing inline
+markup retain the intervening source syntax. Quote, context, both line bounds
+and revision are derived server-side. No review-event schema changes.
+
+Legacy quote requests and existing comments are recovered against rendered
+snapshots. Unique source-shaped and rendered/context candidates must agree;
+ambiguous or missing provenance orphans the comment. Recovered quotes enter the
+source-only reanchor engine. Reanchoring appends events without rewriting the
+original comment. Modified-span alignment uses snapshot source text and source
+trailing context, including when a legacy whole-block quote recorded empty
+context, preventing the paragraph overruns in #126 and #146. Refs: #113, #126,
+#127, #146. This establishes source quote provenance for A6; suggested edits
+remain planned.
+
+## Amendment (2026-10-08, issue #113, PR #157 fix round): preserve atoms and scope leaf identities
+
+An unchanged punctuation run retains each decoded atom's interval. Only an
+actual typography collapse may combine the atoms; selecting one dot, dash or
+apostrophe cannot include an unchanged neighbor. Leaf identifiers now include
+a digest of the remapped file path and LF-normalized snapshot, preventing
+identical offsets in another file or revision from identifying a current leaf.
+
+Legacy recovery bounds source and rendered searches to the recorded lines
+before validating candidates. A terminating newline remains part of its source
+line. Line and text-node indexes, inverse interval bounds and counts of unmapped
+text avoid rescanning an entire block for each occurrence. The independent
+browser interval oracle is permanent; its full-size manual run reports agreement,
+refusals and wrong intervals separately. Renderer exceptions emit a debug event
+with the allowlisted error kind, without source or exception-message content.
