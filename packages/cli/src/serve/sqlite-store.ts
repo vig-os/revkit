@@ -47,7 +47,7 @@ import {
   type ThreadFilter,
   type ThreadStore,
 } from "@revkit/review-core";
-import { ThreadStoreAppendError } from "@revkit/review-core";
+import { ThreadStoreAppendError, parsePersistedEvent, persistedLogError, quoteStoreDiagnostic } from "@revkit/review-core";
 
 const wallClock: Clock = () => new Date().toISOString();
 
@@ -285,17 +285,24 @@ export class SqliteThreadStore implements ThreadStore {
    * …) is still fatal — those signal real log corruption. */
   static open(options: SqliteThreadStoreOptions): SqliteThreadStore {
     const db = new Database(options.filename, { create: true });
-    db.exec(SCHEMA_SQL);
+    try {
+      db.exec(SCHEMA_SQL);
+    } catch (error) {
+      db.close();
+      throw error;
+    }
     const state = emptyLogState();
     let head = 0;
     let replayed = false;
     let indexAvailable = false;
     try {
       db.transaction(() => {
-        const rows = db.query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC").all();
+        const rows = db
+          .query<{ seq: number; payload: string }, []>("SELECT seq, payload FROM events ORDER BY seq ASC")
+          .all();
         const events: ReviewEvent[] = [];
         for (const row of rows) {
-          const event = reviewEventSchema.parse(JSON.parse(row.payload));
+          const event = parsePersistedEvent(row, "open", options.displayName ?? options.filename);
           events.push(event);
           const result = validateNext(state, event);
           if (!result.ok) {
@@ -307,8 +314,8 @@ export class SqliteThreadStore implements ThreadStore {
               // handle at this call site; the daemon logs the count
               // once it has a logger.
               process.stderr.write(
-                `SqliteThreadStore.open: accepting historical ask.answered on ask '${event.askId}' whose value fails the current answer-shape check ` +
-                  `(${result.rejection.field}: ${result.rejection.message}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
+                `SqliteThreadStore.open: accepting historical ask.answered on ask ${quoteStoreDiagnostic(event.askId)} whose value fails the current answer-shape check ` +
+                  `(${quoteStoreDiagnostic(result.rejection.field)}: ${quoteStoreDiagnostic(result.rejection.message)}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
               );
               const ask = state.asks.get(event.askId);
               if (ask !== undefined) ask.status = "answered";
@@ -316,9 +323,7 @@ export class SqliteThreadStore implements ThreadStore {
               continue;
             }
             // Any other rejection is real corruption — refuse loudly.
-            throw new Error(
-              `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.displayName ?? options.filename}' and start clean, or restore from backup.`,
-            );
+            throw persistedLogError("open", row.seq, result.rejection, { displayName: options.displayName ?? options.filename });
           }
           if (event.seq > head) head = event.seq;
         }
@@ -357,8 +362,8 @@ export class SqliteThreadStore implements ThreadStore {
     // the transaction back — the log is unchanged.
     const ts = this.#clock();
     const insertStmt = this.#db.prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)");
-    const catchUpStmt = this.#db.query<{ payload: string }, [number]>(
-      "SELECT payload FROM events WHERE seq > ? ORDER BY seq ASC",
+    const catchUpStmt = this.#db.query<{ seq: number; payload: string }, [number]>(
+      "SELECT seq, payload FROM events WHERE seq > ? ORDER BY seq ASC",
     );
     const maxSeqStmt = this.#db.query<{ seq: number | null }, []>("SELECT MAX(seq) AS seq FROM events");
 
@@ -368,13 +373,10 @@ export class SqliteThreadStore implements ThreadStore {
       // Catch up on any events another writer appended.
       const catchUp = catchUpStmt.all(this.#head);
       for (const row of catchUp) {
-        const foreign = reviewEventSchema.parse(JSON.parse(row.payload));
+        const foreign = parsePersistedEvent(row, "append");
         const result = validateNext(this.#logState, foreign);
         if (!result.ok) {
-          throw new ThreadStoreAppendError({
-            kind: "invalid-shape",
-            message: `append: on-disk event seq=${foreign.seq} broke the local log state (${result.rejection.kind}: ${result.rejection.message}).`,
-          });
+          throw persistedLogError("append", row.seq, result.rejection);
         }
         if (foreign.seq > this.#head) this.#head = foreign.seq;
       }
@@ -389,10 +391,7 @@ export class SqliteThreadStore implements ThreadStore {
       const candidate = { ...input, seq, ts } as ReviewEvent;
       const parsed = reviewEventSchema.safeParse(candidate);
       if (!parsed.success) {
-        throw new ThreadStoreAppendError({
-          kind: "invalid-shape",
-          message: `append: event failed validation: ${JSON.stringify(parsed.error.issues)}`,
-        });
+        throw ThreadStoreAppendError.fromIssues(parsed.error.issues);
       }
       const event = parsed.data;
       const result = validateNext(this.#logState, event);
@@ -445,8 +444,8 @@ export class SqliteThreadStore implements ThreadStore {
       const meta = this.#db.query<{ version: number; last_seq: number }, []>("SELECT version, last_seq FROM thread_index_meta WHERE singleton = 1").get();
       if (meta?.version === THREAD_INDEX_VERSION && meta.last_seq === head) return;
     }
-    const events = this.#db.query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC").all()
-      .map((row) => reviewEventSchema.parse(JSON.parse(row.payload)));
+    const events = this.#db.query<{ seq: number; payload: string }, []>("SELECT seq, payload FROM events ORDER BY seq ASC").all()
+      .map((row) => parsePersistedEvent(row, "append"));
     synchronizeThreadIndex(this.#db, events, head);
   }
 
