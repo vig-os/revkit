@@ -13,7 +13,7 @@
 // Sec-Fetch-Site) and asserts the browser's EventSource received it.
 import { bootDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { expect, test } from "@playwright/test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -51,10 +51,7 @@ test.describe("same-origin daemon UI", () => {
     try {
       daemonPort = info.port;
       launchUrl = info.launchUrl;
-      // The agent token lives in serve.json (mode 600). Read it.
-      const serveJsonPath = join(root, ".revkit", "serve.json");
-      const serveJson = JSON.parse(readFileSync(serveJsonPath, "utf8"));
-      agentToken = String(serveJson.agentToken);
+      agentToken = info.agentToken;
       expect(agentToken.length).toBeGreaterThan(0);
 
       // Step 1 — exchange the launch code for the session cookie.

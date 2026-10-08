@@ -92,7 +92,7 @@ import {
   setCookieHeader,
 } from "./auth.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
-import { buildRailBundle } from "../rail/bundle.ts";
+import { buildRailBundle, type RailBundle } from "../rail/bundle.ts";
 import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
 import {
   ASK_CSS_PATH,
@@ -460,12 +460,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
   const requestedPort = options.port ?? 0;
 
-  // ADR-0013: the injected rail must be usable when serve.json and
-  // the launch announcement advertise readiness. Compile before opening
-  // stores, watchers or sockets so a build failure leaves no live daemon.
+  // ADR-0013: complete the rail build attempt before advertising readiness.
+  // A failed build keeps the daemon available and preserves the rail's 500.
   const railBuildStarted = performance.now();
-  const railBundle = await buildRailBundle();
-  logger.info("rail.build.ready", { durationMs: Math.round(performance.now() - railBuildStarted) });
+  let railBundle: RailBundle | { readonly errorKind: string };
+  try {
+    railBundle = await buildRailBundle();
+    logger.info("rail.build.ready", { durationMs: Math.round(performance.now() - railBuildStarted) });
+  } catch (error) {
+    railBundle = { errorKind: error instanceof Error ? error.name : typeof error };
+    logger.error("rail.build.failed", railBundle);
+  }
 
   // `.revkit/` mode is owned by `ensureRevkitDir` in serve-state.ts
   // (one owner, one place — round-4 review nit). Call it here so the
@@ -4006,8 +4011,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     });
   }
 
-  /** Serve the rail bytes compiled before startup advertised readiness. */
+  /** Serve the prepared rail bytes or the recorded prebuild failure. */
   async function handleRailAsset(url: URL, method: string): Promise<Response> {
+    if ("errorKind" in railBundle) {
+      return withHygiene(new Response("Internal Server Error", { status: 500 }), "text", "text/plain; charset=utf-8");
+    }
     const bundle = railBundle;
     const isJs = url.pathname === RAIL_JS_PATH;
     const body = isJs ? bundle.js : bundle.css;

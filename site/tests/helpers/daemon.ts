@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 const BOOT_TIMEOUT_MS = 15_000;
 const OUTPUT_LIMIT = 8192;
+const GRACEFUL_EXIT_TIMEOUT_MS = 3_000;
 const liveChildren = new Set<ChildProcess>();
 let handlersInstalled = false;
 
@@ -26,7 +27,7 @@ function track(child: ChildProcess): void {
 export async function stopDaemon(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
   await new Promise<void>((done) => {
-    const timer = setTimeout(() => child.kill("SIGKILL"), 1000);
+    const timer = setTimeout(() => child.kill("SIGKILL"), GRACEFUL_EXIT_TIMEOUT_MS);
     child.once("exit", () => { clearTimeout(timer); done(); });
     child.kill("SIGTERM");
   });
@@ -145,7 +146,7 @@ export async function bootReviewDaemon<T>(options: {
   const { child, info } = await bootProcess<T>({
     ...options,
     timeoutMs: 30_000,
-    ready: (line) => line.startsWith("{") ? JSON.parse(line) as T : undefined,
+    ready: (line) => line.trim().startsWith("{") ? JSON.parse(line.trim()) as T : undefined,
   });
   return { ...info, child, root: options.root };
 }
