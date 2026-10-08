@@ -67,7 +67,7 @@ describe("rehype-drop-repo-doc-title", () => {
     });
     // h1 present (with the stamped anchor, which is fine — the
     // predicate rejected this file so the drop skipped).
-    expect(html).toMatch(/<h1[^>]*>MDX Title<\/h1>/);
+    expect(html).toMatch(/<h1[^>]*><span[^>]*data-revkit-leaf[^>]*>MDX Title<\/span><\/h1>/);
   });
 
   test("does NOT touch the tree when the first element is not h1 (h2, p, …)", async () => {
@@ -77,7 +77,7 @@ describe("rehype-drop-repo-doc-title", () => {
       filePath: "/repo/docs/adr/x.md",
       withStrip: true,
     });
-    expect(html).toMatch(/<h2[^>]*>Sub<\/h2>/);
+    expect(html).toMatch(/<h2[^>]*><span[^>]*data-revkit-leaf[^>]*>Sub<\/span><\/h2>/);
     expect(html).toContain("Hello.");
   });
 

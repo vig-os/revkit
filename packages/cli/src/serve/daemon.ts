@@ -74,6 +74,7 @@ import { extractMentions } from "./mentions.ts";
 import { openPresenceHub, type PresenceHub, type PresenceFrame } from "./presence-hub.ts";
 import { openStaticServer } from "./static-server.ts";
 import { resolveAnchorSource } from "./anchor-source.ts";
+import { renderProvenance, recoverLegacyAnchor, selectionAnchor } from "./source-provenance.ts";
 import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
 import { contentTypeForExtension } from "./mime.ts";
 import { promotionAtSeq, threadLifecycleIntents } from "./promotion-provenance.ts";
@@ -1588,22 +1589,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const parsed = createThreadRequestSchema.safeParse(bodyRead.value);
       if (!parsed.success) return badRequest(parsed.error.issues);
       if (!enforceCommentBodyLimit(parsed.data.body)) return payloadTooLarge();
-      // Anchor authority: the daemon (a) confirms the source file
-      // exists under the repo root (containment prevents an anchor
-      // to `/etc/passwd` or `../outside/file`) and (b) OVERRIDES
-      // the client-supplied `revision` with `revisionOf(source)`.
-      // Re-anchoring (M2 item 5) depends on the revision matching
-      // the actual file bytes at thread creation, so a client
-      // value (rail's textContent hash) would fail the pipeline
-      // silently. PR #38 review.
+      // Confine and read the current source before validating renderer
+      // endpoints. New selections must carry this revision; legacy quotes
+      // are recovered uniquely against this authoritative snapshot.
       const anchorResolution = await resolveAnchorSource(parsed.data.anchor, options.repoRoot);
       if (!anchorResolution.ok) {
         return badRequest([{ code: "custom", path: ["anchor", "path"], message: anchorResolution.reason }]);
       }
-      const anchorWithServerRevision: Anchor = {
-        ...parsed.data.anchor,
-        revision: anchorResolution.revision,
-      };
+      let anchorWithServerRevision: Anchor | undefined;
+      try {
+        const rendered = await renderProvenance(options.repoRoot, parsed.data.anchor.path, anchorResolution.source);
+        if (parsed.data.selection !== undefined) {
+          anchorWithServerRevision = selectionAnchor(rendered, anchorResolution.source, parsed.data.anchor, parsed.data.selection, anchorResolution.revision);
+        } else if (parsed.data.anchor.quote !== undefined) {
+          anchorWithServerRevision = recoverLegacyAnchor(rendered, anchorResolution.source, { ...parsed.data.anchor, quote: parsed.data.anchor.quote, revision: anchorResolution.revision });
+        }
+      } catch (error) {
+        // A renderer failure is a refusal; no comment/snapshot is appended.
+        logger.debug("anchor.render.failed", { requestId, errorKind: error instanceof Error ? error.name : "UnknownError" });
+      }
+      if (anchorWithServerRevision === undefined) {
+        return badRequest([{ code: "custom", path: ["selection"], message: "The selection cannot be mapped to this source revision. Reload the page, or explicitly comment on the whole block." }]);
+      }
+      if (parsed.data.anchor.commit !== undefined) {
+        anchorWithServerRevision = { ...anchorWithServerRevision, commit: parsed.data.anchor.commit };
+      }
       // Snapshot the source under this revision so the re-anchoring
       // pipeline (M2 item 5b) can read it back on a later rebuild.
       // Content-addressed — a second thread on the same revision is

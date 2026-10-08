@@ -38,6 +38,7 @@
 //   - axe on the page with the rail open (any-violation gate,
 //     ADR-0017).
 
+import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -86,7 +87,7 @@ async function bootDaemon(): Promise<DaemonCtx> {
   // 6 lines so the fixture anchor at line 5 is inside the file.
   writeFileSync(
     join(root, seedRelPath),
-    "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    `# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`,
     "utf8",
   );
   const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
@@ -154,18 +155,12 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
  * `data-src`-anchored, and this fixture guarantees we know what
  * `path:startLine-endLine` to expect on the anchor without depending
  * on Astro's per-page layout. */
-function writeFixtureHtml(): { relPath: string; cleanup: () => void } {
+async function writeFixtureHtml(): Promise<{ relPath: string; cleanup: () => void }> {
   const relPath = "rail-fixture.html";
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rail fixture</title></head>
-     <body>
-       <main>
-         <h1 data-src="${FIXTURE_REL_PATH}:1-1">Rail fixture</h1>
-         <p id="target" data-src="${FIXTURE_REL_PATH}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
-       </main>
-     </body></html>`,
+    await provenanceFixture(`# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`, FIXTURE_REL_PATH, FIXTURE_START_LINE),
     "utf8",
   );
   return {
@@ -190,7 +185,7 @@ async function selectSubstring(page: Page, substring: string): Promise<{ x: numb
   return await page.evaluate((needle: string): { x: number; y: number; width: number; height: number } => {
     const paragraph = document.getElementById("target");
     if (paragraph === null) throw new Error("no #target paragraph");
-    const textNode = paragraph.firstChild;
+    const textNode = paragraph.querySelector("[data-revkit-leaf]")?.firstChild ?? null;
     if (textNode === null || textNode.nodeType !== Node.TEXT_NODE) {
       throw new Error("target has no text node");
     }
@@ -220,7 +215,7 @@ test.describe("rail round-trip @chromium-only", () => {
 
   test("select → floating Comment → compose → assert anchor → MCP notif → MCP reply → rail update → resolve → axe", async ({ page }) => {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
 
     // MCP side: paired in-memory transport, captured `onEvent` so
     // this test pumps events synchronously through the real
@@ -411,7 +406,7 @@ test.describe("rail round-trip @chromium-only", () => {
 
   test("keyboard-driven composer: selection then `c` opens the composer with focus", async ({ page }) => {
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     try {
       await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
       await page.goto(`${daemon.url}/${fixture.relPath}`);
@@ -440,7 +435,7 @@ test.describe("rail round-trip @chromium-only", () => {
     // `${expr}` as a TEXT node, so the payload appears verbatim
     // and no image element is created. This asserts the invariant.
     const daemon = await bootDaemon();
-    const fixture = writeFixtureHtml();
+    const fixture = await writeFixtureHtml();
     const XSS_PAYLOAD = '<img src=x onerror="window.__xss_fired=true">bar';
     try {
       // Post the payload via the cookie-authenticated API — the
@@ -454,7 +449,7 @@ test.describe("rail round-trip @chromium-only", () => {
         path: "docs/adr/0003-content-model-mdx-typed-data.md",
         startLine: 3,
         endLine: 3,
-        quote: { exact: "line 3", prefix: "", suffix: "" },
+        quote: { exact: "line 2", prefix: "", suffix: "" },
         revision: "c".repeat(64),
       };
       await page.evaluate(

@@ -17,8 +17,8 @@ import { startEventSubscriber, type WireEvent } from "../../src/mcp/event-subscr
 
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 40,
-  endLine: 44,
+  startLine: 4,
+  endLine: 4,
   quote: { exact: "why 30s?", prefix: "", suffix: "" },
   revision: "b".repeat(64),
 };
@@ -40,7 +40,7 @@ describe("event-subscriber (SSE)", () => {
     root = mkdtempSync(join(tmpdir(), "revkit-sse-"));
     // Seed the anchor source so `resolveAnchorSource` finds it.
     mkdirSync(join(root, "docs", "adr"), { recursive: true });
-    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\n");
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\nwhy 30s?\n");
     const dist = join(root, "dist");
     mkdirSync(dist, { recursive: true });
     writeFileSync(join(dist, "index.html"), "<h1>ok</h1>");
