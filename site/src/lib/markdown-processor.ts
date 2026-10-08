@@ -16,7 +16,7 @@
 
 import remarkMath from "remark-math";
 import { rehypeKatexStrict } from "./rehype-katex-strict.ts";
-import { rehypeDataSrc } from "../../../packages/cli/src/rehype-data-src.ts";
+import { rehypeDataSrc, type DataSrcPluginOptions } from "../../../packages/cli/src/rehype-data-src.ts";
 import { rehypeDropRepoDocTitle } from "../../../packages/cli/src/rehype-drop-repo-doc-title.ts";
 import { rehypeStampRevision } from "../../../packages/cli/src/rehype-stamp-revision.ts";
 import { rehypeRewriteMdLinks } from "../../../packages/cli/src/rehype-rewrite-md-links.ts";
@@ -48,7 +48,7 @@ type RehypePlugins = (unknown | readonly unknown[])[];
  */
 export function buildSharedMarkdownConfig(
   repoRoot: string,
-  options: { readonly pathMap?: readonly { readonly from: string; readonly to: string }[] } = {},
+  options: Pick<DataSrcPluginOptions, "pathMap" | "onProvenance"> = {},
 ): {
   readonly remarkPlugins: RemarkPlugins;
   readonly rehypePlugins: RehypePlugins;
@@ -79,7 +79,7 @@ export function buildSharedMarkdownConfig(
       [rehypeRewriteMdLinks, { repoRoot }],
       // Stamp every block with `data-src="repo/relative:start-end"`
       // — the rail anchors on these.
-      [rehypeDataSrc, { repoRoot, ...(options.pathMap !== undefined ? { pathMap: options.pathMap } : {}) }],
+      [rehypeDataSrc, { repoRoot, ...options }],
       // Inject a hidden `<span data-revkit-revision="…">` at the
       // top of the article body. The daemon reads this at
       // request time to decide whether the on-disk `site/dist/`

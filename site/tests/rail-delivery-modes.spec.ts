@@ -15,6 +15,7 @@
 // The daemon is started in a temp workspace outside the repo so the
 // site's dist stays untouched. Chromium-only (WebKit is #19).
 
+import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -29,7 +30,6 @@ const REVKIT_BIN = resolve(__dirname, "..", "..", "packages", "cli", "bin", "rev
 const DIST = resolve(__dirname, "..", "dist");
 const FIXTURE_REL_PATH = "docs/adr/0003-content-model-mdx-typed-data.md";
 const FIXTURE_START_LINE = 5;
-const FIXTURE_END_LINE = 5;
 const FIXTURE_PARAGRAPH_TEXT = "Rail delivery-mode fixture paragraph anchored to a stamped block.";
 const FIXTURE_SELECTED = "delivery-mode fixture paragraph";
 
@@ -49,7 +49,7 @@ async function bootDaemon(): Promise<DaemonCtx> {
   mkdirSync(join(root, dirname(FIXTURE_REL_PATH)), { recursive: true });
   writeFileSync(
     join(root, FIXTURE_REL_PATH),
-    "# Title\n\nline 2\nline 3\nline 4\nline 5\nline 6\n",
+    `# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`,
     "utf8",
   );
   const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
@@ -99,7 +99,7 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
   rmSync(ctx.root, { recursive: true, force: true });
 }
 
-function writeFixture(): { path: string; cleanup: () => void } {
+async function writeFixture(): Promise<{ path: string; cleanup: () => void }> {
   // Round-3: per-process unique fixture path so a parallel spec run
   // (were fullyParallel to reach us) can't collide with a shared
   // `site/dist/rail-mode-fixture.html` write.
@@ -111,13 +111,7 @@ function writeFixture(): { path: string; cleanup: () => void } {
   // has something to anchor a comment to.
   writeFileSync(
     abs,
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>mode fixture</title></head>
-     <body>
-       <main>
-         <h1 data-src="${FIXTURE_REL_PATH}:1-1">Delivery mode fixture</h1>
-         <p id="target" data-src="${FIXTURE_REL_PATH}:${FIXTURE_START_LINE}-${FIXTURE_END_LINE}">${FIXTURE_PARAGRAPH_TEXT}</p>
-       </main>
-     </body></html>`,
+    await provenanceFixture(`# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`, FIXTURE_REL_PATH, FIXTURE_START_LINE),
     "utf8",
   );
   return {
@@ -130,7 +124,7 @@ async function selectSubstring(page: Page, needle: string): Promise<void> {
   await page.evaluate((n: string) => {
     const target = document.getElementById("target");
     if (target === null) throw new Error("no target");
-    const textNode = target.firstChild;
+    const textNode = target.querySelector("[data-revkit-leaf]")?.firstChild ?? null;
     if (textNode === null || textNode.nodeType !== Node.TEXT_NODE) throw new Error("no text node");
     const raw = textNode.textContent ?? "";
     const start = raw.indexOf(n);
@@ -162,7 +156,7 @@ test.describe("rail delivery modes + mention chips (M2 item 6)", () => {
   let fixture: { path: string; cleanup: () => void };
   test.beforeAll(async () => {
     ctx = await bootDaemon();
-    fixture = writeFixture();
+    fixture = await writeFixture();
   });
   test.afterAll(async () => {
     fixture?.cleanup();

@@ -166,8 +166,8 @@ function loopbackHeaders(port: number, extra: Record<string, string> = {}): Reco
 
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 40,
-  endLine: 44,
+  startLine: 4,
+  endLine: 4,
   quote: { exact: "why 30s?", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };

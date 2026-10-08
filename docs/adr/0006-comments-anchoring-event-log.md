@@ -586,3 +586,48 @@ path, `stat`-poll for the swap-damaged ones — and this adds the one shape that
 directory whose own `fs.watch` callback observes it disappear now installs the same `stat`-poll every
 other teardown path installs, so **every tracked directory is always in exactly one of watch or poll,
 never neither**. Refs: #69
+
+## Amendment (2026-10-08, issue #113): quotes come from renderer provenance
+
+Stories A2 and A8 require a stored quote to identify the source addressed by a
+reviewer's rendered selection. Typography, entities, escapes and inline-code
+padding make DOM character arithmetic insufficient. The shared site/CLI
+pipeline therefore stamps each positioned text leaf with a stable, versioned
+identifier and its source interval. Offsets are UTF-16 and half-open; source
+and browser-visible leaf values use LF line endings. Identity runs are implicit.
+Only changed runs carry interval entries.
+
+The owner chose design **(b′)**: a linear walk over each leaf's own positioned
+source slice, decoding a finite substitution table and composing those decoded
+atoms with smart quotes, dash and ellipsis runs. The aligner consumes literal
+star/bracket/dot runs once and never parses emphasis, links or Markdown blocks.
+An unexplained mismatch makes the whole leaf unmapped. Generated text without
+positions remains untouched, including KaTeX's MathML and highlighted code.
+MDX leaves are currently unmapped: legacy recovery never evaluates components.
+Wrapped list/blockquote prefixes and other unexplained source gaps also fail
+closed. The real renderer/browser differential suite guards renderer drift.
+
+The rail sends leaf identifiers and DOM Range offsets, map version, and the
+rendered source revision. It does not send a rendered quote or text-search hint.
+Repeated phrases use the selected occurrence's endpoints. A selection touching
+unmapped content offers an explicit **comment on whole block** action. A refused
+submission keeps the composer draft. Source quotes inside larger blocks use a
+containing-block lookup for navigation.
+
+The daemon reads a confined source, checks the rendered revision, renders that
+snapshot through the shared pipeline and captures maps directly from the
+renderer callback. It does not trust maps embedded in authored HTML. Both
+endpoints, their order, containment and intervening content must validate.
+Lossy-token endpoints include the complete source token; ranges crossing inline
+markup retain the intervening source syntax. Quote, context, both line bounds
+and revision are derived server-side. No review-event schema changes.
+
+Legacy quote requests and existing comments are recovered against rendered
+snapshots. Unique source-shaped and rendered/context candidates must agree;
+ambiguous or missing provenance orphans the comment. Recovered quotes enter the
+source-only reanchor engine. Reanchoring appends events without rewriting the
+original comment. Modified-span alignment uses snapshot source text and source
+trailing context, including when a legacy whole-block quote recorded empty
+context, preventing the paragraph overruns in #126 and #146. Refs: #113, #126,
+#127, #146. This establishes source quote provenance for A6; suggested edits
+remain planned.

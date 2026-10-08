@@ -45,7 +45,7 @@ export const UNIFORM_ANCHOR_REJECTION =
  * (kept as a re-export for the existing test files that import it
  * from that module). */
 export async function resolveAnchorSource(
-  anchor: Anchor,
+  anchor: Pick<Anchor, "path">,
   repoRoot: string,
 ): Promise<
   | { ok: true; revision: string; source: string }

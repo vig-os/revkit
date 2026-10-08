@@ -26,6 +26,8 @@ import { resolve } from "node:path";
 import type { Root, Element, RootContent, ElementContent, Properties } from "hast";
 import { formatDataSrc } from "./data-src-format.ts";
 import { filePathOf, repoRelativePosix, type VFileLike } from "./rehype-vfile.ts";
+import { alignLeaf, type LeafMap } from "./text-provenance.ts";
+import { PROVENANCE_VERSION } from "./provenance-format.ts";
 
 // Re-export the browser-safe format helpers so tests + rail bundle
 // share ONE parser (kept in `data-src-format.ts` so the rail can
@@ -79,6 +81,8 @@ interface Position {
 /** Options accepted by the plugin. `repoRoot` is required; the Astro
  * config passes an absolute path derived from `import.meta.url`. */
 export interface DataSrcPluginOptions {
+  /** Server-side capture; never read authoritative maps from authored HTML. */
+  readonly onProvenance?: (records: ProvenanceRecords) => void;
   /** Absolute path to the repository root. Files outside it are skipped. */
   readonly repoRoot: string;
   /** If false, an existing `data-src` attribute is overwritten (default: false). */
@@ -221,7 +225,60 @@ export function rehypeDataSrc(options: DataSrcPluginOptions) {
     const repoRelPath = repoRelativePosix(repoRoot, mappedPath);
     if (repoRelPath === undefined) return;
     stampTree(tree, { repoRelPath, overwriteExisting });
+    const value = (file as VFileLike & { value?: unknown }).value;
+    const raw = typeof value === "string" ? value : value instanceof Uint8Array ? new TextDecoder().decode(value) : undefined;
+    if (raw !== undefined) {
+      const records = stampLeafProvenance(tree, raw.replace(/\r\n?/g, "\n"), repoRelPath);
+      options.onProvenance?.(records);
+    }
   };
+}
+
+/** Wrap positioned leaves before HTML/MDX normalization drops positions.
+ * Source line/column coordinates survive CRLF normalization; raw offsets
+ * do not. Generated text has no wrapper and selections fail closed. */
+export interface ProvenanceRecords {
+  readonly leaves: ReadonlyMap<string, { readonly map: LeafMap; readonly value: string }>;
+  readonly blocks: ReadonlySet<string>;
+}
+
+export function stampLeafProvenance(tree: Root, source: string, path: string): ProvenanceRecords {
+  const leaves = new Map<string, { map: LeafMap; value: string }>();
+  const blocks = new Set<string>();
+  const lines = [0];
+  for (let i = 0; i < source.length; i++) if (source[i] === "\n") lines.push(i + 1);
+  const walk = (parent: Root | Element): void => {
+    if (parent.type === "element" && parent.position) {
+      const expected = formatDataSrc(path, parent.position.start.line, parent.position.end.line);
+      if (parent.properties.dataSrc === expected) blocks.add(expected);
+    }
+    for (let i = 0; i < parent.children.length; i++) {
+      const child = parent.children[i]!;
+      if (child.type === "element") { walk(child); continue; }
+      if (child.type !== "text" || !child.position) continue;
+      // HTML's input stream normalizes line endings in the browser. Use
+      // that same visible value before recording UTF-16 endpoints.
+      child.value = child.value.replace(/\r\n?/g, "\n");
+      const pos = child.position;
+      const start = pos && lines[pos.start.line - 1] !== undefined ? lines[pos.start.line - 1]! + pos.start.column - 1 : undefined;
+      const end = pos && lines[pos.end.line - 1] !== undefined ? lines[pos.end.line - 1]! + pos.end.column - 1 : undefined;
+      const map = start !== undefined && end !== undefined && start >= 0 && end >= start && end <= source.length && !path.toLowerCase().endsWith(".mdx")
+        ? alignLeaf(source.slice(start, end), child.value, start, parent.type === "element" && parent.tagName === "code")
+        : undefined;
+      const wrapper: Element = {
+        type: "element", tagName: "span",
+        properties: {
+          dataRevkitLeaf: `v${PROVENANCE_VERSION}-${start}-${end}`,
+          dataRevkitMap: map === undefined ? "unmapped" : JSON.stringify(map),
+        },
+        children: [child],
+      };
+      if (map !== undefined) leaves.set(wrapper.properties.dataRevkitLeaf as string, { map, value: child.value });
+      parent.children[i] = wrapper;
+    }
+  };
+  walk(tree);
+  return { leaves, blocks };
 }
 
 /** Default export so the plugin can be registered as

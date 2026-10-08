@@ -27,8 +27,8 @@ import { ensureDaemon } from "../../src/mcp/daemon-bootstrap.ts";
 
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 40,
-  endLine: 44,
+  startLine: 4,
+  endLine: 4,
   quote: { exact: "why 30s?", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };
@@ -61,7 +61,7 @@ describe("round-3 nit 1 — reconnect only on transport/5xx (4xx surfaces)", () 
     mkdirSync(join(root, "dist"), { recursive: true });
     writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
     mkdirSync(join(root, "docs", "adr"), { recursive: true });
-    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\n");
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\nwhy 30s?\n");
     daemon = await startDaemon({
       dir: join(root, "dist"),
       repoRoot: root,
@@ -293,7 +293,7 @@ describe("round-4 nit — 401 (stale bearer) triggers reconnect; other 4xx do no
     mkdirSync(join(root, "dist"), { recursive: true });
     writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
     mkdirSync(join(root, "docs", "adr"), { recursive: true });
-    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\n");
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR 3\n\nbody\nwhy 30s?\n");
     daemon = await startDaemon({
       dir: join(root, "dist"),
       repoRoot: root,

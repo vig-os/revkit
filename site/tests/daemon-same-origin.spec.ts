@@ -117,9 +117,9 @@ test.describe("same-origin daemon UI", () => {
         body: JSON.stringify({
           anchor: {
             path: "docs/x.md",
-            startLine: 1,
-            endLine: 1,
-            quote: { exact: "hi", prefix: "", suffix: "" },
+            startLine: 3,
+            endLine: 3,
+            quote: { exact: "hello", prefix: "", suffix: "" },
             revision: "a".repeat(64),
           },
           body: "hello from playwright",

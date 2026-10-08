@@ -17,8 +17,9 @@
 // wants a specific id (test harness, replay) passes one in.
 
 import { z } from "zod";
-import { anchorSchema, askAnswerSchema, askSchema, idSchema, reviewSubmitEventSchema } from "@revkit/review-core";
+import { anchorSchema, textQuoteSchema, SHA256_HEX_REGEX, askAnswerSchema, askSchema, idSchema, reviewSubmitEventSchema } from "@revkit/review-core";
 import { PUBLISH_ARRAY_SHAPE_MAX } from "./publish.ts";
+import { PROVENANCE_VERSION } from "../provenance-format.ts";
 
 /** POST /api/threads. Creates a thread and its first comment in one
  * event (`comment.created`). */
@@ -26,7 +27,14 @@ export const createThreadRequestSchema = z
   .object({
     threadId: idSchema.optional(),
     commentId: idSchema.optional(),
-    anchor: anchorSchema,
+    anchor: z.object({ ...anchorSchema.shape, quote: textQuoteSchema.optional() }).strict().refine((a) => a.endLine >= a.startLine),
+    selection: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("range"), version: z.literal(PROVENANCE_VERSION), revision: z.string().regex(SHA256_HEX_REGEX),
+        start: z.object({ leaf: z.string().min(1).max(128), offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict(),
+        end: z.object({ leaf: z.string().min(1).max(128), offset: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).strict(),
+      }).strict(),
+      z.object({ kind: z.literal("block"), version: z.literal(PROVENANCE_VERSION), revision: z.string().regex(SHA256_HEX_REGEX) }).strict(),
+    ]).optional(),
     body: z.string().min(1),
   })
   .strict();
