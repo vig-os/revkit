@@ -85,3 +85,5 @@ Local credential files are parsed as data by a shared dotenv parser, never sourc
 reports only a line number and key, with no value fragments. The credential helper preserves unrelated entries
 and keeps the newest five mode-600 backups named `cf.env.bak.<UTC timestamp>.<unique suffix>`. The encrypted copy
 uses the same parsed values. Production and the account boundary remain unchanged.
+
+The restore guard recognizes both command words even when Wrangler flags intervene between them.

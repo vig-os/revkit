@@ -89,7 +89,8 @@ namespace, secrets file or assets. Init performs its own fixed provisioning oper
 Wrangler's output is piped for redaction, so its confirmation prompts cannot protect destructive operations.
 Both wrappers independently refuse `delete`, `rollback` and `time-travel restore` unless `--yes-really` is supplied
 and the operator types `DELETE` at the wrapper's own terminal prompt. Non-interactive calls are refused even with
-that flag; a cancellation never starts Wrangler. `--yes-really` is consumed by the wrapper. Destructive operations
+that flag, including when flags intervene between the restore command words; a cancellation never starts Wrangler.
+`--yes-really` is consumed by the wrapper. Destructive operations
 remain outside the `cf-dev` allowlist even after confirmation; an authorized operator uses the general `cf`
 wrapper for them. Ordinary Wrangler calls receive no stdin; init supplies generated secrets explicitly on stdin.
 

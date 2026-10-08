@@ -344,7 +344,8 @@ test("r1: deploy finishes even while caller stdin remains open", async () => {
 });
 
 for (const args of [["delete"], ["d1", "delete", "revkit-review-dev"], ["r2", "bucket", "delete", "revkit-previews-dev"],
-  ["d1", "time-travel", "restore", "revkit-review-dev"], ["rollback"], ["secret", "delete", "INVITE_TOKEN_HMAC_KEY"],
+  ["d1", "time-travel", "restore", "revkit-review-dev"], ["d1", "time-travel", "--config=other.json", "restore", "revkit-review-dev"],
+  ["rollback"], ["secret", "delete", "INVITE_TOKEN_HMAC_KEY"],
   ["versions", "delete", "fake-version"]]) {
   for (const recipe of ["cf", "cf-dev"]) {
     test(`r1: ${recipe} refuses destructive ${args.join(" ")} without its own TTY confirmation`, async () => {

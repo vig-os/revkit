@@ -1,7 +1,7 @@
 import { closeSync, openSync, readSync, writeSync } from "node:fs";
 
 const destructive = (args: string[]) => args.includes("delete") || args.includes("rollback") ||
-  args.some((arg, index) => arg === "restore" && args[index - 1] === "time-travel");
+  (args.includes("time-travel") && args.includes("restore"));
 const confirmationRequired = () => new Error("cf: destructive command requires --yes-really and an own TTY confirmation");
 export function confirmArguments(input: string[]): string[] {
   const requested = input.includes("--yes-really");
