@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { execFile } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -78,9 +79,19 @@ else console.log("ok");
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 async function run(...args: string[]) {
-  const child = Bun.spawn(["just", ...args], { cwd: root, env, stdout: "pipe", stderr: "pipe" });
-  const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-  return { code, output: stdout + stderr };
+  // Collect output and exit together through the child-process close callback.
+  // Nothing is supplied on stdin for these non-interactive fixture commands.
+  return new Promise<{ code: number; output: string }>((resolve, reject) => {
+    const child = execFile("just", args, { cwd: root, env }, (error, stdout, stderr) => {
+      let code = 0;
+      if (error) {
+        if (typeof error.code !== "number") { reject(error); return; }
+        code = error.code;
+      }
+      resolve({ code, output: stdout + stderr });
+    });
+    child.stdin?.end();
+  });
 }
 
 function sourceConfig() { return JSON.parse(readFileSync(configPath(), "utf8").replace(/^\s*\/\/.*$/gm, "")); }
