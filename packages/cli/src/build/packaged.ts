@@ -17,16 +17,13 @@
 //      loaders that read `../vocab/terms.yaml` and `../plots/…`
 //      RELATIVE TO THE ASTRO PROJECT still land on the consumer's
 //      files.
-//   3. `<staging>/node_modules` is a symlink to the packaged root's
-//      `node_modules` (the FOD-materialised dep tree) so astro,
-//      Solid, Starlight, Tailwind, katex and every other dep resolve
-//      through node's normal walk. Combined with `vite.resolve.
-//      preserveSymlinks: true` (set in `astro.config.mjs` when
-//      REVKIT_CONSUMER_ROOT is present), an MDX file at
-//      `<staging>/src/content/docs/index.mdx` (symlink to
-//      `<consumer>/docs/index.mdx`) resolves imports from the
-//      staging path — not from `<consumer>/docs/` where there is
-//      no node_modules.
+//   3. `<staging>/node_modules` is a real writable directory with
+//      links to the trusted dependencies. Hoisted installs link directly
+//      to packaged dependencies; isolated installs wrap each package
+//      with its own dependency links to preserve Bun’s resolution graph.
+//      Combined with `vite.resolve.preserveSymlinks: true` and
+//      `NODE_PRESERVE_SYMLINKS=1`, module paths stay inside staging
+//      while package contents remain in the trusted install.
 //   4. Astro and vite caches are redirected to
 //      `<consumer>/.revkit/cache/{astro,vite}/` via env
 //      (`REVKIT_ASTRO_CACHE_DIR`, `REVKIT_VITE_CACHE_DIR`), which
@@ -57,6 +54,7 @@ import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnAstroBuild, type SpawnLike } from "../review/build.ts";
 import { unlinkStale } from "../review/build.ts";
+import { stageIsolatedDependencies } from "./stage-dependencies.ts";
 
 /** Input to `runPackagedBuild`. */
 export interface RunPackagedBuildOptions {
@@ -223,7 +221,7 @@ function symlinkEntries(srcDir: string, dstDir: string, skip: ReadonlySet<string
  *                                 present after `prebuild` runs; when
  *                                 absent in the nix package, staging
  *                                 creates an empty dir)
- *     node_modules/            → <packageRoot>/node_modules/
+ *     node_modules/            (real dir; trusted dependency links)
  *     vocab/                   → <consumer>/vocab/     (optional)
  *     plots/                   → <consumer>/plots/     (optional)
  *     .revkit/                 → <consumer>/.revkit/
@@ -404,26 +402,33 @@ export function stageAstroRoot(options: {
   // alongside the deps at a writable path; the deps themselves
   // remain read-only under the store.
   //
+  // Isolated installs need package wrappers with their own dependency
+  // links: preserving a package alias otherwise loses Bun’s sibling deps.
+  // Hoisted installs can keep direct per-package links.
   // Scoped `@astrojs/`, `@revkit/`, etc. get their entries
   // per-package (a resolver walking into the scope dir needs to
   // see a real directory).
   const stagingNodeModules = join(stagingDir, "node_modules");
   mkdirSync(stagingNodeModules, { recursive: true, mode: 0o755 });
-  for (const name of readdirSync(packagedNodeModules)) {
-    const from = join(packagedNodeModules, name);
-    const to = join(stagingNodeModules, name);
-    // `@scope` — real dir, per-package symlinks inside.
-    if (name.startsWith("@") && statSync(from).isDirectory()) {
-      mkdirSync(to, { recursive: true, mode: 0o755 });
-      for (const pkgName of readdirSync(from)) {
-        const pkgFrom = join(from, pkgName);
-        const pkgTo = join(to, pkgName);
-        unlinkStale(pkgTo);
-        symlinkSync(pkgFrom, pkgTo);
+  if (trustedStack.layout === "isolated") {
+    stageIsolatedDependencies(packagedNodeModules, stagingNodeModules);
+  } else {
+    for (const name of readdirSync(packagedNodeModules)) {
+      const from = join(packagedNodeModules, name);
+      const to = join(stagingNodeModules, name);
+      // `@scope` — real dir, per-package symlinks inside.
+      if (name.startsWith("@") && statSync(from).isDirectory()) {
+        mkdirSync(to, { recursive: true, mode: 0o755 });
+        for (const pkgName of readdirSync(from)) {
+          const pkgFrom = join(from, pkgName);
+          const pkgTo = join(to, pkgName);
+          unlinkStale(pkgTo);
+          symlinkSync(pkgFrom, pkgTo);
+        }
+      } else {
+        unlinkStale(to);
+        symlinkSync(from, to);
       }
-    } else {
-      unlinkStale(to);
-      symlinkSync(from, to);
     }
   }
 
