@@ -152,6 +152,60 @@ export function storeConformance(factory: StoreFactory): void {
       store = await factory.make();
     });
 
+    test("#98: a too-small append body names the field and invariant in one human line", async () => {
+      const error = await store.append(commentCreated("th-short", "c-short", { body: "" })).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(ThreadStoreAppendError);
+      const refusal = error as ThreadStoreAppendError;
+      expect(refusal.rejection.kind).toBe("invalid-shape");
+      expect(refusal.message).toContain('field "body"');
+      expect(refusal.message).toContain("Too small");
+      expect(refusal.message).not.toContain('"code":');
+      expect(refusal.message).not.toMatch(/[\r\n\u0085\u2028\u2029]/);
+      expect(await store.since(0)).toEqual([]);
+    });
+
+    test("#98: an import shape refusal uses the same human field and invariant message", async () => {
+      const event = { ...commentCreated("th-short", "c-short", { body: "" }), seq: 1, ts: "2026-10-03T12:00:00Z" };
+      const error = await store.import({ schemaVersion: CURRENT_SCHEMA_VERSION, events: [event] } as ThreadArchive).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(ThreadStoreImportError);
+      const refusal = error as ThreadStoreImportError;
+      expect(refusal.rejection?.kind).toBe("invalid-shape");
+      expect(refusal.message).toContain('field "body"');
+      expect(refusal.message).toContain("Too small");
+      expect(refusal.message).not.toMatch(/[\r\n\u0085\u2028\u2029]/);
+    });
+
+    for (const operation of ["append", "import"] as const) {
+      test(`#98: ${operation} escapes an injected newline in an answer value reaching the diagnostic`, async () => {
+        const created: ReviewEventInput = {
+          actor: agent, kind: "ask.created", askId: "ask-injection",
+          spec: { schemaVersion: 1, kind: "choice", title: "Which?", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }], allowOther: false, multi: false },
+        };
+        const injected = "forged\nlog\r\t\u001b\u0085\u2028\u2029";
+        const answered: ReviewEventInput = {
+          actor: human, kind: "ask.answered", askId: "ask-injection",
+          answer: { kind: "choice", value: injected },
+        };
+        let error: unknown;
+        if (operation === "append") {
+          await store.append(created);
+          error = await store.append(answered).catch((error: unknown) => error);
+          expect(error).toBeInstanceOf(ThreadStoreAppendError);
+        } else {
+          error = await store.import({
+            schemaVersion: CURRENT_SCHEMA_VERSION,
+            events: [created, answered].map((event, index) => ({ ...event, seq: index + 1, ts: "2026-10-03T12:00:00Z" })),
+          } as ThreadArchive).catch((error: unknown) => error);
+          expect(error).toBeInstanceOf(ThreadStoreImportError);
+        }
+        const refusal = error as ThreadStoreAppendError | ThreadStoreImportError;
+        expect(refusal.rejection?.kind).toBe("answer-shape-mismatch");
+        expect(refusal.message).toContain("forged\\nlog");
+        expect(refusal.message).toContain('field "answer.value"');
+        expect(refusal.message).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+      });
+    }
+
     // ── A5 ────────────────────────────────────────────────────────────────
     test("A5: append returns seq 1 first, then strictly increasing, with no gaps", async () => {
       expect(await store.append(createThread("th-a5", "c-a5-1"))).toBe(1);

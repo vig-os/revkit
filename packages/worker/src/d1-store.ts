@@ -435,10 +435,7 @@ export class D1ThreadStore implements ThreadStore {
       const candidate = { ...input, seq, ts } as ReviewEvent;
       const parsed = reviewEventSchema.safeParse(candidate);
       if (!parsed.success) {
-        throw new ThreadStoreAppendError({
-          kind: "invalid-shape",
-          message: `append: event failed validation: ${JSON.stringify(parsed.error.issues)}`,
-        });
+        throw ThreadStoreAppendError.fromIssues(parsed.error.issues);
       }
       const event = parsed.data;
       // Dry-run on a DEEP COPY, never on `#logState`. `validateNext`
@@ -634,13 +631,13 @@ function absorbCatchUp(
 
 /** The `append` half of `absorbCatchUp`'s taxonomy. */
 function appendInconsistency(message: string): ThreadStoreAppendError {
-  return new ThreadStoreAppendError({ kind: "invalid-shape", message: `append: ${message}` });
+  return new ThreadStoreAppendError({ kind: "invalid-shape", message });
 }
 
 /** The `import` half: same condition, the class #72 promised, and no
  * `cause` — there is no `ZodError` behind a log that will not replay. */
 function importInconsistency(message: string): ThreadStoreImportError {
-  return new ThreadStoreImportError(`import: archive refused — ${message}`, {
+  return new ThreadStoreImportError(message, {
     rejection: { kind: "invalid-shape", seq: undefined, index: undefined, transition: undefined },
   });
 }

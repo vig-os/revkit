@@ -191,6 +191,8 @@ export {
   selectThreads,
   ThreadStoreAppendError,
   ThreadStoreImportError,
+  ThreadStoreOpenError,
+  storeRejectionMessage,
   type AppendRejection,
   type Clock,
   type ImportRejection,

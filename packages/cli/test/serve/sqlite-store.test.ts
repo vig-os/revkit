@@ -15,6 +15,7 @@ import {
   exportArchive,
   isLineAnchor,
 } from "@revkit/review-core";
+import * as reviewCore from "@revkit/review-core";
 import { SqliteThreadStore } from "../../src/serve/sqlite-store.ts";
 
 const anchor: Anchor = {
@@ -31,6 +32,34 @@ function tmpDb(): string {
 }
 
 describe("SqliteThreadStore", () => {
+  test("#99: opening a corrupt log throws the shared typed open error and kind", () => {
+    const filename = tmpDb();
+    SqliteThreadStore.open({ filename }).close();
+    const db = new Database(filename);
+    const event = {
+      seq: 1, ts: "2026-10-03T12:00:00Z", actor: { kind: "local", id: "u1" },
+      kind: "thread.resolved", threadId: "missing",
+    };
+    db.query("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)").run(event.seq, event.ts, JSON.stringify(event));
+    db.close();
+    let error: unknown;
+    try {
+      SqliteThreadStore.open({ filename, displayName: "threads\nforged.sqlite" });
+    } catch (caught) {
+      error = caught;
+    } finally {
+      rmSync(filename, { force: true });
+    }
+    expect((error as Error).name).toBe("ThreadStoreOpenError");
+    expect(error).toBeInstanceOf(reviewCore.ThreadStoreOpenError);
+    const refusal = error as reviewCore.ThreadStoreOpenError;
+    expect(refusal.rejection.kind).toBe("unknown-thread");
+    expect(refusal.rejection).toMatchObject({ threadId: "missing" });
+    expect(refusal.message).toContain("Archive");
+    expect(refusal.message).toContain("threads\\nforged.sqlite");
+    expect(refusal.message).not.toMatch(/[\r\n]/);
+  });
+
   test("appends a comment.created and returns seq=1", async () => {
     const filename = tmpDb();
     const store = SqliteThreadStore.open({ filename });

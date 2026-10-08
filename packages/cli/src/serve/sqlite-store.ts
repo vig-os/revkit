@@ -45,7 +45,7 @@ import {
   type ThreadFilter,
   type ThreadStore,
 } from "@revkit/review-core";
-import { ThreadStoreAppendError } from "@revkit/review-core";
+import { ThreadStoreAppendError, ThreadStoreOpenError } from "@revkit/review-core";
 
 const wallClock: Clock = () => new Date().toISOString();
 
@@ -167,9 +167,7 @@ export class SqliteThreadStore implements ThreadStore {
         }
         // Any other rejection is real corruption — refuse loudly.
         db.close();
-        throw new Error(
-          `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.displayName ?? options.filename}' and start clean, or restore from backup.`,
-        );
+        throw new ThreadStoreOpenError(result.rejection, options.displayName ?? options.filename);
       }
       if (event.seq > head) head = event.seq;
     }
@@ -226,10 +224,7 @@ export class SqliteThreadStore implements ThreadStore {
       const candidate = { ...input, seq, ts } as ReviewEvent;
       const parsed = reviewEventSchema.safeParse(candidate);
       if (!parsed.success) {
-        throw new ThreadStoreAppendError({
-          kind: "invalid-shape",
-          message: `append: event failed validation: ${JSON.stringify(parsed.error.issues)}`,
-        });
+        throw ThreadStoreAppendError.fromIssues(parsed.error.issues);
       }
       const event = parsed.data;
       const result = validateNext(this.#logState, event);
