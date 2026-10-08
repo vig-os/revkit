@@ -87,3 +87,27 @@ and keeps the newest five mode-600 backups named `cf.env.bak.<UTC timestamp>.<un
 uses the same parsed values. Production and the account boundary remain unchanged.
 
 The restore guard recognizes both command words even when Wrangler flags intervene between them.
+
+
+## Amendment — 2026-10-08: Wrangler environment and mutation boundary (#176)
+
+Wrangler now receives an explicit environment allowlist: basic path/locale/temp/color settings, credentials from
+the selected credential file and pinned telemetry/logging settings. Caller transport and target overrides
+(`WRANGLER_*`, unapproved `CLOUDFLARE_*` and case-insensitive `*_PROXY`) are refused by name without values;
+other inherited variables are dropped. Ambient credentials are cleared before loading the selected file.
+Wrangler 4.93's explicit `--env-file` list is pinned to a private empty file, disabling default dotenv and dev-vars
+discovery. The Bun wrapper also disables automatic dotenv loading. All dev recipes refuse worker `.env*` and
+`.dev.vars*` entries; the repository ignores them.
+
+The confirmation gate allows only reviewed read-only or idempotent-create commands; all other verbs, including
+unknown future commands and deploy/SQL/migration/object writes, require `--yes-really` and TTY confirmation.
+The dev command allowlist runs before confirmation. `cf-dev-deploy` forwards explicit confirmation or dry-run
+arguments. Init's fixed provisioning sequence and explicit secret-rotation authorization are unchanged.
+A pseudo-terminal with piped confirmation cannot be distinguished from human input; this gate prevents accidents
+and does not establish human identity or grant automation permission.
+
+Both wrappers confine `--file` to the repository and exclude the local credential directory after symlink
+resolution, including for new output files. Ambiguous repeated flags are refused. Credential backup retention
+matches only the generated timestamp/suffix pattern, migrating the legacy backup once and preserving unrelated
+user files. `NO_COLOR` follows the caller's setting. These changes preserve the existing account, reachability
+and production boundaries.

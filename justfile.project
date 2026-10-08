@@ -797,5 +797,6 @@ cf-dev-init *args:
 
 # Deploy this tree to the dev Worker with inherited security settings.
 [group('cloudflare')]
-cf-dev-deploy:
-    @bash scripts/cf.sh dev deploy
+[positional-arguments]
+cf-dev-deploy *args:
+    @bash scripts/cf.sh dev deploy "$@"

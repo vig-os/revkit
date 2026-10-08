@@ -3,10 +3,14 @@
 set +x
 set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bun --no-env-file "$script_dir/cf-environment.ts"
+# Ambient credentials must never substitute for the selected credential file.
+unset CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL_S3 AWS_REGION
 if [[ -n "${REVKIT_CF_SOPS:-}" ]]; then
   [[ -f "$REVKIT_CF_SOPS" ]] || { echo 'cf: missing REVKIT_CF_SOPS file' >&2; exit 1; }
   # exec-env takes a command string. Quote each argument, never interpolate credentials.
-  cf_command="exec bun"
+  cf_command="exec bun --no-env-file"
   for arg in "$script_dir/cf.ts" "$@"; do
     quoted_arg="${arg//\'/\'\\\'\'}"
     cf_command+=" '$quoted_arg'"
@@ -27,4 +31,4 @@ env_file="${REVKIT_CF_ENV:-$HOME/.config/revkit/cf.env}"
 [[ "$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file")" == 600 ]] || {
   echo 'cf: plaintext credentials must be mode 600' >&2; exit 1;
 }
-exec bun "$script_dir/cf-load-env.ts" "$env_file" "$@"
+exec bun --no-env-file "$script_dir/cf-load-env.ts" "$env_file" "$@"
