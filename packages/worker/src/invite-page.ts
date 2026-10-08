@@ -115,7 +115,7 @@
 // `test/invites.test.ts` pins all three carriers absent and the header present,
 // and the ADR-0012 amendment proposed with this slice records the mechanism.
 
-import { MAX_DISPLAY_NAME_CHARS, type ShareType } from "./invites.ts";
+import type { ShareType } from "./invites.ts";
 
 /** The encoding this page's form submits with, by not declaring an `enctype`.
  * Named here because the page is what fixes it; see the note on `redeemFormPage`. */
@@ -239,13 +239,9 @@ export interface RedeemFormInput {
  * posted JSON the way a program would rather than the way a browser does. One
  * test now derives its request from this page's own markup.
  *
- * `maxlength` is `MAX_DISPLAY_NAME_CHARS`, imported from the module that
- * enforces it — **not a literal**, because the two drifting apart would be a
- * finding and a literal is how they drift. That was measurable: the mutation run
- * changed `maxlength="64"` to `maxlength="4096"` and left every test green, since
- * nothing asserted the attribute. The server is still the control, because a
- * `maxlength` attribute is a hint a `curl` does not have to honour; this is the
- * browser's half of the same bound.
+ * The server validates the name in Unicode code points. HTML `maxlength`
+ * counts UTF-16 units, so it would prevent valid astral-character names from
+ * reaching that validation. The input deliberately has no `maxlength`.
  *
  * `autocomplete="nickname"` rather than `name`: this is the name the guest
  * chooses to be called in someone else's review, not their account name, and
@@ -289,7 +285,7 @@ export function redeemFormPage(input: RedeemFormInput): string {
 <input type="hidden" name="token" value="${text(input.token)}">
 <p>
 <label for="displayName">Your display name</label><br>
-<input id="displayName" name="displayName" type="text" maxlength="${MAX_DISPLAY_NAME_CHARS}" autocomplete="nickname" required>
+<input id="displayName" name="displayName" type="text" autocomplete="nickname" required>
 </p>
 <p>
 <button type="submit">Accept and open the review</button>
