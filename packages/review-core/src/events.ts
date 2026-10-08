@@ -210,6 +210,15 @@ const threadExternalSyncedPayload = {
   resolvedByLogin: z.string().min(1).optional(),
 } as const;
 
+/** A refused lifecycle promotion, correlated to its exact authorization.
+ * A comment failure cannot identify a resolve/reopen intent. */
+const threadSyncFailedPayload = {
+  kind: z.literal("thread.sync_failed"),
+  threadId: idSchema,
+  intentSeq: z.number().int().positive(),
+  reason: z.enum(["promotion-review-mismatch", "promotion-review-unbound", "promotion-review-not-pending"]),
+} as const;
+
 /** Trigger for a `handover` delivery event (M2 item 6 review round 2).
  * Every delivery to the agent stream is recorded on the log as a
  * `handover` event with one of these triggers, so the "pending" set
@@ -641,6 +650,7 @@ const eventVariants = [
   z.object({ ...envelope, ...threadResolvedPayload }).strict(),
   z.object({ ...envelope, ...threadReopenedPayload }).strict(),
   z.object({ ...envelope, ...threadExternalSyncedPayload }).strict(),
+  z.object({ ...envelope, ...threadSyncFailedPayload }).strict(),
   z.object({ ...envelope, ...handoverPayload }).strict(),
   z.object({ ...envelope, ...deliveryModeChangedPayload }).strict(),
   z.object({ ...envelope, ...askCreatedPayload }).strict(),
@@ -763,6 +773,7 @@ export const reviewEventKinds = [
   "thread.resolved",
   "thread.reopened",
   "thread.external_synced",
+  "thread.sync_failed",
   "handover",
   "delivery.mode_changed",
   "ask.created",

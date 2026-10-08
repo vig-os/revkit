@@ -155,6 +155,8 @@ export interface ThreadLifecycleState {
   readonly actorKind: ReviewEvent["actor"]["kind"];
   /** The seq of a `draft.promoted` authorizing it, or `undefined`. */
   readonly promotedAtSeq: number | undefined;
+  /** Latest refusal correlated to this intent, cleared by fresh approval or completion. */
+  readonly syncFailure?: Extract<ReviewEvent, { kind: "thread.sync_failed" }>;
 }
 
 /** Derive every thread's `ThreadLifecycleState` from the log. Exported
@@ -179,11 +181,21 @@ export function reduceThreadLifecycleStates(
       });
       continue;
     }
+    if (event.kind === "thread.sync_failed" || event.kind === "thread.external_synced") {
+      const state = states.get(event.threadId);
+      if (state === undefined || event.intentSeq !== (state.promotedAtSeq ?? state.atSeq)) continue;
+      const { syncFailure: _previous, ...rest } = state;
+      void _previous;
+      states.set(event.threadId, event.kind === "thread.sync_failed" ? { ...rest, syncFailure: event } : rest);
+      continue;
+    }
     if (event.kind !== "draft.promoted" || event.target === "comment") continue;
     const state = states.get(event.threadId);
     if (state === undefined || state.target !== event.target) continue;
     if (event.seq <= state.atSeq) continue;
-    states.set(event.threadId, { ...state, promotedAtSeq: event.seq });
+    const { syncFailure: _previous, ...rest } = state;
+    void _previous;
+    states.set(event.threadId, { ...rest, promotedAtSeq: event.seq });
   }
   return states;
 }
@@ -246,6 +258,9 @@ export interface ReviewState {
    * GitHub. Derived, not held, so the rail can say so rather than
    * leaving the reviewer to notice that their click did nothing. */
   readonly droppedReviewerIntents: readonly DroppedReviewerIntent[];
+  /** Current lifecycle refusals; supersession, fresh approval and completion clear them. */
+  readonly lifecycleFailures: readonly (AgentDraft & { readonly target: "resolve" | "reopen";
+    readonly intentSeq: number; readonly reason: Extract<ReviewEvent, { kind: "thread.sync_failed" }>["reason"] })[];
 }
 
 /** One reviewer's lifecycle intent the log shows as dropped. */
@@ -615,6 +630,10 @@ export function reduceReviewState(events: readonly ReviewEvent[]): ReviewState {
     unsyncedCommentIds,
     agentDrafts: allDrafts.map((entry) => entry.draft),
     droppedReviewerIntents: dropped,
+    lifecycleFailures: [...currentLifecycle.values()].flatMap((state) => state.syncFailure === undefined ? [] : [{
+      threadId: state.threadId, target: state.target, path: threadPath.get(state.threadId) ?? "",
+      intentSeq: state.syncFailure.intentSeq, reason: state.syncFailure.reason,
+    }]),
   };
 }
 

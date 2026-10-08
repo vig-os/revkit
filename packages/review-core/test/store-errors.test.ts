@@ -29,6 +29,7 @@ test("#98-r1: every declared rejection kind has a bounded escaped field diagnost
     "not-an-agent-draft": { kind: "not-an-agent-draft", threadId: "t", commentId: "c", message },
     "cross-file-reanchor": { kind: "cross-file-reanchor", threadId: "t", fromPath: "a", toPath: "b", message },
     "duplicate-review": { kind: "duplicate-review", reviewNodeId: "r", message },
+    "promotion-review-not-pending": { kind: "promotion-review-not-pending", reviewNodeId: "r", message },
     "review-not-pending": { kind: "review-not-pending", reviewNodeId: "r", currentStatus: "submitted", attempted: "submitted", message },
     "promotion-review-not-pending": { kind: "promotion-review-not-pending", reviewNodeId: "r", message },
   };
