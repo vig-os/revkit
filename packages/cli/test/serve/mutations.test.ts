@@ -20,9 +20,9 @@ import { MAX_COMMENT_BODY_BYTES } from "../../src/serve/daemon.ts";
 
 const anchor: Anchor = {
   path: "docs/x.md",
-  startLine: 1,
-  endLine: 2,
-  quote: { exact: "hi", prefix: "", suffix: "" },
+  startLine: 3,
+  endLine: 3,
+  quote: { exact: "hello", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };
 

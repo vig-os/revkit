@@ -207,7 +207,7 @@ describe("fast-path feature matrix", () => {
     {
       label: "prose",
       source: "A plain paragraph with **bold**, _emphasis_ and a [link](../adr/0001-static-first-site-stack.md).\n",
-      expect: [/<strong>bold<\/strong>/, /<em>emphasis<\/em>/, /href="\/adr\/0001-static-first-site-stack\/"/],
+      expect: [/<strong><span[^>]*data-revkit-leaf[^>]*>bold<\/span><\/strong>/, /<em><span[^>]*data-revkit-leaf[^>]*>emphasis<\/span><\/em>/, /href="\/adr\/0001-static-first-site-stack\/"/],
     },
     {
       label: "display + inline math",
@@ -234,7 +234,7 @@ describe("fast-path feature matrix", () => {
     {
       label: "inline code and a blockquote",
       source: "Inline `code` here.\n\n> Quoted text.\n",
-      expect: [/<code>code<\/code>/, /<blockquote[ >]/],
+      expect: [/<code><span[^>]*data-revkit-leaf[^>]*>code<\/span><\/code>/, /<blockquote[ >]/],
     },
   ];
 

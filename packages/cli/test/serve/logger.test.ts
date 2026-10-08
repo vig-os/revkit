@@ -26,6 +26,17 @@ function bufferedSink(): { sink: LineSink; lines: string[] } {
 }
 
 describe("logger", () => {
+  test("renderer diagnostics emit debug with allowlisted error kind only", () => {
+    const { sink, lines } = bufferedSink();
+    const log = makeLogger({ sink });
+    (log.debug as (event: string, fields: unknown) => void)("anchor.render.failed", { requestId: "r", errorKind: "ParseError", message: "private source text" });
+    const record = JSON.parse(lines[0]!);
+    expect(record.level).toBe("debug");
+    expect(record.event).toBe("anchor.render.failed");
+    expect(record.errorKind).toBe("ParseError");
+    expect(record.message).toBeUndefined();
+    expect(lines[0]).not.toContain("private source text");
+  });
   test("emits one JSON object per line with a ts and level", () => {
     const { sink, lines } = bufferedSink();
     const log = makeLogger({ sink, clock: () => "2026-09-30T00:00:00.000Z" });

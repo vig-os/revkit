@@ -15,8 +15,8 @@ import { startEventSubscriber, type WireEvent } from "../../src/mcp/event-subscr
 
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 1,
-  endLine: 1,
+  startLine: 3,
+  endLine: 3,
   quote: { exact: "body", prefix: "", suffix: "" },
   revision: "b".repeat(64),
 };

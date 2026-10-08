@@ -31,8 +31,8 @@ import type { WireEvent } from "../../src/mcp/event-subscriber.ts";
 
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
-  startLine: 40,
-  endLine: 44,
+  startLine: 4,
+  endLine: 4,
   quote: { exact: "why 30s?", prefix: "", suffix: "" },
   revision: "a".repeat(64),
 };
@@ -281,7 +281,7 @@ describe("blocker 3 — reconnect on daemon restart", () => {
     mkdirSync(join(root, "dist"), { recursive: true });
     writeFileSync(join(root, "dist", "index.html"), "<h1>x</h1>");
     mkdirSync(join(root, "docs", "adr"), { recursive: true });
-    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR\n\nsecond line\nthird\nfourth\n");
+    writeFileSync(join(root, "docs", "adr", "0003.md"), "# ADR\n\nsecond line\nwhy 30s?\nfourth\n");
     // Use ONE sqlite path shared across daemon boots — that's the
     // "sqlite persists across restarts" property.
     const sqlitePath = join(root, "threads.sqlite");
