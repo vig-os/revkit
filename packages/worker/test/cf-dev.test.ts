@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { execFile } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,11 +21,13 @@ const missingWorker = [
 ].join("\n");
 let root: string;
 let env: Record<string, string | undefined>;
+let fixtureDeadline: number;
 const configPath = () => join(root, "packages/worker/wrangler.jsonc");
 const calls = () => existsSync(join(root, "calls.jsonl"))
   ? readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]) : [];
 
 beforeEach(() => {
+  fixtureDeadline = performance.now() + 9000;
   root = mkdtempSync(join(tmpdir(), "revkit-cf-test-"));
   mkdirSync(join(root, "packages/worker"), { recursive: true });
   mkdirSync(join(root, "bin"));
@@ -79,19 +81,19 @@ else console.log("ok");
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 async function run(...args: string[]) {
-  // Collect output and exit together through the child-process close callback.
-  // Nothing is supplied on stdin for these non-interactive fixture commands.
-  return new Promise<{ code: number; output: string }>((resolve, reject) => {
-    const child = execFile("just", args, { cwd: root, env }, (error, stdout, stderr) => {
-      let code = 0;
-      if (error) {
-        if (typeof error.code !== "number") { reject(error); return; }
-        code = error.code;
-      }
-      resolve({ code, output: stdout + stderr });
-    });
-    child.stdin?.end();
+  // Avoid asynchronous subprocess collection alongside Miniflare. Share a
+  // stricter deadline across ALL commands in a test, below Bun's unchanged 10s.
+  // GNU timeout kills the whole fixture process group, including descendants
+  // that could otherwise keep captured stdout/stderr open after just exits.
+  const remaining = fixtureDeadline - performance.now();
+  if (remaining <= 0) throw new Error("cf test: fixture deadline exceeded");
+  const child = spawnSync("timeout", ["--signal=KILL", `${remaining / 1000}s`, "just", ...args], {
+    cwd: root, env, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", maxBuffer: 1024 * 1024,
   });
+  // A killed/stalled command must FAIL the test, never satisfy a refusal check.
+  if (child.signal || child.status === 124 || child.status === 137) throw new Error("cf test: fixture deadline exceeded");
+  if (child.error || child.status === null) throw new Error("cf test: fixture subprocess failed");
+  return { code: child.status, output: child.stdout + child.stderr };
 }
 
 function sourceConfig() { return JSON.parse(readFileSync(configPath(), "utf8").replace(/^\s*\/\/.*$/gm, "")); }
