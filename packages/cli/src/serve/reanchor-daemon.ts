@@ -66,6 +66,7 @@
 // server and any future PR-adapter can display or hide these
 // events independently. See M2 item 5b's design note.
 
+import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
 import { basename as basenameOf, dirname, relative } from "node:path";
 import {
@@ -133,6 +134,10 @@ interface TrackedSnapshot {
  * one re-anchor pass without noticeably delaying the interactive
  * "type + save + see rail update" path. */
 export const DEFAULT_FILE_DEBOUNCE_MS = 300;
+
+/** Yield after this much continuous legacy recovery work. A timer per
+ * thread makes a large rebuild pay roughly a millisecond for each quote. */
+const RECOVERY_YIELD_MS = 10;
 
 /** Debounce for the `site/dist` build watcher. A build writes many
  * files over a few seconds; 500 ms after the last write gives the
@@ -732,7 +737,24 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
 
       let rendered: RenderedProvenance | undefined;
       try { rendered = await renderProvenance(repoRoot, path, oldSource); } catch { /* Fail closed below. */ }
+      let lastYield = (options.nowMs ?? performance.now)();
+      const closedDuringYield = new Set<string>();
       for (const thread of bucket) {
+        // Store/diff awaits can settle entirely through microtasks. A real
+        // event-loop turn after a work budget keeps HTTP/timers responsive
+        // without charging a timer delay for every thread.
+        if ((options.nowMs ?? performance.now)() - lastYield >= RECOVERY_YIELD_MS) {
+          const headBeforeYield = store.head();
+          await yieldToLoop();
+          // Only inspect events that arrived during the yield. Reading each
+          // whole thread here would replay the entire log once per quote.
+          for (const event of await store.since(headBeforeYield)) {
+            if (event.kind === "thread.resolved") closedDuringYield.add(event.threadId);
+            else if (event.kind === "thread.reopened") closedDuringYield.delete(event.threadId);
+          }
+          lastYield = (options.nowMs ?? performance.now)();
+        }
+        if (closedDuringYield.has(thread.id)) continue;
         const recovered = rendered === undefined ? undefined : recoverLegacyAnchor(rendered, oldSource, thread.anchor);
         const result = recovered === undefined
           ? { kind: "orphaned" as const, revision: newRevision, reason: "The snapshot quote has no unique source provenance." }
