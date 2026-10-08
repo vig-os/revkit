@@ -577,29 +577,25 @@ describe("a key over R2's 1024-byte limit is refused before the read (#133)", ()
   test("1024 bytes — the largest servable key returns its stored bytes", async () => {
     const objectPath = objectPathOfKeyBytes(MAX_R2_KEY_BYTES);
     const key = `${REPO}/pr-${PR}/${objectPath}`;
-    expect(utf8ByteLength(`${REPO}/pr-${PR}/${objectPath}`)).toBe(1024);
+    expect(utf8ByteLength(key)).toBe(1024);
     await seedPreview(key, DOCUMENT);
     const issued = await issueTestSession(harness.db);
     const response = await get(previewUrl(objectPath), authHeaders(issued));
     expect(response.status).toBe(200);
     expect(await response.text()).toBe(DOCUMENT);
     expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
-    expect(await spyReads()).toEqual({ reads: 1, keys: [`${REPO}/pr-${PR}/${objectPath}`] });
+    expect(await spyReads()).toEqual({ reads: 1, keys: [key] });
   });
 
   for (const principal of ["operator", "guest"] as const) {
-    for (const [label, objectPath, multibyte] of [
-      ["one byte over the key limit", objectPathOfKeyBytes(1025), false],
-      ["multibyte name below 1024 UTF-16 units but over 1024 UTF-8 bytes", `${"é".repeat(600)}.html`, true],
+    for (const [label, objectPath] of [
+      ["one byte over the key limit", objectPathOfKeyBytes(1025)],
+      ["percent-encoded multibyte name over the key limit", `${"é".repeat(600)}.html`],
     ] as const) {
       test(`${principal}: ${label} returns a bodyless 404 with full hygiene and no read`, async () => {
-        if (multibyte) {
-          const rawKey = `${REPO}/pr-${PR}/${objectPath}`;
-          expect(rawKey.length).toBeLessThan(1024);
-          expect(utf8ByteLength(rawKey)).toBeGreaterThan(1024);
-        }
-        // URL normalisation percent-encodes the multibyte name, making the
-        // actual R2 key longer still. Count the key the Worker receives.
+        // URL normalisation percent-encodes the multibyte name, so the Worker
+        // sees an ASCII key. The pure-function raw-string test below covers
+        // UTF-16 length versus UTF-8 bytes; this tests the HTTP spelling.
         const key = new URL(previewUrl(objectPath)).pathname.slice(1);
         expect(utf8ByteLength(key)).toBeGreaterThan(1024);
         const headers = principal === "guest"
@@ -720,19 +716,14 @@ describe("a key over R2's 1024-byte limit is refused before the read (#133)", ()
   });
 
   test("the byte length the module uses IS the key's, checked against the real key", async () => {
-    // **The identity behind the arithmetic in `previewTargetFor`**, pinned rather
-    // than trusted: the key is `scopePath` minus its leading slash plus one
-    // joining slash, and the module measures the SUM of the two parts. An earlier
-    // cut measured `` `${scopePath}/${objectPath}` `` instead — the key with a
-    // slash it does not have — and refused a legal 1024-byte key. This case is
-    // what makes that class of slip a red test rather than a silent one byte.
+    // `previewTargetFor` measures the exact key string the Worker reads, with the
+    // prefix and joining slash but excluding the pathname's leading slash.
+    // Measuring the pathname instead would refuse this legal 1024-byte key.
     const objectPath = objectPathOfKeyBytes(MAX_R2_KEY_BYTES);
     const key = `${REPO}/pr-${PR}/${objectPath}`;
     expect(utf8ByteLength(key)).toBe(MAX_R2_KEY_BYTES);
-    expect(utf8ByteLength(SCOPE) + utf8ByteLength(objectPath)).toBe(utf8ByteLength(key));
-    // And through the platform, so it is not only arithmetic agreeing with itself:
-    // a 1024-byte key is READ (a miss) and a 1025-byte one never reaches the
-    // binding at all.
+    // Through the platform: a 1024-byte key is READ (a miss) and a 1025-byte
+    // one never reaches the binding at all.
     const issued = await issueTestSession(harness.db);
     expect((await get(previewUrl(objectPath), authHeaders(issued))).status).toBe(404);
     expect(await spyReads()).toEqual({ reads: 1, keys: [key] });

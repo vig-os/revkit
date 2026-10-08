@@ -210,7 +210,7 @@ export type PreviewRefusal = (typeof PREVIEW_REFUSALS)[number];
  * arrives LONGER than it was written (one `é` is six characters of `%C3%A9`),
  * so a preview path can cross 1024 bytes without any single segment looking long.
  * `test/preview.test.ts` computes its multibyte boundary from the encoded
- * spelling and asserts the key R2 is asked for.
+ * spelling and proves that over-limit keys cause no R2 read.
  */
 export const MAX_R2_KEY_BYTES = 1024;
 
