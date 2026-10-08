@@ -1,13 +1,15 @@
 // `SqliteThreadStore` — the daemon's `bun:sqlite` implementation of
 // `@revkit/review-core`'s `ThreadStore` (ADR-0006).
 //
-// One table: `events(seq INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+// Source of truth: `events(seq INTEGER PRIMARY KEY, ts TEXT NOT NULL,
 // payload TEXT NOT NULL)`. `payload` is the full `ReviewEvent` as JSON,
 // including `seq` and `ts`, so a query returns a row that
 // `reviewEventSchema.parse` accepts unchanged. Two columns are stored
 // separately (`seq`, `ts`) purely because they are the query keys —
 // `since(after)` filters on `seq`, and a future retention job filters
-// on `ts` (ADR-0015).
+// on `ts` (ADR-0015). Derived routing tables and their version/head metadata
+// accelerate path reads; snapshots retain anchor source text. Neither is a
+// second source of truth.
 //
 // **The append path is the same rule set the in-memory store runs.**
 // It uses review-core's `reviewEventSchema` for shape and
@@ -48,6 +50,148 @@ import {
 import { ThreadStoreAppendError } from "@revkit/review-core";
 
 const wallClock: Clock = () => new Date().toISOString();
+
+// Routing keys are derived from validated JS events, never SQLite JSON
+// extraction. JSON string encoding preserves lone surrogates in paths and ids.
+// SQLite's UTF-8 text binding would otherwise collapse them to U+FFFD.
+const routingKey = (value: string): string => JSON.stringify(value);
+const THREAD_INDEX_VERSION = 1;
+
+interface EventRoute {
+  readonly commentOwner?: { readonly commentId: string; readonly threadId: string };
+  readonly threadId?: string;
+  readonly pathUpdate?: { readonly threadId: string; readonly path: string; readonly seq: number };
+}
+
+/** The ONE routing rule, used for writes and validated startup replay.
+ * Comment ids are globally unique (validateNext); thread reduction, including
+ * lifecycle intent seqs, has no cross-thread dependencies. */
+function routeEvent(event: ReviewEvent, ownerOf: (commentId: string) => string | undefined): EventRoute {
+  const threadId = "threadId" in event
+    ? event.threadId
+    : "commentId" in event ? ownerOf(event.commentId) : undefined;
+  return {
+    ...(threadId === undefined ? {} : { threadId }),
+    ...(event.kind === "comment.created" || event.kind === "comment.replied"
+      ? { commentOwner: { commentId: event.commentId, threadId: event.threadId } }
+      : {}),
+    ...(event.kind === "comment.created" || event.kind === "thread.reanchored"
+      ? { pathUpdate: { threadId: event.threadId, path: event.anchor.path, seq: event.seq } }
+      : {}),
+  };
+}
+
+const THREAD_INDEX_SQL = `
+CREATE TABLE IF NOT EXISTS thread_paths (
+  thread_id TEXT PRIMARY KEY,
+  path TEXT NOT NULL,
+  anchor_seq INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_paths_path ON thread_paths (path, thread_id);
+CREATE TABLE IF NOT EXISTS comment_threads (
+  comment_id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS thread_events (
+  seq INTEGER PRIMARY KEY,
+  thread_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_events_thread ON thread_events (thread_id, seq);
+CREATE TABLE IF NOT EXISTS thread_index_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  version INTEGER NOT NULL,
+  last_seq INTEGER NOT NULL
+);
+DROP TRIGGER IF EXISTS events_thread_index;
+`;
+
+// SQL only persists the decisions made by routeEvent. A duplicate ownership key
+// is an error, not INSERT OR IGNORE: validation forbids duplicate comment ids.
+function projectionWriter(db: Database): (event: ReviewEvent, route: EventRoute) => void {
+  const comment = db.prepare("INSERT INTO comment_threads (comment_id, thread_id) VALUES (?, ?)");
+  const thread = db.prepare("INSERT INTO thread_events (seq, thread_id) VALUES (?, ?)");
+  const path = db.prepare(`
+    INSERT INTO thread_paths (thread_id, path, anchor_seq) VALUES (?, ?, ?)
+    ON CONFLICT(thread_id) DO UPDATE SET path = excluded.path, anchor_seq = excluded.anchor_seq
+  `);
+  return (event, route) => {
+    if (route.commentOwner !== undefined) {
+      comment.run(routingKey(route.commentOwner.commentId), routingKey(route.commentOwner.threadId));
+    }
+    if (route.threadId !== undefined) thread.run(event.seq, routingKey(route.threadId));
+    if (route.pathUpdate !== undefined) {
+      path.run(routingKey(route.pathUpdate.threadId), routingKey(route.pathUpdate.path), route.pathUpdate.seq);
+    }
+  };
+}
+
+function checkpointProjection(db: Database, head: number): void {
+  db.query(`
+    INSERT INTO thread_index_meta (singleton, version, last_seq) VALUES (1, ?, ?)
+    ON CONFLICT(singleton) DO UPDATE SET version = excluded.version, last_seq = excluded.last_seq
+  `).run(THREAD_INDEX_VERSION, head);
+}
+
+/** Called within the replay's read transaction. Verify every routing row against
+ * that same parsed log before skipping a rewrite; a seq/version alone would miss
+ * damaged projections. A needed rewrite upgrades the transaction atomically.
+ * Old binaries' unindexed inserts are healed here, without re-reading JSON in SQL. */
+function synchronizeThreadIndex(db: Database, events: readonly ReviewEvent[], head: number): void {
+  const owners = new Map<string, string>();
+  const routes = events.map((event) => {
+    const route = routeEvent(event, (id) => owners.get(id));
+    if (route.commentOwner !== undefined) owners.set(route.commentOwner.commentId, route.commentOwner.threadId);
+    return route;
+  });
+  const paths = new Map<string, { path: string; anchor_seq: number }>();
+  const sequences = new Map<number, string>();
+  for (const [i, route] of routes.entries()) {
+    if (route.threadId !== undefined) sequences.set(events[i]!.seq, routingKey(route.threadId));
+    if (route.pathUpdate !== undefined) {
+      paths.set(routingKey(route.pathUpdate.threadId), {
+        path: routingKey(route.pathUpdate.path), anchor_seq: route.pathUpdate.seq,
+      });
+    }
+  }
+  const schema = db.query<{ name: string }, []>(`
+    SELECT name FROM sqlite_master WHERE name IN (
+      'thread_paths', 'thread_paths_path', 'comment_threads', 'thread_events',
+      'thread_events_thread', 'thread_index_meta', 'events_thread_index'
+    )
+  `).all();
+  if (schema.length === 6 && !schema.some((row) => row.name === "events_thread_index")) {
+    const meta = db.query<{ version: number; last_seq: number }, []>("SELECT version, last_seq FROM thread_index_meta WHERE singleton = 1").get();
+    if (meta?.version === THREAD_INDEX_VERSION && meta.last_seq === head) {
+      const comments = db.query<{ comment_id: string; thread_id: string }, []>("SELECT comment_id, thread_id FROM comment_threads").all();
+      const threads = db.query<{ seq: number; thread_id: string }, []>("SELECT seq, thread_id FROM thread_events").all();
+      const anchored = db.query<{ thread_id: string; path: string; anchor_seq: number }, []>("SELECT thread_id, path, anchor_seq FROM thread_paths").all();
+      const encodedOwners = new Map([...owners].map(([comment, thread]) => [routingKey(comment), routingKey(thread)]));
+      if (
+        comments.length === owners.size && comments.every((row) => encodedOwners.get(row.comment_id) === row.thread_id) &&
+        threads.length === sequences.size && threads.every((row) => sequences.get(row.seq) === row.thread_id) &&
+        anchored.length === paths.size && anchored.every((row) => {
+          const expected = paths.get(row.thread_id);
+          return expected?.path === row.path && expected.anchor_seq === row.anchor_seq;
+        })
+      ) return;
+    }
+  }
+  // Execute DDL separately: bun:sqlite's multi-statement exec can replace an
+  // initial BUSY with a later "no such table" while compiling dependent indexes.
+  for (const statement of THREAD_INDEX_SQL.split(";")) {
+    if (statement.trim()) db.exec(statement);
+  }
+  db.exec("DELETE FROM thread_events; DELETE FROM comment_threads; DELETE FROM thread_paths");
+  const write = projectionWriter(db);
+  for (const [i, event] of events.entries()) write(event, routes[i]!);
+  checkpointProjection(db, head);
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  // The low byte is SQLITE_BUSY, including SQLITE_BUSY_SNAPSHOT. Only startup
+  // repair may fall back; ordinary append/import keep their existing lock policy.
+  return error instanceof Error && "errno" in error && typeof error.errno === "number" && (error.errno & 0xff) === 5;
+}
 
 /** SQL to bring a database up to the current schema. `journal_mode =
  * WAL` gives concurrent readers alongside a single writer, which the
@@ -113,12 +257,14 @@ export class SqliteThreadStore implements ThreadStore {
   readonly #clock: Clock;
   readonly #logState: LogState;
   #head: number;
+  #indexAvailable: boolean;
 
-  private constructor(db: Database, clock: Clock, logState: LogState, head: number) {
+  private constructor(db: Database, clock: Clock, logState: LogState, head: number, indexAvailable: boolean) {
     this.#db = db;
     this.#clock = clock;
     this.#logState = logState;
     this.#head = head;
+    this.#indexAvailable = indexAvailable;
   }
 
   /** Open the store, run the schema-up migration, rehydrate the
@@ -140,40 +286,56 @@ export class SqliteThreadStore implements ThreadStore {
   static open(options: SqliteThreadStoreOptions): SqliteThreadStore {
     const db = new Database(options.filename, { create: true });
     db.exec(SCHEMA_SQL);
-    const rows = db
-      .query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC")
-      .all();
     const state = emptyLogState();
     let head = 0;
-    for (const row of rows) {
-      const event = reviewEventSchema.parse(JSON.parse(row.payload));
-      const result = validateNext(state, event);
-      if (!result.ok) {
-        if (result.rejection.kind === "answer-shape-mismatch" && event.kind === "ask.answered") {
-          // Log and advance state to `answered` — the reducer
-          // already projects the answer, and refusing to start
-          // over a historical answer is worse than accepting
-          // it. Uses stderr since the store has no logger
-          // handle at this call site; the daemon logs the count
-          // once it has a logger.
-          process.stderr.write(
-            `SqliteThreadStore.open: accepting historical ask.answered on ask '${event.askId}' whose value fails the current answer-shape check ` +
-              `(${result.rejection.field}: ${result.rejection.message}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
-          );
-          const ask = state.asks.get(event.askId);
-          if (ask !== undefined) ask.status = "answered";
+    let replayed = false;
+    let indexAvailable = false;
+    try {
+      db.transaction(() => {
+        const rows = db.query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC").all();
+        const events: ReviewEvent[] = [];
+        for (const row of rows) {
+          const event = reviewEventSchema.parse(JSON.parse(row.payload));
+          events.push(event);
+          const result = validateNext(state, event);
+          if (!result.ok) {
+            if (result.rejection.kind === "answer-shape-mismatch" && event.kind === "ask.answered") {
+              // Log and advance state to `answered` — the reducer
+              // already projects the answer, and refusing to start
+              // over a historical answer is worse than accepting
+              // it. Uses stderr since the store has no logger
+              // handle at this call site; the daemon logs the count
+              // once it has a logger.
+              process.stderr.write(
+                `SqliteThreadStore.open: accepting historical ask.answered on ask '${event.askId}' whose value fails the current answer-shape check ` +
+                  `(${result.rejection.field}: ${result.rejection.message}). See ADR-0007 amendment 2026-09-30 (asks replay policy).\n`,
+              );
+              const ask = state.asks.get(event.askId);
+              if (ask !== undefined) ask.status = "answered";
+              if (event.seq > head) head = event.seq;
+              continue;
+            }
+            // Any other rejection is real corruption — refuse loudly.
+            throw new Error(
+              `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.displayName ?? options.filename}' and start clean, or restore from backup.`,
+            );
+          }
           if (event.seq > head) head = event.seq;
-          continue;
         }
-        // Any other rejection is real corruption — refuse loudly.
+        replayed = true;
+        synchronizeThreadIndex(db, events, head);
+        indexAvailable = true;
+      })();
+    } catch (error) {
+      if (!replayed || !isSqliteBusy(error)) {
         db.close();
-        throw new Error(
-          `SqliteThreadStore.open: existing events failed validation (${result.rejection.kind}: ${result.rejection.message}). Archive '${options.displayName ?? options.filename}' and start clean, or restore from backup.`,
-        );
+        throw error;
       }
-      if (event.seq > head) head = event.seq;
+      // A WAL reader used to open successfully while another writer held its
+      // transaction. Preserve that behaviour even if an index needs repair:
+      // use whole-log reads until an append repairs it, or the next open does.
     }
-    return new SqliteThreadStore(db, options.clock ?? wallClock, state, head);
+    return new SqliteThreadStore(db, options.clock ?? wallClock, state, head, indexAvailable);
   }
 
   /** Close the underlying database. Idempotent. */
@@ -222,6 +384,7 @@ export class SqliteThreadStore implements ThreadStore {
       const currentHead = maxSeqStmt.get()?.seq ?? 0;
       if (currentHead > this.#head) this.#head = currentHead;
 
+      this.#repairIndexForWrite(currentHead);
       const seq = this.#head + 1;
       const candidate = { ...input, seq, ts } as ReviewEvent;
       const parsed = reviewEventSchema.safeParse(candidate);
@@ -235,10 +398,13 @@ export class SqliteThreadStore implements ThreadStore {
       const result = validateNext(this.#logState, event);
       if (!result.ok) throw new ThreadStoreAppendError(result.rejection);
       insertStmt.run(seq, ts, JSON.stringify(event));
+      projectionWriter(this.#db)(event, routeEvent(event, (id) => this.#logState.commentIndex.get(id)));
+      checkpointProjection(this.#db, seq);
       this.#head = seq;
       return { seq, event };
     });
     const { seq } = txn.immediate();
+    this.#indexAvailable = true;
     return seq;
   }
 
@@ -253,15 +419,35 @@ export class SqliteThreadStore implements ThreadStore {
     if (events.length === 0) return;
     const insert = this.#db.prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)");
     this.#db.transaction(() => {
+      this.#repairIndexForWrite(this.#db.query<{ seq: number }, []>("SELECT COALESCE(MAX(seq), 0) AS seq FROM events").get()!.seq);
+      const owners = new Map(this.#logState.commentIndex);
+      const write = projectionWriter(this.#db);
       for (const event of events) {
         insert.run(event.seq, event.ts, JSON.stringify(event));
+        const route = routeEvent(event, (id) => owners.get(id));
+        write(event, route);
+        if (route.commentOwner !== undefined) owners.set(route.commentOwner.commentId, route.commentOwner.threadId);
       }
-    })();
+      checkpointProjection(this.#db, events.at(-1)!.seq);
+    }).immediate();
+    this.#indexAvailable = true;
     for (const event of events) {
       // Cannot fail — the dry run accepted this exact sequence.
       validateNext(this.#logState, event);
       this.#head = event.seq;
     }
+  }
+
+  /** Called under the append/import write lock. Startup may have deferred an
+   * index repair, or an older binary may have appended without routing rows. */
+  #repairIndexForWrite(head: number): void {
+    if (this.#indexAvailable) {
+      const meta = this.#db.query<{ version: number; last_seq: number }, []>("SELECT version, last_seq FROM thread_index_meta WHERE singleton = 1").get();
+      if (meta?.version === THREAD_INDEX_VERSION && meta.last_seq === head) return;
+    }
+    const events = this.#db.query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC").all()
+      .map((row) => reviewEventSchema.parse(JSON.parse(row.payload)));
+    synchronizeThreadIndex(this.#db, events, head);
   }
 
   async since(after: number): Promise<ReviewEvent[]> {
@@ -275,7 +461,27 @@ export class SqliteThreadStore implements ThreadStore {
     // review-core owns the reduce → sort → filter sequence in
     // `selectThreads` so a new filter rule shows up on this store and
     // on `InMemoryThreadStore` at once, without a copy-paste.
-    const events = await this.since(0);
+    if (filter?.path === undefined || !this.#indexAvailable) return selectThreads(await this.since(0), filter);
+    // Read checkpoint + events in one WAL snapshot. An old binary can append
+    // without routing; use the log if its head outgrew the projection checkpoint.
+    // The next open (or append) heals that gap. New instances route atomically.
+    const rows = this.#db.transaction(() => {
+      const current = this.#db.query<{ ready: number }, [number]>(`
+        SELECT EXISTS(SELECT 1 FROM thread_index_meta WHERE singleton = 1 AND version = ?
+          AND last_seq = (SELECT COALESCE(MAX(seq), 0) FROM events)) AS ready
+      `).get(THREAD_INDEX_VERSION)!.ready;
+      if (!current) return this.#db.query<{ payload: string }, []>("SELECT payload FROM events ORDER BY seq ASC").all();
+      // Complete histories include comment-only edits/links and earlier anchors.
+      // selectThreads still owns result ordering and status filtering.
+      return this.#db.query<{ payload: string }, [string]>(`
+        SELECT payload FROM events WHERE seq IN (
+          SELECT thread_events.seq FROM thread_paths
+          JOIN thread_events ON thread_events.thread_id = thread_paths.thread_id
+          WHERE thread_paths.path = ?
+        ) ORDER BY seq ASC
+      `).all(routingKey(filter.path!));
+    })();
+    const events = rows.map((row) => reviewEventSchema.parse(JSON.parse(row.payload)));
     return selectThreads(events, filter);
   }
 
