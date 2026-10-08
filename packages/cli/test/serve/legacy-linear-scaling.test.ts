@@ -28,16 +28,37 @@ function medianRecovery(run: () => ReturnType<typeof recoverLegacyAnchor>) {
 
 for (const marker of ["- ", "> "]) test(`legacy recovery scales linearly across nesting depths: ${marker}`, async () => {
   const times: number[] = [];
-  // Warm the renderer and recovery before measuring independent snapshots.
-  const warm = await renderProvenance("/repo", PATH, "deep x");
-  recoverLegacyAnchor(warm, "deep x", { path: PATH, startLine: 1, endLine: 1, revision: await revisionOf("deep x"), quote: { exact: "deep", prefix: "", suffix: "" } });
+  const probes = [];
   for (const depth of [125, 250, 500, 1000]) {
     const source = marker.repeat(depth) + "deep x";
     const rendered = await renderProvenance("/repo", PATH, source);
     const anchor: Anchor = { path: PATH, startLine: 1, endLine: 1, revision: await revisionOf(source), quote: { exact: "deep", prefix: "", suffix: "" } };
     // Fresh identities include indexing in every repetition. Rendering stays
     // outside the measured recovery window.
-    const { median, recovered } = medianRecovery(() => recoverLegacyAnchor({ ...rendered }, source, anchor));
+    const run = () => recoverLegacyAnchor({ ...rendered }, source, anchor);
+    // Give every depth one untimed warm-up before sampling.
+    probes.push({ depth, run, recovered: run(), samples: [] as number[] });
+  }
+  for (let sample = 0; sample < SAMPLE_COUNT; sample++) {
+    Bun.gc(true);
+    const elapsed = probes.map(() => 0);
+    let repetitions = 0;
+    // Measure every depth once per round, even after a depth reaches 20 ms,
+    // so a slow phase affects all depths during the same sample.
+    do {
+      for (const [index, probe] of probes.entries()) {
+        const before = performance.now();
+        probe.recovered = probe.run();
+        elapsed[index]! += performance.now() - before;
+      }
+      repetitions++;
+    } while (elapsed.some(time => time < SAMPLE_MIN_MS));
+    for (const [index, probe] of probes.entries()) {
+      probe.samples.push(elapsed[index]! / repetitions);
+    }
+  }
+  for (const { depth, samples, recovered } of probes) {
+    const median = samples.sort((a, b) => a - b)[Math.floor(SAMPLE_COUNT / 2)]!;
     expect(recovered?.quote.exact).toBe("deep");
     expect([recovered?.startLine, recovered?.endLine]).toEqual([1, 1]);
     times.push(median);
