@@ -1,7 +1,9 @@
 // Manual scaling probe for #115; deliberately outside bun test/CI.
 // From the repository root: nix develop -c bun packages/cli/bench/indexed-threads.ts
 // Copy this same script into an origin/dev scratch checkout for the baseline.
-// Seeding, startup and warm-up are excluded. No timing assertions.
+// Read probes exclude seeding/startup/warm-up. Cold-store opens and logical
+// database bytes are measured separately below. No timing assertions.
+import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,6 +43,48 @@ async function mean(run: () => Promise<unknown>): Promise<number> {
   const start = performance.now();
   for (let i = 0; i < SAMPLES; i++) await run();
   return (performance.now() - start) / SAMPLES;
+}
+
+function logicalBytes(db: Database): number {
+  const pageSize = db.query<{ page_size: number }, []>("PRAGMA page_size").get()!.page_size;
+  const pageCount = db.query<{ page_count: number }, []>("PRAGMA page_count").get()!.page_count;
+  return pageSize * pageCount;
+}
+
+function coldStoreProbe(root: string, eventCount: number): void {
+  const filename = join(root, `cold-${eventCount}.sqlite`);
+  const legacy = new Database(filename, { create: true });
+  let beforeBytes: number;
+  try {
+    // origin/dev's schema, canonical log rows, no routing indexes. The first
+    // open measures migration; subsequent fresh instances verify current rows.
+    legacy.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE events (seq INTEGER PRIMARY KEY, ts TEXT NOT NULL, payload TEXT NOT NULL);
+      CREATE INDEX events_ts ON events (ts);
+      CREATE TABLE snapshots (revision TEXT PRIMARY KEY, source TEXT NOT NULL, bytes INTEGER NOT NULL, created_at TEXT NOT NULL);
+    `);
+    const insert = legacy.prepare("INSERT INTO events (seq, ts, payload) VALUES (?, ?, ?)");
+    legacy.transaction(() => {
+      for (const event of archive(eventCount).events) insert.run(event.seq, event.ts, JSON.stringify(event));
+    })();
+    beforeBytes = logicalBytes(legacy);
+  } finally {
+    legacy.close();
+  }
+  const opens: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    const start = performance.now();
+    const store = SqliteThreadStore.open({ filename });
+    opens.push(performance.now() - start);
+    store.close();
+  }
+  const measured = new Database(filename);
+  try {
+    report(`cold-store ${eventCount}: migration ${opens[0]!.toFixed(1)} ms; reopens ${opens.slice(1).map((value) => value.toFixed(1)).join(" / ")} ms; logical bytes ${beforeBytes} -> ${logicalBytes(measured)}`);
+  } finally {
+    measured.close();
+  }
 }
 
 report(`bun ${Bun.version}; ${process.platform}/${process.arch}; ${PATH_COUNT} threaded paths; mean of ${SAMPLES} warm calls`);
@@ -110,6 +154,9 @@ try {
   } finally {
     await daemon.stop();
   }
+  // Fresh store instances; OS filesystem caches are warm. Logical size is
+  // page_count * page_size, including pages currently residing in WAL.
+  for (const eventCount of [5000, 50000]) coldStoreProbe(root, eventCount);
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
