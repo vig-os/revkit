@@ -47,6 +47,7 @@ import {
   type ReviewEvent,
   type ReviewEventInput,
   type ReviewState,
+  type ViewerReviewSummary,
   type ReviewSubmitEvent,
   type Thread,
   type ThreadFilter,
@@ -77,6 +78,7 @@ import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daem
 import { contentTypeForExtension } from "./mime.ts";
 import { promotionAtSeq, threadLifecycleIntents } from "./promotion-provenance.ts";
 import { guardPendingPromotionDestination, guardPromotionDestination, guardPromotionReview } from "./promotion-review-guard.ts";
+import { isUnchangedSyncFailure } from "./sync-failure.ts";
 import { createAsyncMutex } from "./review-operation-mutex.ts";
 import {
   AuthState,
@@ -2642,6 +2644,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
     const remoteThreads = await review.options.adapter.listReviewThreads(review.options.pr);
     const remoteById = new Map(remoteThreads.map((thread) => [thread.id, thread]));
+    const state = await review.readState(store);
+    const lifecycle = reduceThreadLifecycleStates(events);
+    const destination = state.openPending?.reviewNodeId ?? null;
+    const refusedReviews = new Map<string, ViewerReviewSummary | null>();
+    const observingAdapter = {
+      async getReviewById(reviewNodeId: string) {
+        if (refusedReviews.has(reviewNodeId)) return refusedReviews.get(reviewNodeId) ?? null;
+        const remote = await review.options.adapter.getReviewById(reviewNodeId);
+        // Cache refusals within this pass. Allowed writes/heals each need a
+        // fresh pending observation immediately before acting.
+        if (remote?.state !== "PENDING" || reviewNodeId !== destination) refusedReviews.set(reviewNodeId, remote);
+        return remote;
+      },
+    };
     for (const [threadId, intent] of pending) {
       const { desiredResolved, intentSeq } = intent;
       const thread = await store.thread(threadId);
@@ -2651,11 +2667,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const remote = remoteById.get(external.threadId);
       if (remote === undefined) continue;
       if (intent.actorKind === "agent") {
-        const state = await review.readState(store);
-        const guard = await guardPendingPromotionDestination(state.openPending?.reviewNodeId ?? null, intent.promotion, review.options.adapter);
+        const guard = await guardPendingPromotionDestination(destination, intent.promotion, observingAdapter);
         if (!guard.ok) {
-          await appendReviewLifecycleEvent({ kind: "thread.sync_failed", actor: localActor,
-            threadId, intentSeq, reason: guard.error }, requestId);
+          if (!isUnchangedSyncFailure(lifecycle.get(threadId)?.syncFailure, intentSeq, guard.error)) {
+            await appendReviewLifecycleEvent({ kind: "thread.sync_failed", actor: localActor,
+              threadId, intentSeq, reason: guard.error }, requestId);
+          }
           continue;
         }
       }
@@ -2665,6 +2682,22 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           await review.options.adapter.resolveReviewThread({ threadNodeId: external.threadId });
         } else {
           await review.options.adapter.unresolveReviewThread({ threadNodeId: external.threadId });
+        }
+        if (intent.actorKind === "agent" && intent.promotion?.reviewNodeId !== undefined) {
+          const reviewNodeId = intent.promotion.reviewNodeId;
+          try {
+            // GitHub has no conditional resolve/unresolve. Detect a submit
+            // landing after our check, but keep the completion truthful.
+            const afterWrite = await review.options.adapter.getReviewById(reviewNodeId);
+            if (afterWrite?.state !== "PENDING") {
+              refusedReviews.set(reviewNodeId, afterWrite);
+              logger.warn("review.thread-promotion-race", { requestId, threadId, intentSeq, reviewNodeId,
+                reason: "promotion-review-ended-during-write", from: "PENDING", to: afterWrite?.state ?? "missing" });
+            }
+          } catch (error) {
+            logger.warn("review.thread-promotion-race", { requestId, threadId, intentSeq, reviewNodeId,
+              reason: "post-write-review-read-failed", errorKind: (error as Error).name });
+          }
         }
       }
       try {

@@ -31,3 +31,27 @@ describe("#155 lifecycle refusal events", () => {
     expect(reduceReviewState([...events, { ...envelope, seq: 6, kind: "thread.reopened", threadId: "th-1" }]).lifecycleFailures).toEqual([]);
   });
 });
+
+
+describe("#155 R1 — sync outcome actor restrictions", () => {
+  const outcomes: ReviewEvent[] = [failure,
+    { ...envelope, seq: 5, kind: "comment.sync_failed", commentId: "c-1", reason: "promotion-review-unbound" },
+    { ...envelope, seq: 5, kind: "thread.external_synced", threadId: "th-1", resolved: true, intentSeq: 3 },
+  ];
+  for (const outcome of outcomes) {
+    test(`${outcome.kind} refuses agent outcomes and retains legitimate writers`, () => {
+      const state = emptyLogState();
+      expect(validateNext(state, created).ok).toBe(true);
+      for (const actorKind of ["agent", "system", "gh-user"] as const) {
+        if (outcome.kind === "thread.external_synced" && actorKind === "gh-user") continue;
+        const actor = { kind: actorKind, id: "untrusted" };
+        expect(validateNext(state, { ...outcome, actor })).toMatchObject({ ok: false, rejection: { kind: "invalid-actor", actor } });
+      }
+      expect(validateNext(state, outcome).ok).toBe(true);
+      // The GitHub import path records external observations under gh-user.
+      if (outcome.kind === "thread.external_synced") {
+        expect(validateNext(state, { ...outcome, actor: { kind: "gh-user", id: "github" } }).ok).toBe(true);
+      }
+    });
+  }
+});

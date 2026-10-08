@@ -696,3 +696,23 @@ an intent. Existing completion correlation makes repeated promotion/reconcile
 apply that approved lifecycle change once.
 
 Refs: #155, #136, #148
+
+Lifecycle promotions are checked immediately before each write; a submit landing
+between the check and the write is detected and logged, not prevented. GitHub has
+no conditional resolve/unresolve mutation. The daemon re-reads the bound review
+immediately after an accepted mutation and logs `review.thread-promotion-race`
+with the thread, intent sequence, review, and observed transition if it ended.
+It still records `thread.external_synced`, because the mutation happened, and
+never auto-reverts it. A failed post-write read also produces a structured warning
+without discarding the accepted completion.
+
+Unchanged lifecycle and comment refusals append no additional sync-failure event
+when the current intent sequence and reason already match. Both reconcilers use
+one shared comparison rule; a new intent or changed reason remains observable
+(#154). The lifecycle pass reads local review state once and caches remote
+refusals per review, while allowed writes and completion healing retain fresh
+pending observations. Sync failures require a local reviewer actor. External
+sync completions require a local reviewer or the legitimate `gh-user` import
+actor; agent-authored outcomes are rejected by the shared validator.
+
+Refs: #155, #154, #151

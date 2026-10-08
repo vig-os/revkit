@@ -346,3 +346,15 @@ ordinary reconcile cannot supply that approval. The shared lifecycle reducer
 continues to govern supersession and intent-correlated completions.
 
 Refs: #155, #136, #148
+
+Lifecycle promotions are checked immediately before each write; a submit landing
+between the check and the write is detected and logged, not prevented. GitHub
+cannot condition resolve/unresolve on the review remaining pending. A post-write
+review read detects a terminal transition and records a structured warning naming
+the thread, intent, and review; `thread.external_synced` still records the accepted
+mutation. There is no automatic reversal. Read failures after acceptance warn
+without losing the completion. ADR-0006's #155 addition also specifies unchanged
+failure deduplication (#154), per-pass refusal caching, and sync-outcome actor
+restrictions that preserve GitHub imports.
+
+Refs: #155, #154, #151
