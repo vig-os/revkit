@@ -8,8 +8,8 @@
 import { dispatch } from "../src/index.ts";
 
 const result = await dispatch(process.argv.slice(2));
-if (result.stdout) process.stdout.write(result.stdout);
 if (result.stderr) process.stderr.write(result.stderr);
+if (result.stdout) process.stdout.write(result.stdout);
 if (result.blockForever) {
   await result.blockForever;
 }

@@ -12,7 +12,7 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { GitHubAdapter } from "@revkit/review-core";
+import { GitHubAdapter, type GhReviewThread } from "@revkit/review-core";
 import { runReviewCommand } from "../../src/review/cli.ts";
 import { spawnGit } from "../../src/git-runner.ts";
 import type { GhRunner } from "../../src/gh-runner.ts";
@@ -91,6 +91,71 @@ function makeEnv(fixtureCwd: string, prs: readonly FakePr[]): Parameters<typeof 
 /** Add a `"name": "revkit"` package.json to the fixture so
  * `findRepoRootByPackageJson` accepts it. */
 const BASE_PKG_JSON = JSON.stringify({ name: "revkit", private: true }, null, 2);
+
+describe("#114 — refused imports fail preparation but keep serving available", () => {
+  for (const serve of [false, true]) {
+    test(`a malformed GitHub link ${serve ? "serves with a warning and a final failure code" : "fails --no-serve"}`, async () => {
+      const fixture = await makeFixtureRepo({
+        base: { message: "base", files: [
+          { kind: "file", path: "package.json", content: BASE_PKG_JSON },
+          { kind: "file", path: "docs/index.md", content: "# base\n" },
+          MIN_VOCAB_YAML,
+        ] },
+        head: { message: "content edit", files: [
+          { kind: "file", path: "docs/index.md", content: "# PR edit\n" },
+        ] },
+      });
+      tempDirsToClean.push(fixture.repoDir);
+      const remote: GhReviewThread = {
+        id: "PRT_bad", path: "docs/index.md", isResolved: false, isOutdated: false,
+        resolvedByLogin: null, diffSide: "RIGHT", startDiffSide: null,
+        line: 1, originalLine: 1, startLine: null, originalStartLine: null, subjectType: "LINE",
+        comments: [{
+          nodeId: "PRRC_bad", databaseId: 0, body: "please review", authorLogin: "reviewer",
+          authorType: "User", createdAt: "2026-10-01T00:00:00Z",
+          url: "https://github.com/vig-os/revkit/pull/114#discussion_r0",
+          originalCommitOid: fixture.headSha, diffHunk: null,
+        }],
+      };
+      const pr: FakePr = {
+        owner: "vig-os", repo: "revkit", pullNumber: 114, nodeId: "PR_114",
+        title: "malformed import", state: "open", headSha: fixture.headSha, headRef: "pr",
+        baseSha: fixture.baseSha, baseRef: fixture.baseRef,
+        headRepoFullName: "vig-os/revkit", baseRepoFullName: "vig-os/revkit",
+        url: "https://github.com/vig-os/revkit/pull/114", threads: [remote],
+      };
+      let starts = 0;
+      const env = {
+        ...makeEnv(fixture.repoDir, [pr]),
+        startServe: async () => {
+          starts++;
+          return { url: "http://127.0.0.1:1", port: 1, launchUrl: "http://127.0.0.1:1",
+            blockForever: Promise.resolve(), async stop() {} };
+        },
+      };
+      const result = await runReview(fixture.repoDir, serve ? ["114"] : ["114", "--no-serve"], env, [pr]);
+      expect(result.exitCode).toBe(1);
+      if (serve) {
+        expect(starts).toBe(1);
+        expect(result.stdout).toContain("revkit serve: listening on http://127.0.0.1:1");
+        expect(result.stderr).toContain("WARNING: 1 PR thread event(s) refused; these GitHub comments were not imported");
+        expect(result.blockForever).toBeDefined();
+        await result.blockForever;
+      } else {
+        expect(starts).toBe(0);
+        expect(result.stderr).toContain("1 PR thread event(s) refused");
+        expect(result.stdout).not.toContain("revkit serve: listening");
+        expect(result.blockForever).toBeUndefined();
+      }
+      expect(result.stderr).toContain("see import.refused logs above");
+      expect(result.stderr).toContain("comment.linked");
+      expect(result.stderr).toContain("invalid-shape");
+      expect(result.stderr).not.toContain(remote.comments[0]!.body);
+      expect(result.stdout).toContain("import: 1 new PR thread events, 0 already-present");
+      expect(result.stdout).not.toContain("Prepared review");
+    });
+  }
+});
 
 describe("revkit review — fork refusal", async () => {
   const fixture = await makeFixtureRepo({

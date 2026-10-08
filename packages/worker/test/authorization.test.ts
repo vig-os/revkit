@@ -1888,6 +1888,9 @@ describe("ADR-0012's per-request gate", () => {
         // which seeds the bucket; this file's job is that the answer carries the
         // policy, and a 404 that leaked a body would be the thing to catch.
         { label: "preview 404 (gated, nothing published under it)", path: "/revkit/pr-7/index.html", init: (i) => ({ headers: authHeaders(i) }), expected: 404 },
+        // #133: R2 throws above 1024 bytes. This 1025-byte key must be refused
+        // before the read, preserving the same hygiene as every other answer.
+        { label: "preview 404 (over R2's key limit)", path: `/revkit/pr-7/${"a".repeat(1008)}.html`, init: (i) => ({ headers: authHeaders(i) }), expected: 404 },
       ];
       for (const step of steps) {
         // A session per step, and only for the steps that need one — minting
