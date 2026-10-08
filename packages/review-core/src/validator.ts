@@ -433,6 +433,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       thread.lifecycle = { target: "reopen", actorKind: event.actor.kind };
       return { ok: true };
     }
+    case "thread.sync_failed":
     case "thread.external_synced": {
       if (!state.threads.has(event.threadId)) return unknownThread(event.threadId, event.kind);
       return { ok: true };

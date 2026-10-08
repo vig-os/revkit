@@ -663,3 +663,36 @@ an internal log inconsistency (`promotion-record-missing`, HTTP 500), distinct
 from a historical event without a binding.
 
 Refs: #136, #148
+
+
+## Amendment (issue #155): lifecycle promotions carry review provenance
+
+An agent action reaches GitHub only within the review the reviewer approved it
+in. Resolve/reopen intents resolve their exact `draft.promoted` event through the
+same provenance module as comments. The shared lifecycle derivation still decides
+which change is current and whether a later change supersedes it.
+
+Before each promoted resolve/unresolve mutation or completion healing, including
+read-only boot healing, the daemon reads the bound review from GitHub. The binding
+must name the current review and its remote state must be `PENDING`. A submitted,
+deleted, or otherwise terminal review yields `promotion-review-not-pending`; a
+pending binding to another current review yields `promotion-review-mismatch`;
+legacy promotions without a review identity yield `promotion-review-unbound`.
+No mutation or completion is recorded for a refused intent. A refusal never
+prevents independent reviewer-authored lifecycle intents in the pass from running.
+
+`thread.sync_failed(threadId, intentSeq, reason)` is the smallest new event:
+comment failures cannot identify a lifecycle intent. Its reason is restricted to
+these three promotion refusals. The schema requires a positive intent sequence;
+the validator requires a known thread. The event changes no thread baseline.
+The review view exposes failures only for the current intent, clearing them on
+supersession, a new promotion, or correlated completion. Historical promotions
+continue to load, but unbound lifecycle promotions never replay.
+
+The rail explains the refusal and offers "Promote to this review", disabled until
+there is a current review. This cookie-authenticated action explicitly names the
+current review and appends a fresh bound promotion. Reconciliation never rebinds
+an intent. Existing completion correlation makes repeated promotion/reconcile
+apply that approved lifecycle change once.
+
+Refs: #155, #136, #148

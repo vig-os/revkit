@@ -73,6 +73,10 @@ const validPerKind: Record<ReviewEvent["kind"], ReviewEvent> = {
     intentSeq: 3,
     resolvedByLogin: "gerchowl",
   },
+  "thread.sync_failed": {
+    seq: 6, ts: t, actor, kind: "thread.sync_failed", threadId: "th-1",
+    intentSeq: 3, reason: "promotion-review-unbound",
+  },
   handover: {
     seq: 5,
     ts: t,

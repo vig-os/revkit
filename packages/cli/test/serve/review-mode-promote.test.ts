@@ -1734,3 +1734,114 @@ describe("#136 R1 — promotion binding is enforced at the destination", () => {
     expect(restarted.fake.drafts.filter((entry) => entry.body === body)).toHaveLength(1);
   });
 });
+
+// #155: immediate lifecycle mutations obey the same review binding as comments.
+describe("#155 — lifecycle promotion review binding", () => {
+  async function reconcileLifecycle(ctx: Ctx): Promise<void> {
+    const response = await fetch(`${ctx.handle.url}/api/review/reconcile`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: ctx.handle.url, "sec-fetch-site": "same-origin", cookie: ctx.cookie },
+      body: "{}",
+    });
+    expect(response.status).toBe(201);
+  }
+
+  async function failedPromotion(target: "resolve" | "reopen", loseResponse = false) {
+    const operation = target === "resolve" ? "ResolveReviewThread" : "UnresolveReviewThread";
+    const ctx = await startCtx({ threads: [importedThread("PRT_binding", target === "reopen"), importedThread("PRT_control")],
+      ...(loseResponse ? { loseResponseOnce: operation } : { failBeforeOnce: operation }) });
+    const imported = await refreshAndReadImportedThread(ctx);
+    expect((await postComment(ctx, "open review A", "lifecycle-A")).status).toBe(201);
+    const reviewA = ctx.fake.reviewNodeId!;
+    expect((await agentLifecycle(ctx, imported.id, target, {})).status).toBe(201);
+    expect((await promote(ctx, { threadId: imported.id, target })).status).toBe(500);
+    expect(ctx.fake.resolutions).toHaveLength(loseResponse ? 1 : 0);
+    return { ctx, threadId: imported.id, reviewA };
+  }
+
+  async function submitA(ctx: Ctx, reviewA: string) {
+    const adapter = new GitHubAdapter({ token: staticToken, fetch: ctx.fakeFetch });
+    await adapter.submitReview({ reviewId: reviewA, event: "COMMENT" });
+  }
+
+  async function assertRefused(ctx: Ctx, threadId: string, reason: string) {
+    const events = await readRawEvents(ctx.sqlitePath);
+    const promotion = [...events].reverse().find((event) => event.kind === "draft.promoted" && event.threadId === threadId)!;
+    expect(events.filter((event) => event.kind === "thread.external_synced" && event.threadId === threadId)).toHaveLength(0);
+    expect(events).toContainEqual(expect.objectContaining({ kind: "thread.sync_failed", threadId, intentSeq: promotion.seq, reason }));
+    const response = await fetch(`${ctx.handle.url}/api/review/state`, { headers: { cookie: ctx.cookie, "sec-fetch-site": "same-origin" } });
+    const body = await response.json() as { state: { lifecycleFailures: unknown[] } };
+    expect(body.state.lifecycleFailures).toContainEqual(expect.objectContaining({ threadId, reason }));
+  }
+
+  for (const target of ["resolve", "reopen"] as const) {
+    test(`${target}: A submitted remotely refuses replay`, async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion(target);
+      await submitA(ctx, reviewA);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+    });
+
+    test(`${target}: B open refuses A; independent reviewer intent runs; fresh B promotion applies once`, async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion(target);
+      await submitA(ctx, reviewA);
+      expect((await postComment(ctx, "observe submitted A", "lifecycle-observe")).status).toBe(201);
+      expect((await postComment(ctx, "open B", "lifecycle-B")).status).toBe(201);
+      const reviewB = ctx.fake.reviewNodeId!;
+      expect(reviewB).not.toBe(reviewA);
+      const store = SqliteThreadStore.open({ filename: ctx.sqlitePath });
+      try {
+        const control = (await store.threads()).find((thread) => thread.external?.provider === "github" && thread.external.threadId === "PRT_control")!;
+        await store.append({ kind: "thread.resolved", actor: { kind: "local", id: "p70-user" }, threadId: control.id });
+      } finally { store.close(); }
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toEqual([{ threadNodeId: "PRT_control", op: "resolve" }]);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+      const request = { threadId, target, reviewNodeId: reviewB };
+      expect((await promote(ctx, request)).status).toBe(201);
+      expect((await promote(ctx, request)).status).toBe(200);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions.filter((entry) => entry.threadNodeId === "PRT_binding")).toEqual([{ threadNodeId: "PRT_binding", op: target === "resolve" ? "resolve" : "unresolve" }]);
+      const state = await (await fetch(`${ctx.handle.url}/api/review/state`, { headers: { cookie: ctx.cookie, "sec-fetch-site": "same-origin" } })).json() as { state: { lifecycleFailures: unknown[] } };
+      expect(state.state.lifecycleFailures).toEqual([]);
+    });
+
+    test(`${target}: legacy unbound promotion is refused after restart`, async () => {
+      let { ctx, threadId } = await failedPromotion(target);
+      await ctx.handle.stop();
+      const db = new Database(ctx.sqlitePath);
+      try {
+        for (const row of db.query<{ seq: number; payload: string }, []>("SELECT seq, payload FROM events").all()) {
+          const event = JSON.parse(row.payload);
+          if (event.kind !== "draft.promoted") continue;
+          delete event.reviewNodeId;
+          db.query("UPDATE events SET payload = ? WHERE seq = ?").run(JSON.stringify(event), row.seq);
+        }
+      } finally { db.close(); }
+      ctx = await restartCtx(ctx);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+      await assertRefused(ctx, threadId, "promotion-review-unbound");
+    });
+
+    test(`${target}: matching remote state cannot heal completion after A ends`, async () => {
+      let { ctx, threadId, reviewA } = await failedPromotion(target, true);
+      await submitA(ctx, reviewA);
+      ctx = await restartCtx(ctx);
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(1);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+    });
+
+    test(`${target}: remote submit after comment reconciliation is observed before mutation`, async () => {
+      const { ctx, threadId, reviewA } = await failedPromotion(target);
+      ctx.hooks.beforeGetReviewById = async () => {
+        ctx.hooks.beforeGetReviewById = async () => { await submitA(ctx, reviewA); };
+      };
+      await reconcileLifecycle(ctx);
+      expect(ctx.fake.resolutions).toHaveLength(0);
+      await assertRefused(ctx, threadId, "promotion-review-not-pending");
+    });
+  }
+});

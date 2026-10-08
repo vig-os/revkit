@@ -77,7 +77,7 @@ function random(seed: number): () => number {
 const neutralKinds = [
   "handover", "delivery.mode_changed", "ask.created", "ask.answered", "ask.cancelled", "ask.expired",
   "doc.published", "review.opened", "review.submitted", "review.abandoned", "comment.sync_requested",
-  "comment.sync_failed", "comment.sync_cancelled", "build.requested", "build.started", "build.succeeded", "build.failed",
+  "thread.sync_failed", "comment.sync_failed", "comment.sync_cancelled", "build.requested", "build.started", "build.succeeded", "build.failed",
 ] as const satisfies readonly ReviewEventKind[];
 type GeneratedKind = Exclude<ReviewEventKind, typeof neutralKinds[number]>;
 interface GeneratorContext {

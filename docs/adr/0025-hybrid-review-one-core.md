@@ -325,3 +325,24 @@ intent remains in the log. Ordinary reconciliation never rebinds a promotion.
 ADR-0006's round-one addition specifies the error vocabulary and request shape.
 
 Refs: #136, #148
+
+
+## Amendment (issue #155): review-bound lifecycle promotion replay
+
+The review binding for promoted agent actions also governs immediate GitHub
+resolve/unresolve operations. The daemon uses the shared promotion provenance
+module and observes the bound review's remote state immediately before mutation
+or completion healing. It must be the current review and remotely `PENDING`.
+A missing, terminal, or different binding records a typed `thread.sync_failed`
+with the vocabulary specified in ADR-0006's #155 amendment and causes no lifecycle
+mutation or completion. Legacy unbound promotions are refused across restart.
+Reviewer-authored lifecycle intents remain independent and continue in the same
+reconciliation pass.
+
+The rail projects durable refusals and requires a fresh "Promote to this review"
+click naming the current review before retrying an agent action in another review.
+A new bound promotion replaces authorization for the current lifecycle change;
+ordinary reconcile cannot supply that approval. The shared lifecycle reducer
+continues to govern supersession and intent-correlated completions.
+
+Refs: #155, #136, #148
