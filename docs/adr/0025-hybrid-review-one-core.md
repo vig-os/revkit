@@ -288,3 +288,21 @@ hosted draft until that surface designs the same act — and because
 `reduceReviewState`'s `agentDrafts` is a derivation over the shared core, the
 hosted surface gets the same *view* of the draft list for free if it wants it.
 Refs: #70, #59, #8
+
+
+## Amendment (2026-10-08, issue #136): promotion recovery preserves review identity
+
+The local promotion route records the pending review's GitHub node id in
+`draft.promoted.reviewNodeId`. Both route retries and boot intent recovery use the
+same guard: the recorded review must still be the open pending review. A newer
+review cannot inherit an incomplete promotion from a submitted, discarded, or
+head-move-abandoned review. The route returns HTTP 409 with
+`promotion-review-mismatch`; recovery skips and logs it.
+
+Historical promotions without a review binding still load, but cannot be retried
+or healed (`promotion-review-unbound`). ADR-0006's issue #136 amendment defines
+the backward-compatible schema and validator rule. Boot recovery remains a local
+append followed by read-only remote reconciliation. The hosted promotion surface
+remains outside this amendment.
+
+Refs: #136, #123, #70

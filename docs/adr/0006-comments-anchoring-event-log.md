@@ -586,3 +586,36 @@ path, `stat`-poll for the swap-damaged ones — and this adds the one shape that
 directory whose own `fs.watch` callback observes it disappear now installs the same `stat`-poll every
 other teardown path installs, so **every tracked directory is always in exactly one of watch or poll,
 never neither**. Refs: #69
+
+
+## Amendment (2026-10-08, issue #136): promotions bind to a pending review
+
+`draft.promoted` now carries an optional `reviewNodeId`, the GitHub GraphQL
+node id of the pending review the reviewer attached the draft to. New promotions
+always write it for all three targets (`comment`, `resolve`, `reopen`). The node
+id identifies the remote review itself: it survives daemon restart, is already
+persisted by `review.opened`, and is the identity used by GitHub reconcile. A local
+sequence identifies an event in one log rather than the remote review.
+
+The field remains optional so historical events still parse and replay. The
+transition validator accepts an unbound historical promotion; a bound promotion
+must name a review that is pending at the point it is appended. No event-log
+version bump or migration is required.
+
+The promote route and `healMissingPromotionIntents` share one guard. An absent
+open review yields `no-open-pending-review`. An existing promotion whose node id
+differs from the open review yields `promotion-review-mismatch`. A historical
+promotion without a node id yields `promotion-review-unbound`: its intended
+review cannot be proved, so neither retry nor boot recovery may construct a new
+intent from it. The route returns these typed errors with HTTP 409; boot skips
+the promotion and logs the refusal reason. Already-recorded machine intents keep
+their existing reconciliation semantics.
+
+This closes the incomplete-promotion window: promotion into A, A submitted,
+B opened, daemon restarted. Recovery must not construct an intent that a later
+cookie-authenticated reconcile could publish into B without a promotion click in
+B. The same rule covers discard and head-move abandonment. Legacy promotions are
+left as historical records; recovery never guesses their target review from the
+currently open review.
+
+Refs: #136, #123, #70

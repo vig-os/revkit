@@ -424,3 +424,34 @@ describe("reduceReviewState — droppedReviewerIntents (issue #70 round 3)", () 
     ]);
   });
 });
+
+describe("#136 — draft.promoted review binding", () => {
+  test("the review node id survives parsing for every target while legacy events still validate", () => {
+    const base = { seq: 2, ts: t, actor: localActor, kind: "draft.promoted", threadId: "th-1" } as const;
+    for (const target of ["comment", "resolve", "reopen"] as const) {
+      const event = { ...base, target, ...(target === "comment" ? { commentId: "c-1" } : {}) };
+      expect(reviewEventSchema.parse({ ...event, reviewNodeId: "PRR_A" })).toMatchObject({ reviewNodeId: "PRR_A" });
+      expect(reviewEventSchema.safeParse(event).success).toBe(true);
+      expect(reviewEventSchema.safeParse({ ...event, reviewNodeId: "" }).success).toBe(false);
+    }
+    const legacy = promoted(2, { threadId: "th-1", target: "comment", commentId: "c-1" });
+    expect(validateNext(withValidated([agentComment(1, "th-1", "c-1")]), legacy).ok).toBe(true);
+  });
+
+  test("a bound promotion must name a review that is still pending at append time", () => {
+    const opened: ReviewEvent = { seq: 2, ts: t, actor: localActor, kind: "review.opened", reviewNodeId: "PRR_A", headSha: HEAD_A };
+    const bound = promoted(3, { threadId: "th-1", target: "comment", commentId: "c-1", reviewNodeId: "PRR_A" });
+    expect(validateNext(withValidated([agentComment(1, "th-1", "c-1"), opened]), bound).ok).toBe(true);
+    const missing = validateNext(withValidated([agentComment(1, "th-1", "c-1")]), bound);
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.rejection.kind).toBe("promotion-review-mismatch");
+    for (const terminal of [
+      { seq: 3, ts: t, actor: localActor, kind: "review.submitted", reviewNodeId: "PRR_A", event: "COMMENT" },
+      { seq: 3, ts: t, actor: localActor, kind: "review.abandoned", reviewNodeId: "PRR_A", reason: "user-discarded" },
+    ] as const) {
+      const result = validateNext(withValidated([agentComment(1, "th-1", "c-1"), opened, terminal]), { ...bound, seq: 4 });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.rejection.kind).toBe("promotion-review-mismatch");
+    }
+  });
+});

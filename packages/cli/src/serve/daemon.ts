@@ -74,6 +74,7 @@ import { openStaticServer } from "./static-server.ts";
 import { resolveAnchorSource } from "./anchor-source.ts";
 import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
 import { contentTypeForExtension } from "./mime.ts";
+import { guardPromotionReview } from "./promotion-review-guard.ts";
 import { createAsyncMutex } from "./review-operation-mutex.ts";
 import {
   AuthState,
@@ -2395,13 +2396,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     requestId: string,
   ): Promise<PromoteOutcome> {
     const state = await review.readState(store);
-    if (state.openPending === null) {
-      throw new PromoteRefused(
-        409,
-        "no-open-pending-review",
-        "there is no open pending review to promote into — comment first, then promote.",
-      );
-    }
+    const open = guardPromotionReview(state.openPending);
+    if (!open.ok) throw new PromoteRefused(409, open.error, open.detail);
     const found = await findDraftToPromote({
       store,
       threadId: request.threadId,
@@ -2413,6 +2409,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
     const draft = found.draft;
     const promoted = draft.promotedAtSeq === undefined;
+    if (draft.promotedAtSeq !== undefined) {
+      const promotion = (await store.since(draft.promotedAtSeq - 1)).find(
+        (event) => event.seq === draft.promotedAtSeq && event.kind === "draft.promoted",
+      );
+      if (promotion === undefined || promotion.kind !== "draft.promoted") {
+        throw new PromoteRefused(409, "promotion-review-unbound", "the recorded promotion could not be found in the log.");
+      }
+      const guard = guardPromotionReview(state.openPending, promotion);
+      if (!guard.ok) throw new PromoteRefused(409, guard.error, guard.detail);
+    }
 
     // (c) Build the machine intent BEFORE any append. Everything that
     // can refuse this promotion is decided by now, so the log never
@@ -2444,6 +2450,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       await appendReviewLifecycleEvent(
         {
           kind: "draft.promoted",
+          reviewNodeId: open.review.reviewNodeId,
           actor,
           threadId: draft.thread.id,
           target: request.target,
@@ -2479,7 +2486,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         promoted,
         target: request.target,
         reason: promoted ? undefined : "already-promoted",
-        reviewNodeId: state.openPending.reviewNodeId,
+        reviewNodeId: open.review.reviewNodeId,
       };
     }
     if (intent !== undefined && !draft.intentRecorded) {
@@ -2538,19 +2545,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    * cookie-authenticated reconcile posts into a FRESH pending review —
    * reopening, automatically and after the fact, the review the
    * reviewer had already submitted or discarded. The route refuses that
-   * with `no-open-pending-review`, so the heal must refuse it too, or it
-   * would compose exactly what the route will not. */
+   * with `no-open-pending-review`, so the heal must refuse it too.
+   * Issue #136: the shared guard also requires the SAME review node id;
+   * a newer open review cannot inherit an older review's promotion.
+   * Legacy promotions without that identity load but are never healed. */
   async function healMissingPromotionIntents(
     review: ReviewModeHandle,
     requestId: string,
   ): Promise<number> {
     const open = (await review.readState(store)).openPending;
-    if (open === null) {
-      logger.info("review.boot.promotion-intent.no-pending-review", { requestId });
-      return 0;
-    }
     const events = await store.since(0);
-    const incomplete = new Map<string, string>();
+    const incomplete = new Map<string, Extract<ReviewEvent, { kind: "draft.promoted" }>>();
     for (const event of events) {
       if (event.kind !== "draft.promoted" || event.target !== "comment") continue;
       const commentId = event.commentId;
@@ -2560,12 +2565,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           (candidate.kind === "comment.sync_requested" || candidate.kind === "comment.linked") &&
           candidate.commentId === commentId,
       );
-      if (!hasIntent) incomplete.set(commentId, event.threadId);
+      if (!hasIntent) incomplete.set(commentId, event);
     }
     if (incomplete.size === 0) return 0;
     let healed = 0;
-    for (const [commentId, threadId] of incomplete) {
-      const found = await findDraftToPromote({ store, threadId, target: "comment", commentId });
+    for (const [commentId, promotion] of incomplete) {
+      const guard = guardPromotionReview(open, promotion);
+      if (!guard.ok) {
+        logger.warn("review.boot.promotion-intent.refused", {
+          requestId, commentId, reason: guard.error, reviewNodeId: promotion.reviewNodeId,
+        });
+        continue;
+      }
+      const found = await findDraftToPromote({ store, threadId: promotion.threadId, target: "comment", commentId });
       if (!found.ok) {
         logger.warn("review.boot.promotion-intent.refused", { requestId, commentId, reason: found.error });
         continue;

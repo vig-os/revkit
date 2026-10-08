@@ -273,6 +273,9 @@ export type AppendRejection =
    * author. A reviewer's own comment is mirrored on its own; there is
    * nothing to promote, so the log refuses to record one. */
   | { kind: "not-an-agent-draft"; threadId: string; commentId?: string; message: string }
+  /** A bound promotion must name a pending review at append time.
+   * Legacy unbound events still replay; daemon recovery refuses them. */
+  | { kind: "promotion-review-mismatch"; reviewNodeId: string; message: string }
   | { kind: "cross-file-reanchor"; threadId: string; fromPath: string; toPath: string; message: string }
   /** M3 part 2b: `review.opened` for a `reviewNodeId` that already
    * exists in the log (with any status). GitHub allows at most one
@@ -811,6 +814,16 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
             message:
               `draft.promoted: only the reviewer may promote a draft into their own pending review, ` +
               `got actor kind '${event.actor.kind}'.`,
+          },
+        };
+      }
+      if (event.reviewNodeId !== undefined && state.reviews.get(event.reviewNodeId)?.status !== "pending") {
+        return {
+          ok: false,
+          rejection: {
+            kind: "promotion-review-mismatch",
+            reviewNodeId: event.reviewNodeId,
+            message: `draft.promoted: review '${event.reviewNodeId}' is not pending — a promotion must name its open review.`,
           },
         };
       }
