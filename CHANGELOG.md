@@ -99,5 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Invite display names reject C0/C1 controls and DEL before D1, returning the
-  documented refusal with cache headers and preserving browser slots ([#145](https://github.com/vig-os/revkit/issues/145)).
+- Invite display names reject controls, malformed Unicode, bidi overrides and
+  names without visible content before D1, returning the documented refusal
+  without consuming the invite's browser slot. The cap counts Unicode code points,
+  and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).

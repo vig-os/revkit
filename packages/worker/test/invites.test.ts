@@ -57,6 +57,9 @@ import {
   INVITE_LIFETIME_DAYS,
   INVITE_MAX_BROWSERS,
   MAX_DISPLAY_NAME_CHARS,
+  DISPLAY_NAME_CONTROL_RANGES,
+  DISPLAY_NAME_BIDI_RANGES,
+  isAcceptableDisplayName,
   SHARE_TYPE_CAN_COMMENT,
   SHARE_TYPES,
   inviteCovers,
@@ -711,12 +714,14 @@ describe("invite mechanics (ADR-0009) against D1", () => {
     test("display-name validation (#145): every C0/C1 control and DEL is refused before D1", async () => {
       const { token } = await mint(db(), { repo: REPO, kind: "personal" });
       const binding = mintToken();
-      const controls = [...Array.from({ length: 32 }, (_, i) => i), 0x7f,
-        ...Array.from({ length: 32 }, (_, i) => 0x80 + i)];
+      const controls = DISPLAY_NAME_CONTROL_RANGES.flatMap(([start, end]) =>
+        Array.from({ length: end - start + 1 }, (_, i) => start + i));
       for (const code of controls) {
-        const result = await redeem(token, { binding, displayName: `a${String.fromCharCode(code)}b` });
+        const displayName = `a${String.fromCodePoint(code)}b`;
+        const result = await redeem(token, { binding, displayName });
         expect(result.ok, `U+${code.toString(16).padStart(4, "0")}`).toBe(false);
         if (!result.ok) expect(result.refusal).toBe("display-name-rejected");
+        expect(isAcceptableDisplayName(displayName)).toBe(false);
       }
       expect((await db().prepare("SELECT COUNT(*) AS n FROM invite_redemptions").first<{ n: number }>())?.n).toBe(0);
       expect((await redeem(token, { binding })).ok).toBe(true);
@@ -2021,10 +2026,9 @@ const PAGE_ELEMENTS = [
         expect(html).toContain(`action="${INVITE_REDEEM_PATH}"`);
         expect(html).toContain("revkit");
         expect(html).toContain("#42");
-        // L3: the browser's half of the name bound is the SAME constant the
-        // module enforces, asserted here because changing `maxlength` to 4096
-        // used to leave every test green.
-        expect(html).toContain(`maxlength="${MAX_DISPLAY_NAME_CHARS}"`);
+        // HTML maxlength counts UTF-16 units and would block valid names that
+        // fit the server's code-point cap (for example, 64 emoji).
+        expect(html).not.toMatch(/\bmaxlength=/i);
         // And the form's URL is token-free, so the POST lands in history without it.
         expect(html).not.toContain(`${INVITE_REDEEM_PATH}?`);
         // The browser is bound on the OPEN, which is what makes ADR-0009's "bound
@@ -2805,14 +2809,34 @@ const PAGE_ELEMENTS = [
           ["U+0085 only", "\u0085"],
           ["leading tab", "\tAda"],
           ["trailing newline", "Ada\n"],
-          ["C0 upper boundary", "a\u001fb"],
-          ["DEL", "a\u007fb"],
-          ["C1 lower boundary", "a\u0080b"],
-          ["C1 upper boundary", "a\u009fb"],
+          ...DISPLAY_NAME_CONTROL_RANGES.flatMap(([start, end]) => [...new Set([start, end])]
+            .map((code) => [`control boundary U+${code.toString(16)}`, `a${String.fromCodePoint(code)}b`] as const)),
         ];
+        const malformedNames = [
+          ["lone high surrogate", "\ud800"],
+          ["interior lone low surrogate", "a\udfffb"],
+          ["trailing high surrogate", "Ada\ud83d"],
+        ] as const;
+        const blankNames = [
+          ["zero-width space", "\u200b"],
+          ["Hangul filler", "\u3164"],
+          ["Braille blank", "\u2800"],
+          ["combining mark without a base", "\u0301"],
+          ["right-to-left override", "\u202e"],
+          ["tag space", "\u{e0020}"],
+          ["Mongolian vowel separator", "\u180e"],
+          ["format control only", "\u0600"],
+          ["marks separated by whitespace", "\u0301 \u0300"],
+          ["mixed invisible content", " \u200b\u0301\u00a0\u3164\u2800 "],
+          ...DISPLAY_NAME_BIDI_RANGES.flatMap(([start, end]) =>
+            Array.from({ length: end - start + 1 }, (_, i) => start + i)
+              .map((code) => [`visible name with bidi U+${code.toString(16)}`, `Ada${String.fromCodePoint(code)}`] as const)),
+        ] as const;
         for (const [encoding, submit] of [["JSON", redeem], ["form", redeemUrlEncoded]] as const) {
-          for (const [label, displayName] of rejectedNames) {
-            test(`${encoding}: ${label} is display-name-rejected without consuming a browser slot`, async () => {
+          const cases = [...rejectedNames, ...blankNames,
+            ...(encoding === "JSON" ? malformedNames : [])];
+          for (const [label, displayName] of cases) {
+            test(`${encoding}: ${label} is display-name-rejected without consuming a browser slot (#145-r1)`, async () => {
               const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
               if (!minted.ok) throw new Error("mint failed");
               const token = minted.minted.token;
@@ -2824,6 +2848,7 @@ const PAGE_ELEMENTS = [
                 // URLSearchParams encodes NUL as %00 for the form cases.
                 const refused = await submit(harness, browser, token, { displayName });
                 expect(refused.status).toBe(410);
+                expect(isAcceptableDisplayName(displayName)).toBe(false);
                 expect(refused.headers.get("cache-control")).toBe("no-store");
                 expect(refused.headers.get("set-cookie")).toBeNull();
                 expect(await refused.text()).toBe(inviteClosedPage(clientAssetPath(TEST_REVKIT_VERSION, await clientAssetDigest())));
@@ -2841,6 +2866,18 @@ const PAGE_ELEMENTS = [
               }
             });
           }
+
+          test(`${encoding}: visible names retain accents, joiners and valid surrogate pairs (#145-r1)`, async () => {
+            for (const displayName of ["e\u0301", "Ada 🧑‍🔬", "A\u200bb", "العربية", "\ufffd"]) {
+              expect(isAcceptableDisplayName(displayName)).toBe(true);
+              const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
+              if (!minted.ok) throw new Error("mint failed");
+              const { browser } = await open(harness, minted.minted.token);
+              expect((await submit(harness, browser, minted.minted.token, { displayName })).status).toBe(303);
+              expect((await harness.db.prepare("SELECT display_name FROM guests ORDER BY rowid DESC LIMIT 1")
+                .first<{ display_name: string }>())?.display_name).toBe(displayName);
+            }
+          });
 
           test(`${encoding}: the display-name cap counts normalized Unicode code points`, async () => {
             const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
@@ -3153,19 +3190,8 @@ const PAGE_ELEMENTS = [
         expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM guests").first<{ n: number }>())?.n).toBe(4);
       });
 
-      test("a REPEATED form field is refused, and a repeated JSON key is deterministic", async () => {
-        // A form body can legitimately carry `token` twice, and "the first one" is
-        // how one browser's redemption becomes another's — the `since-repeated`
-        // rule `parseThreadsQuery` already applies. So the FORM encoding refuses a
-        // repeated name outright.
-        //
-        // JSON is different and the difference is not glossed over: `JSON.parse`
-        // keeps the LAST of a repeated key. That is standard, deterministic, and
-        // cannot be exploited — only one of the two values can match an invite and
-        // the other simply finds no row — so this asserts the behaviour rather
-        // than claiming a refusal the parser does not perform. Detecting it would
-        // mean re-scanning the raw text for top-level keys, which is a JSON
-        // parser, for a client-side bug a browser cannot produce.
+      test("a REPEATED form or JSON field is refused", async () => {
+        // Both encodings refuse duplicate top-level fields before redeeming.
         const minted = await mintInvite(harness.db, { repo: REPO, kind: "team" }, { keys });
         if (!minted.ok) throw new Error("mint failed");
         const { browser } = await open(harness, minted.minted.token);
@@ -3180,16 +3206,63 @@ const PAGE_ELEMENTS = [
         });
         expect(posted.status).toBe(400);
         expect(await json(posted)).toMatchObject({ error: "bad-request", reason: "unparsable-body" });
-        // JSON: last wins, and it is the value that counts.
+        // JSON refuses the ambiguity too, even with a valid last token.
         const viaJson = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
           method: "POST",
           ...NO_FOLLOW,
           headers: { ...JSON_HEADERS, cookie },
           body: `{"token":"${decoy}","token":"${token}","displayName":"${NAME}"}`,
         });
-        expect(viaJson.status).toBe(303);
-        // Exactly one session either way — a repeat never mints a second one.
-        expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>())?.n).toBe(1);
+        expect(viaJson.status).toBe(400);
+        expect(await json(viaJson)).toMatchObject({ error: "bad-request", reason: "unparsable-body" });
+        // Neither ambiguous request consumes a slot or issues a session.
+        expect((await harness.db.prepare("SELECT COUNT(*) AS n FROM sessions").first<{ n: number }>())?.n).toBe(0);
+      });
+
+      describe("duplicate JSON keys (#145-r1)", () => {
+        const duplicates = [
+          ["same token twice", (token: string) => `{"token":"${token}","token":"${token}","displayName":"Ada"}`],
+          ["different tokens", (token: string) => `{"token":"${"A".repeat(43)}","token":"${token}","displayName":"Ada"}`],
+          ["same displayName twice", (token: string) => `{"token":"${token}","displayName":"Ada","displayName":"Ada"}`],
+          ["invalid then valid name", (token: string) => `{"token":"${token}","displayName":"\\u0000","displayName":"Ada"}`],
+          ["escaped token key", (token: string) => `{"token":"${token}","to\\u006ben":"${token}","displayName":"Ada"}`],
+          ["escaped displayName key", (token: string) => `{"token":"${token}","displayName":"Ada","displ\\u0061yName":"Ada"}`],
+        ] as const;
+        for (const [label, body] of duplicates) {
+          test(`${label}: 400 before consuming the invite's browser slot`, async () => {
+            const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
+            if (!minted.ok) throw new Error("mint failed");
+            const token = minted.minted.token;
+            const { browser } = await open(harness, token);
+            const refused = await harness.dispatch(`http://localhost${INVITE_REDEEM_PATH}`, {
+              method: "POST",
+              ...NO_FOLLOW,
+              headers: { ...JSON_HEADERS, cookie: browser.header() ?? "" },
+              body: body(token),
+            });
+            expect(refused.status).toBe(400);
+            expect(refused.headers.get("cache-control")).toBe("no-store");
+            expect(refused.headers.get("set-cookie")).toBeNull();
+            expect(await json(refused)).toEqual({ error: "bad-request", reason: "unparsable-body" });
+            for (const table of ["invite_redemptions", "guests", "sessions"]) {
+              expect((await harness.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).first<{ n: number }>())?.n, table).toBe(0);
+            }
+            expect((await redeem(harness, browser, token)).status).toBe(303);
+          });
+        }
+
+        test("nested keys and quoted key-like text are not top-level duplicates", async () => {
+          const minted = await mintInvite(harness.db, { repo: REPO, kind: "personal" }, { keys });
+          if (!minted.ok) throw new Error("mint failed");
+          const { browser } = await open(harness, minted.minted.token);
+          const displayName = 'Ada "displayName": \\ { } [ ]';
+          const response = await redeem(harness, browser, minted.minted.token, {
+            displayName,
+            extra: [{ token: "nested", displayName: "nested" }, { displayName: "nested again" }],
+          });
+          expect(response.status).toBe(303);
+          expect((await harness.db.prepare("SELECT display_name FROM guests").first<{ display_name: string }>())?.display_name).toBe(displayName);
+        });
       });
 
       test("an unparsable, non-object or wrongly-typed body is one 400 with a fixed reason", async () => {

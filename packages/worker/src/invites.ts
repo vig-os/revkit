@@ -581,6 +581,76 @@ export type RedeemResult =
   | { readonly ok: false; readonly refusal: RedeemRefusal };
 
 /**
+ * The guarded INSERT that claims a browser slot: statement 1 of the redemption
+ * batch, as a statement the caller can run.
+ *
+ * **Exported so its predicate is TESTABLE, because it is a control in its own
+ * right and the mutation run proved the function-level tests could not see it.**
+ * Removing `revoked_at IS NULL` from this `WHERE` clause changed **zero** of 87
+ * tests, because `redeemInvite`'s pre-read refuses a revoked invite first — so
+ * the clause looked redundant, and a reviewer could delete it on that evidence.
+ * It is not redundant: it is the only check inside the ATOMIC unit, and a
+ * revocation landing between the pre-read and this statement is exactly the
+ * race a pre-read cannot close. `test/invites.test.ts`'s "the redemption's own
+ * guard refuses …" cases drive THIS statement directly against a revoked row, an
+ * expired row, a full invite and an already-bound browser, which is the only way
+ * to pin a predicate the surrounding function short-circuits.
+ *
+ * The clause is deliberately `expires_at > ?` with the CALLER's clock rather
+ * than SQLite's `datetime('now')`: the Worker has an injectable clock, the tests
+ * need one, and a database-side clock would be a second, untestable one.
+ */
+export function redemptionClaimStatement(
+  db: D1Database,
+  input: {
+    readonly inviteId: string;
+    readonly bindingHash: string;
+    readonly guestId: string;
+    readonly nowIso: string;
+    readonly maxBrowsers: number;
+  },
+): D1PreparedStatement {
+  return db
+    .prepare(
+      "INSERT INTO invite_redemptions (invite_id, binding_hash, guest_id, created_at) " +
+        "SELECT id, ?, ?, ? FROM invites WHERE id = ? AND revoked_at IS NULL AND expires_at > ? " +
+        "AND (SELECT COUNT(*) FROM invite_redemptions WHERE invite_id = invites.id) < ? " +
+        "AND NOT EXISTS (SELECT 1 FROM invite_redemptions WHERE invite_id = invites.id AND binding_hash = ?)",
+    )
+    .bind(
+      input.bindingHash,
+      input.guestId,
+      input.nowIso,
+      input.inviteId,
+      input.nowIso,
+      input.maxBrowsers,
+      input.bindingHash,
+    );
+}
+
+/** C0, DEL and C1 controls refused in the original name, before trimming. */
+export const DISPLAY_NAME_CONTROL_RANGES = [[0x00, 0x1f], [0x7f, 0x7f], [0x80, 0x9f]] as const;
+
+/** Bidi embeddings/overrides and isolates are refused even beside visible text. */
+export const DISPLAY_NAME_BIDI_RANGES = [[0x202a, 0x202e], [0x2066, 0x2069]] as const;
+
+/** The single display-name predicate. Visibility is checked without changing
+ * the stored name, so accents and joiners in otherwise visible names survive. */
+export function isAcceptableDisplayName(input: string): boolean {
+  const normalized = input.trim();
+  if (normalized.length === 0 || Array.from(normalized).length > MAX_DISPLAY_NAME_CHARS) return false;
+  for (const character of input) {
+    const code = character.codePointAt(0) as number;
+    // Iteration combines valid surrogate pairs; only lone surrogates remain
+    // in this interval. Equivalent to !input.isWellFormed() on ES2022 types.
+    if (code >= 0xd800 && code <= 0xdfff) return false;
+    if ([...DISPLAY_NAME_CONTROL_RANGES, ...DISPLAY_NAME_BIDI_RANGES]
+      .some(([start, end]) => code >= start && code <= end)) return false;
+  }
+  return normalized.replace(/[\p{Default_Ignorable_Code_Point}\p{Cf}\p{M}\u2800]/gu, "").trim().length > 0;
+}
+
+/**
  * Exchange an invite token for a session. This is the FIRST legitimate caller
  * of the session-issuance internals, and it goes through `mintSession` +
  * `sessionInsertStatement` — the same 256-bit mint, the same digests at rest
@@ -661,69 +731,18 @@ export type RedeemResult =
  * the ORIGINAL input, including tabs/newlines that trimming would otherwise
  * erase. In particular, SQLite TEXT `length()` stops at NUL, so allowing one
  * would let D1's CHECK be the first refusal and turn it into a server error.
- * With controls excluded, Unicode code points match SQLite's length measure.
+ * Lone surrogates, bidi overrides and names with no visible base character are
+ * also refused by `isAcceptableDisplayName`. With malformed text and controls
+ * excluded, Unicode code points match SQLite's length measure.
  */
-/**
- * The guarded INSERT that claims a browser slot: statement 1 of the redemption
- * batch, as a statement the caller can run.
- *
- * **Exported so its predicate is TESTABLE, because it is a control in its own
- * right and the mutation run proved the function-level tests could not see it.**
- * Removing `revoked_at IS NULL` from this `WHERE` clause changed **zero** of 87
- * tests, because `redeemInvite`'s pre-read refuses a revoked invite first — so
- * the clause looked redundant, and a reviewer could delete it on that evidence.
- * It is not redundant: it is the only check inside the ATOMIC unit, and a
- * revocation landing between the pre-read and this statement is exactly the
- * race a pre-read cannot close. `test/invites.test.ts`'s "the redemption's own
- * guard refuses …" cases drive THIS statement directly against a revoked row, an
- * expired row, a full invite and an already-bound browser, which is the only way
- * to pin a predicate the surrounding function short-circuits.
- *
- * The clause is deliberately `expires_at > ?` with the CALLER's clock rather
- * than SQLite's `datetime('now')`: the Worker has an injectable clock, the tests
- * need one, and a database-side clock would be a second, untestable one.
- */
-export function redemptionClaimStatement(
-  db: D1Database,
-  input: {
-    readonly inviteId: string;
-    readonly bindingHash: string;
-    readonly guestId: string;
-    readonly nowIso: string;
-    readonly maxBrowsers: number;
-  },
-): D1PreparedStatement {
-  return db
-    .prepare(
-      "INSERT INTO invite_redemptions (invite_id, binding_hash, guest_id, created_at) " +
-        "SELECT id, ?, ?, ? FROM invites WHERE id = ? AND revoked_at IS NULL AND expires_at > ? " +
-        "AND (SELECT COUNT(*) FROM invite_redemptions WHERE invite_id = invites.id) < ? " +
-        "AND NOT EXISTS (SELECT 1 FROM invite_redemptions WHERE invite_id = invites.id AND binding_hash = ?)",
-    )
-    .bind(
-      input.bindingHash,
-      input.guestId,
-      input.nowIso,
-      input.inviteId,
-      input.nowIso,
-      input.maxBrowsers,
-      input.bindingHash,
-    );
-}
-
 export async function redeemInvite(
   db: D1Database,
   input: { readonly token: string; readonly binding: string; readonly displayName: string },
   options: { readonly now?: MsClock; readonly keys: InviteTokenHasher },
 ): Promise<RedeemResult> {
   const now = (options.now ?? Date.now)();
+  if (!isAcceptableDisplayName(input.displayName)) return { ok: false, refusal: "display-name-rejected" };
   const displayName = input.displayName.trim();
-  if (
-    /[\u0000-\u001f\u007f-\u009f]/.test(input.displayName) ||
-    displayName.length === 0 || Array.from(displayName).length > MAX_DISPLAY_NAME_CHARS
-  ) {
-    return { ok: false, refusal: "display-name-rejected" };
-  }
   // The binding is what identifies the browser. Refusing a malformed one here
   // means the ledger never holds a binding that could never be presented again,
   // which would otherwise silently consume one of the invite's slots.
