@@ -98,3 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     CI (a retry re-runs `beforeAll` and gets a fresh code).
 
 ### Security
+
+- **Cloudflare tooling hardening** ([#176](https://github.com/vig-os/revkit/issues/176))
+  - Allowlist Wrangler's environment, pin an empty env file, refuse dev dotenv files and confine file paths.
+  - Require explicit TTY confirmation for mutations and unknown commands; preserve user backup files.

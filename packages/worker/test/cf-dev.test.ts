@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,33 +37,42 @@ beforeEach(() => {
   cpSync(join(repo, "packages/worker/wrangler.jsonc"), configPath());
   writeFileSync(join(root, "dev.json"), JSON.stringify(dev));
   writeFileSync(join(root, "cf.env"), `CLOUDFLARE_ACCOUNT_ID=${account}\nCLOUDFLARE_API_TOKEN=${token}\nAWS_ACCESS_KEY_ID=${r2Key}\nAWS_SECRET_ACCESS_KEY=${r2Secret}\n`, { mode: 0o600 });
-  writeFileSync(join(root, "bin/wrangler"), `#!/usr/bin/env bun
-import { appendFileSync } from "node:fs";
+  writeFileSync(join(root, "bin/wrangler"), `#!/usr/bin/env -S bun --no-env-file
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
-appendFileSync(process.env.CF_TEST_CALLS, JSON.stringify(args) + "\\n");
+const settings = JSON.parse(readFileSync(process.env.HOME + "/test-options.json", "utf8"));
+writeFileSync(process.env.HOME + "/child-env.json", JSON.stringify(process.env));
+appendFileSync(settings.CF_TEST_CALLS, JSON.stringify(args) + "\\n");
 if (process.env.WRANGLER_SEND_METRICS !== "false") process.exit(11);
 if (!process.env.WRANGLER_LOG_PATH.endsWith(".log")) process.exit(12);
-const command = args.filter((a, i) => a !== "--config" && args[i - 1] !== "--config");
-if (process.env.CF_TEST_READ_STDIN) await Bun.stdin.text();
-if (process.env.CF_TEST_ECHO) {
+const command = args.filter((a, i) => !["--config", "--env-file"].includes(a) && !["--config", "--env-file"].includes(args[i - 1]));
+if (!args.includes("--env-file")) {
+  for (const name of [".env", ".env.local"]) {
+    const file = Bun.file(process.cwd() + "/" + name);
+    if (await file.exists()) Object.assign(process.env, Object.fromEntries((await file.text()).trim().split("\\n").map(line => line.split("="))));
+  }
+} else if ((await Bun.file(args[args.indexOf("--env-file") + 1]).text()) !== "") process.exit(13);
+if (process.env.CLOUDFLARE_API_BASE_URL) await fetch(process.env.CLOUDFLARE_API_BASE_URL, { headers: { Authorization: "Bearer " + process.env.CLOUDFLARE_API_TOKEN } });
+if (settings.CF_TEST_READ_STDIN) await Bun.stdin.text();
+if (settings.CF_TEST_ECHO) {
   const token = process.env.CLOUDFLARE_API_TOKEN;
   process.stdout.write(token.slice(0, 7));
   await Bun.sleep(5);
   console.log(token.slice(7));
   console.error(process.env.AWS_ACCESS_KEY_ID, process.env.AWS_SECRET_ACCESS_KEY);
   console.log("literal", command.at(-1));
-  process.exit(Number(process.env.CF_TEST_EXIT || 0));
+  process.exit(Number(settings.CF_TEST_EXIT || 0));
 }
-if (command[0] === "d1" && command[1] === "list") console.log(JSON.stringify(process.env.CF_TEST_ABSENT && !(await Bun.file(process.env.HOME + "/created").exists()) ? [] : [{name: "revkit-review-dev", uuid: "${dev.d1.database_id}"}]));
+if (command[0] === "d1" && command[1] === "list") console.log(JSON.stringify(settings.CF_TEST_ABSENT && !(await Bun.file(process.env.HOME + "/created").exists()) ? [] : [{name: "revkit-review-dev", uuid: "${dev.d1.database_id}"}]));
 else if (command[0] === "d1" && command[1] === "create") {
   appendFileSync(process.env.HOME + "/created", "yes"); console.log("created");
 }
-else if (command[0] === "r2" && command[2] === "list") console.log(process.env.CF_TEST_ABSENT ? "Listing buckets..." : "name: revkit-previews-dev\\ncreation_date: today");
-else if (command[0] === "d1" && command[1] === "migrations") console.log(process.env.CF_TEST_PENDING ? "Migrations to be applied:\\n0004_test.sql" : "✅ No migrations to apply!");
+else if (command[0] === "r2" && command[2] === "list") console.log(settings.CF_TEST_ABSENT ? "Listing buckets..." : "name: revkit-previews-dev\\ncreation_date: today");
+else if (command[0] === "d1" && command[1] === "migrations") console.log(settings.CF_TEST_PENDING ? "Migrations to be applied:\\n0004_test.sql" : "✅ No migrations to apply!");
 else if (command[0] === "secret" && command[1] === "list") {
-  if (process.env.CF_TEST_MISSING_WORKER) { console.error(${JSON.stringify(missingWorker)}); process.exit(1); }
-  if (process.env.CF_TEST_AUTH_FAILURE) { console.error("Authentication error"); process.exit(1); }
-  console.log(JSON.stringify(process.env.CF_TEST_ABSENT ? [] : [{name: "INVITE_TOKEN_HMAC_KEY", type: "secret_text"}]));
+  if (settings.CF_TEST_MISSING_WORKER) { console.error(${JSON.stringify(missingWorker)}); process.exit(1); }
+  if (settings.CF_TEST_AUTH_FAILURE) { console.error("Authentication error"); process.exit(1); }
+  console.log(JSON.stringify(settings.CF_TEST_ABSENT ? [] : [{name: "INVITE_TOKEN_HMAC_KEY", type: "secret_text"}]));
 }
 else if (command[0] === "secret" && command[1] === "put") {
   const secret = (await Bun.stdin.text()).trim();
@@ -74,9 +83,16 @@ else console.log("ok");
 `);
   chmodSync(join(root, "bin/wrangler"), 0o700);
   // Never let a test inherit real credential sources or an age identity.
-  env = { ...process.env, HOME: root, REVKIT_CF_ENV: join(root, "cf.env"), REVKIT_CF_SOPS: "", SOPS_AGE_KEY_FILE: "",
+  env = new Proxy({ TMPDIR: process.env.TMPDIR, LANG: process.env.LANG, HOME: root, REVKIT_CF_ENV: join(root, "cf.env"), REVKIT_CF_SOPS: "", SOPS_AGE_KEY_FILE: "",
     CLOUDFLARE_ACCOUNT_ID: "", CLOUDFLARE_API_TOKEN: "", AWS_ACCESS_KEY_ID: "", AWS_SECRET_ACCESS_KEY: "",
-    PATH: `${join(root, "bin")}:${process.env.PATH}`, REVKIT_CF_DEV_CONFIG: join(root, "dev.json"), CF_TEST_CALLS: join(root, "calls.jsonl") };
+    PATH: `${join(root, "bin")}:${process.env.PATH}`, REVKIT_CF_DEV_CONFIG: join(root, "dev.json"), CF_TEST_CALLS: join(root, "calls.jsonl") }, {
+    set(target, key, value) {
+      Reflect.set(target, key, value);
+      writeFileSync(join(root, "test-options.json"), JSON.stringify(Object.fromEntries(Object.entries(target).filter(([name]) => name.startsWith("CF_TEST_")))));
+      return true;
+    },
+  });
+  env.CF_TEST_CALLS = join(root, "calls.jsonl");
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
@@ -116,14 +132,14 @@ test("dev config changes only identifiers and preserves every inherited setting"
 for (const [key, value] of [["workers_dev", true], ["routes", []], ["route", "example.invalid/*"], ["compatibility_flags", ["nodejs_compat"]]] as const) {
   test(`rejects unsafe tracked ${key} before any Wrangler call`, async () => {
     writeFileSync(configPath(), JSON.stringify({ ...sourceConfig(), [key]: value }));
-    const result = await run("cf-dev", "deploy");
+    const result = await run("cf-dev", "deploy", "--dry-run");
     expect(result.code).not.toBe(0); expect(result.output).toContain("security"); expect(calls()).toEqual([]);
   });
 }
 
 test("missing dev state fails clearly before Wrangler", async () => {
   rmSync(join(root, "dev.json"));
-  const result = await run("cf-dev", "deploy");
+  const result = await run("cf-dev", "deploy", "--dry-run");
   expect(result.code).not.toBe(0); expect(result.output).toContain("cf-dev-init"); expect(calls()).toEqual([]);
 });
 
@@ -132,7 +148,7 @@ test("rejects other accounts and resource names in dev state and credential acco
   rmSync(join(root, "calls.jsonl"));
   for (const state of [{ ...dev, account_id: "0".repeat(32) }, { ...dev, worker_name: "production" }]) {
     writeFileSync(join(root, "dev.json"), JSON.stringify(state));
-    expect((await run("cf-dev", "deploy")).code).not.toBe(0);
+    expect((await run("cf-dev", "deploy", "--dry-run")).code).not.toBe(0);
   }
   writeFileSync(join(root, "dev.json"), JSON.stringify(dev));
   writeFileSync(join(root, "cf.env"), `CLOUDFLARE_ACCOUNT_ID=${"0".repeat(32)}\nCLOUDFLARE_API_TOKEN=${token}\n`);
@@ -170,8 +186,8 @@ test("init rotate generates a secret on stdin and redacts it on both output stre
   expect(calls().filter((args) => args.includes("put"))).toHaveLength(1);
 });
 
-test("dev-deploy deploys the current worker through the generated config", async () => {
-  expect((await run("cf-dev-deploy")).code).toBe(0);
+test("dev-deploy dry-run uses the generated config", async () => {
+  expect((await run("cf-dev-deploy", "--dry-run")).code).toBe(0);
   expect(calls()).toHaveLength(1); expect(calls()[0]).toContain("deploy");
   expect(calls()[0]).toContain(join(root, "packages/worker/wrangler.dev.jsonc"));
 });
@@ -179,7 +195,7 @@ test("dev-deploy deploys the current worker through the generated config", async
 for (const recipe of ["cf", "cf-dev", "cf-dev-deploy"]) {
   test(`${recipe} redacts credentials, including split output, and preserves failure`, async () => {
     env.CF_TEST_ECHO = "1"; env.CF_TEST_EXIT = "9";
-    const result = await run(recipe, ...(recipe === "cf-dev-deploy" ? [] : ["whoami"]));
+    const result = await run(recipe, ...(recipe === "cf-dev-deploy" ? ["--dry-run"] : ["whoami"]));
     expect(result.code).not.toBe(0); expect(result.output).toContain("[REDACTED]");
     for (const secret of [token, r2Key, r2Secret]) expect(result.output).not.toContain(secret);
     expect(calls()).toHaveLength(1);
@@ -335,7 +351,7 @@ test("r1: generated config precedes every user argument", async () => {
 
 test("r1: deploy finishes even while caller stdin remains open", async () => {
   env.CF_TEST_READ_STDIN = "1";
-  const child = Bun.spawn(["just", "cf-dev-deploy"], { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(["just", "cf-dev-deploy", "--dry-run"], { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   const output = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
   let timer: ReturnType<typeof setTimeout> | undefined;
   const finished = await Promise.race([child.exited.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 2500); })]);
@@ -353,7 +369,7 @@ for (const args of [["delete"], ["d1", "delete", "revkit-review-dev"], ["r2", "b
     test(`r1: ${recipe} refuses destructive ${args.join(" ")} without its own TTY confirmation`, async () => {
       for (const flags of [[], ["--yes-really"]]) {
         const result = await run(recipe, ...args, ...flags);
-        expect(result.code).not.toBe(0); expect(result.output).toContain("TTY confirmation");
+        expect(result.code).not.toBe(0); expect(result.output).toContain(recipe === "cf-dev" ? "not allowed" : "TTY confirmation");
       }
       expect(calls()).toEqual([]);
     });
@@ -396,42 +412,46 @@ test("r1: credential helper retains the newest five private UTC backups", async 
 });
 
 test("r1: --file inputs are resolved from the repository root", async () => {
-  expect((await run("cf-dev", "d1", "execute", "revkit-review-dev", "--remote", "--file", "fixtures/query.sql")).code).toBe(0);
+  expect((await run("cf-dev", "r2", "object", "get", "revkit-previews-dev/query.sql", "--remote", "--file", "fixtures/query.sql")).code).toBe(0);
   expect(calls()[0]).toContain(join(root, "fixtures/query.sql"));
 });
 
 
-for (const reply of ["DELETE", "cancel"]) {
-  test(`r1: destructive cf command with --yes-really requires TTY response ${reply}`, async () => {
-    env.CF_TEST_ECHO = "1";
-    const argv = process.platform === "darwin"
-      ? ["script", "-q", "/dev/null", "just", "cf", "secret", "delete", "INVITE_TOKEN_HMAC_KEY", "--yes-really"]
-      : ["script", "-qefc", "just cf secret delete INVITE_TOKEN_HMAC_KEY --yes-really", "/dev/null"];
-    const child = Bun.spawn(argv, { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    let output = "";
-    let answered = false;
-    const read = async () => {
-      const reader = child.stdout.getReader();
-      const decoder = new TextDecoder();
-      for (;;) {
-        const { value, done } = await reader.read();
-        output += decoder.decode(value, { stream: !done });
-        if (!answered && output.includes("Type DELETE to confirm:")) {
-          answered = true; child.stdin.write(reply + "\n"); child.stdin.flush();
+for (const [command, words] of [["just cf secret delete INVITE_TOKEN_HMAC_KEY --yes-really", ["just", "cf", "secret", "delete", "INVITE_TOKEN_HMAC_KEY", "--yes-really"]],
+  ["just cf-dev-deploy --yes-really", ["just", "cf-dev-deploy", "--yes-really"]]] as const) {
+  for (const reply of ["DELETE", "cancel"]) {
+    test(`r1: destructive ${command} command with --yes-really requires TTY response ${reply}`, async () => {
+      env.CF_TEST_ECHO = "1";
+      const argv = process.platform === "darwin"
+        ? ["script", "-q", "/dev/null", ...words]
+        : ["script", "-qefc", command, "/dev/null"];
+      const child = Bun.spawn(argv, { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      let output = "";
+      let answered = false;
+      const read = async () => {
+        const reader = child.stdout.getReader();
+        const decoder = new TextDecoder();
+        for (;;) {
+          const { value, done } = await reader.read();
+          output += decoder.decode(value, { stream: !done });
+          if (!answered && output.includes("Type DELETE to confirm:")) {
+            answered = true; child.stdin.write(reply + "\n"); child.stdin.flush();
+          }
+          if (done) break;
         }
-        if (done) break;
-      }
-    };
-    await Promise.all([read(), new Response(child.stderr).text()]);
-    const code = await child.exited;
-    child.stdin.end();
-    expect(answered).toBe(true);
-    if (reply === "DELETE") {
-      expect(code).toBe(0); expect(calls()).toHaveLength(1);
-      expect(calls()[0]).not.toContain("--yes-really"); expect(output).toContain("[REDACTED]");
-    } else { expect(code).not.toBe(0); expect(calls()).toEqual([]); }
-    for (const value of [token, r2Key, r2Secret]) expect(output).not.toContain(value);
-  });
+      };
+      await Promise.all([read(), new Response(child.stderr).text()]);
+      const code = await child.exited;
+      child.stdin.end();
+      expect(answered).toBe(true);
+      if (reply === "DELETE") {
+        expect(code).toBe(0); expect(calls()).toHaveLength(1);
+        expect(calls()[0]).not.toContain("--yes-really"); expect(output).toContain("[REDACTED]");
+      } else { expect(code).not.toBe(0); expect(calls()).toEqual([]); }
+      for (const value of [token, r2Key, r2Secret]) expect(output).not.toContain(value);
+    });
+  }
+
 }
 
 test("r1: missing-Worker detection is pinned to the installed Wrangler source and version", async () => {
@@ -453,3 +473,179 @@ test("r1: missing-Worker detection is pinned to the installed Wrangler source an
   }
   expect(source.includes('Worker "${scriptName}"${args.env ?'), "installed Wrangler Worker-name template changed").toBe(true);
 });
+
+// #176 R1–R7: all transport attempts stay on loopback with dummy credentials.
+for (const recipe of ["cf", "cf-dev"]) {
+  for (const name of ["WRANGLER_CI_OVERRIDE_NAME", "WRANGLER_API_ENVIRONMENT", "CLOUDFLARE_API_BASE_URL", "HTTPS_PROXY", "http_proxy", "ALL_PROXY"]) {
+    test(`176 R1/R2: ${recipe} refuses caller ${name} without printing its value`, async () => {
+      env[name] = "fake-forbidden-value";
+      const result = await run(recipe, "whoami");
+      expect(result.code).not.toBe(0); expect(result.output).toContain(name);
+      expect(result.output).not.toContain(env[name]!); expect(calls()).toEqual([]);
+    });
+  }
+}
+
+async function runAsync(...args: string[]) {
+  const child = Bun.spawn(["just", ...args], { cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => child.kill("SIGKILL"), Math.max(1, fixtureDeadline - performance.now()));
+  try {
+    const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    if (child.signalCode) throw new Error("cf test: fixture deadline exceeded");
+    return { code, output: stdout + stderr };
+  } finally { clearTimeout(timer); }
+}
+
+for (const recipe of ["cf", "cf-dev"]) {
+  for (const source of ["caller", "dotenv"]) {
+    test(`176 R2/R3: ${recipe} ${source} cannot send Authorization to a non-allowlisted localhost host`, async () => {
+      const authorizations: (string | null)[] = [];
+      const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+        authorizations.push(request.headers.get("Authorization")); return new Response("{}");
+      } });
+      try {
+        const url = `http://127.0.0.1:${server.port}/untrusted`;
+        if (source === "caller") env.CLOUDFLARE_API_BASE_URL = url;
+        else writeFileSync(join(root, recipe === "cf" ? ".env.local" : "packages/worker/.env.local"), `CLOUDFLARE_API_BASE_URL=${url}\n`);
+        const result = await runAsync(recipe, "whoami");
+        expect(authorizations, "credential reached an untrusted host").toEqual([]);
+        expect(result.code).toBe(source === "caller" || recipe === "cf-dev" ? 1 : 0);
+      } finally { server.stop(true); }
+    });
+  }
+}
+
+for (const name of [".env", ".env.local", ".env.production", ".dev.vars", ".dev.vars.local"]) {
+  test(`176 R3: cf-dev refuses worker ${name} before Wrangler`, async () => {
+    writeFileSync(join(root, "packages/worker", name), "WRANGLER_CI_OVERRIDE_NAME=revkit-review\n");
+    const result = await run("cf-dev", "whoami");
+    expect(result.code).not.toBe(0); expect(result.output).toContain("remove packages/worker/"); expect(calls()).toEqual([]);
+  });
+  test(`176 R3: worker ${name} is gitignored`, () => {
+    expect(spawnSync("git", ["check-ignore", "--no-index", `packages/worker/${name}`], { cwd: repo }).status).toBe(0);
+  });
+}
+
+test("176 R1: child environment contains only the pinned allowlist and honours NO_COLOR", async () => {
+  env.UNRELATED_SECRET = "fake-unrelated-secret"; env.NODE_OPTIONS = "--trace-warnings"; env.NO_COLOR = "custom";
+  expect((await run("cf", "whoami")).code).toBe(0);
+  const childEnv = JSON.parse(readFileSync(join(root, "child-env.json"), "utf8"));
+  expect(childEnv).not.toHaveProperty("UNRELATED_SECRET"); expect(childEnv).not.toHaveProperty("NODE_OPTIONS");
+  expect(childEnv).not.toHaveProperty("CF_TEST_CALLS"); expect(childEnv.NO_COLOR).toBe("custom");
+  expect(childEnv.CLOUDFLARE_API_TOKEN).toBe(token);
+  for (const name of Object.keys(childEnv)) {
+    expect(["PATH", "HOME", "TMPDIR", "LANG", "NO_COLOR", "CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN",
+      "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "WRANGLER_LOG", "WRANGLER_LOG_PATH", "WRANGLER_SEND_METRICS", "CLOUDFLARE_ENV"].includes(name) || /^LC_/.test(name)).toBe(true);
+  }
+  delete env.NO_COLOR;
+  expect((await run("cf", "whoami")).code).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, "child-env.json"), "utf8"))).not.toHaveProperty("NO_COLOR");
+});
+
+for (const args of [
+  ["r2", "bucket", "domain", "remove", "revkit-previews-dev"],
+  ...["lifecycle", "lock", "cors"].map((verb) => ["r2", "bucket", verb, "set", "revkit-previews-dev"]),
+  ["catalog", "disable"], ["queues", "purge", "queue"], ["workflows", "instances", "terminate", "workflow", "instance"],
+  ["unknown", "future-mutation"], ["deploy"], ["d1", "migrations", "apply", "DB"],
+  ["d1", "execute", "DB", "--remote"], ["r2", "object", "put", "revkit-previews-dev/key"],
+]) {
+  test(`176 R4: mutation ${args.join(" ")} requires confirmation`, async () => {
+    for (const flags of [[], ["--yes-really"]]) {
+      const result = await run("cf", ...args, ...flags);
+      expect(result.code).not.toBe(0); expect(result.output).toContain("TTY confirmation");
+    }
+    expect(calls()).toEqual([]);
+  });
+}
+
+for (const recipe of ["cf", "cf-dev"]) {
+  for (const kind of ["absolute", "traversal", "credential", "symlink", "new-through-symlink"]) {
+    test(`176 R5: ${recipe} refuses ${kind} --file outside the repository`, async () => {
+      const outside = mkdtempSync(join(tmpdir(), "revkit-cf-outside-"));
+      try {
+        writeFileSync(join(outside, "input"), "dummy"); symlinkSync(outside, join(root, "escape"));
+        mkdirSync(join(root, ".config/revkit"), { recursive: true });
+        writeFileSync(join(root, ".config/revkit/cf.env"), "dummy");
+        const path = kind === "absolute" ? join(outside, "input") : kind === "traversal" ? "../" + outside.split("/").at(-1) + "/input" :
+          kind === "credential" ? join(root, ".config/revkit/cf.env") : kind === "symlink" ? "escape/input" : "escape/new-output";
+        const result = await run(recipe, "r2", "object", "get", "revkit-previews-dev/key", "--file=" + path);
+        expect(result.code).not.toBe(0); expect(calls()).toEqual([]);
+      } finally { rmSync(outside, { recursive: true, force: true }); }
+    });
+  }
+}
+
+test("176 R6: only generated backups are pruned; legacy backup migrates once", async () => {
+  const oldGenerated = "cf.env.bak.2026-01-01T00:00:00.000Z..cf-credentials-a1B2c3";
+  writeFileSync(join(root, oldGenerated), "old-generated");
+  const userNames = ["cf.env.bak.notes", "cf.env.bak.0000", "cf.env.bak.2026-10-08T00:00:00.000Z.user"];
+  for (const name of userNames) writeFileSync(join(root, name), "user-owned");
+  writeFileSync(join(root, "cf.env.bak"), "legacy-dummy", { mode: 0o644 });
+  const update = async () => {
+    const helper = Bun.spawn(["bun", join(root, "scripts/cf-credentials-write.ts")], {
+      env: { ...env, CF_ENV_FILE: join(root, "cf.env"), CF_ACCOUNT: account, CF_TOKEN: "fake-next" }, stdout: "pipe", stderr: "pipe",
+    });
+    await Promise.all([new Response(helper.stdout).text(), new Response(helper.stderr).text()]);
+    expect(await helper.exited).toBe(0);
+  };
+  await update();
+  expect(existsSync(join(root, "cf.env.bak"))).toBe(false);
+  const legacy = readdirSync(root).find((name) => name.startsWith("cf.env.bak.") && readFileSync(join(root, name), "utf8") === "legacy-dummy");
+  expect(legacy).toBeDefined(); expect(readFileSync(join(root, legacy!), "utf8")).toBe("legacy-dummy");
+  expect(statSync(join(root, legacy!)).mode & 0o777).toBe(0o600);
+  for (let i = 0; i < 6; i++) await update();
+  for (const name of userNames) expect(readFileSync(join(root, name), "utf8")).toBe("user-owned");
+  const generated = readdirSync(root).filter((name) => name.startsWith("cf.env.bak.") && !userNames.includes(name));
+  expect(generated).toHaveLength(5); expect(existsSync(join(root, legacy!))).toBe(false);
+  expect(existsSync(join(root, oldGenerated))).toBe(false);
+  for (const name of generated) expect(name).not.toContain("Z..");
+});
+
+for (const recipe of ["cf", "cf-dev"]) {
+  for (const args of [["deploy", "--dry-run", "--dry-run"], ["dev", "--port", "8000", "--port=9000"],
+    ["r2", "object", "get", "revkit-previews-dev/key", "--file=a", "--file=b"]]) {
+    test(`176 R7: ${recipe} refuses repeated flags ${args.join(" ")}`, async () => {
+      const result = await run(recipe, ...args);
+      expect(result.code).not.toBe(0); expect(calls()).toEqual([]);
+    });
+  }
+}
+
+test("176 R7: repeated confirmation flag fails before asking", async () => {
+  const result = await run("cf", "secret", "delete", "key", "--yes-really", "--yes-really");
+  expect(result.code).not.toBe(0); expect(result.output).toContain("repeated"); expect(calls()).toEqual([]);
+});
+
+test("176: cf refuses additional env files even on a safe verb", async () => {
+  const result = await run("cf", "whoami", "--env-file=untrusted");
+  expect(result.code).not.toBe(0); expect(calls()).toEqual([]);
+});
+
+test("176: installed Wrangler 4.93 pins both CLI dotenv and dev secrets to explicit env files", () => {
+  const installed = Bun.which("wrangler")!;
+  const source = readFileSync(join(installed, "../../lib/packages/wrangler/wrangler-dist/cli.js"), "utf8");
+  expect(source).toContain('args["env-file"] ?? getDefaultEnvFiles(args.env)');
+  expect(source).toContain('if (!envFiles?.length)');
+  expect(source).toContain('envFiles ?? getDefaultEnvFiles(env6)');
+});
+
+test("176: dev allowlist rejects unsupported mutation before any TTY prompt", async () => {
+  const argv = process.platform === "darwin"
+    ? ["script", "-q", "/dev/null", "just", "cf-dev", "secret", "delete", "key", "--yes-really"]
+    : ["script", "-qefc", "just cf-dev secret delete key --yes-really", "/dev/null"];
+  const child = Bun.spawn(argv, { cwd: root, env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => child.kill("SIGKILL"), Math.max(1, fixtureDeadline - performance.now()));
+  try {
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    child.stdin.end();
+    expect(child.signalCode).toBeNull(); expect(code).not.toBe(0);
+    expect(out + err).toContain("not allowed"); expect(out + err).not.toContain("Type DELETE"); expect(calls()).toEqual([]);
+  } finally { clearTimeout(timer); }
+});
+
+for (const alias of ["-f", "--f", "-foutside"]) {
+  test(`176 R5: general cf cannot bypass file confinement with ${alias}`, async () => {
+    const result = await run("cf", "r2", "object", "get", "revkit-previews-dev/key", alias, "/outside");
+    expect(result.code).not.toBe(0); expect(calls()).toEqual([]);
+  });
+}
