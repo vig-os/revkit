@@ -39,8 +39,9 @@
 // PACKAGED binary. Nothing here is faked; this file simply does not ask
 // for a build that has to compile anything.
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { test, expect } from "@playwright/test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -129,47 +130,8 @@ async function bootDaemon(): Promise<DaemonCtx> {
   );
   writeFileSync(join(root, PLOT_REL_PATH), JSON.stringify([{ x: 1, y: 2 }]), "utf8");
 
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  const stdoutChunks: string[] = [];
-  const stderrChunks: string[] = [];
-  child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c.toString("utf8")));
-  child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c.toString("utf8")));
-  const deadline = Date.now() + 15_000;
-  let state: { readonly url: string; readonly port: number; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch {
-        /* mid-write */
-      }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(
-      `daemon did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  const deadline2 = Date.now() + 3_000;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(`daemon started but never printed 'launch:': ${stdoutChunks.join("")}`);
-  }
-  return { child, root, url: state.url, launchUrl, agentToken: state.agentToken, port: state.port };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--dir", DIST] });
+  return ctx;
 }
 
 /** Restart the daemon on the SAME port with the SAME sqlite file, so
@@ -177,25 +139,13 @@ async function bootDaemon(): Promise<DaemonCtx> {
  * realistic "daemon died and came back" case and the one that would
  * expose a resume point of 0. */
 async function restartDaemon(ctx: DaemonCtx): Promise<void> {
-  ctx.child.kill("SIGTERM");
-  await new Promise((r) => setTimeout(r, 700));
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST, "--port", String(ctx.port)], {
-    cwd: ctx.root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
+  await stopDaemon(ctx.child);
+  const restarted = await startTestDaemon({
+    root: ctx.root,
+    args: [REVKIT_BIN, "serve", "--dir", DIST, "--port", String(ctx.port)],
   });
-  // Mutate the handle so `shutdown` kills the right process.
-  (ctx as { child: ChildProcess }).child = child;
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    if (existsSync(join(ctx.root, ".revkit", "serve.json"))) {
-      await new Promise((r) => setTimeout(r, 250));
-      return;
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error("restarted daemon never wrote serve.json");
+  // Mutate the handle so shutdown kills the restarted process.
+  (ctx as { child: ChildProcess }).child = restarted.child;
 }
 
 /** Plant a sibling file the consumer-tree `revkit check` inside
@@ -216,12 +166,7 @@ function plantCheckFailingSibling(root: string): void {
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try {
-    ctx.child.kill("SIGTERM");
-  } catch {
-    /* already dead */
-  }
-  await new Promise((r) => setTimeout(r, 300));
+  await stopDaemon(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 

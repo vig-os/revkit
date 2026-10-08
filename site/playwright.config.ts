@@ -34,20 +34,9 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:4321",
     trace: "on-first-retry",
   },
-  // Default expect timeout, raised from Playwright's 5 s.
-  //
-  // The daemon BUILDS the rail bundle with `Bun.build` on the first
-  // request and caches it per daemon, so the first page load of every
-  // test pays a one-time compile. Locally `fullyParallel` runs that
-  // across Playwright's default worker count (CI pins `workers: 1`),
-  // and several daemons compiling at once on a loaded box can push a
-  // single cold mount past 5 s — which failed `rail-roundtrip`'s XSS
-  // regression once in ten full-suite runs, on a `toBeVisible()` for
-  // an element that was about to appear. This is a BUDGET for a real
-  // one-time cost, not a way to hide a hang: 15 s still fails a
-  // genuinely broken mount, and any assertion waiting on the debounced
-  // re-anchor pipeline uses the settle-based helper in
-  // `rail-reanchor.spec.ts` instead of a longer sleep.
+  // Keep the existing 15 s assertion budget. The daemon compiles the
+  // rail before advertising readiness, so navigation never waits on
+  // a first-request bundle build. Retry traces capture browser failures.
   expect: {
     timeout: 15_000,
   },

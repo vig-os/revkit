@@ -38,11 +38,12 @@
 //   - axe on the page with the rail open (any-violation gate,
 //     ADR-0017).
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -73,7 +74,7 @@ interface DaemonCtx {
 }
 
 /** Spawn `bun packages/cli/bin/revkit.js serve --dir <dist>` in a
- * temp workspace root, poll `serve.json`, return state + launch URL. */
+ * temp workspace root, await the launch signal, return state + launch URL. */
 async function bootDaemon(): Promise<DaemonCtx> {
   if (!existsSync(DIST)) throw new Error(`site/dist does not exist at ${DIST}; run 'just build' first.`);
   const root = mkdtempSync(join(tmpdir(), "revkit-rt-"));
@@ -90,64 +91,12 @@ async function bootDaemon(): Promise<DaemonCtx> {
     `# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`,
     "utf8",
   );
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString("utf8")));
-  child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk.toString("utf8")));
-  child.on("error", (error) => process.stderr.write(`[rail-rt] spawn error: ${(error as Error).message}\n`));
-  child.on("exit", (code, signal) => {
-    if (code !== 0 && code !== null) {
-      process.stderr.write(
-        `[rail-rt] daemon exited ${code}/${signal}\nstderr:\n${stderrChunks.join("")}\nstdout:\n${stdoutChunks.join("")}\n`,
-      );
-    }
-  });
-  const deadline = Date.now() + 15_000;
-  let state: { readonly pid: number; readonly port: number; readonly url: string; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch {
-        // Mid-write; retry.
-      }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(
-      `revkit serve did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  const deadline2 = Date.now() + 2000;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(`daemon started but never printed 'launch:' line — stdout: ${stdoutChunks.join("")}`);
-  }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--dir", DIST] });
+  return ctx;
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try {
-    ctx.child.kill("SIGTERM");
-  } catch {
-    // Already dead.
-  }
-  await new Promise((r) => setTimeout(r, 200));
+  await stopDaemon(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 
@@ -155,8 +104,9 @@ async function shutdown(ctx: DaemonCtx): Promise<void> {
  * `data-src`-anchored, and this fixture guarantees we know what
  * `path:startLine-endLine` to expect on the anchor without depending
  * on Astro's per-page layout. */
+let fixtureCounter = 0;
 async function writeFixtureHtml(): Promise<{ relPath: string; cleanup: () => void }> {
-  const relPath = "rail-fixture.html";
+  const relPath = `rail-fixture-${process.pid}-${fixtureCounter++}.html`;
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,
@@ -212,6 +162,24 @@ async function selectSubstring(page: Page, substring: string): Promise<{ x: numb
 test.describe("rail round-trip @chromium-only", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "chromium-only");
   test.setTimeout(120_000);
+
+  test("fixture teardown cannot remove another test's page", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const first = await writeFixtureHtml();
+    const second = await writeFixtureHtml();
+    try {
+      // Reproduce overlapping workers: B writes its page, then A tears down.
+      first.cleanup();
+      await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      const response = await page.goto(`${daemon.url}/${second.relPath}`);
+      expect(response?.status()).toBe(200);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+    } finally {
+      first.cleanup();
+      second.cleanup();
+      await shutdown(daemon);
+    }
+  });
 
   test("select → floating Comment → compose → assert anchor → MCP notif → MCP reply → rail update → resolve → axe", async ({ page }) => {
     const daemon = await bootDaemon();

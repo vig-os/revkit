@@ -92,7 +92,7 @@ import {
   setCookieHeader,
 } from "./auth.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
-import { buildRailBundle } from "../rail/bundle.ts";
+import { buildRailBundle, type RailBundle } from "../rail/bundle.ts";
 import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
 import {
   ASK_CSS_PATH,
@@ -459,6 +459,18 @@ const BUILD_REASON_PHRASE: Readonly<Record<BannerReason, string>> = Object.freez
 export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHandle> {
   const logger = makeLogger({ sink: options.logSink ?? defaultSink() });
   const requestedPort = options.port ?? 0;
+
+  // ADR-0013: complete the rail build attempt before advertising readiness.
+  // A failed build keeps the daemon available and preserves the rail's 500.
+  const railBuildStarted = performance.now();
+  let railBundle: RailBundle | { readonly errorKind: string };
+  try {
+    railBundle = await buildRailBundle();
+    logger.info("rail.build.ready", { durationMs: Math.round(performance.now() - railBuildStarted) });
+  } catch (error) {
+    railBundle = { errorKind: error instanceof Error ? error.name : typeof error };
+    logger.error("rail.build.failed", railBundle);
+  }
 
   // `.revkit/` mode is owned by `ensureRevkitDir` in serve-state.ts
   // (one owner, one place — round-4 review nit). Call it here so the
@@ -1305,7 +1317,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // stance as the static branch below.
     if (url.pathname === RAIL_JS_PATH || url.pathname === RAIL_CSS_PATH) {
       if (method !== "GET" && method !== "HEAD") return methodNotAllowed();
-      return handleRailAsset(url, method, requestId);
+      return handleRailAsset(url, method);
     }
 
     // Ask page bundle — mirrors the rail asset shape. Public, no
@@ -3999,18 +4011,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     });
   }
 
-  /** Serve the rail bundle (`/-/rail.js` and `/-/rail.css`). Built
-   * once with `Bun.build` on first request, then held in memory for
-   * the daemon's lifetime — the bundle is deterministic in the
-   * package's source tree. */
-  async function handleRailAsset(url: URL, method: string, requestId: string): Promise<Response> {
-    let bundle;
-    try {
-      bundle = await buildRailBundle();
-    } catch (error) {
-      logger.error("rail.build.failed", { requestId, errorKind: (error as Error).name });
+  /** Serve the prepared rail bytes or the recorded prebuild failure. */
+  async function handleRailAsset(url: URL, method: string): Promise<Response> {
+    if ("errorKind" in railBundle) {
       return withHygiene(new Response("Internal Server Error", { status: 500 }), "text", "text/plain; charset=utf-8");
     }
+    const bundle = railBundle;
     const isJs = url.pathname === RAIL_JS_PATH;
     const body = isJs ? bundle.js : bundle.css;
     const contentType = isJs ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8";

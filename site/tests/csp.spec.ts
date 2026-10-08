@@ -12,8 +12,9 @@
 // the CLI test's daemon registry so the hygiene test can insist that
 // spawned daemons were killed in `finally`.
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { expect, test, type Page } from "@playwright/test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,37 +66,13 @@ async function bootDaemon(options: BootDaemonOptions): Promise<DaemonCtx> {
   }
   writeFileSync(join(root, "package.json"), JSON.stringify({ name: "revkit", private: true, type: "module" }));
 
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--port", "0", "--dir", dist], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  registerDaemonPid(child.pid!);
-  let stdout = "";
-  const chunks: string[] = [];
-  child.stderr?.on("data", (b: Buffer) => chunks.push(b.toString("utf8")));
-  child.stdout?.on("data", (b: Buffer) => { stdout += b.toString("utf8"); });
-  const deadline = Date.now() + 15_000;
-  let listenLine: RegExpMatchArray | null = null;
-  let launchLine: RegExpMatchArray | null = null;
-  while (Date.now() < deadline) {
-    listenLine = stdout.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
-    launchLine = stdout.match(/launch:\s+(http:\/\/[^ \n]+)/);
-    if (listenLine !== null && launchLine !== null) break;
-    await new Promise((r) => setTimeout(r, 40));
-  }
-  if (listenLine === null || launchLine === null) {
-    child.kill("SIGTERM");
-    unregisterDaemonPid(child.pid!);
-    rmSync(root, { recursive: true, force: true });
-    throw new Error(`daemon did not print listen+launch lines: stdout=${stdout}, stderr=${chunks.join("")}`);
-  }
-  const port = Number.parseInt(listenLine[1]!, 10);
-  return { child, root, url: `http://127.0.0.1:${port}`, port, launchUrl: launchLine[1]! };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--port", "0", "--dir", dist] });
+  registerDaemonPid(ctx.child.pid!);
+  return ctx;
 }
 
 async function shutdownDaemon(ctx: DaemonCtx): Promise<void> {
-  try { ctx.child.kill("SIGTERM"); } catch { /* already gone */ }
-  await new Promise((r) => setTimeout(r, 250));
+  await stopDaemon(ctx.child);
   unregisterDaemonPid(ctx.child.pid!);
   rmSync(ctx.root, { recursive: true, force: true });
 }

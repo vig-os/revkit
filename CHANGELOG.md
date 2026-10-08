@@ -88,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **E2E daemon boot uses one observable readiness helper, and the rail
+  bundle is ready before the daemon advertises startup**, avoiding a
+  first-page compilation race under contention; concurrent rail specs use
+  independent fixture paths, without extending timeouts
+  ([#150](https://github.com/vig-os/revkit/issues/150),
+  [#138](https://github.com/vig-os/revkit/issues/138)).
+
 - **Legacy quote recovery stays linear on deeply nested blocks and
   repetitive text**, and rebuilds yield between threads to keep the local
   review daemon responsive
