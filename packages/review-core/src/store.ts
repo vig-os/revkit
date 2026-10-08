@@ -137,6 +137,7 @@ const rejectionFields: Record<AppendRejection["kind"], readonly string[]> = {
   "cross-file-reanchor": ["anchor", "path"],
   "duplicate-review": ["reviewNodeId"],
   "review-not-pending": ["reviewNodeId"],
+  "promotion-review-not-pending": ["reviewNodeId"],
 };
 
 function rejectionPath(rejection: { readonly kind: ImportRejection["kind"] }): readonly PropertyKey[] {

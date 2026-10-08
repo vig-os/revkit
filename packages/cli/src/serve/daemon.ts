@@ -47,6 +47,7 @@ import {
   type ReviewEvent,
   type ReviewEventInput,
   type ReviewState,
+  type ViewerReviewSummary,
   type ReviewSubmitEvent,
   type Thread,
   type ThreadFilter,
@@ -75,8 +76,9 @@ import { openStaticServer } from "./static-server.ts";
 import { resolveAnchorSource } from "./anchor-source.ts";
 import { startReanchorDaemon, type ReanchorDaemonOptions } from "./reanchor-daemon.ts";
 import { contentTypeForExtension } from "./mime.ts";
-import { promotionAtSeq } from "./promotion-provenance.ts";
-import { guardPromotionDestination, guardPromotionReview } from "./promotion-review-guard.ts";
+import { promotionAtSeq, threadLifecycleIntents } from "./promotion-provenance.ts";
+import { guardPendingPromotionDestination, guardPromotionDestination, guardPromotionReview } from "./promotion-review-guard.ts";
+import { isUnchangedSyncFailure } from "./sync-failure.ts";
 import { createAsyncMutex } from "./review-operation-mutex.ts";
 import {
   AuthState,
@@ -2619,46 +2621,16 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return healed;
   }
 
-  /** Boot-time read-only healing for accepted resolve/reopen writes.
-   * A mismatch is left pending for the next cookie-authenticated
-   * action; a matching remote state advances only the local baseline. */
+  /** Reconcile resolve/reopen intents, with read-only completion healing
+   * at boot. Agent authorizations must still name the current remotely
+   * pending review before either mutation or completion. */
   async function reconcileThreadStateIntents(
     review: ReviewModeHandle,
     allowMutations: boolean,
     requestId: string,
   ): Promise<void> {
     const events = await store.since(0);
-    const pending = new Map<string, { readonly desiredResolved: boolean; readonly intentSeq: number }>();
-    // Issue #70: WHICH lifecycle change is this thread's current one,
-    // and is it authorized, comes from the SHARED derivation
-    // (`reduceThreadLifecycleStates`) — the same one the rail's draft
-    // list and `findDraftToPromote` read. Three implementations of one
-    // rule is how a promoted resolve came to be fired for a thread that
-    // had since been reopened (issue #70 review, finding 2), so there is
-    // one now and the reconciler reads it.
-    //
-    // The two arms differ only in what authorizes the write:
-    //   - `local`: the reviewer's own resolve/reopen, which has always
-    //     been authorized. `intentSeq` is the change's own seq, so the
-    //     matching `thread.external_synced` correlates exactly as
-    //     before (round-4 fix).
-    //   - `agent`: authorized only by a LATER `draft.promoted`, whose
-    //     seq becomes the `intentSeq`. An unpromoted agent change has
-    //     no intent at all, so it can never reach the adapter.
-    // A later lifecycle change of EITHER kind supersedes the earlier
-    // one, including a promoted resolve the agent then reopened.
-    for (const state of reduceThreadLifecycleStates(events).values()) {
-      if (state.actorKind === "local") {
-        pending.set(state.threadId, { desiredResolved: state.desiredResolved, intentSeq: state.atSeq });
-        continue;
-      }
-      if (state.actorKind === "agent" && state.promotedAtSeq !== undefined) {
-        pending.set(state.threadId, {
-          desiredResolved: state.desiredResolved,
-          intentSeq: state.promotedAtSeq,
-        });
-      }
-    }
+    const pending = threadLifecycleIntents(events);
     // A completion only clears the intent it was correlated to, so a
     // delayed resolve cannot retire a newer reopen.
     for (const event of events) {
@@ -2672,6 +2644,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
     const remoteThreads = await review.options.adapter.listReviewThreads(review.options.pr);
     const remoteById = new Map(remoteThreads.map((thread) => [thread.id, thread]));
+    const state = await review.readState(store);
+    const lifecycle = reduceThreadLifecycleStates(events);
+    const destination = state.openPending?.reviewNodeId ?? null;
+    const refusedReviews = new Map<string, ViewerReviewSummary | null>();
+    const observingAdapter = {
+      async getReviewById(reviewNodeId: string) {
+        if (refusedReviews.has(reviewNodeId)) return refusedReviews.get(reviewNodeId) ?? null;
+        const remote = await review.options.adapter.getReviewById(reviewNodeId);
+        // Cache refusals within this pass. Allowed writes/heals each need a
+        // fresh pending observation immediately before acting.
+        if (remote?.state !== "PENDING" || reviewNodeId !== destination) refusedReviews.set(reviewNodeId, remote);
+        return remote;
+      },
+    };
     for (const [threadId, intent] of pending) {
       const { desiredResolved, intentSeq } = intent;
       const thread = await store.thread(threadId);
@@ -2680,12 +2666,38 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       if (external?.provider !== "github") continue;
       const remote = remoteById.get(external.threadId);
       if (remote === undefined) continue;
+      if (intent.actorKind === "agent") {
+        const guard = await guardPendingPromotionDestination(destination, intent.promotion, observingAdapter);
+        if (!guard.ok) {
+          if (!isUnchangedSyncFailure(lifecycle.get(threadId)?.syncFailure, intentSeq, guard.error)) {
+            await appendReviewLifecycleEvent({ kind: "thread.sync_failed", actor: localActor,
+              threadId, intentSeq, reason: guard.error }, requestId);
+          }
+          continue;
+        }
+      }
       if (remote.isResolved !== desiredResolved) {
         if (!allowMutations) continue;
         if (desiredResolved) {
           await review.options.adapter.resolveReviewThread({ threadNodeId: external.threadId });
         } else {
           await review.options.adapter.unresolveReviewThread({ threadNodeId: external.threadId });
+        }
+        if (intent.actorKind === "agent" && intent.promotion?.reviewNodeId !== undefined) {
+          const reviewNodeId = intent.promotion.reviewNodeId;
+          try {
+            // GitHub has no conditional resolve/unresolve. Detect a submit
+            // landing after our check, but keep the completion truthful.
+            const afterWrite = await review.options.adapter.getReviewById(reviewNodeId);
+            if (afterWrite?.state !== "PENDING") {
+              refusedReviews.set(reviewNodeId, afterWrite);
+              logger.warn("review.thread-promotion-race", { requestId, threadId, intentSeq, reviewNodeId,
+                reason: "promotion-review-ended-during-write", from: "PENDING", to: afterWrite?.state ?? "missing" });
+            }
+          } catch (error) {
+            logger.warn("review.thread-promotion-race", { requestId, threadId, intentSeq, reviewNodeId,
+              reason: "post-write-review-read-failed", errorKind: (error as Error).name });
+          }
         }
       }
       try {
@@ -2895,6 +2907,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // a later lifecycle change superseded, so they know their
           // click did not reach GitHub rather than finding out later.
           droppedReviewerIntents: state.droppedReviewerIntents,
+          lifecycleFailures: state.lifecycleFailures,
         },
         stale,
       });

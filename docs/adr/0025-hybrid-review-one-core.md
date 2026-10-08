@@ -325,3 +325,36 @@ intent remains in the log. Ordinary reconciliation never rebinds a promotion.
 ADR-0006's round-one addition specifies the error vocabulary and request shape.
 
 Refs: #136, #148
+
+
+## Amendment (issue #155): review-bound lifecycle promotion replay
+
+The review binding for promoted agent actions also governs immediate GitHub
+resolve/unresolve operations. The daemon uses the shared promotion provenance
+module and observes the bound review's remote state immediately before mutation
+or completion healing. It must be the current review and remotely `PENDING`.
+A missing, terminal, or different binding records a typed `thread.sync_failed`
+with the vocabulary specified in ADR-0006's #155 amendment and causes no lifecycle
+mutation or completion. Legacy unbound promotions are refused across restart.
+Reviewer-authored lifecycle intents remain independent and continue in the same
+reconciliation pass.
+
+The rail projects durable refusals and requires a fresh "Promote to this review"
+click naming the current review before retrying an agent action in another review.
+A new bound promotion replaces authorization for the current lifecycle change;
+ordinary reconcile cannot supply that approval. The shared lifecycle reducer
+continues to govern supersession and intent-correlated completions.
+
+Refs: #155, #136, #148
+
+Lifecycle promotions are checked immediately before each write; a submit landing
+between the check and the write is detected and logged, not prevented. GitHub
+cannot condition resolve/unresolve on the review remaining pending. A post-write
+review read detects a terminal transition and records a structured warning naming
+the thread, intent, and review; `thread.external_synced` still records the accepted
+mutation. There is no automatic reversal. Read failures after acceptance warn
+without losing the completion. ADR-0006's #155 addition also specifies unchanged
+failure deduplication (#154), per-pass refusal caching, and sync-outcome actor
+restrictions that preserve GitHub imports.
+
+Refs: #155, #154, #151

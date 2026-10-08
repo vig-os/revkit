@@ -1,12 +1,14 @@
-import type { OpenPendingReview, ReviewEvent } from "@revkit/review-core";
+import type { GitHubAdapter, OpenPendingReview, ReviewEvent } from "@revkit/review-core";
 
 type Promotion = Extract<ReviewEvent, { kind: "draft.promoted" }>;
 
-type Refusal = {
+type DestinationRefusal = {
   readonly ok: false;
-  readonly error: "no-open-pending-review" | "promotion-review-unbound" | "promotion-review-mismatch" | "promotion-review-not-pending";
+  readonly error: "promotion-review-unbound" | "promotion-review-mismatch" | "promotion-review-not-pending";
   readonly detail: string;
 };
+
+type Refusal = DestinationRefusal | { readonly ok: false; readonly error: "no-open-pending-review"; readonly detail: string };
 
 type PromotionReviewGuard = { readonly ok: true; readonly review: OpenPendingReview } | Refusal;
 
@@ -17,7 +19,7 @@ export function guardPromotionDestination(
   destinationReviewNodeId: string | null,
   promotion: Pick<Promotion, "reviewNodeId"> | undefined,
   terminalReviewNodeIds: ReadonlySet<string> = new Set(),
-): { readonly ok: true } | Refusal {
+): { readonly ok: true } | DestinationRefusal {
   if (promotion?.reviewNodeId === undefined) {
     return {
       ok: false,
@@ -61,4 +63,18 @@ export function guardPromotionReview(
     if (!bound.ok) return bound;
   }
   return { ok: true, review: openPending };
+}
+
+/** Lifecycle writes have no review id at the GitHub mutation boundary.
+ * Observe the bound review immediately before either a write or completion
+ * healing, including at boot; local pending state cannot authorize either. */
+export async function guardPendingPromotionDestination(
+  destinationReviewNodeId: string | null,
+  promotion: Pick<Promotion, "reviewNodeId"> | undefined,
+  adapter: Pick<GitHubAdapter, "getReviewById">,
+) {
+  if (promotion?.reviewNodeId === undefined) return guardPromotionDestination(destinationReviewNodeId, promotion);
+  const remote = await adapter.getReviewById(promotion.reviewNodeId);
+  return guardPromotionDestination(destinationReviewNodeId, promotion,
+    new Set(remote?.state === "PENDING" ? [] : [promotion.reviewNodeId]));
 }

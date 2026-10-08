@@ -281,6 +281,7 @@ function applyEvent(
     case "review.abandoned":
     case "comment.sync_requested":
     case "comment.sync_failed":
+    case "thread.sync_failed":
     case "comment.sync_cancelled":
     case "build.requested":
     case "build.started":

@@ -33,3 +33,25 @@ describe("promotion-review guard", () => {
     expect(guard("PRR_B", promotion, new Set(["PRR_A"]))).toMatchObject({ ok: false, error: "promotion-review-not-pending" });
   });
 });
+
+describe("#155 remote lifecycle destination guard", () => {
+  const pending = { id: "PRR_A", databaseId: 1, state: "PENDING", commitSha: review.headSha, submittedAt: null } as const;
+  test("pending authorization is read remotely and must name the current review", async () => {
+    const reads: string[] = [];
+    const adapter = { async getReviewById(id: string) { reads.push(id); return pending; } };
+    expect(await guardModule.guardPendingPromotionDestination("PRR_A", promotion, adapter)).toEqual({ ok: true });
+    expect(await guardModule.guardPendingPromotionDestination("PRR_B", promotion, adapter)).toMatchObject({ ok: false, error: "promotion-review-mismatch" });
+    expect(reads).toEqual(["PRR_A", "PRR_A"]);
+  });
+  test("remote terminal and missing reviews override stale local pending state", async () => {
+    for (const remote of [null, { ...pending, state: "COMMENTED", submittedAt: promotion.ts }] as const) {
+      expect(await guardModule.guardPendingPromotionDestination("PRR_A", promotion, { async getReviewById() { return remote; } }))
+        .toMatchObject({ ok: false, error: "promotion-review-not-pending" });
+    }
+  });
+  test("unbound promotions fail closed without a remote lookup", async () => {
+    const adapter = { async getReviewById() { throw new Error("unbound must never query GitHub"); } };
+    expect(await guardModule.guardPendingPromotionDestination("PRR_A", undefined, adapter)).toMatchObject({ ok: false, error: "promotion-review-unbound" });
+    expect(await guardModule.guardPendingPromotionDestination("PRR_A", {}, adapter)).toMatchObject({ ok: false, error: "promotion-review-unbound" });
+  });
+});

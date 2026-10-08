@@ -55,6 +55,7 @@ import {
 } from "@revkit/review-core";
 import { guardPromotionDestination } from "./promotion-review-guard.ts";
 import { promotedCommentIntents } from "./promotion-provenance.ts";
+import { isUnchangedSyncFailure } from "./sync-failure.ts";
 
 /** Options the daemon accepts in review-mode. */
 export interface ReviewModeOptions {
@@ -280,6 +281,14 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
   const currentHeadSha = review.currentHeadSha();
   const promotions = promotedCommentIntents(await store.since(0));
 
+  async function recordSyncFailure(commentId: string, reason: string): Promise<void> {
+    const previous = state.commentSync.get(commentId);
+    const intentSeq = previous !== undefined && "requestedAtSeq" in previous ? previous.requestedAtSeq : 0;
+    if (isUnchangedSyncFailure(previous?.kind === "failed"
+      ? { intentSeq: previous.requestedAtSeq, reason: previous.reason } : undefined, intentSeq, reason)) return;
+    await appendAndPublish({ kind: "comment.sync_failed", actor, commentId, reason });
+  }
+
   async function promotionRefusal(commentId: string): Promise<string | undefined> {
     if (!promotions.has(commentId)) return undefined;
     const guard = guardPromotionDestination(
@@ -288,7 +297,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
       new Set(state.terminal.map((entry) => entry.reviewNodeId)),
     );
     if (guard.ok) return undefined;
-    await appendAndPublish({ kind: "comment.sync_failed", actor, commentId, reason: guard.error });
+    await recordSyncFailure(commentId, guard.error);
     return guard.error;
   }
 
@@ -465,12 +474,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
       const st = state.commentSync.get(commentId);
       if (st === undefined) continue;
       newlyFailed.push({ commentId, reason: `list-drafts-failed:${(err as Error).name}` });
-      await appendAndPublish({
-        kind: "comment.sync_failed",
-        actor,
-        commentId,
-        reason: `list-drafts-failed:${(err as Error).name}`,
-      });
+      await recordSyncFailure(commentId, `list-drafts-failed:${(err as Error).name}`);
     }
     return { newlySynced: [], newlyFailed, reviewNodeId, healedSubmit, healedAbandon };
   }
@@ -531,7 +535,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
         if (body === undefined || await revisionOf(body) !== fingerprint.bodyHash) {
           const reason = body === undefined ? "body-not-in-log" : "body-drift";
           newlyFailed.push({ commentId, reason });
-          await appendAndPublish({ kind: "comment.sync_failed", actor, commentId, reason });
+          await recordSyncFailure(commentId, reason);
           continue;
         }
         try {
@@ -544,7 +548,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
         } catch (err) {
           const reason = `adapter:${(err as Error).name}`;
           newlyFailed.push({ commentId, reason });
-          await appendAndPublish({ kind: "comment.sync_failed", actor, commentId, reason });
+          await recordSyncFailure(commentId, reason);
           continue;
         }
       }
@@ -614,12 +618,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
     }
     if (submittedBody === undefined) {
       newlyFailed.push({ commentId, reason: "body-not-in-log" });
-      await appendAndPublish({
-        kind: "comment.sync_failed",
-        actor,
-        commentId,
-        reason: "body-not-in-log",
-      });
+      await recordSyncFailure(commentId, "body-not-in-log");
       continue;
     }
     // Round-2 BLOCK-fix 2 (body drift): compare the CURRENT
@@ -634,12 +633,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
     const currentBodyHash = await revisionOf(submittedBody);
     if (fingerprint.bodyHash !== currentBodyHash) {
       newlyFailed.push({ commentId, reason: "body-drift" });
-      await appendAndPublish({
-        kind: "comment.sync_failed",
-        actor,
-        commentId,
-        reason: "body-drift",
-      });
+      await recordSyncFailure(commentId, "body-drift");
       continue;
     }
     // Recompute the outgoing body: if the fingerprint said FILE and
@@ -652,23 +646,13 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
       // anchor is `unanchored` and we never queued a sync request
       // for it. Defensive fail.
       newlyFailed.push({ commentId, reason: "unanchored-thread" });
-      await appendAndPublish({
-        kind: "comment.sync_failed",
-        actor,
-        commentId,
-        reason: "unanchored-thread",
-      });
+      await recordSyncFailure(commentId, "unanchored-thread");
       continue;
     }
     const mapping = mapAnchorForPending(thread.anchor, review.options.files, submittedBody);
     if (mapping.kind === "orphan") {
       newlyFailed.push({ commentId, reason: mapping.reason });
-      await appendAndPublish({
-        kind: "comment.sync_failed",
-        actor,
-        commentId,
-        reason: mapping.reason,
-      });
+      await recordSyncFailure(commentId, mapping.reason);
       continue;
     }
     if (!allowMutations) continue;
@@ -704,12 +688,7 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileOutcome
       } else {
         const reason = `adapter:${(err as Error).name}`;
         newlyFailed.push({ commentId, reason });
-        await appendAndPublish({
-          kind: "comment.sync_failed",
-          actor,
-          commentId,
-          reason,
-        });
+        await recordSyncFailure(commentId, reason);
       }
     }
   }

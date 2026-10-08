@@ -306,6 +306,14 @@ export type ValidationResult = { ok: true } | { ok: false; rejection: AppendReje
  * (cross-event / cross-thread invariants).
  */
 export function validateNext(state: LogState, event: ReviewEvent): ValidationResult {
+  // Sync outcomes come from the reviewer's daemon. External observations
+  // also have a legitimate gh-user writer in the GitHub import path.
+  if (event.kind === "thread.sync_failed" || event.kind === "comment.sync_failed" || event.kind === "thread.external_synced") {
+    if (event.actor.kind !== "local" && !(event.kind === "thread.external_synced" && event.actor.kind === "gh-user")) {
+      return { ok: false, rejection: { kind: "invalid-actor", actor: event.actor,
+        message: `${event.kind}: sync outcomes require a reviewer actor${event.kind === "thread.external_synced" ? " or a GitHub import actor" : ""}, got '${event.actor.kind}'.` } };
+    }
+  }
   switch (event.kind) {
     case "comment.created": {
       if (state.threads.has(event.threadId)) {
@@ -433,6 +441,7 @@ export function validateNext(state: LogState, event: ReviewEvent): ValidationRes
       thread.lifecycle = { target: "reopen", actorKind: event.actor.kind };
       return { ok: true };
     }
+    case "thread.sync_failed":
     case "thread.external_synced": {
       if (!state.threads.has(event.threadId)) return unknownThread(event.threadId, event.kind);
       return { ok: true };

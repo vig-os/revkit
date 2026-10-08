@@ -275,6 +275,14 @@ interface RailReviewState {
       readonly commentId?: string;
       readonly path: string;
     }>;
+    /** Current promoted lifecycle intents refused by their review binding. */
+    readonly lifecycleFailures?: ReadonlyArray<{
+      readonly threadId: string;
+      readonly target: "resolve" | "reopen";
+      readonly path: string;
+      readonly intentSeq: number;
+      readonly reason: string;
+    }>;
     /** Issue #70 round 3: the reviewer's OWN resolve/reopen that a
      * later lifecycle change superseded, so it never reached GitHub. */
     readonly droppedReviewerIntents?: ReadonlyArray<{
@@ -861,6 +869,9 @@ function subscribeEvents(
           event.kind === "comment.linked" ||
           event.kind === "comment.sync_requested" ||
           event.kind === "comment.sync_failed" ||
+          event.kind === "thread.sync_failed" ||
+          event.kind === "thread.external_synced" ||
+          event.kind === "draft.promoted" ||
           event.kind === "review.opened" ||
           event.kind === "review.submitted" ||
           event.kind === "review.abandoned"
@@ -1354,11 +1365,16 @@ function Rail(): JSX.Element {
         event.kind === "comment.linked" ||
         event.kind === "comment.sync_requested" ||
         event.kind === "comment.sync_failed" ||
+        event.kind === "thread.sync_failed" ||
+        event.kind === "thread.external_synced" ||
+        event.kind === "draft.promoted" ||
         event.kind === "review.opened" ||
         event.kind === "review.submitted" ||
         event.kind === "review.abandoned" ||
         event.kind === "thread.reanchored" ||
-        event.kind === "thread.orphaned"
+        event.kind === "thread.orphaned" ||
+        event.kind === "thread.resolved" ||
+        event.kind === "thread.reopened"
       ) {
         void refetchReview();
       }
@@ -1995,6 +2011,41 @@ function Rail(): JSX.Element {
                       data-target={dropped.target}
                     >
                       your {dropped.target} on <code>{dropped.path}</code> — not sent to GitHub
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </div>
+          </Show>
+          <Show when={(reviewState()!.state.lifecycleFailures ?? []).length > 0}>
+            <div class="revkit-rail__review-unsynced" data-testid="revkit-rail-lifecycle-failures" role="alert">
+              <ul class="revkit-rail__review-unsynced-list">
+                <For each={reviewState()!.state.lifecycleFailures ?? []}>
+                  {(entry) => (
+                    <li class="revkit-rail__review-unsynced-item" data-testid="revkit-rail-lifecycle-failure"
+                      data-thread-id={entry.threadId} data-target={entry.target}>
+                      <span>{entry.target} on <code>{entry.path}</code> — {syncFailureMessage(entry.reason)}</span>
+                      <button type="button" class="revkit-rail__agent-draft-promote"
+                        data-testid="revkit-rail-lifecycle-fresh-promote"
+                        disabled={reviewBusy() || reviewState()!.state.openPending === null}
+                        onClick={() => {
+                          const reviewNodeId = reviewState()?.state.openPending?.reviewNodeId;
+                          if (reviewNodeId === undefined) return;
+                          void (async () => {
+                            setReviewBusy(true);
+                            setError(undefined);
+                            try {
+                              await promoteAgentDraft({ threadId: entry.threadId, target: entry.target, reviewNodeId });
+                              await refetchReview();
+                              await refetch();
+                            } catch (cause) {
+                              setError((cause as Error).message);
+                            } finally {
+                              setReviewBusy(false);
+                            }
+                          })();
+                        }}
+                      >Promote to this review</button>
                     </li>
                   )}
                 </For>
