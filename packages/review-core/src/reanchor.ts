@@ -306,11 +306,9 @@ export function findHunkWindow(
 /**
  * Align the OLD quote against `newSource` at `startOffset` and return
  * the offset just past where the quote's END lands in the new source,
- * plus the aligned new text. Uses `diff_main` for a char-level
- * alignment and `diff_xIndex(oldQuote.length - 1) + 1` to walk the
- * quote's LAST character to its counterpart, avoiding the boundary-
- * INSERT bug where `diff_xIndex(len)` swallows a trailing `\n` and
- * the next paragraph.
+ * plus the aligned new text. A raw char diff retains suffix matches;
+ * the endpoint walker finishes the replacement token with Intl.Segmenter
+ * inside a window bounded before any new paragraph separator.
  *
  * After the raw endpoint is computed, whitespace at the START or END
  * of the matched text that the OLD quote did NOT have is trimmed off
@@ -326,7 +324,10 @@ export function alignMatchedText(
   options: { slack?: number; trailingContext?: string } = {},
 ): { startOffset: number; endOffset: number; matchedText: string } {
   const slack = options.slack ?? Math.max(Math.floor(oldQuote.length * 0.5), 16);
-  const trailing = options.trailingContext ?? "";
+  // Match only context in the same bounded block. Context beyond a blank
+  // line is absent from the window and could steal the replacement's equal
+  // characters (right → great aligns against "Tail paragraph" otherwise).
+  const trailing = (options.trailingContext ?? "").split(/\n[\t ]*\n/, 1)[0] ?? "";
   // Append the recorded trailing context to the alignment target so
   // DMP can find a common suffix and bound the INSERT — otherwise a
   // partial-line quote like "brown fox" against a window
@@ -335,14 +336,22 @@ export function alignMatchedText(
   // past the real block boundary. With the trailing context, DMP
   // aligns "cat" only and the rest as an EQUAL suffix.
   const alignmentTarget = oldQuote + trailing;
-  const windowEnd = Math.min(newSource.length, startOffset + alignmentTarget.length + slack);
+  // Keep paragraph separators outside the alignment window. A short suffix
+  // match must never be dissolved into the replacement of the quote itself.
+  // Quotes already spanning paragraphs may retain their existing separators.
+  const separators = [...oldQuote.matchAll(/\n[\t ]*\n/g)].length;
+  const breaks = /\n[\t ]*\n/g;
+  breaks.lastIndex = startOffset;
+  let blockEnd = newSource.length;
+  for (let i = 0; i <= separators; i++) {
+    const next = breaks.exec(newSource);
+    if (next === null) break;
+    if (i === separators) blockEnd = next.index;
+  }
+  const windowEnd = Math.min(blockEnd, startOffset + alignmentTarget.length + slack);
   const window = newSource.slice(startOffset, windowEnd);
   const dmp = new DiffMatchPatch();
   const diffs = dmp.diff_main(alignmentTarget, window) as Diff[];
-  // As in prepareReanchor, discard incidental equal letters inside a
-  // replacement. Otherwise wrong → right ends on an EQUAL "g" and the
-  // endpoint walker omits the inserted "ht" at the quote boundary (#127).
-  dmp.diff_cleanupSemantic(diffs);
   // Walk to position oldQuote.length (the boundary between the
   // block and the trailing context we appended). The trailing
   // context bounds the diff so the walker does not overrun the
@@ -350,7 +359,7 @@ export function alignMatchedText(
   // otherwise happen when DMP finds an incidental single-char
   // match past the block. See test `alignMatchedText — does not
   // spill into a following table row`.
-  const endInWindow = walkAlignmentEnd(diffs, oldQuote.length);
+  const endInWindow = walkAlignmentEnd(diffs, oldQuote, window);
   let start = startOffset;
   let end = Math.min(newSource.length, startOffset + endInWindow);
   // Trim leading whitespace that the OLD quote does not begin with —
@@ -366,6 +375,110 @@ function isWhitespace(ch: number): boolean {
   return ch === 9 /* \t */ || ch === 10 /* \n */ || ch === 13 /* \r */ || ch === 32 /* space */;
 }
 
+/** The snapshot's containing paragraph supplies edge evidence independently
+ * of the fuzzy diff. A changed neighbouring paragraph is not suffix evidence.
+ * Partial quotes require their in-block context to survive at both endpoints;
+ * if a replacement straddles that context, orphan rather than guess its edge. */
+function paragraphBounds(source: string, offset: number): { start: number; end: number } {
+  const breaks = /\n[\t ]*\n/g;
+  breaks.lastIndex = offset;
+  const end = breaks.exec(source)?.index ?? source.length;
+  // Search only the enclosing paragraph, not all preceding document blocks.
+  let newline = source.lastIndexOf("\n", offset - 1);
+  while (newline > 0) {
+    const previous = source.lastIndexOf("\n", newline - 1);
+    if (previous < 0) break;
+    if (/^[\t ]*$/.test(source.slice(previous + 1, newline))) return { start: newline + 1, end };
+    newline = previous;
+  }
+  return { start: 0, end };
+}
+
+function safeTokenEdges(source: string, start: number, end: number): boolean {
+  // LF is always a word/grapheme boundary. Segment the containing lines,
+  // not an entire large paragraph, keeping prepared per-anchor work local.
+  const lineStart = start === 0 ? 0 : source.lastIndexOf("\n", start - 1) + 1;
+  const nextLine = source.indexOf("\n", end);
+  const text = source.slice(lineStart, nextLine < 0 ? source.length : nextLine);
+  const edges = [start - lineStart, end - lineStart];
+  const bounds = new Set<number>([text.length]);
+  for (const cluster of graphemeSegments.segment(text)) bounds.add(cluster.index);
+  if (!edges.every((edge) => bounds.has(edge))) return false;
+  for (const word of wordSegments.segment(text)) {
+    if (word.isWordLike && edges.some((edge) => word.index < edge && edge < word.index + word.segment.length)) return false;
+  }
+  return true;
+}
+
+function preservedEdges(oldSource: string, oldStart: number, oldEnd: number, newSource: string, start: number, end: number): boolean {
+  const oldBlock = paragraphBounds(oldSource, oldStart);
+  const newBlock = paragraphBounds(newSource, start);
+  if (oldEnd > oldBlock.end) return true; // Existing multi-block selections.
+  if (end > newBlock.end) return false;
+  if (oldStart === oldBlock.start) {
+    if (start !== newBlock.start) return false;
+  } else {
+    const prefix = oldSource.slice(Math.max(oldBlock.start, oldStart - DEFAULT_ANCHOR_CONTEXT_CHARS), oldStart);
+    if (!newSource.slice(Math.max(newBlock.start, start - prefix.length), start).endsWith(prefix)) return false;
+    if (oldStart - oldBlock.start <= DEFAULT_ANCHOR_CONTEXT_CHARS) {
+      if (newSource.slice(newBlock.start, start) !== prefix) return false;
+    } else {
+      const text = newSource.slice(newBlock.start, newBlock.end);
+      const first = text.indexOf(prefix);
+      if (first < 0 || text.indexOf(prefix, first + 1) >= 0) return false;
+    }
+  }
+  if (oldEnd === oldBlock.end) return end === newBlock.end;
+  const suffix = oldSource.slice(oldEnd, Math.min(oldBlock.end, oldEnd + DEFAULT_ANCHOR_CONTEXT_CHARS));
+  if (!newSource.startsWith(suffix, end)) return false;
+  if (oldBlock.end - oldEnd <= DEFAULT_ANCHOR_CONTEXT_CHARS) return newSource.slice(end, newBlock.end) === suffix;
+  const text = newSource.slice(newBlock.start, newBlock.end);
+  const first = text.indexOf(suffix);
+  return first >= 0 && text.indexOf(suffix, first + 1) < 0;
+}
+
+// Threads on the same span share endpoint evidence, just as they share the
+// prepared diff. Keep the cache outside the frozen context and release it
+// with that context; no source snapshots remain in a process-global cache.
+const endpointProofs = new WeakMap<ReanchorContext, Map<string, boolean>>();
+
+function cachedEndpointProof(ctx: ReanchorContext, key: string, evaluate: () => boolean): boolean {
+  let proofs = endpointProofs.get(ctx);
+  if (proofs === undefined) { proofs = new Map(); endpointProofs.set(ctx, proofs); }
+  const prior = proofs.get(key);
+  if (prior !== undefined) return prior;
+  const valid = evaluate();
+  proofs.set(key, valid);
+  return valid;
+}
+
+function hasAmbiguousWordEdit(diffs: readonly Diff[], start: number, end: number, oldSource: string, newSource: string): boolean {
+  let oldOffset = 0;
+  let newOffset = 0;
+  const block = paragraphBounds(oldSource, start);
+  const quote = oldSource.slice(start, end);
+  for (let i = 0; i < diffs.length; i++) {
+    const [op, text] = diffs[i]!;
+    const changeStart = oldOffset;
+    const newChangeStart = newOffset;
+    if (op !== 1) oldOffset += text.length;
+    if (op !== -1) newOffset += text.length;
+    if (op === 0) continue;
+    // A replacement of an adjacent word is not an edge insertion. Retain
+    // nearby-edit behavior (must → should before the selected "validate").
+    if (op === 1 ? diffs[i - 1]?.[0] === -1 : diffs[i + 1]?.[0] === 1) continue;
+    if (changeStart < block.start || oldOffset > block.end) continue;
+    if (!safeTokenEdges(op === 1 ? newSource : oldSource, op === 1 ? newChangeStart : changeStart, op === 1 ? newOffset : oldOffset)) continue;
+    const atStart = oldOffset <= start && /^\s*$/.test(oldSource.slice(oldOffset, start));
+    const atEnd = changeStart >= end && /^\s*$/.test(oldSource.slice(end, changeStart));
+    const repeated = text.trim().length > 0 && quote.includes(text.trim());
+    if (!atStart && !atEnd && !repeated) continue;
+    if (/\p{Extended_Pictographic}/u.test(text)) return true;
+    for (const word of wordSegments.segment(text)) if (word.isWordLike) return true;
+  }
+  return false;
+}
+
 /**
  * Walk `diffs` (of `oldQuote` → `window`) and return the position in
  * `window` corresponding to the END of `oldQuote`, including any
@@ -379,7 +492,30 @@ function isWhitespace(ch: number): boolean {
  * any subsequent INSERTs before the next EQUAL — those inserts are
  * the NEW text that replaced the deleted characters.
  */
-function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
+const wordSegments = new Intl.Segmenter("und", { granularity: "word" });
+const graphemeSegments = new Intl.Segmenter("und", { granularity: "grapheme" });
+
+function walkAlignmentEnd(diffs: readonly Diff[], oldQuote: string, window: string): number {
+  const oldQuoteLen = oldQuote.length;
+  // Rule: equal characters in a char diff may cover only part of the new
+  // token, leaving the endpoint inside the replacement. Finish that word
+  // and grapheme using Intl.Segmenter, including CJK dictionary boundaries,
+  // combining marks and emoji sequences. The caller has already confined the
+  // window to the containing paragraph, so expansion cannot swallow a break.
+  // A standalone word inserted exactly at a partial edge stays outside unless
+  // the diff places it inside the replacement; either edge choice is allowed.
+  const finishToken = (offset: number): number => {
+    if (offset >= window.length) return window.length;
+    for (const word of wordSegments.segment(window)) {
+      if (word.index >= offset) break;
+      if (word.isWordLike && word.index + word.segment.length > offset) offset = word.index + word.segment.length;
+    }
+    for (const cluster of graphemeSegments.segment(window)) {
+      if (cluster.index >= offset) break;
+      if (cluster.index + cluster.segment.length > offset) offset = cluster.index + cluster.segment.length;
+    }
+    return offset;
+  };
   let chars1 = 0;
   let chars2 = 0;
   for (let x = 0; x < diffs.length; x += 1) {
@@ -392,7 +528,7 @@ function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
     if (nextChars1 >= oldQuoteLen) {
       if (op === 0) {
         // EQUAL segment covers the end — end is proportional.
-        return chars2 + (oldQuoteLen - chars1);
+        return finishToken(chars2 + (oldQuoteLen - chars1));
       }
       // DELETE segment covers the end — advance past this DELETE
       // (its chars are gone, so chars2 does not advance) and fold in
@@ -406,7 +542,7 @@ function walkAlignmentEnd(diffs: readonly Diff[], oldQuoteLen: number): number {
         if (op2 === 0) break;
         if (op2 === 1) end += text2.length;
       }
-      return end;
+      return finishToken(end);
     }
     chars1 += oldLen;
     chars2 += newLen;
@@ -688,10 +824,22 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
   if (cls.kind === "unchanged") {
     const newStart = dmp.diff_xIndex(diffs as Diff[], oldSpan.start);
     const newEnd = dmp.diff_xIndex(diffs as Diff[], oldSpan.end - 1) + 1;
+    // Identical repeated words let the diff move an interior edit outside
+    // the quote without changing its text. Ownership is ambiguous: do not
+    // silently drop an insertion or preserve a deleted copy. Markup at an
+    // edge remains outside the unchanged half-open selection.
+    const oldPrefix = oldLF.slice(Math.max(0, oldSpan.start - DEFAULT_ANCHOR_CONTEXT_CHARS), oldSpan.start);
+    const oldSuffix = oldLF.slice(oldSpan.end, oldSpan.end + DEFAULT_ANCHOR_CONTEXT_CHARS);
+    const stationaryEdge = (oldPrefix.length > 0 && newLF.slice(Math.max(0, newStart - oldPrefix.length), newStart) === oldPrefix)
+      || (oldSuffix.length > 0 && newLF.slice(newEnd, newEnd + oldSuffix.length) === oldSuffix);
+    if (stationaryEdge && cachedEndpointProof(ctx, `ambiguity:${oldSpan.start}:${oldSpan.end}`, () => hasAmbiguousWordEdit(diffs, oldSpan.start, oldSpan.end, oldLF, newLF))) {
+      return { kind: "orphaned", revision: newRevision, reason: "unchanged: repeated word edit has ambiguous ownership at a quote edge." };
+    }
     const mapped = newLF.slice(newStart, newEnd);
     if (
       mapped === anchor.quote.exact &&
-      boundariesMatch(oldLF, oldSpan.start, oldSpan.end, newLF, newStart, newEnd)
+      boundariesMatch(oldLF, oldSpan.start, oldSpan.end, newLF, newStart, newEnd) &&
+      cachedEndpointProof(ctx, `tokens:${newStart}:${newEnd}`, () => safeTokenEdges(newLF, newStart, newEnd))
     ) {
       const rebuilt = await buildAnchor(
         anchor,
@@ -707,7 +855,7 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     // move detection. If the block truly moved to a new position
     // with intact context, tryMove will find it; otherwise orphan.
     const moveResult = tryMove(oldLF, newLF, anchor.quote);
-    if (moveResult !== null && moveResult.start >= 0) {
+    if (moveResult !== null && moveResult.start >= 0 && safeTokenEdges(newLF, moveResult.start, moveResult.start + anchor.quote.exact.length)) {
       const rebuilt = await buildAnchor(
         anchor,
         newLF,
@@ -738,7 +886,7 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     cls.equalChars / spanLen < DEFAULT_MIN_MODIFIED_EQUAL_FRACTION
   ) {
     const moveResult = tryMove(oldLF, newLF, anchor.quote);
-    if (moveResult !== null && moveResult.start >= 0) {
+    if (moveResult !== null && moveResult.start >= 0 && safeTokenEdges(newLF, moveResult.start, moveResult.start + anchor.quote.exact.length)) {
       const rebuilt = await buildAnchor(
         anchor,
         newLF,
@@ -762,7 +910,7 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
   // (4c) Deleted — try move detection. NO fuzzy fallback.
   if (cls.kind === "deleted") {
     const moveResult = tryMove(oldLF, newLF, anchor.quote);
-    if (moveResult !== null && moveResult.start >= 0) {
+    if (moveResult !== null && moveResult.start >= 0 && safeTokenEdges(newLF, moveResult.start, moveResult.start + anchor.quote.exact.length)) {
       const rebuilt = await buildAnchor(
         anchor,
         newLF,
@@ -801,6 +949,14 @@ export async function reanchorWith(ctx: ReanchorContext, anchor: Anchor): Promis
     // quotes that recorded no DOM context (#126, #146).
     trailingContext: oldLF.slice(oldSpan.end, oldSpan.end + DEFAULT_ANCHOR_CONTEXT_CHARS),
   });
+  if (
+    aligned.startOffset >= aligned.endOffset ||
+    !cachedEndpointProof(ctx, `modified:${oldSpan.start}:${oldSpan.end}:${aligned.startOffset}:${aligned.endOffset}`, () =>
+      safeTokenEdges(newLF, aligned.startOffset, aligned.endOffset) &&
+      preservedEdges(oldLF, oldSpan.start, oldSpan.end, newLF, aligned.startOffset, aligned.endOffset))
+  ) {
+    return { kind: "orphaned", revision: newRevision, reason: "modified: no safe token endpoints with preserved containing-block evidence." };
+  }
   const score = similarity(sourceQuote, aligned.matchedText);
   if (score < DEFAULT_MIN_QUOTE_SCORE) {
     return {

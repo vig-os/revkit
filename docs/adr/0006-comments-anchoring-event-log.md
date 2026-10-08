@@ -777,3 +777,40 @@ text avoid rescanning an entire block for each occurrence. The independent
 browser interval oracle is permanent; its full-size manual run reports agreement,
 refusals and wrong intervals separately. Renderer exceptions emit a debug event
 with the allowlisted error kind, without source or exception-message content.
+
+## Amendment (2026-10-08, issues #126/#146/#127, PR #172 fix round): safe replacement endpoints
+
+Modified-quote alignment retains the raw character diff. Semantic cleanup is
+not applied to that local diff: it can dissolve the short suffix match or blank
+line that bounds the quote into the replacement. The alignment window stops
+before the containing paragraph's next blank-line separator. A selection that
+already includes separators may retain that number, but may not gain another.
+The alignment target also excludes trailing context beyond its next separator;
+text absent from the bounded window must not supply incidental equal characters
+inside a replacement (`right → great` must not align against `Tail paragraph`).
+
+The endpoint walker completes a replacement through its token boundary using
+`Intl.Segmenter` with locale `und`, word and grapheme granularities. This covers
+CJK dictionary boundaries, combining marks and emoji sequences. Both resulting
+endpoints must be grapheme boundaries and must not cut a word. Exact and move
+results receive the same endpoint checks when a rebuild changes the revision.
+
+For a modified partial quote, the snapshot's context inside the containing
+paragraph must survive at both endpoints. Context reaching a block edge must
+still reach that edge; shorter context must match uniquely within the block.
+A whole-block quote must keep both block edges. Rewriting a following paragraph
+does not authorize absorbing it. An uncertain replacement boundary or ambiguous
+repeated-word context produces an orphan instead of a guessed span.
+
+Standalone words inserted exactly at a partial quote's edge may be included or
+excluded. If the diff can also explain an insertion or deletion inside a
+repeated word sequence with a stationary edge, the engine orphans rather than
+silently dropping the insertion or preserving a deleted copy. Punctuation and
+whitespace inserted at an unchanged partial edge stay outside its half-open
+range. An intact phrase may still move mechanically
+through the diff when its surroundings change, as the existing M3 case requires.
+
+The permanent seeded splice oracle derives expected spans from edit records,
+independently of the production diff. It checks 2,000 cases in the normal suite;
+`REVKIT_ANCHOR_ORACLE_CASES=12000` runs the larger manual differential and reports
+correct, orphan and wrong spans. No similarity gate or timeout is relaxed.
