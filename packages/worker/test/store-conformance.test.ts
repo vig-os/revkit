@@ -12,7 +12,7 @@ import { afterAll, beforeAll, describe } from "bun:test";
 import type { ThreadStore } from "@revkit/review-core";
 import { D1ThreadStore } from "../src/d1-store.ts";
 import { previewScopePath } from "../src/router.ts";
-import { fixedClock, storeConformance, type StoreFactory } from "../../review-core/test/store-conformance.ts";
+import { fixedClock, storeConformance, persistedAppendConformance, type StoreFactory } from "../../review-core/test/store-conformance.ts";
 import { startWorker, type Harness } from "./harness.ts";
 
 describe("D1ThreadStore (hosted, miniflare D1)", () => {
@@ -56,4 +56,8 @@ describe("D1ThreadStore (hosted, miniflare D1)", () => {
   };
 
   storeConformance(d1Factory);
+  persistedAppendConformance(d1Factory, async (row) => {
+    await harness.db.prepare("INSERT INTO review_logs (log_key, seq, ts, payload) VALUES (?, ?, ?, ?)")
+      .bind(previewScopePath("revkit", 7), row.seq, "2026-10-03T12:00:00Z", row.payload).run();
+  });
 });

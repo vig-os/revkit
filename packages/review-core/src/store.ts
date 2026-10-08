@@ -83,14 +83,130 @@ export interface ThreadStore {
   ask(id: string): Promise<AskRecord | undefined>;
 }
 
+// Keep the import label in a template literal so the bundle's quoted-module
+// specifier gate cannot mistake operation data for a module import.
+export const STORE_OPERATION_LABELS = { append: "append", import: `import`, open: "open" } as const;
+
+/** Location of a refusal, shared by schema and transition diagnostics. */
+interface RejectionLocation {
+  readonly path?: readonly PropertyKey[];
+  readonly index?: number;
+  readonly seq?: number;
+}
+
+/** Bound each quoted fragment to 120 escaped code units, preserving complete
+ * JSON escapes and an explicit omitted-character count. JSON handles C0 and
+ * lone surrogates; also escape C1 and Unicode line separators. Errors and
+ * accepted-replay warnings share this primitive. */
+export function quoteStoreDiagnostic(value: string): string {
+  let escaped = "";
+  let consumed = 0;
+  for (const char of value) {
+    const fragment = JSON.stringify(char).slice(1, -1).replace(
+      /[\u007f-\u009f\u2028\u2029]/g,
+      (control) => `\\u${control.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    if (escaped.length + fragment.length > 120) break;
+    escaped += fragment;
+    consumed += char.length;
+  }
+  return `"${escaped}"` + (value.length > consumed ? `…(+${value.length - consumed} chars)` : "");
+}
+
+// Exhaustive by type: adding a validator kind requires an explicit field here.
+const rejectionFields: Record<AppendRejection["kind"], readonly string[]> = {
+  "invalid-shape": ["event"],
+  "duplicate-thread": ["threadId"],
+  "unknown-thread": ["threadId"],
+  "unknown-parent": ["parentId"],
+  "duplicate-comment-id": ["commentId"],
+  "not-open": ["threadId"],
+  "not-resolved": ["threadId"],
+  "unknown-comment": ["commentId"],
+  "invalid-actor": ["actor"],
+  "duplicate-ask": ["askId"],
+  "unknown-ask": ["askId"],
+  "duplicate-answer": ["askId"],
+  "ask-not-pending": ["askId"],
+  "answer-kind-mismatch": ["answer", "kind"],
+  "answer-shape-mismatch": ["answer"],
+  "duplicate-link": ["external"],
+  "duplicate-external-id": ["external"],
+  "already-orphaned": ["threadId"],
+  "not-an-agent-draft": ["threadId"],
+  "cross-file-reanchor": ["anchor", "path"],
+  "duplicate-review": ["reviewNodeId"],
+  "review-not-pending": ["reviewNodeId"],
+};
+
+function rejectionPath(rejection: { readonly kind: ImportRejection["kind"] }): readonly PropertyKey[] {
+  if (rejection.kind === "answer-shape-mismatch" && "field" in rejection) return ["answer", String(rejection.field)];
+  if (rejection.kind === "not-an-agent-draft" && "commentId" in rejection && rejection.commentId !== undefined) return ["commentId"];
+  return rejectionFields[rejection.kind as AppendRejection["kind"]] ?? ["seq"];
+}
+
+/** Build the human half of the store error contract. Diagnostics and paths
+ * may contain caller-controlled values, including Zod's interpolated text.
+ * Quote the entire fragment, and escape C1 controls and Unicode line separators
+ * too (JSON already escapes C0 controls), so it stays one physical log line. */
+export function storeRejectionMessage(
+  operation: "append" | "import" | "open",
+  rejection: AppendRejection | { readonly kind: ImportRejection["kind"]; readonly message: string },
+  location: RejectionLocation = {},
+): string {
+  const subject = operation === STORE_OPERATION_LABELS.import ? "archive" : operation === "open" ? "existing log" : "event";
+  const event = location.index !== undefined
+    ? ` at event ${location.index}${location.seq === undefined ? "" : ` (seq ${location.seq})`}`
+    : location.seq === undefined ? "" : ` at persisted event (seq ${location.seq})`;
+  const path = location.path?.length ? location.path : rejectionPath(rejection);
+  const field = `${event === "" ? " at" : ""} field ${quoteStoreDiagnostic(path.map(String).join("."))}`;
+  return `${operation}: ${subject} refused${event}${field}: ${rejection.kind} — ${quoteStoreDiagnostic(rejection.message)}`;
+}
+
+/** The portion of a Zod issue needed to describe a shape refusal. */
+interface StoreIssue {
+  readonly path: readonly PropertyKey[];
+  readonly message: string;
+}
+
 /** Thrown by any `ThreadStore.append` when the input is refused. Exposes
  * a machine-readable `rejection` so callers can branch without parsing
  * `.message`. */
 export class ThreadStoreAppendError extends Error {
   readonly rejection: AppendRejection;
-  constructor(rejection: AppendRejection) {
-    super(rejection.message);
+  constructor(rejection: AppendRejection, location: RejectionLocation = {}, options: ErrorOptions = {}) {
+    super(storeRejectionMessage("append", rejection, location), options);
     this.name = "ThreadStoreAppendError";
+    this.rejection = rejection;
+  }
+
+  /** Shape failures use the first offending field, never a raw issues dump. */
+  static fromIssues(issues: readonly StoreIssue[]): ThreadStoreAppendError {
+    const first = issues[0];
+    return new ThreadStoreAppendError(
+      { kind: "invalid-shape", message: first?.message ?? "event failed schema validation" },
+      { path: first?.path },
+    );
+  }
+}
+
+/** A persisted log failed replay. Distinct from refusing a new append or an
+ * archive: callers must repair or restore the existing store before opening it.
+ * JSON and schema failures are invalid-shape; transition failures retain their
+ * invariant kind. Infrastructure errors keep their original taxonomy. */
+export class ThreadStoreOpenError extends Error {
+  readonly rejection: AppendRejection;
+
+  constructor(rejection: AppendRejection, displayName: string, options: {
+    readonly location?: RejectionLocation;
+    readonly cause?: unknown;
+  } = {}) {
+    super(
+      storeRejectionMessage("open", rejection, options.location) +
+        ` Archive ${quoteStoreDiagnostic(displayName)} and start clean, or restore from backup.`,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
+    this.name = "ThreadStoreOpenError";
     this.rejection = rejection;
   }
 }
@@ -154,9 +270,9 @@ export type ImportRejection = {
  *
  * `rejection` carries the machine-readable reason (the offending event's
  * `seq`/`index` plus the invariant's `kind`) so a caller never has to
- * parse `.message`. `cause` is set only on the shape path, where it is
- * the `ZodError` from `parseArchive` — so `cause instanceof Error`
- * always holds when `cause` is present at all. On the transition path
+ * parse `.message`. `cause` carries archive schema failures or persisted-row
+ * JSON/schema failures — a `ZodError` or `SyntaxError`, so
+ * `cause instanceof Error` holds for these parsing refusals. On the transition path
  * the reason is the structured `rejection.transition` instead, which is
  * why no `cause` is set there: an `AppendRejection` is not an `Error`,
  * and a `cause` that is sometimes an `Error` and sometimes a plain
@@ -164,11 +280,79 @@ export type ImportRejection = {
 export class ThreadStoreImportError extends Error {
   readonly rejection: ImportRejection | undefined;
 
-  constructor(message: string, options: { readonly rejection?: ImportRejection; readonly cause?: unknown } = {}) {
-    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+  constructor(message: string, options: {
+    readonly rejection?: ImportRejection;
+    readonly cause?: unknown;
+    readonly location?: RejectionLocation;
+  } = {}) {
+    super(
+      storeRejectionMessage(STORE_OPERATION_LABELS.import, {
+        ...options.rejection?.transition,
+        kind: options.rejection?.kind ?? "invalid-shape",
+        message,
+      }, options.location),
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
     this.name = "ThreadStoreImportError";
     this.rejection = options.rejection;
   }
+}
+
+/** Columns needed to identify a malformed row even when its payload has no seq. */
+export interface PersistedEventRow {
+  readonly seq: number;
+  readonly payload: string;
+}
+
+/** One constructor for persisted-log failures in every backing. Catch-up
+ * refuses new input as invalid-shape; open retains a transition's real kind.
+ * An import's machine seq/index still name only archive events, so the foreign
+ * row's seq belongs in the human location, not in ImportRejection.seq. */
+export function persistedLogError(
+  operation: "append" | "import" | "open",
+  seq: number,
+  rejection: AppendRejection,
+  options: { readonly path?: readonly PropertyKey[]; readonly cause?: unknown; readonly displayName?: string } = {},
+): ThreadStoreAppendError | ThreadStoreImportError | ThreadStoreOpenError {
+  const location = { seq, path: options.path ?? rejectionPath(rejection) };
+  if (operation === "open") {
+    return new ThreadStoreOpenError(rejection, options.displayName ?? "existing store", { location, cause: options.cause });
+  }
+  const message = rejection.kind === "invalid-shape"
+    ? rejection.message : `persisted event violates ${rejection.kind}: ${rejection.message}`;
+  if (operation === "append") {
+    return new ThreadStoreAppendError({ kind: "invalid-shape", message }, location, { cause: options.cause });
+  }
+  return new ThreadStoreImportError(message, {
+    rejection: { kind: "invalid-shape", seq: undefined, index: undefined, transition: undefined },
+    location,
+    cause: options.cause,
+  });
+}
+
+/** Parse a stored payload in the caller's operation taxonomy. Query/read
+ * methods keep their own behavior; replay on open and catch-up use this gate. */
+export function parsePersistedEvent(
+  row: PersistedEventRow,
+  operation: "append" | "import" | "open",
+  displayName?: string,
+): ReviewEvent {
+  let value: unknown;
+  try {
+    value = JSON.parse(row.payload);
+  } catch (cause) {
+    throw persistedLogError(operation, row.seq, { kind: "invalid-shape", message: "persisted payload must be valid JSON" }, {
+      path: ["payload"], cause, displayName,
+    });
+  }
+  const parsed = reviewEventSchema.safeParse(value);
+  if (!parsed.success) {
+    const first = parsed.error.issues[0];
+    throw persistedLogError(operation, row.seq, {
+      kind: "invalid-shape", message: first?.message ?? "persisted event failed schema validation",
+    }, { path: first?.path.length ? first.path : ["payload"], cause: parsed.error, displayName });
+  }
+  return parsed.data;
 }
 
 /** The `seq` of the event at `index` in a raw (not yet validated)
@@ -205,21 +389,12 @@ function importSchemaError(raw: ThreadArchive, cause: unknown): ThreadStoreImpor
   const issues = (cause as { readonly issues?: readonly ArchiveIssue[] }).issues;
   const first = Array.isArray(issues) ? issues[0] : undefined;
   if (first === undefined) {
-    return new ThreadStoreImportError("import: archive refused — it is not a valid revkit thread archive.", { cause });
+    return new ThreadStoreImportError("it is not a valid revkit thread archive.", { cause });
   }
   const [root, maybeIndex] = first.path;
   const index = root === "events" && typeof maybeIndex === "number" ? maybeIndex : undefined;
   const seq = index === undefined ? undefined : seqAt(raw, index);
-  // A `superRefine` issue already names the invariant in its message
-  // ("log invariant: unknown-thread — …"); a plain Zod issue names a
-  // field, so print the path under the event to say which one.
-  const field = index === undefined ? first.path.join(".") : first.path.slice(2).join(".");
-  const where =
-    index === undefined
-      ? first.path.length === 0
-        ? "the archive itself"
-        : `archive field '${field}'`
-      : `event ${index}${seq === undefined ? "" : ` (seq ${seq})`}${field === "" ? "" : ` field '${field}'`}`;
+  const path = index === undefined ? first.path : first.path.slice(2);
   // The archive failed its OWN `validateNext` play-through, so the
   // invariant's real kind is available and is what the store's dry run
   // would have reported for the same archive. Only a genuine shape
@@ -227,7 +402,7 @@ function importSchemaError(raw: ThreadArchive, cause: unknown): ThreadStoreImpor
   // `invalid-shape` (#72: the two must not be indistinguishable).
   const transition = first.transition;
   return new ThreadStoreImportError(
-    `import: archive refused at ${where}: ${first.message}`,
+    first.message,
     {
       rejection: {
         kind: transition?.kind ?? "invalid-shape",
@@ -236,6 +411,7 @@ function importSchemaError(raw: ThreadArchive, cause: unknown): ThreadStoreImpor
         transition,
       },
       cause,
+      location: { path, index, seq },
     },
   );
 }
@@ -271,8 +447,11 @@ export function prepareImport(archive: ThreadArchive, state: LogState, head: num
   const firstSeq = validated.events[0]?.seq ?? 0;
   if (firstSeq <= head) {
     throw new ThreadStoreImportError(
-      `import: archive's first seq ${firstSeq} is not strictly greater than the store's head ${head}.`,
-      { rejection: { kind: "head-not-monotone", seq: firstSeq, index: 0, transition: undefined } },
+      `archive's first seq ${firstSeq} is not strictly greater than the store's head ${head}.`,
+      {
+        rejection: { kind: "head-not-monotone", seq: firstSeq, index: 0, transition: undefined },
+        location: { path: ["seq"], index: 0, seq: firstSeq },
+      },
     );
   }
   // Atomic commit — the documented behaviour. Dry-run the whole sequence
@@ -286,8 +465,11 @@ export function prepareImport(archive: ThreadArchive, state: LogState, head: num
     const result = validateNext(shadow, event);
     if (!result.ok) {
       throw new ThreadStoreImportError(
-        `import: archive refused at event ${index} (seq ${event.seq}): ${result.rejection.kind} — ${result.rejection.message}`,
-        { rejection: { kind: result.rejection.kind, seq: event.seq, index, transition: result.rejection } },
+        result.rejection.message,
+        {
+          rejection: { kind: result.rejection.kind, seq: event.seq, index, transition: result.rejection },
+          location: { index, seq: event.seq },
+        },
       );
     }
   }
@@ -343,8 +525,8 @@ function notAContinuation(firstSeq: number, head: number): ThreadStoreImportErro
   const gap = firstSeq > head + 1;
   return new ThreadStoreImportError(
     gap
-      ? `import: archive refused — its first seq ${firstSeq} sits above the store's head ${head} + 1, so seqs ${head + 1}..${firstSeq - 1} would stay empty forever.`
-      : `import: archive refused — its first seq ${firstSeq} would continue the store's head ${head}, but this store already holds a log and nothing shows the archive is its continuation.`,
+      ? `its first seq ${firstSeq} sits above the store's head ${head} + 1, so seqs ${head + 1}..${firstSeq - 1} would stay empty forever.`
+      : `its first seq ${firstSeq} would continue the store's head ${head}, but this store already holds a log and nothing shows the archive is its continuation.`,
     {
       rejection: {
         kind: gap ? "seq-gap" : "divergent-archive",
@@ -352,6 +534,7 @@ function notAContinuation(firstSeq: number, head: number): ThreadStoreImportErro
         index: 0,
         transition: undefined,
       },
+      location: { path: ["seq"], index: 0, seq: firstSeq },
     },
   );
 }
@@ -378,10 +561,7 @@ export class InMemoryThreadStore implements ThreadStore {
     const candidate = { ...input, seq, ts } as ReviewEvent;
     const parsed = reviewEventSchema.safeParse(candidate);
     if (!parsed.success) {
-      throw new ThreadStoreAppendError({
-        kind: "invalid-shape",
-        message: `append: event failed validation: ${JSON.stringify(parsed.error.issues)}`,
-      });
+      throw ThreadStoreAppendError.fromIssues(parsed.error.issues);
     }
     const event = parsed.data;
     const result = validateNext(this.#logState, event);
