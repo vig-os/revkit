@@ -3,12 +3,15 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Shared review core — threads, events, dual anchors, revision (ADR-0006, ADR-0025).",
+  "description": "Shared review core \u2014 threads, events, dual anchors, revision (ADR-0006, ADR-0025).",
   "license": "Apache-2.0",
   "exports": {
     ".": "./src/index.ts",
     "./path": "./src/path.ts",
-    "./http-headers": "./src/http-headers.ts"
+    "./http-headers": "./src/http-headers.ts",
+    "./markdown-blocks": "./src/markdown-blocks.ts",
+    "./block-map": "./src/block-map.ts",
+    "./block-preparation": "./src/block-preparation.ts"
   },
   "scripts": {
     "test": "bun test",
@@ -16,7 +19,12 @@
   },
   "dependencies": {
     "diff-match-patch": "1.0.5",
-    "zod": "4.6.5"
+    "zod": "4.6.5",
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm": "3.1.0",
+    "mdast-util-math": "3.0.0",
+    "micromark-extension-gfm": "3.0.0",
+    "micromark-extension-math": "3.1.0"
   },
   "devDependencies": {
     "@types/bun": "1.4.2",

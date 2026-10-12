@@ -66,6 +66,9 @@
 // server and any future PR-adapter can display or hide these
 // events independently. See M2 item 5b's design note.
 
+import { parseMarkdownBlocks } from "@revkit/review-core/markdown-blocks";
+import { prepareBlockSnapshot, prepareBlockPair, type PreparedBlockSnapshot } from "@revkit/review-core/block-preparation";
+import { capturedMarkdownMap } from "../remark-block-map.ts";
 import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { existsSync, statSync, watch, type FSWatcher } from "node:fs";
 import { basename as basenameOf, dirname, relative } from "node:path";
@@ -276,6 +279,8 @@ export interface ReanchorDaemonHandle {
    * skips the pipeline" test asserts on. Diagnostic; not exposed
    * over HTTP. */
   pipelineRunCount(): number;
+  /** Snapshot/map reuse diagnostics; no source text is exposed. */
+  blockPreparationStats(): { readonly snapshotsSegmented: number; readonly bytesSegmented: number; readonly mapsParsed: number; readonly mapsCaptured: number; readonly legacyRenders: number };
   /** How the directory watcher for `dir` is currently served:
    * `"watch"` (a live `fs.watch`), `"poll"` (the `stat`-poll
    * fallback), or `undefined` when the directory has no watcher.
@@ -426,6 +431,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
    * matches the last-processed revision, so a burst of GETs on an
    * idle file leaves this counter unchanged. */
   let pipelineRunCount = 0;
+  const blockStats = { snapshotsSegmented: 0, bytesSegmented: 0, mapsParsed: 0, mapsCaptured: 0, legacyRenders: 0 };
 
   /** Number of threaded paths currently under a watcher (real or
    * poll). Kept in a local helper so both `watchedPaths` and the
@@ -445,6 +451,7 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
     watchedDirs: () => dirWatchers.size,
     fileReadCount: () => fileReadCount,
     pipelineRunCount: () => pipelineRunCount,
+    blockPreparationStats: () => ({ ...blockStats }),
     dirWatchMode: (dir) => {
       const dw = dirWatchers.get(dir);
       if (dw === undefined) return undefined;
@@ -666,6 +673,18 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
       else byRevision.set(thread.anchor.revision, [thread]);
     }
 
+    // Snapshot preparation is scoped to this refresh, so no unbounded source
+    // cache survives snapshot GC. New tables are shared across revision buckets.
+    const blockSnapshots = new Map<string, PreparedBlockSnapshot>();
+    async function snapshotBlocks(source: string, revision: string, captured = capturedMarkdownMap(revision)): Promise<PreparedBlockSnapshot> {
+      const cached = blockSnapshots.get(revision);
+      if (cached) return cached;
+      const map = captured ?? await parseMarkdownBlocks(source);
+      if (captured) blockStats.mapsCaptured++; else blockStats.mapsParsed++;
+      const prepared = await prepareBlockSnapshot(source, map, blockStats);
+      blockSnapshots.set(revision, prepared);
+      return prepared;
+    }
     for (const [oldRevision, bucket] of byRevision) {
       // Identity: nothing changed on the file since the anchor was
       // taken. Skip pipeline work, but memo the orphan check so a
@@ -708,9 +727,28 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         continue;
       }
 
+      // This existing legacy render also captures old mdast: no extra HTML
+      // render is needed to obtain the structural map.
+      let rendered: RenderedProvenance | undefined;
+      blockStats.legacyRenders++;
+      try { rendered = await renderProvenance(repoRoot, path, oldSource); } catch { /* Fail closed below. */ }
+      let prepareBlocks: ((diffs: ReanchorContext["diffs"]) => ReturnType<typeof prepareBlockPair> | undefined) | undefined;
+      if (!path.endsWith(".mdx")) {
+        try {
+          const old = await snapshotBlocks(oldSource, oldRevision, rendered?.blockMap);
+          const next = await snapshotBlocks(newSource, newRevision);
+          prepareBlocks = (diffs) => {
+            try { return prepareBlockPair(old, next, diffs); }
+            catch { logger.debug("reanchor.blocks.unavailable", { path }); return undefined; }
+          };
+        } catch {
+          // Slice 1 does not change acceptance on unavailable structural data.
+          logger.debug("reanchor.blocks.unavailable", { path });
+        }
+      }
       let ctx: ReanchorContext;
       try {
-        ctx = await prepareReanchor(oldSource, newSource);
+        ctx = await prepareReanchor(oldSource, newSource, { prepareBlocks });
       } catch (error) {
         // A diff timeout or a WebCrypto failure is a soft error — do
         // not crash the daemon; log and orphan.
@@ -735,8 +773,6 @@ export function startReanchorDaemon(options: ReanchorDaemonOptions): ReanchorDae
         continue;
       }
 
-      let rendered: RenderedProvenance | undefined;
-      try { rendered = await renderProvenance(repoRoot, path, oldSource); } catch { /* Fail closed below. */ }
       let lastYield = (options.nowMs ?? performance.now)();
       const closedDuringYield = new Set<string>();
       for (const thread of bucket) {

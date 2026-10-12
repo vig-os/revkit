@@ -14,7 +14,7 @@
 //                      granularity, with `diff_cleanupSemantic` and
 //                      `Diff_Timeout` bounded. One diff serves the
 //                      whole classification.
-//   (3) Classify     — locate the anchor's OLD span (byte offsets in
+//   (3) Classify     — locate the anchor's OLD span (UTF-16 offsets in
 //                      `oldLF`) via the recorded `prefix + exact +
 //                      suffix`, then walk the diff to classify:
 //                        unchanged is entirely in EQUAL segments,
@@ -58,6 +58,7 @@
 // beyond the workspace is `diff-match-patch` (pure JS, browser-safe),
 // wrapped in a narrow typed shim (`src/vendor/dmp.ts`) so no ambient
 // declaration leaks out of this package.
+import type { PreparedBlockPair } from "./block-preparation.ts";
 import { anchorSchema, type Anchor, type TextQuote } from "./anchor.ts";
 import { authorSchema, type Author } from "./author.ts";
 import { type ReviewEventInput } from "./events.ts";
@@ -147,6 +148,8 @@ export const DEFAULT_DIFF_TIMEOUT_SECONDS = 2.0;
  * micro-benchmarks and forensic diagnostics can tweak the timeout. */
 export interface ReanchorOptions {
   readonly diffTimeoutSeconds?: number;
+  /** Slice 1 evidence only; ignored by production acceptance. */
+  readonly prepareBlocks?: (diffs: readonly Diff[]) => PreparedBlockPair | undefined;
 }
 
 /**
@@ -166,6 +169,7 @@ export interface ReanchorOptions {
  * async task while it is used, and cheap to discard.
  */
 export interface ReanchorContext {
+  readonly blocks?: PreparedBlockPair;
   readonly oldLF: string;
   readonly newLF: string;
   readonly oldRevision: string;
@@ -178,7 +182,7 @@ export interface ReanchorContext {
 // ---------- Line-offset index (perf) ----------
 
 /**
- * Precompute the sorted list of line-start byte offsets in `source`
+ * Precompute the sorted list of line-start UTF-16 offsets in `source`
  * (LF-normalised). `index[i]` is the offset of line `i+1`'s first
  * character; `index.length` is the number of lines. Called ONCE per
  * source in `reanchor`; subsequent `offsetToLine` / `lineToOffset`
@@ -193,7 +197,7 @@ export function buildLineStartIndex(source: string): number[] {
   return idx;
 }
 
-/** Byte offset of the start of line `line` (1-indexed), via the
+/** UTF-16 offset of the start of line `line` (1-indexed), via the
  * precomputed index. Returns `source.length` for line numbers past
  * the end. */
 export function lineToOffset(index: readonly number[], line: number): number {
@@ -203,7 +207,7 @@ export function lineToOffset(index: readonly number[], line: number): number {
   return index[i] ?? 0;
 }
 
-/** 1-indexed line number that byte `offset` sits on. Binary search
+/** 1-indexed line number that UTF-16 `offset` sits on. Binary search
  * over the precomputed index. */
 export function offsetToLine(index: readonly number[], offset: number): number {
   if (offset <= 0) return 1;
@@ -627,6 +631,7 @@ export async function prepareReanchor(
   const newLineIndex = Object.freeze(buildLineStartIndex(newLF));
   for (const diff of diffs) Object.freeze(diff);
   Object.freeze(diffs);
+  const blocks = options.prepareBlocks?.(diffs);
   return Object.freeze({
     oldLF,
     newLF,
@@ -635,6 +640,7 @@ export async function prepareReanchor(
     diffs,
     oldLineIndex,
     newLineIndex,
+    ...(blocks ? { blocks } : {}),
   });
 }
 

@@ -1,6 +1,7 @@
 // Authoritative maps are rendered from a confined source snapshot through
 // the SAME Astro pipeline as the page. Client-supplied maps/text are never
 // evidence. No MDX components are evaluated during recovery.
+import type { BlockMap } from "@revkit/review-core/block-map";
 import { pathToFileURL } from "node:url";
 import { createMarkdownProcessor } from "@astrojs/markdown-remark";
 import { parseHTML } from "linkedom";
@@ -12,17 +13,19 @@ import { sourceEndpoint, type LeafMap } from "../text-provenance.ts";
 import type { ProvenanceRecords } from "../rehype-data-src.ts";
 
 export interface RenderedProvenance {
+  readonly blockMap?: BlockMap;
   readonly document: Document;
   readonly leaves: ReadonlyMap<string, { readonly element: Element; readonly map: LeafMap }>;
   readonly blocks: ReadonlySet<string>;
 }
 
 export async function renderProvenance(repoRoot: string, path: string, source: string): Promise<RenderedProvenance> {
+  let blockMap: BlockMap | undefined;
   let captured: ProvenanceRecords = { leaves: new Map(), blocks: new Set() };
   const processor = await createMarkdownProcessor({
-    ...buildSharedMarkdownConfig(repoRoot, { onProvenance: (records) => { captured = records; } }), syntaxHighlight: false,
+    ...buildSharedMarkdownConfig(repoRoot, { onProvenance: (records) => { captured = records; }, onBlockMap: (map) => { blockMap = map; } }), syntaxHighlight: false,
   } as Parameters<typeof createMarkdownProcessor>[0]);
-  const { code } = await processor.render(source, { fileURL: pathToFileURL(`${repoRoot}/${path}`) });
+  const { code } = await processor.render(source.replace(/\r\n?/g, "\n"), { fileURL: pathToFileURL(`${repoRoot}/${path}`) });
   const { document } = parseHTML(`<html><body>${code}</body></html>`);
   const leaves = new Map<string, { element: Element; map: LeafMap }>();
   const duplicates = new Set<string>();
@@ -37,7 +40,7 @@ export async function renderProvenance(repoRoot: string, path: string, source: s
     leaves.set(id, { element, map: record.map });
   }
   for (const id of duplicates) leaves.delete(id);
-  return { document, leaves, blocks: captured.blocks };
+  return { document, leaves, blocks: captured.blocks, ...(blockMap ? { blockMap } : {}) };
 }
 
 /** Derive both line bounds, quote AND context from the source. A range
