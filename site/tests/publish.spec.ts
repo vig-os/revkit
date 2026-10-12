@@ -19,8 +19,9 @@
 //
 // Chromium-only (WebKit is #19).
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { test, expect } from "@playwright/test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -69,56 +70,12 @@ async function bootDaemon(): Promise<DaemonCtx> {
   // serves it read-only. Publishes go into the temp `docs/` tree
   // AND install an in-memory HTML override, so the real dist on
   // disk is not modified.
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (c: Buffer) => stderrChunks.push(c.toString("utf8")));
-  child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c.toString("utf8")));
-  const deadline = Date.now() + 15_000;
-  let state: { readonly url: string; readonly port: number; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch {
-        // Mid-write; retry.
-      }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(
-      `daemon did not write serve.json within 15s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  const deadline2 = Date.now() + 3000;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/)) break;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  const launchUrl = stdoutChunks.join("").match(/launch:\s+(\S+)/)?.[1];
-  if (launchUrl === undefined) {
-    child.kill("SIGTERM");
-    throw new Error(`daemon started but never printed 'launch:' — stdout: ${stdoutChunks.join("")}`);
-  }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken, launchUrl };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--dir", DIST] });
+  return ctx;
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try {
-    ctx.child.kill("SIGTERM");
-  } catch {
-    // Already dead.
-  }
-  await new Promise((r) => setTimeout(r, 200));
+  await stopDaemon(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 

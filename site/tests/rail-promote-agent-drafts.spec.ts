@@ -16,9 +16,10 @@
 //      pending review; the badge disappears.
 //   Axe gate at every phase.
 
+import { bootReviewDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,9 +59,9 @@ async function bootDaemon(lifecycleTarget?: "resolve" | "reopen"): Promise<Daemo
   writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
   mkdirSync(join(root, dirname(FIXTURE_REL_PATH)), { recursive: true });
   writeFileSync(join(root, FIXTURE_REL_PATH), FIXTURE_SOURCE, "utf8");
-  const child = spawn(
-    "bun",
-    [
+  return await bootReviewDaemon<BootInfo>({
+    root,
+    args: [
       BOOT_SCRIPT,
       "--dir", DIST,
       "--repo-root", root,
@@ -69,53 +70,17 @@ async function bootDaemon(lifecycleTarget?: "resolve" | "reopen"): Promise<Daemo
       "--control-port", "0",
       ...(lifecycleTarget === undefined ? [] : ["--lifecycle-thread", lifecycleTarget]),
     ],
-    { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env },
-  );
-  const stderrChunks: string[] = [];
-  const stdoutChunks: string[] = [];
-  child.stderr?.on("data", (b: Buffer) => {
-    const s = b.toString("utf8");
-    stderrChunks.push(s);
-    if (process.env.REVKIT_E2E_LOG === "1") process.stderr.write(`[boot.stderr] ${s}`);
   });
-  child.stdout?.on("data", (b: Buffer) => stdoutChunks.push(b.toString("utf8")));
-  child.on("exit", (code) => {
-    if (code !== 0 && code !== null) {
-      process.stderr.write(
-        `[rail-p70] daemon exited ${code}\nstderr:\n${stderrChunks.join("")}\nstdout:\n${stdoutChunks.join("")}\n`,
-      );
-    }
-  });
-  const deadline = Date.now() + 30_000;
-  let info: BootInfo | undefined;
-  while (Date.now() < deadline) {
-    const joined = stdoutChunks.join("");
-    const line = joined.split("\n").find((l) => l.trim().startsWith("{"));
-    if (line !== undefined) {
-      try {
-        info = JSON.parse(line) as BootInfo;
-        break;
-      } catch { /* mid-write */ }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (info === undefined) {
-    try { child.kill("SIGTERM"); } catch { /* fine */ }
-    throw new Error(
-      `boot did not print a JSON info line within 30s\nstderr: ${stderrChunks.join("")}\nstdout: ${stdoutChunks.join("")}`,
-    );
-  }
-  return { ...info, child, root };
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try { ctx.child.kill("SIGTERM"); } catch { /* fine */ }
-  await new Promise((r) => setTimeout(r, 200));
+  await stopDaemon(ctx.child);
   try { rmSync(ctx.root, { recursive: true, force: true }); } catch { /* fine */ }
 }
 
+let fixtureCounter = 0;
 function writeFixtureHtml(): { relPath: string; cleanup: () => void } {
-  const relPath = "rail-promote-fixture.html";
+  const relPath = `rail-promote-fixture-${process.pid}-${fixtureCounter++}.html`;
   const abs = join(DIST, relPath);
   writeFileSync(
     abs,

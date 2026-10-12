@@ -1,6 +1,7 @@
+import { bootDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { test, expect, type Page } from "@playwright/test";
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { type ChildProcess } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { renderFixture } from "./provenance-fixture.ts";
@@ -18,32 +19,12 @@ async function boot(source: string, path = PATH): Promise<Env> {
   writeFileSync(join(root, path), source);
   const document = await renderFixture(root, path, source);
   writeFileSync(join(root, "dist/index.html"), `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Provenance</title></head><body><main>${document.body.innerHTML}</main></body></html>`);
-  const child = spawn("bun", [CLI, "serve", "--dir", join(root, "dist")], { cwd: root, stdio: ["ignore", "pipe", "pipe"], env: process.env });
-  let output = "";
-  child.stdout!.on("data", (chunk) => { output += chunk.toString(); });
-  // Drain stderr without logging launch codes or local credentials.
-  child.stderr!.on("data", () => {});
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    const file = join(root, ".revkit/serve.json");
-    const launch = output.match(/launch:\s+(\S+)/)?.[1];
-    if (existsSync(file) && launch) {
-      const state = JSON.parse(readFileSync(file, "utf8")) as { url: string };
-      return { root, child, url: state.url, launch };
-    }
-    await new Promise((done) => setTimeout(done, 25));
-  }
-  child.kill("SIGTERM");
-  rmSync(root, { recursive: true, force: true });
-  throw new Error("Provenance test daemon did not start");
+  const ctx = await bootDaemon({ root, args: [CLI, "serve", "--dir", join(root, "dist")] });
+  return { root, child: ctx.child, url: ctx.url, launch: ctx.launchUrl };
 }
 
 async function stop(env: Env): Promise<void> {
-  const done = new Promise<void>((resolveDone) => env.child.once("exit", () => resolveDone()));
-  env.child.kill("SIGTERM");
-  await Promise.race([done, new Promise((resolveDone) => setTimeout(resolveDone, 200))]);
-  if (env.child.exitCode === null && env.child.signalCode === null) env.child.kill("SIGKILL");
-  await done;
+  await stopDaemon(env.child);
   rmSync(env.root, { recursive: true, force: true });
 }
 

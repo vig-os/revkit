@@ -1,4 +1,4 @@
-// Rail bundler — assembles the browser-side rail bundle on demand
+// Rail bundler — assembles the browser-side rail bundle at daemon startup
 // with `Bun.build`, cached in memory so the daemon serves the same
 // bytes for the whole session.
 //
@@ -13,7 +13,7 @@
 //   runs it through `@babel/core` + `babel-preset-solid`, and
 //   hands the transformed JS back. Everything else Bun.build does
 //   (module resolution, ESM output, minification) is unchanged.
-// - Building at first serve, rather than at repo build time, keeps
+// - Building before daemon readiness, rather than at repo build time, keeps
 //   the CLI package free of a committed bundle (which would be a
 //   size / diff / vendored-code question the check-dist / vendor
 //   guards would then have to allowlist) and lets `bun test` run

@@ -11,9 +11,9 @@
 // After the fetch and EventSource attach, the test POSTs a comment
 // via the agent bearer (a bearer-authenticated caller does not need
 // Sec-Fetch-Site) and asserts the browser's EventSource received it.
+import { bootDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { expect, test } from "@playwright/test";
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -40,22 +40,18 @@ test.describe("same-origin daemon UI", () => {
     writeFileSync(join(root, "docs", "x.md"), "# x\n\nhello\n");
 
     const cliBin = resolve(import.meta.dirname, "..", "..", "packages", "cli", "bin", "revkit.js");
-    const daemon = spawn("bun", [cliBin, "serve", "--port", "0", "--dir", dist], {
-      cwd: root,
-      stdio: ["ignore", "pipe", "pipe"],
+    const info = await bootDaemon({
+      root, args: [cliBin, "serve", "--port", "0", "--dir", dist], timeoutMs: 10_000,
     });
+    const daemon = info.child;
 
     let daemonPort = 0;
     let launchUrl = "";
     let agentToken = "";
     try {
-      const info = await waitForDaemon(daemon);
       daemonPort = info.port;
       launchUrl = info.launchUrl;
-      // The agent token lives in serve.json (mode 600). Read it.
-      const serveJsonPath = join(root, ".revkit", "serve.json");
-      const serveJson = JSON.parse(readFileSync(serveJsonPath, "utf8"));
-      agentToken = String(serveJson.agentToken);
+      agentToken = info.agentToken;
       expect(agentToken.length).toBeGreaterThan(0);
 
       // Step 1 — exchange the launch code for the session cookie.
@@ -131,42 +127,8 @@ test.describe("same-origin daemon UI", () => {
       expect(parsed.kind).toBe("comment.created");
       expect(parsed.body).toBe("hello from playwright");
     } finally {
-      daemon.kill("SIGTERM");
-      await new Promise((r) => setTimeout(r, 200));
+      await stopDaemon(daemon);
       rmSync(root, { recursive: true, force: true });
     }
   });
 });
-
-async function waitForDaemon(child: ChildProcess): Promise<{ port: number; launchUrl: string }> {
-  return new Promise((resolveOuter, rejectOuter) => {
-    let stdout = "";
-    let stderr = "";
-    const outStream = child.stdout;
-    const errStream = child.stderr;
-    if (outStream === null || errStream === null) {
-      rejectOuter(new Error("daemon stdio not piped"));
-      return;
-    }
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      rejectOuter(new Error(`daemon startup timeout. stdout:\n${stdout}\nstderr:\n${stderr}`));
-    }, 10_000);
-    outStream.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-      const listen = stdout.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
-      const launch = stdout.match(/launch:\s+(http:\/\/[^ \n]+)/);
-      if (listen !== null && launch !== null) {
-        clearTimeout(timer);
-        resolveOuter({ port: Number.parseInt(listen[1] ?? "0", 10), launchUrl: launch[1] ?? "" });
-      }
-    });
-    errStream.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      rejectOuter(new Error(`daemon exited early (${code}). stdout:\n${stdout}\nstderr:\n${stderr}`));
-    });
-  });
-}

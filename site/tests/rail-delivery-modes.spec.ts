@@ -15,11 +15,12 @@
 // The daemon is started in a temp workspace outside the repo so the
 // site's dist stays untouched. Chromium-only (WebKit is #19).
 
+import { bootDaemon as startTestDaemon, stopDaemon } from "./helpers/daemon.ts";
 import { provenanceFixture } from "./provenance-fixture.ts";
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -52,50 +53,12 @@ async function bootDaemon(): Promise<DaemonCtx> {
     `# Title\n\nline 2\n\n${FIXTURE_PARAGRAPH_TEXT}\n\nline 6\n`,
     "utf8",
   );
-  const child = spawn("bun", [REVKIT_BIN, "serve", "--dir", DIST], {
-    cwd: root,
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-    env: process.env,
-  });
-  const stdoutChunks: string[] = [];
-  child.stdout?.on("data", (c: Buffer) => stdoutChunks.push(c.toString("utf8")));
-  const deadline = Date.now() + 15_000;
-  let state: { readonly port: number; readonly url: string; readonly agentToken: string } | undefined;
-  while (Date.now() < deadline) {
-    const path = join(root, ".revkit", "serve.json");
-    if (existsSync(path)) {
-      try {
-        state = JSON.parse(readFileSync(path, "utf8"));
-        break;
-      } catch { /* mid-write */ }
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  if (state === undefined) {
-    child.kill("SIGTERM");
-    throw new Error("daemon never wrote serve.json");
-  }
-  // Readiness gate only. The daemon's launch URL is deliberately NOT kept:
-  // the code in it is single-use, so the one field that caused #74's ask-page
-  // cluster has no reason to exist on a ctx at all. Each test mints its own
-  // via `mintLaunchUrl` — see `fixtures/launch-code.ts`.
-  const deadline2 = Date.now() + 2000;
-  let announcedLaunch = false;
-  while (Date.now() < deadline2) {
-    if (stdoutChunks.join("").match(/launch:\s+(\S+)/) !== null) { announcedLaunch = true; break; }
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  if (!announcedLaunch) {
-    child.kill("SIGTERM");
-    throw new Error("daemon never printed launch URL");
-  }
-  return { child, root, url: state.url, port: state.port, agentToken: state.agentToken };
+  const ctx = await startTestDaemon({ root, args: [REVKIT_BIN, "serve", "--dir", DIST] });
+  return ctx;
 }
 
 async function shutdown(ctx: DaemonCtx): Promise<void> {
-  try { ctx.child.kill("SIGTERM"); } catch { /* already dead */ }
-  await new Promise((r) => setTimeout(r, 200));
+  await stopDaemon(ctx.child);
   rmSync(ctx.root, { recursive: true, force: true });
 }
 
