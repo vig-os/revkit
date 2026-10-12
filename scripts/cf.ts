@@ -1,11 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEV_ACCOUNT, DEV_BUCKET, DEV_WORKER, generateDevConfig, readBaseConfig, validateDevState } from "./cf-dev-config.ts";
 import type { DevState } from "./cf-dev-config.ts";
-import { devArguments } from "./cf-dev-args.ts";
+import { devArguments, fileArgument } from "./cf-dev-args.ts";
 import { confirmArguments } from "./cf-confirm.ts";
+import { checkEnvironment, wranglerEnvironment } from "./cf-environment.ts";
 import { isMissingWorker } from "./cf-wrangler-contract.ts";
 
 const repo = join(import.meta.dir, "..");
@@ -21,6 +22,8 @@ const redact = (text: string, secrets = credentials): string =>
 // to /dev/null rather than leaving credential-bearing diagnostics on disk.
 const logDir = mkdtempSync(join(tmpdir(), "revkit-cf-log-"));
 const logPath = join(logDir, "wrangler.log");
+const emptyEnv = join(logDir, "empty.env");
+writeFileSync(emptyEnv, "", { mode: 0o600 });
 symlinkSync("/dev/null", logPath);
 process.on("exit", () => rmSync(logDir, { recursive: true, force: true }));
 
@@ -38,10 +41,9 @@ async function relay(stream: ReadableStream<Uint8Array>, output: NodeJS.WriteStr
 }
 async function wrangler(args: string[], config?: string, options: { capture?: boolean; secret?: string; allowMissingWorker?: boolean } = {}): Promise<string> {
   const secrets = options.secret ? [...credentials, options.secret] : credentials;
-  const child = Bun.spawn(["wrangler", ...(config ? ["--config", config] : []), ...args], {
+  const child = Bun.spawn(["wrangler", ...(config ? ["--config", config] : []), "--env-file", emptyEnv, ...args], {
     cwd: config ? workerDir : repo,
-    env: { ...process.env, WRANGLER_SEND_METRICS: "false", WRANGLER_LOG_PATH: logPath,
-      WRANGLER_LOG: "log", NO_COLOR: "1", CLOUDFLARE_ENV: "" },
+    env: wranglerEnvironment(process.env, logPath),
     stdin: options.secret ? new Blob([options.secret + "\n"]) : "ignore", stdout: "pipe", stderr: "pipe",
   });
   const forwardSignal = (signal: NodeJS.Signals) => child.kill(signal);
@@ -116,15 +118,41 @@ async function init(rotate: boolean): Promise<void> {
 }
 async function main(): Promise<void> {
   const [mode, ...args] = process.argv.slice(2);
+  checkEnvironment(process.env);
+  if (mode !== "cf" && readdirSync(workerDir).some((name) => name.startsWith(".env") || name.startsWith(".dev.vars"))) {
+    throw new Error("cf-dev: remove packages/worker/.env* and .dev.vars* before running");
+  }
   if (!process.env.CLOUDFLARE_API_TOKEN) throw new Error("cf: missing local Cloudflare API token; use scripts/cf-credentials.sh");
-  if (mode === "cf") { await wrangler(confirmArguments(args)); return; }
+  if (mode === "cf") {
+    const seen = new Set<string>();
+    const validated = [...args];
+    for (let i = 0; i < validated.length; i++) {
+      const arg = validated[i]!;
+      if (!arg.startsWith("-")) continue;
+      const name = arg.split("=")[0]!;
+      // Wrangler treats env-file as an array; never permit an appended file.
+      if (["--env-file", "--envFile", "--f", "--"].includes(name) || /^-f/.test(name)) throw new Error("cf: env-file overrides, file aliases and separators are forbidden");
+      const canonical = ({ "-c": "--config", "-e": "--env" } as Record<string, string>)[name] ?? name;
+      if (seen.has(canonical)) throw new Error(`cf: repeated flag ${canonical}`);
+      seen.add(canonical);
+      if (name === "--file") {
+        const equals = arg.indexOf("=");
+        const value = equals < 0 ? validated[++i] : arg.slice(equals + 1);
+        if (!value || value.startsWith("-")) throw new Error("cf: invalid --file");
+        const path = fileArgument(repo, value);
+        if (equals < 0) validated[i] = path; else validated[i] = "--file=" + path;
+      }
+    }
+    await wrangler(confirmArguments(validated)); return;
+  }
   if (process.env.CLOUDFLARE_ACCOUNT_ID !== DEV_ACCOUNT) throw new Error("cf-dev: credentials must select the authorized dev account");
   if (mode === "init") {
     if (args.length > 1 || (args.length === 1 && args[0] !== "--rotate")) throw new Error("usage: just cf-dev-init [--rotate]");
     await init(args[0] === "--rotate"); return;
   }
   if (mode !== "dev") throw new Error("cf: unknown recipe mode");
-  const validatedArgs = devArguments(confirmArguments(args), repo);
+  const validatedArgs = confirmArguments([...devArguments(args.filter((arg) => arg !== "--yes-really"), repo),
+    ...args.filter((arg) => arg === "--yes-really")]);
   generateDevConfig(readBaseConfig(join(workerDir, "wrangler.jsonc")), readState(), devConfigPath);
   await wrangler(validatedArgs, devConfigPath);
 }

@@ -1,4 +1,4 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DotenvError, dotenvValues, parseDotenv, quoteDotenv } from "./cf-dotenv.ts";
 
@@ -31,16 +31,23 @@ try {
     mkdirSync(dirname(path), { recursive: true });
     const temp = mkdtempSync(join(dirname(path), ".cf-credentials-"));
     try {
+      const backupSuffix = new Date().toISOString() + "." + basename(temp).replace(/^\./, "");
+      if (existsSync(path + ".bak")) {
+        const legacyTime = statSync(path + ".bak").mtime.toISOString();
+        chmodSync(path + ".bak", 0o600);
+        renameSync(path + ".bak", `${path}.bak.${legacyTime}.${basename(temp).replace(/^\./, "")}`);
+      }
       if (existsSync(path)) {
         // Unique UTC names preserve earlier generations, even for concurrent writers.
         writeFileSync(join(temp, "backup"), "", { mode: 0o600 });
         copyFileSync(path, join(temp, "backup")); chmodSync(join(temp, "backup"), 0o600);
-        renameSync(join(temp, "backup"), `${path}.bak.${new Date().toISOString()}.${basename(temp)}`);
+        renameSync(join(temp, "backup"), `${path}.bak.${backupSuffix}`);
       }
       writeFileSync(join(temp, "env"), out.join("\n") + "\n", { mode: 0o600 });
       renameSync(join(temp, "env"), path);
       const prefix = basename(path) + ".bak.";
-      const backups = readdirSync(dirname(path)).filter((name) => name.startsWith(prefix)).sort();
+      const backups = readdirSync(dirname(path)).filter((name) => name.startsWith(prefix) &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\.\.?cf-credentials-[A-Za-z0-9]{6}$/.test(name.slice(prefix.length))).sort();
       for (const old of backups.slice(0, -5)) rmSync(join(dirname(path), old), { force: true });
     } finally { rmSync(temp, { recursive: true, force: true }); }
     process.stdout.write("cf-credentials: updated " + Object.keys(updates).sort().join(", ") + "\n");

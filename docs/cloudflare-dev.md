@@ -18,7 +18,8 @@ nix develop -c just cf whoami
 
 The helper asks silently for the Cloudflare API token, R2 S3 Access Key ID and R2 S3 Secret Access Key. Enter keeps
 an existing value. It writes `~/.config/revkit/cf.env` with mode 600, preserving unrelated lines. Before each update it saves a
-mode-600 backup named `cf.env.bak.<UTC timestamp>.<unique suffix>`, keeping the newest five backups.
+mode-600 backup named `cf.env.bak.<UTC timestamp>.<unique suffix>`, keeping the newest five generated backups. A legacy `cf.env.bak` is migrated once into this naming scheme;
+user files with other `cf.env.bak.*` names are never pruned.
 R2 values use `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3` (derived from the account) and
 `AWS_REGION=auto`. No secret belongs in a command argument or this repository.
 
@@ -31,11 +32,24 @@ expansions and commands never run. Invalid lines report only their line number a
 helper share this parser. Both wrappers redact credential values from output and discard Wrangler's persistent debug logs. Credentials
 stay in each invocation's process tree, never in the parent shell.
 
+Wrangler receives only `PATH`, `HOME`, `TMPDIR`, `LANG`/`LC_*`, `NO_COLOR`, the selected file's credentials
+(`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_API_KEY`, `CLOUDFLARE_EMAIL` and the four AWS names
+above), and wrapper-pinned `WRANGLER_SEND_METRICS=false`, `WRANGLER_LOG=log`, a disposable `WRANGLER_LOG_PATH`
+and empty `CLOUDFLARE_ENV`. Ambient credentials are cleared before loading the selected file. Every other caller
+`WRANGLER_*`/`CLOUDFLARE_*` variable and every `*_PROXY` variable (case insensitive) causes refusal naming only
+the variable. Other environment entries, including Node options, are dropped. `NO_COLOR` is preserved when set.
+
+Every Wrangler call pins `--env-file` to a private, known empty file; additional env-file arguments are refused.
+Wrangler 4.93 uses that explicit list instead of its default `.env`/`.env.local` discovery, and also skips
+`.dev.vars` discovery for dev secrets. Bun's own automatic dotenv loading is disabled in the wrapper.
+`cf-dev`, `cf-dev-init` and `cf-dev-deploy` additionally refuse any `.env*` or `.dev.vars*` entry in
+`packages/worker`; these paths are gitignored. Remove them before invoking the wrappers.
+
 ## Initialize, deploy and inspect
 
 ```sh
 nix develop -c just cf-dev-init
-nix develop -c just cf-dev-deploy
+nix develop -c just cf-dev-deploy --yes-really
 nix develop -c just cf-dev d1 migrations list revkit-review-dev --remote
 ```
 
@@ -58,7 +72,8 @@ Rotation invalidates outstanding invites signed with the old key. Re-running ini
 It fails clearly if state is missing, validates the account/resource names and inherited security settings, and
 rejects Wrangler target overrides such as `--config`, `--env`, `--name` and `--cwd`. Use
 `REVKIT_CF_DEV_CONFIG` to select an alternate local state path with the same authorized identifiers.
-`cf-dev-deploy` deploys the current worktree through that config. Local Wrangler state and the generated config
+`cf-dev-deploy --yes-really` deploys the current worktree through that config after TTY confirmation.
+Use `cf-dev-deploy --dry-run` for offline build inspection. Local Wrangler state and the generated config
 are gitignored. For remote platform testing, an authorized operator may run `just cf-dev dev --remote`; the
 production environment and any public dev URL remain separate owner decisions.
 
@@ -67,7 +82,10 @@ production environment and any public dev URL remain separate owner decisions.
 `cf-dev` places its generated `--config` before the validated user arguments and accepts only these commands and
 flags. Database arguments must be `revkit-review-dev` or `DB`; bucket arguments must be `revkit-previews-dev`, and
 object paths must start with `revkit-previews-dev/`. All `--file` paths resolve from the repository root, including
-`--file=path` syntax.
+`--file=path` syntax. Both wrappers require the lexical and resolved paths to remain inside the repository;
+paths into `~/.config/revkit` and symlinks escaping either boundary are refused, including new output files.
+`cf` refuses file aliases (`-f`/`--f`); use the validated `--file` spelling.
+Repeated flags are refused, including mixed `--flag value`/`--flag=value` forms.
 
 | Command | Allowed flags |
 | --- | --- |
@@ -87,12 +105,23 @@ account, config, environment, name, routes, domains, compatibility settings, var
 namespace, secrets file or assets. Init performs its own fixed provisioning operations.
 
 Wrangler's output is piped for redaction, so its confirmation prompts cannot protect destructive operations.
-Both wrappers independently refuse `delete`, `rollback` and `time-travel restore` unless `--yes-really` is supplied
-and the operator types `DELETE` at the wrapper's own terminal prompt. Non-interactive calls are refused even with
-that flag, including when flags intervene between the restore command words; a cancellation never starts Wrangler.
-`--yes-really` is consumed by the wrapper. Destructive operations
-remain outside the `cf-dev` allowlist even after confirmation; an authorized operator uses the general `cf`
-wrapper for them. Ordinary Wrangler calls receive no stdin; init supplies generated secrets explicitly on stdin.
+Both wrappers use an allowlist of non-destructive commands: `whoami`, `dev`, `d1 list/info/create`,
+`d1 migrations list`, `d1 time-travel info`, `r2 bucket list/info/create`, `r2 object get`, `secret list`,
+`versions list`, `deployments list` and exactly `deploy --dry-run`. Everything else, including unknown future
+verbs, requires `--yes-really` and typing `DELETE` at the wrapper's own terminal prompt. This covers bucket
+domain removal, lifecycle/lock/CORS changes, catalog disable, queue purge and workflow instance termination,
+as well as deploy, SQL execution, migrations apply and object put. Non-interactive calls are refused even with
+the flag. `--yes-really` is consumed by the wrapper and may appear only once.
+
+`cf-dev` validates its command/argument allowlist before any confirmation prompt. Unsupported destructive commands
+remain refused even with `--yes-really`; use the general `cf` wrapper for explicitly authorized operations.
+The fixed provisioning sequence in `cf-dev-init` retains its existing authorization and explicit `--rotate` gate.
+
+A TTY prompt prevents accidental non-interactive mutations, but cannot authenticate a human: a program can create
+a pseudo-terminal and pipe `DELETE` into it (R8). Such automation is indistinguishable from terminal input and
+must still have the operator's authorization.
+
+Ordinary Wrangler calls receive no stdin; init supplies generated secrets explicitly on stdin.
 
 The missing-Worker bootstrap error is pinned to the installed Nix Wrangler version and CLI source by a test.
 Review that error contract when updating Wrangler; an authentication error never triggers bootstrap.

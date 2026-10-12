@@ -39,3 +39,5 @@ playwright/.cache/
 # Cloudflare local state and generated dev config (ADR-0014)
 packages/worker/.wrangler/
 packages/worker/wrangler.dev.jsonc
+packages/worker/.env*
+packages/worker/.dev.vars*
