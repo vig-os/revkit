@@ -35,3 +35,7 @@ playwright/.cache/
 # threads the daemon owns (ADR-0007 acceptance, ADR-0013). Both are
 # always local; hosted mode uses D1 and Durable Objects instead.
 .revkit/
+
+# Cloudflare local state and generated dev config (ADR-0014)
+packages/worker/.wrangler/
+packages/worker/wrangler.dev.jsonc

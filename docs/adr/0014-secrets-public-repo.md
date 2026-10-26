@@ -35,3 +35,55 @@ revkit is public; deploys need Cloudflare and GitHub App credentials, and PRs (i
 ## Consequences
 
 Blocks M3/M4.
+
+## Amendment — 2026-10-08: local credentials and the development account (#160)
+
+Local Cloudflare tooling now prefers an encrypted dotenv selected by `REVKIT_CF_SOPS`, decrypted separately for
+each invocation through `sops exec-env`. If that variable is unset, `just cf` loads
+`REVKIT_CF_ENV` or `~/.config/revkit/cf.env`, requiring mode 600. Credentials exist only in the command's process
+tree, never in the parent dev shell or a tracked file. A configured encrypted file that is missing or cannot
+decrypt fails closed; it does not fall back to plaintext. `scripts/cf-credentials.sh` prompts silently, preserves
+values on Enter, writes a private backup, and can produce an age-encrypted dotenv copy. Cloudflare and R2 S3
+credentials use `CLOUDFLARE_*` and standard `AWS_*` names. Recipe output redacts credential values and generated
+Worker secrets; Wrangler's persistent debug logs go to `/dev/null`.
+
+Account `1ecb6c28f07ad10630be568fcf73a347` is the owner's separate **development account**. Workers Scripts and D1
+token permissions cover an entire account, so the account is the blast-radius boundary. The dev recipes pin that
+account and the names `revkit-review-dev` (Worker and D1) and `revkit-previews-dev` (R2), validating the credential
+account and the non-secret identifiers in `~/.config/revkit/dev.json` before acting. Generated
+`packages/worker/wrangler.dev.jsonc` inherits every tracked setting except those identifiers; generation requires
+`workers_dev: false`, no routes and empty compatibility flags. The generated file and `.wrangler/` state are ignored.
+
+With explicit owner authorization, agents may use `just cf-dev` to inspect the dev resources, initialize absent
+resources, apply pending migrations and deploy the current tree to the dev Worker. Existing resource ids are
+preserved; init refuses to recreate a recorded resource that is missing remotely. Existing `INVITE_TOKEN_HMAC_KEY`
+is kept by default: `wrangler secret put` **overwrites** a secret, so rotation requires an explicit `--rotate`.
+New values come from a CSPRNG and reach Wrangler only on stdin; they are never stored locally. A missing Worker is
+deployed with the generated security settings before adding its secret. Init never probes a public endpoint.
+
+Agents must not inspect or copy credential values, run `wrangler login`, create/rotate/delete API tokens, touch
+DNS/zones or another account, or flip `workers_dev`/routes. The dev Worker has no public URL; enabling one remains
+an owner decision under ADR-0012. Production credentials, owner approvals, the GitHub `production` environment and
+the production deployment process above are unchanged. This tooling provisions the current Worker's HMAC secret;
+it does not implement the owner-gated GitHub App and production deployment train (#34).
+
+The operator workflow and overrides are documented in [Cloudflare development tooling](../cloudflare-dev.md).
+
+## Amendment — 2026-10-08: dev tooling input and confirmation hardening (#160)
+
+The dev wrapper uses a per-command allowlist for commands, resource arguments and flags, with its generated config
+placed before user arguments. Unknown commands/flags, aliases, a bare `--` and security-setting overrides are
+refused. File arguments resolve from the repository root. The operator documentation enumerates the supported
+workflow; destructive operations remain outside its dev allowlist.
+
+Both `cf` and `cf-dev` require an explicit `--yes-really` plus an independent TTY confirmation before any destructive
+verb can reach Wrangler. Piped Wrangler output otherwise causes its own prompts to auto-confirm. Ordinary calls
+receive closed stdin; generated secrets are supplied explicitly. These changes do not grant agents permission to
+delete resources or change the owner's reachability settings.
+
+Local credential files are parsed as data by a shared dotenv parser, never sourced as shell code. Malformed input
+reports only a line number and key, with no value fragments. The credential helper preserves unrelated entries
+and keeps the newest five mode-600 backups named `cf.env.bak.<UTC timestamp>.<unique suffix>`. The encrypted copy
+uses the same parsed values. Production and the account boundary remain unchanged.
+
+The restore guard recognizes both command words even when Wrangler flags intervene between them.

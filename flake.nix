@@ -104,9 +104,13 @@
           pkgs.bun
           # Cloudflare CLI for the hosted Worker (ADR-0008). Auth comes from
           # CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, loaded per call by
-          # `just cf` from ~/.config/revkit/cf.env (ADR-0014), never exported
+          # `just cf` from sops or a local mode-600 dotenv (ADR-0014), never exported
           # into the shell.
           pkgs.wrangler
+          # Decrypt local Cloudflare dotenv credentials per invocation.
+          pkgs.sops
+          # Age identities for local SOPS setup and isolated roundtrip tests.
+          pkgs.age
           # Deterministic font set for the Playwright visual-regression
           # baselines (ADR-0016). Bundling from the flake — reached through
           # REVKIT_TEST_FONTS_DIR in the shell hook below — means the same
