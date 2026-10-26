@@ -89,6 +89,34 @@
 # ramp the gate DOES report comes with an INFLATED growth figure that exceeds the
 # budget — never a passing one.
 #
+# WHAT #89 DID TO THAT CLASSIFICATION, which is recorded here because the table
+# above is documentation a future reader will reason from. The adaptive warm-up
+# (fd-budget.sh) only OPENS a window once the count has been flat for one settle
+# span, so two of the three rows change what they describe:
+#
+#   r <= 10%   STILL REACHABLE, and now reachable through a new door. A count
+#              that stalls for longer than the settle span and then climbs again
+#              produces exactly this shape, and so does any ramp that starts
+#              after the warm-up resolved. Nothing about the p10/probe pair
+#              changed.
+#   10% < r    STILL REACHABLE, and STILL the most dangerous row, which is why it
+#              is still the one the code works hardest to refuse. A stalling
+#              count followed by a climb of more than a decile lands here.
+#   r ~= 50%+  NO LONGER REACHABLE BY THE MODULE-LOAD RAMP. A ramp occupying
+#              half a ~175s window cannot be preceded by a 1s flat span unless
+#              it stalled first, and the real ramp does not — it climbs
+#              continuously to its plateau. This row survives as a shape, but it
+#              is now "a leak that paused", which is the front-loaded-leak limit
+#              documented immediately below rather than a module-load cost. So
+#              the ramp limit is no longer something this gate can walk into by
+#              under-waiting; it is something a leak has to do on purpose.
+#
+# And a fourth state is now possible, which is not a ramp FRACTION at all: the
+# ramp did not END within the warm-up's cap, so no window was ever opened. It
+# is reported as `ramp did not settle within the cap`, it declines the growth
+# figure the same way `unmeasured` does, and it is the only one of the four
+# that asserts something about the runner rather than about the window.
+#
 # THE LIMIT ON THE OTHER SIDE: A FRONT-LOADED LEAK IS REPORTED AS A PASSING
 # NUMBER, and this is the more dangerous of the two limits. The settledness test
 # asks whether the count was at its floor when the window opened, and a leak
@@ -119,6 +147,123 @@
 # much. It does not decide why, and nothing here names a cause — see the
 # failure message in `fd-budget.sh`, which reports the numbers and says the
 # cause is not established.
+
+# THE WARM-UP, AND WHY IT SHARES THIS FILE'S TOLERANCE (issue #89).
+#
+# THE BUG. `fd-budget.sh` warmed up for a fixed 2s and then measured growth.
+# That is correct where the ramp was measured (it ends ~1s into the warm-up on a
+# dev box) and wrong on the CI runner, where the same ~3.9k-descriptor climb
+# takes ~4.1s. The window then opens mid-ramp, the opening probe sits below the
+# floor by 436-540 descriptors, and the settledness test above refuses — which
+# is the gate working. The cost is that on CI the `packages/cli` leg, the leg
+# this budget was derived from, declines to produce a growth figure at all.
+#
+# WHY NO STATISTIC OVER THE TRACE CAN BE THE VERDICT'S OWN. The first thing
+# tried was to run `fd_budget_verdict` itself over the prefix so far, with the
+# "window" starting at the minimum warm-up. It fails, and the reason is worth
+# recording because it is the whole shape of the problem: the verdict's floor is
+# a p10, and a p10 only excludes a front-loaded rise if the window is LONG
+# RELATIVE TO THAT RISE. Over a prefix that is mostly ramp, p10 returns the
+# bottom of the ramp, the floor collapses onto the probe, and the verdict
+# cheerfully reports `settled` at 0.5s — mid-ramp, on a trace where the ramp has
+# another 3.6s to run. Measured, not argued: on the instrumented local trace it
+# returns settled at sample 3 of 660.
+#
+# THE SAME HOLDING, THE OTHER WAY ROUND. Sweeping the predicate "has the count
+# risen by more than the tolerance over its most recent DECILE OF SAMPLES", over
+# every denominator the verdict's formula admits, gives a family that all fail
+# for the same structural reason: the decile is a FRACTION of the trace, so it
+# GROWS with the trace, so `rate x span` grows with time, so the decision lands
+# at `t_fire = 10 x tol / rate` — and for a ramp that ends at `t_ramp` that is
+# 10 x tol / (ramp_total / t_ramp), which is at or just below `t_ramp` for any
+# ramp smaller than 10 x tol. The measured CI ramp is ~3973 descriptors and the
+# largest tolerance in that family is 380, so the family decides at 0.96 x
+# t_ramp: it cannot outlast the ramp by construction. Measured in the simulation
+# over the reconstructed CI trace, the decile family fires at 2.17s against a
+# ramp that ends at 4.08s.
+#
+# ⇒ THE SETTLEDNESS QUESTION MUST BE ASKED OVER AN ABSOLUTE SPAN, and the only
+# two absolute spans in this gate are the verdict's own probe span and the
+# warm-up's. The probe span cannot be used — it is a tenth of a window that does
+# not exist yet, and measured post hoc it is ~17.4s locally and ~17.9s on CI, so
+# a warm-up waiting a full probe span would open the local window ~11s in and
+# move the local growth figure by ~50 descriptors (5%). That is the local
+# regression #89 forbids. What is left is a span measured in seconds, which is
+# `FDV_WARMUP_SETTLE_PCT` below, bounded by measurement on both sides.
+#
+# THE TOLERANCE, AND WHY THE TWO MUST AGREE. The warm-up asks "was the count
+# already at its floor when the window opened?", over the span that just
+# elapsed, and it allows itself the SAME formula this file allows over the
+# window's opening decile:
+#
+#     rise over the settle span  <=  FDV_SLACK + FDV_TOL_PCT% of growth
+#
+# with `growth` read as the rise over the settle span, because that is the only
+# rise the warm-up can name: at decision time the window's own growth is
+# unknowable, and the two things it could be stood in for are both WRONG. The
+# trace's total spread so far is dominated by the ramp, so it inflates the
+# tolerance by exactly the quantity being waited for — measured, it decides at
+# 0.51s on a local trace that ramps to 0.93s. The `--delta-budget` is not usable
+# at all: it is OPTIONAL on `fd-budget.sh` and it is a caller-supplied flag, so
+# reading it here would be a seam — a caller could widen the warm-up's tolerance
+# by passing a larger budget, which is the quiet-for-the-wrong-reason failure
+# #89 is about.
+#
+# Reading `growth` as the span's own rise collapses the ratio to an absolute
+# allowance, and the collapse is the derivation rather than a side effect:
+#
+#     rise <= FDV_SLACK + FDV_TOL_PCT/100 x rise
+#  ⟺  rise <= FDV_SLACK / (1 - FDV_TOL_PCT/100)
+#  ⟺  rise <= 200 / 0.9 = 222 descriptors per settle span
+#
+# 222 is not a second constant. It is this file's own FDV_SLACK and FDV_TOL_PCT
+# composed, it moves when either moves, and a test asserts that it does.
+#
+# MEASURED, and the honest shape of the property: the two do NOT always agree, and
+# the residual is bounded and safe. Sweeping FDV_TOL_PCT over 0/2/5/10/20/40 and
+# ramp rates from 150 to 500 fds/s in steps of 25, the band of rates at which the
+# warm-up opens a window the verdict then REFUSES slides with the allowance:
+#
+#   FDV_TOL_PCT  allowance  disagreeing rates   top edge / allowance
+#        0         200       150 175 200              1.00
+#        2         204       150 175 200 225         1.10
+#        5         210       150 175 200 225         1.07
+#       10         222       150 175 200 225         1.01
+#       20         250            225 250 275         1.10
+#       40         333                   325 350      1.05
+#
+# Two things follow, and both are asserted in fd-budget-script.test.ts. The band
+# MOVES with the constant, which is the "together, not independently" half, and a
+# decoupled constant cannot do that. And its top edge never exceeds ~1.1x the
+# allowance, which bounds the cost: a disagreeing run DECLINES rather than
+# misreporting, because the script only prints a growth figure when this file says
+# settled. Against the control -- a hand-picked 500 per span -- the same sweep
+# disagrees at 250 and 400 fds/s, up to 1.8x the allowance the verdict grants.
+# That is the shape of the bug #89 warns about: quiet for the wrong reason.
+#
+# WHY THE TWO MUST AGREE, stated as the property rather than the arithmetic. The
+# window the warm-up opens has to be one the verdict will accept. If the warm-up
+# is LOOSER than the verdict, it opens a window whose opening decile is still
+# inside the ramp and the run declines — the exact defect #89 exists to fix, and
+# it would be back with a better message. If the warm-up is TIGHTER, it waits
+# past the point the verdict would already be satisfied and charges the wait to
+# the blind spot instead of to the ramp: the gate goes quiet for a reason that is
+# not the one it reports. The safe direction is therefore "never looser", and
+# that is what makes the shared constants load-bearing rather than decorative —
+# one edit to FDV_TOL_PCT moves both decisions together, and there is no
+# combination of the two in which they can disagree.
+#
+# THE LEAK THIS COSTS, because a longer window is a bigger hole. A leak is only
+# swallowed if it climbs faster than 222 descriptors per settle span — 222 fds/s
+# here — AND the warm-up has not yet reached its cap. The measured leak rate is
+# 4.8 fds/s on the CI cli leg (861 descriptors over 178s) and 5.8 fds/s locally
+# (1015 over 174.6s), so reaching the threshold takes a leak 38x the measured
+# rate. Above the threshold the leak keeps the count climbing, so the warm-up
+# never resolves and the run reaches the CAP and reports the new state — a
+# refusal, not a pass. That is what makes the cap part of the safety argument
+# rather than a politeness bound, and it is why the cap is held well below the
+# point where a swallowed leak could exceed the growth budget (see the cap
+# derivation in `fd-budget.sh`).
 
 # Floor percentile. 10 keeps the lowest tenth of the window — the part a ramp
 # can still occupy at the window's opening — out of the floor definition.
@@ -158,6 +303,12 @@ FDV_FLOOR_PCTL=10
 #
 # So: 10 is correct, and the upper bound is what forces it. The lower margin
 # against sampling noise is FDV_SLACK's job, not this constant's.
+#
+# IT IS ALSO THE WARM-UP'S TOLERANCE, and that is a second reason it must not be
+# retuned in isolation: `fd_budget_warmup` below composes this constant with
+# FDV_SLACK, and #89's trap is a gate that declines for a different reason than
+# the one it reports. See "THE WARM-UP, AND WHY IT SHARES THIS FILE'S
+# TOLERANCE" above.
 FDV_TOL_PCT=10
 
 # Absolute allowance, in descriptors, on top of FDV_TOL_PCT% of growth. It
@@ -181,6 +332,12 @@ FDV_TOL_PCT=10
 # noise allowance; it is the detectability floor, and the two uses are the same
 # number for the same reason — both are "how much departure from the floor can
 # this gate absorb before it has to admit it saw something".
+#
+# IT IS ALSO THE WARM-UP'S ALLOWANCE, through FDV_TOL_PCT: the warm-up's
+# tolerance is FDV_SLACK / (1 - FDV_TOL_PCT/100), which is 222 per settle span.
+# So the smallest leak this gate can see is unchanged by #89 in kind — it is now
+# "222 per second of settle span" rather than "220 inside the window's opening
+# tenth" — and the numbers are close enough that the change does not widen it.
 FDV_SLACK=200
 
 # Number of leading samples, as a percentage of the window, that the opening
@@ -191,6 +348,44 @@ FDV_SLACK=200
 # plateau, which is why a decile-wide probe reads the baseline rather than the
 # leak.
 FDV_PROBE_SPAN_PCT=10
+
+# Width of the window the WARM-UP asks its settledness question over, as a
+# percentage of the minimum warm-up. This is a SPAN, not a tolerance: it is the
+# same quantity FDV_PROBE_SPAN_PCT expresses, and it is the one new number in
+# #89's change. See "THE WARM-UP SPAN" below for why a span is unavoidable at
+# all, and why this one is bounded from above by the local leg's own margin.
+#
+# 50 of a 2s minimum warm-up is 1s, and 1s is bounded on both sides by
+# MEASUREMENT, not by taste:
+#
+# BELOW it must not exceed the margin the minimum warm-up already carries, or
+#   the local leg's own window moves and its growth figure changes. Measured on
+#   this host: the ramp's last rise is the sample at t+0.93s, so a 2s warm-up
+#   carries ~1.07s of margin, and 1.0s fits inside it with the window still
+#   opening at the minimum. Anything above ~1.07s extends the local window.
+#
+# ABOVE it must be short enough that the rule still HOLDS against the measured CI
+#   ramp. The effective allowance is FDV_SLACK / (1 - FDV_TOL_PCT/100) = 222 per
+#   span, so a 1s span tolerates a climb of 222 fds/s, and the measured CI runner
+#   climbs at 995-1051, which clears that by 4.5-4.7x. A 0.2s span would
+#   tolerate 1110 and would NOT hold on the runner this gate is measured against,
+#   which is what bounds it from above.
+#
+# AND THE PRICE, measured rather than assumed. Two things narrow what this span
+# buys, and both are properties of sampling rather than of the rule:
+#
+#   1. The samples inside a 1s span cover only ~0.89s of it at CI's 128ms poll
+#      interval, so the effective rate threshold is ~250 fds/s rather than 222.
+#   2. Sweeping the real shape -- the same ~3973 climb at rates from 150 to 500
+#      fds/s over a 178s window -- the rule produces a settled verdict at rates
+#      at or above 500, reports the capped state at 250-400, and DECLINES at or
+#      below 222. So the working band is a module-load pace of ~500 fds/s and up,
+#      the measured CI runner is 2.0x above its floor, and this host's ~3700 is
+#      7.4x. Below ~500 fds/s the run declines, which is the pre-#89 behaviour
+#      and the safe direction: nothing is misreported, the growth budget simply
+#      does not apply. That is a real limit of this change, not a caveat on it.
+# shellcheck disable=SC2034  # read by fd-budget.sh, which shellcheck does not follow
+FDV_WARMUP_SETTLE_PCT=50
 
 # The p-th percentile (1..100) of newline-separated integers read from STDIN:
 # the value at 1-based index ceil(p/100 * n) of the ascending-sorted list.
@@ -285,4 +480,72 @@ fd_budget_verdict() {
       fdv_settled=1
     fi
   fi
+}
+
+# fd_budget_warmup <stamps-file> <settle-span-ms>
+#
+# "Is the ramp over?", decided over the span that just elapsed. Sets, in the
+# caller's scope:
+#
+#   fdw_n          samples inside the settle span (2 or more means it can be
+#                  decided at all — the same `> 1` rule the window needs)
+#   fdw_rise       max - min of those samples: the descriptors the count rose
+#                  across the span, which is the warm-up's `deficit`
+#   fdw_growth     fdw_rise itself — see the derivation for why the warm-up
+#                  cannot name any other growth, and why substituting one is a
+#                  defect rather than an improvement
+#   fdw_tol        the verdict's own formula, FDV_SLACK + FDV_TOL_PCT% of
+#                  fdw_growth. Composes to FDV_SLACK / (1 - FDV_TOL_PCT/100)
+#   fdw_settled    1 iff fdw_rise <= fdw_tol
+#
+# The stamps file is "<elapsed-ms> <count>" per line, in poll order — the same
+# two files the production script hands to `fd_budget_verdict`, plus a time
+# axis, because the settle span is measured in seconds and a sample index is
+# not a duration (at CI's 128ms poll interval a decile of the trace is a
+# different number of seconds than it is on this host, and that is the whole
+# defect).
+#
+# Returns 0 always: it decides, it does not enforce. The caller applies the cap
+# and the minimum, because those are wall-clock bounds on the run and not
+# properties of the samples.
+fd_budget_warmup() {
+  local stamps="$1" span_ms="$2"
+  local ms count last=-1 cut=0 lo='' hi='' i
+  local -a tms=() cnt=()
+
+  fdw_n=0
+  fdw_rise=0
+  fdw_growth=0
+  fdw_tol=0
+  fdw_settled=0
+
+  while read -r ms count; do
+    tms+=("$ms")
+    cnt+=("$count")
+  done <"$stamps"
+
+  [ "${#tms[@]}" -gt 0 ] || return 0
+  last="${tms[${#tms[@]} - 1]}"
+  cut=$((last - span_ms))
+
+  for i in "${!tms[@]}"; do
+    [ "${tms[$i]}" -ge "$cut" ] || continue
+    fdw_n=$((fdw_n + 1))
+    if [ -z "$lo" ] || [ "${cnt[$i]}" -lt "$lo" ]; then lo="${cnt[$i]}"; fi
+    if [ -z "$hi" ] || [ "${cnt[$i]}" -gt "$hi" ]; then hi="${cnt[$i]}"; fi
+  done
+  [ "$fdw_n" -gt 0 ] || return 0
+
+  fdw_rise=$((hi - lo))
+  fdw_growth="$fdw_rise"
+  fdw_tol=$((FDV_SLACK + FDV_TOL_PCT * fdw_growth / 100))
+  # One sample cannot describe a span. This is the same minimum the verdict
+  # applies to a window (`fdv_n > 1`), not a third tuned number: a warm-up that
+  # decided from a single sample would be reading a difference between two
+  # consecutive polls, which on a slow runner is a handful of descriptors.
+  if [ "$fdw_n" -gt 1 ] && [ "$fdw_rise" -le "$fdw_tol" ]; then
+    # shellcheck disable=SC2034  # outputs of this sourced function, read by fd-budget.sh
+    fdw_settled=1
+  fi
+  return 0
 }
