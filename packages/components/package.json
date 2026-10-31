@@ -14,7 +14,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "solid-js": "1.9.15"
+    "solid-js": "1.9.18"
   },
   "devDependencies": {
     "solid-js": "1.9.15",
