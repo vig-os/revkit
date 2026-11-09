@@ -66,7 +66,7 @@ It has three review surfaces on one core (ADR-0025), sharing one content model a
 | # | Story |
 |---|---|
 | D1 | Any repo adds revkit with **one flake input + one line**; devkit consumers opt in as a module |
-| D2 | Each org hosts its own review site (Cloudflare), authenticated per GitHub org |
+| D2 | Each org hosts its own review site (Cloudflare); site access via the target's auth provider (ADR-0026) |
 | D3 | A team on a plain Linux host or VM runs revkit as unprivileged user processes behind its reverse proxy and auth proxy (ADR-0026) |
 | D4 | A reviewer on the same private VPN opens a review page served by a remote daemon (ADR-0026) |
 | D5 | Auth is pluggable and minimal: none, trusted-proxy headers, per-site tokens, Cloudflare Access (ADR-0026) |
@@ -336,7 +336,7 @@ sequenceDiagram
   A->>CI: push PR (docs changed)
   CI->>CF: revkit build → deploy preview pr-<n>
   CI->>GH: upsert PR comment "Review: <url>" (+ @requested reviewers)
-  R->>CF: open link → sign in (GitHub App OAuth) or invite token
+  R->>CF: open link → open via the target's auth provider (e.g. Access or site token); link a GitHub token via App OAuth to comment as self
   CF->>GH: load existing review threads → map path+line → blocks (B4)
   R->>CF: comment on block
   CF->>GH: add to the reviewer's pending review (path, line/start_line, side=RIGHT) as the reviewer
@@ -400,8 +400,9 @@ shareable links and guest reviewers.
 - **One Cloudflare Worker per org** (§6.1). Previews at `review.exoma.org/<repo>/pr-<n>/` (path-based, ADR-0008), with
   the Worker in front of every
   request.
-- **GitHub users:** GitHub App OAuth (user-to-server). The session is valid if the user has read access to the repo,
-  checked via the API and cached. (The App is the *hosted* `TokenSource`; local uses `gh` — ADR-0009 as amended by
+- **GitHub users:** GitHub App OAuth (user-to-server) is the token-linking step for the GitHub comment backend
+  (comment as the reviewer; ADR-0026 amends this clause — site access is the auth provider's job). The link is valid if
+  the user has read access to the repo, checked via the API and cached. (The App is the *hosted* `TokenSource`; local uses `gh` — ADR-0009 as amended by
   ADR-0025.)
 - **Security** of the hosted origin, fork previews and secrets: ADR-0012, ADR-0014.
 - **Invite links (v1).** `revkit invite --repo X --pr 12 --name "Jane Doe" --email … --expires 14d`:
@@ -409,7 +410,7 @@ shareable links and guest reviewers.
   - is revocable (`revkit invite --revoke`);
   - on first open, the token is exchanged for an HttpOnly session cookie and stripped from the URL, one browser per
     link by default.
-- **Authentik** (OIDC) comes later: [#4](https://github.com/vig-os/revkit/issues/4).
+- **Authentik** (OIDC): superseded by ADR-0026 (Cloudflare Access or an auth proxy instead); [#4](https://github.com/vig-os/revkit/issues/4).
 - **GitHub Pages** remains an option only for **public, read-only** previews. It can't authenticate, and on the
   org's Free plan it can't serve private repos.
 
@@ -510,7 +511,7 @@ consumers**: Bun, lint/format/typecheck, TS stub patterns for guardrails, and th
    channel. Re-cut from the old M3 by ADR-0025 — dogfoodable on revkit's own PRs the day it lands.
 4. **M4 — Hosting, previews + guests:** ([#9](https://github.com/vig-os/revkit/issues/9)) `revkit deploy` (§6.1, one
    Worker per org), CI preview deploy + PR comment with the link, GitHub App as the hosted `TokenSource`, hosted
-   threads in D1 with `revkit threads export|import` bridging local ↔ hosted, invite links; then Authentik (#4).
+   threads in D1 with `revkit threads export|import` bridging local ↔ hosted, invite links (the `site-token` provider, ADR-0026).
    The whole human-gated hosted train — org-owner approvals, Cloudflare OAuth, App manifest confirm, org-config PR
    for the upload secret — lives here.
 5. **M5 — distribution:** ([#10](https://github.com/vig-os/revkit/issues/10)) flake outputs, template, devkit module
