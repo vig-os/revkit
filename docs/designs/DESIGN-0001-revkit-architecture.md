@@ -67,6 +67,9 @@ It has three review surfaces on one core (ADR-0025), sharing one content model a
 |---|---|
 | D1 | Any repo adds revkit with **one flake input + one line**; devkit consumers opt in as a module |
 | D2 | Each org hosts its own review site (Cloudflare), authenticated per GitHub org |
+| D3 | A team on a plain Linux host or VM runs revkit as unprivileged user processes behind its reverse proxy and auth proxy (ADR-0026) |
+| D4 | A reviewer on the same private VPN opens a review page served by a remote daemon (ADR-0026) |
+| D5 | Auth is pluggable and minimal: none, trusted-proxy headers, per-site tokens, Cloudflare Access (ADR-0026) |
 | E1 | Low memory/CPU: static HTML by default, JS only where interaction needs it; a lightweight daemon for the local loop |
 
 ## 2. Stack, and which stories each part covers
@@ -89,7 +92,7 @@ gzip -9, with the full library imported.
 | Agent bridge | **MCP server** (`revkit mcp`) + a Claude Code skill | A1–A3, B6 | Tools: `ask`, `await_answer`, `threads`, `reply`, `resolve`, `publish` |
 | Hosting | **Cloudflare Worker (static assets from R2) + D1 + Durable Objects** per org | B1–B5, D2 | Static preview per PR. The Worker handles auth, the thread API and the GitHub bridge; D1 stores threads and invites |
 | GitHub bridge | **GitHub App**, user-to-server tokens | B2–B4 | Comments and reviews post **as the reviewer**, with real attribution and review requests |
-| Guest auth | Self-minted invite links (v1), Authentik OIDC (later, #4) | B5 | See §6 |
+| Guest auth | Self-minted invite links (v1) as the `site-token` provider; Authentik OIDC dropped (ADR-0026) | B5 | See §6 |
 
 On "lean enough": Solid islands (4 KB) plus build-time SVG plots and math mean a typical doc page ships **only the
 comment-rail island**. Observable Plot (82 KB gz) also renders server-side and was considered. Vega-Lite wins because

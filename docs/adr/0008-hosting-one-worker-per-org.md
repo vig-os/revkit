@@ -4,6 +4,8 @@
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: B1, B5, D2
+- Amended by: [ADR-0026](0026-deployment-targets-pluggable-auth.md) — "one Worker per org" is the **Cloudflare target** of a
+  four-target matrix, not the only hosting model; the clauses below stand for that target.
 
 ## Context
 
