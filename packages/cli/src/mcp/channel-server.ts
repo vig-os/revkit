@@ -78,9 +78,9 @@ export type DiscoverFn = (previous: { instanceId?: string } | undefined) => Prom
 
 /** Configuration for `startChannelServer`. */
 export interface ChannelServerOptions {
-  readonly client: DaemonClient;
-  readonly url: string;
-  readonly agentToken: string;
+  readonly client?: DaemonClient;
+  readonly url?: string;
+  readonly agentToken?: string;
   /** The daemon's per-start id at first connect (from `serve.json`),
    * used by the reconnect path to notice a restart. */
   readonly instanceId?: string;
@@ -891,6 +891,10 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   // Mutable state — the reconnect path swaps these atomically.
   let currentClient = options.client;
+  const connectedClient = (): DaemonClient => {
+    if (currentClient === undefined) throw new Error("daemon has not connected yet");
+    return currentClient;
+  };
   let currentUrl = options.url;
   let currentToken = options.agentToken;
   let currentInstanceId = options.instanceId;
@@ -929,7 +933,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     if (set === undefined || set.size === 0) return;
     let record: unknown;
     try {
-      record = await currentClient.getAsk(askId);
+      record = await connectedClient().getAsk(askId);
     } catch (error) {
       // On a transient daemon error we let the poll's own deadline
       // handle it — closing the waiters with an error would surface
@@ -1114,7 +1118,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       throw new Error(`unknown tool '${toolName}'`);
     };
     try {
-      const result = await invoke(currentClient);
+      const result = await invoke(connectedClient());
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       if (error instanceof ToolValidationError) return toolError(error.issues);
@@ -1153,7 +1157,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
               content: [{ type: "text", text: `revkit mcp: daemon unavailable: reconnect did not complete within the tool-call deadline (${options.reconnectToolDeadlineMs ?? TOOL_RECONNECT_DEADLINE_MS_DEFAULT} ms). Try again once the daemon is back.` }],
             };
           }
-          const retry = await invoke(currentClient);
+          const retry = await invoke(connectedClient());
           return { content: [{ type: "text", text: JSON.stringify(retry) }] };
         } catch (retryError) {
           // The retry may itself hit a 4xx (same request, different
@@ -1198,7 +1202,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     //    `initialListing` (round-4 401-reconnect scenario).
     const listing = options.initialListing !== undefined
       ? { threads: options.initialListing.threads, head: options.initialListing.head }
-      : await currentClient.listThreads();
+      : await connectedClient().listThreads();
     lastSeenSeq = listing.head ?? 0;
     // Round-2: the catch-up summary must ONLY list threads that
     // are delivered to the agent. The `deliveredCommentIds` set
@@ -1213,7 +1217,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     // fails silent on the same error; the catch-up now matches.
     let delivered: DeliveredSet;
     try {
-      delivered = new Set(await currentClient.getDeliveredCommentIds());
+      delivered = new Set(await connectedClient().getDeliveredCommentIds());
     } catch {
       // Fail closed: no summary emitted this connect. The agent
       // can still call `threads` to pull if it needs to.
@@ -1232,6 +1236,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
    * Extracted so `primeAndSubscribe` and `reconnectOnce` share ONE
    * subscribe shape (PR #38 round-2 review: duplication.) */
   const attachSubscriber = (): void => {
+    if (currentUrl === undefined || currentToken === undefined) {
+      throw new Error("daemon has not connected yet");
+    }
     const subscribe = options.subscribeEvents ?? startEventSubscriber;
     subscriberHandle = subscribe({
       url: currentUrl,
@@ -1311,7 +1318,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     // If the daemon is fresh (new instanceId), head may be BEHIND
     // our lastSeenSeq (a wiped sqlite would restart at 1). Cap our
     // resume at the current head.
-    const listing = await currentClient.listThreads();
+    const listing = await connectedClient().listThreads();
     const head = listing.head ?? 0;
     if (lastSeenSeq > head) lastSeenSeq = head;
     attachSubscriber();
@@ -1329,7 +1336,13 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
   await server.connect(transport);
 
   // Prime the SSE resume + emit the catchup summary.
-  await primeAndSubscribe();
+  try {
+    await primeAndSubscribe();
+  } catch {
+    // Discovery can fail while the MCP transport remains usable. Tool calls
+    // report the discovery error and the background loop retries with backoff.
+    void reconnect("startup-failed");
+  }
 
   return {
     server,

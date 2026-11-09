@@ -313,16 +313,21 @@ during the poll is under 1 second.
    revkit skill install
    ```
 
-   That writes `.claude/skills/revkit/SKILL.md`. Rerun with `--force`
+   That writes `.claude/skills/revkit/SKILL.md` and merges a project
+   `.mcp.json` registration running `revkit mcp` from PATH. Other servers
+   are preserved; a conflicting revkit registration requires `--force`
+   and is backed up before replacement. Invalid JSON is refused.
+   Keep the packaged `revkit` on PATH; a separate Bun is unnecessary.
+   Rerun with `--force`
    after a revkit upgrade to pick up a newer version — the previous
    file is saved next to it as `SKILL.md.backup-<timestamp>` first,
    so a mid-refactor local edit is never silently lost.
    `--dry-run` prints the target path without writing anything.
 
-3. Start the daemon and the MCP server:
+3. Start Claude Code from the repository root; its project MCP
+   registration starts the server, which auto-starts the local daemon:
 
    ```sh
-   revkit serve &     # or `just serve`
    claude --dangerously-load-development-channels server:revkit
    ```
 

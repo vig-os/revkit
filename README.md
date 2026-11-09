@@ -35,6 +35,24 @@ flake that any repo, including vig-os devkit consumers, can opt into.
 | [Feature matrix](docs/FEATURE-MATRIX.md) | Story → ADR → milestone → issue |
 | [Milestones](https://github.com/vig-os/revkit/milestones) | M1–M8 roadmap |
 
+## Consumer MCP setup
+
+Enter the template's `nix develop` shell (or put `packages.<system>.revkit`
+on PATH), then run `revkit skill install` from your repository root.
+The template and installer provide `.mcp.json` with `command: "revkit"`
+and `args: ["mcp"]`. Claude Code starts the MCP server and it auto-starts
+this repository's daemon; no separate Bun installation is needed.
+Opt into live channels with
+`claude --dangerously-load-development-channels server:revkit` (A1/A3/A5,
+ADR-0007; distribution D1, ADR-0010; local discovery ADR-0013).
+
+The installer preserves other MCP registrations. Existing skill files and
+conflicting revkit registrations require `--force`, which saves backups;
+malformed `.mcp.json` files are refused. `--dry-run` previews the targets.
+Daemon startup failures leave MCP available and tools report a diagnostic
+while discovery retries. This checkout's `.mcp.json` uses `nix run .#revkit`
+to select the local flake package with workspace-relative paths.
+
 ## Development
 
 Requires Nix with flakes and direnv.

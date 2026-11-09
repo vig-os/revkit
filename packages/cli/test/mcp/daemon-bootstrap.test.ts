@@ -18,10 +18,11 @@
 // `revkit serve` for real.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  daemonExecutable,
   defaultRevkitBin,
   ensureDaemon,
   filteredDaemonEnv,
@@ -54,6 +55,32 @@ describe("daemon-bootstrap", () => {
   });
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
+  });
+
+  test("starts a real daemon with no bun on PATH and publishes serve.json", async () => {
+    mkdirSync(join(root, "dist"));
+    writeFileSync(join(root, "dist/index.html"), "<h1>bootstrap</h1>");
+    writeFileSync(join(root, "package.json"), '{"name":"revkit"}');
+    const priorPath = process.env.PATH;
+    let childPid: number | undefined;
+    try {
+      process.env.PATH = "";
+      const boot = await ensureDaemon({ repoRoot: root, dir: "dist", onSpawn: (pid) => { childPid = pid; } });
+      expect(boot.spawned).toBe(true);
+      expect(childPid).toBe(boot.state.pid);
+      expect(existsSync(join(root, ".revkit/serve.json"))).toBe(true);
+    } finally {
+      process.env.PATH = priorPath;
+      if (childPid !== undefined) {
+        process.kill(childPid, "SIGTERM");
+        await Bun.sleep(200);
+      }
+    }
+  }, 20_000);
+
+  test("compiled identity has no separate entry argument", () => {
+    expect(daemonExecutable("unused", "/$bunfs/root/revkit", "/opt/bin/revkit")).toEqual(["/opt/bin/revkit"]);
+    expect(daemonExecutable("/opt/revkit.js", "/opt/revkit.js", "/opt/bin/bun")).toEqual(["/opt/bin/bun", "/opt/revkit.js"]);
   });
 
   test("attaches to a live daemon (no spawn) — the reuse path", async () => {
@@ -163,7 +190,7 @@ describe("daemon-bootstrap", () => {
       pollIntervalMs: 5,
       waitMs: 60_000,
     });
-    expect(spawnedCmd?.[0]).toBe("bun");
+    expect(spawnedCmd?.[0]).toBe(process.execPath);
     expect(spawnedCmd?.includes("serve")).toBe(true);
     expect(spawnedCmd?.includes("--dir")).toBe(true);
     expect(spawnedCmd?.includes("custom/dist")).toBe(true);

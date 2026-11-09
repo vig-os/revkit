@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Packaged MCP auto-start reuses its executable without Bun on PATH; daemon
+  startup errors keep MCP available. Templates and `revkit skill install`
+  supply a project MCP registration with conflict checks and backups (#197, #198).
+
 ### Added
 
 - **Deployment targets and pluggable auth** ([#195](https://github.com/vig-os/revkit/issues/195), [#192](https://github.com/vig-os/revkit/issues/192))

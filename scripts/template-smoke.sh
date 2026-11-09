@@ -47,7 +47,9 @@ if [ ! -f "$revkit_repo/flake.nix" ]; then
   exit 2
 fi
 
-smoke_dir=$(mktemp -d /tmp/revkit-template-smoke-XXXXXX)
+export TMPDIR=${TMPDIR:-"$revkit_repo/.revkit/tmp/template-smoke"}
+mkdir -p "$TMPDIR"
+smoke_dir=$(mktemp -d "$TMPDIR/revkit-template-smoke-XXXXXX")
 serve_pid=""
 
 cleanup() {
@@ -160,6 +162,9 @@ if find "$REVKIT_BIN" -newer "$smoke_dir/.revkit/dist/index.html" 2>/dev/null | 
   exit 1
 fi
 
+# Exercise the actual template registration, with no runtime on the server PATH.
+python3 "$revkit_repo/scripts/mcp-smoke.py" "$REVKIT_BIN"
+
 # --- Step 6: install the packaged consumer skill -----------------------
 echo "smoke: revkit skill install"
 cd "$smoke_dir"
@@ -204,7 +209,6 @@ for _ in $(seq 1 30); do
 done
 if ! grep -q "listening on" "$smoke_dir/serve.out"; then
   echo "smoke: FAIL — daemon never printed a launch URL" >&2
-  cat "$smoke_dir/serve.out" >&2
   cat "$smoke_dir/serve.err" >&2
   exit 1
 fi
@@ -212,15 +216,13 @@ launch_url=$(grep -oE 'http://127\.0\.0\.1:[0-9]+/-/auth\?code=[A-Za-z0-9_-]+' "
 base_url=$(echo "$launch_url" | sed -E 's|/-/auth.*||')
 if [ -z "$launch_url" ]; then
   echo "smoke: FAIL — could not extract launch URL from serve.out" >&2
-  cat "$smoke_dir/serve.out" >&2
   exit 1
 fi
-echo "smoke: base=$base_url launch=$launch_url"
+echo "smoke: base=$base_url"
 # Exchange launch code for a session cookie via the 302 redirect.
 curl -sS -c "$smoke_dir/cookies" -o /dev/null -L "$launch_url"
 if ! grep -q "revkit_session" "$smoke_dir/cookies"; then
   echo "smoke: FAIL — /-/auth did not set a revkit_session cookie" >&2
-  cat "$smoke_dir/cookies" >&2
   exit 1
 fi
 # Fetch the doc page.

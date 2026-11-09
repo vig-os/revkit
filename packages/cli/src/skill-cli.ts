@@ -1,5 +1,5 @@
 // `revkit skill install` — copy the packaged consumer skill into
-// `.claude/skills/revkit/SKILL.md` in the caller's cwd.
+// `.claude/skills/revkit/SKILL.md` and register `revkit mcp` in the caller's cwd.
 //
 // **Why a CLI command and not a documented `cp`**: the `cp -r "$(nix
 // flake prefetch ...)"` line in the earlier install instructions
@@ -62,7 +62,7 @@ export interface SkillInstallResult {
 }
 
 /** Handle `revkit skill install`. Parses `--dir`, `--force`,
- * `--dry-run`. Never touches anything outside `<cwd>/.claude/`. */
+ * `--dry-run`. Writes the skill and project-local `.mcp.json` registration. */
 export function runSkillCommand(
   args: readonly string[],
   env: { readonly cwd: string },
@@ -131,9 +131,40 @@ function runSkillInstall(
   const targetDir = resolve(dir, ".claude/skills/revkit");
   const target = resolve(targetDir, "SKILL.md");
 
+  const registrationPath = resolve(dir, ".mcp.json");
+  const registration = { command: "revkit", args: ["mcp"] };
+  let config: Record<string, unknown> = {};
+  let servers: Record<string, unknown> = {};
+  let priorRegistration: string | undefined;
+  let replaceRegistration = false;
+  try {
+    if (existsSync(registrationPath)) {
+      priorRegistration = readFileSync(registrationPath, "utf8");
+      const parsed: unknown = JSON.parse(priorRegistration);
+      if (!isObject(parsed) || (parsed.mcpServers !== undefined && !isObject(parsed.mcpServers))) {
+        throw new Error("expected an object with an mcpServers object");
+      }
+      config = parsed;
+      servers = (config.mcpServers ?? {}) as Record<string, unknown>;
+      const existing = servers.revkit;
+      if (existing !== undefined) {
+        const matches = isObject(existing) && existing.command === registration.command &&
+          JSON.stringify(existing.args) === JSON.stringify(registration.args) &&
+          Object.keys(existing).every((key) => key === "command" || key === "args");
+        replaceRegistration = !matches;
+        if (replaceRegistration && !force) {
+          return { stdout: "", stderr: `revkit skill install: ${registrationPath} revkit registration already exists. Pass --force to replace it with a backup.\n`, exitCode: 1 };
+        }
+      }
+    }
+  } catch (error) {
+    return { stdout: "", stderr: `revkit skill install: cannot merge ${registrationPath}: ${(error as Error).message}\n`, exitCode: 1 };
+  }
+  const registrationSource = JSON.stringify({ ...config, mcpServers: { ...servers, revkit: registration } }, null, 2) + "\n";
+
   if (dryRun) {
     return {
-      stdout: `Would write ${target} (${source.length} bytes).\n`,
+      stdout: `Would write ${target} (${source.length} bytes) and merge ${registrationPath}.\n`,
       stderr: "",
       exitCode: 0,
     };
@@ -157,6 +188,10 @@ function runSkillInstall(
       const prior = readFileSync(target, "utf8");
       writeFileSync(backup, prior, "utf8");
     }
+    if (replaceRegistration && priorRegistration !== undefined) {
+      writeFileSync(`${registrationPath}.backup-${Date.now()}`, priorRegistration, "utf8");
+    }
+    writeFileSync(registrationPath, registrationSource, "utf8");
     writeFileSync(target, source, "utf8");
   } catch (error) {
     return {
@@ -167,8 +202,12 @@ function runSkillInstall(
   }
 
   return {
-    stdout: `Installed revkit skill: ${target}\n`,
+    stdout: `Installed revkit skill: ${target}\nRegistered revkit mcp: ${registrationPath}\n`,
     stderr: "",
     exitCode: 0,
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

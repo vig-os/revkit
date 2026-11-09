@@ -65,19 +65,16 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     return { exitCode: 2, stdout: "", stderr: `${(error as Error).message}\n` };
   }
   let bootstrap;
+  let startupDiagnostic = "";
   try {
     bootstrap = await ensureDaemon({
       repoRoot,
       ...(parsed.dir !== undefined ? { dir: parsed.dir } : {}),
     });
   } catch (error) {
-    return { exitCode: 1, stdout: "", stderr: `revkit mcp: ${(error as Error).message}\n` };
+    startupDiagnostic = `revkit mcp: daemon unavailable: ${(error as Error).message}. Tool calls will retry.\n`;
   }
-  const state = bootstrap.state;
-  const client = new DaemonClient({
-    url: state.url,
-    agentToken: state.agentToken,
-  });
+  const state = bootstrap?.state;
   // Reconnect discovery for the channel server: re-run `ensureDaemon`
   // (auto-starts if the previous daemon is gone), then confirm via
   // `/-/health` that the running daemon really is the one
@@ -129,10 +126,12 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
   let handle;
   try {
     handle = await startChannelServer({
-      client,
-      url: state.url,
-      agentToken: state.agentToken,
-      ...(state.instanceId !== undefined ? { instanceId: state.instanceId } : {}),
+      ...(state !== undefined ? {
+        client: new DaemonClient({ url: state.url, agentToken: state.agentToken }),
+        url: state.url,
+        agentToken: state.agentToken,
+        ...(state.instanceId !== undefined ? { instanceId: state.instanceId } : {}),
+      } : {}),
       version: env.version,
       discover,
     });
@@ -154,7 +153,7 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
   });
-  const bootMsg = bootstrap.spawned
+  const bootMsg = state === undefined ? startupDiagnostic : bootstrap?.spawned
     ? `revkit mcp: started daemon (pid ${state.pid}, ${state.url})\n`
     : `revkit mcp: attached to daemon (pid ${state.pid}, ${state.url})\n`;
   return {
