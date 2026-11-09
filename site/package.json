@@ -16,6 +16,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@astrojs/internal-helpers": "0.11.0",
     "@astrojs/mdx": "8.0.2",
     "@astrojs/solid-js": "7.0.2",
     "@astrojs/starlight": "0.42.4",
