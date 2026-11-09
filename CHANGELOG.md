@@ -88,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Raw-source comment provenance** ([#200](https://github.com/vig-os/revkit/issues/200)): full builds and request-time rendering preserve frontmatter source coordinates and stamp the published source revision, so comments on documents with code blocks are accepted (A2, ADR-0006).
+
 - **Legacy quote recovery stays linear on deeply nested blocks and
   repetitive text**, and rebuilds yield between threads to keep the local
   review daemon responsive

@@ -277,6 +277,7 @@ export default defineConfig({
   // daemon's fast-path publish also imports (M2 item 9, story A4).
   // A new plugin lands in ONE place; both consumers see it.
   markdown: buildSharedMarkdownConfig(REPO_ROOT, {
+    readSource: true,
     pathMap: CONSUMER_ROOT
       ? [{
           from: join(CONSUMER_ROOT, ".revkit", "build", "src", "content", "docs"),

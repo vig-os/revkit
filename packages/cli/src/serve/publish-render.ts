@@ -199,7 +199,7 @@ export async function renderDocFragment(options: RenderDocOptions): Promise<Rend
     // reads. Same shape Astro's `markdown` block accepts in
     // `astro.config.mjs`.
     processorPromise = createMarkdownProcessor({
-      ...buildSharedMarkdownConfig(options.repoRoot),
+      ...buildSharedMarkdownConfig(options.repoRoot, { readSource: false }),
       syntaxHighlight: false,
     } as Parameters<typeof createMarkdownProcessor>[0]);
     processorCache.set(options.repoRoot, processorPromise);
