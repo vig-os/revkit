@@ -62,8 +62,8 @@
       # than a mismatched hash at build time.
       nodeModulesHashes = {
         x86_64-linux = "sha256-24EbeOUICYolGqwH/sTMrYE5mjZAMEhexj/sMKoLAZw=";
-        aarch64-linux = "sha256-MYjDAV2hT6Q9vI9wvuDIBgmWmfsyaFtWR8gBO49CHEs=";
-        aarch64-darwin = "sha256-jlgIDwYETVIlPcl/6EWMEoEYCOEbABfCciwwd160FFc=";
+        aarch64-linux = "sha256-tIDV9F83WDlpAb2teCTC0aH/+xdntp2aDUTgs4y64xM=";
+        aarch64-darwin = "sha256-6KhlreOwrtiVi7uLuF/x/5yTb3xrEVk7iiZ/EGoTO30=";
       };
 
       # Systems `packages` / `apps` are exposed on. Kept in lockstep with
