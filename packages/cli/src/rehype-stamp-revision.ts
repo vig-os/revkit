@@ -14,7 +14,7 @@
 //
 // The plugin is a pure hast walker; it computes `revisionOf` on
 // the file value it receives from unified (Astro's markdown
-// processor passes the raw source in `file.value`). If the plugin
+// pipeline restores the raw snapshot in `remarkSourceSnapshot`). If the plugin
 // cannot recover the source it skips the stamp — the daemon then
 // falls back to comparing the fast-render's `data-src` set against
 // dist's set (both are cheap regex extractions).

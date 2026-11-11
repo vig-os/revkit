@@ -14,6 +14,7 @@
 // `createMarkdownProcessor()` accepts, so the daemon reconstructs
 // exactly the same pipeline off the Astro loader path.
 
+import { remarkSourceSnapshot } from "../../../packages/cli/src/remark-source-snapshot.ts";
 import remarkMath from "remark-math";
 import { rehypeKatexStrict } from "./rehype-katex-strict.ts";
 import { rehypeDataSrc, type DataSrcPluginOptions } from "../../../packages/cli/src/rehype-data-src.ts";
@@ -48,13 +49,16 @@ type RehypePlugins = (unknown | readonly unknown[])[];
  */
 export function buildSharedMarkdownConfig(
   repoRoot: string,
-  options: Pick<DataSrcPluginOptions, "pathMap" | "onProvenance"> = {},
+  options: Pick<DataSrcPluginOptions, "pathMap" | "onProvenance"> & {
+    /** Builds restore loader-stripped source from disk; requests use their supplied snapshot. */
+    readSource?: boolean;
+  } = {},
 ): {
   readonly remarkPlugins: RemarkPlugins;
   readonly rehypePlugins: RehypePlugins;
 } {
   return {
-    remarkPlugins: [remarkMath],
+    remarkPlugins: [[remarkSourceSnapshot, { readSource: options.readSource ?? false }], remarkMath],
     rehypePlugins: [
       // `rehype-katex-strict` runs first so the KaTeX subtree is
       // shaped before `rehype-drop-repo-doc-title` inspects the

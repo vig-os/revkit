@@ -20,7 +20,7 @@ export interface RenderedProvenance {
 export async function renderProvenance(repoRoot: string, path: string, source: string): Promise<RenderedProvenance> {
   let captured: ProvenanceRecords = { leaves: new Map(), blocks: new Set() };
   const processor = await createMarkdownProcessor({
-    ...buildSharedMarkdownConfig(repoRoot, { onProvenance: (records) => { captured = records; } }), syntaxHighlight: false,
+    ...buildSharedMarkdownConfig(repoRoot, { readSource: false, onProvenance: (records) => { captured = records; } }), syntaxHighlight: false,
   } as Parameters<typeof createMarkdownProcessor>[0]);
   const { code } = await processor.render(source, { fileURL: pathToFileURL(`${repoRoot}/${path}`) });
   const { document } = parseHTML(`<html><body>${code}</body></html>`);
