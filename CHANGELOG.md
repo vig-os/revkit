@@ -125,6 +125,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     naming the page. The empty-root check is backward-compatible — a
     standalone `revkit check-dist <dir>` without the source-body map keeps
     its pre-#237 behaviour.
+- **`revkit build` launches Astro through the staged dependency graph** ([#238](https://github.com/vig-os/revkit/issues/238))
+  - In the isolated (Bun workspace) layout, Astro ran from `site/node_modules/.bin/astro`, which Node resolves to
+    its real path in Bun's store. With `NODE_PRESERVE_SYMLINKS=1`, packages reached from there walked up into Bun's
+    shared fallback folder (`node_modules/.bun/node_modules`), which holds one version per name. Since
+    `hast-util-raw` 9.2.0 (parse5 8) that loaded parse5 7, every Markdown body rendered empty.
+  - Astro now starts from `<staging>/node_modules/astro` with `--preserve-symlinks-main`, so the CLI and every
+    import resolve through `.revkit-deps` in both layouts. The hoisted (nix package) layout was never affected: its
+    flat tree nests conflicting versions under their dependants.
+  - A regression test stages a fixture whose fallback folder holds an incompatible version and asserts the staged
+    one is rendered.
 - **Worker tests derive their version from `wrangler.jsonc` instead of a
   hard-coded dev-placeholder literal** ([#231](https://github.com/vig-os/revkit/issues/231))
   - Seven Worker tests used to hand-write the dev placeholder in bundle paths
