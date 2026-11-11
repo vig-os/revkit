@@ -170,6 +170,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Upgrade `zod` to 4.6.7** ([#235](https://github.com/vig-os/revkit/issues/235))
+  - Clears GHSA-mrhx-c7xc-m3w5 (high): zod < 4.6.6 accumulated one validation issue per bad element when parsing
+    an oversized array/set/map, so an attacker could pack a large array into a request and push the process into
+    memory pressure. The upstream fix (`a0ebf97`, zod#6652) adds a leading length check that short-circuits
+    `.max()` / `.length()` / `.size()` before element-walking.
+  - revkit's HTTP body cap (`MAX_BODY_BYTES = 1 MiB` in `readCappedJsonBody`) already bounds how much the schema
+    can be pushed to walk, so the request-scoped memory outcome stays bounded. The upgrade's leading check does
+    cover `publishRequestSchema`'s two `.max(PUBLISH_ARRAY_SHAPE_MAX)` arrays, but `askAnswerSchema`'s `ranking`,
+    `coordinates` and multi-choice `value` arrays have no `.max()` yet, so on those endpoints the upgrade clears
+    the advisory flag rather than closing the path itself; adding those caps is a separate follow-up.
 - **Upgrade `@modelcontextprotocol/sdk` to 1.32.2** ([#227](https://github.com/vig-os/revkit/issues/227))
   - Clears two high-severity advisories in 1.31.0: GHSA-22jm-h49p-29qw (experimental tasks not tied to the creating
     session) and GHSA-46jr-4wx8-v453 (request validation could exhaust server memory over HTTP); the latter's

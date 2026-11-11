@@ -51,6 +51,6 @@
     "remark-rehype": "11.1.2",
     "typescript": "5.9.3",
     "unified": "11.0.5",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   }
 }
