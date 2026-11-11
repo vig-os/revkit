@@ -1,0 +1,1011 @@
+/*
+ * revkit rail styles — deliberately minimal (ADR-0017: WCAG 2.2 AA).
+ *
+ * A single-column panel pinned to the right edge on desktop; on
+ * phones (≤ 640px) it becomes a full-width sheet at the bottom of
+ * the page. Colours use CSS variables so a future theme (dark
+ * mode, brand palette) can override without touching this file.
+ * The rail intentionally avoids any dependency on Starlight's
+ * Tailwind layer — it renders inside pages that may not have
+ * loaded that layer (a plain HTML file served by the daemon).
+ */
+
+:root {
+  --revkit-rail-bg: #ffffff;
+  --revkit-rail-fg: #111827;
+  /* `muted` must clear WCAG 2.2 SC 1.4.3 (4.5:1 on rail background)
+   * for the small author-id / anchor line text. #4b5563 on #ffffff
+   * gives ~7.6:1 (verified via axe). #6b7280 sat right on the
+   * threshold and failed on the .revkit-rail__comment background
+   * (which mixes 4% fg onto white → ~#f4f5f6). */
+  --revkit-rail-muted: #4b5563;
+  --revkit-rail-accent: #1d4ed8;
+  --revkit-rail-border: #e5e7eb;
+  --revkit-rail-resolved: #047857;
+  --revkit-rail-danger: #b91c1c;
+  --revkit-rail-focus: #fde68a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --revkit-rail-bg: #0b1220;
+    --revkit-rail-fg: #f3f4f6;
+    /* Same 4.5:1 requirement, this time on the dark rail bg. */
+    --revkit-rail-muted: #cbd5e1;
+    --revkit-rail-accent: #93c5fd;
+    --revkit-rail-border: #1f2937;
+    --revkit-rail-resolved: #34d399;
+    --revkit-rail-focus: #78350f;
+  }
+}
+
+.revkit-rail {
+  position: fixed;
+  top: 4rem;
+  right: 0;
+  bottom: 0;
+  width: min(360px, 100%);
+  background: var(--revkit-rail-bg);
+  color: var(--revkit-rail-fg);
+  border-left: 1px solid var(--revkit-rail-border);
+  padding: 1rem;
+  overflow-y: auto;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  z-index: 2147483000;
+}
+
+@media (max-width: 640px) {
+  .revkit-rail {
+    top: auto;
+    right: 0;
+    left: 0;
+    bottom: 0;
+    width: 100%;
+    max-height: 55vh;
+    border-left: none;
+    border-top: 1px solid var(--revkit-rail-border);
+  }
+}
+
+.revkit-rail__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+  gap: 0.5rem;
+}
+
+.revkit-rail__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.revkit-rail__error {
+  margin: 0 0 0.75rem 0;
+  padding: 0.5rem;
+  background: color-mix(in srgb, var(--revkit-rail-danger) 12%, transparent);
+  color: var(--revkit-rail-danger);
+  border: 1px solid var(--revkit-rail-danger);
+  border-radius: 4px;
+}
+
+.revkit-rail__selection {
+  border: 1px dashed var(--revkit-rail-accent);
+  padding: 0.5rem;
+  border-radius: 4px;
+  margin-bottom: 0.75rem;
+}
+
+.revkit-rail__quote {
+  color: var(--revkit-rail-muted);
+  font-style: italic;
+  margin: 0 0 0.5rem 0;
+}
+
+.revkit-rail__composer,
+.revkit-rail__reply-form {
+  margin: 0 0 0.75rem 0;
+  padding: 0.5rem;
+  background: color-mix(in srgb, var(--revkit-rail-accent) 6%, transparent);
+  border: 1px solid var(--revkit-rail-border);
+  border-radius: 4px;
+}
+
+.revkit-rail__composer-anchor,
+.revkit-rail__thread-anchor {
+  display: flex;
+  gap: 0.5rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-muted);
+  margin: 0 0 0.35rem 0;
+}
+
+.revkit-rail__thread-anchor {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--revkit-rail-accent);
+  padding: 0;
+  text-align: left;
+}
+
+.revkit-rail__thread-anchor:hover,
+.revkit-rail__thread-anchor:focus-visible {
+  text-decoration: underline;
+}
+
+.revkit-rail__label {
+  display: block;
+  margin: 0.5rem 0;
+}
+
+.revkit-rail__label-text {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 0.25rem;
+}
+
+.revkit-rail__composer textarea,
+.revkit-rail__reply-form textarea {
+  width: 100%;
+  padding: 0.4rem;
+  border: 1px solid var(--revkit-rail-border);
+  border-radius: 4px;
+  background: var(--revkit-rail-bg);
+  color: var(--revkit-rail-fg);
+  font: inherit;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.revkit-rail__actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+  margin-top: 0.5rem;
+}
+
+.revkit-rail__submit,
+.revkit-rail__new {
+  background: var(--revkit-rail-accent);
+  color: white;
+  border: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.revkit-rail__cancel,
+.revkit-rail__refresh,
+.revkit-rail__reply,
+.revkit-rail__resolve {
+  background: transparent;
+  color: var(--revkit-rail-fg);
+  border: 1px solid var(--revkit-rail-border);
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.revkit-rail__resolve {
+  color: var(--revkit-rail-resolved);
+  border-color: var(--revkit-rail-resolved);
+}
+
+.revkit-rail__threads {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.revkit-rail__thread {
+  padding: 0.5rem;
+  border: 1px solid var(--revkit-rail-border);
+  border-radius: 4px;
+}
+
+/*
+ * Resolved threads are visually de-emphasised. Avoid `opacity: 0.75`
+ * — that would dim the text below the WCAG 2.2 SC 1.4.3 4.5:1
+ * threshold on the small-body author line (axe catches it). Use a
+ * distinct border colour + resolved anchor colour instead; keep the
+ * body text at full contrast.
+ */
+.revkit-rail__thread--resolved {
+  border-color: var(--revkit-rail-resolved);
+  background: color-mix(in srgb, var(--revkit-rail-resolved) 6%, transparent);
+}
+
+.revkit-rail__thread--resolved .revkit-rail__thread-anchor {
+  color: var(--revkit-rail-resolved);
+}
+
+/*
+ * Unread state (issue #60). A thread whose latest touch was an
+ * agent action since the human last acknowledged it keeps a
+ * left-hand accent stripe AND a text pill — so the reviewer notices
+ * it even when the accent hue reads badly for a colour-blind
+ * viewer. axe: the pill carries text and an aria-hidden glyph, so
+ * screen readers announce "agent replied — unread".
+ */
+.revkit-rail__thread--unread {
+  border-left-width: 3px;
+  border-left-color: var(--revkit-rail-accent);
+}
+
+.revkit-rail__thread-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.revkit-rail__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  line-height: 1.4;
+  border: 1px solid currentColor;
+}
+
+.revkit-rail__pill--unread {
+  color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 10%, transparent);
+}
+
+.revkit-rail__pill-icon {
+  font-weight: 700;
+}
+
+/* Resolved-summary disclosure row (issue #60). The button is a real
+ * <button aria-expanded>; the caret is a text glyph so no bitmap
+ * font is needed. Full-width click target so a reviewer can hit it
+ * without pixel-hunting on mobile. */
+.revkit-rail__resolved-summary {
+  margin-top: 0.35rem;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.revkit-rail__resolved-toggle {
+  all: unset;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-resolved);
+  padding: 0.15rem 0.25rem;
+  border-radius: 4px;
+}
+
+.revkit-rail__resolved-toggle:focus-visible {
+  outline: 2px solid var(--revkit-rail-accent);
+  outline-offset: 2px;
+}
+
+.revkit-rail__resolved-caret {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  color: var(--revkit-rail-resolved);
+}
+
+.revkit-rail__resolved-status {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 0.7rem;
+}
+
+.revkit-rail__resolved-meta {
+  color: var(--revkit-rail-muted);
+  font-size: 0.75rem;
+  margin: 0.15rem 0 0 0;
+}
+
+.revkit-rail__resolved-who {
+  color: var(--revkit-rail-fg);
+  font-weight: 500;
+}
+
+.revkit-rail__resolved-excerpt {
+  margin: 0.15rem 0 0 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-muted);
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+}
+
+.revkit-rail__reopen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.revkit-rail__reopen:hover,
+.revkit-rail__reopen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+.revkit-rail__mark-seen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-muted);
+  padding: 0.25rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.revkit-rail__header-resolved-count {
+  font-size: 0.75rem;
+  color: var(--revkit-rail-resolved);
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--revkit-rail-resolved);
+  border-radius: 999px;
+  margin-left: auto;
+  margin-right: 0.5rem;
+}
+
+/* Bulk "Mark all seen" action in the rail header (PR #62 review).
+ * Only rendered when unread > 0, so it doesn't clutter the header
+ * on a quiet page. */
+.revkit-rail__mark-all-seen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.15rem 0.55rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  margin-right: 0.35rem;
+}
+
+.revkit-rail__mark-all-seen:hover,
+.revkit-rail__mark-all-seen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+/* Single polite live region for unread announcements — visually
+ * hidden but announced by screen readers. sr-only pattern. */
+.revkit-rail__unread-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Reopen button lives inside the collapsed row, so a reviewer
+ * can reopen a resolved thread with one click (no need to expand
+ * first). Smaller than the in-body reopen so a long list of
+ * collapsed rows stays scannable. */
+.revkit-rail__resolved-reopen {
+  background: transparent;
+  border: 1px solid var(--revkit-rail-border);
+  color: var(--revkit-rail-fg);
+  padding: 0.1rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.72rem;
+  justify-self: end;
+  align-self: start;
+}
+
+.revkit-rail__resolved-reopen:hover,
+.revkit-rail__resolved-reopen:focus-visible {
+  border-color: var(--revkit-rail-accent);
+  outline: none;
+}
+
+.revkit-rail__comments {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.revkit-rail__comment {
+  padding: 0.35rem 0.5rem;
+  background: color-mix(in srgb, var(--revkit-rail-fg) 4%, transparent);
+  border-radius: 4px;
+}
+
+.revkit-rail__author {
+  margin: 0 0 0.15rem 0;
+  font-size: 0.75rem;
+  color: var(--revkit-rail-muted);
+  display: flex;
+  gap: 0.35rem;
+  align-items: baseline;
+}
+
+.revkit-rail__author-kind {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.revkit-rail__author-kind--agent {
+  color: var(--revkit-rail-accent);
+}
+
+/* System actor (PR #52 round-2 review): daemon-emitted events with
+ * no human or agent origin — the lazy `ask.expired` sweep, the
+ * re-anchor pipeline. Muted foreground with a monospaced feel
+ * makes them visually distinct from `agent`, `local`, and
+ * `gh-user`, so a reviewer scanning the rail can tell "the daemon
+ * did this" at a glance. */
+.revkit-rail__author-kind--system {
+  color: var(--revkit-rail-muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-weight: 500;
+}
+
+.revkit-rail__body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.revkit-rail__thread-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.revkit-rail__empty {
+  color: var(--revkit-rail-muted);
+  text-align: center;
+  padding: 1rem;
+  margin: 0;
+}
+
+/*
+ * Floating "Comment" button pinned to the selection's top edge.
+ * Position is set inline (viewport coordinates from
+ * getBoundingClientRect). Keeps the affordance where the eye
+ * already is when the reviewer just selected text (WCAG 2.5.7
+ * pointer target size — 32px min).
+ */
+.revkit-rail__floating {
+  position: fixed;
+  z-index: 2147483001;
+  background: var(--revkit-rail-accent);
+  color: white;
+  border: none;
+  padding: 0.35rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  min-height: 32px;
+}
+
+.revkit-rail__floating:hover,
+.revkit-rail__floating:focus-visible {
+  filter: brightness(1.1);
+}
+
+[data-rail-focus="true"] {
+  background: var(--revkit-rail-focus);
+  transition: background-color 0.3s ease;
+}
+
+/* Focus outline for keyboard users (WCAG 2.4.7). */
+.revkit-rail :focus-visible {
+  outline: 2px solid var(--revkit-rail-accent);
+  outline-offset: 2px;
+}
+
+/*
+ * Orphan panel (M2 item 5b, story A8).
+ *
+ * A separated region below the open-threads list. Visually
+ * distinct — muted background, warning border on the left edge —
+ * so the reviewer can spot which threads no longer anchor to a
+ * currently-rendered block. Keyboard-accessible; the reply /
+ * resolve buttons participate in the same tab order as open
+ * threads.
+ */
+.revkit-rail__orphans {
+  margin-top: 1rem;
+  padding: 0.75rem 0.5rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 15%, transparent);
+}
+
+.revkit-rail__orphans-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--revkit-rail-fg);
+}
+
+.revkit-rail__orphans-count {
+  color: var(--revkit-rail-muted);
+  font-weight: 400;
+}
+
+.revkit-rail__orphans-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.revkit-rail__thread--orphaned {
+  border-left: 3px solid var(--revkit-rail-accent);
+  padding-left: 0.5rem;
+  background: color-mix(in srgb, var(--revkit-rail-fg) 3%, transparent);
+}
+
+.revkit-rail__thread-anchor--orphaned {
+  color: var(--revkit-rail-muted);
+  font-style: italic;
+  margin: 0 0 0.35rem;
+}
+
+.revkit-rail__orphan-quote {
+  margin: 0.35rem 0;
+  padding: 0.35rem 0.5rem;
+  border-left: 2px solid color-mix(in srgb, var(--revkit-rail-fg) 20%, transparent);
+  color: var(--revkit-rail-fg);
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.revkit-rail__orphan-reason {
+  margin: 0.35rem 0;
+  color: var(--revkit-rail-muted);
+  font-size: 0.8rem;
+}
+
+/* ------------------------------------------------------------------
+ * Delivery mode + presence + mention chips (M2 item 6, ADR-0007/0011).
+ *
+ * Kept flat: one section per concern, uses the same tokens the rest
+ * of the rail defines (--revkit-rail-fg / -muted / -accent). No
+ * :hover-only cues (touch target); no colour-only cues (contrast
+ * threshold + border on the selected radio, per WCAG 2.2 AA).
+ * ------------------------------------------------------------------ */
+
+.revkit-rail__mode {
+  padding: 0.35rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 15%, transparent);
+}
+
+.revkit-rail__mode-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.revkit-rail__mode-legend {
+  font-size: 0.8rem;
+  color: var(--revkit-rail-muted);
+  margin-right: 0.35rem;
+}
+
+.revkit-rail__mode-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.4rem;
+  border: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 20%, transparent);
+  border-radius: 0.35rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.revkit-rail__mode-option[data-selected="true"] {
+  border-color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 8%, transparent);
+}
+.revkit-rail__mode-option input[type="radio"] {
+  /* The radio's native affordance is preserved for screen readers,
+   * but the outer border is what the sighted reviewer relies on. */
+  margin: 0;
+}
+
+.revkit-rail__mode-batched {
+  margin-top: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.revkit-rail__mode-badge {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  background: color-mix(in srgb, var(--revkit-rail-accent) 15%, transparent);
+  color: var(--revkit-rail-fg);
+  font-size: 0.75rem;
+  border-radius: 0.35rem;
+}
+
+.revkit-rail__mode-handover {
+  padding: 0.15rem 0.5rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.35rem;
+  background: var(--revkit-rail-accent);
+  color: var(--revkit-rail-bg);
+  cursor: pointer;
+}
+
+.revkit-rail__presence {
+  padding: 0.25rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 12%, transparent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 5%, transparent);
+}
+
+.revkit-rail__presence-line {
+  margin: 0.1rem 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.revkit-rail__presence-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--revkit-rail-accent);
+  /* Pulsing dot; respects prefers-reduced-motion so the badge does
+   * not oscillate for a vestibular-sensitive reviewer. */
+  animation: revkit-rail-presence-pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .revkit-rail__presence-dot { animation: none; }
+}
+@keyframes revkit-rail-presence-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+
+.revkit-rail__mention {
+  display: inline;
+  padding: 0 0.25rem;
+  border-radius: 0.25rem;
+  background: color-mix(in srgb, var(--revkit-rail-accent) 12%, transparent);
+  color: var(--revkit-rail-fg);
+  font-weight: 500;
+}
+.revkit-rail__mention--agent-now {
+  background: color-mix(in srgb, var(--revkit-rail-accent) 30%, transparent);
+  outline: 1px solid var(--revkit-rail-accent);
+}
+
+.revkit-rail__delivery-note {
+  padding: 0.35rem 0.5rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 12%, transparent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 6%, transparent);
+  border-left: 3px solid var(--revkit-rail-accent);
+}
+
+.revkit-rail__delivery-note-text {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+
+/* M3 part 2b — review-mode panel. Shown when the daemon is in
+   review mode (`/api/review/state` returns 200). Adds a submit
+   form (event radios + optional body), a stale banner with a
+   re-anchor button, and a pending-count line. */
+.revkit-rail__review {
+  padding: 0.6rem 0.75rem;
+  border-top: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 15%, transparent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 4%, transparent);
+}
+.revkit-rail__review-heading {
+  margin: 0 0 0.25rem 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-meta,
+.revkit-rail__review-count {
+  margin: 0.1rem 0;
+  font-size: 0.75rem;
+  color: color-mix(in srgb, var(--revkit-rail-fg) 75%, transparent);
+}
+.revkit-rail__review-meta code,
+.revkit-rail__review-count code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+}
+.revkit-rail__review-stale {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #d97706;
+  background: color-mix(in srgb, #d97706 8%, transparent);
+}
+.revkit-rail__review-stale-text {
+  margin: 0 0 0.4rem 0;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-deleted-remotely {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #b45309;
+  background: color-mix(in srgb, #b45309 10%, transparent);
+}
+.revkit-rail__review-deleted-remotely-summary {
+  margin: 0 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-deleted-remotely-actions {
+  display: flex;
+  gap: 0.35rem;
+}
+.revkit-rail__review-deleted-remotely-repost,
+.revkit-rail__review-deleted-remotely-discard {
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.revkit-rail__review-deleted-remotely-repost:disabled,
+.revkit-rail__review-deleted-remotely-discard:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.revkit-rail__review-reanchor {
+  padding: 0.3rem 0.6rem;
+  border: 1px solid var(--revkit-rail-accent);
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+.revkit-rail__review-reanchor:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--revkit-rail-accent) 15%, transparent);
+}
+.revkit-rail__review-reanchor:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+/* Issue #70 — agent drafts awaiting the reviewer's promotion. The
+ * badge is the "this is not on GitHub yet" signal and rides on both
+ * the draft row and the comment itself; the button is the reviewer's
+ * act, so it is a real <button> with the same affordance language as
+ * the re-anchor / discard actions above. */
+.revkit-rail__agent-draft-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.4rem;
+  margin-left: 0.35rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 999px;
+  color: var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 10%, transparent);
+  font-size: 0.65rem;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.revkit-rail__agent-drafts {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid var(--revkit-rail-accent);
+  background: color-mix(in srgb, var(--revkit-rail-accent) 6%, transparent);
+}
+.revkit-rail__agent-drafts-summary {
+  margin: 0 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__agent-drafts-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+.revkit-rail__agent-draft {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+}
+.revkit-rail__agent-draft .revkit-rail__agent-draft-badge {
+  margin-left: 0;
+}
+.revkit-rail__agent-draft-where {
+  color: var(--revkit-rail-muted);
+}
+.revkit-rail__agent-draft-promote {
+  margin-left: auto;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--revkit-rail-accent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-accent);
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+.revkit-rail__agent-draft-promote:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--revkit-rail-accent) 15%, transparent);
+}
+.revkit-rail__agent-draft-promote:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+/* Issue #70 round 3 — the reviewer's own resolve/reopen that a later
+ * lifecycle change superseded. Deliberately NOT an alert: nothing is
+ * broken and nothing needs a decision, it is a notice that a change did
+ * not reach GitHub. `role="status"` announces it politely. */
+.revkit-rail__dropped-intents {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border-left: 3px solid #b45309;
+  background: color-mix(in srgb, #b45309 8%, transparent);
+}
+.revkit-rail__dropped-intents-summary {
+  margin: 0 0 0.35rem;
+  font-size: 0.8rem;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__dropped-intents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--revkit-rail-muted);
+}
+.revkit-rail__review-submit {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.revkit-rail__review-event {
+  display: flex;
+  gap: 0.6rem;
+  align-items: baseline;
+  padding: 0;
+  margin: 0;
+  border: none;
+}
+.revkit-rail__review-event-legend {
+  padding: 0;
+  font-size: 0.75rem;
+  color: color-mix(in srgb, var(--revkit-rail-fg) 80%, transparent);
+}
+.revkit-rail__review-event-option {
+  display: inline-flex;
+  gap: 0.2rem;
+  font-size: 0.75rem;
+  align-items: center;
+}
+.revkit-rail__review-body-label {
+  font-size: 0.75rem;
+  color: color-mix(in srgb, var(--revkit-rail-fg) 80%, transparent);
+}
+.revkit-rail__review-body {
+  width: 100%;
+  padding: 0.35rem;
+  border: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 20%, transparent);
+  border-radius: 0.25rem;
+  background: transparent;
+  color: var(--revkit-rail-fg);
+  font-family: inherit;
+  font-size: 0.8rem;
+  resize: vertical;
+  min-height: 3rem;
+}
+.revkit-rail__review-actions {
+  display: flex;
+  gap: 0.3rem;
+  flex-wrap: wrap;
+}
+.revkit-rail__review-submit-button,
+.revkit-rail__review-discard,
+.revkit-rail__review-refresh {
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--revkit-rail-fg) 25%, transparent);
+  background: transparent;
+  color: var(--revkit-rail-fg);
+}
+.revkit-rail__review-submit-button {
+  background: var(--revkit-rail-accent);
+  color: #ffffff;
+  border-color: var(--revkit-rail-accent);
+}
+.revkit-rail__review-submit-button:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+.revkit-rail__review-submit-button:disabled,
+.revkit-rail__review-discard:disabled,
+.revkit-rail__review-refresh:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+/* Daemon banners (M2 item 9, PR-56 round 3). Rendered by the
+ * daemon when it must serve stale dist HTML — `stale-check` when
+ * the current source fails `revkit check`, `rendering` when the
+ * fast path refused and a background astro build is running,
+ * `build-failed` when that background build errored. Styles
+ * ship with the rail bundle so the daemon does not need inline
+ * `style=` (round-3 nit — inline styles would fight the CSP). */
+.revkit-daemon-banner {
+  border-radius: 0.5rem;
+  border: 2px solid;
+  padding: 0.75rem 1rem;
+  margin: 0 0 1rem 0;
+  font-family: ui-sans-serif, system-ui;
+  line-height: 1.4;
+}
+.revkit-daemon-banner code {
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+}
+.revkit-daemon-banner ul { margin: 0.5rem 0 0 1.5rem; }
+.revkit-daemon-banner pre {
+  margin: 0.5rem 0 0 0;
+  padding: 0.5rem;
+  border-radius: 0.25rem;
+  background: rgba(0, 0, 0, 0.05);
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+.revkit-daemon-banner--stale-check {
+  border-color: #b45309;
+  background: #fff7ed;
+  color: #7c2d12;
+}
+.revkit-daemon-banner--rendering {
+  border-color: #0369a1;
+  background: #eff6ff;
+  color: #0c4a6e;
+}
+.revkit-daemon-banner--build-failed {
+  border-color: #b91c1c;
+  background: #fef2f2;
+  color: #7f1d1d;
+}

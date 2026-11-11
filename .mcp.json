@@ -1,0 +1,14 @@
+{
+  "$comment": "Workspace CLI through the local flake app: no Bun PATH dependency, workspace-relative source. ADR-0007 channel opt-in: --dangerously-load-development-channels server:revkit.",
+  "mcpServers": {
+    "revkit": {
+      "command": "nix",
+      "args": [
+        "run",
+        ".#revkit",
+        "--",
+        "mcp"
+      ]
+    }
+  }
+}

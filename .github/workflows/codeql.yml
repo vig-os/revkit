@@ -45,6 +45,10 @@ on:  # yamllint disable-line rule:truthy
     branches:
       - main
     paths:
+      - '**.ts'
+      - '**.js'
+      - '**.mjs'
+      - '**.cjs'
       - '.github/workflows/**'
   schedule:
     - cron: '15 2 * * 1'  # Monday at 02:15 UTC
@@ -67,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ['actions']
+        language: ['javascript-typescript', 'actions']
 
     steps:
       - name: Checkout repository

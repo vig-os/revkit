@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "kind": "choice",
+  "title": "Which storage backend?",
+  "prompt": "Pick a backend for M4's hosted mode (DESIGN-0001 §5.1).",
+  "options": [
+    { "id": "d1", "label": "Cloudflare D1" },
+    { "id": "kv", "label": "Workers KV" }
+  ],
+  "allowOther": true
+}

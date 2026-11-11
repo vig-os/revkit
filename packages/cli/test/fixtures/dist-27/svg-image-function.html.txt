@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused fill=image('https://…') via structural String-in-function rule (round 3, nit 2) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><rect fill="image('https://evil.example/x.png')"/></svg>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "data": { "url": "data.csv", "format": { "type": "csv" } },
+  "mark": "bar",
+  "encoding": {
+    "x": { "field": "category", "type": "nominal" },
+    "y": { "field": "value", "type": "quantitative" }
+  }
+}

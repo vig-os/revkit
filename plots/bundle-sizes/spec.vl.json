@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+  "title": "Islands library size, gzipped",
+  "description": "Bundle sizes (KB, gzip -9, full library imported) measured for DESIGN-0001 §2 on 2026-09-29. Solid wins on E1 at 4 KB gz; uPlot is reserved for large time series; Observable Plot ships more than 20x Solid; vega-embed is the interactive-mode escape hatch (lazy island only). Sizes are the source cited in DESIGN-0001 §2 'lean enough'.",
+  "data": { "url": "data.csv", "format": { "type": "csv" } },
+  "width": 480,
+  "height": 220,
+  "mark": { "type": "bar", "cornerRadiusEnd": 2 },
+  "encoding": {
+    "y": {
+      "field": "library",
+      "type": "nominal",
+      "sort": "-x",
+      "title": null
+    },
+    "x": {
+      "field": "kbGzip",
+      "type": "quantitative",
+      "title": "KB, gzipped"
+    },
+    "tooltip": [
+      { "field": "library", "type": "nominal", "title": "Library" },
+      { "field": "kbGzip", "type": "quantitative", "title": "KB gzipped" }
+    ]
+  }
+}

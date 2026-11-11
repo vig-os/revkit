@@ -1,5 +1,13 @@
-# Seeded by vigOS devkit — yours to edit; upgrades never overwrite this file.
+# Consumer-owned (seeded by vigOS devkit; upgrades never overwrite this file).
 # Bugs / missing tools: https://github.com/vig-os/devkit/issues
+#
+# Stamps the release version (ADR-0021, #201) on release/X.Y.Z, so the commit
+# every X.Y.Z-rcN candidate and the final X.Y.Z tag point at already carries
+# X.Y.Z: the single version source (packages/cli/package.json), the Worker's
+# REVKIT_VERSION var, and the `?ref=` pins in the template, README and SKILL.md
+# (scripts/set-release-version.mjs lists the targets). A candidate therefore
+# reports the base X.Y.Z (plus its build revision); a final reports exactly X.Y.Z,
+# and the pin points at the final tag, which exists once the final is promoted.
 
 name: Prepare Release Extension
 
@@ -24,30 +32,57 @@ on:  # yamllint disable-line rule:truthy
         default: false
         type: boolean
 
-# The orchestrator calls this workflow with `secrets: inherit`, so a real
-# extension can mint the COMMIT_APP token to push to the write-protected release
-# branch — the same bypass the changelog-freeze commit already uses.
+# The orchestrator calls this workflow with `secrets: inherit`, so the COMMIT_APP
+# token can push to the write-protected release branch — the same bypass the
+# changelog-freeze commit already uses.
 permissions:
   contents: read
 
 jobs:
   extension:
-    name: Prepare Extension Hook (Default No-op)
+    name: Stamp release version
     runs-on: ubuntu-26.04
     steps:
-      - name: Default extension summary
+      - name: Generate Commit App Token
+        id: commit_app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3
+        with:
+          client-id: ${{ secrets.COMMIT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.COMMIT_APP_PRIVATE_KEY }}
+
+      - name: Checkout release branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.branch_sha }}
+
+      - name: Stamp the release version
+        id: stamp
         env:
           VERSION: ${{ inputs.version }}
-          RELEASE_BRANCH: ${{ inputs.release_branch }}
-          BRANCH_SHA: ${{ inputs.branch_sha }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          echo "No prepare-release extension configured."
-          echo "Version: $VERSION"
-          echo "Release branch: $RELEASE_BRANCH"
-          echo "Branch head SHA: $BRANCH_SHA"
-          echo "Dry-run: $DRY_RUN"
-          echo "Replace this file to prepare the release branch before the PR"
-          echo "opens (e.g. rebuild + commit a generated artifact). A real"
-          echo "extension must honor dry-run (no writes) and may push to"
-          echo "$RELEASE_BRANCH via the COMMIT_APP token (secrets: inherit)."
+          set -euo pipefail
+          flags=()
+          if [ "$DRY_RUN" = "true" ]; then flags+=(--dry-run); fi
+          result=$(node scripts/set-release-version.mjs "$VERSION" "${flags[@]}")
+          echo "stamp result: $result"
+          # First line is changed|unchanged; the rest are the changed paths.
+          if [ "$(printf '%s\n' "$result" | head -n1)" = "changed" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "commit=true" >> "$GITHUB_OUTPUT"
+            echo "paths=$(printf '%s\n' "$result" | tail -n +2 | paste -sd, -)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit the stamped version to the release branch via API
+        if: ${{ steps.stamp.outputs.commit == 'true' }}
+        uses: vig-os/commit-action@7ba7e1ae17547813e708d4cc6a771a09f978f724  # v0.3.3
+        env:
+          GH_TOKEN: ${{ steps.commit_app_token.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          TARGET_BRANCH: refs/heads/${{ inputs.release_branch }}
+          MAX_ATTEMPTS: "3"
+          COMMIT_MESSAGE: |-
+            chore: set release version ${{ inputs.version }}
+
+            Stamp ${{ inputs.version }} into the single version source, the Worker
+            REVKIT_VERSION var and the template/README/SKILL.md pins (ADR-0021).
+          FILE_PATHS: ${{ steps.stamp.outputs.paths }}

@@ -1,0 +1,36 @@
+revkit
+Copyright 2026 gerchowl (Lars Gerchow) and contributors
+
+This product is licensed under the Apache License, Version 2.0.
+See LICENSE for the full text.
+
+================================================================================
+Third-party code
+================================================================================
+
+The @revkit/components package vendors copy-in source from permissive-licensed
+upstreams (see docs/adr/0022-vendored-code-licenses.md). Each vendored drop
+lives in its own subdirectory beside the vendor README, with the upstream
+LICENSE file and an UPSTREAM provenance file that records repo, commit, path
+and the declared SPDX license.
+
+The `revkit check` vendored-code guard enforces every STRUCTURAL rule (UPSTREAM
+key shape, `https://` repo with a host, full-40-char commit SHA, permitted
+SPDX id, layout, symlink refusal, NOTICE format), and requires that each
+entry below points at a real subdirectory whose UPSTREAM `license:` equals
+the entry's SPDX id.
+
+The LICENSE bytes themselves are checked by **manual review only** until the
+SPDX-template matcher tracked in #33 lands. `.github/CODEOWNERS` REQUESTS the
+maintainer's review on `packages/components/vendor/` and `NOTICE`, but the
+CODEOWNERS file becomes an enforced gate only once branch protection on
+`dev` requires code-owner review (an org-config change outside this repo).
+An SPDX-template matcher that admits real upstream LICENSE variance
+(curly quotes, per-line comment prefixes, condensed paragraphs) while
+refusing adversarial appends belongs behind a well-tested library — see #33.
+
+Entries take the form (one per line, at the start of the line):
+
+    - packages/components/vendor/<pkg> — <upstream URL> (SPDX: <id>)
+
+No third-party code is vendored yet.

@@ -29,13 +29,65 @@
       nixpkgs,
       flake-utils,
     }:
-    flake-utils.lib.eachDefaultSystem (
+    let
+      # ────────────────────────────────────────────────────────────────────
+      # revkit's own consumer-facing helpers (D1 / ADR-0010 / M5).
+      # System-independent, so they live outside `eachDefaultSystem`.
+      #
+      #   revkit.lib.hooks — reusable pre-commit hook definitions a
+      #     consumer flake merges into its devkit `hooks` block.
+      #   revkit.templates.default — `nix flake init -t github:vig-os/revkit`
+      #     scaffolds a minimal docs repo consuming this flake.
+      # ────────────────────────────────────────────────────────────────────
+      revkitLib = {
+        hooks = import ./nix/hooks.nix { inherit (nixpkgs) lib; };
+      };
+
+      # Per-system deps hashes captured by the `revkit-flake` matrix job
+      # (see `.github/workflows/revkit-flake.yml`). A system missing from
+      # this attrset falls back to `lib.fakeHash` inside the FOD builder
+      # so the first build on that system reports the correct hash in
+      # its rejection message.
+      #
+      # Bun installs platform-native binaries (esbuild-<os>-<arch>, sharp,
+      # rolldown, lightningcss …), so the FOD output DIFFERS per system —
+      # one hash for all four systems would fail everywhere but where it
+      # was captured. Systems verified by CI:
+      #   x86_64-linux, aarch64-linux, aarch64-darwin
+      # x86_64-darwin is intentionally NOT listed: GitHub-hosted `macos-*`
+      # runners are arm64-only, so verifying that system would need a
+      # self-hosted runner. `packages` is restricted to the three verified
+      # systems (see `packages.revkit` below) — a `nix build` on any
+      # other system fails at eval with a missing-attribute error rather
+      # than a mismatched hash at build time.
+      nodeModulesHashes = {
+        x86_64-linux = "sha256-24EbeOUICYolGqwH/sTMrYE5mjZAMEhexj/sMKoLAZw=";
+        aarch64-linux = "sha256-tIDV9F83WDlpAb2teCTC0aH/+xdntp2aDUTgs4y64xM=";
+        aarch64-darwin = "sha256-6KhlreOwrtiVi7uLuF/x/5yTb3xrEVk7iiZ/EGoTO30=";
+      };
+
+      # Systems `packages` / `apps` are exposed on. Kept in lockstep with
+      # `nodeModulesHashes` so `nix flake show` and a downstream
+      # `revkit.packages.${system}` are always coherent.
+      supportedSystems = builtins.attrNames nodeModulesHashes;
+    in
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ vigos.overlays.default ];
           config.allowUnfree = true;
+        };
+
+        # revkit CLI package (ADR-0010, D1). Reproducible Bun build with
+        # a fixed-output node_modules derivation; see nix/revkit-package.nix
+        # for the split rationale.
+        revkitPkg = pkgs.callPackage ./nix/revkit-package.nix {
+          inherit system nodeModulesHashes;
+          src = ./.;
+          # Identifies the build down to its commit (`revkit --version`).
+          revision = self.shortRev or self.dirtyShortRev or "unknown";
         };
 
         # ────────────────────────────────────────────────────────────────────
@@ -52,7 +104,32 @@
           # Bun: fast TS runtime/test runner/package manager for the review
           # toolchain (Astro/Vite builds, guard scripts).
           pkgs.bun
+          # Cloudflare CLI for the hosted Worker (ADR-0008). Auth comes from
+          # CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID, loaded per call by
+          # `just cf` from ~/.config/revkit/cf.env (ADR-0014), never exported
+          # into the shell.
+          pkgs.wrangler
+          # Deterministic font set for the Playwright visual-regression
+          # baselines (ADR-0016). Bundling from the flake — reached through
+          # REVKIT_TEST_FONTS_DIR in the shell hook below — means the same
+          # /nix/store bytes render the pages on the NixOS dev host and the
+          # Ubuntu CI runner, so screenshots do not depend on either host's
+          # fontconfig. The font is loaded ONLY by the visual-regression
+          # spec's Playwright fixture (site/tests/fixtures/visual.ts); it is
+          # NOT injected into the site build, which stays on Starlight's
+          # system-font stack.
+          pkgs.dejavu_fonts
         ];
+
+        # Playwright browsers from nixpkgs (ADR-0016/0018) — Chromium, Firefox
+        # and WebKit rebuilt with Nix's own libraries, so the driver never
+        # tries to fetch a manylinux tarball on a NixOS host. The consumer
+        # shellHook exports PLAYWRIGHT_BROWSERS_PATH at this store path and
+        # PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true so `@playwright/test`
+        # runs from the store. `@playwright/test` in site/package.json is
+        # pinned to the SAME version as `pkgs.playwright-driver.version` so
+        # the driver protocol matches the browsers.
+        playwrightBrowsers = pkgs.playwright-driver.browsers;
 
         # Devkit knobs read from .vig-os (#1224, #1432, #1431, #1282, #1633): the
         # flake-generated pre-commit hooks — the branch guard and the
@@ -121,6 +198,7 @@
         # finding; escape a single line with `guardrails-ok`.
         codeFiles = "\\.(ts|tsx|js|mjs|cjs|astro)$";
         docFiles = "\\.(md|mdx)$";
+        adrFiles = "^(docs/adr/|docs/FEATURE-MATRIX\\.md$|scripts/adr-index\\.sh$)";
         guardrailsHooks =
           gates: files:
           builtins.listToAttrs (
@@ -142,6 +220,22 @@
           {
             inherit pkgs;
             extraPackages = extraPackages pkgs;
+
+            # Consumer shellHook (mkProjectShell appends this after the module
+            # fragments). Pins Playwright to the nix-built browsers and skips
+            # the driver's host-package validation, which trips on NixOS's
+            # non-FHS layout. Kept last so the "dev environment loaded" echo
+            # from the default shellHook is preserved by re-emitting it.
+            shellHook = ''
+              export PLAYWRIGHT_BROWSERS_PATH="${playwrightBrowsers}"
+              export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+              # Deterministic-font fixture path for the Playwright visual
+              # regression suite (ADR-0016). The site build does not touch
+              # these fonts; only tests/fixtures/visual.ts reads them and
+              # injects them into the page under test.
+              export REVKIT_TEST_FONTS_DIR="${pkgs.dejavu_fonts}/share/fonts/truetype"
+              echo "devcontainer dev environment loaded (nix)"
+            '';
 
             # Capability modules (mirrored in .vig-os DEVKIT_MODULES):
             #   node       - nodejs/npm for the Astro/Vite/TS toolchain
@@ -170,7 +264,85 @@
                 "no-hardcoded"
                 "duplication"
               ] codeFiles
-              // guardrailsHooks [ "derived-docs" ] docFiles;
+              // guardrailsHooks [ "derived-docs" ] docFiles
+              // {
+                # Every Accepted ADR must be cited in the feature matrix and
+                # listed (as Accepted) in the ADR index.
+                guardrails-adr-matrix = {
+                  enable = true;
+                  entry = "guardrails-adr-matrix docs/adr/README.md docs/FEATURE-MATRIX.md";
+                  language = "system";
+                  files = adrFiles;
+                  pass_filenames = false;
+                };
+                # The ADR index is derived from the ADR files; re-check it
+                # whenever any ADR changes, not only when README.md is staged.
+                adr-index = {
+                  enable = true;
+                  entry = "guardrails-derived-docs docs/adr/README.md";
+                  language = "system";
+                  files = adrFiles;
+                  pass_filenames = false;
+                };
+                # `revkit check` (M1 item 4, ADR-0005) runs the five
+                # authoring guards. The hook always walks the whole
+                # workspace (`--staged` would be too narrow — links
+                # resolve across files, vocab loads once from
+                # `vocab/terms.yaml`) and the CLI walks itself with the
+                # same excludes, so `pass_filenames = false`. Also
+                # opts in to `--online` when `gh auth status` succeeds
+                # in the dev shell, else falls back to offline with a
+                # visible warning — the workflow at
+                # `.github/workflows/revkit-guards.yml` runs `--online`
+                # unconditionally with `GITHUB_TOKEN`. `.(md|mdx|astro|
+                # tsx|jsx|json|ya?ml|vue|svelte|html|htm)` (case-
+                # insensitive) is the surface no-hand-rolled-ui and
+                # component-registry look at.
+                revkit-check = {
+                  enable = true;
+                  entry = "packages/cli/bin/revkit-check-hook.sh";
+                  language = "system";
+                  # Ordinary content extensions PLUS the extensionless
+                  # files the ADR-0022 vendored-code guard reads
+                  # (repo-root `NOTICE`, and every `LICENSE` /
+                  # `UPSTREAM` under `packages/components/vendor/`) —
+                  # so a commit that touches only those still fires
+                  # the hook. CI runs `revkit check --online`
+                  # unconditionally, so this is a local convenience
+                  # rather than the sole gate. Kept in ONE place
+                  # (`nix/hooks.nix`) so a consumer using
+                  # `revkit.lib.hooks.mkHooks` and this repo's own
+                  # dev shell never disagree on which files fire the
+                  # hook.
+                  files = revkitLib.hooks.contentFiles;
+                  pass_filenames = false;
+                };
+                # A hand-resolved CHANGELOG merge conflict can leave a repeated
+                # `### ` heading inside a section, which the release train
+                # would silently drop at freeze time. Check structure only:
+                # `prepare-changelog validate` also demands entries under
+                # Unreleased, which release branches (frozen) and dev after a
+                # reset (empty) legitimately lack (#228; devkit#2071).
+                changelog-validate = {
+                  enable = true;
+                  entry = "node scripts/check-changelog-structure.mjs CHANGELOG.md";
+                  language = "system";
+                  files = "^CHANGELOG\\.md$";
+                  pass_filenames = false;
+                };
+                # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
+                # changes for tokens, keys and cookies. `git --staged`
+                # is the current-generation subcommand (`gitleaks protect`
+                # is deprecated). `--redact` keeps a false-positive on a
+                # public value from being leaked twice; `-v` names the
+                # file each finding came from.
+                gitleaks = {
+                  enable = true;
+                  entry = "gitleaks git --staged --redact -v";
+                  language = "system";
+                  pass_filenames = false;
+                };
+              };
 
             # Opt-in: let the flake GENERATE .pre-commit-config.yaml from the
             # shared base hook set instead of hand-managing the scaffolded
@@ -237,6 +409,63 @@
         # Future (upstream, opt-in): vigos may expose modular language shells —
         # e.g. `vigos.devShells.${system}.{cpp,geant4,dataAnalysis}` — that you
         # select without changing this scaffold. Out of scope today.
+
+        # revkit packages (D1 / ADR-0010 / M5). `nix build .#revkit` produces
+        # a reproducible `bin/revkit` that runs `--help`, `check` and `serve`
+        # outside the repo. `packages.default` points at the same drv so
+        # `nix build` and `nix run` work without an attribute name.
+        #
+        # Exposed ONLY for systems whose FOD deps hash is captured in
+        # `nodeModulesHashes` above (x86_64-linux, aarch64-linux,
+        # aarch64-darwin). On other systems (x86_64-darwin today), `nix
+        # build .#revkit` fails at eval with an "attribute missing"
+        # error rather than at build time with a mismatched hash.
       }
-    );
+      // nixpkgs.lib.optionalAttrs (builtins.elem system supportedSystems) {
+        packages = {
+          revkit = revkitPkg;
+          default = revkitPkg;
+        };
+
+        # `nix run .#revkit -- <args>` runs the CLI without a repo checkout
+        # (nix downloads the flake, builds `packages.revkit`, invokes the
+        # wrapper). Idiomatic per the flake schema.
+        apps.revkit = {
+          type = "app";
+          program = "${revkitPkg}/bin/revkit";
+        };
+      }
+    ))
+    //
+      # System-independent outputs (lib.hooks, templates.default).
+      {
+        lib = revkitLib;
+
+        templates.default = {
+          path = ./templates/default;
+          description = "Minimal revkit docs repo — a docs/ example, vocab, revkit-check hook, and a flake consuming revkit.packages.";
+          welcomeText = ''
+            # Welcome to revkit
+
+            A minimal revkit docs repo has been scaffolded here.
+
+            Three commands to review your docs locally:
+
+              direnv allow      # or: nix develop
+              revkit check      # run the ADR-0005 authoring guards
+              revkit build      # render docs/ through the packaged site
+              revkit serve      # boot the review daemon on 127.0.0.1
+
+            `revkit build` writes rendered HTML to `.revkit/dist/`; caches
+            (astro + vite) go under `.revkit/cache/`. `revkit serve` mounts
+            the rail (ADR-0006, 0007, 0013) on every page. If `.revkit/dist/`
+            is missing, `revkit serve` builds first.
+
+            `nix build` runs `revkit check` inside a sandboxed docs
+            derivation — a second, stricter pass CI can gate on.
+
+            Docs: https://github.com/vig-os/revkit
+          '';
+        };
+      };
 }

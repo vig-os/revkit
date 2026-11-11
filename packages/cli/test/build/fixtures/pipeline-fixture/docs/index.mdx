@@ -1,0 +1,36 @@
+---
+title: Pipeline Fixture Index
+description: A stable input for the packaged-build digest test.
+---
+
+import { Callout } from "@revkit/components";
+
+## First heading
+
+The first paragraph of the fixture. It has enough text to stamp a
+`data-src` anchor with a stable line range.
+
+## Second heading
+
+A paragraph with a [link to the sub page](./sub/overview.md) and
+some **bold** and *italic* text.
+
+<Callout kind="info">
+A callout for the pipeline. Its inner paragraph gets its own
+`data-src` anchor, so a plugin mutation that shifted line numbers
+would flip this test.
+</Callout>
+
+## A list
+
+- one
+- two
+- three
+
+## A code block
+
+```ts
+export function example(): number {
+  return 42;
+}
+```

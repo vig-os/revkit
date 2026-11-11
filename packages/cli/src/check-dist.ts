@@ -1,0 +1,779 @@
+// `revkit check-dist <dir>` — output-gate sanitiser, ADR-0012 defence
+// in depth. Parses every built HTML with **parse5** — the WHATWG
+// spec-compliant tree-construction implementation browsers use.
+// Round-4 review closed the linkedom differential this used to
+// depend on: linkedom parses `<title>` inside `<svg>` as RCDATA, so
+// `<svg><title><img onerror=…></title></svg>` slipped past a
+// linkedom-based scan, but Chromium (and parse5) parse SVG > title as
+// foreign content — the inner `<img>` is a real element and fires
+// on load. Walking the parse5 tree closes the class.
+//
+// The check remains an allowlist: only element / attribute / rel
+// tokens the current Starlight + Astro + KaTeX + Vega-Lite build
+// emits pass. `dist-check-allowlist.json` is the enumerated set.
+// SVG element / attribute allowlist reuses the source-side
+// sanitiser's exports so a single source of truth governs both
+// build-time sanitisation and check-dist.
+
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
+import { extname, join, relative } from "node:path";
+import { parse as parse5Parse } from "parse5";
+import type { Diagnostic } from "./diagnostics.ts";
+import ALLOWLIST_JSON from "./dist-check-allowlist.json" with { type: "json" };
+import { parseDataSrc } from "./data-src-format.ts";
+import {
+  ALLOWED_SVG_ATTRIBUTES,
+  ALLOWED_SVG_ELEMENTS,
+  URL_BEARING_SVG_ATTRIBUTES,
+} from "../../../site/src/lib/render-plot.ts";
+import {
+  scanCssForUrlRefs,
+  svgHrefRefusalReason,
+} from "../../../site/src/lib/css-url-scan.ts";
+
+/** Shape of the shipped allowlist. */
+interface ElementEntry {
+  readonly attrs: readonly string[];
+  readonly attrConstraints?: Readonly<Record<string, readonly string[]>>;
+}
+
+interface AllowlistShape {
+  readonly globalAttrs: readonly string[];
+  readonly elements: Readonly<Record<string, ElementEntry>>;
+  readonly customElements: Readonly<Record<string, ElementEntry>>;
+  readonly refusedElements: readonly string[];
+  readonly sha256: Readonly<Record<string, string>>;
+}
+
+const ALLOWLIST = ALLOWLIST_JSON as unknown as AllowlistShape;
+const ALLOWED_HASHES: ReadonlySet<string> = new Set(Object.keys(ALLOWLIST.sha256));
+const REFUSED_ELEMENTS: ReadonlySet<string> = new Set(
+  ALLOWLIST.refusedElements.map((tag) => tag.toLowerCase()),
+);
+const GLOBAL_ATTR_NAMES: ReadonlySet<string> = new Set(
+  ALLOWLIST.globalAttrs
+    .filter((name) => !name.endsWith("*"))
+    .map((name) => name.toLowerCase()),
+);
+
+/** Every script src must start with `/_astro/` (Astro's chunk dir). */
+const ALLOWED_SCRIPT_SRC_PREFIX = "/_astro/";
+
+/** URL attributes the DOM walk scheme-checks. */
+const URL_ATTRS_HTML: ReadonlySet<string> = new Set([
+  "href",
+  "src",
+  "srcset",
+  "action",
+  "formaction",
+  "poster",
+  "background",
+  "cite",
+  "usemap",
+  "manifest",
+  "longdesc",
+  "classid",
+  "codebase",
+  "data",
+]);
+
+/** URL schemes that a NAVIGATION (anchor) URL may carry. Fetching
+ * URL attrs (`src`, `srcset`, `href` on `<link>`, `<script>`,
+ * `<img>`, `<source>`, `<video>`, `<audio>`) require same-origin —
+ * an external URL there would be a subresource fetch the security
+ * model refuses. Navigation attrs (`<a href>`) accept `mailto:` /
+ * `tel:` / http(s):. */
+const NAVIGATION_ALLOWED_SCHEMES: ReadonlySet<string> = new Set([
+  "http:",
+  "https:",
+  "mailto:",
+  "tel:",
+]);
+
+/** Element tags whose `src` / `srcset` attributes MUST resolve
+ * same-origin — a subresource fetch to an external host is refused
+ * regardless of scheme. `<a>` is intentionally NOT here (a link is
+ * navigation, not a fetch). `<link>` is handled specially by
+ * `linkElementFindings`. */
+const FETCH_TAGS_SAME_ORIGIN: ReadonlySet<string> = new Set([
+  "audio",
+  "img",
+  "picture",
+  "script",
+  "source",
+  "track",
+  "video",
+]);
+
+/** `<link>` rel tokens that fetch a subresource — if ANY of these
+ * appears in `rel="..."` the href MUST be same-origin, regardless of
+ * whether a metadata token also appears (round-4 review:
+ * `rel="stylesheet canonical"` slipped through the metadata-first
+ * check). */
+const FETCHING_RELS: ReadonlySet<string> = new Set([
+  "apple-touch-icon",
+  "icon",
+  "manifest",
+  "mask-icon",
+  "modulepreload",
+  "preload",
+  "prefetch",
+  "shortcut",
+  "stylesheet",
+]);
+
+/** `<link>` rel tokens whose href is metadata (canonical, alternate,
+ * sitemap URL). Absolute URLs pass IFF no fetching rel is present. */
+const METADATA_LINK_RELS: ReadonlySet<string> = new Set([
+  "alternate",
+  "canonical",
+  "sitemap",
+]);
+
+// CSS URL handling moved to `scanCssForUrlRefs` (site/src/lib/
+// css-url-scan.ts) — the round-1 substring-plus-unescape pass had
+// three bypass classes closed structurally by a real CSS Syntax
+// Level 3 tokenizer (`css-tree`): unterminated `url(https://…` (no
+// closing `)`), `url(https://…/*)` (fake `*/` end that the pre-pass
+// cssUnescape stripped but CSS wouldn't), and `u\rl(` / `\75 rl(`
+// classified as Function tokens whose name resolves to `url`. See
+// css-url-scan.ts's header for the failure cases the tokenizer
+// closes.
+
+interface Attribute {
+  readonly name: string;
+  readonly value: string;
+  readonly prefix?: string;
+  readonly namespace?: string;
+}
+
+/** parse5 splits a namespaced attribute (`xmlns:xlink`,
+ * `xlink:href`) into `prefix` + `name`. Reconstruct the qualified
+ * name for comparison against our lowercase allowlist entries. */
+function qualifiedAttrName(attr: Attribute): string {
+  return attr.prefix ? `${attr.prefix}:${attr.name}` : attr.name;
+}
+
+interface ParseTreeNode {
+  readonly nodeName: string;
+  readonly tagName?: string;
+  readonly namespaceURI?: string;
+  readonly attrs?: readonly Attribute[];
+  readonly childNodes?: readonly ParseTreeNode[];
+  readonly value?: string;
+  readonly content?: ParseTreeNode; // template content
+}
+
+interface CheckDistFinding {
+  readonly file: string;
+  readonly message: string;
+}
+
+/** Namespace URIs parse5 emits. */
+const SVG_NS = "http://www.w3.org/2000/svg";
+const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
+
+/** Is `tagName` a custom element (contains a hyphen)? Per HTML spec,
+ * a valid custom element name has at least one `-`. */
+function isCustomElementTag(tagName: string): boolean {
+  return tagName.includes("-") && /^[a-z]/.test(tagName);
+}
+
+/** Attribute-name predicates: `data-*` and `aria-*` are wildcards. */
+function isDataAttr(name: string): boolean { return name.startsWith("data-"); }
+function isAriaAttr(name: string): boolean { return name.startsWith("aria-"); }
+
+/** Decode HTML numeric character references and strip ASCII
+ * whitespace + control characters — matches url-scheme.ts's URL
+ * normalization so a `&#106;avascript:` on an href is refused here
+ * too. */
+function decodeAndStripUrl(input: string): string {
+  const decoded = input.replace(/&#(?:x([0-9a-fA-F]+)|(\d+));?/g, (_all, hex, dec) => {
+    const cp = hex !== undefined ? Number.parseInt(hex, 16) : Number.parseInt(dec, 10);
+    if (!Number.isFinite(cp) || cp < 0 || cp > 0x10FFFF) return "";
+    try { return String.fromCodePoint(cp); } catch { return ""; }
+  });
+  return decoded.replace(/[\t\n\r\f\v\u0000-\u001F\u007F ]/g, "");
+}
+
+/** URL scheme check on an HTML attribute value. Fetching URL attrs
+ * (per `FETCH_TAGS_SAME_ORIGIN`) require same-origin — a subresource
+ * fetch to an external host is refused regardless of scheme. */
+function isAllowedUrl(
+  value: string,
+  tagName: string,
+  attrName: string,
+  requireSameOrigin: boolean = false,
+): boolean {
+  const decoded = decodeAndStripUrl(value).toLowerCase();
+  if (decoded.length === 0) return true;
+  if (decoded.startsWith("#")) return true;
+  if (decoded.startsWith("//")) return false;
+  if (decoded.startsWith("/")) return true;
+  const firstColon = decoded.indexOf(":");
+  const firstSlash = decoded.indexOf("/");
+  if (firstColon === -1) return true;
+  if (firstSlash !== -1 && firstSlash < firstColon) return true;
+  const scheme = decoded.slice(0, firstColon + 1);
+  if (scheme === "data:" && tagName === "img" && attrName === "src") {
+    return /^data:image\//.test(decoded);
+  }
+  const isFetchTag = FETCH_TAGS_SAME_ORIGIN.has(tagName);
+  if (requireSameOrigin || isFetchTag) return false;
+  return NAVIGATION_ALLOWED_SCHEMES.has(scheme);
+}
+
+/** Split a `srcset` value into candidate URLs and check each. Splits
+ * on commas that separate candidates (following the img srcset
+ * grammar loosely — any comma outside a `url()` counts). */
+function srcsetFindings(
+  tagName: string,
+  value: string,
+  reportPath: string,
+): CheckDistFinding[] {
+  const findings: CheckDistFinding[] = [];
+  for (const raw of value.split(",")) {
+    const candidate = raw.trim();
+    if (candidate.length === 0) continue;
+    // First whitespace-separated token is the URL; the rest is a
+    // descriptor (density / width). Ignore the descriptor.
+    const url = candidate.split(/\s+/)[0] ?? "";
+    if (!isAllowedUrl(url, tagName, "srcset")) {
+      findings.push({
+        file: reportPath,
+        message: `refused srcset candidate <${tagName} srcset=… ${JSON.stringify(url)}> — refused scheme or off-site.`,
+      });
+    }
+  }
+  return findings;
+}
+
+/** Percent-decode `input` repeatedly until stable — a nested
+ * encoding like `%252e%252e` (double-encoded `..`) survives one
+ * `decodeURIComponent` pass. Refuses invalid encodings by throwing;
+ * a bounded loop keeps a pathological input from spinning. Round-5
+ * review: `/_astro/%2e%2e/evil.js` decodes to `/_astro/../evil.js`,
+ * which would then have to fail the `..`-segment check. */
+export function decodeUntilStable(input: string, maxRounds: number = 8): string {
+  let current = input;
+  for (let i = 0; i < maxRounds; i += 1) {
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      throw new Error(`invalid percent-encoding in ${JSON.stringify(input)}`);
+    }
+    if (next === current) return next;
+    current = next;
+  }
+  throw new Error(`percent-encoding did not stabilise after ${maxRounds} rounds in ${JSON.stringify(input)}`);
+}
+
+/** Script src path normalization: refuse `..` segments (a `..` in
+ * `/_astro/../evil.js` would still start with the allowed prefix
+ * but escape the chunk directory at request time). Percent-decode
+ * first so `%2e%2e` and `%252e%252e` (nested) are also caught. */
+function scriptSrcRefusal(src: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeUntilStable(src);
+  } catch (error) {
+    return `refused <script src=${JSON.stringify(src)}> — ${(error as Error).message}.`;
+  }
+  if (!decoded.startsWith(ALLOWED_SCRIPT_SRC_PREFIX)) {
+    return `refused <script src=${JSON.stringify(src)}> — script sources must be under ${JSON.stringify(ALLOWED_SCRIPT_SRC_PREFIX)} (decoded: ${JSON.stringify(decoded)}).`;
+  }
+  const segments = decoded.split("/");
+  if (segments.some((s) => s === "..")) {
+    return `refused <script src=${JSON.stringify(src)}> — path traversal (\`..\`) inside script src (decoded: ${JSON.stringify(decoded)}).`;
+  }
+  return null;
+}
+
+/** Compute the SHA-256 hex digest of `text`. */
+export function sha256Hex(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/** Walk `dir` recursively for `.html` files. */
+export function walkHtml(dir: string): string[] {
+  const out: string[] = [];
+  const stack: string[] = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) stack.push(path);
+      else if (entry.isFile() && extname(entry.name).toLowerCase() === ".html") {
+        out.push(path);
+      }
+    }
+  }
+  return out.sort();
+}
+
+/** Return true when `attrName` is allowed on `<tagName>` (given the
+ * per-element entry). Global attrs, wildcards, and SVG allowlist
+ * inclusion pass. */
+function isAttrAllowed(
+  tagName: string,
+  attrName: string,
+  entry: ElementEntry | undefined,
+  isSvg: boolean,
+): boolean {
+  const lower = attrName.toLowerCase();
+  if (isDataAttr(lower) || isAriaAttr(lower)) return true;
+  if (GLOBAL_ATTR_NAMES.has(lower)) return true;
+  if (entry !== undefined && entry.attrs.some((a) => a.toLowerCase() === lower)) return true;
+  if (isSvg && ALLOWED_SVG_ATTRIBUTES.has(lower)) return true;
+  return false;
+}
+
+/** Attribute value constraint check. */
+function attrValueConstraintFinding(
+  tagName: string,
+  attrName: string,
+  value: string,
+  entry: ElementEntry | undefined,
+): string | null {
+  const constraints = entry?.attrConstraints;
+  if (!constraints) return null;
+  const lower = attrName.toLowerCase();
+  const allowed = constraints[lower];
+  if (!allowed) return null;
+  const tokens = value.trim().toLowerCase().split(/\s+/).filter((t) => t.length > 0);
+  const bad = tokens.filter((t) => !allowed.includes(t));
+  if (bad.length === 0) return null;
+  return `<${tagName} ${attrName}=${JSON.stringify(value)}> — value(s) [${bad.join(", ")}] not on allowlist [${allowed.join(", ")}].`;
+}
+
+/** `style` attribute value check — walks the CSS Level 3 token
+ * stream (`scanCssForUrlRefs`, allowFragmentUrl=false) and refuses
+ * every URL-shaped construct. Matches the source sanitiser's
+ * decision (render-plot.ts) to drop `style=` entirely on SVG; on
+ * ordinary HTML KaTeX/Starlight `style="height:1em"` shapes pass
+ * because they carry no URL-shaped token. */
+function styleAttrFindings(tagName: string, value: string): string[] {
+  return scanCssForUrlRefs(value, { allowFragmentUrl: false })
+    .map((finding) => `style attribute on <${tagName}> — ${finding}.`);
+}
+
+/** SVG presentation attribute value check — same tokenizer as
+ * `style`, but same-document `url(#id)` refs are allowed (Vega
+ * emits `<rect fill="url(#gradient1)"/>` for gradient / clip / mask
+ * fills). Refuses `url(https://…)`, `url(//…)`, `url(data:…)`,
+ * CSS-escaped / mixed-case / whitespace-padded / unterminated
+ * variants, plus the shared non-URL denylist. Issue #27. */
+function svgPresentationAttrFindings(
+  tagName: string,
+  attrName: string,
+  value: string,
+): string[] {
+  return scanCssForUrlRefs(value, { allowFragmentUrl: true })
+    .map((finding) => `<${tagName} ${attrName}=${JSON.stringify(value)}> — ${finding}.`);
+}
+
+// The round-3 reviewer note dropped the `SVG_HREF_ELEMENTS` subset:
+// the fragment-only rule for `href` / `xlink:href` is now applied
+// inside the attribute walk itself on EVERY SVG element (matching
+// the source sanitiser's `keepAttribute` in render-plot.ts), so
+// `<tspan href>`, `<rect href>` and `<svg xlink:href="https://…">`
+// refuse alongside the element types listed in the previous round.
+// The predicate lives in `svgHrefRefusalReason` (css-url-scan.ts),
+// shared between the source sanitiser and this file — one function,
+// one list of behaviours to reason about.
+
+/** `<link>` policy handler. Rule of thumb: if `rel` contains ANY
+ * fetching token, href must be same-origin (round-4 review closes the
+ * `stylesheet canonical` bypass). */
+function linkElementFindings(link: ParseTreeNode, findings: CheckDistFinding[], reportPath: string): void {
+  const attrs = link.attrs ?? [];
+  const rel = getAttr(attrs, "rel").toLowerCase();
+  const href = getAttr(attrs, "href");
+  if (href.length === 0) return;
+  const tokens = rel.split(/\s+/).filter((t) => t.length > 0);
+  const anyFetching = tokens.some((t) => FETCHING_RELS.has(t));
+  const decoded = decodeAndStripUrl(href).toLowerCase();
+  if (decoded.startsWith("javascript:") || decoded.startsWith("vbscript:") || decoded.startsWith("data:")) {
+    findings.push({
+      file: reportPath,
+      message: `refused <link rel=${JSON.stringify(rel)} href=${JSON.stringify(href)}> — refused scheme.`,
+    });
+    return;
+  }
+  if (anyFetching) {
+    if (!isAllowedUrl(href, "link", "href", /* requireSameOrigin */ true)) {
+      findings.push({
+        file: reportPath,
+        message: `refused <link rel=${JSON.stringify(rel)} href=${JSON.stringify(href)}> — a fetching rel token requires same-origin href (round-4 rel-mix bypass).`,
+      });
+    }
+    return;
+  }
+  // No fetching token: metadata rels (canonical, alternate, sitemap)
+  // pass with an absolute URL; anything else refuses off-origin.
+  const anyMetadata = tokens.some((t) => METADATA_LINK_RELS.has(t));
+  if (anyMetadata) return;
+  if (!isAllowedUrl(href, "link", "href", /* requireSameOrigin */ true)) {
+    findings.push({
+      file: reportPath,
+      message: `refused <link rel=${JSON.stringify(rel)} href=${JSON.stringify(href)}> — external URL and no metadata rel.`,
+    });
+  }
+}
+
+/** Small helper: get attribute value by lowercase name. */
+function getAttr(attrs: readonly Attribute[], name: string): string {
+  for (const attr of attrs) {
+    if (attr.name.toLowerCase() === name) return attr.value;
+  }
+  return "";
+}
+
+/** Recursively walk a parse5 tree, calling `visit` for every element
+ * (skips document / text / comment nodes). Template `content` is
+ * walked too — a `<template>` body carries live DOM. */
+function forEachElement(node: ParseTreeNode, visit: (el: ParseTreeNode) => void): void {
+  const nn = node.nodeName;
+  if (nn.length > 0 && !nn.startsWith("#") && node.tagName !== undefined) {
+    visit(node);
+  }
+  for (const child of node.childNodes ?? []) forEachElement(child, visit);
+  if (node.content !== undefined) forEachElement(node.content, visit);
+}
+
+/** Scan one parsed document. */
+export function scanDocument(document: ParseTreeNode, reportPath: string): CheckDistFinding[] {
+  const findings: CheckDistFinding[] = [];
+  forEachElement(document, (element) => {
+    const rawTag = element.tagName ?? "";
+    const tagName = rawTag.toLowerCase();
+    const isSvg = element.namespaceURI === SVG_NS;
+    const isMath = element.namespaceURI === MATHML_NS;
+
+    if (REFUSED_ELEMENTS.has(tagName)) {
+      findings.push({
+        file: reportPath,
+        message: `refused element <${tagName}> (on the refusedElements list).`,
+      });
+      return;
+    }
+
+    // Element-allowlist lookup. SVG namespaces defer to
+    // ALLOWED_SVG_ELEMENTS. Custom elements go through their own
+    // registry. Everything else must be in `elements`.
+    let entry: ElementEntry | undefined;
+    if (isSvg) {
+      // parse5 preserves case for SVG (`clipPath`); allowlist is lowercase.
+      if (!ALLOWED_SVG_ELEMENTS.has(tagName)) {
+        findings.push({
+          file: reportPath,
+          message: `refused SVG element <${rawTag}> — not on the SVG allowlist (round-4: foreign-content breakout).`,
+        });
+        return;
+      }
+      // SVG attrs fall through to `isAttrAllowed(..., isSvg=true)`.
+      entry = undefined;
+    } else if (isCustomElementTag(tagName)) {
+      entry = ALLOWLIST.customElements[tagName];
+      if (!entry) {
+        findings.push({
+          file: reportPath,
+          message: `refused custom element <${tagName}> — not on the customElements allowlist.`,
+        });
+        return;
+      }
+    } else {
+      entry = ALLOWLIST.elements[tagName];
+      if (!entry) {
+        // MathML tags that KaTeX emits are enumerated in `elements`
+        // above — anything else in the MathML namespace refuses too.
+        const label = isMath ? "MathML element" : "element";
+        findings.push({
+          file: reportPath,
+          message: `refused ${label} <${tagName}> — not on the elements allowlist.`,
+        });
+        return;
+      }
+    }
+
+    // Attribute walk.
+    for (const attr of element.attrs ?? []) {
+      const attrName = qualifiedAttrName(attr);
+      const attrValue = attr.value;
+      const lower = attrName.toLowerCase();
+
+      if (/^on[a-z]/.test(lower)) {
+        findings.push({
+          file: reportPath,
+          message: `refused attribute '${attrName}' on <${tagName}> (inline event handler).`,
+        });
+        continue;
+      }
+      if (!isAttrAllowed(tagName, attrName, entry, isSvg)) {
+        findings.push({
+          file: reportPath,
+          message: `refused attribute '${attrName}' on <${tagName}> — not on the per-element or global allowlist.`,
+        });
+        continue;
+      }
+      const constraint = attrValueConstraintFinding(tagName, attrName, attrValue, entry);
+      if (constraint !== null) {
+        findings.push({ file: reportPath, message: constraint });
+        continue;
+      }
+      // srcset is per-candidate; other URL attrs go through the
+      // scalar check. `<link>` defers to linkElementFindings.
+      if (tagName !== "link" && URL_ATTRS_HTML.has(lower)) {
+        if (lower === "srcset") {
+          findings.push(...srcsetFindings(tagName, attrValue, reportPath));
+        } else if (!isAllowedUrl(attrValue, tagName, lower)) {
+          findings.push({
+            file: reportPath,
+            message: `refused URL on <${tagName} ${attrName}=${JSON.stringify(attrValue)}> — refused scheme or off-site.`,
+          });
+        }
+      }
+      if (lower === "style") {
+        for (const msg of styleAttrFindings(tagName, attrValue)) {
+          findings.push({ file: reportPath, message: msg });
+        }
+      }
+      // `data-src` value format check — every stamped attribute
+      // must parse to `<repo-relative path>:<startLine>-<endLine>`
+      // with a valid path (no `..`, no absolute prefix, no `:`
+      // in the path, etc). A malformed value would either fail
+      // the rail's parser (a dead anchor) or point at a file
+      // outside the repo (a leaked absolute path in the built
+      // output). PR #38 review.
+      if (lower === "data-src") {
+        if (parseDataSrc(attrValue) === undefined) {
+          findings.push({
+            file: reportPath,
+            message: `<${tagName} data-src=${JSON.stringify(attrValue)}> — value does not parse as '<repo-relative path>:<startLine>-<endLine>'.`,
+          });
+        }
+      }
+      // Issue #27: SVG presentation attributes that can carry
+      // `url(…)` get the same CSS Level 3 token walk the `style`
+      // attribute gets, but same-document `url(#id)` refs are
+      // allowed (Vega uses these for gradient / clip fills). Any
+      // `url(https://…)`, `url(//…)`, `url(data:…)`, escaped or
+      // unterminated variant is refused.
+      if (isSvg && URL_BEARING_SVG_ATTRIBUTES.has(lower)) {
+        for (const msg of svgPresentationAttrFindings(tagName, attrName, attrValue)) {
+          findings.push({ file: reportPath, message: msg });
+        }
+      }
+      // Issue #27 round 3: `href` / `xlink:href` on ANY SVG element
+      // must be a same-document `#ident` fragment. Round-2 restricted
+      // this to a subset of elements via `SVG_HREF_ELEMENTS`, which
+      // let `<tspan href>`, `<rect href>` and `<svg xlink:href>`
+      // through; the source sanitiser (render-plot.ts,
+      // `keepAttribute`) checks href on every element and this file
+      // now matches. Predicate shared via `svgHrefRefusalReason`.
+      if (isSvg && (lower === "href" || lower === "xlink:href")) {
+        const message = svgHrefRefusalReason(attrValue);
+        if (message !== null) {
+          findings.push({
+            file: reportPath,
+            message: `refused <${rawTag} ${attrName}=${JSON.stringify(attrValue)}> — ${message}.`,
+          });
+        }
+      }
+    }
+
+    // Per-tag specials.
+    if (tagName === "link") linkElementFindings(element, findings, reportPath);
+    if (tagName === "script") {
+      const src = getAttr(element.attrs ?? [], "src");
+      if (src.length > 0) {
+        const refusal = scriptSrcRefusal(src);
+        if (refusal !== null) findings.push({ file: reportPath, message: refusal });
+      } else {
+        // Concatenate every text child (parse5 does not merge them).
+        let inline = "";
+        for (const child of element.childNodes ?? []) {
+          if (child.nodeName === "#text" && typeof child.value === "string") inline += child.value;
+        }
+        const hash = sha256Hex(inline);
+        if (!ALLOWED_HASHES.has(hash)) {
+          const excerpt = inline.replace(/\s+/g, " ").trim().slice(0, 80);
+          findings.push({
+            file: reportPath,
+            message: `refused inline <script> (sha256=${hash}); add to packages/cli/src/dist-check-allowlist.json if intended. Excerpt: ${JSON.stringify(excerpt)}.`,
+          });
+        }
+      }
+    }
+    // <meta http-equiv=refresh> is handled by the attrConstraints for
+    // `http-equiv` — the value allowlist excludes `refresh`.
+  });
+  return findings;
+}
+
+/** Options accepted by `checkDistDirectory`. */
+export interface CheckDistOptions {
+  /** Dist-relative page paths (e.g. `"index.html"` or
+   * `"adr/0001-foo/index.html"`) whose source doc had a non-empty body.
+   * When provided, each listed page is additionally checked for a
+   * non-empty content root (`<div class="sl-markdown-content">` or
+   * revkit's equivalent) — defense in depth against the astro glob
+   * loader's silent render-error catch (issue #237).
+   *
+   * Pages absent from this set are not checked, so a frontmatter-only
+   * source doc (empty body) never trips the check. A set with no
+   * entries means no defense-in-depth scan runs. */
+  readonly pagesWithNonEmptySource?: ReadonlySet<string>;
+}
+
+/** Run check over every `.html` file under `distDir`. */
+export function checkDistDirectory(
+  distDir: string,
+  options: CheckDistOptions = {},
+): Diagnostic[] {
+  const findings: Diagnostic[] = [];
+  for (const absolute of walkHtml(distDir)) {
+    const relPath = relative(distDir, absolute);
+    let html: string;
+    try {
+      html = readFileSync(absolute, "utf8");
+    } catch (error) {
+      findings.push({
+        file: relPath,
+        line: 0,
+        rule: "check-dist",
+        message: `cannot read: ${(error as Error).message}`,
+      });
+      continue;
+    }
+    const doc = parse5Parse(html) as unknown as ParseTreeNode;
+    for (const finding of scanDocument(doc, relPath)) {
+      findings.push({
+        file: finding.file,
+        line: 0,
+        rule: "check-dist",
+        message: finding.message,
+      });
+    }
+    if (options.pagesWithNonEmptySource?.has(relPath) === true) {
+      const refusal = emptyContentRootRefusal(doc);
+      if (refusal !== null) {
+        findings.push({
+          file: relPath,
+          line: 0,
+          rule: "check-dist",
+          message:
+            `empty rendered content: source doc has a non-empty body but ` +
+            `${refusal} is empty — the markdown renderer failed silently ` +
+            `(issue #237).`,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
+/** The Starlight content-root class name. `MarkdownContent.astro` wraps
+ * the `<slot />` with this; a page whose rendered markdown is missing
+ * emits an empty `<div class="sl-markdown-content">`. The constant is
+ * exported so the dogfood-site integration test can reference the SAME
+ * marker name. */
+export const CONTENT_ROOT_CLASS = "sl-markdown-content";
+
+/** Inspect the parsed document and, when a Starlight content root is
+ * present but has no non-whitespace content (including no element
+ * children), return a human-readable identifier of the empty container.
+ * Returns `null` when the content root is absent (so a non-Starlight
+ * page is NEVER reported as empty) or when it holds content.
+ *
+ * Exported so a direct unit test can exercise it without the surrounding
+ * directory walk. */
+export function emptyContentRootRefusal(doc: ParseTreeNode): string | null {
+  const root = findFirstElementWithClass(doc, CONTENT_ROOT_CLASS);
+  if (root === null) return null;
+  if (elementHasRenderedContent(root)) return null;
+  return `content root <div class="${CONTENT_ROOT_CLASS}">`;
+}
+
+/** Depth-first search for the first element whose `class` attribute
+ * contains `className` as a whitespace-separated token. */
+function findFirstElementWithClass(
+  node: ParseTreeNode,
+  className: string,
+): ParseTreeNode | null {
+  if (node.tagName !== undefined && elementHasClass(node, className)) {
+    return node;
+  }
+  for (const child of node.childNodes ?? []) {
+    const hit = findFirstElementWithClass(child, className);
+    if (hit !== null) return hit;
+  }
+  if (node.content !== undefined) {
+    const hit = findFirstElementWithClass(node.content, className);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/** True when `element` has `className` on its `class` attribute (as a
+ * whitespace-separated token). */
+function elementHasClass(element: ParseTreeNode, className: string): boolean {
+  for (const attr of element.attrs ?? []) {
+    if (attr.name.toLowerCase() !== "class") continue;
+    const tokens = (attr.value ?? "").split(/\s+/);
+    if (tokens.includes(className)) return true;
+  }
+  return false;
+}
+
+/** True when `element` carries ANY rendered content — a child element,
+ * or a non-whitespace text node. Comment nodes do NOT count. Template
+ * `content` is walked too. */
+function elementHasRenderedContent(element: ParseTreeNode): boolean {
+  for (const child of element.childNodes ?? []) {
+    const name = child.nodeName;
+    if (name.length === 0) continue;
+    if (name === "#text") {
+      if ((child.value ?? "").trim().length > 0) return true;
+      continue;
+    }
+    if (name === "#comment") continue;
+    // Any element-shaped child (parse5 reports those with a non-#
+    // nodeName and a tagName) counts as rendered content.
+    if (child.tagName !== undefined) return true;
+  }
+  if (element.content !== undefined && elementHasRenderedContent(element.content)) {
+    return true;
+  }
+  return false;
+}
+
+/** `--print-hashes` implementation. */
+export function collectInlineScriptHashes(distDir: string): Map<string, { count: number; sample: string }> {
+  const seen = new Map<string, { count: number; sample: string }>();
+  for (const absolute of walkHtml(distDir)) {
+    const doc = parse5Parse(readFileSync(absolute, "utf8")) as unknown as ParseTreeNode;
+    forEachElement(doc, (element) => {
+      if ((element.tagName ?? "").toLowerCase() !== "script") return;
+      const attrs = element.attrs ?? [];
+      if (getAttr(attrs, "src").length > 0) return;
+      let inline = "";
+      for (const child of element.childNodes ?? []) {
+        if (child.nodeName === "#text" && typeof child.value === "string") inline += child.value;
+      }
+      const hash = sha256Hex(inline);
+      const existing = seen.get(hash);
+      if (existing !== undefined) existing.count += 1;
+      else seen.set(hash, { count: 1, sample: inline.slice(0, 100) });
+    });
+  }
+  return seen;
+}

@@ -4,9 +4,32 @@
 # Typos configuration
 # https://github.com/crate-ci/typos
 
+# GraphQL schema fixture recorded from GitHub's public schema
+# (packages/review-core/test/fixtures/github/graphql-schema.graphql).
+# Enum values like `FO`, `PN`, `OL` are GitHub type-code identifiers,
+# not typos. Exclude the whole file so we don't have to enumerate
+# them and re-check on every schema refresh.
+[files]
+extend-exclude = ["packages/review-core/test/fixtures/github/graphql-schema.graphql"]
+
 [default.extend-words]
 # Shell scripting: sed label syntax uses 'ba' (branch to label 'a')
 ba = "ba"
+# Bitap (Wu-Manber) is the real name of the fuzzy string-matching algorithm
+# used by `diff-match-patch`'s `match_main` — cited in the re-anchoring
+# engine (ADR-0006, packages/review-core/src/reanchor.ts). Not a typo of
+# "bitmap".
+bitap = "bitap"
+Bitap = "Bitap"
+BITAP = "BITAP"
+# Truncated DMP opcode names ("INSERTs", "DELETEs") — typos strips the
+# lowercase plural suffix and reports the truncated stem. Not typos.
+INSER = "INSER"
+DELET = "DELET"
+# `teh` in the round-5 B5 fixture is a deliberate typo — the fixture
+# tests that fixing `teh` → `the` next to a quote lets the pipeline
+# re-anchor. Not a typo of `the`.
+teh = "teh"
 # CVE policy term (#637): a finding "unexcepted" = not in the exception register
 unexcepted = "unexcepted"
 # version-check.sh duration placeholder (#759): 'Nd' = N days (cf. Nw/Nh/Nm)
@@ -21,3 +44,9 @@ passt = "passt"
 tatus = "tatus"
 fnd = "fnd"
 mis = "mis"
+# npm package name in the recorded PR-38 file listing under
+# packages/review-core/test/fixtures/github/ (a bun.lock excerpt);
+# `devlop` is the actual published package name, not a typo of
+# `develop`. Kept as an extend-word rather than an exclusion so any
+# prose typo elsewhere in the fixture directory is still caught.
+devlop = "devlop"

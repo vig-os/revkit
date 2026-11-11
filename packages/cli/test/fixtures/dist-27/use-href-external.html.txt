@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused SVG <use href=https://…> -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><use href="https://evil.example/lib.svg#g"/></svg>
+</body>
+</html>

@@ -1,0 +1,7 @@
+{
+  "name": "revkit-docs",
+  "private": true,
+  "description": "A minimal revkit docs repo, scaffolded by `nix flake init -t github:vig-os/revkit`.",
+  "license": "Apache-2.0",
+  "revkit": {}
+}

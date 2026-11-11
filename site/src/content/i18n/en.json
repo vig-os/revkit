@@ -1,0 +1,4 @@
+{
+  "$schema": "https://starlight.astro.build/reference/frontmatter/#i18n",
+  "site.title": "revkit"
+}

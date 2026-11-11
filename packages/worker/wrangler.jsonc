@@ -1,0 +1,107 @@
+// wrangler configuration for the hosted revkit Worker (ADR-0008, M4
+// slice 1; comments updated for slice 2 / issue #9).
+//
+// This file is written to be DEPLOYABLE-READY and NOT-YET-DEPLOYED.
+// There is no `account_id`, no `routes`, no custom domain and no secret,
+// because every one of those is owner-gated (#34) and none of them is
+// needed to build, test or run the Worker. `packages/worker/test/`
+// asserts that absence rather than trusting this comment.
+//
+// **`compatibility_flags: []` is load-bearing.** With `nodejs_compat` OFF,
+// the platform itself refuses `node:*` imports and does not provide
+// `Buffer`, `process` or `require`. That turns ADR-0025's "no Node-only
+// deps in the shared core" from a lint into a runtime fact: a regression
+// goes red on the FIRST test that touches the affected path, in workerd,
+// rather than in production. Measured on miniflare 4.20260518.0 with an
+// empty flag list: `typeof Buffer === "undefined"`, same for `process`
+// and `require`. That measurement is also why
+// `@revkit/review-core/http-headers` encodes CSP hashes without `Buffer`.
+//
+// `workers_dev: false` is the other load-bearing line, and it is a
+// TRIPWIRE, NOT AN AUTHORIZATION CHECK.
+//
+// What it does: with no `routes` either, this Worker has no public URL, so
+// a mistake in the handler is not immediately reachable at
+// `*.workers.dev`.
+//
+// What it does NOT do, stated plainly because the first draft of this
+// comment implied otherwise:
+//
+//   - It is not authorization, and it never was. Slice 2 DID add
+//     authorization — ADR-0012's per-request gate in `src/authz.ts`, which
+//     resolves the session cookie by digest against D1 and refuses an
+//     expired, forged, incomplete or unrecognised one — and this line had
+//     no part in it. The gate is the control; this line is a tripwire that
+//     evaporates the moment slice 3 or slice 5 adds a `routes` entry, and it
+//     never applied to `wrangler dev --remote`, which ignores it.
+//   - It is not scope, either. The gate answers "is this a session this
+//     build issued, unexpired"; it does not answer "does this caller have
+//     access to this repo", because no invite and no App exist yet. See the
+//     ADR-0012 amendment dated 2026-10-04 for which of ADR-0012's clauses
+//     are satisfied and which are not.
+//
+// So treat flipping either line as a security-relevant change requiring a
+// fresh argument, not a config tidy-up.
+//
+// `INVITE_TOKEN_HMAC_KEY` is NOT here, and its absence is load-bearing. It is
+// a Worker SECRET (`wrangler secret put INVITE_TOKEN_HMAC_KEY`, provisioned by
+// `revkit deploy init` — slice 8, owner-gated #34), never a `vars` entry: a
+// `vars` value lives in this tracked file, and ADR-0014's first rule is that no
+// secret does. `test/worker-config.test.ts` asserts this file names the binding
+// and declares no value for it. A deployment missing it answers 500 on every
+// route, deliberately — see `src/invite-token.ts` for why there is no fallback
+// key.
+//
+// `d1_databases[].database_id` is a PLACEHOLDER. Provisioning is
+// `wrangler d1 create`, which needs an account, so `revkit deploy init`
+// replaces this value with the provisioned id. It is deliberately an
+// obvious placeholder rather than a plausible-looking UUID: a fake id
+// that reads like a real one would let a deploy fail confusingly later.
+// The BINDING NAME is not a placeholder — `env.DB` is what the code binds
+// and the test asserts the name.
+//
+// `r2_buckets` is the PREVIEW surface's binding, and it is the only R2
+// this Worker declares. Three things about it are load-bearing:
+//
+//   - The BINDING NAME `PREVIEWS` is what `src/index.ts` reads
+//     (`env.PREVIEWS.get`), and `test/worker-config.test.ts` asserts it,
+//     so a rename here is a compile error in the deployed Worker rather
+//     than a 500 discovered by a reviewer.
+//   - `bucket_name` is a NAME, not an id, so there is no placeholder
+//     value to invent — but **no bucket with this name has been
+//     created.** Provisioning is `wrangler r2 bucket create`, which
+//     needs an account, and it is out of scope for the slice that added
+//     the read path. Nothing in this Worker WRITES to it: the upload side
+//     (CI publishing a PR-head build, and the credential that could) is
+//     tracked separately, so this declaration says "this is the bucket
+//     this Worker will read", and a deployment whose bucket is empty
+//     answers 404 on every preview path — which is the honest answer for
+//     a review nothing has been built for.
+//   - ADR-0012's guarantee does not depend on the bucket's contents being
+//     well-behaved: the response's `Content-Type` is derived from the
+//     REQUEST PATH's extension against `src/preview-assets.ts`, never
+//     from the object's `httpMetadata`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "revkit-review",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-18",
+  "compatibility_flags": [],
+  "workers_dev": false,
+  "vars": {
+    "REVKIT_VERSION": "0.1.0"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "revkit-review",
+      "database_id": "PLACEHOLDER_REPLACED_BY_REVKIT_DEPLOY_INIT"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PREVIEWS",
+      "bucket_name": "revkit-previews"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+# revkit daemon state — never commit. `revkit serve` writes its port
+# handshake, threads sqlite and event log under `.revkit/`.
+.revkit/
+
+# Nix build artefacts.
+result
+result-*
+
+# Local direnv state.
+.direnv/

@@ -24,21 +24,32 @@ info:
 # CODE QUALITY
 # -------------------------------------------------------------------------------
 
-# The uv-backed recipes below are guarded on pyproject.toml so they stay safe in
-# a non-Python repo — but they REPORT the skip instead of no-oping in silence: a
-# repo that lost its pyproject.toml used to run nothing, print nothing and exit 0
-# (#1478). Whether the skip is legitimate is asserted once in CI, against the
-# languages this repo declares in .vig-os (DEVKIT_LANGUAGES).
+# revkit is a Bun workspace (ADR-0001); the recipes below wrap `bun` / `astro`
+# / `playwright` from the flake dev shell. They are guarded on package.json so
+# they REPORT the skip instead of no-oping in silence — matching devkit's own
+# language-neutral guard style — but do not assume Python tooling is present.
 
-# Run all linters
+# Run TypeScript / Astro type checks across the workspace: `astro check` in
+# site, then the `typecheck` script of every packages/* member that defines
+# one, so a new package joins without a recipe edit.
 [group('quality')]
 lint:
-    @if [ -f pyproject.toml ]; then uv run ruff check .; else echo "just lint: no pyproject.toml — skipping"; fi
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f package.json ]; then echo "just lint: no package.json — skipping"; exit 0; fi
+    (cd site && bun run check)
+    for manifest in packages/*/package.json; do
+      if jq -e '.scripts.typecheck' "$manifest" >/dev/null; then
+        (cd "$(dirname "$manifest")" && bun run typecheck)
+      fi
+    done
 
-# Format code
+# Format source (Biome is not wired in M1 — the guardrails hooks enforce the
+# rules that matter here; add Biome in the next PR if a veto reviewer wants
+# it, so this scaffold PR stays lean). Kept as a no-op with a clear message.
 [group('quality')]
 format:
-    @if [ -f pyproject.toml ]; then uv run ruff format .; else echo "just format: no pyproject.toml — skipping"; fi
+    @echo "just format: no formatter wired yet (see PR #6 body for the choice-for-veto)"
 
 # Run pre-commit hooks on all files
 [group('quality')]
@@ -49,70 +60,735 @@ precommit:
 # TESTING
 # -------------------------------------------------------------------------------
 
-# Run tests with pytest. Exit 5 ("no tests collected") is a no-op ONLY while the
-# repo has no tests/ directory — a fresh scaffold. Once a test directory exists,
-# zero collected is a signal, not a no-op, so it propagates (#1281 narrowed by
-# #1478).
+# Run unit tests (bun test) in each package that has them, then `revkit
+# check` over the whole repo (ADR-0005 M1 item 4), then the site's
+# Playwright smoke. Bun test runs per-package rather than at the workspace
+# root because it would otherwise walk `site/tests/*.spec.ts` — which are
+# Playwright specs and refuse to load in bun test. The site's own bun tests
+# live under `src/content/schemas/` (outside the Playwright testDir) so both
+# runners coexist without a collision. Playwright's own suite builds the
+# site once and runs Chromium; WebKit is opt-in via REVKIT_ENABLE_WEBKIT=1
+# (see site/playwright.config.ts) pending #19. `revkit check` runs
+# `--online` when GITHUB_TOKEN is exported (CI test lane does not export
+# it today; the offline pass still validates every allow annotation's
+# shape).
+#
+# Every leg below is instrumented because of issue #74, which saw the CI
+# Tests job hang ~18 min in `test/serve/asks-http.test.ts` and die at the
+# 20-minute ceiling with nothing but a group header in the log — the single
+# most expensive possible failure mode, since it burns 20 minutes of a
+# runner to learn nothing. `.github/workflows/ci.yml` is devkit-managed and
+# calls `just test` (ci.yml:282), so every guard lives HERE, in a
+# consumer-owned file.
+#
+# Four instruments, each covering a gap the others cannot:
+#
+#   1. WHICH RUNTIME. Prints `bun --version` and its resolved path first.
+#      This was added on the belief that CI tests a different bun than the
+#      dev shell does, and the first CI run of this PR DISPROVED that: the
+#      log shows the same `bun 1.3.13` at the same nix store path locally
+#      and on the runner. So the runtimes match today.
+#      The line stays because that is a fact worth having in the log rather
+#      than in someone's head — it is exactly the premise that had to be
+#      checked, this repo already carries behaviour pinned to 1.3.13 (the
+#      #49 watcher bug), and "the image was rebuilt" or "the pin moved" is
+#      one `flake.lock` bump away from being true again. Cheap to print,
+#      and it settles the question by observation instead of by argument.
+#
+#   2. FD BUDGET. Every `startDaemon` leaks 2 descriptors on bun 1.3.13
+#      (Bun's `fs.watch(...).close()` does not free the fd; cross-checked
+#      against node v24.21.0, which does not leak). Measured `packages/cli`
+#      peak: 4449 local, 4687 on CI (run 37117007176; 4682 in 37117515667).
+#
+#      The `ulimit -n` below is belt-and-braces and WEAK, and it is worth
+#      being exact about why, because the first version of this comment
+#      overstated it. It only helps when the soft limit is low AND the hard
+#      limit is already high enough to permit the raise: simulated with
+#      `prlimit --nofile=1024:1024`, the `if !` guard catches the refusal,
+#      warns, and the suite carries on at 1024 — where it would still die of
+#      `EMFILE`. So it rescues the soft-low/hard-high case and nothing else.
+#      On CI it is a NO-OP: that runner's default was already 65536, exactly
+#      the value we set.
+#
+#      What actually protects CI is the fd check in instrument 3, and even
+#      that needs honest scope. See `test_fd_delta_budget_*` for why it is
+#      split into an absolute ceiling and a growth delta: the ~3.4k of
+#      fixed module-load descriptors swamp the ~1.1k leak component, so a
+#      ceiling tight enough to catch the first doubling of the leak is
+#      impossible against the raw total. Neither of these fixes the leak — the fds are
+#      Bun's to leak and revkit's teardown is already correct.
+#
+#   3. WALL-CLOCK AND FD BOUNDS. `timeout --signal=ABRT` per leg, so a stall
+#      is a red leg that names itself instead of a cancelled job. Be precise
+#      about what that buys: bun emits NO JS stack for a blocked event loop
+#      (verified on 1.3.13 — ABRT just dumps core), so the bound does not
+#      produce a trace. What it does produce is the leg label, the budget
+#      it blew, and — on a runtime that emits them — the test file bun had
+#      reached. That is the difference between 20 wasted minutes and one
+#      red line.
+#      Budgets come from measurement (see the per-leg comment) with enough
+#      headroom for a healthy CI run (measured: 7m33s for the whole job)
+#      that the bound ALWAYS fires before the workflow's own 20-minute
+#      `timeout-minutes` — a bound that could lose the race to GitHub's
+#      cancellation would be worthless.
+#
+#      `run_leg` reports exit 124 and exit 137 DIFFERENTLY, on purpose. 124
+#      is `timeout` firing: a genuine stall. 137 is the process being
+#      SIGKILLed — with `--kill-after` that means it ignored the grace
+#      period, and from outside it is indistinguishable from the OOM killer.
+#      Reporting a SIGKILL as a hang would be precisely the
+#      misleading-failure-mode this instrumentation exists to remove.
+#
+#   4. `bun --timeout`. Raised from the 5s default to 10s, and the reason is
+#      the SLOW tail, not hang latency. Measured over the full `packages/cli`
+#      suite (1349 tests, junit timings): the slowest single test is 6067ms
+#      and 3 of 1349 exceed the 5s default. CI's own run peaked lower
+#      (4625ms, none over 5s), but CI is not the environment that has to
+#      pass — a contributor on a slower box is. So 10s: 1.65x the worst
+#      single test observed anywhere, 2x the old default.
+#      Be clear about the trade, because it is a real one: any value above
+#      5s makes a hung `await` take LONGER to surface. That is accepted,
+#      because the default was already firing on legitimate tests, and a
+#      timeout that fires spuriously costs far more than one that fires a
+#      few seconds later. This value is for the slow tail.
+#      Either way it is NECESSARY BUT NOT SUFFICIENT, and both halves were
+#      verified on bun 1.3.13:
+#        - a hung `await` in `beforeEach` DOES trip it ("a
+#          beforeEach/afterEach hook timed out for this test");
+#        - an unbounded SYNC block does NOT. `--timeout` is detected only
+#          after the block returns, and a block that never returns blocks
+#          the event loop, so the timeout can never fire — the run prints
+#          its header and then nothing, which is exactly the #74 symptom.
+#      That second case is why instrument 3 is here and not optional.
 [group('test')]
 test *args:
-    @if [ ! -f pyproject.toml ]; then echo "just test: no pyproject.toml — skipping"; elif uv run pytest {{ args }}; then :; else rc=$?; if [ "$rc" -eq 5 ] && [ ! -d tests ]; then echo "just test: no tests collected and no tests/ directory — skipping"; else exit "$rc"; fi; fi
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f package.json ]; then echo "just test: no package.json — skipping"; exit 0; fi
+    REVKIT_FD_ULIMIT_BEFORE="$(ulimit -Sn)"
 
-# Run tests with coverage (same exit-5 rule as `test` above)
+    # --- 1. record which runtime is under test (see note 1 above) ---
+    printf 'just test: bun %s at %s\n' "$(bun --version)" "$(command -v bun)"
+
+    # --- 2. fd headroom, best-effort (see note 2 above) ---
+    # `-S` sets the SOFT limit only. Plain `ulimit -n` sets the hard limit
+    # too, which measurably drags a host's ceiling down for the whole tree
+    # (1048576 -> 65536 here) — the opposite of adding headroom, and a
+    # side effect on sibling processes that has nothing to do with the tests.
+    ulimit_in="{{test_fd_limit}}"
+    if ! ulimit -S -n "$ulimit_in" 2>/dev/null; then
+      printf 'just test: WARNING could not raise the soft fd limit to %s (hard limit %s); continuing\n' \
+        "$ulimit_in" "$(ulimit -Hn)"
+      printf 'just test: WARNING this only helps when the HARD limit is already high. With soft %s and hard %s\n' \
+        "$(ulimit -Sn)" "$(ulimit -Hn)"
+      printf 'just test: WARNING the suite peaks near 4.7k descriptors, so it can still die of EMFILE here.\n'
+    fi
+    printf 'just test: soft fd limit is now %s (was %s), hard limit %s (unchanged)\n' \
+      "$(ulimit -Sn)" "$REVKIT_FD_ULIMIT_BEFORE" "$(ulimit -Hn)"
+
+    .claude/skills/revkit_run/test-lib.sh
+
+    # run_leg <label> <wall-clock-budget> <fd-ceiling> <fd-delta-budget> -- <command...>
+    # Wraps one leg in BOTH the wall-clock bound and the fd check, so no leg
+    # can be added later that silently lacks them. That includes `just check`,
+    # which an earlier revision of this recipe ran bare — a hang there
+    # reproduces #74's symptom completely uncaught.
+    #
+    # Both fd budgets are needed, and neither alone is sufficient; see
+    # `test_fd_delta_budget_*` for the arithmetic. The ceiling catches a
+    # runaway; the delta catches the leak GROWTH that the ~3.4k of
+    # fixed module-load descriptors would otherwise hide.
+    #
+    # The budgets differ per leg because the underlying quantity does: bun
+    # test legs are a single process with a stable count, while the
+    # Playwright leg's peak scales with the worker count. One shared ceiling
+    # would have to be loose enough for the biggest workstation, which throws
+    # away the guard on the legs that have a stable number.
+    #
+    # On a stall, the leg's captured output is grepped for the test file bun
+    # was working on, when the runtime is one that says. Best-effort by
+    # design: bun 1.3.13 buffers its per-file headers when stdout is not a
+    # TTY, so on THAT runtime the stalling file is genuinely absent from the
+    # log and the message says so and hands over a bisect command instead. A
+    # CI runtime that does emit headers gets the file named for free.
+    run_leg() {
+      local label="$1" budget="$2" fd_ceiling="$3" fd_delta="$4"; shift 4
+      [ "$1" = "--" ] && shift
+      local log; log="$(mktemp)"
+      printf '\njust test: === %s (wall %ss, fds<=%s, fd-growth<=%s) ===\n' \
+        "$label" "$budget" "$fd_ceiling" "$fd_delta"
+      set +e
+      timeout --signal=ABRT --kill-after=30s "${budget}s" \
+        ./scripts/fd-budget.sh --budget "$fd_ceiling" --delta-budget "$fd_delta" -- "$@" 2>&1 | tee "$log"
+      local status="${PIPESTATUS[0]}"
+      set -e
+      case "$status" in
+        124)
+          {
+            printf '\njust test: STALL — leg %s exceeded its %ss wall-clock budget and was killed.\n' "$label" "$budget"
+            local last
+            last="$(grep -oE '[A-Za-z0-9_./-]+\.(test|spec)\.[cm]?[jt]sx?:' "$log" | tail -1 || true)"
+            if [ -n "$last" ]; then
+              printf 'just test: last test file named in the output was %s.\n' "$last"
+            else
+              printf 'just test: bun named no test file, so the hang cannot be pinned to one from the log.\n'
+              printf 'just test: bun %s buffers its per-file headers when stdout is not a TTY, so the file\n' "$(bun --version)"
+              printf 'just test: that stalled is invisible here. Re-run the leg with a path filter to bisect:\n'
+              printf 'just test:   just test test/serve/<file>.test.ts\n'
+            fi
+            printf 'just test: a leg that overruns this long is a STALL, not a slow test. bun --timeout\n'
+            printf 'just test: cannot catch a blocked event loop (verified on bun 1.3.13), which is why this\n'
+            printf 'just test: outer bound exists.\n'
+          } >&2
+          ;;
+        137)
+          {
+            printf '\njust test: KILLED — leg %s was SIGKILLed after the %ss budget expired.\n' "$label" "$budget"
+            printf 'just test: this is NOT a confirmed hang. 137 is SIGKILL, which is also what the OOM\n'
+            printf 'just test: killer sends and what --kill-after sends after the grace period, and from\n'
+            printf 'just test: outside the process the three are indistinguishable. Check the runner for an\n'
+            printf 'just test: out-of-memory event before treating this as a stall.\n'
+          } >&2
+          ;;
+      esac
+      rm -f "$log"
+      return "$status"
+    }
+
+
+    # Wall-clock budgets, from measured healthy local times on an 88-core
+    # host (packages/cli 104s / review-core 2s / site schemas 1s / check 3s /
+    # packages/worker 5s / build 8s / Playwright 228s) and the one known good
+    # CI run (7m33s for the whole job, so ~1.3x local). Each leg gets >=3x its
+    # measured time, and any single stalled leg still trips its bound before
+    # the workflow's 20-minute ceiling.
+    #
+    # CI BUDGET, restated with the worker leg in it (issue #9). Only one leg
+    # can be the stalled one; the rest contribute their healthy time. Taking
+    # CI's 1.3x local factor, the healthy total for every leg except Playwright
+    # is 104 + 2 + 1 + 3 + 5 = 115s locally, ~150s on CI:
+    #
+    #   Playwright stalls: 720 + 150                     = ~14.5 min
+    #   cli stalls:        540 + 2 + 1 + 3 + 5 + 228*1.3 = ~13.5 min
+    #   worker stalls:     180 + 104 + 2 + 1 + 3 + 296   = ~9.8 min
+    #   nothing stalls:                                      ~8.5 min
+    #
+    # So the worst case is ~14.5 min against the 20-minute `Tests` ceiling and
+    # the binding leg is still Playwright, which was true before this leg
+    # existed. That is the reason `packages/worker` went into the EXISTING leg
+    # list rather than a new CI job: it costs ~5 s of healthy budget, its own
+    # stall mode is bounded at 180 s, and a second workflow would have bought
+    # a duplicated toolchain setup to save nothing. If a future leg pushes
+    # the stalled-Playwright figure past ~17 min, move THAT leg out rather
+    # than raising a ceiling — `.github/workflows/revkit-flake.yml` shows the
+    # repo-owned-workflow shape if that becomes necessary.
+    #
+    # `just check` goes through `run_leg` too. An earlier revision ran it
+    # bare, which meant a hang there reproduced #74's symptom — an 18-minute
+    # dead job — with neither a wall bound nor an fd check on it.
+    #
+    # `{{ args }}` sits inside single quotes. That buys NOTHING, and two
+    # successive revisions of this comment were wrong about why, so here is
+    # the measured position rather than another rationalisation.
+    #
+    # Quoting cannot help, because just splices `{{ args }}` into this file
+    # as raw TEXT and bash then parses the result. Two separate escapes were
+    # measured against both the single-quoted and double-quoted forms:
+    #
+    #   1. command substitution. `$(...)` in an argument is substituted
+    #      either way, because `bash -c 'SCRIPT'` has the outer shell strip
+    #      the quotes and hand SCRIPT to a second shell that re-parses it
+    #      with nothing quoted. Both forms yield `nomatchINJECTED` for the
+    #      argument `nomatch$(echo INJECTED)`.
+    #   2. breaking out of the recipe's own quoting. A `'` escapes a
+    #      single-quoted string exactly as a `"` escapes a double-quoted
+    #      one, so an argument closes the recipe's quotes either way. Both
+    #      forms ran `echo ESCAPED-RECIPE-SHELL` in the recipe's own shell,
+    #      with byte-identical output.
+    #
+    # So this is a real but LOW-SEVERITY, DEV-LOCAL latent injection
+    # surface, and it is NOT fixed. It is not fixed because it is not
+    # reachable from CI: ci.yml:282 calls bare `just test` with no
+    # arguments, and `*args` exists for a developer passing `-t` or a path
+    # filter. Fixing it properly means not splicing args as text at all
+    # (positional parameters, or an argv array), which just does not offer
+    # here — worth doing if this recipe ever grows a wrapper that forwards
+    # untrusted input.
+    run_leg packages/cli "{{test_leg_timeout_cli}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- env REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
+    run_leg packages/review-core "{{test_leg_timeout_review_core}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/review-core && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
+    run_leg site/schemas "{{test_leg_timeout_schemas}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd site && bun test --timeout {{bun_test_timeout_ms}} src/content/schemas/ {{ args }}'
+    run_leg just/check "{{test_leg_timeout_check}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- just check
+    run_leg packages/worker "{{test_leg_timeout_worker}}" "{{test_fd_budget_stable}}" "{{test_fd_delta_budget_stable}}" -- bash -c 'cd packages/worker && bun test --timeout {{bun_test_timeout_ms}} {{ args }}'
+    run_leg site/playwright "{{test_leg_timeout_e2e}}" "{{test_fd_budget_playwright}}" "{{test_fd_delta_budget_playwright}}" -- just e2e
+
+# Wall-clock budget per leg, in seconds. See note 3 on `test` above for
+# the measurements these come from.
+test_leg_timeout_cli := "540"
+test_leg_timeout_review_core := "180"
+test_leg_timeout_schemas := "180"
+test_leg_timeout_check := "300"
+test_leg_timeout_e2e := "720"
+
+# `packages/worker` (M4 slice 1, issue #9): miniflare boots a real workerd
+# per test file, so this leg was expected to be expensive. Measured: 132
+# tests in 5.0-5.5 s, and inside `run_leg` a peak of 159 open descriptors
+# with 44 of growth. It is the CHEAPEST new leg available — three workerd
+# boots and a ~790 KB bundle, against the cli leg's 104 s and 4449
+# descriptors. CI (run 37141190786, `Tests` job) measures the same leg at
+# 3.1 s, peak 183, growth 87, and the whole job at 6m33s of the 20-minute
+# ceiling — so the leg is ~0.3% of the budget it sits inside.
+#
+# 180 s is 36x the measured time, the same floor the other sub-minute legs
+# (review-core, site/schemas) use. It is deliberately NOT tighter than that,
+# for the reason the CI-budget arithmetic above depends on: the interesting
+# failure here is workerd failing to START, and a budget tight enough to
+# notice a slow boot would also fire on a loaded CI runner.
+#
+# The descriptors are the shared `stable` budgets and they are nowhere near
+# binding (159 peak against 8192, 56 growth against 1800). That is the right
+# relationship for this leg: it holds a handful of long-lived sockets to
+# workerd and a module graph bun never reloads, so it has no daemon-cycle
+# leak to grow. If that ever changes the numbers here are the thing to watch,
+# not the ceiling. A clean run also leaves ZERO `workerd` processes behind
+# (measured: 0 before and 0 after a full leg), so `dispose()` reaps.
+test_leg_timeout_worker := "180"
+
+# The worker leg runs on the SHARED `bun_test_timeout_ms` (10 s), and an
+# earlier revision gave it 30 s. That was wrong, and measuring it is what
+# showed why — see the two comments below. The short version: the raised
+# number was treating a symptom whose cause was never identified, and an
+# unbounded wait does not respond to a bigger ceiling anyway.
+#
+# WHAT WAS OBSERVED. This leg is bimodal on a loaded host: 45 runs gave
+# 5.4-6.1 s typically, with two outliers at 26 s and 38.4 s, and
+# `loadavg` above 30 throughout. Two separate runs produced exactly one
+# failure each, a `beforeAll` hook at `[10002.00ms]` and once at 30 s too.
+#
+# WHAT WAS MEASURED, AND IT IS NOT THE BOOT. `getD1Database("DB")` is where
+# miniflare actually starts workerd and opens its D1 session, so the harness
+# times it (`REVKIT_WORKER_BOOT_LOG=1`, see `packages/worker/test/harness.ts`).
+# Over 70 runs of this leg the slowest boot was 312 ms, with no outlier above
+# it; in isolation over 30 consecutive boots it is 102 ms median / 168 ms
+# worst. So a boot is ~30x under the shared 10 s ceiling, and the 20-32 s
+# the slow runs add is NOT in the boot.
+#
+# WHAT COULD NOT BE SEPARATED. Where those 20-32 s actually go. They did not
+# reproduce in the 25 instrumented runs (loadavg was high for all of them),
+# and the instrumentation covers only the boot, so no slow run was ever
+# captured phase by phase. Candidates left open: bun's own module loading and
+# GC for the test graph, which are CPU-bound and therefore load-sensitive —
+# but that is a hypothesis, not a measurement, and it is not recorded as one.
+#
+# PARTIALLY ANSWERED (issue #9, slice 3, 2026-10-04). The hypothesis above is
+# the right one, and the symptom has a second shape that was measured: this leg
+# fails, not merely slows, when the host cannot give the process the CPU. Two
+# signatures, both from workerd rather than from an assertion: miniflare reports
+# `Unable to connect. Is the computer able to access the url?`, and its D1
+# control channel returns a non-JSON line at `parseSyncResponse`
+# (`SyntaxError: JSON Parse error: Unexpected identifier "ERROR"`). Either one
+# cascades through the rest of the file, so one dead instance reads as dozens of
+# unrelated failures. Measured on a host with `loadavg` ~37 from 6 users, memory
+# and file descriptors NOT the constraint (1.5 TB free, peak 90 fds against a
+# 1048576 limit, and no leaked `workerd` processes between runs):
+#
+#   - `bun test test/<file>.test.ts`, one file per process: 11/11 files green,
+#     repeatedly, every file.
+#   - `bun test` for all 11 files in ONE process: between 1 and 19 failures,
+#     varying run to run on identical bytes.
+#   - The same one-process run is clean when the host has capacity.
+#
+# So the variable is process-wide contention across the eleven workerd instances
+# this leg holds, not any one test. It is recorded here rather than fixed by
+# raising a ceiling, for the reason below: `--isolate` was tried and is worse
+# (it breaks the `beforeAll` lifecycle — 98 of 332 tests ran), and a per-file
+# invocation would change what `just test` means for every package. The honest
+# statement is that this leg needs headroom, and CI has it.
+#
+# WHY 10 s IS STILL RIGHT. A leg that blocks for tens of seconds IS a stall,
+# and `test_leg_timeout_worker` above exists to name it: this repo's #74
+# lesson is that an unbounded wait must read as a stall with a label, not as a
+# slow green. Raising the ceiling bought a slower red, not a fix. If the
+# stall is ever caught, `REVKIT_WORKER_BOOT_LOG=1` plus a slow-run capture is
+# the next step — and the first thing to check is the host's loadavg and free
+# disk, both of which were degraded while this was measured.
+
+# Per-test bun timeout. Sized for the measured slow tail, not for hang
+# latency: the slowest single `packages/cli` test observed is 6067ms and 3 of
+# 1349 exceed the 5s default, so 10s is 1.65x the worst seen anywhere and
+# 2x the old default. The cost is that a hung `await` surfaces in 10s
+# instead of 5s, accepted because the default was already firing on
+# legitimate tests. See note 4 on `test` above.
+bun_test_timeout_ms := "10000"
+
+# SOFT descriptor limit for the suite, applied with `ulimit -S` so the hard
+# limit is left alone.
+#
+# Weak on purpose, and precisely bounded: this only helps when the soft limit
+# is low AND the hard limit already permits the raise. Under
+# `prlimit --nofile=1024:1024` the raise is refused, the recipe warns and
+# continues at 1024, and the suite — peaking near 4.7k — would still die of
+# `EMFILE`. It is a no-op on CI, whose default was already 65536.
+test_fd_limit := "65536"
+
+# Absolute descriptor ceiling per leg: a runaway backstop.
+#
+# Measured peak (peak = the whole process TREE, so Playwright's workers and
+# their daemons count):
+#
+#   packages/cli        4449 local / 4687 CI   single process, so
+#                              worker-count independent and stable. The CI
+#                              figure is the post-redesign run 37117007176;
+#                              37117515667 repeats it at 4682.
+#   packages/review-core   98 local / 82 CI
+#   site/schemas          139 local / 140 CI
+#   site/playwright      499 local at `workers: 1` / 510 CI, but
+#                      4683 / 6008 / 6481 local across ~44 workers, so
+#                              this leg scales with the worker count. The CI
+#                              figure is run 37117007176; 37117515667
+#                              repeats it at 503.
+#
+# These ceilings are deliberately loose: the `packages/cli` one at 8192 sits
+# 1.75x over the worst observed, because tightening it toward 4449 would
+# red-line a busy workstation with many cores. That looseness is exactly why
+# the delta budget below exists — see it for why an absolute ceiling alone
+# cannot see the leak.
+test_fd_budget_stable := "8192"
+test_fd_budget_playwright := "16384"
+
+# Descriptor GROWTH budget per leg, measured after a warm-up so the FIXED
+# module-load cost is excluded. It exists because of an arithmetic problem with
+# the absolute ceiling: the ceiling is blind to the first doubling of the leak.
+#
+# SCOPE CORRECTION, #86. This budget used to be described as "the budget that
+# can actually see the leak". That is no longer true and the claim is retracted
+# rather than softened. On CI the `packages/cli` leg DECLINES to produce a growth
+# figure at all — that runner's module-load ramp extends past the warm-up, and
+# the settledness test refuses the number (measured twice: floor 3966/3971
+# against an opening probe of 3497/3431, deficit 469/540, printed as
+# `baseline settled: no ... growth unmeasured`). So the leg this budget was
+# derived from is the leg it does not judge, and on CI the only active guard
+# against a descriptor leak is the in-process per-cycle test in
+# `packages/cli/test/serve/fd-budget.test.ts` — which measures `startDaemon` +
+# `handle.stop()` and nothing else.
+#
+# What this budget still does, on the legs whose window IS settled
+# (`packages/worker`, `site/playwright`): it bounds growth across the whole
+# process tree, which the per-cycle test does not. What it no longer does:
+# reliably bound growth on `packages/cli` anywhere. Both the coverage gap and
+# the fix that would restore it are tracked with #86.
+#
+# THE FIXED COST, and which measurement each number is. Three distinct
+# quantities were previously conflated into one figure, so to be explicit:
+#
+#   52      a bare `bun test` file importing only `node:fs`.
+#   3268    a minimal probe whose only project import is `serve/daemon.ts`.
+#   ~3.5k   the real `packages/cli` leg's post-warm-up FLOOR, read as the p10
+#           of the post-warm-up window: 3491 local (581 samples). The older
+#           `min`-based reading of the same quantity was 3384 local / 3403 on
+#           CI; see #86 below for why the two differ.
+#
+# The first two are probes; only the third is the baseline the growth budget
+# actually subtracts, so the leak arithmetic below uses it.
+#
+# The `packages/cli` leg rises from that ~3.5k floor to a ~4456 peak, i.e.
+# ~965 of growth, and that growth IS the leak: 2 per daemon cycle across the
+# suite. So the first DOUBLING of the leak lands at ~3491 + 1930 = ~5421,
+# comfortably UNDER the 8192 absolute ceiling. The ceiling passes it. An
+# absolute ceiling loose enough not to false-positive is therefore blind to
+# the first doubling, which is the most likely shape of the regression it
+# was added for. Measuring growth drops the constant term and cannot hide it
+# that way.
+#
+# 1800 therefore sits between the measured growth and a doubling of it. The
+# figure it is now measured against is RAMP-FREE, which is the point of #86.
+# Before #86 the script computed `growth = max - min`, so one module-load
+# sample defined the floor and a ramp was charged as leak; the same commit
+# reported 1632, 1856 and 4006 on three runs of it, and 4006 reddened a CI
+# build whose 1368 tests all passed. Nothing derived from that number was
+# trustworthy, including this budget's own margin.
+#
+# RE-DERIVED FROM RAMP-FREE MEASUREMENTS, and the number did not move. Local
+# `packages/cli` growth is 965 and 1021 on two runs of the p10 statistic
+# (loadavg 3-9); CI's clean runs measured 1284 (run 37117007176) and 1279 (run
+# 37117515667) under `min`, which OVERSTATES growth, so CI's ramp-free figure is
+# at or below those.
+#
+# HOW MUCH p10 UNDERSTATES, measured, because it sets the margin. p10 reads
+# exactly 0.900x the `max - min` figure for a leak starting at the window's
+# opening (1018 -> 917, 2037 -> 1834, 1280 -> 1153) and exactly 1.000x for one
+# starting >=10% in, which is the real leg's shape (1018 -> 1018). So a leak
+# that begins late is measured at full size and one that begins at the opening
+# at 90% of it.
+#
+# 1800 therefore sits between the measured growth and a doubling of it. The
+# doubling's p10 figure is:
+#
+#   local, onset at the opening:  0.900 x 2 x 1018 = 1832
+#   local, onset >=10% in:       1.000 x 2 x 1018 = 2036
+#   CI,    onset at the opening:  0.900 x 2 x 1284 = 2311
+#   CI,    onset >=10% in:       1.000 x 2 x 1284 = 2568
+#
+# The worst case is the local one at 1832, which clears 1800 by 32 descriptors
+# (1.8%). MEASURED on the actual test trace in
+# `packages/cli/test/serve/fd-budget.test.ts` ("a planted leak on a settled
+# baseline still trips the growth budget"): growth 1834 against the budget, so
+# 34 descriptors, 1.9%.
+#
+# CORRECTION. An earlier revision of this comment justified leaving 1800 alone
+# with "a doubling trips it — 2300-2570 on CI against an 1800 budget, and 1930
+# locally". Those were all `min`-based figures, and they overstated the margin
+# by up to 10%. The conclusion is unchanged — leaving 1800 alone is right — but
+# the reason is now stated in the statistic the gate actually computes, and the
+# honest margin is 1.9% rather than the ~19% the old numbers implied. That thin
+# margin is a consequence of p10 under-reporting a monotone leak, which is
+# documented as a limit in `scripts/fd-budget-verdict.sh`.
+#
+# It is NOT raised. Raising it on a ramp-contaminated measurement is precisely
+# what #86 exists to prevent, and the only measured evidence of a shift since
+# then is 961-987 across five local runs. A leg reporting `unmeasured` rather
+# than a number is not a licence to raise the budget either — see the note on
+# what to watch below.
+#
+# WHAT TO WATCH, AND WHY THE OLD NOTE WAS NOT ACTIONABLE. The old note here read
+# "if CI growth ever drifts another 40% the budget needs re-deriving", which
+# could not be acted on: a 40% drift and a ramp were indistinguishable when
+# both land in the same number, and one commit had already produced a 2.5x
+# spread. The replacement note is in `scripts/fd-budget.sh`, which prints
+# `baseline settled: yes|no` alongside floor, probe and deficit. `yes` means
+# the figure is ramp-free and is the number to compare against 1800. `no`, or
+# `growth NOT MEASURED`, means the leg declined to produce a figure at all —
+# that is NOT a growth regression and NOT a licence to raise the budget; it
+# means the run was blind, and the absolute ceiling is what judged it. A leg
+# that reports `unmeasured` repeatedly on CI, rather than occasionally, is the
+# signal worth acting on, and the fix is the warm-up window, not this number.
+#
+# The ~20% CI/local growth gap is NOT the warm-up window. The hypothesis was
+# that CI samples more slowly, so its baseline sits lower and its growth
+# looks inflated — but the arithmetic refutes it: CI's floor is
+# peak-minus-growth = 4687-1284 = 3403, against local 4449-1065 = 3384. Those
+# floors agree to 19 descriptors, so CI really does accumulate ~220 more over
+# the run and the warm-up is not the cause. That residual is unexplained;
+# the budget holds either way, with 40% headroom on the larger number.
+#
+# LEGS THAT REPORT `NOT MEASURED`, and why that is expected. Three of the six
+# legs finish inside the 2s warm-up — `packages/review-core` (520ms),
+# `site/schemas` (117ms) and `just/check` (~2s) — so they have no post-warm-up
+# window and contribute nothing to the growth gate. That was equally true before
+# #86 (the old `observed <= 1` branch produced the same state) and is unchanged
+# by it; the absolute ceiling still judged all three. `packages/cli` is the leg
+# this budget is actually about, and it is the one whose growth the leak moves.
+#
+# The Playwright leg is a different shape and gets its own number. It starts
+# small (a `just build`) and grows into its workers, so on this host its
+# growth is essentially its whole peak — measured 5856 against a 5882 peak,
+# and a budget of 6000 would have false-positived on this host's own 6008
+# and 6481 peaks. 12000 keeps it above the worst observed (6481) by 1.85x.
+# At CI's `workers: 1` the same leg measures peak 510 / growth 491, so this
+# budget is nowhere near binding in CI — the ceiling is the guard there.
+test_fd_delta_budget_stable := "1800"
+test_fd_delta_budget_playwright := "12000"
+
+# Regenerate the pipeline-digest fixture that
+# `packages/cli/test/build/own-build-unchanged.test.ts` compares
+# against (issue #57). Run this after a LEGITIMATE change to the
+# rendering pipeline — a new rehype plugin, a Starlight upgrade, a
+# tweak to `astro.config.mjs`. The recipe sets
+# `REVKIT_UPDATE_OWN_DIGEST=1` so the test WRITES the digest
+# instead of asserting. Commit the resulting
+# `packages/cli/test/build/fixtures/pipeline-digest.json`.
+[group('quality')]
+update-own-digest:
+    REVKIT_UPDATE_OWN_DIGEST=1 REVKIT_E2E_BUILD=1 bash -c 'cd packages/cli && bun test test/build/own-build-unchanged.test.ts'
+
+# Run the revkit authoring guards over the workspace (ADR-0005). Offline
+# by default; passes `--online` when GITHUB_TOKEN is available so `revkit
+# escalate` annotations get verified against GitHub in CI when the
+# workflow forwards the token. A pre-commit hook (see flake.nix's `hooks`
+# block) invokes the same command on any content-shaped stage change.
+[group('quality')]
+check *args:
+    @if [ -n "${GITHUB_TOKEN:-}" ]; then \
+      bun packages/cli/bin/revkit.js check --online {{ args }}; \
+    else \
+      bun packages/cli/bin/revkit.js check {{ args }}; \
+    fi
+
+# Run bun unit tests with coverage. Reports to the terminal by default;
+# `just test-cov --coverage-reporter=lcov` writes an lcov file. Walks every
+# package that grows unit tests over time (packages/cli, site's schema
+# tests today) so new ones join without a recipe edit.
 [group('test')]
 test-cov *args:
-    @if [ ! -f pyproject.toml ]; then echo "just test-cov: no pyproject.toml — skipping"; elif uv run pytest --cov --cov-report=term-missing {{ args }}; then :; else rc=$?; if [ "$rc" -eq 5 ] && [ ! -d tests ]; then echo "just test-cov: no tests collected and no tests/ directory — skipping"; else exit "$rc"; fi; fi
+    @if [ ! -f package.json ]; then \
+      echo "just test-cov: no package.json — skipping"; \
+    else \
+      cd packages/cli && bun test --coverage {{ args }} && cd ../.. && \
+      cd packages/review-core && bun test --coverage {{ args }} && cd ../.. && \
+      cd site && bun test --coverage src/content/schemas/ {{ args }} && cd ../.. && \
+      cd packages/worker && bun test --coverage {{ args }}; \
+    fi
+
+# Run the Playwright browser suite by itself (skips the bun unit tests).
+# ALWAYS builds first: axe over stale HTML and visual baselines against
+# stale HTML both silently pass a regression that landed after the last
+# build (PR #31 review, the low-contrast paragraph reproducer). One
+# build per run — `just test` calls this recipe, so the outer `just
+# build` step used to double up and has been removed there.
+[group('test')]
+e2e *args:
+    @if [ ! -f site/package.json ]; then \
+      echo "just e2e: no site/package.json — skipping"; \
+    else \
+      just build && \
+      cd site && bun run test:e2e -- {{ args }}; \
+    fi
+
+# Regenerate the visual-regression baselines committed under
+# `site/tests/visual.spec.ts-snapshots/`. Intentional-only: run this
+# when a PR means to change what the site looks like, review the
+# resulting image diff in code review, and commit the updated files.
+# Extra args pass through to Playwright (e.g.
+# `just e2e-update visual.spec.ts -g phone` narrows the update).
+# Also builds first — same reason as `just e2e`, otherwise a stale
+# `dist/` would snapshot the previous build.
+[group('test')]
+e2e-update *args:
+    @if [ ! -f site/package.json ]; then \
+      echo "just e2e-update: no site/package.json — skipping"; \
+    else \
+      just build && \
+      cd site && bun run test:e2e -- --update-snapshots=all {{ args }}; \
+    fi
 
 # -------------------------------------------------------------------------------
 # DEPENDENCIES
 # -------------------------------------------------------------------------------
 
-# Sync dependencies (all groups; extras are opt-in, e.g. `just sync --all-extras`)
+# Sync workspace dependencies. `--frozen-lockfile` matches CI: if bun.lock
+# would change, this fails loudly so a missing pin is caught locally.
 [group('deps')]
-sync *args="--all-groups":
-    @if [ -f pyproject.toml ]; then uv sync {{ args }}; else echo "just sync: no pyproject.toml — skipping"; fi
+sync *args="--frozen-lockfile":
+    @if [ -f package.json ]; then \
+      bun install {{ args }}; \
+    else \
+      echo "just sync: no package.json — skipping"; \
+    fi
 
-# Update all dependencies
+# Manual dependency bump. Renovate owns routine bumps (ADR-0001): it opens
+# PRs that update the exact pins in package.json + bun.lock, so this recipe
+# is an escape hatch, not the normal path. Prints the reminder and runs
+# `bun update --latest` — with exact pins, plain `bun update` is a no-op.
 [group('deps')]
-update:
-    uv lock --upgrade
-    @just sync
+update *args="--latest":
+    @echo "Note: Renovate owns routine dependency bumps (ADR-0001); use this only for a manual escape."
+    bun update {{ args }}
+    @just sync --no-frozen-lockfile
 
 # -------------------------------------------------------------------------------
-# BUILD
+# BUILD / DEV
 # -------------------------------------------------------------------------------
 
-# Clean build artifacts
+# Astro dev server for the review site (hot-reload). See ADR-0001.
+[group('build')]
+dev *args:
+    cd site && bun run dev -- {{ args }}
+
+# Build the review site to static output (site/dist), then run the
+# output-gate sanitiser (`revkit check-dist`) over the built HTML —
+# ADR-0012 defence in depth. Source guards can miss a parser
+# differential (bypass classes surfaced in PR #23 round-2 review);
+# check-dist parses every built page with a real DOM parser (linkedom)
+# and refuses `on*` attrs, `javascript:`/`data:`/`vbscript:` URLs,
+# `<iframe>`/`<object>`/`<base>`/`<meta refresh>`, external stylesheets,
+# and any inline `<script>` whose SHA-256 is not in
+# `packages/cli/src/dist-check-allowlist.json`.
+[group('build')]
+build:
+    cd site && bun run build
+    bun packages/cli/bin/revkit.js check-dist site/dist
+
+# Clean workspace build artefacts (Astro output, Playwright reports, TS
+# incremental info). Leaves node_modules/ and bun.lock alone.
 [group('build')]
 clean-artifacts:
-    rm -rf .pytest_cache .ruff_cache .coverage htmlcov dist build *.egg-info
-    find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+    rm -rf site/dist site/.astro site/test-results site/playwright-report site/blob-report
+    find . -name '*.tsbuildinfo' -type f -delete 2>/dev/null || true
 
 # ===============================================================================
 # PROJECT-SPECIFIC RECIPES
 # ===============================================================================
-# Uncomment and customize for your project:
-# # Run the application
-# [group('app')]
-# run *args:
-#     uv run python -m {{project}} {{args}}
-#
-# # Boot the local dev services declared in flake.nix (mkProjectServices,
-# # #795): daemonless process-compose stack, state in ./data (gitignore it).
-# [group('services')]
-# services *args:
-#     nix run .#services -- {{args}}
-#
-# # Prepare release branch (manual workflow dispatch helper)
-# [group('release')]
-# prepare-release version:
-#     gh workflow run prepare-release.yml --ref dev -f "version={{ version }}"
-#
-# # Finalize and publish release (manual workflow dispatch helper)
-# [group('release')]
-# finalize-release version:
-#     gh workflow run release.yml --ref release/{{ version }} -f "version={{ version }}" -f "release-kind=final" -f "dry-run=false"
-#
-# # Publish candidate release (manual workflow dispatch helper)
-# [group('release')]
-# publish-candidate version:
-#     gh workflow run release.yml --ref release/{{ version }} -f "version={{ version }}" -f "release-kind=candidate" -f "dry-run=false"
+
+# -------------------------------------------------------------------------------
+# AGENT
+# -------------------------------------------------------------------------------
+
+# Install the vig-os devkit Claude Code plugin, pinned to this repo's
+# DEVKIT_VERSION by default. Local scope (.claude/settings.local.json,
+# gitignored) because devkit regenerates .claude/settings.json on upgrade, so a
+# project-scope entry would be silently dropped (vig-os/devkit#1765). Re-run
+# after a devkit upgrade to move the marketplace to the new tag. `ref` overrides
+# the pin (e.g. `just claude-plugin dev` for the unreleased plugin); the plugin
+# first ships in the release after 1.17.0.
+[group('agent')]
+claude-plugin ref="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ref="{{ ref }}"
+    if [[ -z "$ref" ]]; then
+      ref=$(sed -n 's/^DEVKIT_VERSION=//p' .vig-os)
+      [[ "$ref" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "DEVKIT_VERSION '$ref' is not X.Y.Z" >&2; exit 1; }
+    fi
+    [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "ref '$ref' has unexpected characters" >&2; exit 1; }
+    if ! gh api "repos/vig-os/devkit/contents/.claude-plugin/marketplace.json?ref=${ref}" --silent 2>/dev/null; then
+      echo "vig-os/devkit@${ref} ships no Claude Code plugin (.claude-plugin/marketplace.json)." >&2
+      echo "Use a later release, or preview the unreleased plugin: just claude-plugin dev" >&2
+      exit 1
+    fi
+    claude plugin marketplace remove vigos-devkit --scope local >/dev/null 2>&1 || true
+    claude plugin marketplace add "vig-os/devkit@${ref}" --sparse .claude-plugin plugins --scope local
+    claude plugin install devkit@vigos-devkit --scope local
+    echo "devkit plugin @${ref} installed (local scope): /devkit:status, /devkit:upgrade, ..."
+
+# End-to-end dogfood of the M2 agent channel loop (ADR-0007, issue #7). Builds
+# the site, starts an ISOLATED `revkit serve` in a temp state dir, spawns a
+# disposable LOCKED-DOWN test Claude session (no built-in tools, only
+# `mcp__revkit__{threads,reply,resolve}`) in a flock pane, then drives a
+# comment through the rail UI with Playwright and waits for the test agent to
+# reply with `ack <nonce>` and resolve. The lockdown is proven pre-launch
+# against the real claude process (/proc/<pid>/cmdline + /proc/<pid>/environ
+# vs a true allowlist), not by any model behaviour. Requires a
+# logged-in Claude (`claude auth`), a running flock server (`flk`), and the
+# nix dev shell. Not part of `just test` or CI. Writes a redacted transcript
+# to `.revkit/dogfood/last.log`, unlinks the daemon.log (unredacted — holds
+# the launch code) at teardown by default; set
+# `REVKIT_DOGFOOD_KEEP_DAEMON_LOG=1` to keep a redacted copy. On success
+# writes a screenshot to
+# `.revkit/dogfood/reply-visible.png`. Cleanup runs on any exit path and
+# ends with a self-check for leaked panes or subprocesses (exit 3 on leak).
+# See `.claude/skills/revkit_dogfood/SKILL.md` for the full runbook and the
+# failure playbook.
+[group('agent')]
+dogfood *args:
+    bun packages/cli/src/dogfood/main.ts {{ args }}
+
+# -------------------------------------------------------------------------------
+# CLOUDFLARE
+# -------------------------------------------------------------------------------
+
+# Run wrangler with the local Cloudflare credentials (ADR-0014). The token is
+# loaded from ~/.config/revkit/cf.env (mode 600) for this one call only and is
+# never exported into the dev shell. Example: `just cf whoami`.
+[group('cloudflare')]
+cf *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    env_file="${REVKIT_CF_ENV:-$HOME/.config/revkit/cf.env}"
+    [[ -f "$env_file" ]] || { echo "missing $env_file (see CLAUDE.md, Secrets)" >&2; exit 1; }
+    [[ "$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file")" == "600" ]] || { echo "$env_file must be mode 600" >&2; exit 1; }
+    set -a; . "$env_file"; set +a
+    WRANGLER_SEND_METRICS=false exec wrangler {{ args }}
+
+# Consumer package and template integration smoke (same script as CI).
+[group('testing')]
+template-smoke:
+    bash scripts/template-smoke.sh "{{justfile_directory()}}"

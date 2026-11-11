@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused SVG cursor unterminated quoted url() (reviewer bypass) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><rect cursor='url(&quot;https://evil.example'/></svg>
+</body>
+</html>

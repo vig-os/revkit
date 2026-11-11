@@ -1,0 +1,300 @@
+/*
+ * revkit /ask/<id> page styles (ADR-0017: WCAG 2.2 AA).
+ *
+ * Standalone: served on a daemon page that carries no Starlight / Tailwind
+ * baseline, so this file defines every rule it needs. Colours use CSS
+ * variables that follow the rail's palette so the review surface reads
+ * as one product; contrast against the page background clears AA (4.5:1
+ * body text, 3:1 large text). The `.revkit-ask__region-canvas` marker
+ * uses the accent colour and a 3px outline so a moved marker is
+ * visible without relying on colour alone.
+ */
+
+:root {
+  --revkit-ask-bg: #ffffff;
+  --revkit-ask-fg: #111827;
+  --revkit-ask-muted: #4b5563;
+  --revkit-ask-accent: #1d4ed8;
+  --revkit-ask-border: #e5e7eb;
+  --revkit-ask-danger: #b91c1c;
+  --revkit-ask-focus: #fde68a;
+  --revkit-ask-surface: #f9fafb;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --revkit-ask-bg: #0b1220;
+    --revkit-ask-fg: #f9fafb;
+    --revkit-ask-muted: #cbd5e1;
+    --revkit-ask-accent: #93c5fd;
+    --revkit-ask-border: #1f2937;
+    --revkit-ask-danger: #fca5a5;
+    --revkit-ask-focus: #a16207;
+    --revkit-ask-surface: #111827;
+  }
+}
+
+html,
+body {
+  background: var(--revkit-ask-bg);
+  color: var(--revkit-ask-fg);
+  margin: 0;
+  padding: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.revkit-ask {
+  max-width: 720px;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+.revkit-ask__header {
+  border-bottom: 1px solid var(--revkit-ask-border);
+  padding-bottom: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.revkit-ask__title {
+  font-size: 1.75rem;
+  margin: 0 0 0.5rem;
+  line-height: 1.2;
+}
+
+.revkit-ask__kind {
+  color: var(--revkit-ask-muted);
+  font-size: 0.875rem;
+  margin: 0 0 0.5rem;
+}
+
+.revkit-ask__prompt {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--revkit-ask-fg);
+}
+
+.revkit-ask__body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.revkit-ask__form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.revkit-ask__options {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.revkit-ask__option {
+  border: 1px solid var(--revkit-ask-border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  background: var(--revkit-ask-surface);
+}
+
+.revkit-ask__option-label {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  cursor: pointer;
+}
+
+.revkit-ask__option-text {
+  color: var(--revkit-ask-fg);
+}
+
+.revkit-ask__option-preview {
+  margin-top: 0.5rem;
+  color: var(--revkit-ask-muted);
+  font-size: 0.75rem;
+}
+
+.revkit-ask__ranking {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.revkit-ask__rank-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--revkit-ask-border);
+  border-radius: 6px;
+  background: var(--revkit-ask-surface);
+}
+
+.revkit-ask__rank-position {
+  color: var(--revkit-ask-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.revkit-ask__rank-controls {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+
+.revkit-ask__rank-controls button {
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+  font-size: 1rem;
+}
+
+.revkit-ask__scale {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.revkit-ask__scale input[type="range"] {
+  width: 100%;
+}
+
+.revkit-ask__scale-value {
+  color: var(--revkit-ask-fg);
+  font-variant-numeric: tabular-nums;
+  font-size: 1rem;
+}
+
+.revkit-ask__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.revkit-ask__field label {
+  color: var(--revkit-ask-muted);
+  font-size: 0.875rem;
+}
+
+.revkit-ask__field input,
+.revkit-ask__field textarea {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--revkit-ask-border);
+  border-radius: 6px;
+  background: var(--revkit-ask-bg);
+  color: var(--revkit-ask-fg);
+  font: inherit;
+}
+
+.revkit-ask__submit {
+  align-self: flex-start;
+  padding: 0.6rem 1.2rem;
+  background: var(--revkit-ask-accent);
+  color: var(--revkit-ask-bg);
+  border: 1px solid var(--revkit-ask-accent);
+  border-radius: 6px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.revkit-ask__submit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.revkit-ask__region-target {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.revkit-ask__region-target-path {
+  color: var(--revkit-ask-muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.875rem;
+}
+
+.revkit-ask__region-canvas {
+  position: relative;
+  height: 240px;
+  background:
+    repeating-linear-gradient(45deg, var(--revkit-ask-surface), var(--revkit-ask-surface) 12px, var(--revkit-ask-bg) 12px, var(--revkit-ask-bg) 24px);
+  border: 1px solid var(--revkit-ask-border);
+  border-radius: 8px;
+  cursor: crosshair;
+}
+
+.revkit-ask__region-canvas:focus-visible {
+  outline: 3px solid var(--revkit-ask-focus);
+  outline-offset: 2px;
+}
+
+.revkit-ask__region-marker {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  border: 2px solid var(--revkit-ask-accent);
+  border-radius: 50%;
+  background: var(--revkit-ask-bg);
+}
+
+.revkit-ask__region-value {
+  color: var(--revkit-ask-muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.875rem;
+}
+
+.revkit-ask__review-target {
+  color: var(--revkit-ask-muted);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.875rem;
+}
+
+.revkit-ask__terminal {
+  padding: 1rem;
+  border: 1px solid var(--revkit-ask-border);
+  border-radius: 8px;
+  background: var(--revkit-ask-surface);
+}
+
+.revkit-ask__terminal-status {
+  margin: 0 0 0.5rem;
+  color: var(--revkit-ask-fg);
+}
+
+.revkit-ask__answer {
+  background: var(--revkit-ask-bg);
+  padding: 0.75rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.875rem;
+  color: var(--revkit-ask-fg);
+  border: 1px solid var(--revkit-ask-border);
+}
+
+.revkit-ask__error {
+  color: var(--revkit-ask-danger);
+  font-weight: 500;
+}
+
+.revkit-ask__submitting {
+  color: var(--revkit-ask-muted);
+}
+
+@media (max-width: 640px) {
+  .revkit-ask {
+    margin: 1rem auto;
+  }
+
+  .revkit-ask__title {
+    font-size: 1.4rem;
+  }
+}

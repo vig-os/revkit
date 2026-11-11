@@ -1,0 +1,8 @@
+<!doctype html>
+<!-- expect: refused <linearGradient href=https://…> (fragment-only rule applies to all SVG href elements) -->
+<html lang="en">
+<head><title>t</title></head>
+<body>
+<svg xmlns="http://www.w3.org/2000/svg"><defs><linearGradient href="https://evil.example/g.svg#g" id="g"/></defs><rect fill="url(#g)"/></svg>
+</body>
+</html>

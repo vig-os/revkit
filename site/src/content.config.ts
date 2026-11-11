@@ -1,0 +1,226 @@
+// Content collections for the revkit site.
+//
+// - `docs` uses Starlight's own loader for site-owned MDX (the landing page)
+//   AND a repo-docs loader that surfaces this repo's ADRs, design docs and
+//   feature matrix in the built site (M1 item 2 dogfood, ADR-0003).
+// - `vocab`, `plots` and `asks` are the typed-data collections
+//   (DESIGN-0001 §3) — every entry carries a `schemaVersion` (ADR-0003
+//   Acceptance). The `i18n` collection is Starlight's, kept present so the
+//   integration stops warning about it (ADR-0019).
+import { defineCollection } from "astro:content";
+import { z } from "astro/zod";
+import { docsLoader, i18nLoader } from "@astrojs/starlight/loaders";
+import { docsSchema, i18nSchema } from "@astrojs/starlight/schema";
+import type { Loader } from "astro/loaders";
+import { file, glob } from "astro/loaders";
+import { existsSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+import { parse as parseYaml } from "yaml";
+import { plotsLoader } from "./content/loaders/plots.ts";
+import { repoDocsLoader } from "./content/loaders/repo-docs.ts";
+import { askSchema } from "@revkit/review-core";
+import { plotSpecSchema } from "./content/schemas/plots.ts";
+import { vocabEntrySchema, vocabFileSchema } from "./content/schemas/vocab.ts";
+import { readConsumerRoot } from "./lib/consumer-root.ts";
+import {
+  assertEveryEntryRendered,
+  captureRenderErrorsFromLogger,
+  collectPagesFromStore,
+} from "./content/assert-rendered.ts";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+// Consumer-root mode (issue #57): when set, this config is rendering
+// an EXTERNAL repo's `docs/`, `vocab/`, `plots/` through the packaged
+// site. Absent, every branch collapses to its pre-#57 form so revkit's
+// own build is unchanged.
+const CONSUMER_ROOT = readConsumerRoot();
+
+/** Compose the Starlight docs loader with the repo-docs loader so a single
+ * `docs` collection carries both site-owned MDX and this repo's documents.
+ * Starlight only builds pages from a collection named `docs`, so a second
+ * collection is not an option. */
+function composedDocsLoader(): Loader {
+  const starlight = docsLoader();
+  const repo = repoDocsLoader();
+  return {
+    name: "revkit-composed-docs-loader",
+    async load(context) {
+      await starlight.load(context);
+      await repo.load(context);
+    },
+  };
+}
+
+/** Wrap a docs loader with a structural render gate (issue #237).
+ *
+ * The astro glob loader catches markdown render errors and stores the
+ * entry with `rendered: undefined` — the build then exits 0 and ships
+ * an empty `sl-markdown-content`. This wrapper:
+ *
+ *   1. Intercepts the loader context's `logger.error(...)` calls so the
+ *      astro-logged "Error rendering <entry>: <message>" line is
+ *      captured in a side-channel map keyed by the SAME string astro
+ *      logs — i.e. the glob-relative entry path — so the structural
+ *      check has the underlying error available.
+ *   2. Runs the inner loader with that wrapped context.
+ *   3. Asserts every entry with a non-empty body carries non-empty
+ *      rendered HTML. A violation throws `EmptyRenderedBodyError` that
+ *      names the entry id, the consumer-visible source path, AND the
+ *      underlying render error.
+ *
+ * Applies to BOTH own-repo mode (which uses `composedDocsLoader`) and
+ * consumer mode (which uses Starlight's `docsLoader` directly), so the
+ * packaged flow is guarded by the same gate the site build uses.
+ *
+ * The gate also fires under `astro dev`. The dev server exits with
+ * astro's generic "Dev server process exited before becoming ready"
+ * supervisor line in that case, but the full
+ * `EmptyRenderedBodyError` (source file + underlying render error)
+ * reaches astro's foreground stdout and, when the dev server is
+ * backgrounded, `.astro/dev.log`. Astro does not expose the
+ * dev-vs-build command to a loader context, and a workers-side
+ * attempt to share state through a module-level flag in an
+ * integration did not work in practice (round-3 review): the
+ * integration and the loader load as separate module instances
+ * under astro's content-sync runtime. The round-3 review accepted
+ * the dev behaviour as-is rather than add more detection
+ * machinery — see PR notes. */
+function guardedDocsLoader(inner: Loader): Loader {
+  return {
+    name: `${inner.name}+revkit-render-guard`,
+    async load(context) {
+      const renderErrors = new Map<string, string>();
+      const restore = captureRenderErrorsFromLogger(context.logger, renderErrors);
+      try {
+        await inner.load(context);
+      } finally {
+        restore();
+      }
+      // Side-channel for `revkit check-dist`'s defense in depth
+      // (issue #237): write a manifest of the dist-relative page
+      // paths whose source bodies were non-empty. The path comes
+      // from `REVKIT_RENDER_GUARD_MANIFEST_PATH` (set by
+      // `revkit build`'s `spawnAstroBuild` extraEnv). Deriving the
+      // set from astro's own content store means we honour astro's
+      // real slug algorithm (github-slugger + any `slug:`
+      // frontmatter override) without re-implementing it — the
+      // round-2 review pointed out that a re-implementation missed
+      // `_`, `.` and custom slugs.
+      const manifestPath = (process.env["REVKIT_RENDER_GUARD_MANIFEST_PATH"] ?? "").trim();
+      if (manifestPath.length > 0) {
+        const pages = Array.from(collectPagesFromStore(context.store.entries())).sort();
+        try {
+          mkdirSync(dirname(manifestPath), { recursive: true });
+          writeFileSync(manifestPath, JSON.stringify({ pages }, null, 2), "utf8");
+        } catch (error) {
+          context.logger.error(
+            `revkit render guard: could not write manifest at ${manifestPath}: ${(error as Error).message}`,
+          );
+        }
+      }
+      assertEveryEntryRendered(context.store.entries(), {
+        renderErrorsByEntryBasename: renderErrors,
+        ...(CONSUMER_ROOT !== null ? { consumerRoot: CONSUMER_ROOT } : {}),
+      });
+    },
+  };
+}
+
+/** Vocab source path — a workspace-owned yaml file. In own-repo
+ * mode this is Astro's `../vocab/terms.yaml` (relative to the
+ * site's project root). In consumer mode `revkit build` symlinks
+ * `<staging>/vocab` → `<consumer>/vocab`, so the SAME relative
+ * path reaches the consumer's file. An empty stub is returned
+ * when the consumer has no `vocab/terms.yaml` — Astro requires
+ * every collection to declare a loader. */
+const VOCAB_RELATIVE = "../vocab/terms.yaml";
+
+/** Plots source dir — same argument. `revkit build` symlinks
+ * `<staging>/plots` → `<consumer>/plots`, so this constant is
+ * unchanged. */
+const PLOTS_RELATIVE = "../plots";
+
+/** Absolute checks so the loader can pick a stub in consumer mode
+ * when the consumer's tree omits `vocab/` or `plots/`. */
+const VOCAB_ABS = CONSUMER_ROOT ? resolvePath(CONSUMER_ROOT, "vocab", "terms.yaml") : null;
+const PLOTS_ABS = CONSUMER_ROOT ? resolvePath(CONSUMER_ROOT, "plots") : null;
+
+/** An empty inline loader — returned when a consumer has no vocab
+ * (or no plots) tree. Astro treats an empty loader as "collection
+ * has no entries" and skips validation; a page that references a
+ * missing vocab term still fails via the `<Term id>` component's
+ * runtime check. */
+function emptyLoader(name: string): Loader {
+  return {
+    name,
+    async load() {
+      // no entries
+    },
+  };
+}
+
+export const collections = {
+  docs: defineCollection({
+    // Own-repo mode composes Starlight's docsLoader (site-owned MDX
+    // under `src/content/docs/`) with `repoDocsLoader` (ADRs /
+    // designs / FEATURE-MATRIX above the site). Consumer mode drops
+    // repoDocsLoader (revkit-specific structure) and reads the
+    // consumer's `docs/` through Starlight's own loader — `revkit
+    // build` populates `<staging>/src/content/docs/` with symlinks
+    // to the consumer's tree so the default base still works.
+    loader: guardedDocsLoader(CONSUMER_ROOT ? docsLoader() : composedDocsLoader()),
+    schema: docsSchema({
+      extend: z.object({
+        // Present on repo-sourced ADR pages; the loader lifts it from the
+        // ADR file's `- Status:` line (ADR-0003) so Starlight can render it
+        // as a badge in the sidebar and in the page header.
+        revkitStatus: z.string().min(1).optional(),
+      }),
+    }),
+  }),
+  i18n: defineCollection({ loader: i18nLoader(), schema: i18nSchema() }),
+  vocab: defineCollection({
+    // `vocab/terms.yaml` is one YAML file: `{ schemaVersion, entries: [...] }`.
+    // The file loader's parser validates schemaVersion + entry shape once,
+    // then hands each entry to the collection under its own id — so a
+    // reference like `getEntry('vocab', 'anchor')` returns one entry.
+    loader:
+      CONSUMER_ROOT !== null && VOCAB_ABS !== null && !existsSync(VOCAB_ABS)
+        ? emptyLoader("revkit-vocab-empty")
+        : file(VOCAB_RELATIVE, {
+            parser: (text) => {
+              const parsed: unknown = parseYaml(text);
+              const file = vocabFileSchema.parse(parsed);
+              return Object.fromEntries(file.entries.map((entry) => [entry.id, entry]));
+            },
+          }),
+    schema: vocabEntrySchema,
+  }),
+  plots: defineCollection({
+    // Plots live in `plots/<name>/spec.vl.json` with a sibling data file
+    // (ADR-0004, C4). The loader wraps glob() and adds a build-time check
+    // that every `data.url` references an existing sibling file — the
+    // filesystem check the schema cannot enforce on its own.
+    loader:
+      CONSUMER_ROOT !== null && PLOTS_ABS !== null && !existsSync(PLOTS_ABS)
+        ? emptyLoader("revkit-plots-empty")
+        : plotsLoader(PLOTS_RELATIVE),
+    schema: plotSpecSchema,
+  }),
+  asks: defineCollection({
+    // Runtime asks the daemon writes at `.revkit/asks/<id>.json`, gitignored
+    // (ADR-0007 acceptance). The id is the filename, never a body field.
+    // The collection is empty in a fresh checkout — it validates promoted
+    // asks (via `revkit ask --keep`, wired up in M2) so a stale spec still
+    // fails the build with a clear message. In consumer mode the asks
+    // path is `<consumer>/.revkit/asks/`; `revkit build` symlinks
+    // `<staging>/.revkit` → `<consumer>/.revkit` so the same relative
+    // glob reaches it.
+    loader: glob({
+      base: "../.revkit/asks",
+      pattern: "*.json",
+    }),
+    schema: askSchema,
+  }),
+};

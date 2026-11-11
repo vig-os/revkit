@@ -9,3 +9,26 @@
 
 # Default: all files require review from the maintainer
 #*                               @username
+
+# Security-sensitive files require an extra review — a change to any
+# of these edits the guard surface (`revkit check`, `revkit check-dist`,
+# ADR-0005 / ADR-0012). Ownership pins the maintainer as a reviewer so
+# no PR silently widens the allowlist. Change to a security team handle
+# (e.g. @vig-os/security) once one exists.
+packages/cli/src/dist-check-allowlist.json     @gerchowl
+packages/cli/src/rules/frontmatter.ts          @gerchowl
+packages/cli/src/rules/component-registry.ts   @gerchowl
+packages/cli/src/rules/vendored-code.ts        @gerchowl
+packages/cli/src/url-scheme.ts                 @gerchowl
+packages/cli/src/check-dist.ts                 @gerchowl
+
+# Vendored third-party source (ADR-0022). Every LICENSE / UPSTREAM /
+# source drop here is the maintainer's manual audit: the
+# `vendored-code` guard enforces the STRUCTURE (UPSTREAM shape,
+# symlink refusal, layout, NOTICE format + SPDX id echoing UPSTREAM)
+# but the LICENSE BYTES are gated by this CODEOWNERS entry — an
+# SPDX-canonical text matcher that admits real upstream LICENSE
+# variance while refusing adversarial appends belongs behind a
+# well-tested library (see the follow-up issue named in PR #30).
+packages/components/vendor/                    @gerchowl
+NOTICE                                         @gerchowl
