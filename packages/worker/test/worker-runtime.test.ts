@@ -29,6 +29,7 @@ import {
   scanAllForbidden,
   scanForForbidden,
   startWorker,
+  TEST_REVKIT_VERSION,
   workerBundle,
   type Harness,
 } from "./harness.ts";
@@ -167,7 +168,7 @@ describe("ADR-0025 runtime gate", () => {
     expect(body.ok).toBe(true);
     // The version the Worker RUNS, not the repo's current CLI version:
     // a deployed Worker is pinned to the release it was deployed as.
-    expect(body.revkitVersion).toBe("0.0.0");
+    expect(body.revkitVersion).toBe(TEST_REVKIT_VERSION);
     expect(body.requestId).toMatch(/^[0-9a-f-]{36}$/);
   });
 
@@ -493,7 +494,7 @@ describe("ADR-0025 runtime gate", () => {
     // A stored page that tries to load a bundle from the revkit-owned
     // path must not be redirected: a browser drops the path part of a CSP
     // source after a redirect, which would widen script-src.
-    const bundle = await harness.dispatch("http://localhost/_revkit/0.0.0/rail.js");
+    const bundle = await harness.dispatch(`http://localhost/_revkit/${TEST_REVKIT_VERSION}/rail.js`);
     expect(bundle.status).toBe(404);
     expect(bundle.headers.get("location")).toBeNull();
   });
@@ -552,7 +553,7 @@ describe("ADR-0025 runtime gate", () => {
       [READ_PATH, "GET"],
       [READ_PATH, "POST"],
       ["/api/session/refresh", "POST"],
-      ["/_revkit/0.0.0/x.js", "GET"],
+      [`/_revkit/${TEST_REVKIT_VERSION}/x.js`, "GET"],
       ["/revkit/pr-1/", "GET"],
     ] as const) {
       const response = await harness.dispatch(`http://localhost${path}`, {

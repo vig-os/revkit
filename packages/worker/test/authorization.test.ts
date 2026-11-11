@@ -60,11 +60,19 @@ import {
   issueTestSession,
   seedLogEvents,
   stripTsComments,
+  TEST_REVKIT_VERSION,
   testTokenHasher,
   JSON_HEADERS,
   startWorker,
   type Harness,
 } from "./harness.ts";
+
+/** The one spelling of a revkit bundle path this file's assertions compare
+ * against: `TEST_REVKIT_VERSION` is `wrangler.jsonc`'s `vars.REVKIT_VERSION`,
+ * so the version segment is the one `env.REVKIT_VERSION` gives the Worker — a
+ * release-stamped tree (`scripts/set-release-version.mjs`) carries through
+ * here rather than tripping over a hand-written dev-placeholder literal (#231). */
+const BUNDLE_PATH = `/_revkit/${TEST_REVKIT_VERSION}/rail.js` as const;
 
 /**
  * The review these cases are about, and the ONE path that reads it.
@@ -183,7 +191,7 @@ const FIXED_PATHS = [
   "/invite/redeem",
   "/invite/abc",
   "/invite/",
-  "/_revkit/0.0.0/rail.js",
+  BUNDLE_PATH,
   "/_revkit",
   REMOVED_THREADS_PATH,
   `${REMOVED_THREADS_PATH}/`,
@@ -225,7 +233,7 @@ const GATED_PATHS = [THREADS_PATH, SESSION_REFRESH_PATH, "/revkit/pr-7/index.htm
 // to probe with: `/api/threads/` is no longer "a near miss of the read" but an
 // unrecognised path, and `/revkit/pr-7/api/threads/` — which IS a preview path —
 // is gated, so it cannot stand in for an ungated probe.
-const UNGATED_PATHS = [HEALTH_PATH, "/_revkit/0.0.0/rail.js", "/nope", REMOVED_THREADS_PATH] as const;
+const UNGATED_PATHS = [HEALTH_PATH, BUNDLE_PATH, "/nope", REMOVED_THREADS_PATH] as const;
 
 /** What `harness.dispatch` actually resolves to. Not the DOM `Response`: bun's
  * and `@cloudflare/workers-types`' declarations of that type disagree (one has
@@ -361,7 +369,7 @@ describe("ADR-0012's per-request gate", () => {
         ["/Revkit/pr-7/index.html GET"]: "unknown",
         ["/REVKIT/pr-7/api/threads GET"]: "unknown",
         ["/API/pr-7/index.html GET"]: "unknown",
-        ["/_revkit/0.0.0/rail.js GET"]: "revkit-bundle",
+        [`${BUNDLE_PATH} GET`]: "revkit-bundle",
         ["/revkit/pr-7/api/threads GET"]: "threads-read",
         ["/revkit/pr-7/api/threads POST"]: "threads-append",
         ["/revkit/pr-7/api/threads PUT"]: "method-not-allowed",
@@ -1120,7 +1128,7 @@ describe("ADR-0012's per-request gate", () => {
       // The REMOVED unscoped read is here rather than a near-miss spelling of
       // the new one: `/revkit/pr-7/api/threads/` is a preview path (gated, 501)
       // and cannot stand in for an ungated 404.
-      for (const pathname of ["/nope", "/_revkit/0.0.0/rail.js", REMOVED_THREADS_PATH, `${REMOVED_THREADS_PATH}/`]) {
+      for (const pathname of ["/nope", BUNDLE_PATH, REMOVED_THREADS_PATH, `${REMOVED_THREADS_PATH}/`]) {
         const refusal = await refusalOf(await harness.dispatch(`http://localhost${pathname}`));
         expect(refusal.status).toBe(404);
         expect(refusal.raw).not.toContain(SEED_BODY);
@@ -1890,7 +1898,7 @@ describe("ADR-0012's per-request gate", () => {
         { label: "health 405 (wrong verb)", path: HEALTH_PATH, init: () => ({ method: "POST" }), expected: 405 },
         { label: "unknown 404", path: "/nope", expected: 404 },
         { label: "threads 401 (no cookie)", path: THREADS_PATH, expected: 401 },
-        { label: "bundle 404", path: "/_revkit/0.0.0/rail.js", expected: 404 },
+        { label: "bundle 404", path: BUNDLE_PATH, expected: 404 },
         { label: "threads 200", path: THREADS_PATH, init: (i) => ({ headers: authHeaders(i) }), expected: 200 },
         { label: "threads 400 (bad ?since)", path: `${THREADS_PATH}?since=-1`, init: (i) => ({ headers: authHeaders(i) }), expected: 400 },
         { label: "refresh 200", path: SESSION_REFRESH_PATH, init: (i) => ({ method: "POST", headers: { ...authHeaders(i), ...JSON_HEADERS } }), expected: 200 },

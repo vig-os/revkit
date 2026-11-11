@@ -63,9 +63,9 @@ import {
   clearPreviews,
   issueTestSession,
   previewSpyBundle,
-  readWranglerConfig,
   resetInvites,
   startWorker,
+  TEST_REVKIT_VERSION,
   testTokenHasher,
   type Harness,
 } from "./harness.ts";
@@ -83,7 +83,7 @@ const INDEX_KEY = `${REPO}/pr-${PR}/${PREVIEW_INDEX_OBJECT}`;
 /** `REVKIT_VERSION` as `wrangler.jsonc` pins it, so the `script-src` assertion
  *  below compares against the SHIPPED var rather than against a literal that
  *  could drift from it. `wrangler.jsonc` is the source for the Worker too. */
-const VERSION = (readWranglerConfig()["vars"] as Record<string, string>)["REVKIT_VERSION"] as string;
+const VERSION = TEST_REVKIT_VERSION;
 
 /** The stored metadata a PR's build pipeline would attach. **`text/javascript`
  *  under `index.html` is the case this file's centre exists for**: if any line of
