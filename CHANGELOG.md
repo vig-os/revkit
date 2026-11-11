@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.1.0] - TBD
+
+### Added
+
 - **Deployment targets and pluggable auth** ([#195](https://github.com/vig-os/revkit/issues/195), [#192](https://github.com/vig-os/revkit/issues/192))
   - ADR-0026 decides four targets (local, private VPN, plain Linux host/VM, Cloudflare) and a minimal auth-provider
     interface (none, trusted-proxy headers, per-site tokens, Cloudflare Access).
@@ -86,10 +100,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The daemon's emitted CSP is byte-for-byte unchanged; its existing
     BYTE-EXACT test was not edited.
 
-### Deprecated
-
-### Removed
-
 ### Fixed
 
 - **One version source, stamped by the release train** ([#201](https://github.com/vig-os/revkit/issues/201))
@@ -144,3 +154,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names without visible content before D1, returning the documented refusal
   without consuming the invite's browser slot. The cap counts Unicode code points,
   and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).
+
