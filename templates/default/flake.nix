@@ -1,21 +1,22 @@
 {
   description = "A minimal revkit docs repo (scaffolded by `nix flake init -t github:vig-os/revkit`).";
 
-  # The one revkit input this repo needs. Pin to a tag once revkit has a
-  # release; the scaffold ships the floating default so a fresh checkout
-  # works without extra flags. Bump deliberately.
+  # The one revkit input this repo needs, PINNED to a release tag (ADR-0021:
+  # consumers pin a tag; a branch moves under you). The scaffold ships the
+  # latest tag at the time it was cut; bump it deliberately with
+  # `nix flake update revkit` after editing `?ref=`. To pin an exact commit
+  # instead (e.g. to test an unreleased fix):
   #
-  # Until revkit's next release ships M5 (`packages.revkit`,
-  # `templates.default`, `lib.hooks`) to `main`, the floating default
-  # branch (`main`) has no `packages` output and evaluation fails with
-  # `attribute 'packages' missing`. Point at `dev` in the meantime:
+  #   revkit.url = "github:vig-os/revkit/<full-commit-sha>";
   #
-  #   revkit.url = "github:vig-os/revkit/dev";
+  # The pin is the release this scaffold shipped with. Before that final release
+  # exists the tag does not resolve: pin a candidate tag (`?ref=X.Y.Z-rcN`) or a
+  # full commit SHA (above) instead.
   #
-  # After the release, `github:vig-os/revkit` alone (or a pinned tag)
-  # works.
+  # `revkit --version` prints `X.Y.Z (<rev>)`. A release candidate
+  # (`X.Y.Z-rcN`) reports the base `X.Y.Z` plus its rev; a final reports `X.Y.Z`.
   inputs = {
-    revkit.url = "github:vig-os/revkit/dev";
+    revkit.url = "github:vig-os/revkit?ref=0.1.0";
     # Follow revkit's pinned nixpkgs + flake-utils so the CLI's runtime
     # (Bun, deps) matches the version revkit was built with — no drift.
     nixpkgs.follows = "revkit/nixpkgs";

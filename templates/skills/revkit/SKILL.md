@@ -299,12 +299,18 @@ during the poll is under 1 second.
 
    ```nix
    # your flake.nix
-   inputs.revkit.url = "github:vig-os/revkit?ref=<tag>";
+   inputs.revkit.url = "github:vig-os/revkit?ref=0.1.0";
    ```
 
+   Always pin a release tag, or an exact commit with
+   `github:vig-os/revkit/<full-commit-sha>`; never float on a branch.
+   `revkit --version` prints `X.Y.Z (<rev>)` — a release candidate reports
+   its base `X.Y.Z` plus the rev, so use the tag or the rev when you need an
+   exact candidate identity.
+
    Scaffolding a fresh docs repo also works: `nix flake init -t
-   github:vig-os/revkit` writes a starter tree that already pulls in
-   revkit's packages.
+   "github:vig-os/revkit?ref=0.1.0"` writes a starter tree that already
+   pulls in revkit's packages, pinned to that tag.
 
 2. Install this skill file with the packaged CLI:
 

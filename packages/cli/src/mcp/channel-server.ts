@@ -51,6 +51,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { DaemonClient, DaemonHttpError } from "./daemon-client.ts";
 import { PUBLISH_ARRAY_SHAPE_MAX } from "../serve/publish.ts";
+import { VERSION } from "../version.ts";
 import {
   startEventSubscriber,
   type EventSubscriberHandle,
@@ -87,7 +88,7 @@ export interface ChannelServerOptions {
   /** MCP server name — the `source="..."` attribute on the channel
    * tag. Defaults to `"revkit"`. */
   readonly name?: string;
-  /** MCP server version — defaults to `"0.0.0"`. */
+  /** MCP server version — defaults to the CLI's single version source. */
   readonly version?: string;
   /** Test hook, replaces `startEventSubscriber` so a test can drive
    * events synchronously. */
@@ -866,7 +867,7 @@ const publishArgsSchema = z
  * whose `stop()` shuts down the transport and the SSE loop. */
 export async function startChannelServer(options: ChannelServerOptions): Promise<ChannelServerHandle> {
   const name = options.name ?? "revkit";
-  const version = options.version ?? "0.0.0";
+  const version = options.version ?? VERSION;
   const reconnectBase = options.reconnectBaseDelayMs ?? 500;
   const reconnectMax = options.reconnectMaxDelayMs ?? 30_000;
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));

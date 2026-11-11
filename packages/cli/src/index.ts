@@ -33,9 +33,10 @@ import { runHookCommand } from "./hook-cli.ts";
 import { runModeCommand } from "./mode-cli.ts";
 import { runSkillCommand } from "./skill-cli.ts";
 import { resolve as resolvePath } from "node:path";
+import { VERSION, versionLine } from "./version.ts";
 
-/** Version rendered by `revkit --version`, kept in lockstep with `package.json`. */
-export const VERSION = "0.0.0";
+/** Re-exported so callers keep importing the version from the CLI entry. */
+export { VERSION };
 
 /** Text rendered by `revkit --help`. */
 export const HELP = `revkit ${VERSION}
@@ -188,7 +189,7 @@ export async function dispatch(
         exitCode: ExitCode.usage,
       };
     }
-    return { stdout: `${VERSION}\n`, stderr: "", exitCode: ExitCode.ok };
+    return { stdout: `${versionLine()}\n`, stderr: "", exitCode: ExitCode.ok };
   }
 
   if (first === "--help" || first === "-h" || first === undefined) {

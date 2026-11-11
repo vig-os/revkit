@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One version source, stamped by the release train** ([#201](https://github.com/vig-os/revkit/issues/201))
+  - `revkit --version` and the flake package version both derive from `packages/cli/package.json`; the duplicate
+    `VERSION` constant is gone and a test fails if a second literal appears.
+  - The prepare-release seam stamps `X.Y.Z` into it on `release/X.Y.Z` (`scripts/set-release-version.mjs`), so
+    candidates and finals carry the release version. `--version` also prints the build revision (`X.Y.Z (<rev>)`):
+    a candidate reports its base `X.Y.Z` plus rev, a final exactly `X.Y.Z` (ADR-0021 amendment).
+  - Stamping `-rcN` itself needs a devkit change: [vig-os/devkit#2070](https://github.com/vig-os/devkit/issues/2070).
+  - The Worker's `REVKIT_VERSION` var is stamped by the same script, and the MCP server's version falls back to the
+    CLI version instead of a hidden `"0.0.0"`; a test fails on any semver literal in package sources.
+  - The template, README and installed SKILL.md pin `?ref=X.Y.Z` instead of floating on `dev`; the script stamps those
+    pins on `release/X.Y.Z`, so candidates and the final carry the tag that exists after promotion. Before the final
+    exists, pin a candidate tag or a commit SHA (ADR-0021 amendment).
+  - `set-release-version.mjs` rewrites only the top-level `version` key and refuses a `--file` with no value.
 - Packaged MCP auto-start reuses its executable without Bun on PATH; daemon
   startup errors keep MCP available. Templates and `revkit skill install`
   supply a project MCP registration with conflict checks and backups (#197, #198).

@@ -129,7 +129,9 @@ Scaffold a fresh docs repo from the template:
 
 ```bash
 mkdir my-docs && cd my-docs && git init
-nix flake init -t github:vig-os/revkit
+nix flake init -t "github:vig-os/revkit?ref=0.1.0"   # pin a release tag
+# Before 0.1.0 is released that tag does not exist yet: pin a candidate tag
+# (?ref=0.1.0-rcN) or a full commit SHA (github:vig-os/revkit/<sha>) instead.
 direnv allow                          # or: nix develop
 revkit check                          # ADR-0005 authoring guards
 nix build                             # runs revkit check under a docs derivation
@@ -141,7 +143,9 @@ Or wire it into an existing flake:
 ```nix
 # your flake.nix
 {
-  inputs.revkit.url = "github:vig-os/revkit";
+  # Pin a release tag (or a full commit SHA: "github:vig-os/revkit/<sha>");
+  # never float on a branch.
+  inputs.revkit.url = "github:vig-os/revkit?ref=0.1.0";
   outputs = { self, nixpkgs, revkit, ... }: let
     system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};

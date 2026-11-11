@@ -86,6 +86,8 @@
         revkitPkg = pkgs.callPackage ./nix/revkit-package.nix {
           inherit system nodeModulesHashes;
           src = ./.;
+          # Identifies the build down to its commit (`revkit --version`).
+          revision = self.shortRev or self.dirtyShortRev or "unknown";
         };
 
         # ────────────────────────────────────────────────────────────────────

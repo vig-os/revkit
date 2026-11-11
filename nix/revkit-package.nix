@@ -37,10 +37,13 @@
 #     bun's per-user caches inside the build sandbox.
 #
 # Version pinning: the CLI's semver comes from `packages/cli/package.json`
-# — the single source of truth per ADR-0021, mirrored by
-# `packages/cli/src/index.ts`'s `VERSION` constant. The Nix package
-# `version` attribute is derived the same way so `nix build`, `bun run`
-# and `revkit --version` cannot disagree.
+# — the single source of truth per ADR-0021 (the prepare-release seam writes
+# it; `packages/cli/src/version.ts` imports it, no second literal). The Nix
+# package `version` attribute is derived the same way so `nix build`, `bun run`
+# and `revkit --version` cannot disagree. `revision` (the flake's
+# `self.shortRev`) is exported to the wrapper as REVKIT_BUILD_REV so a build
+# is identifiable down to its commit — a candidate reports the base X.Y.Z
+# plus that rev (#201).
 #
 # Per-system deps hash: bun installs platform-native binaries
 # (`esbuild-linux-x64` vs `esbuild-darwin-arm64`, `sharp`, `rolldown`,
@@ -62,6 +65,9 @@
   makeWrapper,
   # Source root: the revkit repo (from flake.nix, `./.`).
   src,
+  # Short source revision (`self.shortRev or self.dirtyShortRev` from
+  # flake.nix); "unknown" when the source is not a git checkout.
+  revision ? "unknown",
   # Per-system hashes. A missing system falls back to `lib.fakeHash` so
   # the first build reports the correct hash in its rejection message.
   nodeModulesHashes ? { },
@@ -69,9 +75,8 @@
 
 let
   # CLI package.json is the version source of truth (ADR-0021 SemVer via
-  # the devkit release train; `packages/cli/src/index.ts` reads the same
-  # value into its `VERSION` constant, and the Nix `version` picks it
-  # up here so all three agree).
+  # the devkit release train; `packages/cli/src/version.ts` imports the same
+  # file, and the Nix `version` picks it up here so all three agree).
   cliManifest = builtins.fromJSON (builtins.readFile "${src}/packages/cli/package.json");
   inherit (cliManifest) version;
 
@@ -337,6 +342,7 @@ stdenvNoCC.mkDerivation {
     # user's CWD intact — `revkit check` and `revkit serve` walk from
     # CWD, not from the package dir.
     makeWrapper ${bun}/bin/bun $out/bin/revkit \
+      --set REVKIT_BUILD_REV ${lib.escapeShellArg revision} \
       --add-flags "$out/libexec/revkit/packages/cli/bin/revkit.js"
 
     runHook postInstall
