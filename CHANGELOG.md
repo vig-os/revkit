@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Upgrade `@modelcontextprotocol/sdk` to 1.32.2** ([#227](https://github.com/vig-os/revkit/issues/227))
+  - Fixes two high-severity advisories in 1.31.0: GHSA-22jm-h49p-29qw (experimental tasks not tied to the creating
+    session) and GHSA-46jr-4wx8-v453 (request validation could exhaust server memory over HTTP).
+  - revkit's MCP server uses the low-level `Server` over stdio only, with no `taskStore`, so neither advisory path is
+    reachable from it; the upgrade clears Dependency Review and keeps the dependency current.
+
 ## [0.1.0] - TBD
 
 ### Added
@@ -154,4 +160,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names without visible content before D1, returning the documented refusal
   without consuming the invite's browser slot. The cap counts Unicode code points,
   and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).
-

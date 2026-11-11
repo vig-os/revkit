@@ -40,7 +40,7 @@
   "devDependencies": {
     "@astrojs/check": "0.9.10",
     "@axe-core/playwright": "4.13.0",
-    "@modelcontextprotocol/sdk": "1.31.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "@playwright/test": "1.59.1",
     "@types/bun": "1.4.2",
     "@types/css-tree": "2.3.10",
