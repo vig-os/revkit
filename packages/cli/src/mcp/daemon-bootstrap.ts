@@ -48,7 +48,7 @@ export interface BootstrapOptions {
    * to `revkit serve --dir`. Defaults to `site/dist`. */
   readonly dir?: string;
   /** Path to the `revkit` CLI entrypoint (`bin/revkit.js`). Defaults
-   * to the entry that ships with this package. Tests inject the
+   * to the entry that ships with this running package. Tests inject the
    * absolute path to the local checkout's `bin/revkit.js`. */
   readonly revkitBin?: string;
   /** Test hook: swap out the spawn implementation. Defaults to
@@ -110,7 +110,7 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
 
   // Case 2: no live daemon. Spawn one.
   const revkitBin = options.revkitBin ?? defaultRevkitBin();
-  const cmd = ["bun", revkitBin, "serve"];
+  const cmd = [...daemonExecutable(revkitBin), "serve"];
   if (options.dir !== undefined) {
     cmd.push("--dir", options.dir);
   }
@@ -142,8 +142,16 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
     }
   }
   throw new Error(
-    `revkit mcp: spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
+    `spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
   );
+}
+
+/** Reuse the running runtime by absolute path. Compiled Bun programs have
+ * their entry inside Bun's virtual filesystem and need no script argument. */
+export function daemonExecutable(entry: string, main = Bun.main, executable = process.execPath): string[] {
+  return main.startsWith("/$bunfs/") || main.startsWith("B:/~BUN/")
+    ? [executable]
+    : [executable, entry];
 }
 
 /** Default `spawn`: `Bun.spawn` with `detached: true`, running with
@@ -201,7 +209,7 @@ export function defaultRevkitBin(): string {
  * (PR #38 round-2 review). Anything the daemon needs at runtime
  * must be listed here by name.
  *
- * - `PATH`: `bun` is on it (the flake dev shell put it there).
+ * - `PATH`: preserved for tools the daemon invokes; bootstrap never resolves Bun through it.
  * - `HOME`: `bun install`, `bun run` look up config there.
  * - `USER`: some tools resolve `$USER/…` in home paths.
  * - `TMPDIR` (+ `TMP` / `TEMP`): where `mktemp` lands.

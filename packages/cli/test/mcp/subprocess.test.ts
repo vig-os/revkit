@@ -59,6 +59,28 @@ describe("revkit mcp — real subprocess", () => {
     try { rmSync(root, { recursive: true, force: true }); } catch { /* eventual */ }
   });
 
+  test("auto-start failure leaves MCP available and returns a tool error", async () => {
+    // Prevent the daemon from creating its state directory.
+    writeFileSync(join(root, ".revkit"), "occupied");
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [REVKIT_BIN, "mcp", "--dir", "dist"],
+      cwd: root,
+      env: { ...filteredDaemonEnv(process.env), PATH: "" },
+    });
+    const client = new Client({ name: "startup-failure", version: "0" });
+    try {
+      await client.connect(transport);
+      expect((await client.listTools()).tools.length).toBeGreaterThan(0);
+      const result = await client.callTool({ name: "threads", arguments: {} });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain("daemon unavailable");
+      expect((await client.listTools()).tools.length).toBeGreaterThan(0);
+    } finally {
+      await client.close();
+    }
+  }, 40_000);
+
   test("initialize + tools/list against a fresh spawned daemon", async () => {
     // Assert the binary is executable up front — a permission drop
     // (chmod during install) would otherwise surface as a cryptic
@@ -67,13 +89,13 @@ describe("revkit mcp — real subprocess", () => {
 
     // Client speaks to the subprocess over stdio.
     const transport = new StdioClientTransport({
-      command: "bun",
+      command: process.execPath,
       args: [REVKIT_BIN, "mcp", "--dir", "dist"],
       cwd: root,
       // Reuse the daemon-bootstrap allowlist here too, so this
       // test's env matches production behaviour (nothing hostile
       // leaks in from the test runner's env).
-      env: { ...filteredDaemonEnv(process.env), REVKIT_MCP_SUBPROCESS_TEST: "1" },
+      env: { ...filteredDaemonEnv(process.env), PATH: "", REVKIT_MCP_SUBPROCESS_TEST: "1" },
     });
     const client = new Client(
       { name: "revkit-mcp-subprocess-test", version: "0.0.0" },

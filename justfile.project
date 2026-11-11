@@ -787,3 +787,8 @@ cf *args:
     [[ "$(stat -c %a "$env_file" 2>/dev/null || stat -f %Lp "$env_file")" == "600" ]] || { echo "$env_file must be mode 600" >&2; exit 1; }
     set -a; . "$env_file"; set +a
     WRANGLER_SEND_METRICS=false exec wrangler {{ args }}
+
+# Consumer package and template integration smoke (same script as CI).
+[group('testing')]
+template-smoke:
+    bash scripts/template-smoke.sh "{{justfile_directory()}}"

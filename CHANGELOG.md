@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- Packaged MCP auto-start reuses its executable without Bun on PATH; daemon
+  startup errors keep MCP available. Templates and `revkit skill install`
+  supply a project MCP registration with conflict checks and backups (#197, #198).
+- A daemon that is down when MCP starts is primed on the first successful late
+  connect (subscribe from head, one catch-up summary) instead of replaying from
+  seq 0; the startup error no longer repeats the `revkit mcp:` prefix; an
+  existing registration that only adds keys is accepted, and the registration
+  installs without `--force` replacing an existing `SKILL.md` (#197, #198).
+- MCP reconnect is single-flight: a tool call during a background reconnect awaits
+  the same attempt, and attaching a subscriber closes any previous one, so live
+  events are no longer delivered twice after a late daemon connect (#197, #198).
+
 ### Added
 
 - **Deployment targets and pluggable auth** ([#195](https://github.com/vig-os/revkit/issues/195), [#192](https://github.com/vig-os/revkit/issues/192))

@@ -15,7 +15,7 @@
 // exit code 2 with `unknown argument 'skill'`.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { dispatch } from "../src/index.ts";
@@ -57,6 +57,85 @@ describe("revkit skill install", () => {
     expect(existsSync(target)).toBe(true);
     // Byte-for-byte with the packaged source.
     expect(readFileSync(target, "utf8")).toBe(readFileSync(PACKAGED_SKILL_PATH, "utf8"));
+  });
+
+  test("creates the same packaged MCP registration as the template", () => {
+    expect(runSkillCommand(["install"], { cwd: scratch }).exitCode).toBe(0);
+    const config = JSON.parse(readFileSync(resolve(scratch, ".mcp.json"), "utf8"));
+    const template = JSON.parse(readFileSync(resolve(__dirname, "../../../templates/default/.mcp.json"), "utf8"));
+    expect(config).toEqual(template);
+    expect(config.mcpServers.revkit).toEqual({ command: "revkit", args: ["mcp"] });
+  });
+
+  test("checkout registration uses the local flake app without a Bun PATH lookup", () => {
+    const config = JSON.parse(readFileSync(resolve(__dirname, "../../../.mcp.json"), "utf8"));
+    expect(config.mcpServers.revkit).toEqual({ command: "nix", args: ["run", ".#revkit", "--", "mcp"] });
+  });
+
+  test("an identical template registration is accepted without force", () => {
+    const template = readFileSync(resolve(__dirname, "../../../templates/default/.mcp.json"), "utf8");
+    writeFileSync(resolve(scratch, ".mcp.json"), template);
+    expect(runSkillCommand(["install"], { cwd: scratch }).exitCode).toBe(0);
+    expect(readdirSync(scratch).some((name) => name.startsWith(".mcp.json.backup-"))).toBe(false);
+  });
+
+  test("an existing registration that only adds keys is equivalent, not a conflict", () => {
+    const target = resolve(scratch, ".mcp.json");
+    const prior = JSON.stringify({ mcpServers: { revkit: { type: "stdio", command: "revkit", args: ["mcp"], env: { A: "1" } } } });
+    writeFileSync(target, prior);
+    expect(runSkillCommand(["install"], { cwd: scratch }).exitCode).toBe(0);
+    expect(readFileSync(target, "utf8")).toBe(prior);
+    expect(readdirSync(scratch).some((name) => name.startsWith(".mcp.json.backup-"))).toBe(false);
+  });
+
+  test("an existing SKILL.md does not block adding the registration, and is left untouched without --force", () => {
+    const skillDir = resolve(scratch, ".claude/skills/revkit");
+    mkdirSync(skillDir, { recursive: true });
+    const custom = "# my customised skill\n";
+    writeFileSync(resolve(skillDir, "SKILL.md"), custom);
+    const outcome = runSkillCommand(["install"], { cwd: scratch });
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.stdout).toContain("Registered revkit mcp");
+    expect(readFileSync(resolve(skillDir, "SKILL.md"), "utf8")).toBe(custom);
+    expect(readdirSync(skillDir)).toEqual(["SKILL.md"]);
+    const config = JSON.parse(readFileSync(resolve(scratch, ".mcp.json"), "utf8"));
+    expect(config.mcpServers.revkit).toEqual({ command: "revkit", args: ["mcp"] });
+  });
+
+  test("merges registration while preserving other servers and metadata", () => {
+    const other = { command: "other", args: ["start"] };
+    writeFileSync(resolve(scratch, ".mcp.json"), JSON.stringify({ metadata: true, mcpServers: { other } }));
+    expect(runSkillCommand(["install"], { cwd: scratch }).exitCode).toBe(0);
+    const config = JSON.parse(readFileSync(resolve(scratch, ".mcp.json"), "utf8"));
+    expect(config.metadata).toBe(true);
+    expect(config.mcpServers.other).toEqual(other);
+    expect(config.mcpServers.revkit.command).toBe("revkit");
+  });
+
+  test("conflicting registration refuses before writing the skill; force backs up", () => {
+    const target = resolve(scratch, ".mcp.json");
+    const prior = JSON.stringify({ mcpServers: { revkit: { command: "custom" } } });
+    writeFileSync(target, prior);
+    const refused = runSkillCommand(["install"], { cwd: scratch });
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("already exists");
+    expect(existsSync(resolve(scratch, ".claude/skills/revkit/SKILL.md"))).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe(prior);
+    expect(runSkillCommand(["install", "--force"], { cwd: scratch }).exitCode).toBe(0);
+    const backup = readdirSync(scratch).find((name) => name.startsWith(".mcp.json.backup-"));
+    expect(backup).toBeDefined();
+    expect(readFileSync(resolve(scratch, backup!), "utf8")).toBe(prior);
+  });
+
+  test("malformed registration refuses even with force", () => {
+    const target = resolve(scratch, ".mcp.json");
+    for (const prior of ["{broken", "[]", '{"mcpServers":[]}']) {
+      writeFileSync(target, prior);
+      const result = runSkillCommand(["install", "--force"], { cwd: scratch });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("cannot merge");
+      expect(readFileSync(target, "utf8")).toBe(prior);
+    }
   });
 
   test("--dir <path> installs under a different root", () => {
