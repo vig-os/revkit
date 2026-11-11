@@ -1,6 +1,6 @@
 {
   "name": "@revkit/cli",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "revkit CLI (M1: --version, --help, check, escalate; M2: serve, mcp).",
