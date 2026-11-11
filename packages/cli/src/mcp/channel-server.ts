@@ -1244,6 +1244,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       throw new Error("daemon has not connected yet");
     }
     const subscribe = options.subscribeEvents ?? startEventSubscriber;
+    // Invariant: at most one live subscriber. A handle overwritten
+    // without being closed would deliver every event twice.
+    subscriberHandle?.close();
     subscriberHandle = subscribe({
       url: currentUrl,
       agentToken: currentToken,
@@ -1304,13 +1307,23 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     }
   };
 
-  /** Single reconnect attempt: close the current subscriber, run
+  /** Single-flight wrapper: the background loop and tool calls share ONE
+   * in-flight attempt, so no second concurrent `discover`/attach exists. */
+  let reconnectInFlight: Promise<void> | undefined;
+  const reconnectOnce = (reason: string): Promise<void> => {
+    reconnectInFlight ??= reconnectAttempt(reason).finally(() => {
+      reconnectInFlight = undefined;
+    });
+    return reconnectInFlight;
+  };
+
+  /** One reconnect attempt: close the current subscriber, run
    * `discover`, rebuild the client, and re-attach the subscriber:
    * through `primeAndSubscribe` when no connect has primed yet, else
    * resuming with `lastSeenSeq` capped at the fresh daemon's head. Throws on failure
    * so the caller can decide whether to retry (background loop) or
    * to give up and return an error (tool call). */
-  const reconnectOnce = async (reason: string): Promise<void> => {
+  const reconnectAttempt = async (reason: string): Promise<void> => {
     if (options.discover === undefined) throw new Error("no discover");
     void reason;
     subscriberHandle?.close();

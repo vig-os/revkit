@@ -51,7 +51,9 @@ independently of the skill: an existing `SKILL.md` is kept (and an existing
 equivalent registration, even with extra keys such as `"type": "stdio"`, is
 left untouched) unless `--force` is passed. Overwriting `SKILL.md` or
 replacing a conflicting revkit registration requires `--force` and saves a
-backup; malformed `.mcp.json` files are refused. `--dry-run` previews the targets.
+backup; a malformed or conflicting `.mcp.json` is refused before anything is written,
+so it blocks the install even when `SKILL.md` does not exist yet (fix or remove the
+file, or pass `--force` for a conflict). `--dry-run` previews the targets.
 Daemon startup failures leave MCP available and tools report a diagnostic
 while discovery retries. This checkout's `.mcp.json` uses `nix run .#revkit`
 to select the local flake package with workspace-relative paths; `nix run`

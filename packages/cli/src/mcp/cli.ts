@@ -153,9 +153,11 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
   });
-  const bootMsg = state === undefined ? startupDiagnostic : bootstrap?.spawned
-    ? `revkit mcp: started daemon (pid ${state.pid}, ${state.url})\n`
-    : `revkit mcp: attached to daemon (pid ${state.pid}, ${state.url})\n`;
+  let bootMsg = startupDiagnostic;
+  if (state !== undefined) {
+    const verb = bootstrap?.spawned ? "started" : "attached to";
+    bootMsg = `revkit mcp: ${verb} daemon (pid ${state.pid}, ${state.url})\n`;
+  }
   return {
     exitCode: 0,
     stdout: "",

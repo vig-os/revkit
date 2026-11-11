@@ -247,6 +247,66 @@ describe("blocker 2 — replay-on-start", () => {
   });
 });
 
+describe("single-flight reconnect — tool call during background reconnect", () => {
+  let ctx: Ctx;
+  beforeEach(async () => {
+    ctx = await bootDaemon();
+  });
+  afterEach(async () => {
+    await ctx.daemon.stop();
+    rmSync(ctx.root, { recursive: true, force: true });
+  });
+
+  test("late daemon + `threads` call mid-reconnect → one subscriber, one prime, one notification per live comment", async () => {
+    // Fails on e81ae5d: the tool-call path ran its own discover/attach
+    // alongside the background loop; the second attach overwrote the
+    // first subscriber handle (never closed) and every live event was
+    // delivered twice.
+    const notifications: Array<{ params: { content: string; meta?: Record<string, string> } }> = [];
+    const sinceValues: number[] = [];
+    let discoverCalls = 0;
+    const discover: DiscoverFn = async () => {
+      discoverCalls += 1;
+      if (discoverCalls === 1) throw new Error("daemon not up yet");
+      await new Promise((r) => setTimeout(r, 300));
+      return { url: ctx.daemon.url, agentToken: ctx.daemon.agentToken, instanceId: "late-instance" };
+    };
+    const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+    const mcpClient = new Client({ name: "single-flight", version: "0.0.0" }, { capabilities: {} });
+    mcpClient.setNotificationHandler(channelSchema, async (msg) => {
+      notifications.push(msg);
+    });
+    const channel = await startChannelServer({
+      transport: serverTx,
+      discover,
+      reconnectBaseDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      reconnectToolDeadlineMs: 5_000,
+      subscribeEvents: (opts) => {
+        sinceValues.push(opts.since ?? 0);
+        return startEventSubscriber(opts);
+      },
+    });
+    await mcpClient.connect(clientTx);
+    try {
+      await new Promise((r) => setTimeout(r, 50));
+      const result = await mcpClient.callTool({ name: "threads", arguments: {} });
+      expect(result.isError).not.toBe(true);
+      await new Promise((r) => setTimeout(r, 100));
+      await postHumanComment(ctx.daemon, ctx.cookie, "live comment after late connect");
+      await new Promise((r) => setTimeout(r, 400));
+      expect(sinceValues.length).toBe(1);
+      expect(discoverCalls).toBe(2);
+      const live = notifications.filter((n) => n.params.meta?.["kind"] !== "catchup_summary");
+      expect(live.length).toBe(1);
+      expect(notifications.filter((n) => n.params.meta?.["kind"] === "catchup_summary").length).toBeLessThanOrEqual(1);
+    } finally {
+      await channel.stop();
+      await mcpClient.close();
+    }
+  });
+});
+
 describe("blocker 2b — tool call reconnect is bounded", () => {
   let root: string;
   let daemon: DaemonHandle;

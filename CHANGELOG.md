@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seq 0; the startup error no longer repeats the `revkit mcp:` prefix; an
   existing registration that only adds keys is accepted, and the registration
   installs without `--force` replacing an existing `SKILL.md` (#197, #198).
+- MCP reconnect is single-flight: a tool call during a background reconnect awaits
+  the same attempt, and attaching a subscriber closes any previous one, so live
+  events are no longer delivered twice after a late daemon connect (#197, #198).
 
 ### Added
 
