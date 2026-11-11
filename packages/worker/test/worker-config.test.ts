@@ -234,7 +234,68 @@ describe("wrangler.jsonc", () => {
     expect(CONFIG["name"]).toBe("revkit-review");
     expect(typeof CONFIG["compatibility_date"]).toBe("string");
   });
+
+  // ── #231: no hand-written dev-placeholder version in test files ──────
+  test("regression guard: no test file under packages/worker/test hand-writes the dev-placeholder version (#231)", () => {
+    // **The failure this guard catches.** `scripts/set-release-version.mjs`
+    // rewrites `vars.REVKIT_VERSION` on `release/X.Y.Z` and leaves `dev` at
+    // the dev-placeholder. A test that spells the placeholder by hand builds
+    // a `/_revkit/<placeholder>/…` URL against a Worker now serving
+    // `/_revkit/X.Y.Z/…`, 404s, and turns the release PR's `Tests` job red —
+    // which is where #231 first showed up (seven failures in headers /
+    // runtime, found by the release branch, not by `dev` CI).
+    //
+    // **The guard is on `dev`.** The point is shift-left: the next literal
+    // fails the one branch every change touches, not a release branch nobody
+    // rebuilds on green. The ONE sanctioned spelling is `TEST_REVKIT_VERSION`
+    // from `./harness.ts`, which reads it from `wrangler.jsonc`.
+    //
+    // **The placeholder is assembled**, not spelled literally here, so this
+    // scan does not match itself — the exemption is "this file" (the one
+    // comparing paths), and the surrounding worker-config test file has
+    // other legitimate uses of versions that are not the dev placeholder.
+    const PLACEHOLDER = ["0", "0", "0"].join(".");
+    const SELF = fileURLToPath(import.meta.url);
+    const TEST_DIR = fileURLToPath(new URL(".", import.meta.url));
+    const files = listTestFiles(TEST_DIR).filter((path) => path !== SELF);
+    expect(files.length, "at least one test file other than the guard").toBeGreaterThan(0);
+    const offenders: { readonly file: string; readonly line: number; readonly text: string }[] = [];
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      if (!text.includes(PLACEHOLDER)) continue;
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i += 1) {
+        if (lines[i]!.includes(PLACEHOLDER)) {
+          offenders.push({ file, line: i + 1, text: lines[i]!.trim() });
+        }
+      }
+    }
+    // `TEST_REVKIT_VERSION` (from `./harness.ts`) is the one spelling every
+    // test should use — its docstring explains the failure mode this guard
+    // exists to prevent.
+    expect(offenders, `files with a hand-written ${PLACEHOLDER}`).toEqual([]);
+  });
 });
+
+/** Every file under `packages/worker/test`, recursively — so a future
+ * `fixtures/` or `helpers/` subtree is covered automatically by the #231
+ * guard. Skips `node_modules` the same way `trackedSourceFiles` does. */
+function listTestFiles(dir: string): readonly string[] {
+  const out: string[] = [];
+  const walk = (current: string): void => {
+    for (const entry of readdirSync(current)) {
+      const full = join(current, entry);
+      if (statSync(full).isDirectory()) {
+        if (entry === "node_modules") continue;
+        walk(full);
+        continue;
+      }
+      out.push(full);
+    }
+  };
+  walk(dir);
+  return out;
+}
 
 /** Every `.ts` / `.sql` / `.jsonc` / `.json` / `.md` file in the package,
  * so the A28 scan covers source, schema, config and docs alike. */

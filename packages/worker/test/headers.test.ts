@@ -31,7 +31,7 @@ import {
   revkitBundlePath,
   workerHeaderContext,
 } from "../src/headers.ts";
-import { startWorker, type Harness } from "./harness.ts";
+import { startWorker, TEST_REVKIT_VERSION, type Harness } from "./harness.ts";
 
 /** The COMMITTED release artefact. Path is the one ADR-0012's amendment
  * fixes: the allowlist of the revkit version the Worker runs, never one
@@ -43,7 +43,11 @@ const COMMITTED_DIGESTS = Object.keys(ALLOWLIST.sha256);
 /** A digest that is NOT in the allowlist — the hostile-artefact case. */
 const HOSTILE_DIGEST = "d".repeat(64);
 
-const VERSION = "0.0.0";
+/** The version this file's assertions are built against — read from
+ * `wrangler.jsonc` by `TEST_REVKIT_VERSION`, so a release stamp of the Worker
+ * var (`scripts/set-release-version.mjs`) carries through here instead of
+ * leaving a dev-placeholder literal that 404s under `/_revkit/X.Y.Z/…` (#231). */
+const VERSION = TEST_REVKIT_VERSION;
 const ORIGIN = "https://review.example.test";
 
 function ctx(): ReturnType<typeof workerHeaderContext> {
@@ -81,7 +85,7 @@ describe("ADR-0012 headers on the hosted surface", () => {
       await harness.dispatch("http://localhost/nope"),
       await harness.dispatch("http://localhost/api/threads"),
       await harness.dispatch("http://localhost/api/threads", { method: "POST" }),
-      await harness.dispatch("http://localhost/_revkit/0.0.0/x.js"),
+      await harness.dispatch(`http://localhost/_revkit/${VERSION}/x.js`),
     ];
     for (const response of responses) {
       expect(response.headers.get("x-content-type-options")).toBe("nosniff");
@@ -254,7 +258,7 @@ describe("ADR-0012 headers on the hosted surface", () => {
         // names ONLY the current version so a page cannot load an older,
         // possibly vulnerable bundle.
         `/_revkit/${CLIENT_ASSET_FILE}`,
-        "/_revkit/0.0.0/invite-deadbeef.js",
+        `/_revkit/${VERSION}/invite-deadbeef.js`,
         `/_revkit/${VERSION.slice(0, -1)}0/${CLIENT_ASSET_FILE}`,
         // The same asset with the hash REMOVED — an unhashed alias would make
         // the content hash decorative, because a stable URL is what a browser

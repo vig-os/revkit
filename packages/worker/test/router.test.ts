@@ -10,6 +10,7 @@
 // directly as the accepted ones.
 
 import { describe, expect, test } from "bun:test";
+import { TEST_REVKIT_VERSION } from "./harness.ts";
 import {
   API_SEGMENT,
   REVKIT_BUNDLE_ROOT,
@@ -255,7 +256,7 @@ describe("isRevkitBundlePath", () => {
   test("recognises the bundle root and everything under it", () => {
     expect(isRevkitBundlePath("/_revkit")).toBe(true);
     expect(isRevkitBundlePath("/_revkit/")).toBe(true);
-    expect(isRevkitBundlePath("/_revkit/0.0.0/rail.js")).toBe(true);
+    expect(isRevkitBundlePath(`/_revkit/${TEST_REVKIT_VERSION}/rail.js`)).toBe(true);
   });
 
   test("does not claim a preview or an API path", () => {
