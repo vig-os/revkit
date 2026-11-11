@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The changelog gate no longer breaks release branches** ([#228](https://github.com/vig-os/revkit/issues/228))
+  - The commit hook checks structure only (no `###` heading repeated inside a `##` section) via
+    `scripts/check-changelog-structure.mjs`; an empty `## Unreleased` is valid, as it is after the release freeze.
+
 ### Security
 
 ## [0.1.0] - TBD
@@ -154,4 +158,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names without visible content before D1, returning the documented refusal
   without consuming the invite's browser slot. The cap counts Unicode code points,
   and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).
-
