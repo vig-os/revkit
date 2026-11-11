@@ -89,7 +89,7 @@
   "compatibility_flags": [],
   "workers_dev": false,
   "vars": {
-    "REVKIT_VERSION": "0.0.0"
+    "REVKIT_VERSION": "0.1.0"
   },
   "d1_databases": [
     {
