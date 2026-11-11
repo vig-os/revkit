@@ -61,7 +61,7 @@
       # other system fails at eval with a missing-attribute error rather
       # than a mismatched hash at build time.
       nodeModulesHashes = {
-        x86_64-linux = "sha256-bsiAyjkDH5Ss+EJiDBUK3lP2YrLBklhpwD0kiygoHDs=";
+        x86_64-linux = "sha256-24EbeOUICYolGqwH/sTMrYE5mjZAMEhexj/sMKoLAZw=";
         aarch64-linux = "sha256-MYjDAV2hT6Q9vI9wvuDIBgmWmfsyaFtWR8gBO49CHEs=";
         aarch64-darwin = "sha256-jlgIDwYETVIlPcl/6EWMEoEYCOEbABfCciwwd160FFc=";
       };
