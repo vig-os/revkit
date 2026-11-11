@@ -5,7 +5,7 @@
 // (authoring guards) and `revkit check-dist` after (ADR-0012 output
 // gate) so the output is fit for `revkit serve`.
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, relative as relativePath, resolve as resolvePath } from "node:path";
 import { checkDistDirectory } from "../check-dist.ts";
 import { runCheck, toCheckFiles } from "../check.ts";
@@ -13,7 +13,6 @@ import { formatDiagnostic } from "../diagnostics.ts";
 import { walkForCheckables } from "../file-discovery.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
 import { defaultConsumerDist, runPackagedBuild } from "./packaged.ts";
-import { collectPagesWithNonEmptySource } from "./source-body-map.ts";
 
 /** Result shape aligned with the dispatcher's `CliResult`. */
 export interface RunBuildResult {
@@ -159,9 +158,24 @@ export async function runBuildCommand(
   }
 
   // 2. Packaged build.
+  //
+  //    The astro build also writes a side-channel manifest listing
+  //    the dist-relative page paths whose source doc bodies were
+  //    non-empty (issue #237 defense in depth): we give the loader
+  //    the path via `REVKIT_RENDER_GUARD_MANIFEST_PATH`, the loader
+  //    writes it from astro's own content store (so its slug
+  //    choices — github-slugger + any `slug:` frontmatter override
+  //    — are honoured), and we read it back here to hand
+  //    `check-dist` the exact page set. The file lives under the
+  //    build state dir, not inside dist, so nothing extra ships.
+  const renderGuardManifest = join(consumerRoot, ".revkit", "build", "render-guard-manifest.json");
   let result;
   try {
-    result = await runPackagedBuild({ consumerRoot, distOutDir });
+    result = await runPackagedBuild({
+      consumerRoot,
+      distOutDir,
+      renderGuardManifestPath: renderGuardManifest,
+    });
   } catch (error) {
     return {
       exitCode: 1,
@@ -172,15 +186,9 @@ export async function runBuildCommand(
   stdoutLines.push(`revkit build: astro ok — packaged site ${prettyPath(env.cwd, result.packagedSiteDir)}`);
   stdoutLines.push(`revkit build: staging ${prettyPath(env.cwd, result.stagingDir)}`);
 
-  // 3. check-dist on the built output (ADR-0012 output-gate). The
-  //    consumer's docs/ dir is handed in as the source-body source
-  //    so check-dist can run its empty-content-root defense (issue
-  //    #237): a page whose source body was non-empty but whose
-  //    rendered content root is empty fails here, naming the page.
+  // 3. check-dist on the built output (ADR-0012 output-gate).
   if (!parsed.parsed.skipCheckDist) {
-    const pagesWithNonEmptySource = collectPagesWithNonEmptySource(
-      join(consumerRoot, "docs"),
-    );
+    const pagesWithNonEmptySource = readRenderGuardManifest(renderGuardManifest);
     const diagnostics = checkDistDirectory(distOutDir, { pagesWithNonEmptySource });
     if (diagnostics.length > 0) {
       return {
@@ -194,12 +202,43 @@ export async function runBuildCommand(
     }
     stdoutLines.push(`revkit build: check-dist ok`);
   }
+  // The manifest is build-scoped scratch; drop it once check-dist
+  // has consumed it so a stale one from a prior run never masks a
+  // future fresh build.
+  try {
+    rmSync(renderGuardManifest, { force: true });
+  } catch {
+    /* fine */
+  }
 
   stdoutLines.push(``);
   stdoutLines.push(
     `Built at ${prettyPath(env.cwd, distOutDir)}. Run 'revkit serve' to review.`,
   );
   return { exitCode: 0, stdout: stdoutLines.join("\n") + "\n", stderr: "" };
+}
+
+/** Read the render-guard manifest the astro loader wrote. Returns an
+ * empty set when the file is absent or malformed — the empty-content
+ * defense then does nothing, which is strictly weaker than the
+ * build-time guard (which is the primary check anyway). Issue #237. */
+function readRenderGuardManifest(manifestPath: string): ReadonlySet<string> {
+  if (!existsSync(manifestPath)) return new Set();
+  try {
+    const raw = readFileSync(manifestPath, "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed !== null
+      && typeof parsed === "object"
+      && Array.isArray((parsed as { pages?: unknown }).pages)
+    ) {
+      const pages = (parsed as { pages: readonly unknown[] }).pages;
+      return new Set(pages.filter((p): p is string => typeof p === "string"));
+    }
+  } catch {
+    /* fall through to empty */
+  }
+  return new Set();
 }
 
 /** Pretty-print a path relative to `cwd` when it lives inside it,

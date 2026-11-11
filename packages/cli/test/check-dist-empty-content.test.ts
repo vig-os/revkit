@@ -147,6 +147,32 @@ describe("checkDistDirectory — the #237 defense in depth", () => {
     expect(emptyFindings.length).toBe(0);
   });
 
+  test("round-2 reviewer repro — `sub/My_Doc.md` with underscores is flagged under its real Starlight slug", () => {
+    // The previous ad-hoc slugger mapped `sub/My_Doc.md` to
+    // `sub/my-doc/index.html`, so check-dist never saw an entry for
+    // the real dist path `sub/my_doc/index.html`. The new manifest
+    // comes from astro's own content store, so the entry's id is
+    // the slug Starlight actually emits.
+    const dist = scratch();
+    mkdirSync(join(dist, "sub", "my_doc"), { recursive: true });
+    writeFileSync(
+      join(dist, "sub", "my_doc", "index.html"),
+      `<!doctype html><html><body>
+        <main>
+          <h1>My Doc</h1>
+          <div class="${CONTENT_ROOT_CLASS}">\n   <!-- rendered nothing -->\n   </div>
+        </main>
+      </body></html>`,
+      "utf8",
+    );
+    const findings = checkDistDirectory(dist, {
+      pagesWithNonEmptySource: new Set(["sub/my_doc/index.html"]),
+    });
+    const empty = findings.find((d) => d.message.includes("empty rendered content"));
+    expect(empty, JSON.stringify(findings)).toBeDefined();
+    expect(empty?.file).toBe("sub/my_doc/index.html");
+  });
+
   test("check-dist still reports the other kinds of findings alongside the empty-content check", () => {
     const dist = scratch();
     writeFileSync(

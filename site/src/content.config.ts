@@ -22,7 +22,14 @@ import { askSchema } from "@revkit/review-core";
 import { plotSpecSchema } from "./content/schemas/plots.ts";
 import { vocabEntrySchema, vocabFileSchema } from "./content/schemas/vocab.ts";
 import { readConsumerRoot } from "./lib/consumer-root.ts";
-import { assertEveryEntryRendered } from "./content/assert-rendered.ts";
+import {
+  assertEveryEntryRendered,
+  captureRenderErrorsFromLogger,
+  collectPagesFromStore,
+} from "./content/assert-rendered.ts";
+import { renderGuardMode } from "./content/render-guard-mode.ts";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 // Consumer-root mode (issue #57): when set, this config is rendering
 // an EXTERNAL repo's `docs/`, `vocab/`, `plots/` through the packaged
@@ -50,21 +57,73 @@ function composedDocsLoader(): Loader {
  *
  * The astro glob loader catches markdown render errors and stores the
  * entry with `rendered: undefined` — the build then exits 0 and ships
- * an empty `sl-markdown-content`. This wrapper runs the inner loader
- * first, then asserts every entry with a non-empty body also carries
- * non-empty rendered HTML. A violation throws from `load()`, which
- * astro's content-sync treats as fatal and surfaces as a non-zero
- * `revkit build` exit code.
+ * an empty `sl-markdown-content`. This wrapper:
+ *
+ *   1. Intercepts the loader context's `logger.error(...)` calls so the
+ *      astro-logged "Error rendering <entry>: <message>" line is
+ *      captured in a side-channel map keyed by entry name — otherwise
+ *      the underlying error is lost by the time the structural check
+ *      runs (astro does not re-throw it).
+ *   2. Runs the inner loader with that wrapped context.
+ *   3. Asserts every entry with a non-empty body carries non-empty
+ *      rendered HTML. A violation throws
+ *      `EmptyRenderedBodyError` that names the entry id, the
+ *      consumer-visible source path, AND the underlying render error.
  *
  * Applies to BOTH own-repo mode (which uses `composedDocsLoader`) and
  * consumer mode (which uses Starlight's `docsLoader` directly), so the
- * packaged flow is guarded by the same gate the site build uses. */
+ * packaged flow is guarded by the same gate the site build uses.
+ *
+ * Skipped during `astro dev`: the dev server's native error overlay
+ * already surfaces render errors, and a throw from `load()` only
+ * yields astro's unhelpful "Dev server process exited before becoming
+ * ready" message (round-2 review). `renderGuardMode.command` is set by
+ * the companion integration in `render-guard-mode.ts` from
+ * `astro:config:setup`'s `command` arg, so the loader knows whether
+ * `astro build` or `astro dev` is running. */
 function guardedDocsLoader(inner: Loader): Loader {
   return {
     name: `${inner.name}+revkit-render-guard`,
     async load(context) {
-      await inner.load(context);
-      assertEveryEntryRendered(context.store.entries());
+      const renderErrors = new Map<string, string>();
+      const restore = captureRenderErrorsFromLogger(context.logger, renderErrors);
+      try {
+        await inner.load(context);
+      } finally {
+        restore();
+      }
+      // Side-channel for `revkit check-dist`'s defense in depth
+      // (issue #237): write a manifest of the dist-relative page
+      // paths whose source bodies were non-empty. The path comes
+      // from `REVKIT_RENDER_GUARD_MANIFEST_PATH` (set by
+      // `revkit build`'s `spawnAstroBuild` extraEnv). Deriving the
+      // set from astro's own content store means we honour astro's
+      // real slug algorithm (github-slugger + any `slug:`
+      // frontmatter override) without re-implementing it — the
+      // round-2 review pointed out that a re-implementation missed
+      // `_`, `.` and custom slugs.
+      const manifestPath = (process.env["REVKIT_RENDER_GUARD_MANIFEST_PATH"] ?? "").trim();
+      if (manifestPath.length > 0) {
+        const pages = Array.from(collectPagesFromStore(context.store.entries())).sort();
+        try {
+          mkdirSync(dirname(manifestPath), { recursive: true });
+          writeFileSync(manifestPath, JSON.stringify({ pages }, null, 2), "utf8");
+        } catch (error) {
+          context.logger.error(
+            `revkit render guard: could not write manifest at ${manifestPath}: ${(error as Error).message}`,
+          );
+        }
+      }
+      // In `astro dev` the error overlay already surfaces render
+      // failures and the dev server's own supervisor swallows a
+      // `load()` throw into a bare "exited before becoming ready"
+      // message — our structured error does not reach the terminal
+      // the way `astro build` surfaces it. Skip the gate there.
+      if (renderGuardMode.command === "dev") return;
+      assertEveryEntryRendered(context.store.entries(), {
+        renderErrorsByEntryBasename: renderErrors,
+        ...(CONSUMER_ROOT !== null ? { consumerRoot: CONSUMER_ROOT } : {}),
+      });
     },
   };
 }

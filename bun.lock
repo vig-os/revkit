@@ -7,7 +7,7 @@
     },
     "packages/cli": {
       "name": "@revkit/cli",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "bin": {
         "revkit": "./bin/revkit.js",
       },
@@ -31,7 +31,7 @@
         "solid-js": "1.9.15",
         "unified": "11.0.5",
         "yaml": "2.9.1",
-        "zod": "4.6.5",
+        "zod": "4.6.7",
       },
       "devDependencies": {
         "@types/babel__core": "7.20.5",
@@ -58,7 +58,7 @@
       "version": "0.0.0",
       "dependencies": {
         "diff-match-patch": "1.0.5",
-        "zod": "4.6.5",
+        "zod": "4.6.7",
       },
       "devDependencies": {
         "@types/bun": "1.4.2",
@@ -118,9 +118,12 @@
         "remark-rehype": "11.1.2",
         "typescript": "5.9.3",
         "unified": "11.0.5",
-        "zod": "4.6.5",
+        "zod": "4.6.7",
       },
     },
+  },
+  "overrides": {
+    "zod": "4.6.7",
   },
   "packages": {
     "@astrojs/astro2tsx": ["@astrojs/astro2tsx@0.1.2", "", { "dependencies": { "@emnapi/core": "1.11.3", "@napi-rs/wasm-runtime": "1.2.4" } }, "sha512-Uj/M9zbrhu5cIZEvWAGTbQJRKSxXWJ/E59BZwt7F+chrKhbfttW+9rkS/l+1QxoJP1KU3UnpM62M7yszfAI0WA=="],
@@ -1673,7 +1676,7 @@
 
     "youch-core": ["youch-core@0.3.3", "", { "dependencies": { "@poppinss/exception": "^1.2.2", "error-stack-parser-es": "^1.0.5" } }, "sha512-ho7XuGjLaJ2hWHoK8yFnsUGy2Y5uDpqSTq1FkHLK4/oqKtyUU1AFbOOxY4IpC9f0fTLjwYbslUz0Po5BpD1wrA=="],
 
-    "zod": ["zod@4.6.5", "", {}, "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q=="],
+    "zod": ["zod@4.6.7", "", {}, "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg=="],
 
     "zod-to-json-schema": ["zod-to-json-schema@3.25.2", "", { "peerDependencies": { "zod": "^3.25.28 || ^4" } }, "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA=="],
 

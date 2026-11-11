@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "diff-match-patch": "1.0.5",
-    "zod": "4.6.5"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/bun": "1.4.2",

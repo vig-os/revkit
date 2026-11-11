@@ -21,6 +21,7 @@ import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSharedMarkdownConfig } from "./src/lib/markdown-processor.ts";
 import { readConsumerRoot } from "./src/lib/consumer-root.ts";
+import { revkitRenderGuardMode } from "./src/content/render-guard-mode.ts";
 
 // Consumer-root mode (M5 part 2, issue #57): when `revkit build` sets
 // `REVKIT_CONSUMER_ROOT`, this file is being run from the PACKAGED
@@ -134,6 +135,12 @@ const ASTRO_CACHE_DIR = (process.env.REVKIT_ASTRO_CACHE_DIR ?? "").trim() || und
 export default defineConfig({
   site: "https://revkit.local",
   integrations: [
+    // Captures astro's `command` (`dev` / `build` / …) from
+    // `astro:config:setup` so the render-guard loader in
+    // `src/content.config.ts` can skip its throw in `astro dev`
+    // (where astro's own error overlay already surfaces render
+    // errors). Issue #237 round-2 review.
+    revkitRenderGuardMode(),
     starlight({
       title: "revkit",
       description: "HTML-first review surface for the agentic era.",
