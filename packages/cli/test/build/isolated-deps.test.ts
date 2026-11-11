@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { findPackagedTrustedStack, stageAstroRoot } from "../../src/build/packaged.ts";
+import { astroNodeOptions, findPackagedTrustedStack, runPackagedBuild, stageAstroRoot, stagedAstroEntry } from "../../src/build/packaged.ts";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -99,6 +99,83 @@ test("isolated staging resolves the complete dependency graph, cycles, scopes an
   expect(stdout).toContain("beta:two");
   expect(stdout).toContain("packages:5");
   expect(stdout).toContain("bundled:bridge");
+});
+
+// #238: Bun's shared fallback folder (`node_modules/.bun/node_modules`) holds
+// ONE version per name. A package that Astro reaches through a sibling link in
+// Astro's own store slot must still resolve its dependencies from its own slot,
+// i.e. from revkit's staged graph. The fallback deliberately holds an
+// incompatible `leaf`, so a launch that resolves through Bun's store renders
+// `leaf@1` (the 9.2.0 hast-util-raw / parse5 7 failure, in miniature).
+test("astro launches from the staged graph, never from Bun's fallback folder", async () => {
+  const packageRoot = scratch();
+  const store = join(packageRoot, "node_modules", ".bun");
+  const site = join(packageRoot, "site");
+  mkdirSync(join(site, "src", "content"), { recursive: true });
+  writeFileSync(join(site, "package.json"), "{}");
+  function pkg(slot: string, name: string, manifest: Record<string, unknown>, files: Record<string, string>): string {
+    const dir = join(store, slot, "node_modules", name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name, ...manifest }));
+    for (const [file, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+    return dir;
+  }
+  const leaf1 = pkg("leaf@1", "leaf", { main: "index.cjs" }, { "index.cjs": 'module.exports = "leaf@1";\n' });
+  const leaf2 = pkg("leaf@2", "leaf", { main: "index.cjs" }, { "index.cjs": 'module.exports = "leaf@2";\n' });
+  const mid = pkg("mid@1", "mid", { main: "index.cjs", dependencies: { leaf: "2" } },
+    { "index.cjs": 'module.exports = require("leaf");\n' });
+  const astro = pkg("astro@1", "astro", { type: "module", bin: { astro: "./bin/astro.mjs" }, dependencies: { mid: "1" } }, {
+    "bin/astro.mjs": [
+      "#!/usr/bin/env node",
+      'import { writeFileSync } from "node:fs";',
+      'import { join } from "node:path";',
+      'import { fileURLToPath } from "node:url";',
+      'import leaf from "mid";',
+      'const outDir = process.argv[process.argv.indexOf("--outDir") + 1];',
+      'writeFileSync(join(outDir, "index.html"), JSON.stringify({ leaf, entry: fileURLToPath(import.meta.url) }));',
+      "",
+    ].join("\n"),
+  });
+  chmodSync(join(astro, "bin", "astro.mjs"), 0o755);
+  const starlight = pkg("@astrojs+starlight@1", "@astrojs/starlight", { main: "index.cjs" }, { "index.cjs": "" });
+  linkPackage(dirname(astro), "mid", mid);
+  linkPackage(dirname(mid), "leaf", leaf2);
+  // Bun's fallback folder: one hoisted version per name, incompatible with mid.
+  linkPackage(join(store, "node_modules"), "leaf", leaf1);
+  linkPackage(join(store, "node_modules"), "mid", mid);
+  const nm = join(site, "node_modules");
+  linkPackage(nm, "astro", astro);
+  linkPackage(nm, "@astrojs/starlight", starlight);
+  linkPackage(join(nm, ".bin"), "astro", "../astro/bin/astro.mjs");
+  expect(findPackagedTrustedStack(packageRoot).layout).toBe("isolated");
+
+  const consumerRoot = consumer();
+  const distOutDir = join(consumerRoot, ".revkit", "dist");
+  mkdirSync(distOutDir, { recursive: true });
+  const { stagingDir } = await runPackagedBuild({ consumerRoot, packageRoot, distOutDir });
+  const rendered = JSON.parse(readFileSync(join(distOutDir, "index.html"), "utf8")) as { leaf: string; entry: string };
+  expect(rendered.leaf).toBe("leaf@2");
+  expect(rendered.entry.startsWith(join(realpathSync(stagingDir), "node_modules") + "/")).toBe(true);
+});
+
+test("the staged astro entry honours npm's bin forms and stays inside the package", () => {
+  const stagingDir = scratch();
+  const astroDir = join(stagingDir, "node_modules", "astro");
+  mkdirSync(astroDir, { recursive: true });
+  const manifest = (bin: unknown) => writeFileSync(join(astroDir, "package.json"), JSON.stringify({ name: "astro", bin }));
+  manifest({ astro: "./bin/astro.mjs" });
+  expect(stagedAstroEntry(stagingDir)).toBe(join(astroDir, "bin", "astro.mjs"));
+  manifest("cli.js");
+  expect(stagedAstroEntry(stagingDir)).toBe(join(astroDir, "cli.js"));
+  manifest({ other: "x.js" });
+  expect(() => stagedAstroEntry(stagingDir)).toThrow("declares no 'astro' bin");
+  manifest({ astro: "../../evil.js" });
+  expect(() => stagedAstroEntry(stagingDir)).toThrow("escapes its package");
+  expect(astroNodeOptions(undefined)).toBe("--preserve-symlinks-main");
+  expect(astroNodeOptions("--max-old-space-size=2048")).toBe("--max-old-space-size=2048 --preserve-symlinks-main");
 });
 
 test("the CLI builds the issue's minimal consumer and passes check-dist from a clean temp directory", async () => {

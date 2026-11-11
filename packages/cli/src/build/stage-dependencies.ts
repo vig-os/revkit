@@ -16,14 +16,32 @@ const manifestSchema = z.object({
   peerDependencies: z.record(packageName, z.string()).optional(),
 });
 
-function readManifest(physical: string) {
+const binManifestSchema = z.object({
+  name: packageName,
+  bin: z.union([z.string().min(1), z.record(z.string(), z.string().min(1))]).optional(),
+});
+
+/** The relative path of `binName` in the package at `packageDir`, or
+ * undefined when it declares none. npm's string form names the bin after
+ * the package itself. */
+export function readManifestBin(packageDir: string, binName: string): string | undefined {
+  const manifest = parseManifest(packageDir, binManifestSchema, "a string or string-map 'bin'");
+  if (typeof manifest.bin === "string") return manifest.name.split("/").pop() === binName ? manifest.bin : undefined;
+  return manifest.bin?.[binName];
+}
+
+function parseManifest<T>(physical: string, schema: z.ZodType<T>, expected: string): T {
   const path = join(physical, "package.json");
-  const result = manifestSchema.safeParse(JSON.parse(readFileSync(path, "utf8")));
+  const result = schema.safeParse(JSON.parse(readFileSync(path, "utf8")));
   if (!result.success) {
     const details = result.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ");
-    throw new Error(`revkit build: invalid package manifest '${path}': expected a valid npm package name and string dependency maps (${details})`);
+    throw new Error(`revkit build: invalid package manifest '${path}': expected ${expected} (${details})`);
   }
   return result.data;
+}
+
+function readManifest(physical: string) {
+  return parseManifest(physical, manifestSchema, "a valid npm package name and string dependency maps");
 }
 
 /** Preserve the packaged hoisted layout, including .bin and scoped links. */
