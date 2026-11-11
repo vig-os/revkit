@@ -102,6 +102,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A page whose body fails to render fails the build**
+  ([#237](https://github.com/vig-os/revkit/issues/237))
+  - Astro's glob loader wraps every per-entry markdown render in a try/catch
+    (`astro/dist/content/loaders/glob.js`): on failure it logs the error and
+    stores the entry with `rendered: undefined`. Starlight then renders an
+    empty `sl-markdown-content`, `revkit build` exits 0 and `check-dist`
+    accepts the HTML — a review surface that silently ships empty pages,
+    which is a release-grade defect class.
+  - A new `guardedDocsLoader` wraps Starlight's docs loader in
+    `site/src/content.config.ts` and, after every load pass, asserts every
+    docs entry with a non-empty source body carries non-empty
+    `rendered.html`. A violation throws from `load()`, which astro surfaces
+    as a non-zero `revkit build` exit code; the error names the entry id and
+    the source file, with astro's underlying render error in the lines
+    above. Frontmatter-only docs (empty body) stay green, and entries
+    marked `deferredRender` are skipped (they render later via a virtual
+    module).
+  - Defense in depth lives in `revkit check-dist`: when `revkit build` hands
+    it the set of pages whose source bodies are non-empty, any page whose
+    content root (`<div class="sl-markdown-content">`) is empty fails,
+    naming the page. The empty-root check is backward-compatible — a
+    standalone `revkit check-dist <dir>` without the source-body map keeps
+    its pre-#237 behaviour.
 - **`revkit build` launches Astro through the staged dependency graph** ([#238](https://github.com/vig-os/revkit/issues/238))
   - In the isolated (Bun workspace) layout, Astro ran from `site/node_modules/.bin/astro`, which Node resolves to
     its real path in Bun's store. With `NODE_PRESERVE_SYMLINKS=1`, packages reached from there walked up into Bun's

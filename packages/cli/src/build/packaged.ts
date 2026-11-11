@@ -77,6 +77,14 @@ export interface RunPackagedBuildOptions {
   /** Injectable spawner for tests. Defaults to the shared
    * `spawnAstroBuild`'s default (`Bun.spawn`). */
   readonly spawn?: SpawnLike;
+  /** Absolute path where the astro content loader writes its
+   * render-guard manifest (issue #237 defense-in-depth): a JSON
+   * `{ pages: string[] }` listing dist-relative page paths whose
+   * source body is non-empty. `revkit build` reads this file and
+   * hands the set to `check-dist`. Passed to the astro process via
+   * `REVKIT_RENDER_GUARD_MANIFEST_PATH`; when omitted the loader
+   * writes no manifest. */
+  readonly renderGuardManifestPath?: string;
 }
 
 /** Result of a successful packaged build. */
@@ -607,6 +615,12 @@ export async function runPackagedBuild(
       NODE_PRESERVE_SYMLINKS: "1",
       // …and keep the astro entry itself on its staging path.
       NODE_OPTIONS: astroNodeOptions(process.env.NODE_OPTIONS),
+      // #237 defense-in-depth manifest. When set, the astro-side
+      // render guard writes the dist-relative page set here for
+      // `revkit build` to hand to `check-dist`.
+      ...(options.renderGuardManifestPath !== undefined
+        ? { REVKIT_RENDER_GUARD_MANIFEST_PATH: options.renderGuardManifestPath }
+        : {}),
     },
     ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
   });
