@@ -102,6 +102,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Worker tests derive their version from `wrangler.jsonc` instead of a
+  hard-coded dev-placeholder literal** ([#231](https://github.com/vig-os/revkit/issues/231))
+  - Seven Worker tests used to hand-write the dev placeholder in bundle paths
+    and expectations, so `scripts/set-release-version.mjs` rewriting
+    `vars.REVKIT_VERSION` on `release/X.Y.Z` turned the release PR's `Tests`
+    job red: six headers cases asked for `/_revkit/<placeholder>/invite.js`
+    against a Worker now serving `/_revkit/X.Y.Z/…`, and the runtime gate
+    expected the unstamped placeholder in the `/healthz` body.
+  - Every test under `packages/worker/test/` now derives the version from the
+    single source (`wrangler.jsonc` `vars.REVKIT_VERSION`) through one
+    semver-validated helper in `test/harness.ts` (`TEST_REVKIT_VERSION`); the
+    existing per-file reads in `invites.test.ts` and `preview.test.ts` collapse
+    onto it.
+  - A regression guard in `test/worker-config.test.ts` fails on `dev` if any
+    file under `packages/worker/test/` hand-writes the dev-placeholder
+    literal again, so the next literal fails the branch every change touches
+    rather than the release branch nobody rebuilds on green.
+- **The changelog gate no longer breaks release branches** ([#228](https://github.com/vig-os/revkit/issues/228))
+  - The commit hook checks structure only (no `###` heading repeated inside a `##` section) via
+    `scripts/check-changelog-structure.mjs`; an empty `## Unreleased` is valid, as it is after the release freeze.
 - **One version source, stamped by the release train** ([#201](https://github.com/vig-os/revkit/issues/201))
   - `revkit --version` and the flake package version both derive from `packages/cli/package.json`; the duplicate
     `VERSION` constant is gone and a test fails if a second literal appears.
@@ -154,4 +174,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names without visible content before D1, returning the documented refusal
   without consuming the invite's browser slot. The cap counts Unicode code points,
   and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).
-

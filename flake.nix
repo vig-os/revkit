@@ -318,12 +318,14 @@
                   pass_filenames = false;
                 };
                 # A hand-resolved CHANGELOG merge conflict can leave a repeated
-                # heading under Unreleased, which breaks the release train's
-                # `prepare-changelog validate`. Run the same check on commit
-                # (and so in CI, which runs the pre-commit hooks).
+                # `### ` heading inside a section, which the release train
+                # would silently drop at freeze time. Check structure only:
+                # `prepare-changelog validate` also demands entries under
+                # Unreleased, which release branches (frozen) and dev after a
+                # reset (empty) legitimately lack (#228; devkit#2071).
                 changelog-validate = {
                   enable = true;
-                  entry = "prepare-changelog validate CHANGELOG.md";
+                  entry = "node scripts/check-changelog-structure.mjs CHANGELOG.md";
                   language = "system";
                   files = "^CHANGELOG\\.md$";
                   pass_filenames = false;

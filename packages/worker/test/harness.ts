@@ -603,6 +603,31 @@ export function readWranglerConfig(): Record<string, unknown> {
   return JSON.parse(stripJsonComments(readFileSync(fileURLToPath(new URL("wrangler.jsonc", PKG_ROOT)), "utf8")));
 }
 
+/** The revkit version the Worker binds at runtime, read from the single source
+ *  (`wrangler.jsonc` `vars.REVKIT_VERSION`) and validated as plain semver.
+ *
+ *  **Why this is the one helper every test uses, instead of a literal.** The
+ *  release stamp (`scripts/set-release-version.mjs`) rewrites
+ *  `vars.REVKIT_VERSION` on `release/X.Y.Z` and leaves `dev` at the unstamped
+ *  placeholder — so a test that spells that placeholder by hand builds a URL
+ *  against a Worker that now serves `/_revkit/X.Y.Z/...`, 404s, and turns the
+ *  release PR's `Tests` job red (#231). The invite and preview files already
+ *  derived the version from `wrangler.jsonc`; this consolidation
+ *  (`invites.test.ts`'s `TEST_REVKIT_VERSION`, `preview.test.ts`'s `VERSION`)
+ *  makes "read the shipped var" the only way a test names the version.
+ *
+ *  **Loud failure on misbinding.** An undefined or malformed binding throws
+ *  here, at module load, rather than silently building a `/_revkit/undefined/…`
+ *  URL that then 404s for a reason unrelated to the thing under test. */
+export const TEST_REVKIT_VERSION: string = (() => {
+  const vars = readWranglerConfig()["vars"] as Record<string, string> | undefined;
+  const version = vars?.["REVKIT_VERSION"];
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
+    throw new Error(`wrangler.jsonc must bind a plain REVKIT_VERSION; got ${JSON.stringify(version)}`);
+  }
+  return version;
+})();
+
 function stripJsonComments(source: string): string {
   let out = "";
   let index = 0;
