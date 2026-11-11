@@ -23,7 +23,10 @@
 //      with its own dependency links to preserve Bun’s resolution graph.
 //      Combined with `vite.resolve.preserveSymlinks: true` and
 //      `NODE_PRESERVE_SYMLINKS=1`, module paths stay inside staging
-//      while package contents remain in the trusted install.
+//      while package contents remain in the trusted install. Astro
+//      itself is launched from `<staging>/node_modules/astro` with
+//      `--preserve-symlinks-main` (see `stagedAstroEntry`), so the CLI
+//      and everything it imports resolve through the staged graph too.
 //   4. Astro and vite caches are redirected to
 //      `<consumer>/.revkit/cache/{astro,vite}/` via env
 //      (`REVKIT_ASTRO_CACHE_DIR`, `REVKIT_VITE_CACHE_DIR`), which
@@ -54,7 +57,7 @@ import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnAstroBuild, type SpawnLike } from "../review/build.ts";
 import { unlinkStale } from "../review/build.ts";
-import { stageHoistedDependencies, stageIsolatedDependencies } from "./stage-dependencies.ts";
+import { readManifestBin, stageHoistedDependencies, stageIsolatedDependencies } from "./stage-dependencies.ts";
 
 /** Input to `runPackagedBuild`. */
 export interface RunPackagedBuildOptions {
@@ -454,6 +457,38 @@ export function stageAstroRoot(options: {
   return { packagedSiteDir };
 }
 
+/** The astro CLI entry INSIDE the staged graph:
+ * `<staging>/node_modules/astro/<bin.astro>`. `findPackagedTrustedStack`'s
+ * `astroBin` (`…/.bin/astro`) only proves the trusted stack exists; it must
+ * not be the launch path. Node resolves the main module through its real
+ * path unless `--preserve-symlinks-main` is set, which for the isolated
+ * layout lands in Bun's store slot (`node_modules/.bun/astro@…/`). With
+ * `NODE_PRESERVE_SYMLINKS` on, a package reached from that slot through a
+ * sibling link then walks up into Bun's shared fallback folder
+ * (`node_modules/.bun/node_modules`), which holds one version per name and
+ * so the wrong one whenever two packages disagree (#238: hast-util-raw 9.2
+ * loaded parse5 7). Launching this entry with `--preserve-symlinks-main`
+ * keeps every import on the staged graph, in both layouts. */
+export function stagedAstroEntry(stagingDir: string): string {
+  const astroDir = join(stagingDir, "node_modules", "astro");
+  const entry = readManifestBin(astroDir, "astro");
+  if (entry === undefined) {
+    throw new Error(`revkit build: staged astro at '${astroDir}' declares no 'astro' bin`);
+  }
+  const entryPath = resolvePath(astroDir, entry);
+  if (!entryPath.startsWith(astroDir + "/")) {
+    throw new Error(`revkit build: staged astro bin '${entry}' escapes its package '${astroDir}'`);
+  }
+  return entryPath;
+}
+
+/** `NODE_OPTIONS` for the astro child: the caller's options plus
+ * `--preserve-symlinks-main` (see `stagedAstroEntry`). Node has no env
+ * switch for the main module alone. */
+export function astroNodeOptions(inherited: string | undefined): string {
+  return [inherited, "--preserve-symlinks-main"].filter((part) => part !== undefined && part.length > 0).join(" ");
+}
+
 /** Materialise KaTeX CSS + woff2 fonts under `<stagingPublic>/_katex/`.
  * Ports the logic from `site/scripts/copy-katex-assets.ts`, but
  * (a) reads katex from the packaged root's `node_modules/katex/dist/`
@@ -542,7 +577,7 @@ export async function runPackagedBuild(
   });
 
   await spawnAstroBuild({
-    astroBin: trustedStack.astroBin,
+    astroBin: stagedAstroEntry(stagingDir),
     astroRoot: stagingDir,
     outDir: distOutDir,
     // The staging root already has astro.config.mjs (as a symlink)
@@ -570,6 +605,8 @@ export async function runPackagedBuild(
       // `/nix/store/...` module ids by prepending `<staging>`
       // (it treats out-of-root abs paths as relative).
       NODE_PRESERVE_SYMLINKS: "1",
+      // …and keep the astro entry itself on its staging path.
+      NODE_OPTIONS: astroNodeOptions(process.env.NODE_OPTIONS),
     },
     ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
   });
