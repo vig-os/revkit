@@ -104,7 +104,7 @@ describe("set-release-version", () => {
     const repo = resolve(dirname(script), "..");
     const dir = mkdtempSync(join(tmpdir(), "revkit-stamp-root-"));
     dirs.push(dir);
-    for (const [path] of TARGETS) {
+    for (const [path] of TARGETS as [string, unknown][]) {
       mkdirSync(dirname(join(dir, path)), { recursive: true });
       cpSync(join(repo, path), join(dir, path));
     }
@@ -112,7 +112,7 @@ describe("set-release-version", () => {
     expect(proc.exitCode).toBe(0);
     const [status, ...changed] = proc.stdout.toString().trim().split("\n");
     expect(status).toBe("changed");
-    expect(changed.sort()).toEqual(TARGETS.map(([path]) => path).sort());
+    expect(changed.sort()).toEqual((TARGETS as [string, unknown][]).map(([path]) => path).sort());
     const read = (path: string) => readFileSync(join(dir, path), "utf8");
     expect(JSON.parse(read("packages/cli/package.json")).version).toBe("4.5.6");
     expect(read("packages/worker/wrangler.jsonc")).toContain('"REVKIT_VERSION": "4.5.6"');
