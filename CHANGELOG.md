@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- **One version source, stamped by the release train** ([#201](https://github.com/vig-os/revkit/issues/201))
+  - `revkit --version` and the flake package version both derive from `packages/cli/package.json`; the duplicate
+    `VERSION` constant is gone and a test fails if a second literal appears.
+  - The prepare-release seam stamps `X.Y.Z` into it on `release/X.Y.Z` (`scripts/set-release-version.mjs`), so
+    candidates and finals carry the release version. `--version` also prints the build revision (`X.Y.Z (<rev>)`):
+    a candidate reports its base `X.Y.Z` plus rev, a final exactly `X.Y.Z` (ADR-0021 amendment).
+  - Stamping `-rcN` itself needs a devkit change: [vig-os/devkit#2070](https://github.com/vig-os/devkit/issues/2070).
+  - The template, README and installed SKILL.md pin a release tag (or a commit SHA) instead of floating on `dev`.
+
 ### Added
 
 - **Deployment targets and pluggable auth** ([#195](https://github.com/vig-os/revkit/issues/195), [#192](https://github.com/vig-os/revkit/issues/192))

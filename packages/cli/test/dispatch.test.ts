@@ -13,14 +13,16 @@ const noopEnv: DispatchEnv = {
 describe("dispatch", () => {
   test("--version prints the version and exits 0", async () => {
     const result = await dispatch(["--version"], noopEnv);
-    expect(result.stdout).toBe(`${VERSION}\n`);
+    expect(result.stdout.startsWith(`${VERSION}`)).toBe(true);
+    expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.stderr).toBe("");
     expect(result.exitCode).toBe(ExitCode.ok);
   });
 
   test("-v is a short alias for --version", async () => {
     const result = await dispatch(["-v"], noopEnv);
-    expect(result.stdout).toBe(`${VERSION}\n`);
+    expect(result.stdout.startsWith(`${VERSION}`)).toBe(true);
+    expect(result.stdout.endsWith("\n")).toBe(true);
     expect(result.exitCode).toBe(ExitCode.ok);
   });
 

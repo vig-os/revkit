@@ -3,13 +3,13 @@
 A minimal revkit docs repo. Scaffolded by:
 
 ```bash
-# After the next release lands M5 on main:
-nix flake init -t github:vig-os/revkit
-
-# Until then, target the dev branch — main does not yet carry
-# `packages.revkit` / `templates.default`:
-nix flake init -t github:vig-os/revkit/dev
+nix flake init -t github:vig-os/revkit?ref=0.1.0-rc1
 ```
+
+The scaffolded `flake.nix` pins revkit to that tag. Bump it deliberately (edit
+`?ref=`, then `nix flake update revkit`); to pin an exact commit use
+`github:vig-os/revkit/<full-commit-sha>`. `revkit --version` prints
+`X.Y.Z (<rev>)` so a build is identifiable down to its commit.
 
 ## Three commands
 
