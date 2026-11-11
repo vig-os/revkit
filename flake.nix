@@ -317,6 +317,17 @@
                   files = revkitLib.hooks.contentFiles;
                   pass_filenames = false;
                 };
+                # A hand-resolved CHANGELOG merge conflict can leave a repeated
+                # heading under Unreleased, which breaks the release train's
+                # `prepare-changelog validate`. Run the same check on commit
+                # (and so in CI, which runs the pre-commit hooks).
+                changelog-validate = {
+                  enable = true;
+                  entry = "prepare-changelog validate CHANGELOG.md";
+                  language = "system";
+                  files = "^CHANGELOG\\.md$";
+                  pass_filenames = false;
+                };
                 # gitleaks (ADR-0014 + ADR-0005 acceptance): scan staged
                 # changes for tokens, keys and cookies. `git --staged`
                 # is the current-generation subcommand (`gitleaks protect`
