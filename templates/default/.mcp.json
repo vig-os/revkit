@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "revkit": {
+      "command": "revkit",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

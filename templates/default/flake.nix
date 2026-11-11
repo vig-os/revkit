@@ -9,10 +9,14 @@
   #
   #   revkit.url = "github:vig-os/revkit/<full-commit-sha>";
   #
+  # The pin is the release this scaffold shipped with. Before that final release
+  # exists the tag does not resolve: pin a candidate tag (`?ref=X.Y.Z-rcN`) or a
+  # full commit SHA (above) instead.
+  #
   # `revkit --version` prints `X.Y.Z (<rev>)`. A release candidate
   # (`X.Y.Z-rcN`) reports the base `X.Y.Z` plus its rev; a final reports `X.Y.Z`.
   inputs = {
-    revkit.url = "github:vig-os/revkit?ref=0.1.0-rc1";
+    revkit.url = "github:vig-os/revkit?ref=0.1.0";
     # Follow revkit's pinned nixpkgs + flake-utils so the CLI's runtime
     # (Bun, deps) matches the version revkit was built with — no drift.
     nixpkgs.follows = "revkit/nixpkgs";

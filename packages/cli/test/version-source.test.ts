@@ -5,8 +5,8 @@
 // `--version`, and the flake package's `version` attribute. These tests fail
 // if a second literal appears or if a surface disagrees with the manifest.
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dispatch } from "../src/index.ts";
 import type { DispatchEnv } from "../src/index.ts";
@@ -31,6 +31,36 @@ function filesUnder(dir: string, ext: RegExp): string[] {
   });
 }
 
+/** Quoted strings that are a whole SemVer (`"1.2.3"`, `"1.2.3-rc1"`, `"1.2.3+b"`), comments skipped. */
+const SEMVER_LITERAL = /(["'`])\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]*)?\1/g;
+const COMMENT_LINE = /^\s*(\/\/|\/\*|\*)/;
+
+function semverLiteralsIn(source: string): string[] {
+  return source
+    .split("\n")
+    .filter((line) => !COMMENT_LINE.test(line))
+    .flatMap((line) => line.match(SEMVER_LITERAL) ?? []);
+}
+
+/** `file: literal` for every semver literal in package sources and the Worker config. The
+ * only allowed one is the Worker's `REVKIT_VERSION` binding, which the release script
+ * stamps and `worker-config.test.ts` pins to the manifest. */
+function semverLiteralOffenders(root: string): string[] {
+  const sources = readdirSync(join(root, "packages")).flatMap((pkg) =>
+    ["src", "bin"].flatMap((dir) => {
+      const base = join(root, "packages", pkg, dir);
+      return existsSync(base) ? filesUnder(base, /\.(tsx?|mjs|js)$/) : [];
+    }),
+  );
+  const wrangler = join(root, "packages/worker/wrangler.jsonc");
+  const stampedBinding = /"REVKIT_VERSION"\s*:\s*"[^"]*"/;
+  return [...sources, wrangler].flatMap((file) => {
+    const text = readFileSync(file, "utf8");
+    const scanned = file === wrangler ? text.replace(stampedBinding, "") : text;
+    return semverLiteralsIn(scanned).map((literal) => `${relative(root, file)}: ${literal}`);
+  });
+}
+
 describe("version source of truth", () => {
   test("package.json carries a SemVer version", () => {
     expect(manifest.version).toMatch(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/);
@@ -42,12 +72,18 @@ describe("version source of truth", () => {
     expect(result.stdout).toMatch(new RegExp(`^${escaped}( \\([0-9a-z-]+\\))?\\n$`));
   });
 
-  test("no second version literal in CLI sources", () => {
-    const assignment = /\bVERSION\b[^=\n]*=\s*["'`]\d+\.\d+\.\d+/;
-    const offenders = filesUnder(join(cliRoot, "src"), /\.tsx?$/).filter((file) =>
-      assignment.test(readFileSync(file, "utf8")),
-    );
+  test("no semver literal in CLI/worker sources or the worker config beyond the stamped binding", () => {
+    const offenders = semverLiteralOffenders(repoRoot);
     expect(offenders).toEqual([]);
+  });
+
+  test("the detector catches a second literal under any name (mutation)", () => {
+    const hits = (source: string) => semverLiteralsIn(source);
+    expect(hits('const cliVersion = "0.0.0"; export const VERSION = cliVersion')).toHaveLength(1);
+    expect(hits("const v = `1.2.3-rc1`")).toHaveLength(1);
+    expect(hits("export const pinned = '10.20.30+build.5'")).toHaveLength(1);
+    expect(hits('// the "1.4.0" example in a comment\n/* "2.0.0" */\n * "3.0.0"')).toEqual([]);
+    expect(hits('const dotted = "1.2"; const ip = "10.0.0.1"')).toEqual([]);
   });
 
   test("no version literal in the nix package or flake", () => {
@@ -56,10 +92,10 @@ describe("version source of truth", () => {
     expect(files.filter((file) => literal.test(readFileSync(file, "utf8")))).toEqual([]);
   });
 
-  test("the scaffolded template pins a tag and does not float on a branch", () => {
+  test("the scaffolded template pins a final X.Y.Z tag and does not float on a branch", () => {
     const flake = readFileSync(join(repoRoot, "templates/default/flake.nix"), "utf8");
     const url = flake.match(/^\s*revkit\.url\s*=\s*"([^"]+)"/m)?.[1] ?? "";
-    expect(url).toMatch(/^github:vig-os\/revkit\?ref=\d+\.\d+\.\d+(-rc\d+)?$/);
+    expect(url).toMatch(/^github:vig-os\/revkit\?ref=\d+\.\d+\.\d+$/);
   });
 
   const hasNix = Bun.which("nix") !== null;

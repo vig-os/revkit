@@ -27,7 +27,7 @@ import type { Anchor } from "@revkit/review-core";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
 import { DaemonClient } from "../../src/mcp/daemon-client.ts";
 import { startChannelServer, type DiscoverFn } from "../../src/mcp/channel-server.ts";
-import type { WireEvent } from "../../src/mcp/event-subscriber.ts";
+import { startEventSubscriber, type WireEvent } from "../../src/mcp/event-subscriber.ts";
 
 const anchor: Anchor = {
   path: "docs/adr/0003.md",
@@ -189,6 +189,117 @@ describe("blocker 2 — replay-on-start", () => {
     try {
       await new Promise((r) => setTimeout(r, 30));
       expect(notifications.length).toBe(0);
+    } finally {
+      await channel.stop();
+      await mcpClient.close();
+    }
+  });
+
+  test("daemon down at startup, up later → late connect subscribes from head with one summary, no replay", async () => {
+    // Fails on ceb30b1: the late connect skipped the prime path, so the
+    // subscriber resumed from seq 0 and the summary was never sent.
+    const first = await postHumanComment(ctx.daemon, ctx.cookie, "first comment");
+    const second = await postHumanComment(ctx.daemon, ctx.cookie, "second comment");
+    const third = await postHumanComment(ctx.daemon, ctx.cookie, "third comment");
+    const head = (await new DaemonClient({ url: ctx.daemon.url, agentToken: ctx.daemon.agentToken }).listThreads()).head;
+    expect(head).toBeGreaterThanOrEqual(third.seq);
+
+    const notifications: Array<{ params: { content: string; meta?: Record<string, string> } }> = [];
+    const sinceValues: number[] = [];
+    let discoverCalls = 0;
+    const discover: DiscoverFn = async () => {
+      discoverCalls += 1;
+      if (discoverCalls === 1) throw new Error("daemon not up yet");
+      return { url: ctx.daemon.url, agentToken: ctx.daemon.agentToken, instanceId: "late-instance" };
+    };
+    const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+    const mcpClient = new Client({ name: "late-connect", version: "0.0.0" }, { capabilities: {} });
+    mcpClient.setNotificationHandler(channelSchema, async (msg) => {
+      notifications.push(msg);
+    });
+    const channel = await startChannelServer({
+      transport: serverTx,
+      discover,
+      reconnectBaseDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      subscribeEvents: (opts) => {
+        sinceValues.push(opts.since ?? 0);
+        return startEventSubscriber(opts);
+      },
+    });
+    await mcpClient.connect(clientTx);
+    try {
+      const deadline = Date.now() + 5_000;
+      while (sinceValues.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 200));
+      expect(discoverCalls).toBe(2);
+      expect(sinceValues).toEqual([head]);
+      expect(notifications.length).toBe(1);
+      const only = notifications[0]!;
+      expect(only.params.meta?.["kind"]).toBe("catchup_summary");
+      expect(only.params.meta?.["waiting"]).toBe("3");
+      for (const id of [first.threadId, second.threadId, third.threadId]) expect(only.params.content).toContain(id);
+      expect(only.params.content).not.toContain("first comment");
+    } finally {
+      await channel.stop();
+      await mcpClient.close();
+    }
+  });
+});
+
+describe("single-flight reconnect — tool call during background reconnect", () => {
+  let ctx: Ctx;
+  beforeEach(async () => {
+    ctx = await bootDaemon();
+  });
+  afterEach(async () => {
+    await ctx.daemon.stop();
+    rmSync(ctx.root, { recursive: true, force: true });
+  });
+
+  test("late daemon + `threads` call mid-reconnect → one subscriber, one prime, one notification per live comment", async () => {
+    // Fails on e81ae5d: the tool-call path ran its own discover/attach
+    // alongside the background loop; the second attach overwrote the
+    // first subscriber handle (never closed) and every live event was
+    // delivered twice.
+    const notifications: Array<{ params: { content: string; meta?: Record<string, string> } }> = [];
+    const sinceValues: number[] = [];
+    let discoverCalls = 0;
+    const discover: DiscoverFn = async () => {
+      discoverCalls += 1;
+      if (discoverCalls === 1) throw new Error("daemon not up yet");
+      await new Promise((r) => setTimeout(r, 300));
+      return { url: ctx.daemon.url, agentToken: ctx.daemon.agentToken, instanceId: "late-instance" };
+    };
+    const [clientTx, serverTx] = InMemoryTransport.createLinkedPair();
+    const mcpClient = new Client({ name: "single-flight", version: "0.0.0" }, { capabilities: {} });
+    mcpClient.setNotificationHandler(channelSchema, async (msg) => {
+      notifications.push(msg);
+    });
+    const channel = await startChannelServer({
+      transport: serverTx,
+      discover,
+      reconnectBaseDelayMs: 5,
+      reconnectMaxDelayMs: 20,
+      reconnectToolDeadlineMs: 5_000,
+      subscribeEvents: (opts) => {
+        sinceValues.push(opts.since ?? 0);
+        return startEventSubscriber(opts);
+      },
+    });
+    await mcpClient.connect(clientTx);
+    try {
+      await new Promise((r) => setTimeout(r, 50));
+      const result = await mcpClient.callTool({ name: "threads", arguments: {} });
+      expect(result.isError).not.toBe(true);
+      await new Promise((r) => setTimeout(r, 100));
+      await postHumanComment(ctx.daemon, ctx.cookie, "live comment after late connect");
+      await new Promise((r) => setTimeout(r, 400));
+      expect(sinceValues.length).toBe(1);
+      expect(discoverCalls).toBe(2);
+      const live = notifications.filter((n) => n.params.meta?.["kind"] !== "catchup_summary");
+      expect(live.length).toBe(1);
+      expect(notifications.filter((n) => n.params.meta?.["kind"] === "catchup_summary").length).toBeLessThanOrEqual(1);
     } finally {
       await channel.stop();
       await mcpClient.close();

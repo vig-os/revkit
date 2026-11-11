@@ -51,6 +51,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { DaemonClient, DaemonHttpError } from "./daemon-client.ts";
 import { PUBLISH_ARRAY_SHAPE_MAX } from "../serve/publish.ts";
+import { VERSION } from "../version.ts";
 import {
   startEventSubscriber,
   type EventSubscriberHandle,
@@ -78,16 +79,16 @@ export type DiscoverFn = (previous: { instanceId?: string } | undefined) => Prom
 
 /** Configuration for `startChannelServer`. */
 export interface ChannelServerOptions {
-  readonly client: DaemonClient;
-  readonly url: string;
-  readonly agentToken: string;
+  readonly client?: DaemonClient;
+  readonly url?: string;
+  readonly agentToken?: string;
   /** The daemon's per-start id at first connect (from `serve.json`),
    * used by the reconnect path to notice a restart. */
   readonly instanceId?: string;
   /** MCP server name — the `source="..."` attribute on the channel
    * tag. Defaults to `"revkit"`. */
   readonly name?: string;
-  /** MCP server version — defaults to `"0.0.0"`. */
+  /** MCP server version — defaults to the CLI's single version source. */
   readonly version?: string;
   /** Test hook, replaces `startEventSubscriber` so a test can drive
    * events synchronously. */
@@ -866,7 +867,7 @@ const publishArgsSchema = z
  * whose `stop()` shuts down the transport and the SSE loop. */
 export async function startChannelServer(options: ChannelServerOptions): Promise<ChannelServerHandle> {
   const name = options.name ?? "revkit";
-  const version = options.version ?? "0.0.0";
+  const version = options.version ?? VERSION;
   const reconnectBase = options.reconnectBaseDelayMs ?? 500;
   const reconnectMax = options.reconnectMaxDelayMs ?? 30_000;
   const sleep = options.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -891,11 +892,18 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
 
   // Mutable state — the reconnect path swaps these atomically.
   let currentClient = options.client;
+  const connectedClient = (): DaemonClient => {
+    if (currentClient === undefined) throw new Error("daemon has not connected yet");
+    return currentClient;
+  };
   let currentUrl = options.url;
   let currentToken = options.agentToken;
   let currentInstanceId = options.instanceId;
   let subscriberHandle: EventSubscriberHandle | undefined;
   let lastSeenSeq = 0;
+  // True once a connect has run the prime path (listed threads, set
+  // `lastSeenSeq` to head). Later reconnects resume from `lastSeenSeq`.
+  let primed = false;
   let stopped = false;
 
   // ── tools/list ────────────────────────────────────────────────────
@@ -929,7 +937,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     if (set === undefined || set.size === 0) return;
     let record: unknown;
     try {
-      record = await currentClient.getAsk(askId);
+      record = await connectedClient().getAsk(askId);
     } catch (error) {
       // On a transient daemon error we let the poll's own deadline
       // handle it — closing the waiters with an error would surface
@@ -1114,7 +1122,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       throw new Error(`unknown tool '${toolName}'`);
     };
     try {
-      const result = await invoke(currentClient);
+      const result = await invoke(connectedClient());
       return { content: [{ type: "text", text: JSON.stringify(result) }] };
     } catch (error) {
       if (error instanceof ToolValidationError) return toolError(error.issues);
@@ -1153,7 +1161,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
               content: [{ type: "text", text: `revkit mcp: daemon unavailable: reconnect did not complete within the tool-call deadline (${options.reconnectToolDeadlineMs ?? TOOL_RECONNECT_DEADLINE_MS_DEFAULT} ms). Try again once the daemon is back.` }],
             };
           }
-          const retry = await invoke(currentClient);
+          const retry = await invoke(connectedClient());
           return { content: [{ type: "text", text: JSON.stringify(retry) }] };
         } catch (retryError) {
           // The retry may itself hit a 4xx (same request, different
@@ -1198,8 +1206,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     //    `initialListing` (round-4 401-reconnect scenario).
     const listing = options.initialListing !== undefined
       ? { threads: options.initialListing.threads, head: options.initialListing.head }
-      : await currentClient.listThreads();
+      : await connectedClient().listThreads();
     lastSeenSeq = listing.head ?? 0;
+    primed = true;
     // Round-2: the catch-up summary must ONLY list threads that
     // are delivered to the agent. The `deliveredCommentIds` set
     // is derived on the daemon and returned from `/api/delivered`.
@@ -1213,7 +1222,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     // fails silent on the same error; the catch-up now matches.
     let delivered: DeliveredSet;
     try {
-      delivered = new Set(await currentClient.getDeliveredCommentIds());
+      delivered = new Set(await connectedClient().getDeliveredCommentIds());
     } catch {
       // Fail closed: no summary emitted this connect. The agent
       // can still call `threads` to pull if it needs to.
@@ -1232,7 +1241,13 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
    * Extracted so `primeAndSubscribe` and `reconnectOnce` share ONE
    * subscribe shape (PR #38 round-2 review: duplication.) */
   const attachSubscriber = (): void => {
+    if (currentUrl === undefined || currentToken === undefined) {
+      throw new Error("daemon has not connected yet");
+    }
     const subscribe = options.subscribeEvents ?? startEventSubscriber;
+    // Invariant: at most one live subscriber. A handle overwritten
+    // without being closed would deliver every event twice.
+    subscriberHandle?.close();
     subscriberHandle = subscribe({
       url: currentUrl,
       agentToken: currentToken,
@@ -1293,12 +1308,23 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     }
   };
 
-  /** Single reconnect attempt: close the current subscriber, run
-   * `discover`, rebuild the client, cap `lastSeenSeq` at the fresh
-   * daemon's head, and re-attach the subscriber. Throws on failure
+  /** Single-flight wrapper: the background loop and tool calls share ONE
+   * in-flight attempt, so no second concurrent `discover`/attach exists. */
+  let reconnectInFlight: Promise<void> | undefined;
+  const reconnectOnce = (reason: string): Promise<void> => {
+    reconnectInFlight ??= reconnectAttempt(reason).finally(() => {
+      reconnectInFlight = undefined;
+    });
+    return reconnectInFlight;
+  };
+
+  /** One reconnect attempt: close the current subscriber, run
+   * `discover`, rebuild the client, and re-attach the subscriber:
+   * through `primeAndSubscribe` when no connect has primed yet, else
+   * resuming with `lastSeenSeq` capped at the fresh daemon's head. Throws on failure
    * so the caller can decide whether to retry (background loop) or
    * to give up and return an error (tool call). */
-  const reconnectOnce = async (reason: string): Promise<void> => {
+  const reconnectAttempt = async (reason: string): Promise<void> => {
     if (options.discover === undefined) throw new Error("no discover");
     void reason;
     subscriberHandle?.close();
@@ -1308,10 +1334,17 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     currentToken = next.agentToken;
     currentInstanceId = next.instanceId;
     currentClient = new DaemonClient({ url: currentUrl, agentToken: currentToken });
+    // First successful connect (the daemon was down at startup): take the
+    // same prime path as an initial connect — subscribe from head and emit
+    // the single catch-up summary — instead of replaying from seq 0.
+    if (!primed) {
+      await primeAndSubscribe();
+      return;
+    }
     // If the daemon is fresh (new instanceId), head may be BEHIND
     // our lastSeenSeq (a wiped sqlite would restart at 1). Cap our
     // resume at the current head.
-    const listing = await currentClient.listThreads();
+    const listing = await connectedClient().listThreads();
     const head = listing.head ?? 0;
     if (lastSeenSeq > head) lastSeenSeq = head;
     attachSubscriber();
@@ -1329,7 +1362,13 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
   await server.connect(transport);
 
   // Prime the SSE resume + emit the catchup summary.
-  await primeAndSubscribe();
+  try {
+    await primeAndSubscribe();
+  } catch {
+    // Discovery can fail while the MCP transport remains usable. Tool calls
+    // report the discovery error and the background loop retries with backoff.
+    void reconnect("startup-failed");
+  }
 
   return {
     server,

@@ -35,6 +35,31 @@ flake that any repo, including vig-os devkit consumers, can opt into.
 | [Feature matrix](docs/FEATURE-MATRIX.md) | Story → ADR → milestone → issue |
 | [Milestones](https://github.com/vig-os/revkit/milestones) | M1–M8 roadmap |
 
+## Consumer MCP setup
+
+Enter the template's `nix develop` shell (or put `packages.<system>.revkit`
+on PATH), then run `revkit skill install` from your repository root.
+The template and installer provide `.mcp.json` with `command: "revkit"`
+and `args: ["mcp"]`. Claude Code starts the MCP server and it auto-starts
+this repository's daemon; no separate Bun installation is needed.
+Opt into live channels with
+`claude --dangerously-load-development-channels server:revkit` (A1/A3/A5,
+ADR-0007; distribution D1, ADR-0010; local discovery ADR-0013).
+
+The installer preserves other MCP registrations. The registration is merged
+independently of the skill: an existing `SKILL.md` is kept (and an existing
+equivalent registration, even with extra keys such as `"type": "stdio"`, is
+left untouched) unless `--force` is passed. Overwriting `SKILL.md` or
+replacing a conflicting revkit registration requires `--force` and saves a
+backup; a malformed or conflicting `.mcp.json` is refused before anything is written,
+so it blocks the install even when `SKILL.md` does not exist yet (fix or remove the
+file, or pass `--force` for a conflict). `--dry-run` previews the targets.
+Daemon startup failures leave MCP available and tools report a diagnostic
+while discovery retries. This checkout's `.mcp.json` uses `nix run .#revkit`
+to select the local flake package with workspace-relative paths; `nix run`
+builds only git-tracked files, so `git add` new source files before relying on
+it.
+
 ## Development
 
 Requires Nix with flakes and direnv.
@@ -104,7 +129,9 @@ Scaffold a fresh docs repo from the template:
 
 ```bash
 mkdir my-docs && cd my-docs && git init
-nix flake init -t "github:vig-os/revkit?ref=0.1.0-rc1"   # pin a release tag
+nix flake init -t "github:vig-os/revkit?ref=0.1.0"   # pin a release tag
+# Before 0.1.0 is released that tag does not exist yet: pin a candidate tag
+# (?ref=0.1.0-rcN) or a full commit SHA (github:vig-os/revkit/<sha>) instead.
 direnv allow                          # or: nix develop
 revkit check                          # ADR-0005 authoring guards
 nix build                             # runs revkit check under a docs derivation
@@ -118,7 +145,7 @@ Or wire it into an existing flake:
 {
   # Pin a release tag (or a full commit SHA: "github:vig-os/revkit/<sha>");
   # never float on a branch.
-  inputs.revkit.url = "github:vig-os/revkit?ref=0.1.0-rc1";
+  inputs.revkit.url = "github:vig-os/revkit?ref=0.1.0";
   outputs = { self, nixpkgs, revkit, ... }: let
     system = "x86_64-linux";
     pkgs = nixpkgs.legacyPackages.${system};

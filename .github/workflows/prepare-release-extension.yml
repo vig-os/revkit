@@ -1,11 +1,13 @@
 # Consumer-owned (seeded by vigOS devkit; upgrades never overwrite this file).
 # Bugs / missing tools: https://github.com/vig-os/devkit/issues
 #
-# Stamps the release version into the single version source
-# (packages/cli/package.json, ADR-0021, #201) on release/X.Y.Z, so the commit
+# Stamps the release version (ADR-0021, #201) on release/X.Y.Z, so the commit
 # every X.Y.Z-rcN candidate and the final X.Y.Z tag point at already carries
-# X.Y.Z. A candidate therefore reports the base X.Y.Z (plus its build revision);
-# a final reports exactly X.Y.Z.
+# X.Y.Z: the single version source (packages/cli/package.json), the Worker's
+# REVKIT_VERSION var, and the `?ref=` pins in the template, README and SKILL.md
+# (scripts/set-release-version.mjs lists the targets). A candidate therefore
+# reports the base X.Y.Z (plus its build revision); a final reports exactly X.Y.Z,
+# and the pin points at the final tag, which exists once the final is promoted.
 
 name: Prepare Release Extension
 
@@ -53,7 +55,7 @@ jobs:
         with:
           ref: ${{ inputs.branch_sha }}
 
-      - name: Stamp version into packages/cli/package.json
+      - name: Stamp the release version
         id: stamp
         env:
           VERSION: ${{ inputs.version }}
@@ -64,8 +66,10 @@ jobs:
           if [ "$DRY_RUN" = "true" ]; then flags+=(--dry-run); fi
           result=$(node scripts/set-release-version.mjs "$VERSION" "${flags[@]}")
           echo "stamp result: $result"
-          if [ "$result" = "changed" ] && [ "$DRY_RUN" != "true" ]; then
+          # First line is changed|unchanged; the rest are the changed paths.
+          if [ "$(printf '%s\n' "$result" | head -n1)" = "changed" ] && [ "$DRY_RUN" != "true" ]; then
             echo "commit=true" >> "$GITHUB_OUTPUT"
+            echo "paths=$(printf '%s\n' "$result" | tail -n +2 | paste -sd, -)" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Commit the stamped version to the release branch via API
@@ -79,6 +83,6 @@ jobs:
           COMMIT_MESSAGE: |-
             chore: set release version ${{ inputs.version }}
 
-            Stamp ${{ inputs.version }} into packages/cli/package.json, the single
-            version source (ADR-0021).
-          FILE_PATHS: packages/cli/package.json
+            Stamp ${{ inputs.version }} into the single version source, the Worker
+            REVKIT_VERSION var and the template/README/SKILL.md pins (ADR-0021).
+          FILE_PATHS: ${{ steps.stamp.outputs.paths }}
