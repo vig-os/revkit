@@ -38,7 +38,7 @@ describe("version source of truth", () => {
 
   test("`revkit --version` is the manifest version, optionally with a build revision", async () => {
     const result = await dispatch(["--version"], env);
-    const escaped = manifest.version.replace(/[.+]/g, "\\$&");
+    const escaped = manifest.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     expect(result.stdout).toMatch(new RegExp(`^${escaped}( \\([0-9a-z-]+\\))?\\n$`));
   });
 
