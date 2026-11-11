@@ -46,12 +46,17 @@ Opt into live channels with
 `claude --dangerously-load-development-channels server:revkit` (A1/A3/A5,
 ADR-0007; distribution D1, ADR-0010; local discovery ADR-0013).
 
-The installer preserves other MCP registrations. Existing skill files and
-conflicting revkit registrations require `--force`, which saves backups;
-malformed `.mcp.json` files are refused. `--dry-run` previews the targets.
+The installer preserves other MCP registrations. The registration is merged
+independently of the skill: an existing `SKILL.md` is kept (and an existing
+equivalent registration, even with extra keys such as `"type": "stdio"`, is
+left untouched) unless `--force` is passed. Overwriting `SKILL.md` or
+replacing a conflicting revkit registration requires `--force` and saves a
+backup; malformed `.mcp.json` files are refused. `--dry-run` previews the targets.
 Daemon startup failures leave MCP available and tools report a diagnostic
 while discovery retries. This checkout's `.mcp.json` uses `nix run .#revkit`
-to select the local flake package with workspace-relative paths.
+to select the local flake package with workspace-relative paths; `nix run`
+builds only git-tracked files, so `git add` new source files before relying on
+it.
 
 ## Development
 

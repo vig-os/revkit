@@ -900,6 +900,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
   let currentInstanceId = options.instanceId;
   let subscriberHandle: EventSubscriberHandle | undefined;
   let lastSeenSeq = 0;
+  // True once a connect has run the prime path (listed threads, set
+  // `lastSeenSeq` to head). Later reconnects resume from `lastSeenSeq`.
+  let primed = false;
   let stopped = false;
 
   // ── tools/list ────────────────────────────────────────────────────
@@ -1204,6 +1207,7 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
       ? { threads: options.initialListing.threads, head: options.initialListing.head }
       : await connectedClient().listThreads();
     lastSeenSeq = listing.head ?? 0;
+    primed = true;
     // Round-2: the catch-up summary must ONLY list threads that
     // are delivered to the agent. The `deliveredCommentIds` set
     // is derived on the daemon and returned from `/api/delivered`.
@@ -1301,8 +1305,9 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
   };
 
   /** Single reconnect attempt: close the current subscriber, run
-   * `discover`, rebuild the client, cap `lastSeenSeq` at the fresh
-   * daemon's head, and re-attach the subscriber. Throws on failure
+   * `discover`, rebuild the client, and re-attach the subscriber:
+   * through `primeAndSubscribe` when no connect has primed yet, else
+   * resuming with `lastSeenSeq` capped at the fresh daemon's head. Throws on failure
    * so the caller can decide whether to retry (background loop) or
    * to give up and return an error (tool call). */
   const reconnectOnce = async (reason: string): Promise<void> => {
@@ -1315,6 +1320,13 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
     currentToken = next.agentToken;
     currentInstanceId = next.instanceId;
     currentClient = new DaemonClient({ url: currentUrl, agentToken: currentToken });
+    // First successful connect (the daemon was down at startup): take the
+    // same prime path as an initial connect — subscribe from head and emit
+    // the single catch-up summary — instead of replaying from seq 0.
+    if (!primed) {
+      await primeAndSubscribe();
+      return;
+    }
     // If the daemon is fresh (new instanceId), head may be BEHIND
     // our lastSeenSeq (a wiped sqlite would restart at 1). Cap our
     // resume at the current head.

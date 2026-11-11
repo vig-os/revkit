@@ -132,45 +132,28 @@ function runSkillInstall(
   const target = resolve(targetDir, "SKILL.md");
 
   const registrationPath = resolve(dir, ".mcp.json");
-  const registration = { command: "revkit", args: ["mcp"] };
-  let config: Record<string, unknown> = {};
-  let servers: Record<string, unknown> = {};
-  let priorRegistration: string | undefined;
-  let replaceRegistration = false;
-  try {
-    if (existsSync(registrationPath)) {
-      priorRegistration = readFileSync(registrationPath, "utf8");
-      const parsed: unknown = JSON.parse(priorRegistration);
-      if (!isObject(parsed) || (parsed.mcpServers !== undefined && !isObject(parsed.mcpServers))) {
-        throw new Error("expected an object with an mcpServers object");
-      }
-      config = parsed;
-      servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-      const existing = servers.revkit;
-      if (existing !== undefined) {
-        const matches = isObject(existing) && existing.command === registration.command &&
-          JSON.stringify(existing.args) === JSON.stringify(registration.args) &&
-          Object.keys(existing).every((key) => key === "command" || key === "args");
-        replaceRegistration = !matches;
-        if (replaceRegistration && !force) {
-          return { stdout: "", stderr: `revkit skill install: ${registrationPath} revkit registration already exists. Pass --force to replace it with a backup.\n`, exitCode: 1 };
-        }
-      }
-    }
-  } catch (error) {
-    return { stdout: "", stderr: `revkit skill install: cannot merge ${registrationPath}: ${(error as Error).message}\n`, exitCode: 1 };
-  }
-  const registrationSource = JSON.stringify({ ...config, mcpServers: { ...servers, revkit: registration } }, null, 2) + "\n";
+  const plan = planRegistration(registrationPath, force);
+  if ("error" in plan) return { stdout: "", stderr: `${plan.error}\n`, exitCode: 1 };
+
+  // The registration is independent of the skill file: a consumer who already
+  // has SKILL.md can add the registration without `--force` replacing it.
+  const skillExists = existsSync(target);
+  const writeSkill = !skillExists || force;
+  const writeRegistration = plan.source !== undefined;
 
   if (dryRun) {
+    const actions = [
+      ...(writeSkill ? [`write ${target} (${source.length} bytes)`] : []),
+      ...(writeRegistration ? [`merge ${registrationPath}`] : []),
+    ];
     return {
-      stdout: `Would write ${target} (${source.length} bytes) and merge ${registrationPath}.\n`,
+      stdout: `Would ${actions.length > 0 ? actions.join(" and ") : "change nothing"}.\n`,
       stderr: "",
       exitCode: 0,
     };
   }
 
-  if (existsSync(target) && !force) {
+  if (!writeSkill && !writeRegistration) {
     return {
       stdout: "",
       stderr:
@@ -180,19 +163,26 @@ function runSkillInstall(
     };
   }
 
+  const lines: string[] = [];
   try {
-    mkdirSync(targetDir, { recursive: true });
-    if (existsSync(target)) {
-      // Backup then overwrite (force mode).
-      const backup = `${target}.backup-${Date.now()}`;
-      const prior = readFileSync(target, "utf8");
-      writeFileSync(backup, prior, "utf8");
+    if (writeSkill) {
+      mkdirSync(targetDir, { recursive: true });
+      if (skillExists) {
+        // Backup then overwrite (force mode).
+        writeFileSync(`${target}.backup-${Date.now()}`, readFileSync(target, "utf8"), "utf8");
+      }
+      writeFileSync(target, source, "utf8");
+      lines.push(`Installed revkit skill: ${target}`);
+    } else {
+      lines.push(`Kept existing revkit skill: ${target} (pass --force to overwrite)`);
     }
-    if (replaceRegistration && priorRegistration !== undefined) {
-      writeFileSync(`${registrationPath}.backup-${Date.now()}`, priorRegistration, "utf8");
+    if (plan.source !== undefined) {
+      if (plan.prior !== undefined && plan.replaces) {
+        writeFileSync(`${registrationPath}.backup-${Date.now()}`, plan.prior, "utf8");
+      }
+      writeFileSync(registrationPath, plan.source, "utf8");
+      lines.push(`Registered revkit mcp: ${registrationPath}`);
     }
-    writeFileSync(registrationPath, registrationSource, "utf8");
-    writeFileSync(target, source, "utf8");
   } catch (error) {
     return {
       stdout: "",
@@ -201,11 +191,49 @@ function runSkillInstall(
     };
   }
 
-  return {
-    stdout: `Installed revkit skill: ${target}\nRegistered revkit mcp: ${registrationPath}\n`,
-    stderr: "",
-    exitCode: 0,
-  };
+  return { stdout: `${lines.join("\n")}\n`, stderr: "", exitCode: 0 };
+}
+
+const MCP_REGISTRATION = { command: "revkit", args: ["mcp"] };
+
+type RegistrationPlan =
+  | { readonly error: string }
+  // `source` is the merged file to write, or undefined when the existing
+  // registration is already equivalent and the file stays untouched.
+  | { readonly source: string | undefined; readonly prior: string | undefined; readonly replaces: boolean };
+
+/** Decide how to merge the `revkit` MCP server into `<dir>/.mcp.json`.
+ * An existing entry with the same `command` + `args` is equivalent even when
+ * it carries extra keys (`type`, `env`, ...); any other entry is a conflict
+ * that only `--force` replaces (with a backup). */
+function planRegistration(registrationPath: string, force: boolean): RegistrationPlan {
+  let config: Record<string, unknown> = {};
+  let servers: Record<string, unknown> = {};
+  let prior: string | undefined;
+  try {
+    if (existsSync(registrationPath)) {
+      prior = readFileSync(registrationPath, "utf8");
+      const parsed: unknown = JSON.parse(prior);
+      if (!isObject(parsed) || (parsed.mcpServers !== undefined && !isObject(parsed.mcpServers))) {
+        throw new Error("expected an object with an mcpServers object");
+      }
+      config = parsed;
+      servers = (config.mcpServers ?? {}) as Record<string, unknown>;
+    }
+  } catch (error) {
+    return { error: `revkit skill install: cannot merge ${registrationPath}: ${(error as Error).message}` };
+  }
+  const existing = servers.revkit;
+  if (existing !== undefined) {
+    const equivalent = isObject(existing) && existing.command === MCP_REGISTRATION.command &&
+      JSON.stringify(existing.args) === JSON.stringify(MCP_REGISTRATION.args);
+    if (equivalent) return { source: undefined, prior, replaces: false };
+    if (!force) {
+      return { error: `revkit skill install: ${registrationPath} revkit registration already exists. Pass --force to replace it with a backup.` };
+    }
+  }
+  const merged = { ...config, mcpServers: { ...servers, revkit: MCP_REGISTRATION } };
+  return { source: JSON.stringify(merged, null, 2) + "\n", prior, replaces: existing !== undefined };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

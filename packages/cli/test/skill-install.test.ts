@@ -79,6 +79,29 @@ describe("revkit skill install", () => {
     expect(readdirSync(scratch).some((name) => name.startsWith(".mcp.json.backup-"))).toBe(false);
   });
 
+  test("an existing registration that only adds keys is equivalent, not a conflict", () => {
+    const target = resolve(scratch, ".mcp.json");
+    const prior = JSON.stringify({ mcpServers: { revkit: { type: "stdio", command: "revkit", args: ["mcp"], env: { A: "1" } } } });
+    writeFileSync(target, prior);
+    expect(runSkillCommand(["install"], { cwd: scratch }).exitCode).toBe(0);
+    expect(readFileSync(target, "utf8")).toBe(prior);
+    expect(readdirSync(scratch).some((name) => name.startsWith(".mcp.json.backup-"))).toBe(false);
+  });
+
+  test("an existing SKILL.md does not block adding the registration, and is left untouched without --force", () => {
+    const skillDir = resolve(scratch, ".claude/skills/revkit");
+    mkdirSync(skillDir, { recursive: true });
+    const custom = "# my customised skill\n";
+    writeFileSync(resolve(skillDir, "SKILL.md"), custom);
+    const outcome = runSkillCommand(["install"], { cwd: scratch });
+    expect(outcome.exitCode).toBe(0);
+    expect(outcome.stdout).toContain("Registered revkit mcp");
+    expect(readFileSync(resolve(skillDir, "SKILL.md"), "utf8")).toBe(custom);
+    expect(readdirSync(skillDir)).toEqual(["SKILL.md"]);
+    const config = JSON.parse(readFileSync(resolve(scratch, ".mcp.json"), "utf8"));
+    expect(config.mcpServers.revkit).toEqual({ command: "revkit", args: ["mcp"] });
+  });
+
   test("merges registration while preserving other servers and metadata", () => {
     const other = { command: "other", args: ["start"] };
     writeFileSync(resolve(scratch, ".mcp.json"), JSON.stringify({ metadata: true, mcpServers: { other } }));

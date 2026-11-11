@@ -142,7 +142,7 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
     }
   }
   throw new Error(
-    `revkit mcp: spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
+    `spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
   );
 }
 
