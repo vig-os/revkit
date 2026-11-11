@@ -268,7 +268,6 @@ export function assertEveryEntryRendered(
       const rawSource = entry.filePath ?? id;
       const source = toConsumerPath(rawSource, options.consumerRoot);
       const underlying = findUnderlyingRenderError(
-        id,
         rawSource,
         options.renderErrorsByEntryBasename,
       );
@@ -277,31 +276,43 @@ export function assertEveryEntryRendered(
   }
 }
 
-/** Look up the captured render error for one entry, trying the id, its
- * basename AND the source's basename (astro's glob loader logs the
- * glob entry name, which equals the file basename for flat layouts
- * and the relative path for nested ones). Returns `null` when nothing
- * matches so `EmptyRenderedBodyError`'s format skips the "Underlying"
- * line cleanly. */
+/** Collection bases astro's glob loader uses for the `docs` content
+ * collection. The glob loader logs `Error rendering <entry>:` where
+ * `<entry>` is the tinyglobby match path, which is relative to the
+ * loader's `base`. For Starlight the base is
+ * `src/content/docs` (from
+ * `@astrojs/starlight/dist/utils/collection.js`
+ * `getCollectionPathFromRoot`). Stripping that prefix off the
+ * entry's astro-root-relative `filePath` yields the exact string
+ * astro logs — no guessing. */
+const KNOWN_GLOB_COLLECTION_BASES: readonly string[] = [
+  "src/content/docs/",
+];
+
+/** Look up the captured render error for one entry. Astro's glob
+ * loader logs `Error rendering <entry>: <message>` where `<entry>`
+ * is the tinyglobby match path relative to the loader's `base`, so
+ * for `src/content/docs/sub/My_Doc.md` the key is `sub/My_Doc.md`.
+ *
+ * Reversing the derivation is deterministic — strip the known
+ * collection base off the entry's astro-root-relative filePath. No
+ * guessing, no basename-only fallback (which previously missed
+ * nested broken docs — round-3 review). */
 function findUnderlyingRenderError(
-  entryId: string,
-  sourcePath: string,
+  entryFilePath: string,
   errors: ReadonlyMap<string, string> | undefined,
 ): string | null {
-  if (errors === undefined) return null;
-  // Candidates in order of preference: the id, the id's basename, the
-  // source basename, and the full source path (normalised to /).
-  const candidates = new Set<string>();
-  candidates.add(entryId);
-  const idBase = entryId.split("/").pop();
-  if (idBase !== undefined) candidates.add(idBase);
-  const normalisedSource = sourcePath.replace(/\\/g, "/");
-  candidates.add(normalisedSource);
-  const srcBase = normalisedSource.split("/").pop();
-  if (srcBase !== undefined) candidates.add(srcBase);
-  for (const key of candidates) {
-    const hit = errors.get(key);
-    if (hit !== undefined) return hit;
+  if (errors === undefined || errors.size === 0) return null;
+  const posix = entryFilePath.replace(/\\/g, "/");
+  for (const base of KNOWN_GLOB_COLLECTION_BASES) {
+    if (posix.startsWith(base)) {
+      const hit = errors.get(posix.slice(base.length));
+      if (hit !== undefined) return hit;
+    }
   }
+  // Fallback: a loader that logs with a non-base-relative key
+  // (unlikely for Starlight today) — accept the exact filePath.
+  const direct = errors.get(posix);
+  if (direct !== undefined) return direct;
   return null;
 }

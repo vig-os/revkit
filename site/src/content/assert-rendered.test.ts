@@ -258,7 +258,10 @@ describe("assertEveryEntryRendered — the acceptance clauses of #237", () => {
     }
   });
 
-  test("the thrown error carries the UNDERLYING render error (round-2 review item 1)", () => {
+  test("the thrown error carries the UNDERLYING render error at the top level (round-2 review item 1)", () => {
+    // Astro's glob loader logs `Error rendering bad-render.mdx: ...`
+    // for an entry at `src/content/docs/bad-render.mdx` (base is
+    // `src/content/docs/`).
     const renderErrors = new Map<string, string>([
       ["bad-render.mdx", "Failed to parse Markdown: Undefined control sequence \\invalidmacro"],
     ]);
@@ -285,6 +288,92 @@ describe("assertEveryEntryRendered — the acceptance clauses of #237", () => {
       expect(e.message).toContain("Undefined control sequence");
       // ES2022 `cause` chain is present too.
       expect((e as unknown as { cause: Error }).cause).toBeInstanceOf(Error);
+    }
+  });
+
+  test("underlying error is attached for a NESTED broken doc (round-3 review item 1)", () => {
+    // Reviewer repro: `docs/sub/My_Doc.md` with bad KaTeX exited
+    // non-zero but the gate's message lacked `Underlying render
+    // error`. Astro logs the glob-relative key `sub/My_Doc.md`
+    // (base `src/content/docs/`); the fix keys the lookup on
+    // `entry.filePath` minus that base, deterministically.
+    const renderErrors = new Map<string, string>([
+      ["sub/My_Doc.md", "KaTeX parse error: Undefined control sequence \\invalidmacro"],
+    ]);
+    const entries: [string, ContentStoreEntry][] = [
+      [
+        "sub/my_doc",
+        entry({
+          id: "sub/my_doc",
+          body: "# x\n",
+          filePath: "src/content/docs/sub/My_Doc.md",
+        }),
+      ],
+    ];
+    try {
+      assertEveryEntryRendered(entries, {
+        consumerRoot: "/tmp/consumer",
+        renderErrorsByEntryBasename: renderErrors,
+      });
+      throw new Error("expected throw");
+    } catch (error) {
+      const e = error as EmptyRenderedBodyError;
+      expect(e.message).toContain("docs/sub/My_Doc.md");
+      expect(e.message).toContain("Underlying render error:");
+      expect(e.message).toContain("KaTeX parse error");
+      expect(e.underlying).toContain("Undefined control sequence");
+    }
+  });
+
+  test("underlying error is attached for a NESTED broken doc whose name contains `_` (round-3 extra)", () => {
+    const renderErrors = new Map<string, string>([
+      ["deep/My_Nested_Doc.md", "render failed"],
+    ]);
+    const entries: [string, ContentStoreEntry][] = [
+      [
+        "deep/my_nested_doc",
+        entry({
+          id: "deep/my_nested_doc",
+          body: "# body\n",
+          filePath: "src/content/docs/deep/My_Nested_Doc.md",
+        }),
+      ],
+    ];
+    try {
+      assertEveryEntryRendered(entries, {
+        consumerRoot: "/tmp/consumer",
+        renderErrorsByEntryBasename: renderErrors,
+      });
+      throw new Error("expected throw");
+    } catch (error) {
+      const e = error as EmptyRenderedBodyError;
+      expect(e.underlying).toBe("render failed");
+    }
+  });
+
+  test("when no matching render-error key is captured, `underlying` is null and the message is clean", () => {
+    const renderErrors = new Map<string, string>([
+      ["something-else.md", "unrelated"],
+    ]);
+    const entries: [string, ContentStoreEntry][] = [
+      [
+        "a",
+        entry({
+          id: "a",
+          body: "# x\n",
+          filePath: "src/content/docs/a.md",
+        }),
+      ],
+    ];
+    try {
+      assertEveryEntryRendered(entries, {
+        renderErrorsByEntryBasename: renderErrors,
+      });
+      throw new Error("expected throw");
+    } catch (error) {
+      const e = error as EmptyRenderedBodyError;
+      expect(e.underlying).toBeNull();
+      expect(e.message).not.toContain("Underlying render error:");
     }
   });
 

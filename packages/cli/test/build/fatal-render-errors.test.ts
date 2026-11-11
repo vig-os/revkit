@@ -74,8 +74,13 @@ function scaffoldConsumer(): { root: string; distDir: string } {
   // the build exited 0 and Starlight shipped an empty
   // `sl-markdown-content`; after the fix, `guardedDocsLoader` throws
   // during the content-sync phase and astro exits non-zero.
+  // The doc whose render MUST fail lives in a NESTED directory so
+  // the round-3 reviewer's repro is directly exercised (an earlier
+  // version of the underlying-error lookup mis-keyed nested docs
+  // and missed the message in the thrown error).
+  mkdirSync(join(root, "docs", "deep"), { recursive: true });
   writeFileSync(
-    join(root, "docs", "bad-math.md"),
+    join(root, "docs", "deep", "bad-math.md"),
     "---\ntitle: Bad Math\n---\n\n# Bad\n\nA document with a KaTeX parse error below.\n\n$$\n\\invalidmacro{x}\n$$\n",
     "utf8",
   );
@@ -120,12 +125,15 @@ describe("revkit build — fatal render errors (issue #237)", () => {
     // and assert the consumer path is there. Astro's stderr before
     // the gate's throw legitimately prints the staging path (that's
     // what astro's content-layer passes through to the logger), so
-    // we scope the assertion to the gate line itself.
+    // we scope the assertion to the gate line itself. Also assert
+    // the nested path survives — the round-3 reviewer's repro was a
+    // nested doc that lost its underlying-error attribution before
+    // the fix landed.
     const gateLineMatch =
       combined.match(/revkit content gate \(#237\)[^\n]+/);
     expect(gateLineMatch, `gate line not found in output: ${combined}`).not.toBeNull();
     const gateLine = gateLineMatch?.[0] ?? "";
-    expect(gateLine).toContain("docs/bad-math.md");
+    expect(gateLine).toContain("docs/deep/bad-math.md");
     expect(gateLine).not.toContain("src/content/");
   }, 600_000);
 });

@@ -168,61 +168,70 @@ export async function runBuildCommand(
   //    — are honoured), and we read it back here to hand
   //    `check-dist` the exact page set. The file lives under the
   //    build state dir, not inside dist, so nothing extra ships.
+  //
+  //    The manifest is build-scoped scratch and is removed on
+  //    EVERY exit path below (try / finally) so a stale one from
+  //    a prior run never masks a future fresh build — round-3
+  //    review item 4.
   const renderGuardManifest = join(consumerRoot, ".revkit", "build", "render-guard-manifest.json");
-  let result;
   try {
-    result = await runPackagedBuild({
-      consumerRoot,
-      distOutDir,
-      renderGuardManifestPath: renderGuardManifest,
-    });
-  } catch (error) {
-    return {
-      exitCode: 1,
-      stdout: stdoutLines.join("\n") + "\n",
-      stderr: `revkit build: astro build failed: ${(error as Error).message}\n`,
-    };
-  }
-  stdoutLines.push(`revkit build: astro ok — packaged site ${prettyPath(env.cwd, result.packagedSiteDir)}`);
-  stdoutLines.push(`revkit build: staging ${prettyPath(env.cwd, result.stagingDir)}`);
-
-  // 3. check-dist on the built output (ADR-0012 output-gate).
-  if (!parsed.parsed.skipCheckDist) {
-    const pagesWithNonEmptySource = readRenderGuardManifest(renderGuardManifest);
-    const diagnostics = checkDistDirectory(distOutDir, { pagesWithNonEmptySource });
-    if (diagnostics.length > 0) {
+    let result;
+    try {
+      result = await runPackagedBuild({
+        consumerRoot,
+        distOutDir,
+        renderGuardManifestPath: renderGuardManifest,
+      });
+    } catch (error) {
       return {
         exitCode: 1,
         stdout: stdoutLines.join("\n") + "\n",
-        stderr:
-          `revkit build: 'revkit check-dist' refused the built output:\n` +
-          diagnostics.map(formatDiagnostic).join("\n") +
-          "\n",
+        stderr: `revkit build: astro build failed: ${(error as Error).message}\n`,
       };
     }
-    stdoutLines.push(`revkit build: check-dist ok`);
-  }
-  // The manifest is build-scoped scratch; drop it once check-dist
-  // has consumed it so a stale one from a prior run never masks a
-  // future fresh build.
-  try {
-    rmSync(renderGuardManifest, { force: true });
-  } catch {
-    /* fine */
-  }
+    stdoutLines.push(`revkit build: astro ok — packaged site ${prettyPath(env.cwd, result.packagedSiteDir)}`);
+    stdoutLines.push(`revkit build: staging ${prettyPath(env.cwd, result.stagingDir)}`);
 
-  stdoutLines.push(``);
-  stdoutLines.push(
-    `Built at ${prettyPath(env.cwd, distOutDir)}. Run 'revkit serve' to review.`,
-  );
-  return { exitCode: 0, stdout: stdoutLines.join("\n") + "\n", stderr: "" };
+    // 3. check-dist on the built output (ADR-0012 output-gate).
+    if (!parsed.parsed.skipCheckDist) {
+      const pagesWithNonEmptySource = readRenderGuardManifest(renderGuardManifest);
+      const diagnostics = checkDistDirectory(distOutDir, { pagesWithNonEmptySource });
+      if (diagnostics.length > 0) {
+        return {
+          exitCode: 1,
+          stdout: stdoutLines.join("\n") + "\n",
+          stderr:
+            `revkit build: 'revkit check-dist' refused the built output:\n` +
+            diagnostics.map(formatDiagnostic).join("\n") +
+            "\n",
+        };
+      }
+      stdoutLines.push(`revkit build: check-dist ok`);
+    }
+
+    stdoutLines.push(``);
+    stdoutLines.push(
+      `Built at ${prettyPath(env.cwd, distOutDir)}. Run 'revkit serve' to review.`,
+    );
+    return { exitCode: 0, stdout: stdoutLines.join("\n") + "\n", stderr: "" };
+  } finally {
+    try {
+      rmSync(renderGuardManifest, { force: true });
+    } catch {
+      /* fine */
+    }
+  }
 }
 
 /** Read the render-guard manifest the astro loader wrote. Returns an
  * empty set when the file is absent or malformed — the empty-content
  * defense then does nothing, which is strictly weaker than the
- * build-time guard (which is the primary check anyway). Issue #237. */
-function readRenderGuardManifest(manifestPath: string): ReadonlySet<string> {
+ * build-time guard (which is the primary check anyway). Issue #237.
+ *
+ * Exported so a dedicated regression test (round-3 review item 3)
+ * exercises the exact function `runBuildCommand` relies on: mutating
+ * this to return `new Set()` must flip a test red. */
+export function readRenderGuardManifest(manifestPath: string): ReadonlySet<string> {
   if (!existsSync(manifestPath)) return new Set();
   try {
     const raw = readFileSync(manifestPath, "utf8");

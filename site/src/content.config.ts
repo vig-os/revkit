@@ -27,7 +27,6 @@ import {
   captureRenderErrorsFromLogger,
   collectPagesFromStore,
 } from "./content/assert-rendered.ts";
-import { renderGuardMode } from "./content/render-guard-mode.ts";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -61,26 +60,32 @@ function composedDocsLoader(): Loader {
  *
  *   1. Intercepts the loader context's `logger.error(...)` calls so the
  *      astro-logged "Error rendering <entry>: <message>" line is
- *      captured in a side-channel map keyed by entry name — otherwise
- *      the underlying error is lost by the time the structural check
- *      runs (astro does not re-throw it).
+ *      captured in a side-channel map keyed by the SAME string astro
+ *      logs — i.e. the glob-relative entry path — so the structural
+ *      check has the underlying error available.
  *   2. Runs the inner loader with that wrapped context.
  *   3. Asserts every entry with a non-empty body carries non-empty
- *      rendered HTML. A violation throws
- *      `EmptyRenderedBodyError` that names the entry id, the
- *      consumer-visible source path, AND the underlying render error.
+ *      rendered HTML. A violation throws `EmptyRenderedBodyError` that
+ *      names the entry id, the consumer-visible source path, AND the
+ *      underlying render error.
  *
  * Applies to BOTH own-repo mode (which uses `composedDocsLoader`) and
  * consumer mode (which uses Starlight's `docsLoader` directly), so the
  * packaged flow is guarded by the same gate the site build uses.
  *
- * Skipped during `astro dev`: the dev server's native error overlay
- * already surfaces render errors, and a throw from `load()` only
- * yields astro's unhelpful "Dev server process exited before becoming
- * ready" message (round-2 review). `renderGuardMode.command` is set by
- * the companion integration in `render-guard-mode.ts` from
- * `astro:config:setup`'s `command` arg, so the loader knows whether
- * `astro build` or `astro dev` is running. */
+ * The gate also fires under `astro dev`. The dev server exits with
+ * astro's generic "Dev server process exited before becoming ready"
+ * supervisor line in that case, but the full
+ * `EmptyRenderedBodyError` (source file + underlying render error)
+ * reaches astro's foreground stdout and, when the dev server is
+ * backgrounded, `.astro/dev.log`. Astro does not expose the
+ * dev-vs-build command to a loader context, and a workers-side
+ * attempt to share state through a module-level flag in an
+ * integration did not work in practice (round-3 review): the
+ * integration and the loader load as separate module instances
+ * under astro's content-sync runtime. The round-3 review accepted
+ * the dev behaviour as-is rather than add more detection
+ * machinery — see PR notes. */
 function guardedDocsLoader(inner: Loader): Loader {
   return {
     name: `${inner.name}+revkit-render-guard`,
@@ -114,12 +119,6 @@ function guardedDocsLoader(inner: Loader): Loader {
           );
         }
       }
-      // In `astro dev` the error overlay already surfaces render
-      // failures and the dev server's own supervisor swallows a
-      // `load()` throw into a bare "exited before becoming ready"
-      // message — our structured error does not reach the terminal
-      // the way `astro build` surfaces it. Skip the gate there.
-      if (renderGuardMode.command === "dev") return;
       assertEveryEntryRendered(context.store.entries(), {
         renderErrorsByEntryBasename: renderErrors,
         ...(CONSUMER_ROOT !== null ? { consumerRoot: CONSUMER_ROOT } : {}),
