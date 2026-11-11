@@ -102,6 +102,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`revkit build` launches Astro through the staged dependency graph** ([#238](https://github.com/vig-os/revkit/issues/238))
+  - In the isolated (Bun workspace) layout, Astro ran from `site/node_modules/.bin/astro`, which Node resolves to
+    its real path in Bun's store. With `NODE_PRESERVE_SYMLINKS=1`, packages reached from there walked up into Bun's
+    shared fallback folder (`node_modules/.bun/node_modules`), which holds one version per name. Since
+    `hast-util-raw` 9.2.0 (parse5 8) that loaded parse5 7, every Markdown body rendered empty.
+  - Astro now starts from `<staging>/node_modules/astro` with `--preserve-symlinks-main`, so the CLI and every
+    import resolve through `.revkit-deps` in both layouts. The hoisted (nix package) layout was never affected: its
+    flat tree nests conflicting versions under their dependants.
+  - A regression test stages a fixture whose fallback folder holds an incompatible version and asserts the staged
+    one is rendered.
 - **Worker tests derive their version from `wrangler.jsonc` instead of a
   hard-coded dev-placeholder literal** ([#231](https://github.com/vig-os/revkit/issues/231))
   - Seven Worker tests used to hand-write the dev placeholder in bundle paths
@@ -180,6 +190,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cover `publishRequestSchema`'s two `.max(PUBLISH_ARRAY_SHAPE_MAX)` arrays, but `askAnswerSchema`'s `ranking`,
     `coordinates` and multi-choice `value` arrays have no `.max()` yet, so on those endpoints the upgrade clears
     the advisory flag rather than closing the path itself; adding those caps is a separate follow-up.
+  - A root `overrides: { zod: "4.6.7" }` in `package.json` pins every resolution, including transitives
+    (`@modelcontextprotocol/sdk`, `astro`, `@astrojs/sitemap`), so no nested copy of the vulnerable `zod@4.6.5`
+    ships. Dependency Review only checks direct manifests, but the MCP SDK validates tool args with its nested
+    `zod` — those copies carried the advisory until this dedupe.
 - **Upgrade `@modelcontextprotocol/sdk` to 1.32.2** ([#227](https://github.com/vig-os/revkit/issues/227))
   - Clears two high-severity advisories in 1.31.0: GHSA-22jm-h49p-29qw (experimental tasks not tied to the creating
     session) and GHSA-46jr-4wx8-v453 (request validation could exhaust server memory over HTTP); the latter's
