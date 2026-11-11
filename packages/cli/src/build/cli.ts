@@ -6,13 +6,14 @@
 // gate) so the output is fit for `revkit serve`.
 
 import { existsSync } from "node:fs";
-import { relative as relativePath, resolve as resolvePath } from "node:path";
+import { join, relative as relativePath, resolve as resolvePath } from "node:path";
 import { checkDistDirectory } from "../check-dist.ts";
 import { runCheck, toCheckFiles } from "../check.ts";
 import { formatDiagnostic } from "../diagnostics.ts";
 import { walkForCheckables } from "../file-discovery.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
 import { defaultConsumerDist, runPackagedBuild } from "./packaged.ts";
+import { collectPagesWithNonEmptySource } from "./source-body-map.ts";
 
 /** Result shape aligned with the dispatcher's `CliResult`. */
 export interface RunBuildResult {
@@ -171,9 +172,16 @@ export async function runBuildCommand(
   stdoutLines.push(`revkit build: astro ok — packaged site ${prettyPath(env.cwd, result.packagedSiteDir)}`);
   stdoutLines.push(`revkit build: staging ${prettyPath(env.cwd, result.stagingDir)}`);
 
-  // 3. check-dist on the built output (ADR-0012 output-gate).
+  // 3. check-dist on the built output (ADR-0012 output-gate). The
+  //    consumer's docs/ dir is handed in as the source-body source
+  //    so check-dist can run its empty-content-root defense (issue
+  //    #237): a page whose source body was non-empty but whose
+  //    rendered content root is empty fails here, naming the page.
   if (!parsed.parsed.skipCheckDist) {
-    const diagnostics = checkDistDirectory(distOutDir);
+    const pagesWithNonEmptySource = collectPagesWithNonEmptySource(
+      join(consumerRoot, "docs"),
+    );
+    const diagnostics = checkDistDirectory(distOutDir, { pagesWithNonEmptySource });
     if (diagnostics.length > 0) {
       return {
         exitCode: 1,

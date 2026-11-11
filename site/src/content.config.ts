@@ -22,6 +22,7 @@ import { askSchema } from "@revkit/review-core";
 import { plotSpecSchema } from "./content/schemas/plots.ts";
 import { vocabEntrySchema, vocabFileSchema } from "./content/schemas/vocab.ts";
 import { readConsumerRoot } from "./lib/consumer-root.ts";
+import { assertEveryEntryRendered } from "./content/assert-rendered.ts";
 
 // Consumer-root mode (issue #57): when set, this config is rendering
 // an EXTERNAL repo's `docs/`, `vocab/`, `plots/` through the packaged
@@ -41,6 +42,29 @@ function composedDocsLoader(): Loader {
     async load(context) {
       await starlight.load(context);
       await repo.load(context);
+    },
+  };
+}
+
+/** Wrap a docs loader with a structural render gate (issue #237).
+ *
+ * The astro glob loader catches markdown render errors and stores the
+ * entry with `rendered: undefined` — the build then exits 0 and ships
+ * an empty `sl-markdown-content`. This wrapper runs the inner loader
+ * first, then asserts every entry with a non-empty body also carries
+ * non-empty rendered HTML. A violation throws from `load()`, which
+ * astro's content-sync treats as fatal and surfaces as a non-zero
+ * `revkit build` exit code.
+ *
+ * Applies to BOTH own-repo mode (which uses `composedDocsLoader`) and
+ * consumer mode (which uses Starlight's `docsLoader` directly), so the
+ * packaged flow is guarded by the same gate the site build uses. */
+function guardedDocsLoader(inner: Loader): Loader {
+  return {
+    name: `${inner.name}+revkit-render-guard`,
+    async load(context) {
+      await inner.load(context);
+      assertEveryEntryRendered(context.store.entries());
     },
   };
 }
@@ -87,7 +111,7 @@ export const collections = {
     // consumer's `docs/` through Starlight's own loader — `revkit
     // build` populates `<staging>/src/content/docs/` with symlinks
     // to the consumer's tree so the default base still works.
-    loader: CONSUMER_ROOT ? docsLoader() : composedDocsLoader(),
+    loader: guardedDocsLoader(CONSUMER_ROOT ? docsLoader() : composedDocsLoader()),
     schema: docsSchema({
       extend: z.object({
         // Present on repo-sourced ADR pages; the loader lifts it from the

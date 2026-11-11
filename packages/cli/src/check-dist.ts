@@ -619,16 +619,35 @@ export function scanDocument(document: ParseTreeNode, reportPath: string): Check
   return findings;
 }
 
+/** Options accepted by `checkDistDirectory`. */
+export interface CheckDistOptions {
+  /** Dist-relative page paths (e.g. `"index.html"` or
+   * `"adr/0001-foo/index.html"`) whose source doc had a non-empty body.
+   * When provided, each listed page is additionally checked for a
+   * non-empty content root (`<div class="sl-markdown-content">` or
+   * revkit's equivalent) — defense in depth against the astro glob
+   * loader's silent render-error catch (issue #237).
+   *
+   * Pages absent from this set are not checked, so a frontmatter-only
+   * source doc (empty body) never trips the check. A set with no
+   * entries means no defense-in-depth scan runs. */
+  readonly pagesWithNonEmptySource?: ReadonlySet<string>;
+}
+
 /** Run check over every `.html` file under `distDir`. */
-export function checkDistDirectory(distDir: string): Diagnostic[] {
+export function checkDistDirectory(
+  distDir: string,
+  options: CheckDistOptions = {},
+): Diagnostic[] {
   const findings: Diagnostic[] = [];
   for (const absolute of walkHtml(distDir)) {
+    const relPath = relative(distDir, absolute);
     let html: string;
     try {
       html = readFileSync(absolute, "utf8");
     } catch (error) {
       findings.push({
-        file: relative(distDir, absolute),
+        file: relPath,
         line: 0,
         rule: "check-dist",
         message: `cannot read: ${(error as Error).message}`,
@@ -636,7 +655,7 @@ export function checkDistDirectory(distDir: string): Diagnostic[] {
       continue;
     }
     const doc = parse5Parse(html) as unknown as ParseTreeNode;
-    for (const finding of scanDocument(doc, relative(distDir, absolute))) {
+    for (const finding of scanDocument(doc, relPath)) {
       findings.push({
         file: finding.file,
         line: 0,
@@ -644,8 +663,97 @@ export function checkDistDirectory(distDir: string): Diagnostic[] {
         message: finding.message,
       });
     }
+    if (options.pagesWithNonEmptySource?.has(relPath) === true) {
+      const refusal = emptyContentRootRefusal(doc);
+      if (refusal !== null) {
+        findings.push({
+          file: relPath,
+          line: 0,
+          rule: "check-dist",
+          message:
+            `empty rendered content: source doc has a non-empty body but ` +
+            `${refusal} is empty — the markdown renderer failed silently ` +
+            `(issue #237).`,
+        });
+      }
+    }
   }
   return findings;
+}
+
+/** The Starlight content-root class name. `MarkdownContent.astro` wraps
+ * the `<slot />` with this; a page whose rendered markdown is missing
+ * emits an empty `<div class="sl-markdown-content">`. The constant is
+ * exported so the dogfood-site integration test can reference the SAME
+ * marker name. */
+export const CONTENT_ROOT_CLASS = "sl-markdown-content";
+
+/** Inspect the parsed document and, when a Starlight content root is
+ * present but has no non-whitespace content (including no element
+ * children), return a human-readable identifier of the empty container.
+ * Returns `null` when the content root is absent (so a non-Starlight
+ * page is NEVER reported as empty) or when it holds content.
+ *
+ * Exported so a direct unit test can exercise it without the surrounding
+ * directory walk. */
+export function emptyContentRootRefusal(doc: ParseTreeNode): string | null {
+  const root = findFirstElementWithClass(doc, CONTENT_ROOT_CLASS);
+  if (root === null) return null;
+  if (elementHasRenderedContent(root)) return null;
+  return `content root <div class="${CONTENT_ROOT_CLASS}">`;
+}
+
+/** Depth-first search for the first element whose `class` attribute
+ * contains `className` as a whitespace-separated token. */
+function findFirstElementWithClass(
+  node: ParseTreeNode,
+  className: string,
+): ParseTreeNode | null {
+  if (node.tagName !== undefined && elementHasClass(node, className)) {
+    return node;
+  }
+  for (const child of node.childNodes ?? []) {
+    const hit = findFirstElementWithClass(child, className);
+    if (hit !== null) return hit;
+  }
+  if (node.content !== undefined) {
+    const hit = findFirstElementWithClass(node.content, className);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/** True when `element` has `className` on its `class` attribute (as a
+ * whitespace-separated token). */
+function elementHasClass(element: ParseTreeNode, className: string): boolean {
+  for (const attr of element.attrs ?? []) {
+    if (attr.name.toLowerCase() !== "class") continue;
+    const tokens = (attr.value ?? "").split(/\s+/);
+    if (tokens.includes(className)) return true;
+  }
+  return false;
+}
+
+/** True when `element` carries ANY rendered content — a child element,
+ * or a non-whitespace text node. Comment nodes do NOT count. Template
+ * `content` is walked too. */
+function elementHasRenderedContent(element: ParseTreeNode): boolean {
+  for (const child of element.childNodes ?? []) {
+    const name = child.nodeName;
+    if (name.length === 0) continue;
+    if (name === "#text") {
+      if ((child.value ?? "").trim().length > 0) return true;
+      continue;
+    }
+    if (name === "#comment") continue;
+    // Any element-shaped child (parse5 reports those with a non-#
+    // nodeName and a tagName) counts as rendered content.
+    if (child.tagName !== undefined) return true;
+  }
+  if (element.content !== undefined && elementHasRenderedContent(element.content)) {
+    return true;
+  }
+  return false;
 }
 
 /** `--print-hashes` implementation. */
