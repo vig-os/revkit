@@ -104,20 +104,10 @@ import {
   startWorker,
   stripTsComments,
   TEST_INVITE_TOKEN_HMAC_KEY,
+  TEST_REVKIT_VERSION,
   testTokenHasher,
   type Harness,
 } from "./harness.ts";
-
-/** The revkit version the harness binds, READ from `wrangler.jsonc` rather than
- * spelled out — the asset's URL is version-scoped, so a literal here would be a
- * third copy of a value `test/worker-config.test.ts` already pins against
- * `packages/cli/package.json`. Guarded, because an undefined version would
- * quietly build a `/_revkit/undefined/…` URL and 404 for a reason that has
- * nothing to do with the thing under test. */
-const TEST_REVKIT_VERSION = (readWranglerConfig()["vars"] as Record<string, string> | undefined)?.["REVKIT_VERSION"] ?? "";
-if (!/^\d+\.\d+\.\d+$/.test(TEST_REVKIT_VERSION)) {
-  throw new Error(`wrangler.jsonc must bind a plain REVKIT_VERSION; got ${JSON.stringify(TEST_REVKIT_VERSION)}`);
-}
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const VERBS = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] as const;
@@ -2403,8 +2393,8 @@ const PAGE_ELEMENTS = [
           // matter for any input — which is exactly why deleting it survived,
           // and why the honest statement is that it is uniformity rather than a
           // control. Asserted as such instead of left implied.
-          expect(rateLimitedPage(30, "/_revkit/0.0.0/invite.js")).toContain("Try again in 30 seconds.");
-          expect(inviteClosedPage("/_revkit/0.0.0/invite.js")).toContain("cannot be used");
+          expect(rateLimitedPage(30, `/_revkit/${TEST_REVKIT_VERSION}/invite.js`)).toContain("Try again in 30 seconds.");
+          expect(inviteClosedPage(`/_revkit/${TEST_REVKIT_VERSION}/invite.js`)).toContain("cannot be used");
         });
 
         test("a hostile REVKIT_VERSION fails LOUDLY on every route, rather than serving a page whose script silently 404s", () => {
@@ -2429,7 +2419,7 @@ const PAGE_ELEMENTS = [
           }
           // The shape that is legitimate still works, prerelease included —
           // a version gate that refused `0.1.0-rc.1` would be its own outage.
-          expect(revkitBundlePath("0.0.0")).toBe("/_revkit/0.0.0/");
+          expect(revkitBundlePath(TEST_REVKIT_VERSION)).toBe(`/_revkit/${TEST_REVKIT_VERSION}/`);
           expect(revkitBundlePath("1.2.3-rc.1")).toBe("/_revkit/1.2.3-rc.1/");
           // And so `scriptSrc` — the sink above — is now a constant-shaped
           // string by construction rather than by configuration discipline.
@@ -2460,7 +2450,7 @@ const PAGE_ELEMENTS = [
           // `/acme/`, which is a different page entirely.
           expect(runClientScript(INVITE_OPEN_PREFIX)).toEqual([INVITE_OPEN_PREFIX]);
           expect(runClientScript("/acme/pr-7/")).toEqual([]);
-          expect(runClientScript(`/_revkit/0.0.0/invite.js`)).toEqual([]);
+          expect(runClientScript(`/_revkit/${TEST_REVKIT_VERSION}/invite.js`)).toEqual([]);
           expect(runClientScript("/inviteish/token")).toEqual([]);
         });
 
