@@ -4,6 +4,9 @@
 - Date: 2026-09-29
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
 - Stories: B2, B3, B5
+- Superseded in part by: [ADR-0026](0026-deployment-targets-pluggable-auth.md) — the Authentik clause (#4) is dropped, invite
+  links become the `site-token` auth provider (mechanics unchanged), and GitHub-OAuth sign-in as site access control is
+  replaced by Cloudflare Access; the GitHub App stays as the GitHub comment backend's `TokenSource`.
 - Amended by: [ADR-0025](0025-hybrid-review-one-core.md) — the GitHub App is the **hosted** surface's `TokenSource`;
   the local `revkit review` surface uses the reviewer's own `gh auth token` and needs no App.
 

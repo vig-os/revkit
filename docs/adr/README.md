@@ -32,4 +32,5 @@ is **derived** from those files by `scripts/adr-index.sh` and checked by the gua
 | [0023](0023-co-editing-crdt.md) | Co-editing with a CRDT (deferred) | **Proposed** |
 | [0024](0024-scope-docs-then-code.md) | Scope: docs first, code diffs in M8 | **Accepted** |
 | [0025](0025-hybrid-review-one-core.md) | Hybrid review — one core, local and hosted backends | **Accepted** |
+| [0026](0026-deployment-targets-pluggable-auth.md) | Deployment targets and pluggable auth | **Accepted** |
 <!-- guardrails:derived:end -->

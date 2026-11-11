@@ -4,6 +4,9 @@
 - Date: 2026-09-29
 - Stories: A1–A5, A8
 - Design: [DESIGN-0001](../designs/DESIGN-0001-revkit-architecture.md)
+- Amended by: [ADR-0026](0026-deployment-targets-pluggable-auth.md) — "127.0.0.1 only" and "nothing listens on a public
+  interface" are the **default**; an explicit opt-in private-VPN mode (bind address plus `Host`/`Origin` allowlist) is the
+  one supported exception. Every other rule here is unchanged on the loopback listener.
 
 ## Context
 

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deployment targets and pluggable auth** ([#195](https://github.com/vig-os/revkit/issues/195), [#192](https://github.com/vig-os/revkit/issues/192))
+  - ADR-0026 decides four targets (local, private VPN, plain Linux host/VM, Cloudflare) and a minimal auth-provider
+    interface (none, trusted-proxy headers, per-site tokens, Cloudflare Access).
+  - It amends ADR-0008 and ADR-0013 and supersedes parts of ADR-0009; stories D3–D5 are `planned` in the feature matrix.
 - **The hosted kernel** ([#9](https://github.com/vig-os/revkit/issues/9))
   - `@revkit/worker` is a real Cloudflare Worker that boots on workerd with
     `compatibility_flags: []`, so ADR-0025's "same core in a Worker" is enforced
