@@ -22,6 +22,28 @@ export {
   type UnanchoredAnchor,
 } from "./anchor.ts";
 export {
+  identityKey,
+  PROVIDER_ID_RE,
+  type AuthProvider,
+  type AuthRefusal,
+  type AuthRefusalReason,
+  type AuthRequest,
+  type AuthRequestPeer,
+  type AuthResult,
+  type Capability,
+  type Identity,
+} from "./auth.ts";
+export {
+  createNoneAuthProvider,
+  type NoneAuthProviderConfig,
+} from "./auth-none.ts";
+export {
+  createTrustedProxyAuthProvider,
+  type TrustedProxyAuthProviderConfig,
+  type TrustedProxyHeaders,
+  type TrustedProxyTrust,
+} from "./auth-trusted-proxy.ts";
+export {
   anchorToPrComment,
   anchorToPrCommentWithHunks,
   fileFallbackPreamble,
