@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`AuthProvider` interface in `@revkit/review-core`, plus the `none` and `trusted-proxy` providers**
+  ([#244](https://github.com/vig-os/revkit/issues/244))
+  - Runtime-neutral contract (ADR-0026 §"The auth-provider interface"): `authenticate(AuthRequest) → AuthResult`
+    where `AuthRequest` carries method, URL, headers and the transport peer address (`unix` or `tcp` plus the
+    connection's IP) and nothing else, and `AuthResult` is either `{ kind: "identity", identity }` or
+    `{ kind: "refused", reason: { reason, status } }`. Subjects are namespaced by provider id and compared via
+    `identityKey(identity)`, so an identity minted by one provider never merges with another's — the
+    `auth-trusted-proxy.test.ts` "identityKey — AC 4" case pins it.
+  - `createNoneAuthProvider` mints a self-declared, unverified `comment` identity from a configurable
+    display-name header (defaults to `x-revkit-display-name`), with an operator-configurable default name when the
+    header is missing. Used by the local target today (same shape as the loopback daemon's guest session) and the
+    private-VPN target in #192.
+  - `createTrustedProxyAuthProvider` reads the subject (required), display name (optional) and groups (optional)
+    from a configured header set, accepted only from a configured trusted peer. Trust is either a unix socket
+    (filesystem permissions are the check) or an IPv4/IPv6 address + CIDR allowlist on TCP; the ADR's "not both at
+    once" rule is a construction-time typed union. The peer check is the transport peer address of the connection,
+    NEVER `X-Forwarded-For`, and a forged `x-forwarded-for: 127.0.0.1` from an untrusted peer is 403 (pinned by
+    `auth-trusted-proxy.test.ts`). An empty peer list throws at construction (ADR-0026 §Identity, bullet 5: "no
+    default"), and an unparsable address throws at construction too so a typo is a startup error rather than a
+    silent fail-closed.
+  - `trusted-proxy` holds no state across `authenticate()` calls: ADR-0026's open-question entry on revocation of
+    proxy-derived sessions is decided in favour of "re-derive per request". A later change that introduces a
+    session for a proxy-derived identity must land session-binding and revocation tests at the same time; today's
+    test suite pins the moot-revocation shape so that commitment cannot be forgotten.
+  - The daemon's existing loopback-only ADR-0013 guards are UNCHANGED on the loopback listener: this issue adds
+    the interface in review-core, and the next sub-issue (#245) composes `trusted-proxy` with a unix-socket
+    listener. No daemon call site is rewired here.
+
 ### Changed
 
 ### Deprecated
@@ -154,4 +182,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names without visible content before D1, returning the documented refusal
   without consuming the invite's browser slot. The cap counts Unicode code points,
   and duplicate redemption fields are refused ([#145](https://github.com/vig-os/revkit/issues/145)).
-
