@@ -476,13 +476,19 @@ def step5_publish(mcp: McpClient, consumer_dir: str) -> dict[str, Any]:
     build_status = (result.get("build") or {}).get("status")
     if build_status not in {"pending", "running", "succeeded"}:
         fail(5, f"publish build status unexpected: {build_status!r}")
+    generation = (result.get("build") or {}).get("generation")
+    log(
+        "step5",
+        f"publish ok (build.status={build_status} generation={generation!r}); waiting for dist",
+    )
     # Wait for the build to succeed. A `build.failed` is a hard fail.
     # The daemon writes the built HTML to .revkit/dist/<route>/index.html.
-    # 420 s: on a cold CI runner the first full Astro build over a
-    # fresh consumer tree takes 3–5 min (no prior `.astro/` or
-    # `node_modules/.vite` cache), on a dev-shell laptop it is under
-    # 90 s. The bound is wall-clock only; we still fail hard if the
-    # file lacks the expected body.
+    # 420 s is the upper bound: on a cold CI runner the first full Astro
+    # build over a fresh consumer tree takes several minutes (no prior
+    # `.astro/` or `node_modules/.vite` cache); on a dev-shell laptop
+    # it is under 90 s. We drain channel notifications while we wait
+    # so a `build.failed` surfaces immediately instead of as an opaque
+    # 420 s timeout — the channel event is the authoritative signal.
     deadline = time.monotonic() + 420
     built_path = (
         Path(consumer_dir)
@@ -493,6 +499,13 @@ def step5_publish(mcp: McpClient, consumer_dir: str) -> dict[str, Any]:
         / "index.html"
     )
     while time.monotonic() < deadline:
+        for note in mcp.drain_notifications():
+            meta = (note.get("params") or {}).get("meta") or {}
+            if meta.get("kind") == "build_failed":
+                fail(
+                    5,
+                    f"daemon reported build.failed: {note.get('params', {}).get('content')!r}",
+                )
         if built_path.exists():
             html = built_path.read_text()
             if "Local-loop acceptance fixture" in html and "fenced code forces" in html:

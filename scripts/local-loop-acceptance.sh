@@ -112,14 +112,42 @@ echo "accept: step 3 — revkit check (through nix run) + consumer nix build"
 "$revkit_bin" check 2>&1 | sed 's/^/  /'
 nix build --no-link "${override_flag[@]}" 2>&1 | sed 's/^/  /'
 # Build `.revkit/dist/` ahead of step 4 so `revkit mcp`'s auto-started
-# daemon can boot instantly (it would otherwise run the full Astro
-# build itself before writing `serve.json`, which overruns the MCP's
-# 10 s spawn deadline on a cold CI runner). Same tree a consumer runs
-# with `revkit build`; no shortcut.
-echo "accept: step 3 — revkit build (prime .revkit/dist for step 4)"
+# daemon boots instantly (it would otherwise run the full Astro build
+# itself before writing `serve.json`, overrunning the MCP's 10 s
+# spawn deadline on a cold CI runner). We also seed the step-5 ADR
+# fixture *before* this prebuild so Astro's node_modules/.vite and
+# .astro/ caches cover the fixture route from the start — the first
+# publish in step 5 then re-renders it, instead of walking a cold
+# Astro build pipeline for the whole site (~5 min on hosted CI).
+# Same tree a consumer runs with `revkit build`; no shortcut.
+echo "accept: step 3 — pre-seed step-5 fixture and revkit build"
+mkdir -p "$consumer_dir/docs/adr"
+cat > "$consumer_dir/docs/adr/0202-local-loop-acceptance-fixture.md" <<'FIXTURE_EOF'
+---
+title: Local-loop acceptance fixture
+description: Round-trip page used by scripts/local-loop-acceptance.sh.
+---
+
+# Local-loop acceptance fixture
+
+This paragraph is published by the acceptance test and is one of two
+candidate anchors for the rail comment.
+
+The second paragraph is unique to this fixture so reanchor-after-insert
+can find it again at a different line after step 7 shifts it.
+
+```text
+fenced code forces the full build path
+instead of the fast-path renderer, exercising B4
+```
+FIXTURE_EOF
 "$revkit_bin" build 2>&1 | sed 's/^/  /'
 test -f "$consumer_dir/.revkit/dist/index.html" || {
   echo "FAIL: step 3: revkit build did not write .revkit/dist/index.html" >&2
+  exit 1
+}
+test -f "$consumer_dir/.revkit/dist/adr/0202-local-loop-acceptance-fixture/index.html" || {
+  echo "FAIL: step 3: pre-seed did not build the acceptance fixture page" >&2
   exit 1
 }
 
