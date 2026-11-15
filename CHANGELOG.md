@@ -19,16 +19,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `auth-trusted-proxy.test.ts` "identityKey — AC 4" case pins it.
   - `createNoneAuthProvider` mints a self-declared, unverified `comment` identity from a configurable
     display-name header (defaults to `x-revkit-display-name`), with an operator-configurable default name when the
-    header is missing. Used by the local target today (same shape as the loopback daemon's guest session) and the
-    private-VPN target in #192.
-  - `createTrustedProxyAuthProvider` reads the subject (required), display name (optional) and groups (optional)
-    from a configured header set, accepted only from a configured trusted peer. Trust is either a unix socket
-    (filesystem permissions are the check) or an IPv4/IPv6 address + CIDR allowlist on TCP; the ADR's "not both at
-    once" rule is a construction-time typed union. The peer check is the transport peer address of the connection,
-    NEVER `X-Forwarded-For`, and a forged `x-forwarded-for: 127.0.0.1` from an untrusted peer is 403 (pinned by
-    `auth-trusted-proxy.test.ts`). An empty peer list throws at construction (ADR-0026 §Identity, bullet 5: "no
-    default"), and an unparsable address throws at construction too so a typo is a startup error rather than a
-    silent fail-closed.
+    header is missing. The local and private-VPN targets (#192) use it; this issue adds the interface in
+    review-core only and does not rewire the loopback daemon's existing local-actor path, so a later sub-issue of
+    #195 is where the daemon's `{ kind: "local", id, displayName? }` author starts being derived from this
+    provider's `Identity`.
+  - `createTrustedProxyAuthProvider` reads the subject (required), display name (optional) and groups (optional
+    and reserved for the later allowed-groups gate) from a configured header set, accepted only from a configured
+    trusted peer. Trust is either a unix socket (filesystem permissions are the check) or an IPv4/IPv6 address +
+    CIDR allowlist on TCP; the ADR's "not both at once" rule is a construction-time typed union. The peer check is
+    the transport peer address of the connection, NEVER `X-Forwarded-For`, and a forged `x-forwarded-for: 127.0.0.1`
+    from an untrusted peer is 403 (pinned by `auth-trusted-proxy.test.ts`). An empty peer list throws at
+    construction (ADR-0026 §Identity, bullet 5: "no default"), an unparsable address throws at construction (so a
+    typo is a startup error rather than a silent fail-closed), and a configured header name that is not an
+    RFC 9110 §5.6.2 token throws at construction too — `authenticate()` keeps its "MUST NOT throw" contract.
+  - Hardening (round 2): `1.2.3.4::` and other misplaced IPv4-dotted-quad IPv6 literals are refused (RFC 4291
+    §2.2.3 — the dotted-quad is the trailing 32 bits, nothing else); zone ids (`%zone`) are refused on both IPv4
+    and IPv6 for allowlist entries and peer addresses; IPv4-mapped IPv6 peers (`::ffff:127.0.0.1`) normalise to
+    their IPv4 form on both the peer and the rule, so an IPv4 rule matches the mapped peer; a repeated subject or
+    display-name header (which `Headers.get()` comma-joins) is refused with 401 `missing-subject`; display-name
+    C0/C1 control characters are stripped and the value is capped at 256 code units.
   - `trusted-proxy` holds no state across `authenticate()` calls: ADR-0026's open-question entry on revocation of
     proxy-derived sessions is decided in favour of "re-derive per request". A later change that introduces a
     session for a proxy-derived identity must land session-binding and revocation tests at the same time; today's

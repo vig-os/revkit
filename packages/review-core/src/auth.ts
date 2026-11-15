@@ -72,15 +72,15 @@ export interface AuthRefusal {
 
 /** Stable refusal codes, matching ADR-0026 §"Plain Linux host / VM"
  * → Identity:
- *   - `no-trust-configured` (403) — neither a unix-socket trust nor a
- *     non-empty peer list;
  *   - `untrusted-peer` (403) — the TCP peer is outside the list, or
- *     the transport does not match the configured trust;
+ *     the transport does not match the configured trust. An empty
+ *     peer list is a construction-time error in `trusted-proxy`, not
+ *     a runtime refusal, so there is no separate "no trust
+ *     configured" reason code.
  *   - `missing-subject` (401) — the peer is trusted but the subject
  *     header is missing or empty.
  * Future providers extend this union. */
 export type AuthRefusalReason =
-  | "no-trust-configured"
   | "untrusted-peer"
   | "missing-subject";
 
@@ -97,13 +97,29 @@ export interface AuthProvider {
   authenticate(request: AuthRequest): Promise<AuthResult>;
 }
 
+/** Provider ids embedded in `Identity.provider` must be a short
+ * kebab-case token so `identityKey` is collision-free with a plain
+ * `:` separator — otherwise `a:b` + `c` would collide with `a` + `b:c`.
+ * The in-core providers (`none`, `trusted-proxy`) match; a provider
+ * added later must match too, and the exported constant is the one
+ * place that rule is stated. */
+export const PROVIDER_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
 /** Comparable key enforcing ADR-0026's "two providers never merge"
  * rule: the provider id is prefixed, with a colon separator, before
  * the subject. No whitespace collapse, no case folding — a provider
  * that wants case-insensitive subjects folds them before returning
  * the `Identity`. `displayName` and `capability` are not part of the
  * key: two sessions of the same person at different capabilities are
- * still the same person. */
+ * still the same person. Throws if the `identity.provider` field is
+ * not a `PROVIDER_ID_RE` token; without that guard a provider id
+ * containing `:` could manufacture a key collision with another
+ * provider's subject (`a:b` + `c` vs `a` + `b:c`). */
 export function identityKey(identity: Identity): string {
+  if (!PROVIDER_ID_RE.test(identity.provider)) {
+    throw new Error(
+      `identityKey: provider id is not a kebab-case token (needed for collision-free keys): ${JSON.stringify(identity.provider)}`,
+    );
+  }
   return `${identity.provider}:${identity.subject}`;
 }

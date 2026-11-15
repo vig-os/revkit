@@ -1,9 +1,13 @@
-// `none` auth provider (ADR-0026). Used by the local target (today's
-// loopback daemon, re-expressed behind the ADR-0026 interface) and by
+// `none` auth provider (ADR-0026). Used by the local target and by
 // the private-VPN target in #192 — both targets where the NETWORK is
-// the boundary. The provider issues a session for a SELF-DECLARED
+// the boundary. The provider issues an identity for a SELF-DECLARED
 // display name, which the attribution layer renders as unverified
-// ("Name (guest)", ADR-0009 amended by ADR-0026).
+// ("Name (guest)", ADR-0009 amended by ADR-0026). This issue does not
+// rewire the loopback daemon; a later sub-issue of #195 composes the
+// provider with the daemon's existing local-actor model, and the
+// shape at that point is the daemon's `{ kind: "local", id,
+// displayName? }` author being derived from this provider's
+// `Identity` — not a pre-existing session reused unchanged.
 //
 // "Self-declared" shape: a configurable header the surface sets from
 // its UI (or from a VPN peer's own identity). A missing or empty

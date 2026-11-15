@@ -23,6 +23,7 @@ export {
 } from "./anchor.ts";
 export {
   identityKey,
+  PROVIDER_ID_RE,
   type AuthProvider,
   type AuthRefusal,
   type AuthRefusalReason,
