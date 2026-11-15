@@ -115,6 +115,17 @@ transcript). The dogfood comment is a natural reviewer's note (channel content i
 may decline). Requires `flk` and a logged-in Claude; not part of `just test` or CI. See
 [`.claude/skills/revkit_dogfood/SKILL.md`](.claude/skills/revkit_dogfood/SKILL.md) for the runbook.
 
+Unattended end-to-end proof of the whole consumer path (no model in the loop): `just accept-local-loop` runs
+`scripts/local-loop-acceptance.sh`. It builds `.#revkit`, scaffolds `templates.default` into a scratch dir,
+runs `revkit check` + consumer `nix build` + the `lib.hooks.mkHooks` entry, launches `revkit mcp` through the
+shipped `.mcp.json` with NO `bun` on the server PATH (asserted by reading `/proc/<daemon pid>/environ`),
+publishes an ADR with frontmatter + fenced code, posts a `@agent now` rail comment via headless Chromium,
+replies and resolves through the MCP tools, republishes for a re-anchor, SIGTERMs the daemon and proves the
+next tool call restarts it with threads intact, then runs 30 publishes + 3 full builds and asserts
+`/proc/<daemon pid>/fd` is stable. Linux-only (the `/proc` assertions). Runs as the `local-loop-acceptance` job
+in `.github/workflows/revkit-flake.yml` on every PR — see issue [#202](https://github.com/vig-os/revkit/issues/202)
+for the 9-step spec.
+
 ## Adopt revkit (one line)
 
 revkit ships as a flake ([ADR-0010](docs/adr/0010-distribution-flake-opt-in.md), D1). This is **M5 part 1**: the

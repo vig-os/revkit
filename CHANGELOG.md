@@ -23,6 +23,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Local-loop acceptance test in CI (consumer path)** ([#202](https://github.com/vig-os/revkit/issues/202))
+  - `scripts/local-loop-acceptance.sh` + `just accept-local-loop` drive the full consumer loop
+    end-to-end: `nix build .#revkit`, scaffold `templates.default` into a scratch dir with
+    `--override-input revkit path:<checkout>`, `revkit check` + consumer `nix build` + the
+    `lib.hooks.mkHooks` entry, launch the MCP from the shipped `.mcp.json` with NO `bun` on
+    the server PATH (asserted by reading `/proc/<daemon pid>/environ`), publish an ADR with
+    frontmatter + fenced code (full-build path — the B4 provenance regression), post a
+    `@agent now` comment through the rail with headless Chromium, observe the channel
+    notification frame, reply + resolve via the MCP tools, republish with inserted paragraphs
+    and assert the thread re-anchors with a positive line shift, SIGTERM the daemon and prove
+    the next tool call restarts it with threads intact, then 30 publishes + 3 full builds
+    and assert `/proc/<daemon pid>/fd` grows by at most 20 descriptors.
+  - New CI job `local-loop-acceptance` in `.github/workflows/revkit-flake.yml` (Linux only —
+    the `/proc` interfaces the test relies on are Linux-specific; cross-system coverage of
+    the build itself stays in the existing `build` matrix). The blockers #197, #198, #199,
+    #200 and #201 were ALL invisible to CI before this job — the existing `template-smoke`
+    stopped at `revkit check` and never touched the daemon.
 - **Deployment targets and pluggable auth** ([#195](https://github.com/vig-os/revkit/issues/195), [#192](https://github.com/vig-os/revkit/issues/192))
   - ADR-0026 decides four targets (local, private VPN, plain Linux host/VM, Cloudflare) and a minimal auth-provider
     interface (none, trusted-proxy headers, per-site tokens, Cloudflare Access).
