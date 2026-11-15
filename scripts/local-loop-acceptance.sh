@@ -111,6 +111,17 @@ echo "accept: step 3 — revkit check (through nix run) + consumer nix build"
 # the flake we just built.
 "$revkit_bin" check 2>&1 | sed 's/^/  /'
 nix build --no-link "${override_flag[@]}" 2>&1 | sed 's/^/  /'
+# Build `.revkit/dist/` ahead of step 4 so `revkit mcp`'s auto-started
+# daemon can boot instantly (it would otherwise run the full Astro
+# build itself before writing `serve.json`, which overruns the MCP's
+# 10 s spawn deadline on a cold CI runner). Same tree a consumer runs
+# with `revkit build`; no shortcut.
+echo "accept: step 3 — revkit build (prime .revkit/dist for step 4)"
+"$revkit_bin" build 2>&1 | sed 's/^/  /'
+test -f "$consumer_dir/.revkit/dist/index.html" || {
+  echo "FAIL: step 3: revkit build did not write .revkit/dist/index.html" >&2
+  exit 1
+}
 
 # Evaluate the `lib.hooks.mkHooks` entry and assert it is the packaged
 # binary we just built. A consumer wiring `revkit.lib.hooks` into its
