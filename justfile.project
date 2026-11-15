@@ -792,3 +792,18 @@ cf *args:
 [group('testing')]
 template-smoke:
     bash scripts/template-smoke.sh "{{justfile_directory()}}"
+
+# Consumer end-to-end local-loop acceptance (same script as CI). Drives
+# the full agent/review loop a consumer would run: `nix build .#revkit`,
+# scaffold `templates.default` into a scratch dir, `revkit check` +
+# consumer `nix build` + `lib.hooks` entry, then launch the MCP from
+# the shipped `.mcp.json` (NO bun on PATH), publish an ADR with
+# frontmatter + fenced code, post a `@agent now` comment through the
+# rail with headless Chromium, reply + resolve via the MCP tools,
+# republish for a reanchor, SIGTERM the daemon and prove the next tool
+# call restarts it with threads intact, then 30 publishes + 3 full
+# builds and assert `/proc/<pid>/fd` is stable. Each step fails hard
+# with a prefixed `FAIL:` line. See issue #202 for the 9-step spec.
+[group('testing')]
+accept-local-loop:
+    bash scripts/local-loop-acceptance.sh "{{justfile_directory()}}"

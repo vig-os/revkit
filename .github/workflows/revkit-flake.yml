@@ -31,7 +31,12 @@ name: revkit-flake
 
 "on":
   pull_request:
-    branches: [dev, main]
+    # `release/**` covers the long-lived release branches (e.g.
+    # `release/0.1.0`). Without it, the flake jobs — including the
+    # local-loop-acceptance gate — never run on a PR that targets a
+    # release branch directly, which would hide the exact class of
+    # regression this file exists to catch.
+    branches: [dev, main, "release/**"]
 
 concurrency:
   group: revkit-flake-${{ github.ref }}
@@ -119,3 +124,47 @@ jobs:
         # scripts/template-smoke.sh traps EXIT so no daemon leaks
         # on failure (kills its own child pid only).
         run: bash scripts/template-smoke.sh "${GITHUB_WORKSPACE}"
+
+  local-loop-acceptance:
+    name: local-loop acceptance (consumer path)
+    # End-to-end consumer-path acceptance (issue #202). Drives the full
+    # agent/review loop CI never exercised: `revkit mcp` through the
+    # shipped `.mcp.json`, auto-started daemon, publish, headless-rail
+    # comment, channel frame, reply + resolve, re-anchor on republish,
+    # SIGTERM-and-restart with threads intact, and 30 publishes + 3
+    # full builds with a flat descriptor count. NO `bun` on the server
+    # PATH: the harness proves it by reading /proc/<daemon pid>/environ.
+    #
+    # The blockers #197/#198/#199/#200/#201 were ALL invisible to CI
+    # before this; template-smoke stopped at `revkit check`. This job
+    # is the gate that keeps them visible for every release train.
+    #
+    # Linux-only on hosted ubuntu-latest — `/proc/<pid>/{environ,fd}`
+    # is Linux-specific and the fd-budget step relies on it. macOS /
+    # aarch64 coverage falls back to `template-smoke` plus the per-
+    # system `build` matrix above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix (upstream CppNix, flakes enabled)
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24  # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Run local-loop acceptance
+        # The dev shell provides bun + the pinned playwright-driver
+        # browsers for the harness; the harness launches `revkit mcp`
+        # with a scrubbed PATH so none of it leaks onto the server
+        # environment (asserted at /proc/<daemon pid>/environ).
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail
+            bun install --frozen-lockfile
+            bash scripts/local-loop-acceptance.sh "${GITHUB_WORKSPACE}"
+          '
