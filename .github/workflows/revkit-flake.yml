@@ -31,7 +31,12 @@ name: revkit-flake
 
 "on":
   pull_request:
-    branches: [dev, main]
+    # `release/**` covers the long-lived release branches (e.g.
+    # `release/0.1.0`). Without it, the flake jobs — including the
+    # local-loop-acceptance gate — never run on a PR that targets a
+    # release branch directly, which would hide the exact class of
+    # regression this file exists to catch.
+    branches: [dev, main, "release/**"]
 
 concurrency:
   group: revkit-flake-${{ github.ref }}
