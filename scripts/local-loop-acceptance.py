@@ -478,7 +478,12 @@ def step5_publish(mcp: McpClient, consumer_dir: str) -> dict[str, Any]:
         fail(5, f"publish build status unexpected: {build_status!r}")
     # Wait for the build to succeed. A `build.failed` is a hard fail.
     # The daemon writes the built HTML to .revkit/dist/<route>/index.html.
-    deadline = time.monotonic() + 180
+    # 420 s: on a cold CI runner the first full Astro build over a
+    # fresh consumer tree takes 3–5 min (no prior `.astro/` or
+    # `node_modules/.vite` cache), on a dev-shell laptop it is under
+    # 90 s. The bound is wall-clock only; we still fail hard if the
+    # file lacks the expected body.
+    deadline = time.monotonic() + 420
     built_path = (
         Path(consumer_dir)
         / ".revkit"
@@ -787,7 +792,7 @@ def step7_reanchor(mcp: McpClient, consumer_dir: str) -> None:
         mcp,
         "publish",
         {"docs": [{"path": FIXTURE_PATH, "content": FIXTURE_V2}]},
-        timeout=60,
+        timeout=420,
     )
     # Wait for the reanchor notification. The channel-server does NOT
     # stamp `kind` for `thread.reanchored` (only `reanchor_orphan` gets
@@ -806,7 +811,7 @@ def step7_reanchor(mcp: McpClient, consumer_dir: str) -> None:
                 or n.get("params", {}).get("meta", {}).get("kind") == "reanchor_orphan"
             )
         ),
-        timeout=60,
+        timeout=120,
     )
     meta_kind = note["params"]["meta"].get("kind")
     if meta_kind == "reanchor_orphan":
