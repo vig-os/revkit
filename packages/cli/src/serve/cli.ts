@@ -11,10 +11,15 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { randomBytes } from "node:crypto";
 import { startDaemon, type StartDaemonOptions } from "./daemon.ts";
-import { ensureRevkitDir } from "./serve-state.ts";
+import {
+  acquireStartingLock,
+  ensureRevkitDir,
+  type AcquiredStartingDaemon,
+} from "./serve-state.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
 import { defaultConsumerDist } from "../build/packaged.ts";
 import { runBuildCommand } from "../build/cli.ts";
+import { mintToken } from "./auth.ts";
 
 /** One CLI invocation of `revkit serve`. `blockForever` is a Promise
  * the caller can await; it resolves when the daemon stops. */
@@ -146,6 +151,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
   const explicitDir = parsed.dir;
   const stdoutLines: string[] = [];
   let dir: string;
+  let needsAutoBuild = false;
   if (explicitDir !== undefined) {
     dir = resolvePath(repoRoot, explicitDir);
   } else {
@@ -168,25 +174,71 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
           `Run 'revkit build' first (or drop --no-auto-build to have serve build for you).\n`,
       };
     } else {
-      // Auto-build the consumer's tree before serving. If it
-      // fails, we surface the build error and refuse to start
-      // the daemon.
-      stdoutLines.push(`revkit serve: no dist at ${packagedDist} — building first`);
-      const buildResult = await runBuildCommand([], {
+      // Auto-build needed. We MUST take `.revkit/daemon.lock` BEFORE
+      // the build runs so a concurrent `ensureDaemon` sees a
+      // "starting" record and waits on readiness instead of spawning
+      // another daemon that races into the same `.revkit/dist` (#251).
+      dir = packagedDist;
+      needsAutoBuild = true;
+    }
+  }
+
+  // #251: claim the daemon lock BEFORE the auto-build so a concurrent
+  // `revkit serve` or `ensureDaemon` sees we are starting and does
+  // NOT spawn another daemon. The lock is kept alive for the daemon's
+  // lifetime; on refusal we surface the same error the daemon's
+  // in-process `acquireAndPublish` would have.
+  const serveInstanceId = mintToken();
+  const serveStartedAt = new Date().toISOString();
+  const acquired = acquireStartingLock(repoRoot, {
+    pid: process.pid,
+    version: env.version,
+    startedAt: serveStartedAt,
+    instanceId: serveInstanceId,
+  });
+  if (acquired.kind === "already-running") {
+    const existing = acquired.state;
+    const where = existing !== undefined
+      ? `pid ${existing.pid}${existing.url.length > 0 ? `, ${existing.url}` : ""}`
+      : "no advertisement on disk";
+    return {
+      exitCode: 1,
+      stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
+      stderr:
+        `revkit serve: another daemon holds .revkit/daemon.lock (${where}). Stop it, then retry.\n`,
+    };
+  }
+
+  if (needsAutoBuild) {
+    // Auto-build the consumer's tree before serving. If it fails,
+    // release the lock and surface the build error. A concurrent
+    // ensureDaemon that saw the starting record then sees the lock
+    // free (died while starting) and can retry or spawn.
+    stdoutLines.push(`revkit serve: no dist at ${dir} — building first`);
+    let buildResult;
+    try {
+      buildResult = await runBuildCommand([], {
         cwd: env.cwd,
         version: env.version,
         repoSlug: env.repoSlug ?? "vig-os/revkit",
       });
-      if (buildResult.exitCode !== 0) {
-        return {
-          exitCode: buildResult.exitCode,
-          stdout: buildResult.stdout,
-          stderr: `revkit serve: auto-build failed:\n${buildResult.stderr}`,
-        };
-      }
-      if (buildResult.stdout.length > 0) stdoutLines.push(buildResult.stdout.trimEnd());
-      dir = packagedDist;
+    } catch (error) {
+      acquired.release();
+      return {
+        exitCode: 1,
+        stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
+        stderr: `revkit serve: auto-build failed:\n${(error as Error).message}\n`,
+      };
     }
+    if (buildResult.exitCode !== 0) {
+      acquired.release();
+      return {
+        exitCode: buildResult.exitCode,
+        stdout: buildResult.stdout,
+        stderr: `revkit serve: auto-build failed:\n${buildResult.stderr}`,
+      };
+    }
+    if (buildResult.stdout.length > 0) stdoutLines.push(buildResult.stdout.trimEnd());
   }
 
   const options: StartDaemonOptions = {
@@ -197,11 +249,15 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     localUserId: readOrMintLocalUserId(repoRoot),
     announce: true,
     installSignalHandlers: true,
+    acquired,
+    acquiredInstanceId: serveInstanceId,
+    acquiredStartedAt: serveStartedAt,
   };
   let handle;
   try {
     handle = await startDaemon(options);
   } catch (error) {
+    acquired.release();
     return {
       exitCode: 1,
       stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",

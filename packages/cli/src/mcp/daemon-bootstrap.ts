@@ -30,7 +30,11 @@
 
 import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { findRunningDaemon, type ServeState } from "../serve/serve-state.ts";
+import {
+  findRunningOrStartingDaemon,
+  isReadyServeState,
+  type ServeState,
+} from "../serve/serve-state.ts";
 import { stripTrailingSlashes } from "./daemon-client.ts";
 
 /** Options for `ensureDaemon`. */
@@ -39,8 +43,23 @@ export interface BootstrapOptions {
   readonly repoRoot: string;
   /** How long to wait, in ms, for a freshly spawned daemon to take
    * the lock and publish `serve.json`. Defaults to 10 s — the daemon
-   * binds a random port + opens sqlite; a slow disk can take a beat. */
+   * binds a random port + opens sqlite; a slow disk can take a beat.
+   *
+   * #251: this is the deadline for reaching the "lock held" state.
+   * Once we SEE a "starting" record, we instead wait for
+   * `startingReadyMs` for the transition to "ready" — a cold-start
+   * auto-build can legitimately take longer than this spawn window. */
   readonly waitMs?: number;
+  /** How long to wait, in ms, for a daemon in `status: "starting"`
+   * to reach `status: "ready"` (#251). Defaults to 10 s — same as
+   * `waitMs`. Readiness is SIGNALLED (status flips to "ready"), not
+   * guessed; this deadline only bounds how long an `ensureDaemon`
+   * call will sit waiting on the signal before returning a clear
+   * "daemon still starting after N ms" error to its caller. The
+   * background reconnect loop (channel-server.ts) retries with
+   * exponential backoff, so a slow build eventually surfaces as
+   * a successful tool call once the daemon is ready. */
+  readonly startingReadyMs?: number;
   /** Between `findRunningDaemon` polls, this long in ms. Defaults to
    * 50. */
   readonly pollIntervalMs?: number;
@@ -72,10 +91,16 @@ export interface BootstrapOptions {
    * off the public wire (no default) so the production path stays
    * free of test bookkeeping. */
   readonly onSpawn?: (pid: number) => void;
-  /** Test hook: swap out `findRunningDaemon`. Defaults to the
-   * shared implementation in `serve-state.ts`. Lets a test drive the
-   * discover / spawn / re-discover cycle without touching a real
-   * lock file. */
+  /** Test hook: swap out the daemon-discovery function. Defaults to
+   * `findRunningOrStartingDaemon` (returns a ServeState whenever the
+   * lock is held, in either "starting" or "ready" status). Lets a
+   * test drive the discover / spawn / re-discover cycle without
+   * touching a real lock file.
+   *
+   * Historical name retained: callers still pass `findRunningDaemon`
+   * because the legacy callers of the ready-only `findRunningDaemon`
+   * did — but what a bootstrap wants is EVERY state, so a starting
+   * daemon stops us spawning another one (#251). */
   readonly findRunningDaemon?: (repoRoot: string) => ServeState | undefined;
   /** Test hook: injected clock (ms epoch). */
   readonly nowMs?: () => number;
@@ -90,22 +115,55 @@ export interface Bootstrapped {
   readonly spawned: boolean;
 }
 
-/** Ensure a daemon is running for `repoRoot` and return its state.
- * Uses `findRunningDaemon` (the lock is the ground truth), spawning
- * `revkit serve` when nothing owns the lock. Throws on timeout. */
+/** Ensure a daemon is running for `repoRoot` and return its READY
+ * state. Uses `findRunningOrStartingDaemon` (the lock is the ground
+ * truth), spawning `revkit serve` only when nothing owns the lock.
+ *
+ * #251 lifecycle contract. A daemon doing a cold-start auto-build
+ * holds `.revkit/daemon.lock` and advertises `status: "starting"`
+ * BEFORE binding, so:
+ *
+ *   - If a "ready" state is seen, return it (no spawn, no wait).
+ *   - If a "starting" state is seen, wait on the transition to
+ *     "ready" (bounded by `startingReadyMs`) — NEVER spawn a second
+ *     daemon. A starting daemon that DIES (lock released while we
+ *     wait) is detected promptly via the next poll and surfaced as a
+ *     "died while starting" error, not after the full deadline.
+ *   - If no daemon owns the lock, spawn `revkit serve` detached and
+ *     poll until it transitions to "starting" or "ready". A spawn
+ *     window of `waitMs` bounds how long we wait for the lock to be
+ *     taken (a daemon that cannot start at all); once "starting"
+ *     appears we hand off to the readiness-wait path above.
+ *
+ * Throws on timeout or on a daemon that dies while starting. */
 export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrapped> {
   const repoRoot = resolvePath(options.repoRoot);
   const waitMs = options.waitMs ?? 10_000;
+  const startingReadyMs = options.startingReadyMs ?? 10_000;
   const pollIntervalMs = options.pollIntervalMs ?? 50;
   const spawn = options.spawn ?? defaultSpawn;
   const clock = options.nowMs ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
-  const discover = options.findRunningDaemon ?? findRunningDaemon;
+  const discover = options.findRunningDaemon ?? findRunningOrStartingDaemon;
 
-  // Case 1: a live daemon owns the lock.
+  // Case 1: a daemon already owns the lock (ready OR starting).
   const existing = discover(repoRoot);
   if (existing !== undefined) {
-    return { state: existing, spawned: false };
+    if (isReadyServeState(existing)) {
+      return { state: existing, spawned: false };
+    }
+    // A starting daemon is here — wait for it (no spawn).
+    const ready = await waitForReady({
+      discover,
+      repoRoot,
+      pollIntervalMs,
+      deadlineMs: clock() + startingReadyMs,
+      startingReadyMs,
+      clock,
+      sleep,
+      startingPid: existing.pid,
+    });
+    return { state: ready, spawned: false };
   }
 
   // Case 2: no live daemon. Spawn one.
@@ -129,20 +187,86 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   });
   options.onSpawn?.(spawnResult.pid);
 
-  // Poll `findRunningDaemon` until the new daemon claims the lock
-  // and publishes its state. The lock discipline (PR #36) guarantees
-  // no false positive: `findRunningDaemon` returns a state only when
-  // the lock is currently held.
-  const deadline = clock() + waitMs;
-  while (clock() < deadline) {
+  // Poll `findRunningOrStartingDaemon` until the new daemon claims
+  // the lock. The lock discipline (PR #36) guarantees no false
+  // positive: discover returns a state only when the lock is
+  // currently held. #251: once we see a state (ready OR starting),
+  // hand off to the readiness-wait path — never spawn twice.
+  const spawnDeadline = clock() + waitMs;
+  while (clock() < spawnDeadline) {
     await sleep(pollIntervalMs);
     const state = discover(repoRoot);
-    if (state !== undefined) {
+    if (state === undefined) continue;
+    if (isReadyServeState(state)) {
       return { state, spawned: true };
     }
+    // Starting record visible — wait for readiness. The
+    // `startingReadyMs` deadline resets here so a cold build gets
+    // its full readiness window (it already consumed part of
+    // `waitMs` in the spawn window).
+    const ready = await waitForReady({
+      discover,
+      repoRoot,
+      pollIntervalMs,
+      deadlineMs: clock() + startingReadyMs,
+      startingReadyMs,
+      clock,
+      sleep,
+      startingPid: state.pid,
+    });
+    return { state: ready, spawned: true };
   }
   throw new Error(
     `spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
+  );
+}
+
+/** Wait for a daemon in `status: "starting"` to reach `"ready"`.
+ * Polls `discover` on `pollIntervalMs` and resolves on the
+ * `"ready"` transition. Throws promptly on:
+ *   - the lock being released while we wait (daemon died while
+ *     starting; pid gone), without a fixed-length wait;
+ *   - the deadline passing (surfaced as "building, N s elapsed"
+ *     so the agent sees a clear retriable status). */
+async function waitForReady(args: {
+  readonly discover: (repoRoot: string) => ServeState | undefined;
+  readonly repoRoot: string;
+  readonly pollIntervalMs: number;
+  readonly deadlineMs: number;
+  readonly startingReadyMs: number;
+  readonly clock: () => number;
+  readonly sleep: (ms: number) => Promise<void>;
+  readonly startingPid: number;
+}): Promise<ServeState> {
+  const {
+    discover,
+    repoRoot,
+    pollIntervalMs,
+    deadlineMs,
+    startingReadyMs,
+    clock,
+    sleep,
+    startingPid,
+  } = args;
+  const startMs = clock();
+  while (clock() < deadlineMs) {
+    const state = discover(repoRoot);
+    if (state === undefined) {
+      // Lock released while we were waiting — the starting daemon
+      // died before it could bind. This is the "promptly detected"
+      // path (#251 AC): we do NOT burn the rest of the deadline.
+      throw new Error(
+        `revkit serve (pid ${startingPid}) died while starting (daemon.lock released before ready)`,
+      );
+    }
+    if (isReadyServeState(state)) {
+      return state;
+    }
+    await sleep(pollIntervalMs);
+  }
+  const elapsedS = Math.max(0, Math.round((clock() - startMs) / 1000));
+  throw new Error(
+    `revkit serve (pid ${startingPid}) still starting after ${startingReadyMs} ms (building, ${elapsedS} s elapsed). Try again once the daemon is ready.`,
   );
 }
 

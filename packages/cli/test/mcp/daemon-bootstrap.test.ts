@@ -298,6 +298,249 @@ describe("daemon-bootstrap", () => {
   });
 });
 
+describe("ensureDaemon — #251 starting-state lifecycle", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "revkit-boot-starting-"));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Shape of a "starting" record published pre-bind by
+   * `acquireStartingLock` (serve/cli.ts #251): the lock is held, pid
+   * is real, but the URL/token/port are placeholders because the
+   * HTTP server has not bound yet. */
+  function startingFixture(overrides: Partial<ServeState> = {}): ServeState {
+    return {
+      pid: process.pid,
+      port: 0,
+      url: "",
+      agentToken: "",
+      startedAt: new Date().toISOString(),
+      version: "0.0.0-test",
+      instanceId: "starting-" + "x".repeat(20),
+      status: "starting",
+      ...overrides,
+    };
+  }
+
+  test("#251: a starting daemon is WAITED on — ensureDaemon does NOT spawn another", async () => {
+    // This is the direct repro: a cold-start `revkit serve` is in
+    // the pre-bind window (lock held, status="starting"). A
+    // concurrent `ensureDaemon` (the first tool call from `revkit
+    // mcp`) must wait on the readiness transition, NEVER spawn a
+    // second daemon. BEFORE the fix, `findRunningDaemon` returned
+    // undefined for a "starting" record (empty url) and
+    // `ensureDaemon` spawned a second `revkit serve` that raced
+    // into the build.
+    const starting = startingFixture({ instanceId: "starting-1" });
+    const ready = fixtureState({ instanceId: "ready-1" });
+    let findCalls = 0;
+    let spawnCount = 0;
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => {
+        findCalls++;
+        // Starting for the first 3 probes (simulating a slow
+        // auto-build); then ready.
+        return findCalls <= 3 ? starting : ready;
+      },
+      spawn: () => {
+        spawnCount++;
+        return { pid: 999 };
+      },
+      sleep: async () => {},
+      pollIntervalMs: 5,
+      waitMs: 60_000,
+      startingReadyMs: 60_000,
+    });
+    expect(spawnCount).toBe(0);
+    expect(result.spawned).toBe(false);
+    expect(result.state.instanceId).toBe("ready-1");
+  });
+
+  test("#251: a spawned daemon that advertises 'starting' is waited on (ONE spawn, no second)", async () => {
+    // Variant: no daemon on first probe → ensureDaemon spawns.
+    // The spawn's "revkit serve" takes the lock and writes a
+    // starting record. The subsequent polls see "starting" then
+    // "ready". There must be EXACTLY ONE spawn, even though the
+    // starting window spans several polls.
+    const starting = startingFixture({ instanceId: "starting-2" });
+    const ready = fixtureState({ instanceId: "ready-2" });
+    let findCalls = 0;
+    let spawnCount = 0;
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => {
+        findCalls++;
+        if (findCalls === 1) return undefined; // initial probe
+        if (findCalls <= 4) return starting; // during pre-bind
+        return ready; // after bind
+      },
+      spawn: () => {
+        spawnCount++;
+        return { pid: 4242 };
+      },
+      sleep: async () => {},
+      pollIntervalMs: 5,
+      waitMs: 10_000,
+      startingReadyMs: 60_000,
+    });
+    expect(spawnCount).toBe(1);
+    expect(result.spawned).toBe(true);
+    expect(result.state.instanceId).toBe("ready-2");
+  });
+
+  test("#251: a daemon that dies while starting is reported promptly (lock released)", async () => {
+    // A starting daemon crashes before it can bind. The lock is
+    // released on process exit; the next poll returns undefined.
+    // `ensureDaemon` must fail PROMPTLY with a diagnostic naming
+    // the dead pid — NOT after `startingReadyMs` of sleeping.
+    const starting = startingFixture({ pid: 31337, instanceId: "starting-3" });
+    let findCalls = 0;
+    const spawnCount = { n: 0 };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => {
+          findCalls++;
+          // First probe: starting daemon visible.
+          // Subsequent probes: lock released (daemon died).
+          return findCalls === 1 ? starting : undefined;
+        },
+        spawn: () => {
+          spawnCount.n++;
+          return { pid: 999 };
+        },
+        sleep: async () => {},
+        pollIntervalMs: 5,
+        waitMs: 60_000,
+        startingReadyMs: 60_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.message ?? "").toContain("died while starting");
+    expect(threw?.message ?? "").toContain("31337");
+    // The MCP side NEVER tries to spawn on top of a live lock —
+    // detection + propagation only; the CALLER (channel server's
+    // reconnect loop) decides whether to retry.
+    expect(spawnCount.n).toBe(0);
+  });
+
+  test("#251: a starting daemon that never reaches ready is surfaced as 'building, N s elapsed'", async () => {
+    // When `startingReadyMs` passes with the daemon still
+    // "starting", `ensureDaemon` throws a diagnostic the agent can
+    // retry. No widened timeout, no sleeping past the deadline:
+    // the deadline is a bounded wait on the readiness signal, not
+    // a blind guess.
+    const starting = startingFixture({ pid: 9999, instanceId: "starting-4" });
+    let now = 0;
+    const clock = (): number => now;
+    const sleep = async (ms: number): Promise<void> => {
+      now += ms;
+    };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => starting, // forever "starting"
+        spawn: () => ({ pid: 999 }),
+        sleep,
+        nowMs: clock,
+        pollIntervalMs: 50,
+        waitMs: 1_000,
+        startingReadyMs: 2_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.message ?? "").toContain("still starting");
+    expect(threw?.message ?? "").toContain("building");
+    expect(threw?.message ?? "").toContain("9999");
+  });
+
+  test("#251: concurrent ensureDaemon calls on a REAL shared filesystem elect ONE daemon", async () => {
+    // End-to-end race test: two concurrent `ensureDaemon` callers
+    // on the SAME repoRoot, using the REAL `acquireStartingLock`
+    // for the simulated daemons. Even when both callers probe
+    // "no daemon" at the same instant, only one spawned daemon
+    // can take `.revkit/daemon.lock` — the other must fail to
+    // acquire, and both callers converge on the same winner.
+    const { acquireStartingLock } = await import("../../src/serve/serve-state.ts");
+    const winnerStates: Array<{ status?: string }> = [];
+    let acquireAttempts = 0;
+    let acquireWins = 0;
+    const simulateServeSpawn = (): { pid: number } => {
+      acquireAttempts++;
+      const acquired = acquireStartingLock(root, {
+        pid: process.pid,
+        version: "0.0.0-test",
+        startedAt: new Date().toISOString(),
+        instanceId: `starting-race-${acquireAttempts}`,
+      });
+      if (acquired.kind === "already-running") {
+        return { pid: -1 };
+      }
+      acquireWins++;
+      // Simulate build + bind: publish ready after some sleeps,
+      // then release the lock. We leave the state on disk so
+      // ensureDaemon returns it; it will be released in the test's
+      // afterEach cleanup (rmSync of root).
+      setTimeout(() => {
+        acquired.publishReady({
+          pid: process.pid,
+          port: 54321,
+          url: "http://127.0.0.1:54321",
+          agentToken: "race-token",
+          startedAt: new Date().toISOString(),
+          version: "0.0.0-test",
+          instanceId: `ready-race-${acquireAttempts}`,
+        });
+      }, 20);
+      return { pid: 1234 };
+    };
+    // Both callers share the real `findRunningOrStartingDaemon`
+    // (no `findRunningDaemon` override), so they see the real lock
+    // state on disk. `spawn` simulates `revkit serve` taking the
+    // lock in-process — the second concurrent spawn will be
+    // refused because the first already holds it.
+    const bootstrapA = ensureDaemon({
+      repoRoot: root,
+      spawn: simulateServeSpawn,
+      pollIntervalMs: 5,
+      waitMs: 1_000,
+      startingReadyMs: 1_000,
+    });
+    const bootstrapB = ensureDaemon({
+      repoRoot: root,
+      spawn: simulateServeSpawn,
+      pollIntervalMs: 5,
+      waitMs: 1_000,
+      startingReadyMs: 1_000,
+    });
+    const [resultA, resultB] = await Promise.all([bootstrapA, bootstrapB]);
+    winnerStates.push(resultA.state, resultB.state);
+    // EXACTLY ONE daemon acquired the lock and published "ready".
+    // Both callers converge on the same winner (either both
+    // `spawned: true` from the same spawn — conceivable if their
+    // `undefined` probes raced and both spawned, but only one
+    // won the lock — or one spawned and one waited).
+    expect(acquireWins).toBe(1);
+    expect(resultA.state.instanceId).toBe(resultB.state.instanceId);
+    // Both results show a READY state: status is either absent
+    // (legacy wire-shape, treated as ready) or "ready"; never
+    // "starting", which is the pre-bind window ensureDaemon waits on.
+    expect(resultA.state.status === "starting").toBe(false);
+    expect(resultB.state.status === "starting").toBe(false);
+  }, 10_000);
+});
+
 describe("verifyDaemonInstance", () => {
   /** A minimal fetch stub. `verifyDaemonInstance` only needs
    * `(url, init?) => Promise<Response>`, so a plain function

@@ -51,10 +51,13 @@ export function parseMcpArgs(args: readonly string[]): { ok: true; dir?: string 
   return { ok: true, ...(dir !== undefined ? { dir } : {}) };
 }
 
-/** Run `revkit mcp` end-to-end. Ensures a daemon is up, connects the
- * MCP server to stdio, and returns a `blockForever` promise the CLI
- * wrapper awaits. `stderr` carries user-visible startup notes; nothing
- * goes to `stdout` (stdio belongs to the MCP protocol). */
+/** Run `revkit mcp` end-to-end. Connects the MCP server to stdio and
+ * returns a `blockForever` promise the CLI wrapper awaits. Daemon
+ * bootstrap runs ASYNCHRONOUSLY through the channel server's
+ * `discover` path (#212): the transport answers `initialize`
+ * immediately, and the first tool call drives — or waits on —
+ * the daemon's startup. Nothing goes to `stdout` (stdio belongs to
+ * the MCP protocol); user-visible startup notes land on `stderr`. */
 export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Promise<RunResult> {
   const parsed = parseMcpArgs(args);
   if (!parsed.ok) return { exitCode: 2, stdout: "", stderr: parsed.message + "\n" };
@@ -64,17 +67,6 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
   } catch (error) {
     return { exitCode: 2, stdout: "", stderr: `${(error as Error).message}\n` };
   }
-  let bootstrap;
-  let startupDiagnostic = "";
-  try {
-    bootstrap = await ensureDaemon({
-      repoRoot,
-      ...(parsed.dir !== undefined ? { dir: parsed.dir } : {}),
-    });
-  } catch (error) {
-    startupDiagnostic = `revkit mcp: daemon unavailable: ${(error as Error).message}. Tool calls will retry.\n`;
-  }
-  const state = bootstrap?.state;
   // Reconnect discovery for the channel server: re-run `ensureDaemon`
   // (auto-starts if the previous daemon is gone), then confirm via
   // `/-/health` that the running daemon really is the one
@@ -126,12 +118,13 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
   let handle;
   try {
     handle = await startChannelServer({
-      ...(state !== undefined ? {
-        client: new DaemonClient({ url: state.url, agentToken: state.agentToken }),
-        url: state.url,
-        agentToken: state.agentToken,
-        ...(state.instanceId !== undefined ? { instanceId: state.instanceId } : {}),
-      } : {}),
+      // #212: no eager `ensureDaemon`. The transport connects
+      // immediately; the channel server's own prime step throws
+      // "daemon has not connected yet" and falls into the
+      // background reconnect loop (which runs `discover`). The
+      // first tool call either finds the daemon ready or surfaces
+      // a clear "building / unavailable" message, both bounded by
+      // the tool-call deadline — never the MCP initialize deadline.
       version: env.version,
       discover,
     });
@@ -153,11 +146,11 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
   });
-  let bootMsg = startupDiagnostic;
-  if (state !== undefined) {
-    const verb = bootstrap?.spawned ? "started" : "attached to";
-    bootMsg = `revkit mcp: ${verb} daemon (pid ${state.pid}, ${state.url})\n`;
-  }
+  // #212: daemon bootstrap is deferred to the first tool call's
+  // `discover` path — no synchronous "attached to pid X" line here.
+  // The background reconnect loop logs its own progress through the
+  // event subscriber's `onError` callback when the daemon isn't up.
+  const bootMsg = "revkit mcp: ready (daemon bootstrap deferred to first tool call)\n";
   return {
     exitCode: 0,
     stdout: "",

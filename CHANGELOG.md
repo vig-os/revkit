@@ -102,6 +102,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP cold-start no longer spawns duplicate daemons during a slow auto-build**
+  ([#251](https://github.com/vig-os/revkit/issues/251),
+  [#212](https://github.com/vig-os/revkit/issues/212))
+  - `revkit serve` now takes `.revkit/daemon.lock` BEFORE the cold-start
+    auto-build (`packages/cli/src/serve/cli.ts`). While the build runs,
+    `.revkit/serve.json` carries a `status: "starting"` record with the
+    daemon's pid and placeholder url/token. A concurrent `revkit mcp`'s
+    `ensureDaemon` sees the "starting" state and waits on the readiness
+    transition — it never spawns a second daemon that races into the
+    same `.revkit/dist`. Pre-fix, `ensureDaemon`'s 10-second wait would
+    time out during a cold build and every tool-call retry spawned
+    another `revkit serve`.
+  - `ensureDaemon` detects a daemon that dies while starting PROMPTLY:
+    the OS releases `daemon.lock` on process exit, the next poll sees
+    the lock free, and the caller gets a `died while starting (pid N)`
+    error without burning the rest of the deadline. A daemon that stays
+    "starting" past its deadline surfaces as a clear
+    `building, N s elapsed` diagnostic the agent can retry.
+  - `revkit mcp` answers `initialize` immediately — it no longer calls
+    `ensureDaemon` synchronously before `server.connect(transport)`.
+    Daemon bootstrap runs through the channel server's existing reconnect
+    path on the first tool call, so the client's `initialize` round-trip
+    stays well under a second even when the daemon cannot start.
+  - Legacy callers (`revkit events`, `revkit open`, `revkit hook`) keep
+    their pre-#251 "ready-only" view through `findRunningDaemon`; MCP
+    uses a new `findRunningOrStartingDaemon` that also returns a
+    "starting" daemon. `acquireAndPublish` is unchanged for programmatic
+    callers.
 - **A page whose body fails to render fails the build**
   ([#237](https://github.com/vig-os/revkit/issues/237))
   - Astro's glob loader wraps every per-entry markdown render in a try/catch

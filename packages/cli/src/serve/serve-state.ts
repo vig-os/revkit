@@ -73,6 +73,18 @@ export interface ServeState {
    * `removeServeState` refuses to delete (a file without an
    * instanceId cannot be proved ours). */
   readonly instanceId?: string;
+  /** Lifecycle marker (#251):
+   *  - `"starting"` — the daemon holds `.revkit/daemon.lock` and is
+   *    doing pre-bind work (e.g. the cold-start auto-build in
+   *    `serve/cli.ts`). `url`/`agentToken`/`port` are placeholders
+   *    (empty strings / 0) because the HTTP server has not bound yet.
+   *  - `"ready"` (or absent, for backwards compat) — the HTTP server
+   *    is bound and the connection fields are meaningful.
+   *
+   * A second `ensureDaemon` seeing `"starting"` MUST wait for the
+   * transition to `"ready"` instead of spawning another daemon;
+   * see `findRunningOrStartingDaemon` and `mcp/daemon-bootstrap.ts`. */
+  readonly status?: "starting" | "ready";
 }
 
 /** Filename constants. Kept here so a rename lands in one place. */
@@ -247,6 +259,8 @@ export function readServeStateVerbose(repoRoot: string): ReadOutcome {
       return { kind: "unparsable", reason: `serve-state: ${path} missing string '${key}'.` };
     }
   }
+  const status =
+    record.status === "starting" || record.status === "ready" ? record.status : undefined;
   return {
     kind: "ok",
     state: {
@@ -257,8 +271,16 @@ export function readServeStateVerbose(repoRoot: string): ReadOutcome {
       startedAt: record.startedAt as string,
       version: record.version as string,
       ...(typeof record.instanceId === "string" ? { instanceId: record.instanceId } : {}),
+      ...(status !== undefined ? { status } : {}),
     },
   };
+}
+
+/** True when `state` advertises a bound HTTP server (`status === "ready"`,
+ * or `status` absent for backwards compat). A `"starting"` state is NOT
+ * ready — its `url`/`agentToken`/`port` are placeholders (#251). */
+export function isReadyServeState(state: ServeState): boolean {
+  return state.status !== "starting";
 }
 
 /** Convenience wrapper: undefined for either missing or unparsable. */
@@ -330,20 +352,51 @@ export interface RefusedDaemon {
   readonly reason: string;
 }
 
-export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
+/** Initial record identifying a starting daemon. The caller supplies
+ * these before bind; `publishReady` later swaps in the bound state. */
+export interface AcquiredStartingInit {
+  readonly pid: number;
+  readonly version: string;
+  readonly startedAt: string;
+  readonly instanceId: string;
+}
+
+/** Acquired daemon-lock PRE-bind (#251). The caller (serve/cli.ts)
+ * takes this BEFORE the cold-start auto-build so a concurrent
+ * `revkit serve` is refused immediately and a concurrent
+ * `ensureDaemon` sees a "starting" state and waits on readiness
+ * instead of spawning another daemon. `publishReady(state)` must be
+ * called once the HTTP server has bound, before the daemon begins
+ * answering requests. `release()` is idempotent and does the
+ * ownership-checked unlink of `serve.json` plus drops the OS lock. */
+export interface AcquiredStartingDaemon {
+  readonly kind: "ok";
+  readonly repoId: string;
+  publishReady(state: ServeState): void;
+  release(): void;
+}
+
+/** Acquire `.revkit/daemon.lock` and publish a "starting" record to
+ * `serve.json`. Returns a handle the caller uses to publish the
+ * bound state later and release on shutdown.
+ *
+ * Writes a ServeState with `status: "starting"`, `pid` / `version` /
+ * `startedAt` / `instanceId` set, and placeholders in `url` (empty
+ * string), `agentToken` (empty string) and `port` (0). Consumers
+ * that see this record wait for the "ready" transition — the
+ * placeholders are chosen so a legacy consumer that forgets to
+ * check `status` fails fast (HTTP to an empty URL) rather than
+ * silently talking to a half-born daemon. */
+export function acquireStartingLock(
+  repoRoot: string,
+  init: AcquiredStartingInit,
+): AcquiredStartingDaemon | RefusedDaemon {
   ensureRevkitDir(repoRoot);
   const lockPath = daemonLockPath(repoRoot);
   const lock = acquireDaemonLock(lockPath);
   if (lock === null) {
     // Deliberately does NOT read `.revkit/repo-id` (issue #63
-    // review nit). It carried the winner's id on an earlier draft,
-    // but the lock is per repo root — so a refused start is by
-    // construction on the SAME repo, and the id is a file the caller
-    // already has on its own filesystem plus an unauthenticated
-    // `/-/health` field. It told the reader nothing they did not
-    // have, `daemon.ts` throws before reading it, and touching the
-    // file at all weakens the one invariant that matters here: a
-    // start that does not win the lock does not go near the id.
+    // review nit). See `acquireAndPublish` for the rationale.
     return {
       kind: "already-running",
       state: readServeState(repoRoot),
@@ -351,15 +404,43 @@ export function acquireAndPublish(repoRoot: string, state: ServeState): Acquired
     };
   }
   // We have the lock, so we are the only writer for the life of the
-  // daemon: any existing `serve.json` is stale (an exited-uncleanly
-  // daemon left it behind) and any existing `repo-id` is THE repo
-  // id. Overwrite the former, read-or-mint the latter.
+  // daemon. Read-or-mint the repo id under the lock (issue #63).
   const repoId = readOrMintRepoId(repoRoot);
-  writeServeState(repoRoot, state);
+  const startingState: ServeState = {
+    pid: init.pid,
+    port: 0,
+    url: "",
+    agentToken: "",
+    startedAt: init.startedAt,
+    version: init.version,
+    instanceId: init.instanceId,
+    status: "starting",
+  };
+  writeServeState(repoRoot, startingState);
   let released = false;
+  // Track the most recently published state so `release()` can do
+  // the ownership check against whichever record we actually own
+  // right now (starting first, ready afterwards).
+  let ownedState: ServeState = startingState;
   return {
     kind: "ok",
     repoId,
+    publishReady(state: ServeState): void {
+      if (released) {
+        throw new Error("acquireStartingLock: publishReady called after release");
+      }
+      // The caller composes the final state (with the bound port,
+      // agent token, url). We enforce `status: "ready"` and the
+      // same `instanceId` we started under so the lifecycle is
+      // one coherent story on disk.
+      const readyState: ServeState = {
+        ...state,
+        instanceId: init.instanceId,
+        status: "ready",
+      };
+      writeServeState(repoRoot, readyState);
+      ownedState = readyState;
+    },
     release(): void {
       if (released) return;
       released = true;
@@ -370,8 +451,8 @@ export function acquireAndPublish(repoRoot: string, state: ServeState): Acquired
       if (
         current.kind === "ok" &&
         current.state.instanceId !== undefined &&
-        state.instanceId !== undefined &&
-        current.state.instanceId === state.instanceId
+        ownedState.instanceId !== undefined &&
+        current.state.instanceId === ownedState.instanceId
       ) {
         try {
           unlinkSync(serveStatePath(repoRoot));
@@ -381,6 +462,32 @@ export function acquireAndPublish(repoRoot: string, state: ServeState): Acquired
       }
       lock.release();
     },
+  };
+}
+
+export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
+  if (state.instanceId === undefined) {
+    // instanceId is required by the lifecycle; the production call
+    // site always passes one. Make the contract explicit so a buggy
+    // new call site is caught before it writes a lock-held-but-
+    // unreleasable serve.json.
+    throw new Error("acquireAndPublish: state.instanceId is required");
+  }
+  const acquired = acquireStartingLock(repoRoot, {
+    pid: state.pid,
+    version: state.version,
+    startedAt: state.startedAt,
+    instanceId: state.instanceId,
+  });
+  if (acquired.kind === "already-running") return acquired;
+  // Immediately publish ready — the two-phase API is for callers
+  // with a pre-bind window; a synchronous `acquireAndPublish`
+  // behaves exactly as before for every existing caller / test.
+  acquired.publishReady(state);
+  return {
+    kind: "ok",
+    repoId: acquired.repoId,
+    release: acquired.release,
   };
 }
 
@@ -400,10 +507,15 @@ export function removeServeState(repoRoot: string): void {
   }
 }
 
-/** Consumer helper: find a running daemon by checking the lock. If
- * the lock is free, the state file — even if it exists — is stale.
- * Kept small so `revkit mcp` and other clients can import one
- * function to answer "is the daemon up, and if so where".
+/** Consumer helper: find a READY daemon by checking the lock. If
+ * the lock is free, the state file — even if it exists — is stale;
+ * if it is held but the state is `"starting"` (#251 pre-bind window),
+ * this helper returns `undefined` so legacy callers (`revkit events`,
+ * `revkit open`, `revkit hook`) that would blindly fetch from the
+ * advertised URL get a clean "no daemon" result rather than a
+ * placeholder empty URL. Clients that need to WAIT for a starting
+ * daemon call `findRunningOrStartingDaemon` instead
+ * (`mcp/daemon-bootstrap.ts`).
  *
  * **Race note (acceptable).** `findRunningDaemon` and a starting
  * daemon can race: the caller's `acquireDaemonLock` probe succeeds
@@ -415,6 +527,18 @@ export function removeServeState(repoRoot: string): void {
  * probes, which is the wrong trade. `revkit mcp` retries on
  * `undefined`, so the race window is a single extra probe. */
 export function findRunningDaemon(repoRoot: string): ServeState | undefined {
+  const state = findRunningOrStartingDaemon(repoRoot);
+  if (state === undefined) return undefined;
+  return isReadyServeState(state) ? state : undefined;
+}
+
+/** Variant of `findRunningDaemon` that ALSO returns a daemon whose
+ * `status` is `"starting"` (the pre-bind window during a cold-start
+ * auto-build, #251). The caller must guard on `state.status` and
+ * either wait for the transition to `"ready"` or treat the lock
+ * holder as "a daemon is starting; don't spawn another" — see
+ * `mcp/daemon-bootstrap.ts`. */
+export function findRunningOrStartingDaemon(repoRoot: string): ServeState | undefined {
   const lockPath = daemonLockPath(repoRoot);
   if (!existsSync(lockPath)) return undefined;
   // Probe: can we acquire the lock? If yes, no daemon owns it —
@@ -425,6 +549,7 @@ export function findRunningDaemon(repoRoot: string): ServeState | undefined {
     attempt.release();
     return undefined;
   }
-  // Lock is held by someone. Return the advertisement.
+  // Lock is held by someone. Return the advertisement (ready OR
+  // starting; the caller decides).
   return readServeState(repoRoot);
 }
