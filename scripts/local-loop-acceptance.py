@@ -360,9 +360,15 @@ def step4_launch_mcp(consumer_dir: str, server_env: dict[str, str]) -> McpClient
         fail(4, f"initialize response missing serverInfo: {init!r}")
     mcp.notify("notifications/initialized")
     # Wait for the daemon's advertisement file; proves the bootstrap
-    # finished and gave us the daemon's pid.
+    # finished and gave us the daemon's pid. `revkit mcp`'s built-in
+    # spawn deadline is 10 s (daemon-bootstrap.ts:waitMs), but the
+    # process it detached keeps coming up in background on a cold CI
+    # runner where the first Bun invocation can take 30–60 s. The MCP
+    # retries on the next tool call; our poll just has to outlive the
+    # cold start.
     state_path = Path(consumer_dir) / ".revkit" / "serve.json"
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 120
+    nudged = False
     while time.monotonic() < deadline:
         if state_path.exists():
             break
@@ -371,7 +377,16 @@ def step4_launch_mcp(consumer_dir: str, server_env: dict[str, str]) -> McpClient
                 4,
                 f"revkit mcp exited (code {mcp.proc.returncode}) before publishing serve.json; stderr tail:\n{mcp.stderr_tail()}",
             )
-        time.sleep(0.05)
+        # 15 s in, nudge the MCP with a `tools/list` so its retry path
+        # engages — this also surfaces any protocol-level breakage
+        # ahead of the daemon handshake. Harmless on the happy path.
+        if not nudged and time.monotonic() > deadline - 105:
+            try:
+                mcp.call("tools/list", timeout=5)
+            except Exception:
+                pass
+            nudged = True
+        time.sleep(0.1)
     if not state_path.exists():
         fail(4, f"serve.json never appeared; stderr tail:\n{mcp.stderr_tail()}")
     state = read_serve_state(consumer_dir)
