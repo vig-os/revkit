@@ -466,28 +466,53 @@ export function acquireStartingLock(
 }
 
 export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
-  if (state.instanceId === undefined) {
-    // instanceId is required by the lifecycle; the production call
-    // site always passes one. Make the contract explicit so a buggy
-    // new call site is caught before it writes a lock-held-but-
-    // unreleasable serve.json.
-    throw new Error("acquireAndPublish: state.instanceId is required");
+  ensureRevkitDir(repoRoot);
+  const lockPath = daemonLockPath(repoRoot);
+  const lock = acquireDaemonLock(lockPath);
+  if (lock === null) {
+    // Deliberately does NOT read `.revkit/repo-id` (issue #63
+    // review nit). See `acquireStartingLock` for the rationale.
+    return {
+      kind: "already-running",
+      state: readServeState(repoRoot),
+      reason: "another revkit daemon holds .revkit/daemon.lock",
+    };
   }
-  const acquired = acquireStartingLock(repoRoot, {
-    pid: state.pid,
-    version: state.version,
-    startedAt: state.startedAt,
-    instanceId: state.instanceId,
-  });
-  if (acquired.kind === "already-running") return acquired;
-  // Immediately publish ready — the two-phase API is for callers
-  // with a pre-bind window; a synchronous `acquireAndPublish`
-  // behaves exactly as before for every existing caller / test.
-  acquired.publishReady(state);
+  // We have the lock. Mint the repo id under the lock (#63) and
+  // publish ONCE — this is the fast path for callers that need no
+  // pre-bind window (every pre-#251 caller, the Playwright
+  // `bootDaemon` helpers in `site/tests` that read `serve.json`
+  // directly and expect ready-state fields). Two atomic writes
+  // back-to-back would otherwise expose a "starting" record on disk
+  // for one scheduler tick — enough time for a concurrent reader to
+  // see empty `url`/`agentToken`. See #251.
+  const repoId = readOrMintRepoId(repoRoot);
+  writeServeState(repoRoot, state);
+  let released = false;
   return {
     kind: "ok",
-    repoId: acquired.repoId,
-    release: acquired.release,
+    repoId,
+    release(): void {
+      if (released) return;
+      released = true;
+      // Only remove `serve.json` if it still carries OUR
+      // instanceId. A racing daemon could conceivably have taken
+      // over during our shutdown; do not delete their advertisement.
+      const current = readServeStateVerbose(repoRoot);
+      if (
+        current.kind === "ok" &&
+        current.state.instanceId !== undefined &&
+        state.instanceId !== undefined &&
+        current.state.instanceId === state.instanceId
+      ) {
+        try {
+          unlinkSync(serveStatePath(repoRoot));
+        } catch {
+          // Fine if it is already gone.
+        }
+      }
+      lock.release();
+    },
   };
 }
 

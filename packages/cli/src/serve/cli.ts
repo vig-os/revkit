@@ -183,30 +183,41 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     }
   }
 
-  // #251: claim the daemon lock BEFORE the auto-build so a concurrent
-  // `revkit serve` or `ensureDaemon` sees we are starting and does
-  // NOT spawn another daemon. The lock is kept alive for the daemon's
-  // lifetime; on refusal we surface the same error the daemon's
-  // in-process `acquireAndPublish` would have.
-  const serveInstanceId = mintToken();
-  const serveStartedAt = new Date().toISOString();
-  const acquired = acquireStartingLock(repoRoot, {
-    pid: process.pid,
-    version: env.version,
-    startedAt: serveStartedAt,
-    instanceId: serveInstanceId,
-  });
-  if (acquired.kind === "already-running") {
-    const existing = acquired.state;
-    const where = existing !== undefined
-      ? `pid ${existing.pid}${existing.url.length > 0 ? `, ${existing.url}` : ""}`
-      : "no advertisement on disk";
-    return {
-      exitCode: 1,
-      stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
-      stderr:
-        `revkit serve: another daemon holds .revkit/daemon.lock (${where}). Stop it, then retry.\n`,
-    };
+  // #251: when an auto-build is needed, claim the daemon lock and
+  // publish a "starting" serve.json record BEFORE the build runs so a
+  // concurrent `ensureDaemon` sees we are starting and WAITS on
+  // readiness instead of spawning another daemon that races into the
+  // same `.revkit/dist`. When no auto-build is needed (explicit
+  // `--dir`), the legacy startDaemon-internal lock acquisition is
+  // enough — serve.json stays unwritten until bind, which matches the
+  // pre-#251 shape consumer-side scripts rely on (`bootDaemon`
+  // helpers in site/tests read `serve.json` directly and expect
+  // ready-state fields).
+  let acquired: AcquiredStartingDaemon | undefined;
+  let serveInstanceId: string | undefined;
+  let serveStartedAt: string | undefined;
+  if (needsAutoBuild) {
+    serveInstanceId = mintToken();
+    serveStartedAt = new Date().toISOString();
+    const result = acquireStartingLock(repoRoot, {
+      pid: process.pid,
+      version: env.version,
+      startedAt: serveStartedAt,
+      instanceId: serveInstanceId,
+    });
+    if (result.kind === "already-running") {
+      const existing = result.state;
+      const where = existing !== undefined
+        ? `pid ${existing.pid}${existing.url.length > 0 ? `, ${existing.url}` : ""}`
+        : "no advertisement on disk";
+      return {
+        exitCode: 1,
+        stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
+        stderr:
+          `revkit serve: another daemon holds .revkit/daemon.lock (${where}). Stop it, then retry.\n`,
+      };
+    }
+    acquired = result;
   }
 
   if (needsAutoBuild) {
@@ -223,7 +234,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
         repoSlug: env.repoSlug ?? "vig-os/revkit",
       });
     } catch (error) {
-      acquired.release();
+      acquired?.release();
       return {
         exitCode: 1,
         stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
@@ -231,7 +242,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
       };
     }
     if (buildResult.exitCode !== 0) {
-      acquired.release();
+      acquired?.release();
       return {
         exitCode: buildResult.exitCode,
         stdout: buildResult.stdout,
@@ -249,15 +260,15 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     localUserId: readOrMintLocalUserId(repoRoot),
     announce: true,
     installSignalHandlers: true,
-    acquired,
-    acquiredInstanceId: serveInstanceId,
-    acquiredStartedAt: serveStartedAt,
+    ...(acquired !== undefined ? { acquired } : {}),
+    ...(serveInstanceId !== undefined ? { acquiredInstanceId: serveInstanceId } : {}),
+    ...(serveStartedAt !== undefined ? { acquiredStartedAt: serveStartedAt } : {}),
   };
   let handle;
   try {
     handle = await startDaemon(options);
   } catch (error) {
-    acquired.release();
+    acquired?.release();
     return {
       exitCode: 1,
       stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
