@@ -23,12 +23,14 @@
 // needs no revocation surface. Introducing a session later means
 // landing session-binding + revocation tests at the same time.
 //
-// Hardening (round 2, #244):
+// Hardening (rounds 2 and 3, #244):
 //
 //   * Header names are validated at construction against RFC 9110
-//     §5.6.2 (token). An invalid header name is a startup error, so
-//     `authenticate()` never throws — the provider contract pins
-//     refusal as the only error shape.
+//     §5.6.2 (token) via the shared `validateHeaderName` in
+//     `auth-internal.ts` — one validator across every in-core
+//     provider. An invalid header name is a startup error, so
+//     `authenticate()` never throws (the provider contract pins
+//     refusal as the only error shape).
 //   * Repeated subject header: the Fetch `Headers.get()` comma-joins
 //     multiple values for one header name. A subject that contains
 //     `,` is treated as repeated / malformed and refused with 401
@@ -38,10 +40,13 @@
 //     consumed yet; when a later issue parses it (#195 allowed-
 //     groups), the documented format is comma-separated tokens, so
 //     the comma-refusal does not apply there.
-//   * Display name: C0 (U+0000..U+001F) and C1 (U+007F..U+009F)
-//     control characters are stripped, and the result is capped at
+//   * Display name: C0 (U+0000..U+001F), DEL (U+007F) and C1
+//     (U+0080..U+009F) control characters are stripped, Unicode
+//     whitespace is trimmed, and the result is capped at
 //     `DISPLAY_NAME_MAX_CHARS` (256) code units. A value that becomes
-//     empty after stripping/trimming falls back to the subject.
+//     empty after stripping/trimming falls back to the subject. The
+//     `none` provider shares the same sanitisation via
+//     `sanitiseDisplayName` (`auth-internal.ts`).
 //   * IP parsing refuses `1.2.3.4::` and similar — the IPv4 dotted
 //     quad is allowed ONLY as the very last 32 bits of the address
 //     (RFC 4291 §2.2.3). A zone id (`%zone`) is accepted ONLY for
@@ -53,6 +58,16 @@
 //   * An unparsable peer entry is a construction-time error, so a
 //     typo in the allowlist is a startup failure, not a silent
 //     fail-closed at runtime.
+//   * CIDR prefix syntax: leading zeros are refused (`/08` would
+//     otherwise be ambiguous with the IPv4 octet rule that already
+//     refuses `010`). Prefix lengths with no leading zeros are
+//     syntactically valid; semantic rejection of `/0` happens below.
+//   * Zero-length prefixes (`0.0.0.0/0`, `::/0`,
+//     `::ffff:0:0/96` → reinterpreted to `/0` in IPv4 space) are
+//     refused at construction: they would trust every peer and defeat
+//     the ADR-0026 §Identity fail-closed gate. An operator who
+//     legitimately wants to trust every peer must say so one host at
+//     a time, not with a wildcard rule.
 
 import type {
   AuthProvider,
@@ -61,6 +76,11 @@ import type {
   AuthResult,
   Capability,
 } from "./auth.ts";
+import {
+  containsControlChar,
+  sanitiseDisplayName,
+  validateHeaderName,
+} from "./auth-internal.ts";
 
 /** Header names carrying the identity assertions. No default preset is
  * shipped — the deployment picks the names its proxy sets, and the
@@ -97,35 +117,29 @@ export interface TrustedProxyAuthProviderConfig {
   readonly capability?: Capability;
 }
 
-/** Documented bound on the stripped display name. Longer values are
- * truncated to this many UTF-16 code units; the subject itself is
- * refused if it exceeds the bound, because a stable proxy-asserted
- * subject is a short id. */
-const DISPLAY_NAME_MAX_CHARS = 256;
+/** Documented bound on the stripped subject header value. */
 const SUBJECT_MAX_CHARS = 256;
-
-/** RFC 9110 §5.6.2 token characters. A valid HTTP header name is one
- * or more of these; anything else (space, `:`, newline, high byte) is
- * rejected at construction so a typo is a startup error. */
-const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 /** Create a `trusted-proxy` auth provider.
  *
- * @throws Error if the peer list is empty, any entry fails to parse
- *  as an IPv4/IPv6 address or CIDR, or any configured header name is
- *  not an RFC 9110 §5.6.2 token. Catching these at construction turns
- *  a typo into a startup error and preserves the `authenticate()`
- *  "MUST NOT throw" contract from `auth.ts`.
+ * @throws Error if the peer list is empty; any entry fails to parse as
+ *  an IPv4/IPv6 address or CIDR (including leading zeros in a prefix
+ *  length); any configured prefix normalises to `/0` — a rule that
+ *  would trust every peer and defeat ADR-0026's fail-closed gate; any
+ *  configured header name is not an RFC 9110 §5.6.2 token. Catching
+ *  these at construction turns a typo into a startup error and
+ *  preserves the `authenticate()` "MUST NOT throw" contract from
+ *  `auth.ts`.
  */
 export function createTrustedProxyAuthProvider(
   config: TrustedProxyAuthProviderConfig,
 ): AuthProvider {
-  validateHeaderName("subject", config.headers.subject);
+  validateHeaderName("trusted-proxy subject header", config.headers.subject);
   if (config.headers.displayName !== undefined) {
-    validateHeaderName("displayName", config.headers.displayName);
+    validateHeaderName("trusted-proxy displayName header", config.headers.displayName);
   }
   if (config.headers.groups !== undefined) {
-    validateHeaderName("groups", config.headers.groups);
+    validateHeaderName("trusted-proxy groups header", config.headers.groups);
   }
 
   const subjectHeader = config.headers.subject;
@@ -195,14 +209,6 @@ function refuse(reason: "untrusted-peer" | "missing-subject", status: 401 | 403)
   return { kind: "refused", reason: { reason, status } };
 }
 
-function validateHeaderName(field: "subject" | "displayName" | "groups", name: string): void {
-  if (!HEADER_NAME_RE.test(name)) {
-    throw new Error(
-      `trusted-proxy: invalid HTTP header name for ${field} (RFC 9110 §5.6.2 token): ${JSON.stringify(name)}`,
-    );
-  }
-}
-
 /** Trim + validate a subject header value.
  *
  * - `null` / empty / whitespace-only → `undefined` (treated as missing).
@@ -230,35 +236,15 @@ function normaliseSubject(raw: string | null): string | undefined {
  * - Contains `,` → `undefined` (repeated-header defence; same rule as
  *   subject, so a legitimately comma-containing display name cannot
  *   silently combine two values).
- * - Control characters (C0 / C1 / DEL) are stripped out.
- * - The result is truncated to `DISPLAY_NAME_MAX_CHARS` code units.
- *   If the stripped+capped value is empty, falls back to `undefined`.
+ * - Control characters (C0 / C1 / DEL) are stripped out by the shared
+ *   `sanitiseDisplayName`, which also trims Unicode whitespace and
+ *   truncates to `DISPLAY_NAME_MAX_CHARS` code units. If the
+ *   stripped+capped value is empty, falls back to `undefined`.
  */
 function normaliseDisplayName(raw: string | null): string | undefined {
   if (raw === null) return undefined;
   if (raw.includes(",")) return undefined;
-  const stripped = stripControlChars(raw).trim();
-  if (stripped.length === 0) return undefined;
-  if (stripped.length <= DISPLAY_NAME_MAX_CHARS) return stripped;
-  return stripped.slice(0, DISPLAY_NAME_MAX_CHARS);
-}
-
-function containsControlChar(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c <= 0x1f || (c >= 0x7f && c <= 0x9f)) return true;
-  }
-  return false;
-}
-
-function stripControlChars(s: string): string {
-  let out = "";
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c <= 0x1f || (c >= 0x7f && c <= 0x9f)) continue;
-    out += s[i];
-  }
-  return out;
+  return sanitiseDisplayName(raw);
 }
 
 /** A parsed peer rule: a single IPv4/IPv6 literal (prefix = max bits)
@@ -292,8 +278,15 @@ function parsePeerRule(entry: string): PeerRule {
   const normalisedMaxBits = normalised.family === 4 ? 32 : 128;
   let prefixBits = normalisedMaxBits;
   if (prefixPart !== undefined) {
-    if (!/^[0-9]+$/.test(prefixPart)) {
-      throw new Error(`trusted-proxy: CIDR prefix is not an integer: ${JSON.stringify(entry)}`);
+    // `/08` is refused for the same reason `010.0.0.1` is refused on
+    // the IPv4 side (classic SSRF-bypass octal shape): a well-formed
+    // integer has no leading zeros, with `0` as the only exception.
+    // `0` on its own is syntactically valid; it is rejected below as
+    // a zero-length prefix for a security reason, not a syntax one.
+    if (!/^(0|[1-9][0-9]*)$/.test(prefixPart)) {
+      throw new Error(
+        `trusted-proxy: CIDR prefix must be a non-negative integer with no leading zeros: ${JSON.stringify(entry)}`,
+      );
     }
     let raw = Number.parseInt(prefixPart, 10);
     if (raw < 0 || raw > parsedMaxBits) {
@@ -316,6 +309,19 @@ function parsePeerRule(entry: string): PeerRule {
       raw = raw - 96;
     }
     prefixBits = raw;
+  }
+  // Architect decision (round 3): a zero-length prefix is a
+  // trust-everyone rule — `0.0.0.0/0`, `::/0` and `::ffff:0:0/96`
+  // (reinterpreted to `/0` in IPv4 space) all land here. ADR-0026
+  // §Identity requires a non-empty allowlist precisely to keep the
+  // gate fail-closed; admitting a /0 rule would defeat that even
+  // though the allowlist is technically non-empty. Operators who
+  // need to trust every peer must say so one host at a time (or
+  // move to a unix socket), not with a wildcard rule.
+  if (prefixBits === 0) {
+    throw new Error(
+      `trusted-proxy: zero-length prefix would trust every peer and defeat ADR-0026's fail-closed gate: ${JSON.stringify(entry)}`,
+    );
   }
   return { family: normalised.family, bytes: normalised.bytes, prefixBits };
 }
@@ -395,47 +401,32 @@ function parseIpv4(input: string): ParsedAddress | undefined {
 function parseIpv6(input: string): ParsedAddress | undefined {
   const compressionIdx = input.indexOf("::");
   const hasCompression = compressionIdx !== -1;
-  if (hasCompression && input.indexOf("::", compressionIdx + 1) !== -1) return undefined;
 
   const leftRaw = hasCompression ? input.slice(0, compressionIdx) : input;
   const rightRaw = hasCompression ? input.slice(compressionIdx + 2) : "";
   const left = leftRaw === "" ? [] : leftRaw.split(":");
   const right = rightRaw === "" ? [] : rightRaw.split(":");
 
-  // RFC 4291 §2.2.3: the IPv4-dotted-quad form may only appear as the
+  // RFC 4291 §2.2.3: the IPv4 dotted-quad form may only appear as the
   // final element of the full address (representing the trailing 32
-  // bits). That means (uncompressed) dots only in the last of `left`,
-  // (`::` with a non-empty right) dots only in the last of `right`,
-  // and (`::` with an empty right, e.g. `1.2.3.4::`) no dots anywhere
-  // because the trailing 32 bits are zero-filled. Any other placement
-  // of a dot is a malformed literal.
-  let dottedTail: string[] | null = null;
-  if (hasCompression) {
-    if (right.length > 0) {
-      dottedTail = right;
-    }
-  } else {
-    dottedTail = left;
-  }
-  for (let i = 0; i < left.length; i++) {
-    if (!left[i]!.includes(".")) continue;
-    if (dottedTail !== left || i !== left.length - 1) return undefined;
-  }
-  for (let i = 0; i < right.length; i++) {
-    if (!right[i]!.includes(".")) continue;
-    if (dottedTail !== right || i !== right.length - 1) return undefined;
-  }
-
-  // Expand the dotted-quad in place into two 16-bit hex groups so the
-  // group-assembly below treats a length-4 IPv6 the same as length-6.
-  if (dottedTail !== null && dottedTail.length > 0) {
-    const tailLast = dottedTail[dottedTail.length - 1]!;
+  // bits). Expand the dotted-quad in place into two 16-bit hex groups
+  // so the group-count and per-group hex-regex checks below catch
+  // every other placement. A dot anywhere other than the tail leaves
+  // a group that fails the hex regex. The `1.2.3.4::` shape
+  // (compression with an empty right side) leaves `1.2.3.4` as a
+  // group in `left`, which fails that same regex. And a second `::`
+  // (`::1::2`) leaves an empty-string group that fails that same
+  // regex. One validation path, no redundant position / double-`::`
+  // guards.
+  const finalTail = hasCompression ? (right.length > 0 ? right : null) : left;
+  if (finalTail !== null && finalTail.length > 0) {
+    const tailLast = finalTail[finalTail.length - 1]!;
     if (tailLast.includes(".")) {
       const dotted = parseIpv4(tailLast);
       if (dotted === undefined) return undefined;
       const b = dotted.bytes;
-      dottedTail.pop();
-      dottedTail.push(((b[0]! << 8) | b[1]!).toString(16), ((b[2]! << 8) | b[3]!).toString(16));
+      finalTail.pop();
+      finalTail.push(((b[0]! << 8) | b[1]!).toString(16), ((b[2]! << 8) | b[3]!).toString(16));
     }
   }
 

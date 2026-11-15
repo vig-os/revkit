@@ -103,6 +103,61 @@ describe("createNoneAuthProvider", () => {
     expect(forgedKey).toBe("trusted-proxy:Alice");
   });
 
+  test("refuses an invalid `displayNameHeader` at construction (round-3 blocker: validate the header name)", () => {
+    // auth.ts:91-93 pins "`authenticate()` MUST NOT throw on an
+    // unauthenticated request". Without construction-time validation,
+    // a typo'd header name (`Headers.get` throws TypeError on a
+    // non-token name) would turn every request into a thrown error at
+    // `authenticate` time. The shared `validateHeaderName` in
+    // `auth-internal.ts` catches it as a startup error instead.
+    expect(() =>
+      createNoneAuthProvider({ displayNameHeader: "bad header" }),
+    ).toThrow(/invalid HTTP header name/);
+    expect(() =>
+      createNoneAuthProvider({ displayNameHeader: "" }),
+    ).toThrow(/invalid HTTP header name/);
+    expect(() =>
+      createNoneAuthProvider({ displayNameHeader: "x-auth-name\n" }),
+    ).toThrow(/invalid HTTP header name/);
+  });
+
+  test("strips C0/DEL/C1 control characters from the display-name header (shared helper with trusted-proxy)", async () => {
+    // Round-3 fix: `none` reuses `sanitiseDisplayName` so a header
+    // like `"A\u0001lice\u0085"` becomes `"Alice"` — the same rule as
+    // the trusted-proxy display-name path. The U+0085 (NEL) char
+    // exercises the C1 range (0x7F..0x9F), which a dropped
+    // `(c >= 0x7f && c <= 0x9f)` guard would leak into the identity.
+    const provider = createNoneAuthProvider();
+    const result = await provider.authenticate(
+      request({ "x-revkit-display-name": "A\u0001lice\u0085" }),
+    );
+    expect(result.kind).toBe("identity");
+    if (result.kind !== "identity") return;
+    expect(result.identity.displayName).toBe("Alice");
+    expect(result.identity.subject).toBe("Alice");
+  });
+
+  test("falls back to the default when the display name is only control chars (shared helper refuses empty)", async () => {
+    const provider = createNoneAuthProvider({ defaultDisplayName: "anonymous" });
+    const result = await provider.authenticate(
+      request({ "x-revkit-display-name": "\u0001\u0002\u0003" }),
+    );
+    expect(result.kind).toBe("identity");
+    if (result.kind !== "identity") return;
+    expect(result.identity.displayName).toBe("anonymous");
+  });
+
+  test("caps the display name at 256 code units (shared helper)", async () => {
+    const provider = createNoneAuthProvider();
+    const result = await provider.authenticate(
+      request({ "x-revkit-display-name": "A".repeat(300) }),
+    );
+    expect(result.kind).toBe("identity");
+    if (result.kind !== "identity") return;
+    expect(result.identity.displayName.length).toBe(256);
+    expect(result.identity.subject.length).toBe(256);
+  });
+
   test("the provider holds no state between calls (per-request derivation)", async () => {
     const provider = createNoneAuthProvider();
     const first = await provider.authenticate(

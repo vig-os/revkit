@@ -598,6 +598,189 @@ describe("createTrustedProxyAuthProvider — display-name hardening", () => {
   });
 });
 
+describe("createTrustedProxyAuthProvider — round-3 blocker: IPv6-mapped `raw < 96` guard", () => {
+  // Without the `raw < 96` guard in parsePeerRule, `::ffff:10.0.0.0/64`
+  // would compute `prefixBits = 64 - 96 = -32`. JavaScript's
+  // `Math.floor(-32 / 8)` is `-4` and `-32 % 8` is `-0`, so the matcher
+  // would run with an impossible negative prefix. The outcome depends
+  // on the matcher's byte-loop behaviour, but the right answer is to
+  // refuse the config up front — a `/64` in IPv6 space cannot describe
+  // an IPv4 range once the rule is reinterpreted.
+  test("refuses `::ffff:10.0.0.0/64` at construction (/<96 IPv4-mapped prefix)", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["::ffff:10.0.0.0/64"])),
+    ).toThrow(/needs a \/96 or longer prefix/i);
+  });
+
+  test("refuses `::ffff:127.0.0.1/95` at construction (just below the /96 floor)", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["::ffff:127.0.0.1/95"])),
+    ).toThrow(/needs a \/96 or longer prefix/i);
+  });
+
+  test("accepts `::ffff:10.0.0.0/104` at construction (regression guard)", () => {
+    // The paired regression: a /104 reinterprets to /8 in IPv4 space,
+    // which matches the plain IPv4 peer 10.0.0.42 — same test as the
+    // IPv4-mapped IPv6 group above, duplicated here so the paired
+    // "fails before, passes after" is in one block with the /64 case.
+    const provider = createTrustedProxyAuthProvider(
+      peersConfig(["::ffff:10.0.0.0/104"]),
+    );
+    expect(provider.id).toBe("trusted-proxy");
+  });
+});
+
+describe("createTrustedProxyAuthProvider — round-3 blocker: IPv6 parser mutation kills", () => {
+  // Fresh-reviewer mutation (parseIpv6:groups.length !== 8): without
+  // this guard a 9-group literal like `1:2:3:4:5:6:7:8:9` would reach
+  // the hex-regex loop (all nine groups are valid hex) and be accepted
+  // with a truncated or over-sized byte buffer. The test fails before
+  // the guard and passes after.
+  test("refuses `1:2:3:4:5:6:7:8:9` at construction (kills the 'drop groups.length !== 8' mutation)", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["1:2:3:4:5:6:7:8:9"])),
+    ).toThrow(/trusted-proxy:/);
+  });
+
+  // Fresh-reviewer mutation (parseIpv6 per-group `/^[0-9a-fA-F]{1,4}$/`):
+  // widening the `{1,4}` bound would accept `12345::1`, a 5-nibble
+  // "group" that cannot represent 16 bits. The test fails before the
+  // guard and passes after.
+  test("refuses `12345::1` at construction (kills the 'widen hex-group {1,4}' mutation)", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["12345::1"])),
+    ).toThrow(/trusted-proxy:/);
+  });
+});
+
+describe("createTrustedProxyAuthProvider — round-3 blocker: subject trim + length cap + C1 refusal", () => {
+  // Fresh-reviewer mutation (normaliseSubject `.trim()` call, line
+  // ~219): without the trim, the Fetch `Headers` normaliser only
+  // strips HTTP whitespace (space, tab), so a Unicode-whitespace-
+  // wrapped subject like `" alice "` would leak into the
+  // identity verbatim. With the trim, it is normalised to "alice".
+  test("trims Unicode whitespace from the subject (kills the 'drop subject trim()' mutation)", async () => {
+    const provider = createTrustedProxyAuthProvider(peersConfig(["127.0.0.1"]));
+    const result = await provider.authenticate(
+      tcpRequest("127.0.0.1", { "x-auth-user": " alice " }),
+    );
+    expect(result.kind).toBe("identity");
+    if (result.kind !== "identity") return;
+    expect(result.identity.subject).toBe("alice");
+  });
+
+  // Fresh-reviewer mutation (normaliseSubject SUBJECT_MAX_CHARS cap,
+  // line ~221): without the cap, an oversized subject (say 300 chars)
+  // would mint an identity with a 300-char `subject` field. The 256-
+  // char edge is accepted, 257 is refused.
+  test("accepts a subject at exactly 256 code units", async () => {
+    const provider = createTrustedProxyAuthProvider(peersConfig(["127.0.0.1"]));
+    const subject = "a".repeat(256);
+    const result = await provider.authenticate(
+      tcpRequest("127.0.0.1", { "x-auth-user": subject }),
+    );
+    expect(result.kind).toBe("identity");
+    if (result.kind !== "identity") return;
+    expect(result.identity.subject.length).toBe(256);
+  });
+
+  test("refuses a subject longer than 256 code units (kills the 'drop SUBJECT_MAX_CHARS cap' mutation)", async () => {
+    const provider = createTrustedProxyAuthProvider(peersConfig(["127.0.0.1"]));
+    const result = await provider.authenticate(
+      tcpRequest("127.0.0.1", { "x-auth-user": "a".repeat(257) }),
+    );
+    expect(result.kind).toBe("refused");
+    if (result.kind !== "refused") return;
+    expect(result.reason.reason).toBe("missing-subject");
+  });
+
+  // Fresh-reviewer mutation (containsControlChar C1 half, `c >= 0x7f &&
+  // c <= 0x9f`): dropping that clause would let C1 characters through
+  // the subject refusal. U+0085 (NEL) is a C1 character; U+007F (DEL)
+  // is the boundary case that lives in the same clause.
+  test("refuses a subject carrying a C1 (U+0085 NEL) control character (kills the 'drop C1 range' mutation)", async () => {
+    const provider = createTrustedProxyAuthProvider(peersConfig(["127.0.0.1"]));
+    const result = await provider.authenticate(
+      tcpRequest("127.0.0.1", { "x-auth-user": "alice\u0085evil" }),
+    );
+    expect(result.kind).toBe("refused");
+    if (result.kind !== "refused") return;
+    expect(result.reason.reason).toBe("missing-subject");
+  });
+
+  test("refuses a subject carrying a DEL (U+007F) control character", async () => {
+    const provider = createTrustedProxyAuthProvider(peersConfig(["127.0.0.1"]));
+    const result = await provider.authenticate(
+      tcpRequest("127.0.0.1", { "x-auth-user": "alice\u007fevil" }),
+    );
+    expect(result.kind).toBe("refused");
+    if (result.kind !== "refused") return;
+    expect(result.reason.reason).toBe("missing-subject");
+  });
+});
+
+describe("createTrustedProxyAuthProvider — round-3 architect decision: zero-length prefixes refused", () => {
+  // A /0 rule would trust every peer and defeat ADR-0026 §Identity's
+  // fail-closed gate. The allowlist shape says "explicit list of
+  // peers"; a wildcard rule violates that shape even though the array
+  // is technically non-empty. An operator who really wants to trust
+  // every peer must say so one host at a time (or switch to a unix
+  // socket). This block covers the three shapes that normalise to /0.
+  test("refuses `0.0.0.0/0` at construction", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["0.0.0.0/0"])),
+    ).toThrow(/zero-length prefix/i);
+  });
+
+  test("refuses `::/0` at construction", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["::/0"])),
+    ).toThrow(/zero-length prefix/i);
+  });
+
+  test("refuses `::ffff:0:0/96` at construction (reinterprets to /0 in IPv4 space)", () => {
+    // After the mapped-IPv6 reinterpret, `/96` becomes `/0` in IPv4
+    // space — the same trust-everyone shape. The zero-length check
+    // must fire AFTER the reinterpret so this entry does not slip
+    // through just because the written prefix was nominally 96.
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["::ffff:0:0/96"])),
+    ).toThrow(/zero-length prefix/i);
+  });
+
+  test("accepts `0.0.0.0/32` at construction (single exact host is explicit, not a wildcard)", () => {
+    // Regression guard: the /0 rejection is for zero-length prefixes
+    // only. A `/32` on IPv4 picks exactly one host, which is explicit
+    // and matches the allowlist shape.
+    const provider = createTrustedProxyAuthProvider(peersConfig(["0.0.0.0/32"]));
+    expect(provider.id).toBe("trusted-proxy");
+  });
+});
+
+describe("createTrustedProxyAuthProvider — round-3 architect decision: prefix syntax hardening", () => {
+  // The existing IPv4-octet rule refuses `010` to avoid the classic
+  // octal-SSRF bypass. The same rule applies to the CIDR prefix, for
+  // the same reason: a human reading `/08` has no way to tell whether
+  // it is octal 8 or decimal 8, and the only safe policy is to refuse
+  // the ambiguity at parse time.
+  test("refuses `127.0.0.1/08` at construction (leading-zero prefix length)", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["127.0.0.1/08"])),
+    ).toThrow(/leading zeros/i);
+  });
+
+  test("refuses `127.0.0.1/032` at construction (leading-zero prefix length)", () => {
+    expect(() =>
+      createTrustedProxyAuthProvider(peersConfig(["127.0.0.1/032"])),
+    ).toThrow(/leading zeros/i);
+  });
+
+  test("accepts `127.0.0.1/8` at construction (regression: single-digit prefix is fine)", () => {
+    const provider = createTrustedProxyAuthProvider(peersConfig(["10.0.0.0/8"]));
+    expect(provider.id).toBe("trusted-proxy");
+  });
+});
+
 describe("identityKey — AC 4 provider namespacing", () => {
   test("an identity with provider=none and subject=S does not match one with provider=trusted-proxy and subject=S", async () => {
     const trusted = createTrustedProxyAuthProvider(peersConfig(["127.0.0.1"]));

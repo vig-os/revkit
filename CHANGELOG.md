@@ -38,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     their IPv4 form on both the peer and the rule, so an IPv4 rule matches the mapped peer; a repeated subject or
     display-name header (which `Headers.get()` comma-joins) is refused with 401 `missing-subject`; display-name
     C0/C1 control characters are stripped and the value is capped at 256 code units.
+  - Hardening (round 3): shared `auth-internal.ts` holds the one `HEADER_NAME_RE` + `validateHeaderName` the two
+    in-core providers reuse, so `none`'s `displayNameHeader` is validated at construction too — a typo like
+    `"bad header"` is a startup error rather than a per-request `Headers.get` throw (which would have violated
+    `authenticate()`'s MUST-NOT-throw contract). `none` also reuses `sanitiseDisplayName` so C0 / DEL / C1
+    control chars are stripped from its runtime header and the value is capped at 256 code units, falling back
+    to the configured default if the sanitised result is empty. Zero-length CIDR prefixes (`0.0.0.0/0`, `::/0`,
+    and `::ffff:0:0/96` which reinterprets to `/0` in IPv4 space) are refused at construction — a trust-everyone
+    rule would defeat ADR-0026 §Identity's fail-closed gate even though the allowlist is nominally non-empty.
+    Leading-zero CIDR prefix lengths (`/08`, `/032`) are refused for the same reason the IPv4 octet rule refuses
+    `010`: octal ambiguity. The IPv6 parser is simplified to one validation path — the per-group hex regex plus
+    the 8-group count subsume the earlier dotted-quad-position and double-`::` guards.
   - `trusted-proxy` holds no state across `authenticate()` calls: ADR-0026's open-question entry on revocation of
     proxy-derived sessions is decided in favour of "re-derive per request". A later change that introduces a
     session for a proxy-derived identity must land session-binding and revocation tests at the same time; today's
