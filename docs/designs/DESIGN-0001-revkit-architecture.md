@@ -272,7 +272,9 @@ The path from there:
    - select text, type a replacement, and it is stored as a comment carrying a patch;
    - accept applies it to the source file;
    - in PR mode it becomes a GitHub ` ```suggestion ` block, so it's one click to commit on GitHub too.
-   This covers most "just fix this word" needs with zero merge machinery.
+   This covers most "just fix this word" needs with zero merge machinery. The decided shape — unit = one
+   suggestion / one commit's worth of edits, per-block editing surface, 3-way atomic apply under a cookie session,
+   agent parity (MCP `suggest` and git-commit import), and PR-mode mapping — is **ADR-0027**.
 2. **Co-editing** (A7, later):
    - a **CodeMirror 6** source pane next to the rendered view, scroll-synced via the `data-src` anchors and bound to
      a Yjs doc (`y-codemirror.next`);
