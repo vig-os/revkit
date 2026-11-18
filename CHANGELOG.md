@@ -59,6 +59,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`revkit serve`'s request handler is now composable across deployment targets**
+  ([#279](https://github.com/vig-os/revkit/issues/279))
+  - Three seams are injected on `startDaemon` and exported from `@revkit/cli/serve`:
+    - `GuardPolicy` (`guard-policy.ts`) owns the ADR-0013 Host/Origin/`Sec-Fetch-Site` discipline for the local
+      daemon and the ADR-0026 §"Plain Linux host / VM" discipline for the Linux-host target. `createLoopbackGuardPolicy`
+      is the default (byte-for-byte unchanged behaviour on `revkit serve`); `createPublicOriginGuardPolicy` is the
+      host target's binding (#245 composes it with the unix-socket listener).
+    - `RouteGroups` (`route-groups.ts`) selects which paths the handler registers. `LOCAL_DAEMON_ROUTE_GROUPS` keeps
+      every route; `HOST_TARGET_ROUTE_GROUPS` disables the agent-only surface (`/-/auth`, `/-/health`, `/-/launch-code`,
+      `/-/ask.*`, `/ask/*`, `/api/asks*`, `/api/publish`, `/api/review*`, `/api/delivery-mode`, `/api/handover`,
+      `/api/presence`, `/api/delivered`, `/api/pending`, `/events?for=agent`) per ADR-0026 §"Plain Linux host / VM" →
+      Authorization. `assertRouteGroupsCompatibleWithPolicy` throws at construction when agent-only groups are enabled
+      under a non-loopback policy — a misconfiguration that would have silently exposed the agent bearer flow is a
+      startup refusal instead.
+    - `IdentityResolver` (`identity-resolver.ts`) turns a request into an `Author` or a refusal.
+      `createLocalIdentityResolver` wraps today's `AuthState` (launch-code / session-cookie / agent-bearer flow,
+      ADR-0013) and reproduces `identifyActor`'s historical semantics; `createAuthProviderIdentityResolver` adapts the
+      ADR-0026 `AuthProvider` for the host target. `createStaticIdentityResolver` is the test seam the AC2 cases use.
+  - Local-provider wrap (not the `none` provider) for the local target, justified: today's local flow carries three
+    distinct credentials with three distinct lifecycles (launch code → mint session cookie; session cookie →
+    cookie-authenticated routes; agent bearer → agent routes + `POST /-/launch-code`). The ADR-0026 `AuthProvider`
+    interface returns one identity from headers alone and cannot carry a launch-code exchange that mints a cookie —
+    so `createLocalIdentityResolver` keeps the three-credential state behind `AuthState` and projects whichever actor
+    each credential already minted in the pre-split daemon.
+  - `createLoopbackGuardPolicy({port})` is applied on `revkit serve` unless the caller overrides it. The pre-existing
+    `isLoopbackHost` / `isLoopbackOrigin` helpers in `auth.ts` stay for the test suite; the dispatcher goes through
+    the policy from now on.
+- **Agent-only route groups return `404` on any non-loopback target**
+  ([#279](https://github.com/vig-os/revkit/issues/279))
+  - Enforced at the dispatcher's one-shot 404 guard, before the method-sensitive branches that would otherwise answer
+    `405 Method Not Allowed`. `test/serve/composable-handler.test.ts` pins this across every agent-only path the host
+    target must not expose, and the `/events?for=agent` branch is pinned separately (the query parameter can smuggle
+    past a path-only check).
+
 ### Deprecated
 
 ### Removed
