@@ -515,3 +515,20 @@ waking the agent mid-turn.
 - **A channel notification does not arrive after a comment** — the
   daemon may be down or the delivery mode is `quiet`. Call `threads`
   to pull, or `review_url` to hand the user a page they can check.
+- **A tool returns `revkit mcp: daemon is building (cold-start
+  auto-build, pid N, S s elapsed since …)`** — the local daemon is
+  running its first-time site build (`.revkit/dist` was missing).
+  **This call did no work.** Retry the same call in a few seconds;
+  subsequent calls return promptly, well inside the tool-call
+  deadline. `S` is elapsed since the daemon recorded `startedAt`,
+  so it climbs with real wall time (not a 10 s reset per call).
+  Do NOT try to `revkit serve` yourself — the lock is already
+  held, and a second `revkit serve` is refused.
+- **A tool returns `revkit mcp: daemon failed to start (<stage>
+  at <time>): <reason>`** — the last `revkit serve` auto-build or
+  `startDaemon` failed and the reason is persisted in
+  `.revkit/start-failed.json`. The MCP side will NOT respawn
+  blindly while the same inputs still apply. The human's fix is
+  to read the recorded `stderrTail`, correct the source, and
+  either run `revkit build` manually (which clears the record)
+  or delete `.revkit/start-failed.json` to retry.

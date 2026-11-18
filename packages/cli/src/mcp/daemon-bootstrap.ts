@@ -28,12 +28,16 @@
 // process. The daemon writes its own state file (mode 600) and the
 // bootstrap only ever reads it.
 
-import { resolve as resolvePath } from "node:path";
+import { existsSync } from "node:fs";
+import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  clearStartFailure,
   findRunningOrStartingDaemon,
   isReadyServeState,
+  readStartFailure,
   type ServeState,
+  type StartFailureRecord,
 } from "../serve/serve-state.ts";
 import { stripTrailingSlashes } from "./daemon-client.ts";
 
@@ -102,10 +106,28 @@ export interface BootstrapOptions {
    * did — but what a bootstrap wants is EVERY state, so a starting
    * daemon stops us spawning another one (#251). */
   readonly findRunningDaemon?: (repoRoot: string) => ServeState | undefined;
+  /** Test hook: swap out `readStartFailure`. Defaults to reading
+   * `.revkit/start-failed.json` (#251 N1). */
+  readonly readStartFailure?: (repoRoot: string) => StartFailureRecord | undefined;
+  /** Test hook: swap out `clearStartFailure`. Defaults to deleting
+   * `.revkit/start-failed.json` (#251 N1). */
+  readonly clearStartFailure?: (repoRoot: string) => void;
   /** Test hook: injected clock (ms epoch). */
   readonly nowMs?: () => number;
   /** Test hook: sleep (ms → Promise). */
   readonly sleep?: (ms: number) => Promise<void>;
+  /** #251 B2: what to do when a "starting" ServeState is seen.
+   *  - `"wait"` (default, legacy): block up to `startingReadyMs`
+   *    for the transition to `"ready"`. Suits the background
+   *    reconnect loop that will keep retrying with backoff.
+   *  - `"diagnose"`: throw `DaemonBuildingError` immediately with
+   *    elapsed computed from the record's `startedAt`. Suits the
+   *    per-tool-call `discover` in `mcp/cli.ts`, which MUST return
+   *    inside the tool-call deadline with a retriable message —
+   *    sitting on `startingReadyMs` races the tool deadline and
+   *    30 of 36 tool calls got the generic "reconnect did not
+   *    complete" error in a real 3-minute build (see #251 B2). */
+  readonly onStartingDaemon?: "wait" | "diagnose";
 }
 
 /** Result of bootstrap: the daemon's state file, plus a flag saying
@@ -113,6 +135,63 @@ export interface BootstrapOptions {
 export interface Bootstrapped {
   readonly state: ServeState;
   readonly spawned: boolean;
+}
+
+/** Thrown by `ensureDaemon` in `onStartingDaemon: "diagnose"` mode
+ * when a daemon-starting record is live (#251 B2). The message is
+ * the agent-facing diagnostic: it names the pid and the elapsed
+ * seconds computed from the record's `startedAt`, and tells the
+ * agent to retry. Elapsed is wall-clock since the record was
+ * published (NOT since the waiter started), so a tool call made
+ * ten minutes into a slow build reports `elapsed ~= 600 s`, not
+ * `elapsed ~= 10 s`. */
+export class DaemonBuildingError extends Error {
+  readonly pid: number;
+  readonly elapsedMs: number;
+  readonly startedAt: string;
+  constructor(args: { pid: number; elapsedMs: number; startedAt: string }) {
+    const elapsedS = Math.max(0, Math.round(args.elapsedMs / 1000));
+    super(
+      `revkit mcp: daemon is building (cold-start auto-build, pid ${args.pid}, ` +
+        `${elapsedS} s elapsed since ${args.startedAt}). ` +
+        `Retry this tool call in a few seconds.`,
+    );
+    this.name = "DaemonBuildingError";
+    this.pid = args.pid;
+    this.elapsedMs = args.elapsedMs;
+    this.startedAt = args.startedAt;
+  }
+}
+
+/** Thrown by `ensureDaemon` when `.revkit/start-failed.json` records
+ * a recent failure and `.revkit/dist` is in the same state (#251
+ * N1). Tells the caller WHY the last `revkit serve` could not
+ * start — instead of silently re-spawning it on every tool call. */
+export class DaemonStartFailedError extends Error {
+  readonly stage: StartFailureRecord["stage"];
+  readonly failedAt: string;
+  readonly stderrTail?: string;
+  constructor(record: StartFailureRecord) {
+    super(
+      `revkit mcp: daemon failed to start (${record.stage} at ${record.failedAt}): ${record.message}` +
+        (record.stderrTail !== undefined && record.stderrTail.length > 0
+          ? `\n--- last stderr ---\n${record.stderrTail}`
+          : ""),
+    );
+    this.name = "DaemonStartFailedError";
+    this.stage = record.stage;
+    this.failedAt = record.failedAt;
+    if (record.stderrTail !== undefined) this.stderrTail = record.stderrTail;
+  }
+}
+
+/** Build the elapsed-ms value for a "starting" record. ISO-8601
+ * with offset parses in every supported runtime; on an unparsable
+ * value we fall back to 0 so the error still carries the pid. */
+function elapsedSinceStartedAt(startedAt: string, nowMs: number): number {
+  const started = Date.parse(startedAt);
+  if (Number.isNaN(started)) return 0;
+  return Math.max(0, nowMs - started);
 }
 
 /** Ensure a daemon is running for `repoRoot` and return its READY
@@ -145,12 +224,26 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   const clock = options.nowMs ?? Date.now;
   const sleep = options.sleep ?? defaultSleep;
   const discover = options.findRunningDaemon ?? findRunningOrStartingDaemon;
+  const readFailure = options.readStartFailure ?? readStartFailure;
+  const clearFailure = options.clearStartFailure ?? clearStartFailure;
+  const onStarting = options.onStartingDaemon ?? "wait";
 
   // Case 1: a daemon already owns the lock (ready OR starting).
   const existing = discover(repoRoot);
   if (existing !== undefined) {
     if (isReadyServeState(existing)) {
       return { state: existing, spawned: false };
+    }
+    // Starting state. #251 B2: honour `onStartingDaemon`. Elapsed
+    // is computed from the record's `startedAt`, not from the
+    // caller's clock-at-entry, so a tool call made ten minutes
+    // into a build reports ~600 s elapsed — not ~0 s.
+    if (onStarting === "diagnose") {
+      throw new DaemonBuildingError({
+        pid: existing.pid,
+        elapsedMs: elapsedSinceStartedAt(existing.startedAt, clock()),
+        startedAt: existing.startedAt,
+      });
     }
     // A starting daemon is here — wait for it (no spawn).
     const ready = await waitForReady({
@@ -164,6 +257,25 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
       startingPid: existing.pid,
     });
     return { state: ready, spawned: false };
+  }
+
+  // #251 N1: before spawning, check for a persisted start failure.
+  // `revkit serve`'s spawn ignores stdio, so a build or startDaemon
+  // failure is otherwise invisible — every MCP tool call would
+  // keep blindly respawning it. The record is honoured only while
+  // the recorded inputs match the current state (dist still
+  // missing / present as it was at failure time); when the user
+  // runs `revkit build` manually, dist exists and the record is
+  // treated as stale (cleared, then spawn proceeds).
+  const failure = readFailure(repoRoot);
+  if (failure !== undefined) {
+    const distExistsNow = existsSync(defaultDistPath(repoRoot, options.dir));
+    if (distExistsNow === failure.inputs.distExists) {
+      throw new DaemonStartFailedError(failure);
+    }
+    // Inputs changed — the user likely ran `revkit build`. Clear
+    // the record and proceed to spawn a fresh daemon.
+    clearFailure(repoRoot);
   }
 
   // Case 2: no live daemon. Spawn one.
@@ -196,14 +308,31 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   while (clock() < spawnDeadline) {
     await sleep(pollIntervalMs);
     const state = discover(repoRoot);
-    if (state === undefined) continue;
+    if (state === undefined) {
+      // #251 N1: a start-failed record written while we were
+      // polling means our spawn died cleanly (serve wrote its
+      // reason to disk and released the lock). Surface it now
+      // instead of waiting out the full spawnDeadline.
+      const latestFailure = readFailure(repoRoot);
+      if (latestFailure !== undefined) {
+        throw new DaemonStartFailedError(latestFailure);
+      }
+      continue;
+    }
     if (isReadyServeState(state)) {
       return { state, spawned: true };
     }
-    // Starting record visible — wait for readiness. The
-    // `startingReadyMs` deadline resets here so a cold build gets
-    // its full readiness window (it already consumed part of
-    // `waitMs` in the spawn window).
+    // Starting record visible. #251 B2: honour `onStartingDaemon`.
+    if (onStarting === "diagnose") {
+      throw new DaemonBuildingError({
+        pid: state.pid,
+        elapsedMs: elapsedSinceStartedAt(state.startedAt, clock()),
+        startedAt: state.startedAt,
+      });
+    }
+    // Wait for readiness. The `startingReadyMs` deadline resets
+    // here so a cold build gets its full readiness window (it
+    // already consumed part of `waitMs` in the spawn window).
     const ready = await waitForReady({
       discover,
       repoRoot,
@@ -219,6 +348,14 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   throw new Error(
     `spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
   );
+}
+
+/** Resolve the dist path that `revkit serve` would default to.
+ * Used by `ensureDaemon` to check whether `revkit build` created
+ * dist after a recorded start failure. */
+function defaultDistPath(repoRoot: string, dir: string | undefined): string {
+  if (dir !== undefined) return resolvePath(repoRoot, dir);
+  return join(repoRoot, ".revkit", "dist");
 }
 
 /** Wait for a daemon in `status: "starting"` to reach `"ready"`.

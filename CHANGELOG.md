@@ -130,6 +130,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     uses a new `findRunningOrStartingDaemon` that also returns a
     "starting" daemon. `acquireAndPublish` is unchanged for programmatic
     callers.
+  - **SIGKILL / SIGTERM safety for the cold-start build.** Before the
+    build runs, `revkit serve` opens the daemon-lock fd with
+    `inheritable: true` (no `O_CLOEXEC`) and passes it to the astro
+    child via `Bun.spawn`'s `stdio` array. If the parent is SIGKILLed
+    mid-build the child still owns the fd and the kernel-held flock
+    stays alive, so a second `revkit serve` is refused immediately —
+    the two-concurrent-build race is impossible even without a
+    graceful shutdown. SIGTERM / SIGINT wire a pre-bind signal
+    handler that aborts the build (AbortSignal threaded into
+    `spawnAstroBuild`) and does the ownership-checked serve.json
+    cleanup through `acquired.release()`.
+  - **Building diagnostic is prompt and accurate.** The per-tool-call
+    `discover` now calls `ensureDaemon` with
+    `onStartingDaemon: "diagnose"`: a live "starting" record throws
+    `DaemonBuildingError` immediately with elapsed computed from the
+    record's `startedAt` (not the waiter's start). The channel
+    server's tool-call catch passes the message through unwrapped,
+    so the agent reads "daemon is building (cold-start auto-build,
+    pid X, N s elapsed since YYYY-…)" well inside the tool-call
+    deadline — ending the 10 s race that gave 30 of 36 calls the
+    generic "reconnect did not complete" error in a 3-minute build.
+  - **Build failure reaches the MCP caller.** `revkit serve`
+    persists a `.revkit/start-failed.json` record (stage, message,
+    stderr tail, inputs) whenever its auto-build or `startDaemon`
+    fails, and clears it on a successful bind. `ensureDaemon` reads
+    the record before spawning: a matching failure surfaces as
+    `DaemonStartFailedError` instead of silently respawning a
+    daemon that will fail the same way. Running `revkit build`
+    manually changes the recorded inputs (dist now exists) and
+    lifts the suppression.
+  - **`revkit open` during a cold-start.** Now reports
+    `a daemon is starting (cold-start auto-build, pid X, N s
+    elapsed since …)` instead of the misleading "no daemon is
+    running. Start one with `revkit serve` first" — which would
+    only be refused by the still-held `.revkit/daemon.lock`.
 - **A page whose body fails to render fails the build**
   ([#237](https://github.com/vig-os/revkit/issues/237))
   - Astro's glob loader wraps every per-entry markdown render in a try/catch

@@ -28,7 +28,7 @@ import {
   filteredDaemonEnv,
   verifyDaemonInstance,
 } from "../../src/mcp/daemon-bootstrap.ts";
-import type { ServeState } from "../../src/serve/serve-state.ts";
+import type { ServeState, StartFailureRecord } from "../../src/serve/serve-state.ts";
 
 /** One state fixture — the shape `findRunningDaemon` returns to the
  * bootstrap. `instanceId` is optional on the wire; every fixture
@@ -539,6 +539,168 @@ describe("ensureDaemon — #251 starting-state lifecycle", () => {
     expect(resultA.state.status === "starting").toBe(false);
     expect(resultB.state.status === "starting").toBe(false);
   }, 10_000);
+});
+
+describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted start failure)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "revkit-boot-b2-"));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A "starting" record whose `startedAt` is `elapsedS` seconds
+   * before `now`, so the diagnostic reports a specific elapsed. */
+  function startingAt(now: number, elapsedS: number, overrides: Partial<ServeState> = {}): ServeState {
+    return {
+      pid: 4242,
+      port: 0,
+      url: "",
+      agentToken: "",
+      startedAt: new Date(now - elapsedS * 1000).toISOString(),
+      version: "0.0.0-test",
+      instanceId: "starting-b2",
+      status: "starting",
+      ...overrides,
+    };
+  }
+
+  test("#251 B2: onStartingDaemon='diagnose' throws DaemonBuildingError IMMEDIATELY (no wait)", async () => {
+    // Fake clock lets us assert zero sleep calls — the point of
+    // the diagnose mode is that the tool-call deadline never
+    // races the startingReadyMs wait.
+    let now = 1_700_000_000_000;
+    const clock = (): number => now;
+    let sleepCalls = 0;
+    const sleep = async (ms: number): Promise<void> => {
+      sleepCalls++;
+      now += ms;
+    };
+    const starting = startingAt(now, 73, { pid: 31337 });
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => starting,
+        spawn: () => ({ pid: -1 }),
+        sleep,
+        nowMs: clock,
+        onStartingDaemon: "diagnose",
+        startingReadyMs: 60_000, // would race the tool deadline in "wait" mode
+        waitMs: 60_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.name).toBe("DaemonBuildingError");
+    expect(threw?.message).toContain("31337");
+    // Elapsed MUST be computed from startedAt, not from the
+    // waiter's start (which would be 0 s). 73 s is the fixture.
+    expect(threw?.message).toContain("73 s elapsed");
+    // No sleeps — we did not race the deadline.
+    expect(sleepCalls).toBe(0);
+  });
+
+  test("#251 B2: onStartingDaemon='wait' (default) keeps the pre-#251-B2 behaviour", async () => {
+    // Baseline check: in "wait" mode we still block on readiness
+    // so the background reconnect loop converges once the daemon
+    // is ready. Tool calls use "diagnose" instead.
+    let now = 0;
+    let findCalls = 0;
+    const starting = startingAt(now, 5, { instanceId: "starting-wait" });
+    const ready = fixtureState({ instanceId: "ready-wait" });
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => (findCalls++ < 2 ? starting : ready),
+      spawn: () => ({ pid: -1 }),
+      sleep: async (ms) => {
+        now += ms;
+      },
+      nowMs: () => now,
+      startingReadyMs: 10_000,
+      waitMs: 10_000,
+      // onStartingDaemon default = "wait"
+    });
+    expect(result.state.instanceId).toBe("ready-wait");
+  });
+
+  test("#251 N1: a persisted start failure surfaces DaemonStartFailedError without re-spawning", async () => {
+    // A failure record whose inputs match the current state
+    // (dist still missing). The bootstrap must NOT try to spawn
+    // a daemon — every retry would fail the same way.
+    let spawnCount = 0;
+    const failure: StartFailureRecord = {
+      stage: "build-failed",
+      message: "revkit serve: auto-build failed",
+      stderrTail: "SyntaxError in docs/foo.mdx line 42",
+      failedAt: new Date().toISOString(),
+      version: "0.0.0-test",
+      inputs: { distExists: false }, // dist didn't exist at failure time; still doesn't
+    };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => undefined, // no live daemon
+        readStartFailure: () => failure,
+        clearStartFailure: () => {},
+        spawn: () => {
+          spawnCount++;
+          return { pid: 999 };
+        },
+        sleep: async () => {},
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.name).toBe("DaemonStartFailedError");
+    expect(threw?.message).toContain("auto-build failed");
+    expect(threw?.message).toContain("SyntaxError");
+    expect(spawnCount).toBe(0);
+  });
+
+  test("#251 N1: a stale failure (inputs changed — dist now exists) is cleared and bootstrap proceeds", async () => {
+    // The user ran `revkit build` after the failure, so dist
+    // exists now. The record is stale; bootstrap must clear it
+    // and proceed to spawn.
+    mkdirSync(join(root, ".revkit", "dist"), { recursive: true });
+    const failure: StartFailureRecord = {
+      stage: "build-failed",
+      message: "revkit serve: auto-build failed",
+      failedAt: new Date().toISOString(),
+      version: "0.0.0-test",
+      inputs: { distExists: false }, // was missing then
+    };
+    let clearCalled = 0;
+    let spawnCount = 0;
+    const ready = fixtureState({ instanceId: "ready-n1-stale" });
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: (() => {
+        let n = 0;
+        return () => (n++ === 0 ? undefined : ready);
+      })(),
+      readStartFailure: () => failure,
+      clearStartFailure: () => {
+        clearCalled++;
+      },
+      spawn: () => {
+        spawnCount++;
+        return { pid: 777 };
+      },
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      waitMs: 100,
+    });
+    expect(clearCalled).toBe(1);
+    expect(spawnCount).toBe(1);
+    expect(result.spawned).toBe(true);
+    expect(result.state.instanceId).toBe("ready-n1-stale");
+  });
 });
 
 describe("verifyDaemonInstance", () => {

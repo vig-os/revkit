@@ -79,8 +79,17 @@ export async function runMcpCommand(args: readonly string[], env: RunMcpEnv): Pr
     let attempts = 0;
     while (true) {
       attempts++;
+      // #251 B2: `onStartingDaemon: "diagnose"` makes ensureDaemon
+      // throw `DaemonBuildingError` immediately when the daemon is
+      // in the pre-bind window, with elapsed computed from the
+      // record's `startedAt`. The channel-server tool-call catch
+      // surfaces that message to the agent inside the tool-call
+      // deadline instead of racing against it (30 of 36 tool
+      // calls hit the generic "reconnect did not complete" error
+      // in a real 3-minute build pre-fix — see #251).
       const boot = await ensureDaemon({
         repoRoot,
+        onStartingDaemon: "diagnose",
         ...(parsed.dir !== undefined ? { dir: parsed.dir } : {}),
       });
       const next = boot.state;

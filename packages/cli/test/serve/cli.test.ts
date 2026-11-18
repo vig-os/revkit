@@ -4,10 +4,11 @@
 // file keeps the pure functions honest.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseServeArgs, readOrMintLocalUserId } from "../../src/serve/cli.ts";
+import { parseServeArgs, readOrMintLocalUserId, runServeCommand } from "../../src/serve/cli.ts";
+import { readStartFailure } from "../../src/serve/serve-state.ts";
 
 describe("parseServeArgs", () => {
   test("accepts an empty argv (auto-build enabled by default)", () => {
@@ -96,4 +97,111 @@ describe("readOrMintLocalUserId", () => {
     const second = readOrMintLocalUserId(root);
     expect(second).toBe(first);
   });
+});
+
+describe("runServeCommand — #251 B1 (signal cleanup, SIGKILL safety) & N1 (persisted failure)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "revkit-serve-b1-"));
+    // Minimal workspace: `revkit` marker in package.json so
+    // findRepoRootByPackageJson resolves to `root`.
+    writeFileSync(join(root, "package.json"), '{"name":"revkit","private":true}', "utf8");
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("SIGTERM during auto-build aborts the build, releases the lock, and clears serve.json (#251 B1)", async () => {
+    // A slow fake build that awaits the AbortSignal. We dispatch
+    // SIGTERM via `process.emit("SIGTERM")` (triggers listeners
+    // without actually killing the test runner).
+    let buildSawSignal: AbortSignal | undefined;
+    let resolveBuildStarted!: () => void;
+    const buildStarted = new Promise<void>((r) => {
+      resolveBuildStarted = r;
+    });
+    const runPromise = runServeCommand([], {
+      cwd: root,
+      version: "test-0.1.0",
+      runBuildOverride: async (_args, opts) => {
+        buildSawSignal = opts.signal;
+        resolveBuildStarted();
+        await new Promise<void>((resolveAbort) => {
+          opts.signal?.addEventListener("abort", () => resolveAbort(), { once: true });
+        });
+        // Return a non-zero exit so runServeCommand treats it
+        // as a failure after abort (equivalent to astro exiting
+        // on kill).
+        return { exitCode: 143, stdout: "", stderr: "aborted" };
+      },
+    });
+    await buildStarted;
+    // Lock + "starting" serve.json record should both exist.
+    expect(existsSync(join(root, ".revkit", "daemon.lock"))).toBe(true);
+    expect(existsSync(join(root, ".revkit", "serve.json"))).toBe(true);
+    const beforeState = JSON.parse(readFileSync(join(root, ".revkit", "serve.json"), "utf8")) as { status: string };
+    expect(beforeState.status).toBe("starting");
+    // Fire SIGTERM.
+    process.emit("SIGTERM");
+    // The build sees the signal.
+    expect(buildSawSignal?.aborted).toBe(true);
+    // runServeCommand returns with a non-zero exit code.
+    const result = await runPromise;
+    expect(result.exitCode).not.toBe(0);
+    // serve.json was cleaned up (ownership-checked unlink via
+    // `acquired.release()`).
+    expect(existsSync(join(root, ".revkit", "serve.json"))).toBe(false);
+    // start-failed.json is persisted so a subsequent MCP tool
+    // call reads the reason (#251 N1).
+    const failure = readStartFailure(root);
+    expect(failure).toBeDefined();
+    expect(failure?.stage).toBe("aborted");
+    expect(failure?.message).toContain("SIGTERM");
+  }, 20_000);
+
+  test("passes inheritFds=[lockFd] to the auto-build so the astro child inherits the lock (#251 B1 SIGKILL safety)", async () => {
+    let receivedFds: readonly number[] | undefined;
+    const result = await runServeCommand([], {
+      cwd: root,
+      version: "test-0.1.0",
+      runBuildOverride: async (_args, opts) => {
+        receivedFds = opts.inheritFds;
+        // Fake a successful build. Create the default dist so the
+        // "dist exists" postcondition is met.
+        mkdirSync(join(root, ".revkit", "dist"), { recursive: true });
+        writeFileSync(join(root, ".revkit", "dist", "index.html"), "<h1>x</h1>");
+        return { exitCode: 0, stdout: "built", stderr: "" };
+      },
+      // A fake startDaemon that fails fast — we only care about
+      // whether inheritFds reached runBuildCommand.
+      startDaemonOverride: async () => {
+        throw new Error("test: startDaemon not exercised");
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(receivedFds).toBeDefined();
+    expect(receivedFds!.length).toBe(1);
+    expect(receivedFds![0]).toBeGreaterThan(2); // the lock fd, above stdin/stdout/stderr
+  }, 10_000);
+
+  test("non-zero build exit code persists a start-failure record (#251 N1)", async () => {
+    const result = await runServeCommand([], {
+      cwd: root,
+      version: "test-0.1.0",
+      runBuildOverride: async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "revkit build: astro build exited 1. Tail: a page body is empty",
+      }),
+    });
+    expect(result.exitCode).not.toBe(0);
+    const failure = readStartFailure(root);
+    expect(failure).toBeDefined();
+    expect(failure?.stage).toBe("build-failed");
+    expect(failure?.stderrTail ?? "").toContain("a page body is empty");
+    expect(failure?.inputs.distExists).toBe(false);
+    // Lock + serve.json cleaned up.
+    expect(existsSync(join(root, ".revkit", "serve.json"))).toBe(false);
+  }, 10_000);
 });

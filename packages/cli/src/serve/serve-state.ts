@@ -368,10 +368,17 @@ export interface AcquiredStartingInit {
  * instead of spawning another daemon. `publishReady(state)` must be
  * called once the HTTP server has bound, before the daemon begins
  * answering requests. `release()` is idempotent and does the
- * ownership-checked unlink of `serve.json` plus drops the OS lock. */
+ * ownership-checked unlink of `serve.json` plus drops the OS lock.
+ *
+ * `lockFd` is the OS file descriptor of the flock. The caller passes
+ * it to `Bun.spawn` (via `stdio: [..., ..., ..., lockFd]` or by
+ * leaving it inheritable and letting POSIX inherit it) so a child
+ * process keeps the flock alive if the parent is SIGKILLed mid-build
+ * (#251 B1). */
 export interface AcquiredStartingDaemon {
   readonly kind: "ok";
   readonly repoId: string;
+  readonly lockFd: number;
   publishReady(state: ServeState): void;
   release(): void;
 }
@@ -393,7 +400,14 @@ export function acquireStartingLock(
 ): AcquiredStartingDaemon | RefusedDaemon {
   ensureRevkitDir(repoRoot);
   const lockPath = daemonLockPath(repoRoot);
-  const lock = acquireDaemonLock(lockPath);
+  // #251 B1: open the lock fd WITHOUT O_CLOEXEC so it is inherited
+  // by the astro child the cold-start auto-build spawns. On a SIGKILL
+  // of the parent `revkit serve` the child keeps the fd open and the
+  // flock stays held — a second `revkit serve` is refused immediately
+  // and cannot race into the same `.revkit/dist`. The child does not
+  // need to know about the fd; the kernel tracks the flock on the
+  // inode as long as any process has it open.
+  const lock = acquireDaemonLock(lockPath, { inheritable: true });
   if (lock === null) {
     // Deliberately does NOT read `.revkit/repo-id` (issue #63
     // review nit). See `acquireAndPublish` for the rationale.
@@ -425,6 +439,7 @@ export function acquireStartingLock(
   return {
     kind: "ok",
     repoId,
+    lockFd: lock.fd,
     publishReady(state: ServeState): void {
       if (released) {
         throw new Error("acquireStartingLock: publishReady called after release");
@@ -577,4 +592,109 @@ export function findRunningOrStartingDaemon(repoRoot: string): ServeState | unde
   // Lock is held by someone. Return the advertisement (ready OR
   // starting; the caller decides).
   return readServeState(repoRoot);
+}
+
+// ── #251 N1: persisted last-start failure ────────────────────────
+//
+// `revkit mcp` spawns `revkit serve` detached with ignored stdio,
+// so a build-time failure in the spawned serve never reaches the
+// MCP caller. Each MCP tool call would then re-spawn serve, which
+// would fail the same way, which the caller would see as an
+// unexplained "died while starting" on every retry.
+//
+// Fix (#251 N1): `revkit serve` writes a small failure record to
+// `.revkit/start-failed.json` when its auto-build or startDaemon
+// fails, and clears it on a successful start. `ensureDaemon` reads
+// the record BEFORE spawning: if one exists whose inputs match the
+// current state (`.revkit/dist` still missing), it surfaces the
+// recorded error instead of re-spawning. A manual `revkit build` or
+// a successful `revkit serve` clears the record.
+
+/** Shape written to `.revkit/start-failed.json` (#251 N1). */
+export interface StartFailureRecord {
+  /** One-line summary of what failed (`build-failed`, `start-failed`). */
+  readonly stage: "build-failed" | "start-failed" | "aborted";
+  /** The error message (user-facing). */
+  readonly message: string;
+  /** Last ~4 KiB of the spawned child's stderr, when available. */
+  readonly stderrTail?: string;
+  /** ISO-8601 timestamp of the failure. */
+  readonly failedAt: string;
+  /** The daemon version that recorded this failure. */
+  readonly version: string;
+  /** Snapshot of the inputs that failed. A caller can compare with
+   * the current state to decide whether a respawn is warranted. */
+  readonly inputs: {
+    /** Did `.revkit/dist` exist at the time of failure? When false,
+     * the respawn-suppression stays in force as long as dist is
+     * still missing; `revkit build` creating dist changes the
+     * inputs and lifts suppression. */
+    readonly distExists: boolean;
+  };
+}
+
+/** Absolute path to `.revkit/start-failed.json` under `repoRoot`. */
+export function startFailurePath(repoRoot: string): string {
+  return join(repoRoot, SERVE_STATE_DIR, "start-failed.json");
+}
+
+/** Write `.revkit/start-failed.json` atomically at mode 0600.
+ * Callers: `revkit serve` on a non-zero-exit auto-build or a
+ * failed `startDaemon`. Never carries secrets (the daemon has not
+ * minted its agent token yet at this point). */
+export function writeStartFailure(repoRoot: string, record: StartFailureRecord): void {
+  ensureRevkitDir(repoRoot);
+  writeSecretAtomic(startFailurePath(repoRoot), JSON.stringify(record, null, 2) + "\n");
+}
+
+/** Read `.revkit/start-failed.json`. Returns `undefined` when the
+ * file is absent, unreadable, unparsable, or carries a shape this
+ * module does not recognise. Fail-closed — a malformed record never
+ * blocks a spawn. */
+export function readStartFailure(repoRoot: string): StartFailureRecord | undefined {
+  const path = startFailurePath(repoRoot);
+  if (!existsSync(path)) return undefined;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  const stage = record.stage;
+  if (stage !== "build-failed" && stage !== "start-failed" && stage !== "aborted") {
+    return undefined;
+  }
+  if (typeof record.message !== "string") return undefined;
+  if (typeof record.failedAt !== "string") return undefined;
+  if (typeof record.version !== "string") return undefined;
+  const inputs = record.inputs as Record<string, unknown> | undefined;
+  if (inputs === undefined || typeof inputs.distExists !== "boolean") return undefined;
+  return {
+    stage,
+    message: record.message,
+    ...(typeof record.stderrTail === "string" ? { stderrTail: record.stderrTail } : {}),
+    failedAt: record.failedAt,
+    version: record.version,
+    inputs: { distExists: inputs.distExists },
+  };
+}
+
+/** Delete `.revkit/start-failed.json`. Callers: `revkit serve` after
+ * a successful bind, and `ensureDaemon` when it decides the inputs
+ * have changed (the user ran `revkit build`, so dist exists now).
+ * Silent on `ENOENT`. */
+export function clearStartFailure(repoRoot: string): void {
+  try {
+    unlinkSync(startFailurePath(repoRoot));
+  } catch {
+    // Fine if already gone.
+  }
 }

@@ -73,11 +73,26 @@ export interface SpawnResult {
   readonly exitCode: number;
 }
 
-/** Injectable spawner shape. Tests provide a stub. */
+/** Injectable spawner shape. Tests provide a stub.
+ *
+ * `signal` (#251 B1) is an optional AbortSignal that must kill the
+ * spawned child when aborted. `spawnAstroBuild` passes it through
+ * so `revkit serve` can abort an in-flight auto-build on SIGINT /
+ * SIGTERM without orphaning the astro child. Implementations
+ * should either pass it directly to `Bun.spawn` (which honours
+ * `signal`) or call `child.kill()` from an `abort` listener.
+ *
+ * `inheritFds` (#251 B1) lists extra file descriptors the child
+ * MUST inherit, so the parent's `.revkit/daemon.lock` fd stays
+ * open in the child and the flock survives a parent SIGKILL. The
+ * child does not need to use these fds — the kernel keeps the
+ * flock alive while any process maps the fd to the inode. */
 export type SpawnLike = (options: {
   readonly cmd: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
+  readonly signal?: AbortSignal;
+  readonly inheritFds?: readonly number[];
 }) => Promise<SpawnResult>;
 
 /** The env-var allowlist. Anything not on this list is REMOVED from
@@ -198,6 +213,18 @@ export interface SpawnAstroBuildOptions {
   readonly extraEnv?: Readonly<Record<string, string>>;
   /** Injectable spawner. Defaults to `Bun.spawn`. */
   readonly spawn?: SpawnLike;
+  /** AbortSignal that kills the astro child when aborted (#251 B1).
+   * `revkit serve` installs SIGINT / SIGTERM handlers around its
+   * cold-start auto-build and aborts this signal on any signal so
+   * the child dies with the parent instead of continuing orphaned. */
+  readonly signal?: AbortSignal;
+  /** Extra file descriptors to inherit through to the astro child
+   * (#251 B1). `revkit serve` passes its `.revkit/daemon.lock` fd
+   * here so the flock stays held even if the parent is SIGKILLed
+   * mid-build: an orphaned child still owns the lock, a second
+   * `revkit serve` is refused, and the child's eventual exit
+   * releases the lock cleanly. */
+  readonly inheritFds?: readonly number[];
 }
 
 /** Low-level: spawn astro build with the trusted-binary + minimal-env
@@ -246,8 +273,21 @@ export async function spawnAstroBuild(options: SpawnAstroBuildOptions): Promise<
     ];
 
     const spawn = options.spawn ?? defaultSpawn;
-    const result = await spawn({ cmd, cwd, env });
+    const result = await spawn({
+      cmd,
+      cwd,
+      env,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      ...(options.inheritFds !== undefined ? { inheritFds: options.inheritFds } : {}),
+    });
     if (result.exitCode !== 0) {
+      // Abort → exit 143 (SIGTERM) or similar; the caller
+      // (serve/cli.ts) already knows why, so re-raise a tagged
+      // error rather than confusing the operator with a tail of
+      // vite's "killed" noise.
+      if (options.signal?.aborted === true) {
+        throw new Error("astro build aborted by signal");
+      }
       const tail = result.stderr.slice(-4096);
       throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
     }
@@ -400,12 +440,26 @@ export function unlinkStale(target: string): void {
   }
 }
 
-const defaultSpawn: SpawnLike = async ({ cmd, cwd, env }) => {
+const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal, inheritFds }) => {
+  // Build the `stdio` tuple. Fds 0..2 are always pipes (we capture
+  // stdout/stderr); any extra fds the caller named in `inheritFds`
+  // are listed AFTER so Bun inherits them through to the child
+  // (POSIX fd inheritance). Bun.spawn's `stdio` option accepts an
+  // array of mixed items: strings for standard pipe modes and
+  // numbers for fds to inherit.
+  //
+  // #251 B1: `revkit serve` passes its `.revkit/daemon.lock` fd
+  // here so the astro child keeps the flock alive on a SIGKILL of
+  // the parent.
+  const stdio: Array<"ignore" | "pipe" | number> = ["ignore", "pipe", "pipe"];
+  if (inheritFds !== undefined) {
+    for (const fd of inheritFds) stdio.push(fd);
+  }
   const proc = Bun.spawn(cmd as string[], {
     cwd,
     env: env as Record<string, string>,
-    stdout: "pipe",
-    stderr: "pipe",
+    stdio: stdio as never,
+    ...(signal !== undefined ? { signal } : {}),
   });
   const [stdout, stderr] = await Promise.all([
     new Response(proc.stdout).text(),

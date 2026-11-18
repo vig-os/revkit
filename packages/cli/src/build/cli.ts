@@ -26,6 +26,15 @@ export interface RunBuildEnv {
   readonly cwd: string;
   readonly version: string;
   readonly repoSlug: string;
+  /** AbortSignal threaded into `runPackagedBuild` so the astro
+   * child is killed on cancellation (#251 B1). `revkit serve`
+   * aborts this on SIGINT / SIGTERM; `revkit build` on its own
+   * leaves it unset. */
+  readonly signal?: AbortSignal;
+  /** Extra file descriptors the astro child must inherit (#251 B1).
+   * `revkit serve` passes its `.revkit/daemon.lock` fd here so the
+   * flock survives a parent SIGKILL. */
+  readonly inheritFds?: readonly number[];
 }
 
 /** Parse args: `--dir <consumer-root>`, `--out <dist-dir>`,
@@ -181,6 +190,8 @@ export async function runBuildCommand(
         consumerRoot,
         distOutDir,
         renderGuardManifestPath: renderGuardManifest,
+        ...(env.signal !== undefined ? { signal: env.signal } : {}),
+        ...(env.inheritFds !== undefined ? { inheritFds: env.inheritFds } : {}),
       });
     } catch (error) {
       return {

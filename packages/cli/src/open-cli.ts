@@ -14,7 +14,11 @@
 import { spawn } from "node:child_process";
 import { resolve as resolvePath } from "node:path";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
-import { findRunningDaemon } from "./serve/serve-state.ts";
+import {
+  findRunningDaemon,
+  findRunningOrStartingDaemon,
+  isReadyServeState,
+} from "./serve/serve-state.ts";
 import { DaemonClient } from "./mcp/daemon-client.ts";
 
 /** Same shape the other `revkit *` subcommand runners return. */
@@ -75,8 +79,29 @@ export async function runOpenCommand(args: readonly string[], env: RunOpenEnv): 
   } catch (error) {
     return { exitCode: 2, stdout: "", stderr: `${(error as Error).message}\n` };
   }
-  const state = findRunningDaemon(resolvePath(repoRoot));
+  const resolvedRoot = resolvePath(repoRoot);
+  const state = findRunningDaemon(resolvedRoot);
   if (state === undefined) {
+    // #251 N4: a daemon in the pre-bind window (cold-start
+    // auto-build) holds .revkit/daemon.lock with
+    // `status: "starting"`, so `findRunningDaemon` (ready-only)
+    // returns undefined. Report "building" instead of the
+    // misleading "no daemon is running" — running `revkit serve`
+    // would be refused by that lock.
+    const starting = findRunningOrStartingDaemon(resolvedRoot);
+    if (starting !== undefined && !isReadyServeState(starting)) {
+      const parsed = Date.parse(starting.startedAt);
+      const elapsedS = Number.isFinite(parsed)
+        ? Math.max(0, Math.round((Date.now() - parsed) / 1000))
+        : 0;
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr:
+          `revkit open: a daemon is starting (cold-start auto-build, pid ${starting.pid}, ${elapsedS} s elapsed since ${starting.startedAt}). ` +
+          `Try again once the build finishes.\n`,
+      };
+    }
     return {
       exitCode: 1,
       stdout: "",

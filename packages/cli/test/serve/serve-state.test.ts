@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   acquireAndPublish,
   daemonLockPath,
@@ -211,6 +211,143 @@ describe("daemon-lock (raw acquire / release)", () => {
     const second = acquireDaemonLock(path);
     expect(second).not.toBeNull();
     second?.release();
+  });
+
+  test("#251 B1: inheritable:true opens the lock fd WITHOUT FD_CLOEXEC so it survives exec", () => {
+    // SIGKILL safety relies on the astro child inheriting the
+    // lock fd: the kernel keeps the flock alive while any process
+    // maps the fd to the inode. That only happens when
+    // FD_CLOEXEC is off on the fd — otherwise exec clears it.
+    //
+    // We can't drive an exec from a unit test, but we can assert
+    // the invariant that makes exec-time inheritance possible:
+    // FD_CLOEXEC on the inheritable lock fd is 0.
+    const path = daemonLockPath(repoRoot);
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+
+    const held = acquireDaemonLock(path, { inheritable: true });
+    expect(held).not.toBeNull();
+    try {
+      const { dlopen, FFIType } = require("bun:ffi") as typeof import("bun:ffi");
+      const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+        fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+      });
+      const F_GETFD = 1;
+      const FD_CLOEXEC = 1;
+      const flags = Number(lib.symbols.fcntl(held!.fd, F_GETFD, 0));
+      // Inheritable: FD_CLOEXEC bit MUST be off.
+      expect(flags & FD_CLOEXEC).toBe(0);
+    } finally {
+      held?.release();
+    }
+  });
+
+  test("#251 B1 SIGKILL: an inherited lock fd survives parent death; a second acquire is refused until the child exits", async () => {
+    // End-to-end proof that fd inheritance is what keeps the
+    // flock alive on a parent SIGKILL. We simulate `revkit serve`
+    // being killed mid-build by:
+    //
+    // 1. Spawning a Bun parent that acquires the lock
+    //    (inheritable: true), then execs a child `sleep` with
+    //    the fd inherited, and WAITS for the child.
+    // 2. Killing the PARENT with SIGKILL while the child sleeps.
+    // 3. From this test process: try `acquireDaemonLock` on the
+    //    same path. It MUST be refused because the orphaned
+    //    child still has the fd open and the kernel still holds
+    //    the flock on that inode.
+    // 4. Kill the child; verify the lock is then free.
+    const path = daemonLockPath(repoRoot);
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+    // Parent that holds the inheritable lock + spawns a sleep
+    // child that inherits the fd via `stdio` (Bun.spawn requires
+    // the fd listed in `stdio` for inheritance — a non-CLOEXEC
+    // fd is NOT silently inherited the way a plain posix_spawn
+    // would have). The parent then blocks on the child; a
+    // SIGKILL cuts the parent but leaves the orphaned sleep
+    // (adopted by init / the test runner) with the fd.
+    const parentScript = `
+      const { acquireDaemonLock } = await import("${resolve(import.meta.dirname, "..", "..", "src", "serve", "daemon-lock.ts")}");
+      const held = acquireDaemonLock(${JSON.stringify(path)}, { inheritable: true });
+      if (held === null) { process.exit(2); }
+      // stdio: [stdin, stdout, stderr, lockFd] — Bun inherits
+      // the lock fd by appending it to the stdio array, which
+      // mirrors how serve/cli.ts hands the fd to the astro child.
+      const sleepProc = Bun.spawn(["sleep", "30"], {
+        stdio: ["ignore", "inherit", "inherit", held.fd],
+      });
+      process.stderr.write("CHILDPID=" + sleepProc.pid + "\\n");
+      await sleepProc.exited;
+    `;
+    const parent = (await import("node:child_process")).spawn(
+      "bun",
+      ["-e", parentScript],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let childPid: number | undefined;
+    let stderrBuf = "";
+    parent.stderr?.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString();
+      const m = stderrBuf.match(/CHILDPID=(\d+)/);
+      if (m !== null) childPid = Number(m[1]);
+    });
+    // Wait up to 5 s for the child to be announced.
+    const deadline = Date.now() + 5_000;
+    while (childPid === undefined && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(childPid).toBeDefined();
+    try {
+      // SIGKILL the parent — no handlers run, lock fd closes in
+      // the parent, but the sleep child still has it mapped.
+      parent.kill("SIGKILL");
+      await new Promise((r) => parent.on("exit", r));
+      // Lock is STILL held by the orphan: a second acquire is
+      // refused.
+      const refused = acquireDaemonLock(path);
+      expect(refused).toBeNull();
+      // Kill the orphan. On exit the kernel closes the fd and
+      // releases the lock.
+      process.kill(childPid!, "SIGKILL");
+      // Poll briefly for the lock to become free.
+      const freeDeadline = Date.now() + 2_000;
+      let freed = false;
+      while (Date.now() < freeDeadline) {
+        const attempt = acquireDaemonLock(path);
+        if (attempt !== null) {
+          attempt.release();
+          freed = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(freed).toBe(true);
+    } finally {
+      try { parent.kill("SIGKILL"); } catch { /* already dead */ }
+      if (childPid !== undefined) {
+        try { process.kill(childPid, "SIGKILL"); } catch { /* already dead */ }
+      }
+    }
+  }, 15_000);
+
+  test("#251 B1: inheritable omitted (default) keeps FD_CLOEXEC on — fd NOT inherited", () => {
+    const path = daemonLockPath(repoRoot);
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+
+    const held = acquireDaemonLock(path); // default
+    expect(held).not.toBeNull();
+    try {
+      const { dlopen, FFIType } = require("bun:ffi") as typeof import("bun:ffi");
+      const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+        fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+      });
+      const F_GETFD = 1;
+      const FD_CLOEXEC = 1;
+      const flags = Number(lib.symbols.fcntl(held!.fd, F_GETFD, 0));
+      // Default: FD_CLOEXEC bit MUST be on (the pre-#251 contract).
+      expect(flags & FD_CLOEXEC).toBe(FD_CLOEXEC);
+    } finally {
+      held?.release();
+    }
   });
 });
 

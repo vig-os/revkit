@@ -13,7 +13,9 @@ import { randomBytes } from "node:crypto";
 import { startDaemon, type StartDaemonOptions } from "./daemon.ts";
 import {
   acquireStartingLock,
+  clearStartFailure,
   ensureRevkitDir,
+  writeStartFailure,
   type AcquiredStartingDaemon,
 } from "./serve-state.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
@@ -40,6 +42,16 @@ export interface RunServeEnv {
    * because the pre-#57 tests don't supply it; the auto-build path
    * runs `--online: false` anyway. */
   readonly repoSlug?: string;
+  /** Test hook: swap out the auto-build step. #251 B1 tests drive
+   * the signal-abort + start-failure path without invoking the
+   * real 3-minute astro build. Shape matches `runBuildCommand`
+   * (args + env → RunBuildResult). Production callers never set
+   * this — the default is `runBuildCommand`. */
+  readonly runBuildOverride?: typeof runBuildCommand;
+  /** Test hook: swap out `startDaemon`. #251 B1 tests drive the
+   * post-build failure path without binding a real HTTP server.
+   * Production callers never set this. */
+  readonly startDaemonOverride?: typeof startDaemon;
 }
 
 /** Parse `--dir <path>`, `--port <n>` and `--no-auto-build`. Returns
@@ -220,6 +232,38 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     acquired = result;
   }
 
+  // #251 B1: once we hold the pre-bind lock we MUST clean up
+  // before exiting on SIGINT / SIGTERM, or serve.json would stay
+  // stuck on `status: "starting"`. The signal handlers below also
+  // abort the in-flight auto-build via an AbortController so the
+  // astro child dies with us instead of continuing orphaned.
+  //
+  // SIGKILL safety is a separate mechanism: `acquireStartingLock`
+  // opened the lock fd without O_CLOEXEC, and we hand that fd to
+  // the astro child via `inheritFds` below. If this process is
+  // SIGKILLed mid-build, the child still owns the fd → flock stays
+  // held → a second `revkit serve` is refused immediately.
+  const buildAbort = needsAutoBuild ? new AbortController() : undefined;
+  let buildSignalHandlers: Array<{ signal: NodeJS.Signals; handler: () => void }> = [];
+  const abortedViaSignal = { reason: "" };
+  if (acquired !== undefined && buildAbort !== undefined) {
+    const onSignal = (signal: NodeJS.Signals): void => {
+      abortedViaSignal.reason = signal;
+      buildAbort.abort();
+    };
+    for (const sig of ["SIGINT", "SIGTERM"] as const) {
+      const handler = () => onSignal(sig);
+      buildSignalHandlers.push({ signal: sig, handler });
+      process.on(sig, handler);
+    }
+  }
+  const removeBuildSignalHandlers = (): void => {
+    for (const { signal, handler } of buildSignalHandlers) {
+      process.removeListener(signal, handler);
+    }
+    buildSignalHandlers = [];
+  };
+
   if (needsAutoBuild) {
     // Auto-build the consumer's tree before serving. If it fails,
     // release the lock and surface the build error. A concurrent
@@ -227,30 +271,73 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     // free (died while starting) and can retry or spawn.
     stdoutLines.push(`revkit serve: no dist at ${dir} — building first`);
     let buildResult;
+    const build = env.runBuildOverride ?? runBuildCommand;
     try {
-      buildResult = await runBuildCommand([], {
+      buildResult = await build([], {
         cwd: env.cwd,
         version: env.version,
         repoSlug: env.repoSlug ?? "vig-os/revkit",
+        ...(buildAbort !== undefined ? { signal: buildAbort.signal } : {}),
+        // #251 B1: inherit the daemon.lock fd through to the astro
+        // child so the flock survives a parent SIGKILL.
+        ...(acquired !== undefined ? { inheritFds: [acquired.lockFd] } : {}),
       });
     } catch (error) {
+      removeBuildSignalHandlers();
+      const abortedBySignal = buildAbort?.signal.aborted === true;
+      const message = abortedBySignal
+        ? `auto-build aborted by ${abortedViaSignal.reason || "signal"}`
+        : `revkit serve: auto-build failed:\n${(error as Error).message}`;
+      writeStartFailure(repoRoot, {
+        stage: abortedBySignal ? "aborted" : "build-failed",
+        message,
+        failedAt: new Date().toISOString(),
+        version: env.version,
+        inputs: { distExists: existsSync(dir) },
+      });
       acquired?.release();
       return {
         exitCode: 1,
         stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
-        stderr: `revkit serve: auto-build failed:\n${(error as Error).message}\n`,
+        stderr: `${message}\n`,
       };
     }
     if (buildResult.exitCode !== 0) {
+      removeBuildSignalHandlers();
+      const stderrTail = buildResult.stderr.slice(-4096);
+      // If a signal arrived while the build was in flight, treat
+      // this exit as an abort (not a build failure the user needs
+      // to fix). The subsequent MCP tool call then sees stage
+      // "aborted" and the agent can distinguish "daemon gone"
+      // from "daemon said no".
+      const abortedBySignal = buildAbort?.signal.aborted === true;
+      const stage = abortedBySignal ? "aborted" : "build-failed";
+      const message = abortedBySignal
+        ? `revkit serve: auto-build aborted by ${abortedViaSignal.reason || "signal"}`
+        : "revkit serve: auto-build failed (see stderrTail)";
+      writeStartFailure(repoRoot, {
+        stage,
+        message,
+        stderrTail,
+        failedAt: new Date().toISOString(),
+        version: env.version,
+        inputs: { distExists: existsSync(dir) },
+      });
       acquired?.release();
       return {
         exitCode: buildResult.exitCode,
         stdout: buildResult.stdout,
-        stderr: `revkit serve: auto-build failed:\n${buildResult.stderr}`,
+        stderr: abortedBySignal
+          ? `${message}\n`
+          : `revkit serve: auto-build failed:\n${buildResult.stderr}`,
       };
     }
     if (buildResult.stdout.length > 0) stdoutLines.push(buildResult.stdout.trimEnd());
   }
+  // Build survived (or wasn't needed). The daemon's own signal
+  // handlers take over below; drop the pre-bind handlers so a
+  // signal that arrives AFTER bind doesn't abort twice.
+  removeBuildSignalHandlers();
 
   const options: StartDaemonOptions = {
     dir,
@@ -264,10 +351,21 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     ...(serveInstanceId !== undefined ? { acquiredInstanceId: serveInstanceId } : {}),
     ...(serveStartedAt !== undefined ? { acquiredStartedAt: serveStartedAt } : {}),
   };
+  const startDaemonFn = env.startDaemonOverride ?? startDaemon;
   let handle;
   try {
-    handle = await startDaemon(options);
+    handle = await startDaemonFn(options);
   } catch (error) {
+    // #251 N1: persist the failure so the MCP side (whose spawn
+    // ignores stdio) can read the reason instead of re-spawning
+    // blind on every tool call.
+    writeStartFailure(repoRoot, {
+      stage: "start-failed",
+      message: `revkit serve: startDaemon failed: ${(error as Error).message}`,
+      failedAt: new Date().toISOString(),
+      version: env.version,
+      inputs: { distExists: existsSync(dir) },
+    });
     acquired?.release();
     return {
       exitCode: 1,
@@ -275,6 +373,10 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
       stderr: `${(error as Error).message}\n`,
     };
   }
+  // #251 N1: the daemon bound cleanly. Any stale `start-failed.json`
+  // from a prior failure is now irrelevant — clear it so the next
+  // MCP tool call does not keep seeing the old error.
+  clearStartFailure(repoRoot);
   // Return a `blockForever` promise the CLI top-level awaits so the
   // process does not exit until `stop()` resolves (either via a signal
   // or via the daemon's own error path).
