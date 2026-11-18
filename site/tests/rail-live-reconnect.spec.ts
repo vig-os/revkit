@@ -314,9 +314,18 @@ test.describe("rail live reconnect @chromium-only (issue #277)", () => {
             const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
             self.__revkit_listeners = listeners;
             sources.push(self);
-            const nativeAdd = Native.prototype.addEventListener.bind(this);
-            const nativeRemove = Native.prototype.removeEventListener.bind(this);
-            self.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject | null, opts?: boolean | AddEventListenerOptions): void => {
+            // DOMs typing for addEventListener's `listener` is
+            // non-nullable; keep the shim types loose so a listener
+            // === null caller still reaches native (which treats it
+            // as a no-op).
+            type LooseListener = EventListenerOrEventListenerObject | null;
+            const nativeAdd: (type: string, listener: LooseListener, opts?: boolean | AddEventListenerOptions) => void = (type, listener, opts) => {
+              (Native.prototype.addEventListener as unknown as (t: string, l: LooseListener, o?: boolean | AddEventListenerOptions) => void).call(this, type, listener, opts);
+            };
+            const nativeRemove: (type: string, listener: LooseListener, opts?: boolean | EventListenerOptions) => void = (type, listener, opts) => {
+              (Native.prototype.removeEventListener as unknown as (t: string, l: LooseListener, o?: boolean | EventListenerOptions) => void).call(this, type, listener, opts);
+            };
+            self.addEventListener = ((type: string, listener: LooseListener, opts?: boolean | AddEventListenerOptions): void => {
               if (listener !== null) {
                 const bag = listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
                 bag.add(listener);
@@ -324,7 +333,7 @@ test.describe("rail live reconnect @chromium-only (issue #277)", () => {
               }
               nativeAdd(type, listener, opts);
             }) as EventSource["addEventListener"];
-            self.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject | null, opts?: boolean | EventListenerOptions): void => {
+            self.removeEventListener = ((type: string, listener: LooseListener, opts?: boolean | EventListenerOptions): void => {
               if (listener !== null) {
                 listeners.get(type)?.delete(listener);
               }
