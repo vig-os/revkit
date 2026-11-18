@@ -9,19 +9,24 @@
 // `Permissions-Policy` that denies the powerful features the daemon UI
 // never asks for, and per-kind `Cache-Control`.
 //
-// **What this file is now.** A pure coordinate-mapping: the daemon's
-// loopback origins, its script path conventions, and the position a
-// route-specific bundle takes inside `script-src`. The policy itself —
-// which directives exist, the hygiene quartet, the hex→base64
-// conversion — moved to `@revkit/review-core` when the hosted Worker
-// needed the same rules. Copying it would have been the third
-// implementation of one security policy; importing it from
-// `@revkit/cli/serve/headers` would have dragged the whole CLI into the
-// Worker bundle for a dependency-free module.
+// **What this file is now.** A pure coordinate-mapping: the CSP origin
+// allowlists the active guard policy exposes (`guardPolicy.cspOrigins`,
+// ADR-0025 one core + ADR-0026 §"Plain Linux host / VM"), the script
+// path conventions, and the position a route-specific bundle takes
+// inside `script-src`. The policy itself — which directives exist, the
+// hygiene quartet, the hex→base64 conversion — lives in
+// `@revkit/review-core` so the hosted Worker (D2) runs the same rules.
 //
-// The daemon's emitted CSP is byte-for-byte what it was before the move.
-// `test/serve/headers.test.ts` pins that, and the pinned literals were not
-// edited in this refactor.
+// Before #245 the context carried a `port` from which loopback origins
+// were derived inline. That worked for the local daemon but silently
+// pinned the CSP to loopback on the Linux-host target too: a reverse-
+// proxied reviewer loading `https://host.example/review/…` would have
+// received a CSP whose `script-src` named `http://127.0.0.1:…`,
+// refused by the browser. The context now takes `scriptOrigins` /
+// `connectOrigins` directly — the local daemon passes the loopback
+// aliases (byte-for-byte unchanged via `guardPolicy.cspOrigins`); the
+// host target passes its configured public origin and its `ws://`
+// twin.
 //
 // This module remains pure — `buildCspHeader` and
 // `applyResponseHeaders` return values only, so a unit test drives them
@@ -55,12 +60,23 @@ export { buildMinimalCspHeader, hexToBase64, permissionsPolicyValue };
  *  shared policy so the daemon and the Worker agree on one vocabulary. */
 export type ResponseKind = SharedResponseKind;
 
-/** Inputs to the daemon's header builders. Unchanged in shape from
- * before the move to the shared policy: the daemon speaks in terms of
- * its own `port` and the allowlist the running revkit version ships. */
+/** Inputs to the daemon's header builders. #245: `scriptOrigins` /
+ * `connectOrigins` are passed in directly instead of derived from a
+ * `port`, so the host target can emit a CSP keyed on its configured
+ * public origin instead of the loopback port. The local daemon passes
+ * `guardPolicy.cspOrigins.http` / `guardPolicy.cspOrigins.ws` from the
+ * loopback policy — the two loopback aliases, byte-for-byte unchanged
+ * from before. */
 export interface HeaderContext {
-  /** Loopback port the daemon bound to. */
-  readonly port: number;
+  /** Origins named in the CSP's `script-src` (and `worker-src`). For
+   * the local target these are the two loopback aliases; for the host
+   * target this is the configured public origin only (one entry). The
+   * daemon derives this from `guardPolicy.cspOrigins.http`. */
+  readonly scriptOrigins: readonly string[];
+  /** Origins named in the CSP's `connect-src`, after the implicit
+   * `'self'`. Covers the WebSocket twin of each `scriptOrigins`
+   * entry. Derived from `guardPolicy.cspOrigins.ws`. */
+  readonly connectOrigins: readonly string[];
   /** Distinct SHA-256 hex digests of the inline scripts allowed by
    * the running revkit version. These come from the COMMITTED,
    * reviewed set (`packages/cli/src/dist-check-allowlist.json`), not
@@ -102,61 +118,78 @@ export const ASTRO_SCRIPTS_URL_PREFIX = "/_astro/";
  * allow `eval` / `new Function()` on any script). */
 export const PAGEFIND_URL_PREFIX = "/pagefind/";
 
-/** The two loopback origins the daemon's `isLoopbackHost` accepts —
- * `127.0.0.1:<port>` and `localhost:<port>`. `script-src`,
- * `worker-src` and the WebSocket `connect-src` list both so a page
- * opened at either origin loads the same set of assets under the
- * same policy. Kept small (two aliases only); a browser that opens
- * a foreign public IP whose DNS points at 127.0.0.1 fails the Host
- * check well before the CSP fires. */
-function loopbackOrigins(port: number, scheme: "http" | "ws"): readonly string[] {
-  return [`${scheme}://127.0.0.1:${port}`, `${scheme}://localhost:${port}`];
-}
-
-/** Map the daemon's `(port, allowlist)` context plus the response's
- * route-specific script paths onto the shared policy's inputs.
+/** Map the daemon's context (policy-derived origins plus the response's
+ * route-specific script paths) onto the shared policy's inputs.
  *
  * **Order is load-bearing.** Before the move, `buildCspHeader` emitted
  * `RAIL`, then every `extraScriptPaths` entry, then `ASTRO`, then
  * `PAGEFIND`. Flattening that into one ordered `scriptPaths` list is
  * what keeps the emitted header byte-identical, so `RAIL` leads and
  * the extras sit second. */
-function sharedContext(ctx: HeaderContext, extraScriptPaths: readonly string[]): SharedHeaderContext {
+function sharedContext(
+  ctx: HeaderContext,
+  extraScriptPaths: readonly string[],
+  scriptPathPrefix: string,
+): SharedHeaderContext {
+  const prefixed = (path: string): string => scriptPathPrefix + path;
   return {
-    scriptOrigins: loopbackOrigins(ctx.port, "http"),
-    scriptPaths: [RAIL_SCRIPT_URL_PATH, ...extraScriptPaths, ASTRO_SCRIPTS_URL_PREFIX, PAGEFIND_URL_PREFIX],
+    scriptOrigins: ctx.scriptOrigins,
+    scriptPaths: [
+      prefixed(RAIL_SCRIPT_URL_PATH),
+      ...extraScriptPaths.map(prefixed),
+      prefixed(ASTRO_SCRIPTS_URL_PREFIX),
+      prefixed(PAGEFIND_URL_PREFIX),
+    ],
     // Pagefind is the ONLY runtime the daemon serves a Worker for
     // today; naming the exact prefix means a future stored HTML that
     // tries `new Worker("/-/anything.js")` is refused by the browser
     // as a CSP violation, closing the narrowest hole a bare
     // `worker-src 'self'` would leave open. Same shape as script-src's
-    // pagefind entry — one path scope, two aliases. (M2 item 5b
-    // carry-over from #41 review.)
-    workerPaths: [PAGEFIND_URL_PREFIX],
+    // pagefind entry — one path scope, every configured origin. (M2
+    // item 5b carry-over from #41 review.)
+    workerPaths: [prefixed(PAGEFIND_URL_PREFIX)],
     // CSP L3 (Chromium >= 96, Firefox >= 99) treats `'self'` as covering
     // `ws://` on the same origin; the explicit `ws://` origins are for
     // older WebKit builds (ADR-0012 amendment 2026-09-30).
-    connectOrigins: loopbackOrigins(ctx.port, "ws"),
+    connectOrigins: ctx.connectOrigins,
     inlineScriptHashes: ctx.inlineScriptHashes,
   };
 }
 
 /** Build the daemon's Content-Security-Policy value for an HTML
  * response. See `@revkit/review-core/http-headers` for the directive
- * rationale; this function only supplies the daemon's coordinates. */
-export function buildCspHeader(ctx: HeaderContext, extraScriptPaths: readonly string[] = []): string {
-  return buildSharedCspHeader(sharedContext(ctx, extraScriptPaths));
+ * rationale; this function only supplies the daemon's coordinates.
+ *
+ * `scriptPathPrefix` is the deployment's base path (e.g. `/review`)
+ * prepended to every daemon-served script path so the CSP matches
+ * what the browser actually requests under a sub-path deployment.
+ * Empty on the root deployment (default). */
+export function buildCspHeader(
+  ctx: HeaderContext,
+  extraScriptPaths: readonly string[] = [],
+  scriptPathPrefix: string = "",
+): string {
+  return buildSharedCspHeader(sharedContext(ctx, extraScriptPaths, scriptPathPrefix));
 }
 
 /** Attach ADR-0012 headers to `response` given the response kind and
  * (optional) explicit content-type. Returns the same response
- * mutated in place — callers already treat `withHygiene` this way. */
+ * mutated in place — callers already treat `withHygiene` this way.
+ *
+ * `scriptPathPrefix` is the deployment's base path prepended to every
+ * daemon-served script path; see `buildCspHeader` above. */
 export function applyResponseHeaders(
   response: Response,
   kind: ResponseKind,
   contentType: string | undefined,
   ctx: HeaderContext,
   extraScriptPaths: readonly string[] = [],
+  scriptPathPrefix: string = "",
 ): Response {
-  return applySharedResponseHeaders(response, kind, contentType, sharedContext(ctx, extraScriptPaths));
+  return applySharedResponseHeaders(
+    response,
+    kind,
+    contentType,
+    sharedContext(ctx, extraScriptPaths, scriptPathPrefix),
+  );
 }

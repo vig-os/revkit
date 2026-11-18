@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shared request handler closes the four Linux-host gaps from the #281 review**
+  ([#245](https://github.com/vig-os/revkit/issues/245))
+  - **Base-path stripping before routing.** When the guard policy carries a non-empty `basePath` (derived from a
+    public origin like `http://review.example.com/review`), the dispatcher now STRIPS the prefix after the gate
+    check and routes against the un-prefixed path. The prior shape let a `/review/api/threads` request past the
+    gate but no dispatch branch matched it, so it 404'd as static. API, `/events`, assets and the site root all
+    serve under the prefix now. Prefix confusion (`/review` vs `/reviewer`, `/reviewapi/*`), a trailing slash and
+    an encoded slash (`/review%2Fapi/threads`) stay 404 — the strip keys on exact-or-slash, not `startsWith`.
+  - **Base-path body rewrite for served HTML and the rail bundle.** Absolute-path references inside HTML
+    responses (`href="/foo"`, `src="/foo"`, inline `fetch("/api/...")`) and the rail JS bundle are rewritten to
+    carry the configured prefix, so a browser loading `${publicOrigin}/review/` resolves every link against the
+    one proxied origin. Protocol-relative (`//cdn`) and fully qualified URLs are untouched. Idempotent — an
+    already-prefixed path is passed through (`prefixAbsolutePaths` in `packages/cli/src/serve/base-path.ts`).
+  - **Transport peer address flows end-to-end.** `IdentityResolver.resolve(request, peer?)` now carries the
+    peer. The daemon dispatcher derives it from `Bun.serve`'s `requestIP` and passes it to the resolver on every
+    call. `createAuthProviderIdentityResolver` uses the passed-in peer first and falls back to its
+    construction-time function; a call with neither configured refuses closed with `no-peer` (401). This closes
+    the pre-#245 shape where the resolver had to know the peer at construction time — i.e. before `Bun.serve`
+    had bound a socket — and the `trusted-proxy` provider's peer allowlist could not actually be checked. A new
+    `StartDaemonOptions.peer` seam lets the host target override the derivation (unix socket, say).
+  - **401 (missing credential) vs 403 (untrusted peer) propagate.** `identifyActor` now returns the full
+    `IdentityResolution` and the five dispatcher call sites surface the resolver's own status onto the response.
+    An untrusted peer no longer surfaces as `401 Unauthorized`, which hid a misconfigured allowlist as a
+    missing-credential outage; a missing subject header no longer surfaces as `403`. The dispatcher's
+    `respondIdentityRefused` is the one place that maps a resolution's `(status, reason)` onto the HTTP body.
+  - **CSP derives from the guard policy's public origin, not a loopback port.** `HeaderContext` now takes
+    `scriptOrigins` / `connectOrigins` directly (fed from `guardPolicy.cspOrigins`), and `applyResponseHeaders`
+    accepts a `scriptPathPrefix` so the CSP's `script-src` paths carry the base path on a sub-path deployment.
+    The local daemon's emitted CSP is byte-for-byte unchanged (the loopback policy exposes the two loopback
+    aliases and the ws:// twins); the host target's CSP now names the configured origin + its ws(s)://
+    twin, so a reverse-proxied reviewer does not have their own CSP refuse the rail bundle.
+
 - **`AuthProvider` interface in `@revkit/review-core`, plus the `none` and `trusted-proxy` providers**
   ([#244](https://github.com/vig-os/revkit/issues/244))
   - Runtime-neutral contract (ADR-0026 §"The auth-provider interface"): `authenticate(AuthRequest) → AuthResult`
