@@ -1,4 +1,4 @@
-// Authentication and request-shape guards for the daemon (ADR-0013).
+// Credential state for the local daemon (ADR-0013).
 //
 // Three separate credentials, one per caller class.
 //
@@ -20,15 +20,11 @@
 // and `/events?for=agent`. The token is written to the mode-600 file
 // at startup and lives in memory here for constant-time comparison.
 //
-// Request shape (loopback-only, DNS-rebinding defence, ADR-0013).
-// The **Host** header must be `127.0.0.1:<port>` or
-// `localhost:<port>` — any other value, even a public IP whose DNS
-// points at 127.0.0.1, is refused with 421 Misdirected Request. The
-// **Origin** on every non-GET request must be the daemon's own
-// origin (`http://127.0.0.1:<port>` or `http://localhost:<port>`).
-// **`Sec-Fetch-Site`** on every non-GET is refused unless it is
-// `same-origin` or `none` (missing is accepted for older browsers
-// and non-browser callers).
+// The request-shape guards (Host / Origin / Sec-Fetch-Site) are
+// orthogonal to credentials and live in `guard-policy.ts` (#279):
+// `isLoopbackHost`, `isLoopbackOrigin` and `isSecFetchAcceptable`
+// are exported from there so the daemon's production path and the
+// test suite share one implementation.
 //
 // All comparisons use `timingSafeEqual` (the launch code and the agent
 // token). The session cookie also uses `timingSafeEqual` at the map
@@ -264,25 +260,7 @@ export function bearerFromHeader(header: string | null): string | undefined {
   return token.length > 0 ? token : undefined;
 }
 
-/** Is the request's Host header one of the two loopback names for
- * `port`? DNS-rebinding defence: a public DNS record that resolves
- * to 127.0.0.1 cannot present a matching Host. */
-export function isLoopbackHost(host: string | null, port: number): boolean {
-  if (host === null) return false;
-  return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
-}
-
-/** Is the request's Origin header one of the two allowed loopback
- * origins for `port`? Applied to every non-GET request. */
-export function isLoopbackOrigin(origin: string | null, port: number): boolean {
-  if (origin === null) return false;
-  return origin === `http://127.0.0.1:${port}` || origin === `http://localhost:${port}`;
-}
-
-/** Reject Sec-Fetch-Site values that are neither `same-origin` nor
- * `none`. Missing header is accepted (older browsers, non-browser
- * callers) — Origin already refuses a cross-site browser POST. */
-export function isSecFetchAcceptable(secFetchSite: string | null): boolean {
-  if (secFetchSite === null) return true;
-  return secFetchSite === "same-origin" || secFetchSite === "none";
-}
+// Host / Origin / Sec-Fetch-Site helpers moved to `guard-policy.ts`
+// (#279 round 2 blocker 2): the loopback policy factory consumes
+// them and tests exercise them there, so the production path and
+// the test path share a single implementation.

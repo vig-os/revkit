@@ -2,20 +2,27 @@
 // bookkeeping and the Host / Origin / Sec-Fetch-Site helpers. Time is
 // injected so the TTL test is deterministic; nothing here reaches the
 // wall clock.
+//
+// The request-shape helpers (`isLoopbackHost` / `isLoopbackOrigin` /
+// `isSecFetchAcceptable`) live in `guard-policy.ts` since #279 round
+// 2 blocker 2; this suite imports them from there so it exercises
+// the code the loopback policy factory actually runs.
 
 import { describe, expect, test } from "bun:test";
 import {
   AuthState,
   bearerFromHeader,
   cookieName,
-  isLoopbackHost,
-  isLoopbackOrigin,
-  isSecFetchAcceptable,
   mintToken,
   readCookie,
   safeEqual,
   setCookieHeader,
 } from "../../src/serve/auth.ts";
+import {
+  isLoopbackHost,
+  isLoopbackOrigin,
+  isSecFetchAcceptable,
+} from "../../src/serve/guard-policy.ts";
 
 describe("mintToken / safeEqual", () => {
   test("mintToken produces distinct 43-char base64url tokens", () => {
