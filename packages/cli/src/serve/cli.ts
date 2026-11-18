@@ -249,6 +249,10 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
   if (acquired !== undefined && buildAbort !== undefined) {
     const onSignal = (signal: NodeJS.Signals): void => {
       abortedViaSignal.reason = signal;
+      // Abort() is idempotent — a signal arriving after the build
+      // already finished (during `startDaemon` pre-bind) is a
+      // no-op on the AbortController but still tags the reason so
+      // the post-startDaemon branch below can detect it.
       buildAbort.abort();
     };
     for (const sig of ["SIGINT", "SIGTERM"] as const) {
@@ -334,10 +338,12 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     }
     if (buildResult.stdout.length > 0) stdoutLines.push(buildResult.stdout.trimEnd());
   }
-  // Build survived (or wasn't needed). The daemon's own signal
-  // handlers take over below; drop the pre-bind handlers so a
-  // signal that arrives AFTER bind doesn't abort twice.
-  removeBuildSignalHandlers();
+  // Build survived (or wasn't needed). Keep the pre-bind
+  // handlers active through startDaemon's bind window so a SIGTERM
+  // that arrives before the daemon's own handlers install doesn't
+  // leak serve.json as "starting". We detect that case after
+  // startDaemon returns (via `abortedViaSignal.reason`) and tear
+  // the daemon back down cleanly.
 
   const options: StartDaemonOptions = {
     dir,
@@ -356,6 +362,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
   try {
     handle = await startDaemonFn(options);
   } catch (error) {
+    removeBuildSignalHandlers();
     // #251 N1: persist the failure so the MCP side (whose spawn
     // ignores stdio) can read the reason instead of re-spawning
     // blind on every tool call.
@@ -377,6 +384,24 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
   // from a prior failure is now irrelevant — clear it so the next
   // MCP tool call does not keep seeing the old error.
   clearStartFailure(repoRoot);
+  // The daemon installed its own SIGINT / SIGTERM handlers inside
+  // `startDaemon` (installSignalHandlers: true). Drop the pre-bind
+  // handlers now so a signal fires the daemon's stop() path only.
+  if (abortedViaSignal.reason.length > 0) {
+    // A SIGINT/SIGTERM arrived during the bind window AFTER the
+    // build had already finished (so the AbortController call was
+    // a no-op). The daemon's handlers may or may not have been
+    // active at that moment, so tear down deterministically here
+    // instead of hoping Node's listener dispatch caught it.
+    removeBuildSignalHandlers();
+    void handle.stop();
+    return {
+      exitCode: 0,
+      stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
+      stderr: `revkit serve: aborted by ${abortedViaSignal.reason} during bind\n`,
+    };
+  }
+  removeBuildSignalHandlers();
   // Return a `blockForever` promise the CLI top-level awaits so the
   // process does not exit until `stop()` resolves (either via a signal
   // or via the daemon's own error path).
