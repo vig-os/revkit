@@ -24,6 +24,7 @@ import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
 import { runServeCommand } from "./serve/cli.ts";
 import { runBuildCommand } from "./build/cli.ts";
+import { clearStartFailure } from "./serve/serve-state.ts";
 import { runMcpCommand } from "./mcp/cli.ts";
 import { runOpenCommand } from "./open-cli.ts";
 import { runReviewCommand, defaultReviewEnv } from "./review/cli.ts";
@@ -228,6 +229,18 @@ export async function dispatch(
       version: VERSION,
       repoSlug: env.repoSlug,
     });
+    if (outcome.exitCode === 0) {
+      // #251 round 3: a successful `revkit build` clears any stale
+      // start-failure suppression. The next MCP tool call that
+      // triggers an auto-spawn will proceed instead of surfacing
+      // the old error.
+      try {
+        const repoRoot = findRepoRootByPackageJson(env.cwd);
+        clearStartFailure(repoRoot);
+      } catch {
+        // No workspace marker — nothing to clear.
+      }
+    }
     return { stdout: outcome.stdout, stderr: outcome.stderr, exitCode: outcome.exitCode };
   }
 
@@ -413,6 +426,15 @@ async function runCheckCommand(
     repoSlug: env.repoSlug,
     gh: env.gh,
   });
+  if (output.exitCode === 0) {
+    // #251 round 3: a successful `revkit check` on the full tree
+    // clears a stale start-failure record. A staged / path-limited
+    // check cannot prove the build inputs are coherent, so we only
+    // clear on the no-flags full run.
+    if (!staged && positional.length === 0) {
+      clearStartFailure(repoRoot);
+    }
+  }
   return {
     stdout: output.lines.length > 0 ? `${output.lines.join("\n")}\n` : "",
     stderr: "",

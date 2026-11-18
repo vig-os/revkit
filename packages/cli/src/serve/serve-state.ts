@@ -50,9 +50,10 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   renameSync,
+  rmSync,
   unlinkSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -73,6 +74,18 @@ export interface ServeState {
    * `removeServeState` refuses to delete (a file without an
    * instanceId cannot be proved ours). */
   readonly instanceId?: string;
+  /** Lifecycle marker (#251):
+   *  - `"starting"` — the daemon holds `.revkit/daemon.lock` and is
+   *    doing pre-bind work (e.g. the cold-start auto-build in
+   *    `serve/cli.ts`). `url`/`agentToken`/`port` are placeholders
+   *    (empty strings / 0) because the HTTP server has not bound yet.
+   *  - `"ready"` (or absent, for backwards compat) — the HTTP server
+   *    is bound and the connection fields are meaningful.
+   *
+   * A second `ensureDaemon` seeing `"starting"` MUST wait for the
+   * transition to `"ready"` instead of spawning another daemon;
+   * see `findRunningOrStartingDaemon` and `mcp/daemon-bootstrap.ts`. */
+  readonly status?: "starting" | "ready";
 }
 
 /** Filename constants. Kept here so a rename lands in one place. */
@@ -247,6 +260,8 @@ export function readServeStateVerbose(repoRoot: string): ReadOutcome {
       return { kind: "unparsable", reason: `serve-state: ${path} missing string '${key}'.` };
     }
   }
+  const status =
+    record.status === "starting" || record.status === "ready" ? record.status : undefined;
   return {
     kind: "ok",
     state: {
@@ -257,8 +272,16 @@ export function readServeStateVerbose(repoRoot: string): ReadOutcome {
       startedAt: record.startedAt as string,
       version: record.version as string,
       ...(typeof record.instanceId === "string" ? { instanceId: record.instanceId } : {}),
+      ...(status !== undefined ? { status } : {}),
     },
   };
+}
+
+/** True when `state` advertises a bound HTTP server (`status === "ready"`,
+ * or `status` absent for backwards compat). A `"starting"` state is NOT
+ * ready — its `url`/`agentToken`/`port` are placeholders (#251). */
+export function isReadyServeState(state: ServeState): boolean {
+  return state.status !== "starting";
 }
 
 /** Convenience wrapper: undefined for either missing or unparsable. */
@@ -330,20 +353,65 @@ export interface RefusedDaemon {
   readonly reason: string;
 }
 
-export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
+/** Initial record identifying a starting daemon. The caller supplies
+ * these before bind; `publishReady` later swaps in the bound state. */
+export interface AcquiredStartingInit {
+  readonly pid: number;
+  readonly version: string;
+  readonly startedAt: string;
+  readonly instanceId: string;
+}
+
+/** Acquired daemon-lock PRE-bind (#251). The caller (serve/cli.ts)
+ * takes this BEFORE the cold-start auto-build so a concurrent
+ * `revkit serve` is refused immediately and a concurrent
+ * `ensureDaemon` sees a "starting" state and waits on readiness
+ * instead of spawning another daemon. `publishReady(state)` must be
+ * called once the HTTP server has bound, before the daemon begins
+ * answering requests. `release()` is idempotent and does the
+ * ownership-checked unlink of `serve.json` plus drops the OS lock.
+ *
+ * The lock is always CLOEXEC: round-3 of #251 reverted the
+ * `inheritable: true` fd-inheritance mechanism. SIGKILL safety for
+ * the cold build is now provided through output staging — the
+ * auto-build writes to a private `.revkit/dist.staging-<pid>-<nonce>`
+ * directory that `revkit serve` atomically promotes to
+ * `.revkit/dist` only after `check-dist` passes. An orphaned astro
+ * from a SIGKILLed serve writes its own staging dir, which is never
+ * promoted. */
+export interface AcquiredStartingDaemon {
+  readonly kind: "ok";
+  readonly repoId: string;
+  publishReady(state: ServeState): void;
+  release(): void;
+}
+
+/** Acquire `.revkit/daemon.lock` and publish a "starting" record to
+ * `serve.json`. Returns a handle the caller uses to publish the
+ * bound state later and release on shutdown.
+ *
+ * Writes a ServeState with `status: "starting"`, `pid` / `version` /
+ * `startedAt` / `instanceId` set, and placeholders in `url` (empty
+ * string), `agentToken` (empty string) and `port` (0). Consumers
+ * that see this record wait for the "ready" transition — the
+ * placeholders are chosen so a legacy consumer that forgets to
+ * check `status` fails fast (HTTP to an empty URL) rather than
+ * silently talking to a half-born daemon. */
+export function acquireStartingLock(
+  repoRoot: string,
+  init: AcquiredStartingInit,
+): AcquiredStartingDaemon | RefusedDaemon {
   ensureRevkitDir(repoRoot);
   const lockPath = daemonLockPath(repoRoot);
+  // The lock is always CLOEXEC: fd inheritance into the astro child
+  // was reverted in #251 round 3 (see `daemon-lock.ts` and
+  // `AcquiredStartingDaemon` above). A SIGKILLed serve now releases
+  // the lock immediately; the orphaned astro writes only its own
+  // staging dir, which `revkit serve` never promotes.
   const lock = acquireDaemonLock(lockPath);
   if (lock === null) {
     // Deliberately does NOT read `.revkit/repo-id` (issue #63
-    // review nit). It carried the winner's id on an earlier draft,
-    // but the lock is per repo root — so a refused start is by
-    // construction on the SAME repo, and the id is a file the caller
-    // already has on its own filesystem plus an unauthenticated
-    // `/-/health` field. It told the reader nothing they did not
-    // have, `daemon.ts` throws before reading it, and touching the
-    // file at all weakens the one invariant that matters here: a
-    // start that does not win the lock does not go near the id.
+    // review nit). See `acquireAndPublish` for the rationale.
     return {
       kind: "already-running",
       state: readServeState(repoRoot),
@@ -351,9 +419,88 @@ export function acquireAndPublish(repoRoot: string, state: ServeState): Acquired
     };
   }
   // We have the lock, so we are the only writer for the life of the
-  // daemon: any existing `serve.json` is stale (an exited-uncleanly
-  // daemon left it behind) and any existing `repo-id` is THE repo
-  // id. Overwrite the former, read-or-mint the latter.
+  // daemon. Read-or-mint the repo id under the lock (issue #63).
+  const repoId = readOrMintRepoId(repoRoot);
+  const startingState: ServeState = {
+    pid: init.pid,
+    port: 0,
+    url: "",
+    agentToken: "",
+    startedAt: init.startedAt,
+    version: init.version,
+    instanceId: init.instanceId,
+    status: "starting",
+  };
+  writeServeState(repoRoot, startingState);
+  let released = false;
+  // Track the most recently published state so `release()` can do
+  // the ownership check against whichever record we actually own
+  // right now (starting first, ready afterwards).
+  let ownedState: ServeState = startingState;
+  return {
+    kind: "ok",
+    repoId,
+    publishReady(state: ServeState): void {
+      if (released) {
+        throw new Error("acquireStartingLock: publishReady called after release");
+      }
+      // The caller composes the final state (with the bound port,
+      // agent token, url). We enforce `status: "ready"` and the
+      // same `instanceId` we started under so the lifecycle is
+      // one coherent story on disk.
+      const readyState: ServeState = {
+        ...state,
+        instanceId: init.instanceId,
+        status: "ready",
+      };
+      writeServeState(repoRoot, readyState);
+      ownedState = readyState;
+    },
+    release(): void {
+      if (released) return;
+      released = true;
+      // Only remove `serve.json` if it still carries OUR
+      // instanceId. A racing daemon could conceivably have taken
+      // over during our shutdown; do not delete their advertisement.
+      const current = readServeStateVerbose(repoRoot);
+      if (
+        current.kind === "ok" &&
+        current.state.instanceId !== undefined &&
+        ownedState.instanceId !== undefined &&
+        current.state.instanceId === ownedState.instanceId
+      ) {
+        try {
+          unlinkSync(serveStatePath(repoRoot));
+        } catch {
+          // Fine if it is already gone.
+        }
+      }
+      lock.release();
+    },
+  };
+}
+
+export function acquireAndPublish(repoRoot: string, state: ServeState): AcquiredDaemon | RefusedDaemon {
+  ensureRevkitDir(repoRoot);
+  const lockPath = daemonLockPath(repoRoot);
+  const lock = acquireDaemonLock(lockPath);
+  if (lock === null) {
+    // Deliberately does NOT read `.revkit/repo-id` (issue #63
+    // review nit). See `acquireStartingLock` for the rationale.
+    return {
+      kind: "already-running",
+      state: readServeState(repoRoot),
+      reason: "another revkit daemon holds .revkit/daemon.lock",
+    };
+  }
+  // We have the lock. Mint the repo id under the lock (#63) and
+  // publish ONCE — this is the fast path for callers that need no
+  // pre-bind window (every pre-#251 caller, the Playwright
+  // `bootDaemon` helpers in `site/tests` that read `serve.json`
+  // directly and expect ready-state fields). Two atomic writes
+  // back-to-back would otherwise expose a "starting" record on disk
+  // for one scheduler tick — enough time for a concurrent reader to
+  // see empty `url`/`agentToken`. See #251.
   const repoId = readOrMintRepoId(repoRoot);
   writeServeState(repoRoot, state);
   let released = false;
@@ -400,10 +547,15 @@ export function removeServeState(repoRoot: string): void {
   }
 }
 
-/** Consumer helper: find a running daemon by checking the lock. If
- * the lock is free, the state file — even if it exists — is stale.
- * Kept small so `revkit mcp` and other clients can import one
- * function to answer "is the daemon up, and if so where".
+/** Consumer helper: find a READY daemon by checking the lock. If
+ * the lock is free, the state file — even if it exists — is stale;
+ * if it is held but the state is `"starting"` (#251 pre-bind window),
+ * this helper returns `undefined` so legacy callers (`revkit events`,
+ * `revkit open`, `revkit hook`) that would blindly fetch from the
+ * advertised URL get a clean "no daemon" result rather than a
+ * placeholder empty URL. Clients that need to WAIT for a starting
+ * daemon call `findRunningOrStartingDaemon` instead
+ * (`mcp/daemon-bootstrap.ts`).
  *
  * **Race note (acceptable).** `findRunningDaemon` and a starting
  * daemon can race: the caller's `acquireDaemonLock` probe succeeds
@@ -415,6 +567,18 @@ export function removeServeState(repoRoot: string): void {
  * probes, which is the wrong trade. `revkit mcp` retries on
  * `undefined`, so the race window is a single extra probe. */
 export function findRunningDaemon(repoRoot: string): ServeState | undefined {
+  const state = findRunningOrStartingDaemon(repoRoot);
+  if (state === undefined) return undefined;
+  return isReadyServeState(state) ? state : undefined;
+}
+
+/** Variant of `findRunningDaemon` that ALSO returns a daemon whose
+ * `status` is `"starting"` (the pre-bind window during a cold-start
+ * auto-build, #251). The caller must guard on `state.status` and
+ * either wait for the transition to `"ready"` or treat the lock
+ * holder as "a daemon is starting; don't spawn another" — see
+ * `mcp/daemon-bootstrap.ts`. */
+export function findRunningOrStartingDaemon(repoRoot: string): ServeState | undefined {
   const lockPath = daemonLockPath(repoRoot);
   if (!existsSync(lockPath)) return undefined;
   // Probe: can we acquire the lock? If yes, no daemon owns it —
@@ -425,6 +589,278 @@ export function findRunningDaemon(repoRoot: string): ServeState | undefined {
     attempt.release();
     return undefined;
   }
-  // Lock is held by someone. Return the advertisement.
+  // Lock is held by someone. Return the advertisement (ready OR
+  // starting; the caller decides).
   return readServeState(repoRoot);
+}
+
+// ── #251 N1: persisted last-start failure ────────────────────────
+//
+// `revkit mcp` spawns `revkit serve` detached with ignored stdio,
+// so a build-time failure in the spawned serve never reaches the
+// MCP caller. Each MCP tool call would then re-spawn serve, which
+// would fail the same way, which the caller would see as an
+// unexplained "died while starting" on every retry.
+//
+// Fix (#251 round 3): `revkit serve` writes a small failure record
+// to `.revkit/start-failed.json` ONLY for a genuine build or
+// check-dist failure — never for lock contention, a signal/abort,
+// or a bind-time race, each of which is transient and would
+// otherwise poison every future respawn. The record carries an
+// input fingerprint (sha256 over `docs/`, `vocab/`, `plots/` paths/
+// sizes/mtimes plus `package.json` — see
+// `input-fingerprint.ts`'s `FINGERPRINT_INPUT_ROOTS` /
+// `FINGERPRINT_CONFIG_FILES`), and `ensureDaemon` refuses to
+// respawn ONLY while the current fingerprint matches the recorded
+// one. Any change to the inputs, a successful `revkit build` or
+// `revkit check`, or a successful bind clears / invalidates it.
+//
+// The manual escape (`revkit serve` directly, or `rm
+// .revkit/start-failed.json`) is documented in SKILL.md.
+
+/** Shape written to `.revkit/start-failed.json` (#251 N1, round 3).
+ *
+ * `stage` is EXCLUSIVELY a genuine failure: a non-zero build exit,
+ * a `check-dist` refusal of the built output, or a bind-time
+ * startDaemon error. A SIGTERM/SIGINT abort, a lock contention
+ * ("someone else is already serving"), and any other transient is
+ * NOT written — those would otherwise wedge the MCP auto-start
+ * forever. */
+export interface StartFailureRecord {
+  readonly stage: "build-failed" | "start-failed";
+  /** The error message (user-facing, bounded). */
+  readonly message: string;
+  /** Last ~4 KiB of the spawned child's stderr, when available. */
+  readonly stderrTail?: string;
+  /** ISO-8601 timestamp of the failure. */
+  readonly failedAt: string;
+  /** The daemon version that recorded this failure. */
+  readonly version: string;
+  /** Snapshot of the inputs that failed.
+   *
+   * `fingerprint` is a deterministic hash over the consumer's
+   * build inputs at failure time (see `input-fingerprint.ts`).
+   * `ensureDaemon` compares this hash with the current fingerprint
+   * and respawn-suppresses only while they match. */
+  readonly inputs: {
+    readonly fingerprint: string;
+  };
+}
+
+/** Message bound for `StartFailureRecord.message`. A failure message
+ * is user-facing and must never include a secret (`revkit serve`
+ * never surfaces its agent token into this file), but the shape
+ * still bounds it so a pathological stack trace does not blow out
+ * the record. 4 KiB matches `stderrTail`. */
+export const START_FAILURE_MESSAGE_MAX = 4096;
+
+/** `stderrTail` is also bounded — the 4 KiB tail is what the caller
+ * typically grabs; this constant names the enforced ceiling. */
+export const START_FAILURE_STDERR_TAIL_MAX = 4096;
+
+/** Absolute path to `.revkit/start-failed.json` under `repoRoot`. */
+export function startFailurePath(repoRoot: string): string {
+  return join(repoRoot, SERVE_STATE_DIR, "start-failed.json");
+}
+
+/** Write `.revkit/start-failed.json` atomically at mode 0600.
+ * Callers: `revkit serve` ONLY on a genuine build-failed /
+ * check-dist-failed / startDaemon-failed outcome. Never carries
+ * secrets (the daemon has not minted its agent token yet at this
+ * point). */
+export function writeStartFailure(repoRoot: string, record: StartFailureRecord): void {
+  ensureRevkitDir(repoRoot);
+  // Bound the message and tail so a runaway stack trace cannot
+  // blow past the atomic-write ceiling.
+  const bounded: StartFailureRecord = {
+    stage: record.stage,
+    message: record.message.slice(0, START_FAILURE_MESSAGE_MAX),
+    ...(record.stderrTail !== undefined
+      ? { stderrTail: record.stderrTail.slice(-START_FAILURE_STDERR_TAIL_MAX) }
+      : {}),
+    failedAt: record.failedAt,
+    version: record.version,
+    inputs: { fingerprint: record.inputs.fingerprint },
+  };
+  writeSecretAtomic(startFailurePath(repoRoot), JSON.stringify(bounded, null, 2) + "\n");
+}
+
+/** Read `.revkit/start-failed.json`. Returns `undefined` when the
+ * file is absent, unreadable, unparsable, or carries a shape this
+ * module does not recognise. Fail-closed — a malformed record never
+ * blocks a spawn. */
+export function readStartFailure(repoRoot: string): StartFailureRecord | undefined {
+  const path = startFailurePath(repoRoot);
+  if (!existsSync(path)) return undefined;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  const stage = record.stage;
+  if (stage !== "build-failed" && stage !== "start-failed") {
+    return undefined;
+  }
+  if (typeof record.message !== "string") return undefined;
+  if (typeof record.failedAt !== "string") return undefined;
+  if (typeof record.version !== "string") return undefined;
+  const inputs = record.inputs as Record<string, unknown> | undefined;
+  if (inputs === undefined || typeof inputs.fingerprint !== "string") return undefined;
+  if (inputs.fingerprint.length === 0) return undefined;
+  return {
+    stage,
+    message: record.message,
+    ...(typeof record.stderrTail === "string" ? { stderrTail: record.stderrTail } : {}),
+    failedAt: record.failedAt,
+    version: record.version,
+    inputs: { fingerprint: inputs.fingerprint },
+  };
+}
+
+/** Delete `.revkit/start-failed.json`. Callers: `revkit serve` after
+ * a successful bind, `revkit build` / `revkit check` after a
+ * successful run, and `ensureDaemon` when it decides the inputs
+ * have changed (fingerprint mismatch). Silent on `ENOENT`. */
+export function clearStartFailure(repoRoot: string): void {
+  try {
+    unlinkSync(startFailurePath(repoRoot));
+  } catch {
+    // Fine if already gone.
+  }
+}
+
+// ── #251 round 3: staging-dir promotion for the cold auto-build ──
+//
+// The cold `revkit serve` auto-build writes to a private
+// `.revkit/dist.staging-<pid>-<nonce>/` and, only after `check-dist`
+// passes, atomically renames it to `.revkit/dist`. If `.revkit/dist`
+// already exists at promotion time, serve keeps the existing one
+// and removes the staging dir instead (a concurrent winner's output
+// is authoritative). An orphaned astro from a SIGKILLed parent
+// writes only its own staging dir, which is never promoted; the
+// next cold serve removes stale staging dirs whose pid is dead.
+
+/** The prefix for staging dirs under `.revkit/`. A directory under
+ * `.revkit/` that starts with this prefix is managed by
+ * `revkit serve`'s cold-start build. */
+export const DIST_STAGING_PREFIX = "dist.staging-";
+
+/** Build a new staging dir name (not yet created): `dist.staging-
+ * <pid>-<base64url nonce>`. The pid identifies the parent so stale
+ * detection can check whether the writer is still alive. */
+export function newDistStagingName(pid: number, nonce: string): string {
+  // The nonce must be filesystem-safe; the caller is expected to pass
+  // a base64url-shaped token from `crypto.randomBytes(…).toString(
+  // "base64url")`. We defensively strip any character outside that
+  // alphabet to keep the format predictable.
+  const safeNonce = nonce.replace(/[^A-Za-z0-9_-]/g, "");
+  return `${DIST_STAGING_PREFIX}${pid}-${safeNonce}`;
+}
+
+/** The regex that `listDistStagingDirs` uses to recognise one of
+ * its own staging dirs. Exported for tests. */
+export const DIST_STAGING_RE = /^dist\.staging-(\d+)-[A-Za-z0-9_-]+$/;
+
+/** List every `.revkit/dist.staging-*` directory, with the pid
+ * parsed out of each name. Silent on a missing `.revkit/`. */
+export function listDistStagingDirs(
+  repoRoot: string,
+): Array<{ readonly name: string; readonly path: string; readonly pid: number }> {
+  const revkitDir = join(repoRoot, SERVE_STATE_DIR);
+  if (!existsSync(revkitDir)) return [];
+  let entries: string[];
+  try {
+    entries = readdirSync(revkitDir);
+  } catch {
+    return [];
+  }
+  const out: Array<{ name: string; path: string; pid: number }> = [];
+  for (const name of entries) {
+    const match = DIST_STAGING_RE.exec(name);
+    if (match === null) continue;
+    out.push({ name, path: join(revkitDir, name), pid: Number(match[1]) });
+  }
+  return out;
+}
+
+/** Is `pid` alive? `process.kill(pid, 0)` throws `ESRCH` when no
+ * process has that id. A permission error (`EPERM`) means a process
+ * with that pid EXISTS but is not ours — treat it as alive so we
+ * do not accidentally scrub a running daemon's staging dir (bullet
+ * 4 of the #251 round-3 brief). */
+export function pidIsAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM") return true;
+    return false;
+  }
+}
+
+/** Remove every `.revkit/dist.staging-*` directory whose owner pid
+ * is dead. Returns the names of the directories removed. Called by
+ * `revkit serve` before it mints its own staging dir, so an
+ * orphaned SIGKILLed-serve leftover never grows the tree. */
+export function cleanupOrphanedStagingDirs(repoRoot: string): readonly string[] {
+  const removed: string[] = [];
+  for (const entry of listDistStagingDirs(repoRoot)) {
+    if (pidIsAlive(entry.pid)) continue;
+    try {
+      rmSync(entry.path, { recursive: true, force: true });
+      removed.push(entry.name);
+    } catch {
+      // A permission error or a vanished dir is non-fatal; we only
+      // need to be eventually-clean.
+    }
+  }
+  return removed;
+}
+
+/** Atomically promote `stagingDir` to `finalDir` while the caller
+ * holds `.revkit/daemon.lock`. Returns:
+ *   - `"promoted"` when the rename succeeded and `finalDir` now
+ *     holds the staged output;
+ *   - `"kept-existing"` when `finalDir` already exists (a concurrent
+ *     winner beat us); the caller MUST discard `stagingDir`;
+ *   - `"failed"` on an unexpected IO error (surfaced via `error`).
+ *
+ * The rename IS the atomic guarantee (POSIX `renameat2` /
+ * `rename(2)` on the same filesystem). The pre-rename existence
+ * check is advisory and races a concurrent promotion; the rename
+ * then fails with `ENOTEMPTY` / `EEXIST`, which we translate to
+ * `kept-existing`. */
+export interface PromoteOutcome {
+  readonly kind: "promoted" | "kept-existing" | "failed";
+  readonly error?: string;
+}
+export function promoteStagingDir(stagingDir: string, finalDir: string): PromoteOutcome {
+  // Fast-path: a pre-existing final dir short-circuits the rename.
+  if (existsSync(finalDir)) {
+    return { kind: "kept-existing" };
+  }
+  try {
+    renameSync(stagingDir, finalDir);
+    return { kind: "promoted" };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTEMPTY" || code === "EEXIST") {
+      // Concurrent promotion landed between our existsSync and our
+      // rename; treat as "kept-existing" and let the caller clean
+      // up its staging dir.
+      return { kind: "kept-existing" };
+    }
+    return { kind: "failed", error: (error as Error).message };
+  }
 }

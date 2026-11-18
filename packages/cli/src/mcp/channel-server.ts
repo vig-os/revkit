@@ -1172,6 +1172,24 @@ export async function startChannelServer(options: ChannelServerOptions): Promise
               content: [{ type: "text", text: `revkit mcp: tool '${toolName}' rejected by daemon (${retryError.status}): ${retryError.body || retryError.message}` }],
             };
           }
+          // #251 B2/N1: `discover` throws distinct, agent-facing
+          // errors for the pre-bind window (`DaemonBuildingError`)
+          // and for a persisted start failure
+          // (`DaemonStartFailedError`). Pass the message straight
+          // through so the agent reads "daemon is building,
+          // 123 s elapsed" or "daemon failed to start: <reason>"
+          // instead of a wrapped "daemon unavailable: ..." that
+          // obscures the real state.
+          if (
+            retryError instanceof Error &&
+            (retryError.name === "DaemonBuildingError" ||
+              retryError.name === "DaemonStartFailedError")
+          ) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: retryError.message }],
+            };
+          }
           return {
             isError: true,
             content: [{ type: "text", text: `revkit mcp: daemon unavailable: tool '${toolName}' failed after reconnect: ${(retryError as Error).message}` }],

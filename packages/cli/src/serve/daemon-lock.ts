@@ -26,6 +26,21 @@
 // `acquireDaemonLock`, so mutual exclusion is between daemon
 // instances (which the round-3 blocker asks for). An external tool
 // that ignores flock cannot become "another daemon".
+//
+// #251 round 3: the lock is ALWAYS CLOEXEC. An earlier round
+// opened it `inheritable: true` so a SIGKILLed parent's astro
+// child could keep the flock alive across the build. That
+// mechanism was unsafe: Bun closes fds passed through `stdio`
+// when the Subprocess is garbage-collected, so a GC during serve
+// would close the serving daemon's own lock fd (reproduced:
+// `Bun.gc(true)` after a completed build dropped the flock, and
+// a second `revkit serve` then bound on the same repo, sharing
+// `threads.sqlite`). The race the inherited-fd fix tried to
+// close is now addressed through the OUTPUT instead: the cold
+// build writes to a private staging dir which `revkit serve`
+// atomically promotes while holding the lock (see
+// `serve/cli.ts`). An orphaned astro from a SIGKILLed serve
+// writes only its own staging dir, which is never promoted.
 
 import { closeSync, constants, openSync } from "node:fs";
 
@@ -79,14 +94,22 @@ function loadLibc(): LibcBindings {
   throw new Error(`daemon-lock: could not load libc (tried ${candidates.join(", ")}): ${String(lastError)}`);
 }
 
-/** A held daemon lock. `release()` is idempotent. */
+/** A held daemon lock. `release()` is idempotent. `fd` is the
+ * underlying OS file descriptor, exposed for diagnostic use only.
+ * Callers MUST NOT pass this fd to a subprocess (via `stdio` or
+ * otherwise): the lock is CLOEXEC and must stay that way, so the
+ * flock lives for exactly the serving process and dies with it.
+ * The #251 cold-start race is solved by staging-dir promotion, not
+ * fd inheritance. */
 export interface DaemonLock {
+  readonly fd: number;
   release(): void;
 }
 
 /** Try to acquire an exclusive OS-held lock on `lockPath`. Returns
  * the lock handle on success or `null` when another process already
- * holds it. `lockPath` is `open()`'d at mode 0600 (owner-only).
+ * holds it. `lockPath` is `open()`'d at mode 0600 (owner-only) and
+ * always CLOEXEC.
  *
  * The kernel releases the lock on process exit (any exit — clean
  * or not — because file descriptors are always closed). This means
@@ -101,14 +124,15 @@ export function acquireDaemonLock(lockPath: string): DaemonLock | null {
   //
   // `O_CLOEXEC` so the lock fd is not inherited by any subprocess
   // the daemon spawns (a child that inherits the fd would keep the
-  // lock alive past the daemon's exit, refusing every future start).
-  // Node's `fs.constants.O_CLOEXEC` is present on Linux and macOS
-  // — when it is missing we fall through to `fcntl(F_SETFD,
+  // lock alive past the daemon's exit, refusing every future
+  // start). Node's `fs.constants.O_CLOEXEC` is present on Linux and
+  // macOS — when it is missing we fall through to `fcntl(F_SETFD,
   // FD_CLOEXEC)` after the open.
   const O_CLOEXEC = (constants as { O_CLOEXEC?: number }).O_CLOEXEC ?? 0;
+  const openFlags = constants.O_RDWR | constants.O_CREAT | O_CLOEXEC;
   let fd: number;
   try {
-    fd = openSync(lockPath, constants.O_RDWR | constants.O_CREAT | O_CLOEXEC, 0o600);
+    fd = openSync(lockPath, openFlags, 0o600);
   } catch (error) {
     throw new Error(`daemon-lock: could not open '${lockPath}': ${(error as Error).message}`);
   }
@@ -135,6 +159,7 @@ export function acquireDaemonLock(lockPath: string): DaemonLock | null {
   }
   let released = false;
   return {
+    fd,
     release(): void {
       if (released) return;
       released = true;

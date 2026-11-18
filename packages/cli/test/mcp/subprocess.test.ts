@@ -81,6 +81,46 @@ describe("revkit mcp — real subprocess", () => {
     }
   }, 40_000);
 
+  test("#212: initialize completes in well under 1 s even when the daemon never starts", async () => {
+    // Issue #212: `revkit mcp` used to call `ensureDaemon`
+    // synchronously BEFORE `server.connect(transport)`, so a daemon
+    // that could not start held `initialize` for the full ~10 s
+    // bootstrap timeout. The fix defers bootstrap to the first
+    // tool-call's reconnect path, so `initialize` must return
+    // promptly regardless.
+    //
+    // `.revkit` as a file keeps the daemon from creating its state
+    // directory — the daemon spawn will fail fast. The client must
+    // still receive `initialize` in well under 1 s. A pre-fix
+    // run of this assertion observed ~10 s.
+    writeFileSync(join(root, ".revkit"), "occupied");
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [REVKIT_BIN, "mcp", "--dir", "dist"],
+      cwd: root,
+      env: { ...filteredDaemonEnv(process.env), PATH: "" },
+    });
+    const client = new Client({ name: "initialize-latency", version: "0" });
+    const started = Date.now();
+    try {
+      await client.connect(transport);
+      const elapsedMs = Date.now() - started;
+      // 1 s is the bound #212 names; bump the assertion a little
+      // to account for process spawn + stdio pipe setup on a
+      // shared host (vm-dev under load), while staying well below
+      // the pre-fix 10 s observed.
+      expect(elapsedMs).toBeLessThan(2_000);
+      // And the first tool call surfaces the daemon unavailability
+      // diagnostically (the deferred-bootstrap contract), not by
+      // blocking initialize.
+      const result = await client.callTool({ name: "threads", arguments: {} });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain("daemon unavailable");
+    } finally {
+      await client.close();
+    }
+  }, 30_000);
+
   test("initialize + tools/list against a fresh spawned daemon", async () => {
     // Assert the binary is executable up front — a permission drop
     // (chmod during install) would otherwise surface as a cryptic
