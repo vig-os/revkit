@@ -255,6 +255,14 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
   // astro child (and its whole process group) dies with us
   // instead of continuing orphaned.
   //
+  // #251 round 4 BLOCKER 3: astro's SIGTERM handler installs an
+  // orderly-shutdown path that can take tens of seconds (observed
+  // 131 s in a real build while holding the daemon lock). The
+  // AbortController's listener in the default spawner first sends
+  // SIGTERM to the astro child's whole process group, then
+  // SIGKILLs the group after a `SIGKILL_GRACE_MS` grace period so
+  // serve always exits promptly on a user signal.
+  //
   // SIGKILL safety is provided through the OUTPUT: the auto-build
   // writes to a private `.revkit/dist.staging-<pid>-<nonce>`
   // directory which this process atomically promotes to
@@ -321,6 +329,19 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     }
   };
 
+  // #251 round 4 BLOCKER 2: compute the fingerprint ONCE, BEFORE
+  // the build runs. A build often takes minutes; during that window
+  // the user may save a fix. If we recomputed AFTER the build
+  // failed, the record would carry the POST-fix hash and MCP's
+  // comparison against the then-current inputs would match — the
+  // record would then suppress every retry for a bug that is
+  // already fixed. The pre-build fingerprint pins "the inputs that
+  // failed", and any edit after it flips the current-tree hash so
+  // ensureDaemon clears the suppression on the next tool call.
+  const preBuildFingerprint = needsAutoBuild
+    ? (computeInputFingerprint(repoRoot) ?? "")
+    : "";
+
   if (needsAutoBuild) {
     // Auto-build the consumer's tree before serving. If it fails,
     // release the lock and surface the build error. A concurrent
@@ -360,7 +381,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
           message,
           failedAt: new Date().toISOString(),
           version: env.version,
-          inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+          inputs: { fingerprint: preBuildFingerprint },
         });
       }
       acquired?.release();
@@ -389,7 +410,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
           stderrTail,
           failedAt: new Date().toISOString(),
           version: env.version,
-          inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+          inputs: { fingerprint: preBuildFingerprint },
         });
       }
       acquired?.release();
@@ -417,7 +438,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
           message,
           failedAt: new Date().toISOString(),
           version: env.version,
-          inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+          inputs: { fingerprint: preBuildFingerprint },
         });
         acquired?.release();
         return {
@@ -478,12 +499,20 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     const abortedBySignal = buildAbort?.signal.aborted === true;
     const lockContention = isLockContentionError(message);
     if (!abortedBySignal && !lockContention) {
+      // Use the same pre-build fingerprint so a start-time failure
+      // and its earlier build-failure variants refer to the same
+      // "inputs that failed" snapshot. When no auto-build ran
+      // (`--dir` explicit), fall back to the current tree.
+      const fingerprint =
+        preBuildFingerprint.length > 0
+          ? preBuildFingerprint
+          : (computeInputFingerprint(repoRoot) ?? "");
       writeStartFailure(repoRoot, {
         stage: "start-failed",
         message: `revkit serve: startDaemon failed: ${message}`,
         failedAt: new Date().toISOString(),
         version: env.version,
-        inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+        inputs: { fingerprint },
       });
     }
     acquired?.release();

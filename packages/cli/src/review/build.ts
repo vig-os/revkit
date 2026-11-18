@@ -81,11 +81,12 @@ export interface SpawnResult {
  * SIGTERM without orphaning the astro child.
  *
  * The default spawner runs the child in its own process GROUP
- * (via `detached: true`) and `kill`s the whole group when `signal`
- * aborts, so a nested vite / node sub-process cannot outlive the
- * SIGTERMed serve. Implementations should preserve this contract
- * — either reuse the default, or call `process.kill(-child.pid,
- * "SIGTERM")` from an `abort` listener. */
+ * (via `detached: true`) and, on abort, sends SIGTERM to the whole
+ * group, then escalates to SIGKILL after `SIGKILL_GRACE_MS` so a
+ * child that catches SIGTERM (astro installs its own handler)
+ * cannot wedge serve on exit. Implementations should preserve
+ * this contract — either reuse the default, or send SIGTERM then
+ * SIGKILL to `-child.pid` from an `abort` listener. */
 export type SpawnLike = (options: {
   readonly cmd: readonly string[];
   readonly cwd: string;
@@ -433,7 +434,25 @@ export function unlinkStale(target: string): void {
   }
 }
 
-const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
+/** How long (ms) the default spawner waits for a child's process
+ * group to exit on SIGTERM before escalating to SIGKILL (#251
+ * round 4 BLOCKER 3). Astro installs its own SIGTERM handler that
+ * runs an orderly-shutdown path; a real run observed it holding
+ * the daemon lock for 131 s after the parent sent SIGTERM. The
+ * escalation bounds `revkit serve`'s exit at `SIGKILL_GRACE_MS +
+ * the time to deliver SIGKILL + the time bun reaps the child`,
+ * which is well under the 10 s bootstrap deadline MCP uses.
+ *
+ * 5 s is enough for a well-behaved astro to flush its vite /
+ * esbuild workers and exit cleanly (observed under a second when
+ * astro's own handler doesn't catch), but short enough that a
+ * stuck handler cannot wedge the whole system. */
+export const SIGKILL_GRACE_MS = 5_000;
+
+/** The default `SpawnLike` implementation. Exported so a test of
+ * the SIGTERM → SIGKILL escalation drives the production path, not
+ * a half-reimplementation of it (#251 round 4 test 3). */
+export const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
   // The child runs in its OWN process group (`detached: true`), so
   // an abort can kill the whole group — astro, vite, every
   // chain-spawned node. Without the group kill, `child.kill()`
@@ -448,24 +467,41 @@ const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
     // Bun's spawn: the child becomes a process-group leader.
     detached: true,
   });
-  const onAbort = (): void => {
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const sendToGroup = (sig: NodeJS.Signals): void => {
     // Kill the WHOLE group (negative pid). Falls back to killing
     // just the child when the group kill is refused (ESRCH after
     // normal exit; EPERM if Bun ever reparents).
     try {
-      process.kill(-proc.pid, "SIGTERM");
+      process.kill(-proc.pid, sig);
     } catch {
       try {
-        proc.kill("SIGTERM");
+        proc.kill(sig);
       } catch {
         /* already dead */
       }
     }
   };
+  const onAbort = (): void => {
+    sendToGroup("SIGTERM");
+    // #251 round 4 BLOCKER 3: escalate to SIGKILL if SIGTERM is
+    // caught (astro installs its own SIGTERM handler). `exited`
+    // resolves on reap, and the `.then` below clears the timer on
+    // a cooperative exit.
+    killTimer = setTimeout(() => sendToGroup("SIGKILL"), SIGKILL_GRACE_MS);
+  };
   if (signal !== undefined) {
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
   }
+  // Clear the escalation timer the instant the child is reaped,
+  // whether it exited cooperatively or we killed it.
+  void proc.exited.then(() => {
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
+  });
   try {
     const [stdout, stderr] = await Promise.all([
       new Response(proc.stdout).text(),
@@ -475,6 +511,10 @@ const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
     return { stdout, stderr, exitCode };
   } finally {
     if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
   }
 };
 

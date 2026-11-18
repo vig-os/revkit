@@ -299,12 +299,19 @@ describe("daemon-lock (raw acquire / release)", () => {
         child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
       }
       await child.exited;
-      // Drop the Subprocess reference and force GC. The round-2
-      // reviewer reproduced the drop with this exact shape.
+      // Drop the Subprocess reference and force several GC cycles
+      // with 200 ms spacings. The round-4 falsifier saw the pre-
+      // fix round-2 bug (3e4ad4c) stay dormant on a single
+      // `Bun.gc(true) + 50 ms` sequence and only reproduced with
+      // repeated cycles — one GC cycle freed the Subprocess
+      // reference, subsequent cycles ran the finalizers that
+      // closed the inherited stdio fds. Five 200 ms cycles
+      // match the falsifier's observed minimum.
       child = undefined;
-      Bun.gc(true);
-      // Give Bun a tick to actually close resources.
-      await Bun.sleep(50);
+      for (let i = 0; i < 5; i++) {
+        Bun.gc(true);
+        await Bun.sleep(200);
+      }
       // Second acquire MUST be refused — the serving daemon
       // (this test fixture) still holds the flock.
       const refused = acquireDaemonLock(daemonLockPath(repoRoot));

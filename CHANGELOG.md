@@ -163,25 +163,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     process is dead, so a mid-race read never points the agent at a
     vanished pid.
   - **Build failure reaches the MCP caller through an input-aware
-    record (round 3).** `revkit serve` persists
-    `.revkit/start-failed.json` ONLY for a genuine build or
-    check-dist failure — never for lock contention, a SIGTERM /
-    SIGINT abort, or a bind-time race. The record carries an input
-    fingerprint: SHA-256 over `docs/`, `vocab/`, `plots/` (paths +
-    sizes + mtimes) plus `package.json` under the consumer root (see
-    `packages/cli/src/serve/input-fingerprint.ts`,
-    `FINGERPRINT_INPUT_ROOTS` / `FINGERPRINT_CONFIG_FILES`).
+    record (round 3, widened in round 4).** `revkit serve`
+    persists `.revkit/start-failed.json` ONLY for a genuine build
+    or check-dist failure — never for lock contention, a SIGTERM /
+    SIGINT abort, or a bind-time race. Round 4 widens the input
+    fingerprint to the WHOLE repo-root file listing: SHA-256 over
+    the paths returned by `git ls-files -co --exclude-standard`
+    (tracked + untracked-not-ignored) in a git working tree, or a
+    fallback filesystem walk that skips `.revkit/`, `node_modules/`,
+    `.git/` and common dist/cache dirs otherwise. For each listed
+    file the hash mixes repo-relative POSIX path + size +
+    integer-millisecond mtime; revkit's own CLI version is also
+    mixed in so a CLI upgrade invalidates every prior record (#251
+    round 4 test 4), and `package.json` is always-mixed as
+    belt-and-braces. See `packages/cli/src/serve/input-fingerprint.ts`,
+    `FINGERPRINT_WALK_SKIP` / `FINGERPRINT_CONFIG_FILES`.
     `ensureDaemon` refuses to respawn only while the current
-    fingerprint matches the recorded one; any edit under those trees,
-    a successful `revkit check` on the full tree, a successful
-    `revkit build`, or a successful `revkit serve` bind clears or
-    invalidates the record. The pre-fix key was `distExists`, so a
-    content fix could not lift the suppression without manually
-    running `revkit build` first; the round-2 shape also wrote
-    `stage: "aborted"` on every SIGTERM, which then wedged MCP until
-    the user removed the file by hand. Both issues resolved in round
-    3. Manual escape (`revkit serve` directly, or `rm
-    .revkit/start-failed.json`) documented in `SKILL.md`.
+    fingerprint matches the recorded one; any edit anywhere in the
+    tree, a successful `revkit check`, a successful `revkit build`,
+    or a successful `revkit serve` bind clears or invalidates the
+    record. Pre-round-4, the hash only covered `docs/`, `vocab/`,
+    `plots/` and `package.json`, so fixing or deleting a broken
+    file outside those trees (e.g. `components/Widget.tsx` — refused
+    by `revkit check`'s `no-hand-rolled-ui`) left the recorded hash
+    unchanged and MCP kept suppressing. **The fingerprint is
+    computed ONCE, BEFORE the build starts**, and carried through
+    to the record (#251 round 4 BLOCKER 2) — a user fix saved
+    mid-build is NEVER absorbed into the recorded hash. The pre-
+    round-4 code recomputed after the failure, so a fix saved
+    during the build matched the recorded hash on the next poll
+    and MCP suppressed retries for a bug that was already fixed.
+    **Known limit.** A same-size, same-mtime edit (`touch -r a b`
+    style surgery, or a byte-identical overwrite restored to its
+    prior mtime) is not detected — we hash metadata, not contents,
+    because walking every byte of a consumer tree on every MCP
+    `ensureDaemon` call is too expensive. The manual escape (`rm
+    .revkit/start-failed.json`, `revkit serve` directly) is
+    documented in `SKILL.md`. The round-2 shape also wrote
+    `stage: "aborted"` on every SIGTERM, which then wedged MCP
+    until the user removed the file by hand; that was resolved in
+    round 3.
+  - **Prompt SIGKILL escalation on a signalled cold build (#251
+    round 4 BLOCKER 3).** Astro installs its own SIGTERM handler
+    that runs an orderly-shutdown path; a real cold build observed
+    it holding `.revkit/daemon.lock` for 131 s after `revkit
+    serve` forwarded SIGTERM. The shared default spawner now
+    sends SIGTERM to the astro child's whole process group and,
+    if the group is still alive after `SIGKILL_GRACE_MS` (5 s
+    named constant in `packages/cli/src/review/build.ts`),
+    SIGKILLs the group. `revkit serve` therefore exits promptly on
+    a user signal, releases the lock, and leaves `.revkit/dist`
+    alone (the orphan's staging dir is never promoted); no start-
+    failure record is planted for a signal abort.
   - **`revkit open` during a cold-start.** Now reports
     `a daemon is starting (cold-start auto-build, pid X, N s
     elapsed since …)` instead of the misleading "no daemon is

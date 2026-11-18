@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseServeArgs, readOrMintLocalUserId, runServeCommand } from "../../src/serve/cli.ts";
+import { computeInputFingerprint } from "../../src/serve/input-fingerprint.ts";
 import {
   DIST_STAGING_PREFIX,
   listDistStagingDirs,
@@ -305,6 +306,55 @@ describe("runServeCommand — #251 round 3: signal handling, staging promotion, 
     expect(readFileSync(join(root, ".revkit", "dist", "index.html"), "utf8")).toContain("second-build-winner");
     expect(readFileSync(join(root, ".revkit", "dist", "index.html"), "utf8")).not.toContain("orphan");
   }, 15_000);
+
+  test(
+    "#251 round 4 BLOCKER 2: a fix written DURING the build is NOT absorbed into the recorded fingerprint",
+    async () => {
+      // Pre-fix (round 3): the fingerprint was computed AFTER the
+      // build failed, so a user who saved a fix while the build
+      // ran had their fix hashed into the record; MCP then saw the
+      // "new" fingerprint == recorded fingerprint and suppressed
+      // every retry for a bug that was already fixed. Round 4
+      // pins the pre-build fingerprint and writes it to disk
+      // verbatim.
+      mkdirSync(join(root, "docs"), { recursive: true });
+      writeFileSync(join(root, "docs", "a.md"), "# broken\n");
+      const preBuild = computeInputFingerprint(root);
+      expect(preBuild).toBeDefined();
+
+      const result = await runServeCommand([], {
+        cwd: root,
+        version: "test-0.1.0",
+        runBuildOverride: async () => {
+          // Simulate the user saving a fix mid-build: touch a doc
+          // AND mutate another input the whole-tree fingerprint
+          // covers.
+          writeFileSync(join(root, "docs", "a.md"), "# fixed\n");
+          mkdirSync(join(root, "components"), { recursive: true });
+          writeFileSync(join(root, "components", "Widget.tsx"), "export const x = 1;\n");
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: "revkit build: astro build exited 1. Tail: a page body is empty",
+          };
+        },
+      });
+      expect(result.exitCode).not.toBe(0);
+      const failure = readStartFailure(root);
+      expect(failure).toBeDefined();
+      const recorded = failure?.inputs.fingerprint ?? "";
+      const postBuild = computeInputFingerprint(root);
+      expect(postBuild).toBeDefined();
+      // Round 4 contract: the record carries the PRE-BUILD
+      // fingerprint, NOT the post-build one.
+      expect(recorded).toBe(preBuild!);
+      expect(recorded).not.toBe(postBuild!);
+      // Consequence: `ensureDaemon` comparing the current tree
+      // with the recorded fingerprint will see a mismatch and
+      // clear the suppression on the next MCP tool call.
+    },
+    15_000,
+  );
 
   test("successful bind clears any stale start-failed.json", async () => {
     // Seed a stale record from a prior failed attempt.

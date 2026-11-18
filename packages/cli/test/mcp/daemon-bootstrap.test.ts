@@ -710,6 +710,95 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
     expect(result.state.instanceId).toBe("ready-n1-stale");
   });
 
+  test(
+    "#251 round 4 BLOCKER 1: fixing or deleting a broken file OUTSIDE docs/ clears the suppression on the next ensureDaemon",
+    async () => {
+      // Repro of the architect's probe: pre-fix, `revkit build`
+      // checks the whole consumer tree, so a bad
+      // `components/Widget.tsx` fails the build and
+      // `revkit serve` records a start failure. But the recorded
+      // fingerprint only covered docs/vocab/plots/package.json,
+      // so DELETING the broken file left the hash unchanged and
+      // MCP kept suppressing every retry. Round 4 widens the
+      // fingerprint to the whole repo-root listing.
+      const failure: StartFailureRecord = {
+        stage: "build-failed",
+        message: "revkit serve: astro build exited 1 (components/Widget.tsx broken)",
+        failedAt: new Date().toISOString(),
+        version: "0.0.0-test",
+        inputs: { fingerprint: "fp-with-widget" },
+      };
+      const ready = fixtureState({ instanceId: "ready-fp-fixed" });
+      // `computeInputFingerprint` reports a DIFFERENT hash now
+      // (the broken file was fixed/deleted on disk). This is the
+      // mutation under test — pre-fix, the function returned
+      // "fp-with-widget" because it ignored components/, so
+      // ensureDaemon would throw DaemonStartFailedError and never
+      // reach the spawn below.
+      let clearCalled = 0;
+      let spawnCount = 0;
+      const result = await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: (() => {
+          let n = 0;
+          return () => (n++ === 0 ? undefined : ready);
+        })(),
+        readStartFailure: () => failure,
+        clearStartFailure: () => {
+          clearCalled++;
+        },
+        computeInputFingerprint: () => "fp-AFTER-widget-fixed",
+        spawn: () => {
+          spawnCount++;
+          return { pid: 555 };
+        },
+        sleep: async () => {},
+        pollIntervalMs: 1,
+        waitMs: 100,
+      });
+      expect(clearCalled).toBe(1);
+      expect(spawnCount).toBe(1);
+      expect(result.spawned).toBe(true);
+      expect(result.state.instanceId).toBe("ready-fp-fixed");
+    },
+  );
+
+  test(
+    "#251 round 4 BLOCKER 1 test 4: a revkit version change invalidates the suppression",
+    async () => {
+      // The record was written by an older revkit; the current
+      // CLI's fingerprint mixes the NEW version into the hash so
+      // the comparison fails and MCP respawns under the new CLI.
+      const failure: StartFailureRecord = {
+        stage: "build-failed",
+        message: "revkit serve: auto-build failed under previous version",
+        failedAt: new Date().toISOString(),
+        version: "0.0.0-prior",
+        inputs: { fingerprint: "fp-under-version-prior" },
+      };
+      const ready = fixtureState({ instanceId: "ready-version-upgrade" });
+      let clearCalled = 0;
+      const result = await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: (() => {
+          let n = 0;
+          return () => (n++ === 0 ? undefined : ready);
+        })(),
+        readStartFailure: () => failure,
+        clearStartFailure: () => {
+          clearCalled++;
+        },
+        computeInputFingerprint: () => "fp-under-version-NEW",
+        spawn: () => ({ pid: 777 }),
+        sleep: async () => {},
+        pollIntervalMs: 1,
+        waitMs: 100,
+      });
+      expect(clearCalled).toBe(1);
+      expect(result.spawned).toBe(true);
+    },
+  );
+
   test("#251 round-3 nit: DaemonBuildingError omits the pid when the recorded serve process is dead", async () => {
     // The pre-revert path named the serve pid even after it was
     // SIGKILLed (the astro child kept the lock alive through the
