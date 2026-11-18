@@ -23,6 +23,7 @@ import { spawnGh } from "./gh-runner.ts";
 import { runEscalate } from "./escalate.ts";
 import { findRepoRootByPackageJson } from "./repo-root.ts";
 import { runServeCommand } from "./serve/cli.ts";
+import { runHostCommand } from "./host/host-cli.ts";
 import { runBuildCommand } from "./build/cli.ts";
 import { runMcpCommand } from "./mcp/cli.ts";
 import { runOpenCommand } from "./open-cli.ts";
@@ -49,6 +50,7 @@ Usage:
   revkit escalate "<need>"
   revkit build [--dir <path>] [--out <path>]
   revkit serve [--dir <path>] [--port <n>] [--no-auto-build]
+  revkit host --config <path>
   revkit mcp [--dir <path>]
   revkit open [<path>]
   revkit review <pr-number|url> [--trust <sha>] [--no-serve] [--repo <slug>]
@@ -78,6 +80,16 @@ path — no bunx, no npx, no registry fetch. Output lands at
 <consumer>/.revkit/cache/ so nothing is written into the nix store
 or the packaged site directory. Runs 'revkit check' before and
 'revkit check-dist' after (ADR-0012 output gate).
+
+host boots the Linux-host target server (ADR-0026 §"Plain Linux
+host / VM", #195 sub-issue 2): a Bun.serve process bound to a unix
+socket (default) or a single-tenant loopback TCP port, with
+identity from the trusted-proxy provider, a base-path-aware route
+table and an optional per-site allowed-groups gate. No .revkit/
+workspace at the CWD is required — the --config file names every
+resource. Agent routes (/api/*, /events?for=agent, bearer
+Authorization) are 404 on this listener; the agent surface stays
+on 'revkit serve'.
 
 serve boots the local daemon (ADR-0013, ADR-0006/0007): Bun.serve
 bound to 127.0.0.1 on a random free port (--port 0), serving
@@ -214,6 +226,16 @@ export async function dispatch(
       version: VERSION,
       repoSlug: env.repoSlug,
     });
+    return {
+      stdout: outcome.stdout,
+      stderr: outcome.stderr,
+      exitCode: outcome.exitCode,
+      ...(outcome.blockForever !== undefined ? { blockForever: outcome.blockForever } : {}),
+    };
+  }
+
+  if (first === "host") {
+    const outcome = await runHostCommand(rest, { cwd: env.cwd });
     return {
       stdout: outcome.stdout,
       stderr: outcome.stderr,
