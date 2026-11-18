@@ -47,12 +47,21 @@ export type IdentityResolution =
 /** One request → one identity (or a refusal). An auth provider is a
  * resolver with a specific shape; a local resolver is a resolver
  * that composes the three local credentials; a stub is a resolver
- * that returns a fixed actor for tests. */
+ * that returns a fixed actor for tests.
+ *
+ * #245 adds the optional `peer` argument so the dispatcher can tell
+ * the resolver which socket the request arrived on. The host target's
+ * `trusted-proxy` provider is the whole reason: its allowlist check
+ * runs on the TCP peer address (NOT `X-Forwarded-For`), and the peer
+ * only becomes known once the request reaches `Bun.serve`'s fetch
+ * callback. Local and static resolvers ignore the argument; it is
+ * optional so existing call sites (and the resolver's own unit tests
+ * that pin a constant peer at construction) stay compiling. */
 export interface IdentityResolver {
   /** Short label for structured logs (`local`, `trusted-proxy`,
    * `stub`). */
   readonly id: string;
-  resolve(request: Request): Promise<IdentityResolution>;
+  resolve(request: Request, peer?: AuthRequestPeer): Promise<IdentityResolution>;
 }
 
 /** Options for the local identity resolver. `agentActor` is minted on
@@ -67,12 +76,15 @@ export interface LocalIdentityResolverOptions {
 /** Wrap today's `AuthState` as the local target's identity resolver.
  * Matches `identifyActor`'s historical behaviour exactly: agent
  * bearer wins; session cookie is the human path; anything else is
- * `401`. */
+ * `401`. The `peer` argument is accepted for interface uniformity
+ * but ignored — the local target binds to loopback only, so the
+ * credential IS the identity (ADR-0013). */
 export function createLocalIdentityResolver(options: LocalIdentityResolverOptions): IdentityResolver {
   const { auth, port, localActor, agentActor } = options;
   return {
     id: "local",
-    async resolve(request: Request): Promise<IdentityResolution> {
+    async resolve(request: Request, _peer?: AuthRequestPeer): Promise<IdentityResolution> {
+      void _peer;
       const bearer = bearerFromHeader(request.headers.get("authorization"));
       if (bearer !== undefined && auth.isAgent(bearer)) {
         return { kind: "ok", actor: agentActor };
@@ -86,19 +98,27 @@ export function createLocalIdentityResolver(options: LocalIdentityResolverOption
   };
 }
 
-/** Options for the AuthProvider-backed resolver. `peer` is how the
- * resolver tells the provider which transport the request arrived on
- * (ADR-0026 `AuthRequest.peer`). Callers that cannot determine the
- * peer per request may pass a constant (e.g. the unix socket of the
- * host listener). */
+/** Options for the AuthProvider-backed resolver.
+ *
+ * #245 made the dispatcher's `resolve(request, peer)` call carry the
+ * peer, so the construction-time `peer` function is now a FALLBACK —
+ * used only when the caller (test code; a resolver run outside the
+ * dispatcher) does not pass one. The dispatcher always passes one in
+ * production, computed from the real `Bun.serve` socket (TCP peer
+ * address, or `{transport: "unix"}` for a socket listener). This
+ * closes the #281 review gap: the earlier shape forced the peer to be
+ * known at resolver-construction time, which was before `Bun.serve`
+ * had bound a socket, so the host target had no way to reach the real
+ * peer address. */
 export interface AuthProviderIdentityResolverOptions {
   readonly provider: AuthProvider;
-  /** Peer selector: compute the transport + address from the request.
-   * For a unix-socket host, return `{ transport: "unix" }`. For a
-   * loopback TCP single-tenant listener, return `{ transport: "tcp",
-   * address }`. The function is called per request so a dual-stack
-   * listener can decide by connection, not by configuration. */
-  readonly peer: (request: Request) => AuthRequestPeer;
+  /** Fallback peer selector for callers that do not pass a `peer`
+   * into `resolve`. Optional; when absent, a `resolve` call without
+   * an explicit `peer` is a programmer error — the resolver refuses
+   * with `401` / `no-peer` so a dispatcher that forgot to wire it
+   * through fails loudly instead of silently handing the provider a
+   * unix-socket transport it may not trust. */
+  readonly peer?: (request: Request) => AuthRequestPeer;
 }
 
 /** Map an ADR-0026 `AuthProvider` onto the handler's resolver shape.
@@ -109,15 +129,22 @@ export interface AuthProviderIdentityResolverOptions {
 export function createAuthProviderIdentityResolver(
   options: AuthProviderIdentityResolverOptions,
 ): IdentityResolver {
-  const { provider, peer } = options;
+  const { provider, peer: fallbackPeer } = options;
   return {
     id: provider.id,
-    async resolve(request: Request): Promise<IdentityResolution> {
+    async resolve(request: Request, peer?: AuthRequestPeer): Promise<IdentityResolution> {
+      const effective = peer ?? fallbackPeer?.(request);
+      if (effective === undefined) {
+        // Fail-closed: a dispatcher that neither passes a peer nor
+        // configured a fallback cannot satisfy the provider's trust
+        // check. Refusing beats guessing a transport.
+        return { kind: "refused", status: 401, reason: "no-peer" };
+      }
       const result = await provider.authenticate({
         method: request.method,
         url: request.url,
         headers: request.headers,
-        peer: peer(request),
+        peer: effective,
       });
       if (result.kind === "identity") {
         const actor: Author = {
@@ -149,7 +176,8 @@ export interface StaticIdentityResolverOptions {
 export function createStaticIdentityResolver(options: StaticIdentityResolverOptions): IdentityResolver {
   return {
     id: "stub",
-    async resolve(request: Request): Promise<IdentityResolution> {
+    async resolve(request: Request, _peer?: AuthRequestPeer): Promise<IdentityResolution> {
+      void _peer;
       const refusal = options.refuse?.(request);
       if (refusal !== undefined) {
         return { kind: "refused", status: refusal.status, reason: refusal.reason };
