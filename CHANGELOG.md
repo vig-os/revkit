@@ -83,15 +83,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     interface returns one identity from headers alone and cannot carry a launch-code exchange that mints a cookie —
     so `createLocalIdentityResolver` keeps the three-credential state behind `AuthState` and projects whichever actor
     each credential already minted in the pre-split daemon.
-  - `createLoopbackGuardPolicy({port})` is applied on `revkit serve` unless the caller overrides it. The pre-existing
-    `isLoopbackHost` / `isLoopbackOrigin` helpers in `auth.ts` stay for the test suite; the dispatcher goes through
-    the policy from now on.
+  - `createLoopbackGuardPolicy({port})` is applied on `revkit serve` unless the caller overrides it.
+    `isLoopbackHost` / `isLoopbackOrigin` / `isSecFetchAcceptable` live in `guard-policy.ts` so the loopback
+    policy factory and the test suite share a single implementation (#279 round 2, blocker 2). `auth.ts` keeps
+    only the credential state (launch code, session cookie, agent token); the request-shape helpers moved.
 - **Agent-only route groups return `404` on any non-loopback target**
   ([#279](https://github.com/vig-os/revkit/issues/279))
   - Enforced at the dispatcher's one-shot 404 guard, before the method-sensitive branches that would otherwise answer
     `405 Method Not Allowed`. `test/serve/composable-handler.test.ts` pins this across every agent-only path the host
     target must not expose, and the `/events?for=agent` branch is pinned separately (the query parameter can smuggle
     past a path-only check).
+  - `assertRouteGroupsCompatibleWithPolicy` keys on a new `GuardPolicy.allowsAgentRoutes` flag (set only by
+    `createLoopbackGuardPolicy`), not on `policy.id === "loopback"` — a bespoke policy that spells its id
+    `"loopback"` cannot reach the agent surface. A regression test pins the spoofed-id refusal.
+- **`/api/events-head` now flows through the injected `IdentityResolver`** ([#279](https://github.com/vig-os/revkit/issues/279))
+  - Round 1 left `handleEventsHeadApi` on the direct `auth.hasSession` / agent-bearer path. The rail fetches
+    the events tip BEFORE opening `/events`, so a proxied reviewer on the host target would have lost its
+    resume point. The handler now calls `identifyActor` like every other shared route. The
+    "shared routes remain reachable" test asserts exact `200` statuses (not `!= 404`) so the regression is
+    caught the moment it reappears.
+- **`hasValidBearer` is forced false on any non-loopback target** ([#279](https://github.com/vig-os/revkit/issues/279))
+  - Even though no agent routes exist on the host target, a client that submits a bearer value under a shared
+    route (threads, events-head, `/events`) must not reap the bearer branch's origin leniency. A single
+    `hasValidAgentBearerFor` helper gates the inline check on `routeGroups.agentEvents`; a regression test
+    sends a `Bearer any-value` on a cross-origin POST and asserts `403`.
+- **Host guard policy carries the deployment's base path** ([#279](https://github.com/vig-os/revkit/issues/279))
+  - `createPublicOriginGuardPolicy` derives `basePath` from the configured public origin's pathname. The
+    dispatcher 404s any request whose pathname is neither the base path nor starts with `basePath + "/"`
+    (ADR-0026 §"Plain Linux host / VM"; #195 implementation scope then adds sub-path routing inside the
+    prefix). The loopback policy's `basePath` is `""` so `revkit serve` is unchanged.
+- **Local `request.rejected.origin` log shape restored** ([#279](https://github.com/vig-os/revkit/issues/279))
+  - Round 1 drifted into `{ requestId, origin: "", reason: "sfs=…" }` for cross-origin POSTs. Restored to
+    the pre-refactor shape: `{ requestId, origin }` when `Origin` is present, `{ requestId, reason }` when
+    it is absent — a byte-for-byte match against `dev` on the local path.
 
 ### Deprecated
 

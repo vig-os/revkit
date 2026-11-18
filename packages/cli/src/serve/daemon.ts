@@ -1210,6 +1210,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(response, "text", undefined);
     }
 
+    // Base-path gate (#279 round-2; ADR-0026 §"Plain Linux host / VM"
+    // sub-path support, #195 implementation scope). When the policy
+    // carries a non-empty `basePath`, every URL must either equal it
+    // or start with `basePath + "/"`. A request outside the prefix
+    // is 404 — the handler acknowledges nothing at the wrong root.
+    // basePath is "" on the loopback policy so the local daemon's
+    // dispatch is unchanged.
+    if (guardPolicy.basePath !== "") {
+      const prefix = guardPolicy.basePath;
+      if (url.pathname !== prefix && !url.pathname.startsWith(prefix + "/")) {
+        logger.warn("request.rejected.base-path", { requestId, path: url.pathname });
+        return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+      }
+    }
+
     const method = request.method.toUpperCase();
 
     // #279 AC3 / ADR-0026 §"Plain Linux host / VM" → Authorization:
@@ -1315,7 +1330,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // reached only for `/api/threads*`, so a handler placed there for
     // a different path is unreachable and 404s. (It did, once.)
     if (url.pathname === "/api/events-head" && routeGroups.eventsHeadApi) {
-      return handleEventsHeadApi(request, method, requestId);
+      return await handleEventsHeadApi(request, method, requestId);
     }
 
     // Delivery mode + handover + presence + delivered-set (M2 item 6,
@@ -1430,10 +1445,25 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // slip past this call site.
       return withHygiene(new Response(null, { status: 307, headers: { location: outcome.location } }), "text", undefined);
     }
+    // Restore the pre-refactor log shape (#279 round-2): a rejected
+    // request with `Origin` present logs `{ requestId, origin }` and
+    // nothing else; one with `Origin` absent logs
+    // `{ requestId, reason }` where the reason names the Sec-Fetch-
+    // Site value (or "missing"). An empty `origin: ""` field and a
+    // `reason: "sfs=<...>"` on a cross-origin POST never existed on
+    // `dev` — this keeps the local refactor zero-change.
     if (outcome.reason === "origin-not-allowed") {
-      logger.warn("request.rejected.origin", { requestId, origin: origin ?? "", reason: sfs === null ? "missing" : `sfs=${sfs}` });
+      if (origin !== null) {
+        logger.warn("request.rejected.origin", { requestId, origin });
+      } else {
+        logger.warn("request.rejected.origin", { requestId, reason: sfs === null ? "missing" : `sfs=${sfs}` });
+      }
     } else {
-      logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs ?? "" });
+      // `sec-fetch-not-allowed` is only reached when `sfs` is a
+      // non-null value the policy refused (`isSecFetchAcceptable`
+      // accepts null). Log the raw header, matching the pre-refactor
+      // `{requestId, reason: sfs}` shape.
+      logger.warn("request.rejected.sec-fetch", { requestId, reason: sfs ?? "missing" });
     }
     return withHygiene(new Response("Forbidden", { status: outcome.status }), "text", "text/plain; charset=utf-8");
   }
@@ -1542,8 +1572,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // Origin gate runs BEFORE authentication so a page from another
     // loopback port cannot smuggle the browser's session cookie into
     // a same-site API call (browsers do not partition cookies by port).
-    const bearer = bearerFromHeader(request.headers.get("authorization"));
-    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    // `hasValidBearer` is forced false on any non-loopback target
+    // (the host has no agent bearer; see `hasValidAgentBearerFor`),
+    // so the bearer path's origin leniency cannot be entered there
+    // even if a client submits the local bearer value.
+    const hasValidBearer = hasValidAgentBearerFor(request);
     const originRejection = checkOrigin(request, requestId, hasValidBearer);
     if (originRejection !== undefined) return originRejection;
 
@@ -2028,6 +2061,21 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const resolution = await identityResolver.resolve(request);
     if (resolution.kind === "ok") return resolution.actor;
     return undefined;
+  }
+
+  /** Does the request carry a valid agent bearer AND is the agent
+   * surface active on this target? Returns false on any non-loopback
+   * target because the host has no agent bearer at all
+   * (ADR-0026 §"Plain Linux host / VM" → Authorization) — a client
+   * that presents the local daemon's bearer value against a host
+   * listener must not reap the bearer's leniency in the shared
+   * `checkOrigin` path. Keyed on `routeGroups.agentEvents` because
+   * that flag already tracks "agent audience lives here". #279
+   * round-2 fix. */
+  function hasValidAgentBearerFor(request: Request): boolean {
+    if (!routeGroups.agentEvents) return false;
+    const bearer = bearerFromHeader(request.headers.get("authorization"));
+    return bearer !== undefined && auth.isAgent(bearer);
   }
 
   async function handleDeliveryApi(
@@ -3460,8 +3508,11 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // page on another loopback port could otherwise open a WebSocket
     // and receive live event frames on the daemon's cookie jar
     // (WebSocket does not enforce same-origin at the socket layer).
-    const bearer = bearerFromHeader(request.headers.get("authorization"));
-    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    // The bearer helper returns false on any non-loopback target.
+    // The ?for=agent branch below is already 404'd by route-group
+    // enforcement there, so this only affects the shared /events
+    // path and keeps its origin discipline strict.
+    const hasValidBearer = hasValidAgentBearerFor(request);
     const originRejection = checkOrigin(request, requestId, hasValidBearer);
     if (originRejection !== undefined) return originRejection;
 
@@ -4434,13 +4485,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
    * stays because the cost is one comparison and the sibling routes
    * set the precedent.
    */
-  function handleEventsHeadApi(request: Request, method: string, requestId: string): Response {
+  async function handleEventsHeadApi(request: Request, method: string, requestId: string): Promise<Response> {
     if (method !== "GET") return methodNotAllowed();
-    const bearer = bearerFromHeader(request.headers.get("authorization"));
-    const hasValidBearer = bearer !== undefined && auth.isAgent(bearer);
+    const hasValidBearer = hasValidAgentBearerFor(request);
     const originRejection = checkOrigin(request, requestId, hasValidBearer);
     if (originRejection !== undefined) return originRejection;
-    if (!hasValidBearer && !auth.hasSession(readCookie(request.headers.get("cookie"), cookieName(port)))) {
+    // #279 round-2 blocker 1: route identity through the injected
+    // resolver so the host target's `trusted-proxy` identity (or any
+    // future resolver) can reach this endpoint. The rail fetches
+    // `/api/events-head` BEFORE opening `/events`, so a proxied
+    // reviewer that hit a direct `auth.hasSession` / agent-bearer
+    // check would see 401 and lose its resume point.
+    const actor = await identifyActor(request);
+    if (actor === undefined) {
       logger.warn("api.events-head.rejected.role", { requestId });
       return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
     }

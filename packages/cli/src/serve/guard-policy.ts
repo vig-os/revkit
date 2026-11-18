@@ -21,19 +21,24 @@
 //      canonicalisation; its single public origin IS the canonical
 //      origin.
 //
+// The policy also carries two capabilities the dispatcher consults
+// directly:
+//
+//   - `allowsAgentRoutes` — a non-forgeable brand set only by the
+//     loopback policy factory. `assertRouteGroupsCompatibleWithPolicy`
+//     keys on this, not on `policy.id`, so a bespoke policy that
+//     spells its id `"loopback"` cannot reach the agent surface.
+//   - `basePath` — the path prefix every request on the host target
+//     must carry (ADR-0026 §"Plain Linux host / VM" sub-path
+//     deployment). Empty on loopback. The dispatcher 404s requests
+//     outside the prefix before routing.
+//
 // The handler calls through a `GuardPolicy` so that the local and
 // Linux-host servers can share one dispatcher, as ADR-0026
 // §"Open questions" → "Dual-listener mechanism" anticipates
 // ("two servers sharing a handler"). The policy is a *pure* function
 // of (configuration, request) → outcome: it does not read globals or
 // mutate state, and the handler owns the response construction.
-//
-// Why this is a separate file (and not wired into `auth.ts`):
-// `auth.ts` owns credential state — launch codes, sessions, the agent
-// token. The request-shape guards are orthogonal: they never consult
-// the credential, and the credential never consults the request
-// shape. Co-locating them hid the orthogonality and is what the
-// trusted-proxy and loopback flows now disentangle.
 
 /** Outcome of a guard check. `ok` means the request is allowed to
  * proceed. A `refused` outcome carries a stable reason code (safe
@@ -74,6 +79,21 @@ export interface OriginCheckInput {
 export interface GuardPolicy {
   /** Short policy label for structured logs (`loopback`, `host`, …). */
   readonly id: string;
+  /** True only when this policy was minted by `createLoopbackGuardPolicy`.
+   * A spoofed `id: "loopback"` on a bespoke policy cannot forge this
+   * flag — it is read-only on the returned object and set by the
+   * loopback factory alone. `assertRouteGroupsCompatibleWithPolicy`
+   * keys on this flag (not on `id`), so the agent-route gate stays
+   * authoritative. */
+  readonly allowsAgentRoutes: boolean;
+  /** Path prefix every request on this target must carry; empty when
+   * the target serves at `/`. The dispatcher 404s requests whose URL
+   * pathname is neither `basePath` itself nor starts with
+   * `basePath + "/"`. The loopback policy sets `""` (no prefix).
+   * The public-origin policy derives it from the configured public
+   * origin's pathname so one configuration carries both the origin
+   * and the prefix without a second config field to keep in sync. */
+  readonly basePath: string;
   /** Check the `Host` header. `upgrade` is the lowercased `Upgrade`
    * header value when present; some policies canonicalise GET+non-WS
    * requests and refuse a WS upgrade on a non-canonical alias
@@ -104,6 +124,35 @@ export interface LoopbackGuardPolicyOptions {
   readonly port: number;
 }
 
+/** Is the request's Host header one of the two loopback names for
+ * `port`? DNS-rebinding defence: a public DNS record that resolves
+ * to 127.0.0.1 cannot present a matching Host. The loopback policy
+ * factory calls this; tests also exercise it directly. Moved here
+ * from `auth.ts` so the daemon's production path and the test path
+ * share one implementation (#279 round-2 blocker 2). */
+export function isLoopbackHost(host: string | null, port: number): boolean {
+  if (host === null) return false;
+  return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
+}
+
+/** Is the request's Origin header one of the two allowed loopback
+ * origins for `port`? Applied to every non-GET request. Moved here
+ * from `auth.ts` so the daemon's production path and the test path
+ * share one implementation (#279 round-2 blocker 2). */
+export function isLoopbackOrigin(origin: string | null, port: number): boolean {
+  if (origin === null) return false;
+  return origin === `http://127.0.0.1:${port}` || origin === `http://localhost:${port}`;
+}
+
+/** Reject Sec-Fetch-Site values that are neither `same-origin` nor
+ * `none`. Missing header is accepted (older browsers, non-browser
+ * callers) — Origin already refuses a cross-site browser POST. Moved
+ * here from `auth.ts` alongside the other request-shape helpers. */
+export function isSecFetchAcceptable(secFetchSite: string | null): boolean {
+  if (secFetchSite === null) return true;
+  return secFetchSite === "same-origin" || secFetchSite === "none";
+}
+
 /** Create the loopback (ADR-0013) guard policy. Rules match the
  * daemon's historical inline checks byte-for-byte: `127.0.0.1:<port>`
  * and `localhost:<port>` on `Host`, with a 307 canonicalisation from
@@ -115,7 +164,6 @@ export interface LoopbackGuardPolicyOptions {
  * implementation. */
 export function createLoopbackGuardPolicy(options: LoopbackGuardPolicyOptions): GuardPolicy {
   const port = options.port;
-  const loopback127 = `127.0.0.1:${port}`;
   const loopbackLh = `localhost:${port}`;
   const allowedOrigins = Object.freeze([
     `http://127.0.0.1:${port}`,
@@ -127,8 +175,10 @@ export function createLoopbackGuardPolicy(options: LoopbackGuardPolicyOptions): 
   ] as const);
   return {
     id: "loopback",
+    allowsAgentRoutes: true,
+    basePath: "",
     checkHost(host, upgrade, pathname, search): GuardOutcome {
-      if (host !== loopback127 && host !== loopbackLh) {
+      if (!isLoopbackHost(host, port)) {
         return { kind: "refused", status: 421, reason: "host-not-allowed" };
       }
       if (host === loopbackLh) {
@@ -141,18 +191,18 @@ export function createLoopbackGuardPolicy(options: LoopbackGuardPolicyOptions): 
       return { kind: "ok" };
     },
     checkOrigin({ origin, secFetchSite, hasValidBearer }): GuardOutcome {
-      const isAllowedOrigin = origin !== null && (allowedOrigins as readonly string[]).includes(origin);
+      const originAllowed = isLoopbackOrigin(origin, port);
       if (hasValidBearer) {
-        if (origin !== null && !isAllowedOrigin) {
+        if (origin !== null && !originAllowed) {
           return { kind: "refused", status: 403, reason: "origin-not-allowed" };
         }
-        if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+        if (!isSecFetchAcceptable(secFetchSite)) {
           return { kind: "refused", status: 403, reason: "sec-fetch-not-allowed" };
         }
         return { kind: "ok" };
       }
       if (origin !== null) {
-        if (!isAllowedOrigin) {
+        if (!originAllowed) {
           return { kind: "refused", status: 403, reason: "origin-not-allowed" };
         }
         if (secFetchSite !== null && secFetchSite !== "same-origin") {
@@ -177,7 +227,11 @@ export interface PublicOriginGuardPolicyOptions {
   /** The single configured public origin (`https://review.example.com`
    * or `http://review.example.com/review`). The handler compares
    * `Host` against this origin's hostname+port and refuses any other
-   * value. Writes require `Origin` equal to this exact string. */
+   * value. Writes require `Origin` equal to this exact origin
+   * (scheme + host, pathname excluded; `Origin` headers do not carry
+   * a path). The pathname, when present, becomes the deployment's
+   * `basePath` (ADR-0026 §"Plain Linux host / VM", #195 sub-path
+   * support): requests outside the prefix are 404'd before routing. */
   readonly publicOrigin: string;
   /** Additional `Host` values accepted alongside the public origin's
    * hostname. Empty by default; the vhost case uses only the public
@@ -192,6 +246,15 @@ export interface PublicOriginGuardPolicyOptions {
  * origin and refuses writes whose `Origin` differs from that origin.
  * Does NOT canonicalise — a sub-path deployment serves its one
  * canonical origin unchanged.
+ *
+ * Carries the deployment's `basePath` (derived from the public
+ * origin's URL pathname) so the shared dispatcher can 404 requests
+ * outside the sub-path. An origin spelled with no path (or `/`)
+ * yields an empty basePath; `http://review.example.com/review`
+ * yields `/review`. ADR-0026 §"Plain Linux host / VM" calls out
+ * "Base-path support for a sub-path deployment is #195 implementation
+ * scope" — the policy already carries it so #245 wires it with no
+ * further config field.
  *
  * Used today by the AC2/AC3 integration tests; #245 composes it with
  * the unix-socket listener. */
@@ -214,8 +277,19 @@ export function createPublicOriginGuardPolicy(options: PublicOriginGuardPolicyOp
   const allowedHosts = new Set<string>([hostHeader, ...(options.extraAllowedHosts ?? [])]);
   const wsScheme = parsed.protocol === "https:" ? "wss:" : "ws:";
   const wsOrigin = `${wsScheme}//${parsed.host}`;
+  // Derive the basePath from the configured origin's pathname. `/`
+  // and the empty string both mean "no prefix". Trailing slashes are
+  // stripped so `/review/` and `/review` collapse to the same value.
+  // A path with query/fragment is a configuration error at a higher
+  // layer; `URL`'s own parser would not have accepted one in host
+  // position anyway. basePath never contains a trailing slash.
+  const rawPath = parsed.pathname;
+  const basePath =
+    rawPath === "" || rawPath === "/" ? "" : rawPath.replace(/\/+$/u, "");
   return {
     id: "public-origin",
+    allowsAgentRoutes: false,
+    basePath,
     checkHost(host): GuardOutcome {
       if (host === null || !allowedHosts.has(host)) {
         return { kind: "refused", status: 421, reason: "host-not-allowed" };

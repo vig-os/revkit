@@ -201,22 +201,53 @@ describe("#279 composable handler under a non-loopback policy", () => {
   });
 
   test("AC3 — shared routes remain reachable under the host policy", async () => {
-    const sharedGet: readonly string[] = [
-      "/api/threads",
-      "/api/events-head",
-      "/events?since=0",
-      "/", // static index.html
-      "/-/rail.js",
+    // Exact expected statuses (#279 round-2 blocker 1): `!= 404`
+    // let `/api/events-head`'s 401 under the pre-fix handler pass
+    // this test, so the rail's "fetch head before opening /events"
+    // dance quietly lost its resume point on a proxied reviewer.
+    // Every shared endpoint MUST answer 200 under an identity the
+    // resolver accepts.
+    const sharedGet: ReadonlyArray<readonly [string, number]> = [
+      ["/api/threads", 200],
+      ["/api/events-head", 200],
+      ["/events?since=0", 200],
+      ["/", 200], // static index.html
+      ["/-/rail.js", 200],
     ];
-    for (const path of sharedGet) {
+    for (const [path, expectedStatus] of sharedGet) {
       const response = await fetch(`${ctx.handle.url}${path}`, {
         headers: { host: ctx.publicHost, origin: ctx.publicOrigin },
       });
-      // Not 404 — the handler acknowledges these paths. `/events`
-      // returns 200 + an SSE stream we drain below.
-      expect([response.status, path]).not.toEqual([404, path]);
+      expect([response.status, path]).toEqual([expectedStatus, path]);
       await response.body?.cancel();
     }
+  });
+
+  test("AC3 — a valid local agent bearer cannot smuggle bearer-origin leniency into the host target", async () => {
+    // Under the host policy the agent surface is not registered at
+    // all. A request that nevertheless presents an `Authorization:
+    // Bearer <value>` must NOT be treated as a bearer caller by the
+    // shared `/events` / `/api/threads` origin check — the host has
+    // no agent bearer, so a bearer value cannot grant any extra
+    // leniency. The dispatcher forces `hasValidBearer=false` on any
+    // target that disables agent routes; a cross-origin POST then
+    // rejects the way a cookie-less POST would.
+    const response = await fetch(`${ctx.handle.url}/api/threads`, {
+      method: "POST",
+      headers: {
+        host: ctx.publicHost,
+        // A foreign Origin that is NOT the public one. If the handler
+        // honoured the bearer, it would accept an absent Origin (the
+        // bearer branch is lenient) OR refuse with origin-not-allowed
+        // based on the bearer branch. Either way, a cross-origin POST
+        // under the host policy must be 403, never anything softer.
+        origin: "http://attacker.example.com",
+        authorization: "Bearer any-value-at-all",
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+    expect(response.status).toBe(403);
   });
 });
 
@@ -243,5 +274,110 @@ describe("#279 route-group / policy compatibility", () => {
     expect(() => {
       assertRouteGroupsCompatibleWithPolicy(HOST_TARGET_ROUTE_GROUPS, hostPolicy);
     }).not.toThrow();
+  });
+
+  test("AC3 construction — a bespoke policy with id='loopback' cannot forge agent-route access", () => {
+    // #279 round-2 fix: the gate keys on `allowsAgentRoutes`, a
+    // flag only the real loopback factory sets. A policy that
+    // spells its id `"loopback"` but is in fact a non-loopback
+    // target must be refused the agent surface. This is the
+    // adversarial test the pre-fix gate would have passed.
+    const spoofed = {
+      ...createPublicOriginGuardPolicy({ publicOrigin: "http://review.example.com" }),
+      id: "loopback",
+    };
+    expect(() => {
+      assertRouteGroupsCompatibleWithPolicy(LOCAL_DAEMON_ROUTE_GROUPS, spoofed);
+    }).toThrow(/agent-only route group/);
+  });
+
+  test("AC3 construction — the real loopback policy carries `allowsAgentRoutes: true`", () => {
+    const loopback = createLoopbackGuardPolicy({ port: 1234 });
+    expect(loopback.allowsAgentRoutes).toBe(true);
+    const hostPolicy = createPublicOriginGuardPolicy({ publicOrigin: "http://review.example.com" });
+    expect(hostPolicy.allowsAgentRoutes).toBe(false);
+  });
+
+  test("basePath — derived from the public origin's URL pathname", () => {
+    expect(createPublicOriginGuardPolicy({ publicOrigin: "http://review.example.com" }).basePath).toBe("");
+    expect(createPublicOriginGuardPolicy({ publicOrigin: "http://review.example.com/" }).basePath).toBe("");
+    expect(createPublicOriginGuardPolicy({ publicOrigin: "http://review.example.com/review" }).basePath).toBe("/review");
+    expect(createPublicOriginGuardPolicy({ publicOrigin: "http://review.example.com/review/" }).basePath).toBe("/review");
+    expect(createLoopbackGuardPolicy({ port: 1234 }).basePath).toBe("");
+  });
+});
+
+describe("#279 host target under a base-path deployment", () => {
+  // The host policy carries the public origin AND a deployment base
+  // path derived from that URL's pathname; #245 wires this into the
+  // real listener. The handler refuses every URL outside the prefix
+  // before it reaches route matching, so a request at the bare root
+  // on a /review deployment is 404 just like an unknown path.
+  // Sub-path routing INSIDE the prefix is #195 implementation scope.
+  // The policy already carries the data so #245 picks it up without
+  // a second config field.
+  interface HostCtx {
+    handle: DaemonHandle;
+    root: string;
+    publicHost: string;
+    publicOrigin: string;
+  }
+
+  let ctx: HostCtx;
+  beforeEach(async () => {
+    const root = mkdtempSync(join(tmpdir(), "revkit-279-basepath-"));
+    const dist = join(root, "dist");
+    mkdirSync(dist, { recursive: true });
+    writeFileSync(join(dist, "index.html"), "<!doctype html><h1>sub-path</h1>");
+    const publicOrigin = "http://review.example.com/review";
+    const publicHost = "review.example.com";
+    const handle = await startDaemon({
+      dir: dist,
+      repoRoot: root,
+      port: 0,
+      sqlitePath: ":memory:",
+      version: "0.0.0-279-basepath-test",
+      localUserId: "279-basepath-local",
+      installSignalHandlers: false,
+      logSink: { write: () => {} },
+      guardPolicy: createPublicOriginGuardPolicy({ publicOrigin }),
+      routeGroups: HOST_TARGET_ROUTE_GROUPS,
+      identityResolver: createStaticIdentityResolver({ actor: STUB_ACTOR }),
+      enableBackgroundBuild: false,
+    });
+    ctx = { handle, root, publicHost, publicOrigin };
+  });
+  afterEach(async () => {
+    await ctx.handle.stop();
+    rmSync(ctx.root, { recursive: true, force: true });
+  });
+
+  test("requests outside the base path are 404 before routing", async () => {
+    // `/api/threads` is a routed path on the loopback, but the host
+    // target serves at `/review/*`; a request at the bare root must
+    // be refused as if the path did not exist.
+    const outside = await fetch(`${ctx.handle.url}/api/threads`, {
+      headers: { host: ctx.publicHost, origin: ctx.publicOrigin },
+    });
+    expect(outside.status).toBe(404);
+  });
+
+  test("Origin check on the base-path policy keys on the public origin", () => {
+    // The policy exposes `checkOrigin`; it rejects a non-matching
+    // Origin and accepts the configured public origin. Keeping this
+    // at the policy level avoids coupling the assertion to the
+    // sub-path routing #195 will add — the policy's own contract is
+    // all we need to pin for the brief's "Origin checks use the
+    // public origin" requirement.
+    const policy = createPublicOriginGuardPolicy({ publicOrigin: ctx.publicOrigin });
+    expect(
+      policy.checkOrigin({ origin: "http://attacker.example.com", secFetchSite: null, hasValidBearer: false }).kind,
+    ).toBe("refused");
+    expect(
+      policy.checkOrigin({ origin: "http://review.example.com", secFetchSite: "same-origin", hasValidBearer: false }).kind,
+    ).toBe("ok");
+    // basePath is preserved but Origin ignores it (Origin never
+    // carries a path).
+    expect(policy.basePath).toBe("/review");
   });
 });

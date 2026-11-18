@@ -24,6 +24,9 @@ export { SqliteThreadStore, type SqliteThreadStoreOptions } from "./sqlite-store
 export {
   createLoopbackGuardPolicy,
   createPublicOriginGuardPolicy,
+  isLoopbackHost,
+  isLoopbackOrigin,
+  isSecFetchAcceptable,
   type GuardOutcome,
   type GuardPolicy,
   type GuardRefusalReason,

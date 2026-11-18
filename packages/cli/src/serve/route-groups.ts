@@ -142,6 +142,11 @@ export const AGENT_ONLY_ROUTE_GROUP_NAMES: readonly (keyof RouteGroups)[] = Obje
  * agent bearer flow. Throwing at construction is the single door that
  * closes the misconfiguration, not a runtime check per request.
  *
+ * The gate keys on `policy.allowsAgentRoutes`, a flag only the
+ * loopback policy factory sets (#279 round 2). A bespoke policy that
+ * spells its `id` as `"loopback"` cannot forge this flag — the check
+ * no longer trusts `policy.id`.
+ *
  * Returns the list of offending group names so the error message
  * names them. Throws `Error` on violation; the caller catches at a
  * policy boundary. */
@@ -149,7 +154,7 @@ export function assertRouteGroupsCompatibleWithPolicy(
   groups: RouteGroups,
   policy: GuardPolicy,
 ): void {
-  if (policy.id === "loopback") return;
+  if (policy.allowsAgentRoutes) return;
   const offenders: string[] = [];
   for (const name of AGENT_ONLY_ROUTE_GROUP_NAMES) {
     if (groups[name]) offenders.push(name);
