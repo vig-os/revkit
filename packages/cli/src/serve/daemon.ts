@@ -91,7 +91,7 @@ import {
   readCookie,
   setCookieHeader,
 } from "./auth.ts";
-import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
+import { EventBus, sseFrame, sseHeartbeat, type Subscriber } from "./event-bus.ts";
 import { buildRailBundle } from "../rail/bundle.ts";
 import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
 import {
@@ -249,6 +249,18 @@ export interface StartDaemonOptions {
    * in the pending review skip the adapter call when the poster
    * is the agent. */
   readonly reviewMode?: ReviewModeOptions;
+  /** Test-only override for the SSE heartbeat interval (ms).
+   * Production omits — the default is `SSE_KEEPALIVE_INTERVAL_MS`
+   * (15 s). A test pins a short value (plus `sseHeartbeatScheduler`,
+   * so the tick is deterministic) to exercise the periodic path
+   * without a real 15 s wait. */
+  readonly sseHeartbeatIntervalMs?: number;
+  /** Test-only scheduler for the periodic SSE heartbeat timer.
+   * Production omits — the default wraps `globalThis.setInterval` /
+   * `clearInterval`. A test injects a fake whose `setInterval`
+   * records the callback for manual invocation, pinning the periodic
+   * heartbeat deterministically (issue #277 review round 2). */
+  readonly sseHeartbeatScheduler?: SseHeartbeatScheduler;
 }
 
 /** A handle on a running daemon. `stop()` is idempotent and removes
@@ -317,8 +329,8 @@ class WebSocketSubscriber implements Subscriber {
   }
 }
 
-/** How often to send an SSE keepalive comment. Kept short so a paused
- * tab wakes quickly; long enough not to spam the log.
+/** How often to send an SSE heartbeat (`event: ping`). Kept short so
+ * a paused tab wakes quickly; long enough not to spam the log.
  *
  * **Issue #277** — this must stay below the smallest idle-timeout
  * any likely reverse proxy / load balancer enforces, or an idle
@@ -326,11 +338,26 @@ class WebSocketSubscriber implements Subscriber {
  * reported behaviour). Common ceilings: nginx `proxy_read_timeout`
  * 60 s, HAProxy `timeout server` 60 s, AWS ALB 60 s, Cloudflare 100 s,
  * aiohttp `keepalive_timeout` 75 s. 15 s leaves a 4× margin against
- * the tightest of those — a single lost keepalive still wakes the
+ * the tightest of those — a single lost heartbeat still wakes the
  * next one well under 60 s. Exported so a regression test pins the
  * invariant: if someone later raises this past ~45 s, the rail starts
- * dropping streams silently again. */
+ * dropping streams silently again.
+ *
+ * The rail's live-channel controller derives its watchdog from this
+ * same value (`heartbeatIntervalMs * 2.5`): a stream that delivers no
+ * `ping` and no real frame for 2.5× this interval is reaped
+ * client-side, closing the "stays visible and online, bytes stopped
+ * flowing" window. */
 export const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
+
+/** Scheduler the daemon uses for the periodic SSE heartbeat timer.
+ * Production uses `globalThis.setInterval` / `clearInterval`; the
+ * keepalive test injects a fake so it does not wait 15 s for the first
+ * periodic tick to observe. */
+export interface SseHeartbeatScheduler {
+  setInterval(fn: () => void, ms: number): unknown;
+  clearInterval(handle: unknown): void;
+}
 
 /** Issue #70: `POST /api/review/promote` declined to act, with a
  * machine-readable `error` and a human-readable `reason`. Distinct
@@ -796,7 +823,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     }
   }
 
-  const keepaliveTimers = new Set<ReturnType<typeof setInterval>>();
+  // Periodic SSE heartbeat (named `ping` event). Interval and
+  // scheduler are injectable (production uses the defaults; tests pin
+  // both so a periodic tick is deterministic — issue #277 round 2).
+  const heartbeatIntervalMs = options.sseHeartbeatIntervalMs ?? SSE_KEEPALIVE_INTERVAL_MS;
+  const heartbeatScheduler: SseHeartbeatScheduler = options.sseHeartbeatScheduler ?? {
+    setInterval: (fn, ms) => globalThis.setInterval(fn, ms),
+    clearInterval: (handle) => globalThis.clearInterval(handle as Parameters<typeof globalThis.clearInterval>[0]),
+  };
+  const heartbeatTimers = new Set<unknown>();
 
   const server: Server<WebSocketData> = Bun.serve<WebSocketData>({
     port: requestedPort,
@@ -804,8 +839,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // `/events` is a long-lived SSE / WebSocket stream — a
     // per-request idle timeout of 10 s (Bun's default) would close
     // the connection before the next event arrives on a quiet
-    // channel. Zero disables the per-request timer; keepalive
-    // frames (SSE `sseKeepalive`) still give the client a heartbeat.
+    // channel. Zero disables the per-request timer; named `ping`
+    // heartbeats (SSE `sseHeartbeat`) still give the client a signal.
     idleTimeout: 0,
     async fetch(request, srv): Promise<Response | undefined> {
       const requestId = randomUUID();
@@ -1096,8 +1131,8 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
-      for (const timer of keepaliveTimers) clearInterval(timer);
-      keepaliveTimers.clear();
+      for (const timer of heartbeatTimers) heartbeatScheduler.clearInterval(timer);
+      heartbeatTimers.clear();
       bus.closeAll();
       // Tear down the re-anchor watchers BEFORE closing the store —
       // a fire-and-forget refresh queued mid-shutdown would
@@ -3472,7 +3507,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // callback runs are queued and flushed as the first frames.
     const encoder = new TextEncoder();
     let sseController: ReadableStreamDefaultController<Uint8Array> | undefined;
-    let keepalive: ReturnType<typeof setInterval> | undefined;
+    let heartbeat: unknown;
     const pending: ReviewEvent[] = [];
     let closed = false;
     const subscriber: Subscriber = {
@@ -3485,17 +3520,28 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         try {
           sseController.enqueue(encoder.encode(sseFrame(event)));
         } catch {
+          // `enqueue` throws when the stream has already been
+          // closed / errored by Bun (client TCP close, overflow,
+          // etc). Mark the subscriber shut and re-throw so the bus
+          // detaches it — which calls `close()` below. Round-2
+          // #277: the previous `close()` short-circuited on
+          // `closed=true` and never reached `sseController.close()`,
+          // so a subscriber whose `deliver` had thrown could leave
+          // the ReadableStream open server-side while the bus had
+          // already stopped fanning out to it. Fixed below by
+          // making `close()` always idempotently close the
+          // controller.
           closed = true;
           throw new Error("sse-enqueue-failed");
         }
       },
       close(): void {
-        if (closed) return;
         closed = true;
         try {
           sseController?.close();
         } catch {
-          // Already closed.
+          // Already closed, or the controller errored out before
+          // we got here — either way, nothing more to do.
         }
       },
       audience,
@@ -3505,13 +3551,13 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const stream = new ReadableStream<Uint8Array>({
       async start(controller): Promise<void> {
         sseController = controller;
-        // Emit a keepalive comment right away so the client's fetch()
+        // Emit a heartbeat frame right away so the client's fetch()
         // resolves with the response headers before we do the (async)
         // prime; without this, some HTTP clients wait until a data
         // byte arrives before returning from `fetch()` and the test
         // race window opens between "fetch resolved" and "we
         // subscribed".
-        controller.enqueue(encoder.encode(sseKeepalive()));
+        controller.enqueue(encoder.encode(sseHeartbeat()));
         // Prime with the resume slice — the client should see the
         // past before the future.
         try {
@@ -3551,20 +3597,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         // `start` firing.
         for (const event of pending) controller.enqueue(encoder.encode(sseFrame(event)));
         pending.length = 0;
-        keepalive = setInterval(() => {
+        heartbeat = heartbeatScheduler.setInterval(() => {
           if (closed || sseController === undefined) return;
           try {
-            sseController.enqueue(encoder.encode(sseKeepalive()));
+            sseController.enqueue(encoder.encode(sseHeartbeat()));
           } catch {
             closed = true;
           }
-        }, SSE_KEEPALIVE_INTERVAL_MS);
-        keepaliveTimers.add(keepalive);
+        }, heartbeatIntervalMs);
+        heartbeatTimers.add(heartbeat);
       },
       cancel(): void {
-        if (keepalive !== undefined) {
-          clearInterval(keepalive);
-          keepaliveTimers.delete(keepalive);
+        if (heartbeat !== undefined) {
+          heartbeatScheduler.clearInterval(heartbeat);
+          heartbeatTimers.delete(heartbeat);
         }
         detach();
         closed = true;

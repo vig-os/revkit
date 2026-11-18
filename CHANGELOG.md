@@ -67,33 +67,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Rail live-update channel drops silently on a long-running tab**
   ([#277](https://github.com/vig-os/revkit/issues/277))
-  - Diagnosis: a tab open for hours behind a reverse proxy (or on a laptop that
-    went to sleep) could reach a zombie-open state where the client-side
-    `EventSource` still thought the stream was live, but the server had long
-    forgotten it. `onerror` never fired, so the rail never reconnected and new
-    comments only appeared on a page refresh.
-  - New `packages/cli/src/rail/live-channel.ts` extracts the reconnect state
-    machine out of `rail.tsx`: exponential backoff from 500 ms to a 30 s cap;
-    a `wake()` entry point the rail now fires from `visibilitychange` and
-    `online` listeners, forcing a fresh connection every time the tab returns
-    to the foreground or the network recovers; three observable states
-    (`connecting`, `open`, `reconnecting`) driven by a pure clock-injected
-    schedule.
-  - The rail renders a visible "Live updates paused — reconnecting…" indicator
-    while the controller is in `reconnecting`, with a "Refresh now" button that
-    re-fetches threads immediately. An invisible drop is the bug the reporter
-    filed; the indicator ensures a future drop is never invisible again.
-  - The daemon's SSE keepalive interval is unchanged (15 s — still well below
-    the tightest common proxy idle timeout of 60 s), and the constant is now
-    exported with a regression-pin test so a future change past ~45 s goes red.
+  - Diagnosis: a tab open for hours could reach a state where the client-side
+    `EventSource` still thought the stream was live, but it had silently
+    stopped delivering frames. Two shapes: a visible drop (`onerror` fired
+    but nothing noticed on page side) and a SILENT drop (the socket stays
+    open and the tab stays visible AND online — no DOM event ever fires).
+    `onerror` never fired for the silent case, so the rail never reconnected
+    and new comments only appeared on a page refresh.
+  - **Named-event server heartbeat.** The daemon now emits a named `event: ping`
+    frame every `SSE_KEEPALIVE_INTERVAL_MS` (15 s) instead of a bare SSE
+    comment (`: keepalive`). `EventSource` never surfaces comment lines to the
+    page, so a client-side watchdog could not see them — the previous
+    "keepalive" was enough to hold the TCP connection open under an idle
+    proxy but invisible to the rail. A named event carries `event: ping\ndata: \n\n`:
+    proxies still see "bytes flowing," and `source.addEventListener("ping", …)`
+    resets the client watchdog.
+  - **Client-side stale-stream watchdog.** `packages/cli/src/rail/live-channel.ts`
+    extracts the reconnect state machine out of `rail.tsx`: exponential
+    backoff from 500 ms to a 30 s cap; a `wake()` entry point the rail fires
+    from `visibilitychange`, `online` and the "Refresh now" button; three
+    observable states (`connecting`, `open`, `reconnecting`) driven by a
+    clock-injected schedule. A watchdog arms whenever the stream is `open`
+    and fires if no `ping` or data frame arrives for 2.5× the heartbeat
+    interval — that is what catches the visible-and-online silent drop.
+    A connect-timeout fires if a fresh source never produces `onopen` or
+    `onerror` within 15 s, synthesising a failure and triggering the same
+    reconnect path.
+  - **No more badge flicker.** The controller now stays in `reconnecting`
+    across every retry attempt (the previous code toggled `reconnecting` →
+    `connecting` → `reconnecting` on every backoff tick, which made the
+    rail's `aria-live` region re-announce "Live updates paused" on each
+    schedule tick). `onStateChange` now fires exactly once per observable
+    transition.
+  - **Rail wiring.** The rail renders a visible "Live updates paused —
+    reconnecting…" indicator while the controller is in `reconnecting`, with
+    a "Refresh now" button that both forces a controller `wake()` (bypassing
+    the current backoff) and refetches the thread list. The SSE subscriber
+    resumes from the highest seq this tab has acted on (via
+    `readResumeSeq`) on every reconnect, not the page-load `since`, so a
+    reconnect does not ask the daemon to replay events the per-seq gate is
+    about to drop.
   - Tests: `packages/cli/test/rail/live-channel.test.ts` (fake clock + fake
     source factory, covering backoff math, mid-stream errors, visibility
-    wake-up, late-callback guards and `stop()` lifecycle);
-    `packages/cli/test/serve/sse-keepalive.test.ts` (interval invariant plus
-    the on-`start()` keepalive flush); `site/tests/rail-live-reconnect.spec.ts`
-    (Playwright e2e that drops the stream via `context.setOffline`, posts a
-    comment into the gap, and asserts the rail shows it after the browser
-    returns online — without a page reload).
+    wake-up, the stale-stream watchdog, the connect-timeout, late-callback
+    guards and `stop()` lifecycle); `packages/cli/test/serve/sse-keepalive.test.ts`
+    (interval invariant; the on-`start()` named-event flush; the periodic
+    heartbeat driven by an injected scheduler so each tick is deterministic
+    without a real `setInterval` wait); `site/tests/rail-live-reconnect.spec.ts`
+    (Playwright e2e — one scenario drops the stream via `context.setOffline`
+    and asserts recovery on online; a second scenario FREEZES the
+    EventSource's handlers in place so the TCP connection stays alive but
+    no frame reaches the rail, then asserts the client watchdog reconnects
+    anyway and the missed comment arrives without a page reload).
 
 ### Security
 

@@ -623,15 +623,20 @@ describe("revkit serve — API round-trip", () => {
       const resolvedPayload = await json<WriteResponse>(resolved);
       expect(resolvedPayload.seq).toBe(3);
 
-      // Wait for the SSE to have all three frames.
+      // Wait for the SSE to have all three EVENT frames. The daemon
+      // also emits a named `ping` heartbeat (`event: ping\ndata: \n\n`),
+      // so filter by `data: {` to match only JSON-payload frames
+      // (real events) — not the heartbeat's empty data line. Issue
+      // #277 round 2: the server heartbeat is a NAMED event instead
+      // of an SSE comment so the client watchdog can observe it.
       const start = performance.now();
       while (performance.now() - start < 2000) {
         const joined = buffered.join("");
-        if ((joined.match(/^data: /gm) ?? []).length >= 3) break;
+        if ((joined.match(/^data: \{/gm) ?? []).length >= 3) break;
         await new Promise((r) => setTimeout(r, 20));
       }
       const joined = buffered.join("");
-      const dataLines = joined.split("\n").filter((line) => line.startsWith("data: "));
+      const dataLines = joined.split("\n").filter((line) => line.startsWith("data: {"));
       expect(dataLines.length).toBe(3);
       const parsed = dataLines.map((line) => JSON.parse(line.slice("data: ".length)));
       expect(parsed[0].kind).toBe("comment.created");
@@ -656,10 +661,13 @@ describe("revkit serve — API round-trip", () => {
         const { value, done: readerDone } = await resumeReader.read();
         if (readerDone) break;
         resumeBuf += new TextDecoder().decode(value, { stream: true });
-        const lines = resumeBuf.split("\n").filter((line) => line.startsWith("data: "));
+        // Filter by `data: {` — the `event: ping` heartbeat frames
+        // also carry a `data: ` line, so a bare prefix would count
+        // them. See the note on the three-frame assertion above.
+        const lines = resumeBuf.split("\n").filter((line) => line.startsWith("data: {"));
         if (lines.length >= 1) break;
       }
-      const resumeLines = resumeBuf.split("\n").filter((line) => line.startsWith("data: "));
+      const resumeLines = resumeBuf.split("\n").filter((line) => line.startsWith("data: {"));
       expect(resumeLines.length).toBe(1);
       const first = JSON.parse(resumeLines[0]!.slice("data: ".length));
       expect(first.kind).toBe("thread.resolved");

@@ -129,11 +129,22 @@ export function sseFrame(event: ReviewEvent): string {
   return `id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
-/** SSE "keepalive" comment. A comment-line (`:` prefix) is ignored by
- * the client but keeps intermediate proxies from closing an idle
- * connection. The daemon is loopback-only so proxies are unlikely, but
- * a browser will sometimes freeze the tab; a heartbeat gets an
- * immediate reconnect signal on wake. */
-export function sseKeepalive(): string {
-  return `: keepalive\n\n`;
+/** SSE heartbeat as a NAMED EVENT (not a comment).
+ *
+ * **Why named, not a comment.** A plain comment line (`: keepalive`)
+ * keeps proxies from idling the stream out, but `EventSource` never
+ * surfaces comments to the page — so a client that only sees events
+ * cannot distinguish "quiet-but-alive" from "dead". That is the
+ * reported shape of issue #277: the tab stays visible and online, the
+ * underlying TCP is fine, but the stream has silently stopped
+ * delivering real frames and nothing on the client side notices.
+ *
+ * Emitting a named `ping` event (`event: ping\ndata: \n\n`) is the
+ * smallest fix: proxies still see "bytes flowing" (keepalive intent
+ * preserved), and `source.addEventListener("ping", …)` on the rail's
+ * live-channel resets a client-side watchdog. Any gap of ~2.5× the
+ * heartbeat interval with no frame — ping or data — is a stale
+ * stream, and the controller reconnects. */
+export function sseHeartbeat(): string {
+  return `event: ping\ndata: \n\n`;
 }

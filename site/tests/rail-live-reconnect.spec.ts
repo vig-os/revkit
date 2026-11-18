@@ -1,31 +1,29 @@
 // Playwright e2e for issue #277 — the rail reconnects a dropped SSE
-// stream, resyncs the missed events, and surfaces the "paused" state
-// while reconnecting.
+// stream (visible AND silent), resyncs the missed events, and
+// surfaces the "paused" state while reconnecting.
 //
-// What this pins:
+// Two scenarios live in this file:
 //
-//   1. On tab open, the rail has NO "live updates paused" indicator
-//      (the stream is live).
-//   2. When the browser goes offline, the EventSource fires `onerror`,
-//      the live-channel controller flips to `reconnecting`, and the
-//      indicator appears. From the application's point of view, this
-//      is indistinguishable from a proxy idle-reaping the stream
-//      server-side (the TCP teardown reaches the client either way,
-//      and `EventSource.onerror` is the same).
-//   3. While disconnected, a comment appended via the agent-bearer
-//      API from the test side (Node fetch, not the offline page)
-//      lands in the daemon's log but is NOT delivered to the rail.
-//   4. When the browser comes back online, the `online` event fires,
-//      the controller `wake()`s, a fresh EventSource opens at the
-//      resume point, the daemon replays the missed event, and the
-//      rail's thread list shows the new comment — without reload.
+//   1. **"Visible error"** — the browser goes offline, the
+//      EventSource fires `onerror`, the live-channel controller
+//      flips to `reconnecting`, the indicator appears, a comment
+//      posted during the gap is picked up on reconnect.
 //
-// Chromium-only. The test uses `context.setOffline()` (CDP under the
-// hood) rather than `route.abort()` because we need the EXISTING
-// stream to fail, not just the next request. `route.abort()` runs at
-// request start, so a stream that is already open is unaffected.
+//   2. **"Silent stream"** (round-2 regression) — the stream stays
+//      OPEN but stops delivering frames. No `onerror`, no `online`,
+//      no `visibilitychange`. The CLIENT-SIDE watchdog is the only
+//      thing that can catch this, and it drives the same recovery:
+//      reconnect, replay, show the missed comment.
+//
+// Chromium-only. The visible-error scenario uses
+// `context.setOffline()` (CDP under the hood) rather than
+// `route.abort()` because we need the EXISTING stream to fail, not
+// just the next request. The silent scenario freezes the page's
+// EventSource handlers in place (no server cooperation needed) —
+// which is exactly the shape of the real bug: the socket is fine,
+// but the client side has stopped seeing frames.
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -269,7 +267,159 @@ test.describe("rail live reconnect @chromium-only (issue #277)", () => {
       await shutdown(daemon);
     }
   });
-});
 
-// Suppress an unused-import warning on the strict tsconfig.
-export type { Page };
+  test("ROUND-2 REGRESSION: the stream stays OPEN but stops delivering frames — the client watchdog reconnects anyway (visible-and-online case)", async ({ page }) => {
+    const daemon = await bootDaemon();
+    const fixture = await writeFixtureHtml();
+    try {
+      // Step 1 — before any page script, do TWO things:
+      //
+      //   (a) shrink the live-channel's heartbeat interval,
+      //       watchdog multiplier and connect-timeout so the
+      //       watchdog fires inside the Playwright 60 s budget.
+      //       Production uses 15 s / 2.5× / 15 s; here 200 ms /
+      //       2.5× / 2 s gives us a ~500 ms watchdog window.
+      //       `window.__revkit_live_opts` is the documented test
+      //       seam in `packages/cli/src/rail/rail.tsx`.
+      //
+      //   (b) wrap `EventSource` so the test can FREEZE a specific
+      //       source — null out `onopen` / `onmessage` / `onerror`
+      //       and un-register every listener added through
+      //       `addEventListener`. The underlying TCP connection
+      //       stays up; the server keeps sending `event: ping`
+      //       frames and real data frames; but nothing reaches the
+      //       controller. That is the visible-and-online bug:
+      //       bytes on the wire, nothing reaches the rail.
+      await page.addInitScript(() => {
+        (window as unknown as { __revkit_live_opts: {
+          heartbeatIntervalMs: number;
+          watchdogMultiplier: number;
+          connectTimeoutMs: number;
+        } }).__revkit_live_opts = {
+          heartbeatIntervalMs: 200,
+          watchdogMultiplier: 2.5,
+          connectTimeoutMs: 2_000,
+        };
+        interface Frozen extends EventSource {
+          __revkit_freeze?: () => void;
+          __revkit_listeners?: Map<string, Set<EventListenerOrEventListenerObject>>;
+        }
+        const sources: Frozen[] = [];
+        (window as unknown as { __revkit_sources: Frozen[] }).__revkit_sources = sources;
+        const Native = window.EventSource;
+        class Wrapped extends Native {
+          constructor(url: string | URL, init?: EventSourceInit) {
+            super(url, init);
+            const self = this as Frozen;
+            const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+            self.__revkit_listeners = listeners;
+            sources.push(self);
+            const nativeAdd = Native.prototype.addEventListener.bind(this);
+            const nativeRemove = Native.prototype.removeEventListener.bind(this);
+            self.addEventListener = ((type: string, listener: EventListenerOrEventListenerObject | null, opts?: boolean | AddEventListenerOptions): void => {
+              if (listener !== null) {
+                const bag = listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+                bag.add(listener);
+                listeners.set(type, bag);
+              }
+              nativeAdd(type, listener, opts);
+            }) as EventSource["addEventListener"];
+            self.removeEventListener = ((type: string, listener: EventListenerOrEventListenerObject | null, opts?: boolean | EventListenerOptions): void => {
+              if (listener !== null) {
+                listeners.get(type)?.delete(listener);
+              }
+              nativeRemove(type, listener, opts);
+            }) as EventSource["removeEventListener"];
+            // Freeze: silence everything from the controller's
+            // perspective while leaving the TCP connection alive.
+            self.__revkit_freeze = (): void => {
+              self.onopen = null;
+              self.onmessage = null;
+              self.onerror = null;
+              for (const [type, bag] of listeners.entries()) {
+                for (const listener of bag) {
+                  nativeRemove(type, listener);
+                }
+                bag.clear();
+              }
+            };
+          }
+        }
+        window.EventSource = Wrapped as unknown as typeof window.EventSource;
+        (window as unknown as { __revkit_freeze_sources: () => number }).__revkit_freeze_sources = () => {
+          let frozen = 0;
+          for (const source of sources) {
+            source.__revkit_freeze?.();
+            frozen++;
+          }
+          // Reset the list so the next check sees only NEW sources.
+          sources.length = 0;
+          return frozen;
+        };
+      });
+
+      // Step 2 — auth, open the page, confirm the rail is live.
+      await page.goto(daemon.launchUrl, { waitUntil: "commit", timeout: 15_000 });
+      await page.goto(`${daemon.url}/${fixture.relPath}`);
+      await expect(page.getByTestId("revkit-rail")).toBeVisible();
+      await expect(page.getByTestId("revkit-rail-empty")).toBeVisible();
+      await expect(page.getByTestId("revkit-rail-live-paused")).toBeHidden();
+
+      // Marker so we can prove no page reload happened.
+      await page.evaluate(() => {
+        (window as unknown as { __revkit_silent_marker?: number }).__revkit_silent_marker = 7;
+      });
+
+      // Step 3 — FREEZE the rail's EventSource(s). The underlying
+      // stream stays open on the server side; the controller stops
+      // seeing any frame. No `onerror`, no `online`, no
+      // `visibilitychange` fires. Only the client-side watchdog
+      // (new in round 2) can catch this.
+      const frozen = await page.evaluate(() => (window as unknown as { __revkit_freeze_sources: () => number }).__revkit_freeze_sources());
+      expect(frozen).toBeGreaterThanOrEqual(1);
+
+      // Step 4 — POST a comment into the daemon from the TEST side.
+      // The daemon fans it out on the live stream, but the rail's
+      // listeners are frozen so it never arrives.
+      const seedAnchor = {
+        path: FIXTURE_REL_PATH,
+        startLine: 3,
+        endLine: 3,
+        quote: { exact: "line 2", prefix: "", suffix: "" },
+        revision: "c".repeat(64),
+      };
+      const postResponse = await fetch(`${daemon.url}/api/threads`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${daemon.agentToken}`,
+          host: `127.0.0.1:${daemon.port}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ anchor: seedAnchor, body: "posted while the stream was silently frozen" }),
+      });
+      expect(postResponse.status).toBe(201);
+
+      // Step 5 — wait for the watchdog to fire. The paused
+      // indicator appears without any DOM-event stimulus and
+      // without the test touching `window.online` /
+      // `visibilitychange`.
+      await expect(page.getByTestId("revkit-rail-live-paused")).toBeVisible({ timeout: 5_000 });
+
+      // Step 6 — the watchdog's reconnect opens a fresh
+      // EventSource (the Wrapped constructor pushes it onto
+      // `__revkit_sources`). That source receives the replay of
+      // the comment posted in step 4, and the rail renders it
+      // without a page reload.
+      await expect(page.getByTestId("revkit-rail-live-paused")).toBeHidden({ timeout: 15_000 });
+      await expect(page.locator(".revkit-rail__comment")).toHaveCount(1, { timeout: 15_000 });
+      await expect(page.locator(".revkit-rail__body").first()).toContainText("posted while the stream was silently frozen");
+
+      // Sanity: no reload happened.
+      const afterMarker = await page.evaluate(() => (window as unknown as { __revkit_silent_marker?: number }).__revkit_silent_marker);
+      expect(afterMarker).toBe(7);
+    } finally {
+      fixture.cleanup();
+      await shutdown(daemon);
+    }
+  });
+});

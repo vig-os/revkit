@@ -377,7 +377,10 @@ describe("issue #67 — the unscoped read", () => {
         const frame = buf.slice(0, idx);
         buf = buf.slice(idx + 2);
         for (const line of frame.split("\n")) {
-          if (!line.startsWith("data:")) continue;
+          // Issue #277: the daemon emits a named `event: ping`
+          // heartbeat whose `data:` line is empty. Skip anything
+          // that isn't a JSON-payload frame.
+          if (!line.startsWith("data: {")) continue;
           seen.push((JSON.parse(line.slice(5).trim()) as { kind: string }).kind);
         }
         idx = buf.indexOf("\n\n");

@@ -12,9 +12,23 @@
 //       controller surfaces a visible "reconnecting" state so the
 //       reviewer knows the live feed is paused).
 //   (c) server heartbeats — not a controller concern (the daemon
-//       owns the 15s keepalive, tested in publish-http.test.ts),
+//       owns the 15s heartbeat, tested in `publish-http.test.ts`),
 //       but verified here that the controller does NOT reset
-//       backoff on keepalive comments.
+//       backoff on heartbeat callbacks.
+//
+// Round 2 (#277) adds:
+//
+//   (d) the stream stays open but stops delivering frames (the
+//       visible-and-online case the server keepalive comment could
+//       not catch, because `EventSource` never surfaces comments).
+//       The controller's watchdog fires after ~2.5× the server
+//       heartbeat interval with no `onHeartbeat` callback.
+//   (e) a connecting attempt that never produces onOpen or onError
+//       — the connect-timeout synthesises a failure.
+//   (f) the controller stays in `reconnecting` across every retry
+//       attempt. The old behaviour (`reconnecting` → `connecting`
+//       on each retry tick) made the rail's indicator flicker and
+//       re-announce on every aria-live tick.
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -93,9 +107,23 @@ interface Harness {
   readonly wake: () => void;
 }
 
-function startHarness(
-  overrides: { initialBackoffMs?: number; maxBackoffMs?: number } = {},
-): Harness {
+interface HarnessOverrides {
+  initialBackoffMs?: number;
+  maxBackoffMs?: number;
+  heartbeatIntervalMs?: number;
+  watchdogMultiplier?: number;
+  connectTimeoutMs?: number;
+}
+
+/** Default watchdog + connect-timeout are deliberately far outside
+ * the "normal" backoff schedule, so a test that drives backoff
+ * errors never trips the watchdog accidentally. Tests that want to
+ * assert on the watchdog override `heartbeatIntervalMs` and / or
+ * `watchdogMultiplier`. */
+const SAFE_HEARTBEAT_MS = 10_000_000;
+const SAFE_CONNECT_TIMEOUT_MS = 10_000_000;
+
+function startHarness(overrides: HarnessOverrides = {}): Harness {
   const clock = fakeClock();
   const sources: FakeSource[] = [];
   const states: LiveState[] = [];
@@ -117,7 +145,11 @@ function startHarness(
       states.push(state);
     },
     clock,
-    ...overrides,
+    heartbeatIntervalMs: overrides.heartbeatIntervalMs ?? SAFE_HEARTBEAT_MS,
+    connectTimeoutMs: overrides.connectTimeoutMs ?? SAFE_CONNECT_TIMEOUT_MS,
+    ...(overrides.initialBackoffMs !== undefined ? { initialBackoffMs: overrides.initialBackoffMs } : {}),
+    ...(overrides.maxBackoffMs !== undefined ? { maxBackoffMs: overrides.maxBackoffMs } : {}),
+    ...(overrides.watchdogMultiplier !== undefined ? { watchdogMultiplier: overrides.watchdogMultiplier } : {}),
   });
   return {
     clock,
@@ -177,7 +209,11 @@ describe("live-channel — scenario (a): stream closed by an intermediary", () =
 
     h.clock.advance(1);
     expect(h.sources).toHaveLength(2);
-    expect(h.state()).toBe("connecting");
+    // State stays `reconnecting` across the retry — no flicker.
+    // Round-2 fix: the controller no longer emits `connecting`
+    // for retries (only the initial attach), so the rail's
+    // aria-live region does not re-announce every tick.
+    expect(h.state()).toBe("reconnecting");
     // A successful open resets the state and the backoff schedule.
     h.sources[1]!.callbacks.onOpen();
     expect(h.state()).toBe("open");
@@ -237,11 +273,13 @@ describe("live-channel — scenario (a2): visibility / online wake-up", () => {
 
     // Zombie — no onerror ever fires. `wake()` (e.g. from
     // `visibilitychange` when the tab returns to the foreground)
-    // forces the swap anyway.
+    // forces the swap anyway. Round-2 fix: the swap emits
+    // `reconnecting` so the user sees the indicator across the
+    // swap; there is no promise the new source will open instantly.
     h.wake();
     expect(h.sources).toHaveLength(2);
     expect(h.sources[0]!.closed).toBe(true);
-    expect(h.state()).toBe("connecting");
+    expect(h.state()).toBe("reconnecting");
     h.sources[1]!.callbacks.onOpen();
     expect(h.state()).toBe("open");
     h.stop();
@@ -251,14 +289,12 @@ describe("live-channel — scenario (a2): visibility / online wake-up", () => {
     const h = startHarness();
     h.sources[0]!.callbacks.onError();
     expect(h.state()).toBe("reconnecting");
-    expect(h.clock.pending()).toBe(1);
     // Partway through the backoff, the tab becomes visible.
     h.clock.advance(100);
     h.wake();
     expect(h.sources).toHaveLength(2);
-    // The scheduled timer has been cancelled; no stray callback
-    // can double-open later.
-    expect(h.clock.pending()).toBe(0);
+    // The previous retry timer has been cancelled; no stray
+    // callback from the old backoff can double-open.
     h.clock.advance(10_000);
     expect(h.sources).toHaveLength(2);
     h.stop();
@@ -288,10 +324,191 @@ describe("live-channel — scenario (a2): visibility / online wake-up", () => {
   });
 });
 
+describe("live-channel — scenario (d): stream open but no frames (watchdog)", () => {
+  test("REGRESSION: no frames for 2.5× the heartbeat interval → reconnect, even while the socket is still open on the TCP side", () => {
+    // Round-2 regression: the reporter's case was a tab that stays
+    // visible AND online, with a stream the server has quietly
+    // stopped serving but the TCP connection is still up — so
+    // `onerror`, `visibilitychange` and `online` all fail to fire.
+    // The server keepalive COMMENT could not help because
+    // `EventSource` never surfaces comment lines. The controller's
+    // watchdog is what catches this: a named `ping` event (or any
+    // data frame) resets it; a gap of 2.5× the server's heartbeat
+    // interval with nothing arriving reaps the stream.
+    const h = startHarness({
+      heartbeatIntervalMs: 1_000,
+      watchdogMultiplier: 2.5,
+    });
+    h.sources[0]!.callbacks.onOpen();
+    expect(h.state()).toBe("open");
+
+    // Just under the watchdog: still `open`.
+    h.clock.advance(2_499);
+    expect(h.state()).toBe("open");
+    expect(h.sources).toHaveLength(1);
+    // One more ms trips the watchdog: the controller treats this
+    // as a stale stream and reconnects at the current backoff.
+    h.clock.advance(1);
+    expect(h.state()).toBe("reconnecting");
+    // The current source is closed as part of the reconnect.
+    expect(h.sources[0]!.closed).toBe(true);
+    // Backoff schedule still applies — the retry opens at 500 ms.
+    h.clock.advance(500);
+    expect(h.sources).toHaveLength(2);
+    h.sources[1]!.callbacks.onOpen();
+    expect(h.state()).toBe("open");
+    h.stop();
+  });
+
+  test("a heartbeat callback resets the watchdog so a quiet-but-alive stream stays open past 2.5×", () => {
+    const h = startHarness({ heartbeatIntervalMs: 1_000, watchdogMultiplier: 2.5 });
+    h.sources[0]!.callbacks.onOpen();
+
+    // Just before the watchdog fires, a `ping` arrives.
+    h.clock.advance(2_000);
+    h.sources[0]!.callbacks.onHeartbeat();
+
+    // 2 s past the heartbeat — well past the pre-heartbeat
+    // deadline but under the fresh one.
+    h.clock.advance(2_000);
+    expect(h.state()).toBe("open");
+
+    // 2.5 s since the last heartbeat — one more ms past it trips
+    // the watchdog.
+    h.clock.advance(499);
+    expect(h.state()).toBe("open");
+    h.clock.advance(1);
+    expect(h.state()).toBe("reconnecting");
+    h.stop();
+  });
+
+  test("a data frame also resets the watchdog — the factory calls `onHeartbeat` on `onmessage` too", () => {
+    // The rail's factory calls `onHeartbeat()` from BOTH
+    // `source.onmessage` AND `source.addEventListener("ping", …)`:
+    // any frame is proof-of-life. This test pins the controller
+    // treats them identically.
+    const h = startHarness({ heartbeatIntervalMs: 1_000, watchdogMultiplier: 2.5 });
+    h.sources[0]!.callbacks.onOpen();
+    h.clock.advance(2_000);
+    // Same code path as a data frame coming in through the
+    // factory's `source.onmessage` handler.
+    h.sources[0]!.callbacks.onHeartbeat();
+    h.clock.advance(2_499);
+    expect(h.state()).toBe("open");
+    h.clock.advance(1);
+    expect(h.state()).toBe("reconnecting");
+    h.stop();
+  });
+
+  test("the watchdog is not armed before `onOpen` — a slow TLS handshake is covered by the connect-timeout, not the watchdog", () => {
+    const h = startHarness({
+      heartbeatIntervalMs: 1_000,
+      watchdogMultiplier: 2.5,
+      connectTimeoutMs: 10_000,
+    });
+    // Source is created but never fires onOpen. Watchdog is not
+    // armed; the connect-timeout is what fires here.
+    h.clock.advance(2_500);
+    expect(h.state()).toBe("connecting");
+    h.clock.advance(7_499);
+    expect(h.state()).toBe("connecting");
+    h.clock.advance(1);
+    // Connect-timeout tripped — synthesised failure, now
+    // reconnecting.
+    expect(h.state()).toBe("reconnecting");
+    h.stop();
+  });
+
+  test("a late heartbeat from a closed source does not reset a new source's watchdog", () => {
+    // The old EventSource can drain a late event after close.
+    // The controller guards on `connectionId` so a late
+    // `onHeartbeat` from the replaced source cannot postpone the
+    // new one's watchdog.
+    const h = startHarness({ heartbeatIntervalMs: 1_000, watchdogMultiplier: 2.5 });
+    h.sources[0]!.callbacks.onOpen();
+    h.sources[0]!.callbacks.onError();
+    // At this point source 0 has been closed and connectionId
+    // advanced. Advance backoff so source 1 opens.
+    h.clock.advance(500);
+    expect(h.sources).toHaveLength(2);
+    h.sources[1]!.callbacks.onOpen();
+
+    // 2 s pass — source 0's queued `onHeartbeat` drains late.
+    // That callback must be IGNORED: it belongs to the replaced
+    // source.
+    h.clock.advance(2_000);
+    h.sources[0]!.callbacks.onHeartbeat();
+
+    // The watchdog is still measured from source 1's onOpen, not
+    // from the late callback. Source 1 opened at t=500, and its
+    // watchdog is 2 500 ms, so it should fire at t=3 000. We are
+    // currently at t=2 500 (500 + 2 000); 500 more ms trips it.
+    h.clock.advance(499);
+    expect(h.state()).toBe("open");
+    h.clock.advance(1);
+    expect(h.state()).toBe("reconnecting");
+    h.stop();
+  });
+});
+
+describe("live-channel — scenario (e): connect timeout", () => {
+  test("REGRESSION: a `connecting` attempt that neither opens nor errors within the bound counts as a failure", () => {
+    // Round-2 fallback: the browser can, rarely, leave a fresh
+    // EventSource silent — neither `onopen` nor `onerror` ever
+    // fires. Without a connect-timeout the controller would sit
+    // in `connecting` forever, and the rail (which hides the
+    // indicator on `connecting`) would look live while being
+    // completely disconnected.
+    const h = startHarness({ connectTimeoutMs: 5_000 });
+    expect(h.state()).toBe("connecting");
+    expect(h.sources).toHaveLength(1);
+
+    h.clock.advance(4_999);
+    expect(h.state()).toBe("connecting");
+    expect(h.sources).toHaveLength(1);
+
+    h.clock.advance(1);
+    expect(h.state()).toBe("reconnecting");
+    expect(h.sources[0]!.closed).toBe(true);
+    // Backoff kicks in from here.
+    h.clock.advance(500);
+    expect(h.sources).toHaveLength(2);
+    h.stop();
+  });
+
+  test("`onOpen` cancels the connect-timeout — a healthy slow-start does not false-positive", () => {
+    const h = startHarness({ connectTimeoutMs: 5_000 });
+    // Open just before the timeout.
+    h.clock.advance(4_999);
+    h.sources[0]!.callbacks.onOpen();
+    expect(h.state()).toBe("open");
+    // Advance well past the original timeout — still `open`.
+    h.clock.advance(10_000);
+    expect(h.state()).toBe("open");
+    h.stop();
+  });
+
+  test("`onError` cancels the connect-timeout — the normal failure path is not double-counted", () => {
+    const h = startHarness({ connectTimeoutMs: 5_000 });
+    h.sources[0]!.callbacks.onError();
+    expect(h.state()).toBe("reconnecting");
+    // Before the round-2 fix, the connect-timer could fire AFTER
+    // the error path had already run, pulling the controller into
+    // a double-reconnect. This test pins that it does not.
+    h.clock.advance(5_000);
+    // The backoff retry (500 ms) has fired exactly ONCE, so
+    // sources.length is 2 (the initial + one retry). Not 3.
+    expect(h.sources.length).toBe(2);
+    h.stop();
+  });
+});
+
 describe("live-channel — stop + lifecycle", () => {
   test("`stop()` cancels timers, closes the current source, and refuses further reconnects", () => {
     const h = startHarness();
     h.sources[0]!.callbacks.onError();
+    // `scheduleReconnect` has fired: the retry timer is pending
+    // and the connect-timeout for the old source was cleared.
     expect(h.clock.pending()).toBe(1);
     h.stop();
     expect(h.clock.pending()).toBe(0);
@@ -318,7 +535,13 @@ describe("live-channel — stop + lifecycle", () => {
     expect(h.sources).toHaveLength(2);
   });
 
-  test("`onStateChange` is called exactly once per transition and never with the same value twice in a row", () => {
+  test("`onStateChange` fires exactly once per transition, and retries stay in `reconnecting` (no flicker)", () => {
+    // Round-2 regression: the old code emitted `reconnecting` →
+    // `connecting` → `reconnecting` → `connecting` … on every
+    // retry tick, which made the rail's aria-live region
+    // re-announce "Live updates paused — reconnecting…" over and
+    // over. Now the state stays `reconnecting` until a stream
+    // actually opens.
     const h = startHarness();
     expect(h.states).toEqual(["connecting"]);
     h.sources[0]!.callbacks.onOpen();
@@ -328,11 +551,19 @@ describe("live-channel — stop + lifecycle", () => {
     expect(h.states).toEqual(["connecting", "open"]);
     h.sources[0]!.callbacks.onError();
     expect(h.states).toEqual(["connecting", "open", "reconnecting"]);
+    // Timer fires; a new source opens without emitting
+    // `connecting` — the state STAYS `reconnecting` until the
+    // real `onOpen` arrives.
     h.clock.advance(500);
-    // `connecting` again on the second open attempt.
-    expect(h.states).toEqual(["connecting", "open", "reconnecting", "connecting"]);
+    expect(h.states).toEqual(["connecting", "open", "reconnecting"]);
+    expect(h.sources).toHaveLength(2);
     h.sources[1]!.callbacks.onOpen();
-    expect(h.states).toEqual(["connecting", "open", "reconnecting", "connecting", "open"]);
+    expect(h.states).toEqual(["connecting", "open", "reconnecting", "open"]);
+    // A second error → reconnecting; another retry stays silent
+    // on `onStateChange`.
+    h.sources[1]!.callbacks.onError();
+    h.clock.advance(500);
+    expect(h.states).toEqual(["connecting", "open", "reconnecting", "open", "reconnecting"]);
     h.stop();
   });
 });

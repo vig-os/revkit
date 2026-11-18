@@ -37,6 +37,7 @@ import {
   type ResumeStorage,
 } from "./resume-point.ts";
 import { createLiveChannel, type LiveState } from "./live-channel.ts";
+import { browserWakeupScope, registerLiveWakeupListeners } from "./wakeup-listeners.ts";
 import {
   readDraft,
   removeDraft,
@@ -732,6 +733,18 @@ async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<
  *
  * The resume point is persisted BEFORE any action, so the reload the
  * action triggers starts the next page load already past it. */
+export interface RailLiveHandle {
+  /** Tear down the subscription, remove DOM listeners. */
+  unsubscribe(): void;
+  /** Force an immediate reconnect — the rail's "Refresh now" button
+   * calls this so the controller re-syncs through the same code
+   * path that the `visibilitychange` and `online` DOM events use.
+   * The button hits BOTH a thread refetch and this wake so the
+   * reviewer sees a resync even when the controller is still in
+   * `open` (a stale-but-not-yet-caught stream). */
+  wake(): void;
+}
+
 function subscribeEvents(
   onBump: (event: RailReviewEvent) => void,
   onModeBump: () => void = () => {},
@@ -754,7 +767,7 @@ function subscribeEvents(
   }) => void = () => {},
   onAttached: () => void = () => {},
   onLiveState: (state: LiveState) => void = () => {},
-): () => void {
+): RailLiveHandle {
   /** Monotonic per-seq gate: a replay is dropped before it can bump
    * state or navigate. Seeded with the persisted resume point so the
    * gate holds on its own even if `?since=` does not — see
@@ -901,43 +914,93 @@ function subscribeEvents(
       // A broken rail hook must not take down the subscription.
     }
   };
+  // Test seam (issue #277 round 2): the e2e drops the server
+  // heartbeat interval and the client watchdog to a few hundred ms
+  // so Playwright does not have to wait 37.5 s (2.5× the default
+  // 15 s heartbeat) for the stale-stream watchdog to trip. Production
+  // pages never set this global — the controller then uses its own
+  // defaults, which match the daemon's `SSE_KEEPALIVE_INTERVAL_MS`.
+  const liveOverrides: {
+    readonly heartbeatIntervalMs?: number;
+    readonly watchdogMultiplier?: number;
+    readonly connectTimeoutMs?: number;
+  } =
+    typeof window !== "undefined"
+      ? (window as unknown as { __revkit_live_opts?: {
+          heartbeatIntervalMs?: number;
+          watchdogMultiplier?: number;
+          connectTimeoutMs?: number;
+        } }).__revkit_live_opts ?? {}
+      : {};
   const controller = createLiveChannel({
-    open({ onOpen, onError }): { close: () => void } {
+    ...liveOverrides,
+    open({ onOpen, onError, onHeartbeat }): { close: () => void } {
       // Deliberately kept as a closure — each open captures a fresh
       // `MessageEvent` handler so late frames from a replaced source
       // can be identified and ignored at the EventSource level.
       let source: EventSource | undefined;
+      let pingListener: (() => void) | undefined;
       let cancelled = false;
-      void initialSincePromise.then((since) => {
+      void initialSincePromise.then((initialSince) => {
         if (cancelled || detached) return;
+        // Resume from the HIGHEST seq this tab has already acted on,
+        // not the page-load `since`. A reconnect that still used the
+        // page-load `since` would ask the daemon to replay every
+        // event we had already handled since page load; the per-seq
+        // gate drops them on arrival, but it is a wasted round-trip
+        // and (worse) if the daemon log has rolled it can refuse to
+        // serve from that far back. Reading `readResumeSeq` here
+        // picks up every `writeResumeSeq` the parser has done in
+        // between.
+        const storedSince = readResumeSeq(sessionStorageOrUndefined());
+        const since = Math.max(initialSince, storedSince);
         // `EventSource` sends the session cookie automatically
         // because we opened the page under the daemon's own origin.
         source = new EventSource(
           since > 0 ? `/events?since=${encodeURIComponent(String(since))}` : "/events?since=0",
         );
         source.onopen = (): void => onOpen();
-        source.onmessage = (message: MessageEvent<string>): void => handleMessageData(message.data);
+        source.onmessage = (message: MessageEvent<string>): void => {
+          // Any data frame is also a stream-alive signal — reset
+          // the controller's watchdog BEFORE we run the parser so a
+          // broken parser does not starve the watchdog.
+          onHeartbeat();
+          handleMessageData(message.data);
+        };
         source.onerror = (): void => onError();
+        // Named `ping` events (the daemon's `sseHeartbeat()` frames)
+        // are what the client-side watchdog listens for on an
+        // otherwise-quiet channel. EventSource never surfaces SSE
+        // comment lines to the page, so a bare server comment would
+        // not be observable.
+        pingListener = (): void => onHeartbeat();
+        source.addEventListener("ping", pingListener);
       });
       return {
         close(): void {
           cancelled = true;
           if (source !== undefined) {
             try {
+              if (pingListener !== undefined) {
+                source.removeEventListener("ping", pingListener);
+              }
               source.close();
             } catch {
               // Already closed.
             }
             source = undefined;
+            pingListener = undefined;
           }
         },
       };
     },
     onStateChange(state): void {
-      // `connecting` is both the initial attach AND every reconnect
-      // attempt. Either way, fire the attached hook so the rail
-      // refetches threads once the (re)connection is in flight.
-      if (state === "connecting") fireAttached();
+      // Fire the attached hook on every `open` transition — a
+      // (re)connection is the moment to resync threads so the rail's
+      // model matches what the daemon has just started replaying. We
+      // ALSO fire on the initial `connecting` so a cold page gets
+      // its first thread list immediately, before the stream opens.
+      if (state === "connecting" || state === "open") fireAttached();
       try {
         onLiveState(state);
       } catch {
@@ -946,34 +1009,26 @@ function subscribeEvents(
     },
   });
 
-  // Visibility + online wake-ups. See the function doc: a tab
+  // Visibility + online wake-ups. See `wakeup-listeners.ts`: a tab
   // returning from hidden is the strongest signal that the SSE may
   // have gone stale while the browser froze the connection; forcing
   // a reconnect here closes the zombie-open window diagnosed in
-  // issue #277. We register against `document` / `window` only if
-  // they exist (they do in a browser; a test harness may stub them).
-  const onVisibilityChange = (): void => {
-    if (typeof document !== "undefined" && document.visibilityState === "visible") {
-      controller.wake();
-    }
-  };
-  const onOnline = (): void => controller.wake();
-  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
-    document.addEventListener("visibilitychange", onVisibilityChange);
-  }
-  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
-    window.addEventListener("online", onOnline);
-  }
+  // issue #277. The helper owns listener add + remove so a unit
+  // test can assert the teardown is symmetric.
+  const unregisterWakeups = registerLiveWakeupListeners(
+    browserWakeupScope(),
+    () => controller.wake(),
+  );
 
-  return () => {
-    detached = true;
-    controller.stop();
-    if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    }
-    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
-      window.removeEventListener("online", onOnline);
-    }
+  return {
+    unsubscribe(): void {
+      detached = true;
+      controller.stop();
+      unregisterWakeups();
+    },
+    wake(): void {
+      controller.wake();
+    },
   };
 }
 
@@ -1368,7 +1423,7 @@ function Rail(): JSX.Element {
   // Wire the SSE stream on mount, tear it down on unmount. The three
   // subscribers are separated so a `presence` event does not force a
   // thread refetch, and a comment event does not force a mode refetch.
-  const unsubscribe = subscribeEvents(
+  const liveHandle = subscribeEvents(
     (event) => {
       void refetch();
       // Any comment.linked / review.* event affects the derived
@@ -1407,7 +1462,7 @@ function Rail(): JSX.Element {
       setLiveState(state);
     },
   );
-  onCleanup(unsubscribe);
+  onCleanup(() => liveHandle.unsubscribe());
 
   // Selection listener: on `mouseup` (or a keyboard-driven
   // `selectionchange` when a screen reader / keyboard user extends
@@ -1662,11 +1717,13 @@ function Rail(): JSX.Element {
       </header>
       {/* Issue #277: "live updates paused" indicator. Shown only when
           the SSE channel is in `reconnecting` — initial `connecting`
-          flicker on page load is noise, not signal. Reviewer clicks
-          Retry to force a reconnect NOW (also fired on
-          `visibilitychange` / `online`; the button exists for the
-          cases those events do not cover, e.g. a stuck tab whose
-          network returns while already in the foreground). */}
+          on page load is suppressed by the controller (the state
+          stays `reconnecting` across every retry until a stream
+          actually opens, so the badge and its `aria-live` region
+          do not flicker). "Refresh now" forces the controller to
+          `wake()` (bypassing the current backoff) AND refetches the
+          thread list immediately — a reviewer who clicks it expects
+          BOTH a fresh stream AND a fresh thread list. */}
       <Show when={liveState() === "reconnecting"}>
         <div
           class="revkit-rail__live-paused"
@@ -1681,7 +1738,10 @@ function Rail(): JSX.Element {
             type="button"
             class="revkit-rail__live-paused-retry"
             data-testid="revkit-rail-live-paused-retry"
-            onClick={() => void refetch()}
+            onClick={() => {
+              liveHandle.wake();
+              void refetch();
+            }}
           >Refresh now</button>
         </div>
       </Show>
