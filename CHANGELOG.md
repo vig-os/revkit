@@ -130,17 +130,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     uses a new `findRunningOrStartingDaemon` that also returns a
     "starting" daemon. `acquireAndPublish` is unchanged for programmatic
     callers.
-  - **SIGKILL / SIGTERM safety for the cold-start build.** Before the
-    build runs, `revkit serve` opens the daemon-lock fd with
-    `inheritable: true` (no `O_CLOEXEC`) and passes it to the astro
-    child via `Bun.spawn`'s `stdio` array. If the parent is SIGKILLed
-    mid-build the child still owns the fd and the kernel-held flock
-    stays alive, so a second `revkit serve` is refused immediately —
-    the two-concurrent-build race is impossible even without a
-    graceful shutdown. SIGTERM / SIGINT wire a pre-bind signal
-    handler that aborts the build (AbortSignal threaded into
-    `spawnAstroBuild`) and does the ownership-checked serve.json
-    cleanup through `acquired.release()`.
+  - **SIGKILL safety through output staging, not fd inheritance (round
+    3).** The cold auto-build writes to a private
+    `.revkit/dist.staging-<pid>-<nonce>/` directory which the holding
+    `revkit serve` atomically renames to `.revkit/dist` after
+    `check-dist` passes. If the parent is SIGKILLed mid-build, the
+    orphaned astro child writes only its own staging dir — never
+    promoted — and the next `revkit serve` sweeps stale staging dirs
+    whose pid is dead (`cleanupOrphanedStagingDirs`). The earlier
+    round-2 attempt handed the daemon-lock fd to the astro child via
+    `Bun.spawn`'s `stdio` to keep the flock alive on a parent SIGKILL;
+    Bun closes stdio fds on Subprocess garbage collection, so a GC
+    during serve would then drop the serving daemon's OWN lock fd and
+    a second `revkit serve` could bind on the same repo
+    (reproduced). The lock is now always CLOEXEC; mutual exclusion is
+    the kernel flock, and the build race is closed through atomic
+    output promotion. SIGTERM / SIGINT still abort the build via an
+    AbortController threaded into `spawnAstroBuild`, and the default
+    spawner kills the astro child's whole process group so nested
+    vite / node sub-processes die with it.
   - **Building diagnostic is prompt and accurate.** The per-tool-call
     `discover` now calls `ensureDaemon` with
     `onStartingDaemon: "diagnose"`: a live "starting" record throws
@@ -151,20 +159,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pid X, N s elapsed since YYYY-…)" well inside the tool-call
     deadline — ending the 10 s race that gave 30 of 36 calls the
     generic "reconnect did not complete" error in a 3-minute build.
-  - **Build failure reaches the MCP caller.** `revkit serve`
-    persists a `.revkit/start-failed.json` record (stage, message,
-    stderr tail, inputs) whenever its auto-build or `startDaemon`
-    fails, and clears it on a successful bind. `ensureDaemon` reads
-    the record before spawning: a matching failure surfaces as
-    `DaemonStartFailedError` instead of silently respawning a
-    daemon that will fail the same way. Running `revkit build`
-    manually changes the recorded inputs (dist now exists) and
-    lifts the suppression.
+    The pid is omitted from the diagnostic when the recorded serve
+    process is dead, so a mid-race read never points the agent at a
+    vanished pid.
+  - **Build failure reaches the MCP caller through an input-aware
+    record (round 3).** `revkit serve` persists
+    `.revkit/start-failed.json` ONLY for a genuine build or
+    check-dist failure — never for lock contention, a SIGTERM /
+    SIGINT abort, or a bind-time race. The record carries an input
+    fingerprint: SHA-256 over `docs/`, `vocab/`, `plots/` (paths +
+    sizes + mtimes) plus `package.json` under the consumer root (see
+    `packages/cli/src/serve/input-fingerprint.ts`,
+    `FINGERPRINT_INPUT_ROOTS` / `FINGERPRINT_CONFIG_FILES`).
+    `ensureDaemon` refuses to respawn only while the current
+    fingerprint matches the recorded one; any edit under those trees,
+    a successful `revkit check` on the full tree, a successful
+    `revkit build`, or a successful `revkit serve` bind clears or
+    invalidates the record. The pre-fix key was `distExists`, so a
+    content fix could not lift the suppression without manually
+    running `revkit build` first; the round-2 shape also wrote
+    `stage: "aborted"` on every SIGTERM, which then wedged MCP until
+    the user removed the file by hand. Both issues resolved in round
+    3. Manual escape (`revkit serve` directly, or `rm
+    .revkit/start-failed.json`) documented in `SKILL.md`.
   - **`revkit open` during a cold-start.** Now reports
     `a daemon is starting (cold-start auto-build, pid X, N s
     elapsed since …)` instead of the misleading "no daemon is
     running. Start one with `revkit serve` first" — which would
-    only be refused by the still-held `.revkit/daemon.lock`.
+    only be refused by the still-held `.revkit/daemon.lock`. The
+    pid is omitted from the message if the recorded serve process
+    is dead (round 3 nit).
 - **A page whose body fails to render fails the build**
   ([#237](https://github.com/vig-os/revkit/issues/237))
   - Astro's glob loader wraps every per-entry markdown render in a try/catch

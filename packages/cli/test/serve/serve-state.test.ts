@@ -6,18 +6,28 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import {
+  DIST_STAGING_PREFIX,
+  DIST_STAGING_RE,
   acquireAndPublish,
+  cleanupOrphanedStagingDirs,
   daemonLockPath,
   findRunningDaemon,
+  listDistStagingDirs,
+  newDistStagingName,
+  pidIsAlive,
+  promoteStagingDir,
   readOrMintRepoId,
   readServeState,
   readServeStateVerbose,
+  readStartFailure,
   removeServeState,
   repoIdPath,
   serveStatePath,
+  startFailurePath,
   writeServeState,
+  writeStartFailure,
   type ServeState,
 } from "../../src/serve/serve-state.ts";
 import { readFileSync } from "node:fs";
@@ -213,21 +223,20 @@ describe("daemon-lock (raw acquire / release)", () => {
     second?.release();
   });
 
-  test("#251 B1: inheritable:true opens the lock fd WITHOUT FD_CLOEXEC so it survives exec", () => {
-    // SIGKILL safety relies on the astro child inheriting the
-    // lock fd: the kernel keeps the flock alive while any process
-    // maps the fd to the inode. That only happens when
-    // FD_CLOEXEC is off on the fd — otherwise exec clears it.
-    //
-    // We can't drive an exec from a unit test, but we can assert
-    // the invariant that makes exec-time inheritance possible:
-    // FD_CLOEXEC on the inheritable lock fd is 0.
+  test("#251 round 3: the lock fd is always CLOEXEC — a child does not keep the flock alive after parent death", async () => {
+    // Round-3 revert of the inherited-fd mechanism. The lock fd
+    // MUST be CLOEXEC so it never silently outlives its owning
+    // process through an inherited subprocess. We assert both:
+    //   (1) FD_CLOEXEC is set on the fd we got back, and
+    //   (2) a subprocess that inherited our lock fd through
+    //       `Bun.spawn`'s stdio does NOT keep the flock alive
+    //       after the parent exits.
     const path = daemonLockPath(repoRoot);
     require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
-
-    const held = acquireDaemonLock(path, { inheritable: true });
+    const held = acquireDaemonLock(path);
     expect(held).not.toBeNull();
     try {
+      // (1) FD_CLOEXEC is on.
       const { dlopen, FFIType } = require("bun:ffi") as typeof import("bun:ffi");
       const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
         fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
@@ -235,120 +244,75 @@ describe("daemon-lock (raw acquire / release)", () => {
       const F_GETFD = 1;
       const FD_CLOEXEC = 1;
       const flags = Number(lib.symbols.fcntl(held!.fd, F_GETFD, 0));
-      // Inheritable: FD_CLOEXEC bit MUST be off.
-      expect(flags & FD_CLOEXEC).toBe(0);
-    } finally {
-      held?.release();
-    }
-  });
-
-  test("#251 B1 SIGKILL: an inherited lock fd survives parent death; a second acquire is refused until the child exits", async () => {
-    // End-to-end proof that fd inheritance is what keeps the
-    // flock alive on a parent SIGKILL. We simulate `revkit serve`
-    // being killed mid-build by:
-    //
-    // 1. Spawning a Bun parent that acquires the lock
-    //    (inheritable: true), then execs a child `sleep` with
-    //    the fd inherited, and WAITS for the child.
-    // 2. Killing the PARENT with SIGKILL while the child sleeps.
-    // 3. From this test process: try `acquireDaemonLock` on the
-    //    same path. It MUST be refused because the orphaned
-    //    child still has the fd open and the kernel still holds
-    //    the flock on that inode.
-    // 4. Kill the child; verify the lock is then free.
-    const path = daemonLockPath(repoRoot);
-    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
-    // Parent that holds the inheritable lock + spawns a sleep
-    // child that inherits the fd via `stdio` (Bun.spawn requires
-    // the fd listed in `stdio` for inheritance — a non-CLOEXEC
-    // fd is NOT silently inherited the way a plain posix_spawn
-    // would have). The parent then blocks on the child; a
-    // SIGKILL cuts the parent but leaves the orphaned sleep
-    // (adopted by init / the test runner) with the fd.
-    const parentScript = `
-      const { acquireDaemonLock } = await import("${resolve(import.meta.dirname, "..", "..", "src", "serve", "daemon-lock.ts")}");
-      const held = acquireDaemonLock(${JSON.stringify(path)}, { inheritable: true });
-      if (held === null) { process.exit(2); }
-      // stdio: [stdin, stdout, stderr, lockFd] — Bun inherits
-      // the lock fd by appending it to the stdio array, which
-      // mirrors how serve/cli.ts hands the fd to the astro child.
-      const sleepProc = Bun.spawn(["sleep", "30"], {
-        stdio: ["ignore", "inherit", "inherit", held.fd],
-      });
-      process.stderr.write("CHILDPID=" + sleepProc.pid + "\\n");
-      await sleepProc.exited;
-    `;
-    const parent = (await import("node:child_process")).spawn(
-      "bun",
-      ["-e", parentScript],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let childPid: number | undefined;
-    let stderrBuf = "";
-    parent.stderr?.on("data", (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
-      const m = stderrBuf.match(/CHILDPID=(\d+)/);
-      if (m !== null) childPid = Number(m[1]);
-    });
-    // Wait up to 5 s for the child to be announced.
-    const deadline = Date.now() + 5_000;
-    while (childPid === undefined && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 25));
-    }
-    expect(childPid).toBeDefined();
-    try {
-      // SIGKILL the parent — no handlers run, lock fd closes in
-      // the parent, but the sleep child still has it mapped.
-      parent.kill("SIGKILL");
-      await new Promise((r) => parent.on("exit", r));
-      // Lock is STILL held by the orphan: a second acquire is
-      // refused.
-      const refused = acquireDaemonLock(path);
-      expect(refused).toBeNull();
-      // Kill the orphan. On exit the kernel closes the fd and
-      // releases the lock.
-      process.kill(childPid!, "SIGKILL");
-      // Poll briefly for the lock to become free.
-      const freeDeadline = Date.now() + 2_000;
-      let freed = false;
-      while (Date.now() < freeDeadline) {
-        const attempt = acquireDaemonLock(path);
-        if (attempt !== null) {
-          attempt.release();
-          freed = true;
-          break;
-        }
-        await new Promise((r) => setTimeout(r, 25));
-      }
-      expect(freed).toBe(true);
-    } finally {
-      try { parent.kill("SIGKILL"); } catch { /* already dead */ }
-      if (childPid !== undefined) {
-        try { process.kill(childPid, "SIGKILL"); } catch { /* already dead */ }
-      }
-    }
-  }, 15_000);
-
-  test("#251 B1: inheritable omitted (default) keeps FD_CLOEXEC on — fd NOT inherited", () => {
-    const path = daemonLockPath(repoRoot);
-    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
-
-    const held = acquireDaemonLock(path); // default
-    expect(held).not.toBeNull();
-    try {
-      const { dlopen, FFIType } = require("bun:ffi") as typeof import("bun:ffi");
-      const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
-        fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-      });
-      const F_GETFD = 1;
-      const FD_CLOEXEC = 1;
-      const flags = Number(lib.symbols.fcntl(held!.fd, F_GETFD, 0));
-      // Default: FD_CLOEXEC bit MUST be on (the pre-#251 contract).
       expect(flags & FD_CLOEXEC).toBe(FD_CLOEXEC);
     } finally {
       held?.release();
     }
   });
+
+  test("#251 round 3 BLOCKER 1: the lock is still held after a forced Bun.gc() following a completed build", async () => {
+    // Pre-fix reproduction of the round-3 reviewer's duplicate-
+    // daemon race.
+    //
+    // ROUND 2 (pre-fix): `acquireStartingLock` opened the lock
+    // with `{ inheritable: true }` and exposed `lockFd` so
+    // `revkit serve` could hand it to the astro child via
+    // `Bun.spawn`'s `stdio` array. Bun closes fds passed through
+    // `stdio` when the Subprocess is garbage-collected, so once
+    // the build completed and the Subprocess dropped, GC closed
+    // the serving daemon's OWN lock fd — the kernel then
+    // released the flock while the daemon was still serving,
+    // and a second `revkit serve` bound on the same repo
+    // (reproduced: two daemons sharing threads.sqlite).
+    //
+    // ROUND 3 (post-fix): the `inheritable` option is gone
+    // and `AcquiredStartingDaemon` no longer exposes `lockFd`.
+    // The SIGKILL race is addressed through staging-dir
+    // promotion instead. The flock is CLOEXEC-only, held by the
+    // serving daemon for the life of that process — no fd ever
+    // reaches a Subprocess's `stdio`, so GC of a Subprocess
+    // cannot touch it.
+    const { acquireStartingLock } = require("../../src/serve/serve-state.ts");
+    const acquired = acquireStartingLock(repoRoot, {
+      pid: process.pid,
+      version: "0.0.0-test",
+      startedAt: new Date().toISOString(),
+      instanceId: "gc-test",
+    });
+    expect(acquired.kind).toBe("ok");
+    try {
+      // Simulate `revkit serve`'s cold-start astro spawn. Pre-
+      // fix, `serve/cli.ts` passed `inheritFds: [lockFd]` which
+      // the shared `defaultSpawn` turned into a stdio entry on
+      // `Bun.spawn`. If a pre-fix-shaped `lockFd` leaks through
+      // the API surface, drive the real inheritance path here
+      // so the pre-fix bug is proved. Post-fix the field is
+      // absent and we just spawn a plain child — the lock
+      // stays held because no fd was ever handed to anyone.
+      const maybeLockFd = (acquired as { lockFd?: number }).lockFd;
+      let child: Bun.Subprocess | undefined;
+      if (typeof maybeLockFd === "number") {
+        child = Bun.spawn(["true"], {
+          stdio: ["ignore", "ignore", "ignore", maybeLockFd] as never,
+        });
+      } else {
+        child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
+      }
+      await child.exited;
+      // Drop the Subprocess reference and force GC. The round-2
+      // reviewer reproduced the drop with this exact shape.
+      child = undefined;
+      Bun.gc(true);
+      // Give Bun a tick to actually close resources.
+      await Bun.sleep(50);
+      // Second acquire MUST be refused — the serving daemon
+      // (this test fixture) still holds the flock.
+      const refused = acquireDaemonLock(daemonLockPath(repoRoot));
+      expect(refused).toBeNull();
+    } finally {
+      acquired.release();
+    }
+  }, 15_000);
 });
 
 describe("readOrMintRepoId (issue #60 PR #62 round-3)", () => {
@@ -395,5 +359,151 @@ describe("readOrMintRepoId (issue #60 PR #62 round-3)", () => {
     expect(id.length).toBeGreaterThanOrEqual(16);
     // The file has been rewritten with a fresh id.
     expect(readFileSync(path, "utf8").trim()).toBe(id);
+  });
+});
+
+describe("#251 round 3: staging-dir promotion", () => {
+  let repoRoot: string;
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), "revkit-staging-"));
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  test("newDistStagingName composes `dist.staging-<pid>-<nonce>` and strips unsafe chars", () => {
+    const name = newDistStagingName(42, "abc_DEF-0");
+    expect(name).toBe(`${DIST_STAGING_PREFIX}42-abc_DEF-0`);
+    expect(DIST_STAGING_RE.test(name)).toBe(true);
+    // The regex rejects a bogus nonce with slashes / spaces — only
+    // the sanitised shape is written.
+    const sanitised = newDistStagingName(99, "a/b c!");
+    expect(DIST_STAGING_RE.test(sanitised)).toBe(true);
+    expect(sanitised).toContain("abc");
+  });
+
+  test("listDistStagingDirs reports every matching dir under .revkit/", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-abc`), { recursive: true });
+    fs.mkdirSync(join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}2-def`), { recursive: true });
+    fs.mkdirSync(join(repoRoot, ".revkit", "dist"), { recursive: true });
+    fs.mkdirSync(join(repoRoot, ".revkit", "unrelated"), { recursive: true });
+    const seen = listDistStagingDirs(repoRoot).map((e) => `${e.name}:${e.pid}`).sort();
+    expect(seen).toEqual([`${DIST_STAGING_PREFIX}1-abc:1`, `${DIST_STAGING_PREFIX}2-def:2`]);
+  });
+
+  test("cleanupOrphanedStagingDirs removes dirs whose pid is dead, leaves live ones alone", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    // pid 1 is PID-1 (init), always alive on any POSIX host —
+    // acts as our "live" placeholder (we would not scrub someone
+    // else's staging dir mid-build).
+    const alive = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-alive`);
+    fs.mkdirSync(alive, { recursive: true });
+    // Pick a pid that is almost certainly dead: use a large one.
+    // `process.kill(pid, 0)` returns ESRCH for a gap in the pid
+    // space.
+    let deadPid = 2 ** 20;
+    while (pidIsAlive(deadPid)) deadPid++;
+    const dead = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}${deadPid}-dead`);
+    fs.mkdirSync(dead, { recursive: true });
+    const removed = cleanupOrphanedStagingDirs(repoRoot);
+    expect(removed).toContain(`${DIST_STAGING_PREFIX}${deadPid}-dead`);
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(alive)).toBe(true);
+  });
+
+  test("promoteStagingDir renames staging → dist when dist is absent", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const staging = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-abc`);
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(join(staging, "index.html"), "<h1>staged</h1>");
+    const dist = join(repoRoot, ".revkit", "dist");
+    const outcome = promoteStagingDir(staging, dist);
+    expect(outcome.kind).toBe("promoted");
+    expect(existsSync(staging)).toBe(false);
+    expect(readFileSync(join(dist, "index.html"), "utf8")).toBe("<h1>staged</h1>");
+  });
+
+  test("promoteStagingDir refuses to overwrite an existing dist (kept-existing)", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const staging = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-abc`);
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(join(staging, "index.html"), "<h1>staged</h1>");
+    const dist = join(repoRoot, ".revkit", "dist");
+    fs.mkdirSync(dist, { recursive: true });
+    fs.writeFileSync(join(dist, "index.html"), "<h1>existing</h1>");
+    const outcome = promoteStagingDir(staging, dist);
+    expect(outcome.kind).toBe("kept-existing");
+    // The existing winner survives untouched.
+    expect(readFileSync(join(dist, "index.html"), "utf8")).toBe("<h1>existing</h1>");
+    // Staging dir is left in place — caller discards it.
+    expect(existsSync(staging)).toBe(true);
+  });
+});
+
+describe("#251 round 3: StartFailureRecord uses an input fingerprint", () => {
+  let repoRoot: string;
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), "revkit-start-failure-"));
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  test("writeStartFailure persists the fingerprint; readStartFailure round-trips it", () => {
+    writeStartFailure(repoRoot, {
+      stage: "build-failed",
+      message: "revkit serve: auto-build failed (astro build exited 1)",
+      stderrTail: "SyntaxError in docs/foo.mdx",
+      failedAt: "2026-11-18T12:00:00Z",
+      version: "test-0.1.0",
+      inputs: { fingerprint: "0123456789abcdef" },
+    });
+    const read = readStartFailure(repoRoot);
+    expect(read).toBeDefined();
+    expect(read?.stage).toBe("build-failed");
+    expect(read?.inputs.fingerprint).toBe("0123456789abcdef");
+    expect(read?.stderrTail).toContain("SyntaxError");
+  });
+
+  test("readStartFailure refuses legacy records that only carry distExists (#251 round-3 BLOCKER 2 (d))", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    // The pre-fix shape had `inputs.distExists` and no
+    // `fingerprint`. The round-3 schema refuses it (returns
+    // undefined) so a legacy record from a crash never blocks a
+    // new MCP auto-spawn forever.
+    fs.writeFileSync(
+      startFailurePath(repoRoot),
+      JSON.stringify({
+        stage: "build-failed",
+        message: "legacy",
+        failedAt: "2026-11-01T12:00:00Z",
+        version: "0.0.0",
+        inputs: { distExists: false },
+      }),
+      "utf8",
+    );
+    expect(readStartFailure(repoRoot)).toBeUndefined();
+  });
+
+  test('readStartFailure rejects stage "aborted" — round-3 removes that case entirely', () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.writeFileSync(
+      startFailurePath(repoRoot),
+      JSON.stringify({
+        stage: "aborted",
+        message: "signal",
+        failedAt: "2026-11-01T12:00:00Z",
+        version: "0.0.0",
+        inputs: { fingerprint: "deadbeef" },
+      }),
+      "utf8",
+    );
+    // After round 3, `stage: "aborted"` is never written; the
+    // reader also refuses it so an operator who edits in the old
+    // literal cannot silently wedge MCP.
+    expect(readStartFailure(repoRoot)).toBeUndefined();
   });
 });

@@ -18,6 +18,7 @@ import {
   findRunningDaemon,
   findRunningOrStartingDaemon,
   isReadyServeState,
+  pidIsAlive,
 } from "./serve/serve-state.ts";
 import { DaemonClient } from "./mcp/daemon-client.ts";
 
@@ -94,11 +95,18 @@ export async function runOpenCommand(args: readonly string[], env: RunOpenEnv): 
       const elapsedS = Number.isFinite(parsed)
         ? Math.max(0, Math.round((Date.now() - parsed) / 1000))
         : 0;
+      // #251 round-3 nit: omit the pid when the recorded serve is
+      // dead — pointing the agent at a vanished process confuses
+      // more than it helps. After the inherited-fd revert this
+      // branch only triggers mid-race; the normal path still
+      // names the live serve.
+      const pidAlive = pidIsAlive(starting.pid);
+      const pidClause = pidAlive ? `pid ${starting.pid}, ` : "";
       return {
         exitCode: 1,
         stdout: "",
         stderr:
-          `revkit open: a daemon is starting (cold-start auto-build, pid ${starting.pid}, ${elapsedS} s elapsed since ${starting.startedAt}). ` +
+          `revkit open: a daemon is starting (cold-start auto-build, ${pidClause}${elapsedS} s elapsed since ${starting.startedAt}). ` +
           `Try again once the build finishes.\n`,
       };
     }

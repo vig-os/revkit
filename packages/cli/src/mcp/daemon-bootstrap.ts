@@ -28,17 +28,18 @@
 // process. The daemon writes its own state file (mode 600) and the
 // bootstrap only ever reads it.
 
-import { existsSync } from "node:fs";
-import { join, resolve as resolvePath } from "node:path";
+import { resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   clearStartFailure,
   findRunningOrStartingDaemon,
   isReadyServeState,
+  pidIsAlive,
   readStartFailure,
   type ServeState,
   type StartFailureRecord,
 } from "../serve/serve-state.ts";
+import { computeInputFingerprint } from "../serve/input-fingerprint.ts";
 import { stripTrailingSlashes } from "./daemon-client.ts";
 
 /** Options for `ensureDaemon`. */
@@ -112,6 +113,14 @@ export interface BootstrapOptions {
   /** Test hook: swap out `clearStartFailure`. Defaults to deleting
    * `.revkit/start-failed.json` (#251 N1). */
   readonly clearStartFailure?: (repoRoot: string) => void;
+  /** Test hook: swap out `computeInputFingerprint`. Defaults to
+   * walking docs/vocab/plots + package.json under `repoRoot`.
+   * `undefined` means "could not compute", in which case the
+   * caller treats any recorded failure as stale. */
+  readonly computeInputFingerprint?: (repoRoot: string) => string | undefined;
+  /** Test hook: swap out `pidIsAlive` for deterministic tests of
+   * the dead-pid branch in the building diagnostic. */
+  readonly isPidAlive?: (pid: number) => boolean;
   /** Test hook: injected clock (ms epoch). */
   readonly nowMs?: () => number;
   /** Test hook: sleep (ms → Promise). */
@@ -144,20 +153,29 @@ export interface Bootstrapped {
  * agent to retry. Elapsed is wall-clock since the record was
  * published (NOT since the waiter started), so a tool call made
  * ten minutes into a slow build reports `elapsed ~= 600 s`, not
- * `elapsed ~= 10 s`. */
+ * `elapsed ~= 10 s`.
+ *
+ * `pid` is `undefined` when the serve process that published the
+ * "starting" record is DEAD. Round-3 nit: the inherited-fd
+ * mechanism used to leave a dead serve's pid in the record (astro
+ * child held the lock after a SIGKILL); after the revert the lock
+ * is released on serve death, so this branch is reached only when
+ * a race delivered a stale record. Suppressing the pid avoids
+ * pointing the agent at a process that is no longer there. */
 export class DaemonBuildingError extends Error {
-  readonly pid: number;
+  readonly pid: number | undefined;
   readonly elapsedMs: number;
   readonly startedAt: string;
-  constructor(args: { pid: number; elapsedMs: number; startedAt: string }) {
+  constructor(args: { pid: number | undefined; elapsedMs: number; startedAt: string }) {
     const elapsedS = Math.max(0, Math.round(args.elapsedMs / 1000));
+    const pidClause = args.pid !== undefined ? `pid ${args.pid}, ` : "";
     super(
-      `revkit mcp: daemon is building (cold-start auto-build, pid ${args.pid}, ` +
+      `revkit mcp: daemon is building (cold-start auto-build, ${pidClause}` +
         `${elapsedS} s elapsed since ${args.startedAt}). ` +
         `Retry this tool call in a few seconds.`,
     );
     this.name = "DaemonBuildingError";
-    this.pid = args.pid;
+    if (args.pid !== undefined) this.pid = args.pid;
     this.elapsedMs = args.elapsedMs;
     this.startedAt = args.startedAt;
   }
@@ -226,6 +244,8 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   const discover = options.findRunningDaemon ?? findRunningOrStartingDaemon;
   const readFailure = options.readStartFailure ?? readStartFailure;
   const clearFailure = options.clearStartFailure ?? clearStartFailure;
+  const computeFingerprint = options.computeInputFingerprint ?? computeInputFingerprint;
+  const isAlive = options.isPidAlive ?? pidIsAlive;
   const onStarting = options.onStartingDaemon ?? "wait";
 
   // Case 1: a daemon already owns the lock (ready OR starting).
@@ -238,9 +258,16 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
     // is computed from the record's `startedAt`, not from the
     // caller's clock-at-entry, so a tool call made ten minutes
     // into a build reports ~600 s elapsed — not ~0 s.
+    //
+    // #251 round 3 nit: if the recorded serve pid is NOT alive,
+    // omit it from the diagnostic. After the inherited-fd revert
+    // the lock is released on serve death, so reaching this branch
+    // with a dead pid means we are reading a mid-release race
+    // record. Pointing the agent at a dead pid is misleading.
     if (onStarting === "diagnose") {
+      const pidAlive = isAlive(existing.pid);
       throw new DaemonBuildingError({
-        pid: existing.pid,
+        pid: pidAlive ? existing.pid : undefined,
         elapsedMs: elapsedSinceStartedAt(existing.startedAt, clock()),
         startedAt: existing.startedAt,
       });
@@ -259,22 +286,30 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
     return { state: ready, spawned: false };
   }
 
-  // #251 N1: before spawning, check for a persisted start failure.
-  // `revkit serve`'s spawn ignores stdio, so a build or startDaemon
-  // failure is otherwise invisible — every MCP tool call would
-  // keep blindly respawning it. The record is honoured only while
-  // the recorded inputs match the current state (dist still
-  // missing / present as it was at failure time); when the user
-  // runs `revkit build` manually, dist exists and the record is
-  // treated as stale (cleared, then spawn proceeds).
+  // #251 N1 / round 3: before spawning, check for a persisted
+  // start failure. `revkit serve`'s spawn ignores stdio, so a
+  // genuine build or startDaemon failure is otherwise invisible —
+  // every MCP tool call would keep blindly respawning it. The
+  // record is honoured only while the input fingerprint matches
+  // what was recorded at failure time; any change to the consumer's
+  // docs/vocab/plots/package.json flips the fingerprint and the
+  // record is treated as stale (cleared, then spawn proceeds).
+  //
+  // When the fingerprint cannot be computed (missing / unreadable
+  // repoRoot), we also treat the record as stale: respawn-
+  // suppression cannot be proved to still apply, so prefer "try
+  // again" to "surface forever".
   const failure = readFailure(repoRoot);
   if (failure !== undefined) {
-    const distExistsNow = existsSync(defaultDistPath(repoRoot, options.dir));
-    if (distExistsNow === failure.inputs.distExists) {
+    const currentFingerprint = computeFingerprint(repoRoot);
+    if (
+      currentFingerprint !== undefined &&
+      currentFingerprint === failure.inputs.fingerprint
+    ) {
       throw new DaemonStartFailedError(failure);
     }
-    // Inputs changed — the user likely ran `revkit build`. Clear
-    // the record and proceed to spawn a fresh daemon.
+    // Inputs changed (or unreadable) — the user likely edited a
+    // file. Clear the record and proceed to spawn a fresh daemon.
     clearFailure(repoRoot);
   }
 
@@ -324,8 +359,9 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
     }
     // Starting record visible. #251 B2: honour `onStartingDaemon`.
     if (onStarting === "diagnose") {
+      const pidAlive = isAlive(state.pid);
       throw new DaemonBuildingError({
-        pid: state.pid,
+        pid: pidAlive ? state.pid : undefined,
         elapsedMs: elapsedSinceStartedAt(state.startedAt, clock()),
         startedAt: state.startedAt,
       });
@@ -348,14 +384,6 @@ export async function ensureDaemon(options: BootstrapOptions): Promise<Bootstrap
   throw new Error(
     `spawned daemon did not take '.revkit/daemon.lock' within ${waitMs} ms`,
   );
-}
-
-/** Resolve the dist path that `revkit serve` would default to.
- * Used by `ensureDaemon` to check whether `revkit build` created
- * dist after a recorded start failure. */
-function defaultDistPath(repoRoot: string, dir: string | undefined): string {
-  if (dir !== undefined) return resolvePath(repoRoot, dir);
-  return join(repoRoot, ".revkit", "dist");
 }
 
 /** Wait for a daemon in `status: "starting"` to reach `"ready"`.

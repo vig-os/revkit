@@ -526,9 +526,21 @@ waking the agent mid-turn.
   held, and a second `revkit serve` is refused.
 - **A tool returns `revkit mcp: daemon failed to start (<stage>
   at <time>): <reason>`** — the last `revkit serve` auto-build or
-  `startDaemon` failed and the reason is persisted in
-  `.revkit/start-failed.json`. The MCP side will NOT respawn
-  blindly while the same inputs still apply. The human's fix is
-  to read the recorded `stderrTail`, correct the source, and
-  either run `revkit build` manually (which clears the record)
-  or delete `.revkit/start-failed.json` to retry.
+  bind-time startup failed (`<stage>` is `build-failed` or
+  `start-failed`) and the reason is persisted in
+  `.revkit/start-failed.json`. The record carries an input
+  fingerprint over the consumer's `docs/`, `vocab/`, `plots/` and
+  `package.json`; MCP refuses to respawn only while the current
+  fingerprint matches the recorded one, so any edit under those
+  trees — a fixed MDX syntax, a renamed term, a new plot file —
+  invalidates the record and the NEXT MCP tool call will spawn a
+  fresh `revkit serve` on its own. The human's fix is to read
+  the recorded `stderrTail`, edit the source, and call the tool
+  again; a successful `revkit build`, a successful full `revkit
+  check` and a successful `revkit serve` bind also clear the
+  record. Manual escape: run `revkit serve` directly to see the
+  live error, or `rm .revkit/start-failed.json` to force the
+  next MCP tool call to retry. A transient — a SIGTERM abort of
+  the cold build, a lock contention from a parallel
+  `revkit serve`, a bind-time race — is NEVER persisted; only a
+  real build / startup failure lands here.

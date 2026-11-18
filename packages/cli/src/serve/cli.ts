@@ -7,20 +7,24 @@
 // test that wants to run `startDaemon` directly) does not pick up the
 // argv parser and the "block forever" behaviour they don't want.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { randomBytes } from "node:crypto";
 import { startDaemon, type StartDaemonOptions } from "./daemon.ts";
 import {
   acquireStartingLock,
+  cleanupOrphanedStagingDirs,
   clearStartFailure,
   ensureRevkitDir,
+  newDistStagingName,
+  promoteStagingDir,
   writeStartFailure,
   type AcquiredStartingDaemon,
 } from "./serve-state.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
 import { defaultConsumerDist } from "../build/packaged.ts";
 import { runBuildCommand } from "../build/cli.ts";
+import { computeInputFingerprint } from "./input-fingerprint.ts";
 import { mintToken } from "./auth.ts";
 
 /** One CLI invocation of `revkit serve`. `blockForever` is a Promise
@@ -52,6 +56,18 @@ export interface RunServeEnv {
    * post-build failure path without binding a real HTTP server.
    * Production callers never set this. */
   readonly startDaemonOverride?: typeof startDaemon;
+}
+
+/** True for a startDaemon error that is a lock-contention race, not
+ * a bind-time failure the user needs to fix (#251 round 3 BLOCKER 2
+ * (a)). `revkit serve`'s own lock-refused wording is matched here
+ * so the filter stays co-located with the writer. */
+function isLockContentionError(message: string): boolean {
+  return (
+    message.includes("another revkit daemon") ||
+    message.includes("another daemon holds") ||
+    message.includes(".revkit/daemon.lock")
+  );
 }
 
 /** Parse `--dir <path>`, `--port <n>` and `--no-auto-build`. Returns
@@ -232,17 +248,24 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     acquired = result;
   }
 
-  // #251 B1: once we hold the pre-bind lock we MUST clean up
+  // #251 round 3: once we hold the pre-bind lock we MUST clean up
   // before exiting on SIGINT / SIGTERM, or serve.json would stay
   // stuck on `status: "starting"`. The signal handlers below also
   // abort the in-flight auto-build via an AbortController so the
-  // astro child dies with us instead of continuing orphaned.
+  // astro child (and its whole process group) dies with us
+  // instead of continuing orphaned.
   //
-  // SIGKILL safety is a separate mechanism: `acquireStartingLock`
-  // opened the lock fd without O_CLOEXEC, and we hand that fd to
-  // the astro child via `inheritFds` below. If this process is
-  // SIGKILLed mid-build, the child still owns the fd → flock stays
-  // held → a second `revkit serve` is refused immediately.
+  // SIGKILL safety is provided through the OUTPUT: the auto-build
+  // writes to a private `.revkit/dist.staging-<pid>-<nonce>`
+  // directory which this process atomically promotes to
+  // `.revkit/dist` only after `check-dist` passes. If the parent
+  // is SIGKILLed mid-build, the astro child's output lands in
+  // its own staging dir and is NEVER promoted. The next cold
+  // `revkit serve` sweeps stale staging dirs whose pid is dead.
+  // Fd-inheritance into the child was reverted — a GC of the
+  // Subprocess would close our serving daemon's own lock fd, which
+  // was the round-3 reviewer's reproduced duplicate-daemon
+  // scenario.
   const buildAbort = needsAutoBuild ? new AbortController() : undefined;
   let buildSignalHandlers: Array<{ signal: NodeJS.Signals; handler: () => void }> = [];
   const abortedViaSignal = { reason: "" };
@@ -268,12 +291,43 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     buildSignalHandlers = [];
   };
 
+  // Private staging dir for the cold auto-build (#251 round 3).
+  // Unused when no auto-build is needed; kept at a predictable name
+  // so `cleanupOrphanedStagingDirs` finds and removes it after a
+  // SIGKILL.
+  let stagingDir: string | undefined;
+  if (needsAutoBuild) {
+    // Sweep stale staging dirs from SIGKILLed prior serves BEFORE
+    // minting our own, so a crash-loop does not grow the tree.
+    cleanupOrphanedStagingDirs(repoRoot);
+    const nonce = randomBytes(6).toString("base64url");
+    const stagingName = newDistStagingName(process.pid, nonce);
+    stagingDir = resolvePath(repoRoot, ".revkit", stagingName);
+    // The auto-build will create the dir; remove any stale same-named
+    // leftover (pid collision after wrap-around — rare but cheap to
+    // handle).
+    try {
+      rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      /* fine */
+    }
+  }
+  const removeStaging = (): void => {
+    if (stagingDir === undefined) return;
+    try {
+      rmSync(stagingDir, { recursive: true, force: true });
+    } catch {
+      /* fine */
+    }
+  };
+
   if (needsAutoBuild) {
     // Auto-build the consumer's tree before serving. If it fails,
     // release the lock and surface the build error. A concurrent
     // ensureDaemon that saw the starting record then sees the lock
     // free (died while starting) and can retry or spawn.
     stdoutLines.push(`revkit serve: no dist at ${dir} — building first`);
+    stdoutLines.push(`revkit serve: staging ${stagingDir}`);
     let buildResult;
     const build = env.runBuildOverride ?? runBuildCommand;
     try {
@@ -282,23 +336,33 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
         version: env.version,
         repoSlug: env.repoSlug ?? "vig-os/revkit",
         ...(buildAbort !== undefined ? { signal: buildAbort.signal } : {}),
-        // #251 B1: inherit the daemon.lock fd through to the astro
-        // child so the flock survives a parent SIGKILL.
-        ...(acquired !== undefined ? { inheritFds: [acquired.lockFd] } : {}),
+        // #251 round 3: route the astro build's output through a
+        // private staging dir. serve atomically promotes it after
+        // check-dist passes.
+        ...(stagingDir !== undefined ? { distOutDir: stagingDir } : {}),
       });
     } catch (error) {
       removeBuildSignalHandlers();
+      removeStaging();
       const abortedBySignal = buildAbort?.signal.aborted === true;
       const message = abortedBySignal
         ? `auto-build aborted by ${abortedViaSignal.reason || "signal"}`
         : `revkit serve: auto-build failed:\n${(error as Error).message}`;
-      writeStartFailure(repoRoot, {
-        stage: abortedBySignal ? "aborted" : "build-failed",
-        message,
-        failedAt: new Date().toISOString(),
-        version: env.version,
-        inputs: { distExists: existsSync(dir) },
-      });
+      // A build-ending signal / abort is NEVER recorded as a
+      // start-failure (#251 round 3 BLOCKER 2): the record is
+      // reserved for genuine build or check-dist failures that
+      // the user needs to fix. A transient abort would otherwise
+      // wedge every future MCP auto-spawn until the user
+      // manually removes the file.
+      if (!abortedBySignal) {
+        writeStartFailure(repoRoot, {
+          stage: "build-failed",
+          message,
+          failedAt: new Date().toISOString(),
+          version: env.version,
+          inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+        });
+      }
       acquired?.release();
       return {
         exitCode: 1,
@@ -308,25 +372,26 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     }
     if (buildResult.exitCode !== 0) {
       removeBuildSignalHandlers();
+      removeStaging();
       const stderrTail = buildResult.stderr.slice(-4096);
       // If a signal arrived while the build was in flight, treat
       // this exit as an abort (not a build failure the user needs
-      // to fix). The subsequent MCP tool call then sees stage
-      // "aborted" and the agent can distinguish "daemon gone"
-      // from "daemon said no".
+      // to fix). We do NOT persist a start-failure for a signal
+      // abort — see the matching comment on the catch branch.
       const abortedBySignal = buildAbort?.signal.aborted === true;
-      const stage = abortedBySignal ? "aborted" : "build-failed";
       const message = abortedBySignal
         ? `revkit serve: auto-build aborted by ${abortedViaSignal.reason || "signal"}`
         : "revkit serve: auto-build failed (see stderrTail)";
-      writeStartFailure(repoRoot, {
-        stage,
-        message,
-        stderrTail,
-        failedAt: new Date().toISOString(),
-        version: env.version,
-        inputs: { distExists: existsSync(dir) },
-      });
+      if (!abortedBySignal) {
+        writeStartFailure(repoRoot, {
+          stage: "build-failed",
+          message,
+          stderrTail,
+          failedAt: new Date().toISOString(),
+          version: env.version,
+          inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+        });
+      }
       acquired?.release();
       return {
         exitCode: buildResult.exitCode,
@@ -337,6 +402,41 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
       };
     }
     if (buildResult.stdout.length > 0) stdoutLines.push(buildResult.stdout.trimEnd());
+    // Build succeeded. Atomically promote the staging dir to
+    // `.revkit/dist` while we still hold the daemon lock. If a
+    // concurrent winner already published their output first
+    // (kept-existing), we discard our staging dir and reuse theirs.
+    if (stagingDir !== undefined) {
+      const outcome = promoteStagingDir(stagingDir, dir);
+      if (outcome.kind === "failed") {
+        removeBuildSignalHandlers();
+        removeStaging();
+        const message = `revkit serve: could not promote staging dir to ${dir}: ${outcome.error ?? "unknown error"}`;
+        writeStartFailure(repoRoot, {
+          stage: "build-failed",
+          message,
+          failedAt: new Date().toISOString(),
+          version: env.version,
+          inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+        });
+        acquired?.release();
+        return {
+          exitCode: 1,
+          stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
+          stderr: `${message}\n`,
+        };
+      }
+      if (outcome.kind === "kept-existing") {
+        // Another cold serve won the race; use their dist and
+        // discard ours. A later refactor could try to detect this
+        // earlier, but it is strictly a transient during a two-
+        // cold-start-at-once race, which the lock would otherwise
+        // have also serialised.
+        removeStaging();
+        stdoutLines.push(`revkit serve: concurrent winner published ${dir}; staging discarded`);
+      }
+      stagingDir = undefined;
+    }
   }
   // Build survived (or wasn't needed). Keep the pre-bind
   // handlers active through startDaemon's bind window so a SIGTERM
@@ -363,21 +463,34 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
     handle = await startDaemonFn(options);
   } catch (error) {
     removeBuildSignalHandlers();
-    // #251 N1: persist the failure so the MCP side (whose spawn
-    // ignores stdio) can read the reason instead of re-spawning
-    // blind on every tool call.
-    writeStartFailure(repoRoot, {
-      stage: "start-failed",
-      message: `revkit serve: startDaemon failed: ${(error as Error).message}`,
-      failedAt: new Date().toISOString(),
-      version: env.version,
-      inputs: { distExists: existsSync(dir) },
-    });
+    removeStaging();
+    // #251 N1 / round 3: persist the failure so the MCP side (whose
+    // spawn ignores stdio) can read the reason instead of re-
+    // spawning blind on every tool call — but ONLY for a genuine
+    // bind-time error (port permission denied, sqlite migration
+    // refused). Transient races — a signal abort, or a lock
+    // contention from a concurrent `revkit serve` that grabbed the
+    // lock between our acquire window and startDaemon's — MUST NOT
+    // land in `.revkit/start-failed.json`: they would otherwise
+    // wedge every future MCP auto-spawn until the user manually
+    // cleared the file (#251 round 3 BLOCKER 2 (a) + (c)).
+    const message = (error as Error).message;
+    const abortedBySignal = buildAbort?.signal.aborted === true;
+    const lockContention = isLockContentionError(message);
+    if (!abortedBySignal && !lockContention) {
+      writeStartFailure(repoRoot, {
+        stage: "start-failed",
+        message: `revkit serve: startDaemon failed: ${message}`,
+        failedAt: new Date().toISOString(),
+        version: env.version,
+        inputs: { fingerprint: computeInputFingerprint(repoRoot) ?? "" },
+      });
+    }
     acquired?.release();
     return {
       exitCode: 1,
       stdout: stdoutLines.length > 0 ? stdoutLines.join("\n") + "\n" : "",
-      stderr: `${(error as Error).message}\n`,
+      stderr: `${message}\n`,
     };
   }
   // #251 N1: the daemon bound cleanly. Any stale `start-failed.json`

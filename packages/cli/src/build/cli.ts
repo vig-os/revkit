@@ -31,10 +31,13 @@ export interface RunBuildEnv {
    * aborts this on SIGINT / SIGTERM; `revkit build` on its own
    * leaves it unset. */
   readonly signal?: AbortSignal;
-  /** Extra file descriptors the astro child must inherit (#251 B1).
-   * `revkit serve` passes its `.revkit/daemon.lock` fd here so the
-   * flock survives a parent SIGKILL. */
-  readonly inheritFds?: readonly number[];
+  /** Optional override for the astro output directory (#251 round
+   * 3). `revkit serve` passes a `.revkit/dist.staging-*` path so
+   * the cold build writes to a private staging dir, which serve
+   * atomically promotes to `.revkit/dist` after `check-dist`
+   * passes. Standalone `revkit build` leaves it unset and writes
+   * to the default `defaultConsumerDist` directly. */
+  readonly distOutDir?: string;
 }
 
 /** Parse args: `--dir <consumer-root>`, `--out <dist-dir>`,
@@ -127,7 +130,9 @@ export async function runBuildCommand(
   const distOutDir =
     parsed.parsed.out !== undefined
       ? resolvePath(env.cwd, parsed.parsed.out)
-      : defaultConsumerDist(consumerRoot);
+      : env.distOutDir !== undefined
+        ? env.distOutDir
+        : defaultConsumerDist(consumerRoot);
 
   const stdoutLines: string[] = [];
   stdoutLines.push(`revkit build: consumer=${prettyPath(env.cwd, consumerRoot)}`);
@@ -191,7 +196,6 @@ export async function runBuildCommand(
         distOutDir,
         renderGuardManifestPath: renderGuardManifest,
         ...(env.signal !== undefined ? { signal: env.signal } : {}),
-        ...(env.inheritFds !== undefined ? { inheritFds: env.inheritFds } : {}),
       });
     } catch (error) {
       return {

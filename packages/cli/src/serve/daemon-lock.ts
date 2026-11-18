@@ -26,6 +26,21 @@
 // `acquireDaemonLock`, so mutual exclusion is between daemon
 // instances (which the round-3 blocker asks for). An external tool
 // that ignores flock cannot become "another daemon".
+//
+// #251 round 3: the lock is ALWAYS CLOEXEC. An earlier round
+// opened it `inheritable: true` so a SIGKILLed parent's astro
+// child could keep the flock alive across the build. That
+// mechanism was unsafe: Bun closes fds passed through `stdio`
+// when the Subprocess is garbage-collected, so a GC during serve
+// would close the serving daemon's own lock fd (reproduced:
+// `Bun.gc(true)` after a completed build dropped the flock, and
+// a second `revkit serve` then bound on the same repo, sharing
+// `threads.sqlite`). The race the inherited-fd fix tried to
+// close is now addressed through the OUTPUT instead: the cold
+// build writes to a private staging dir which `revkit serve`
+// atomically promotes while holding the lock (see
+// `serve/cli.ts`). An orphaned astro from a SIGKILLed serve
+// writes only its own staging dir, which is never promoted.
 
 import { closeSync, constants, openSync } from "node:fs";
 
@@ -80,87 +95,54 @@ function loadLibc(): LibcBindings {
 }
 
 /** A held daemon lock. `release()` is idempotent. `fd` is the
- * underlying OS file descriptor — exposed so a caller that wants
- * the lock to outlive this process on SIGKILL can pass the fd to
- * a child via `Bun.spawn`'s `stdio` option (the inherited fd keeps
- * the flock alive while the child lives). */
+ * underlying OS file descriptor, exposed for diagnostic use only.
+ * Callers MUST NOT pass this fd to a subprocess (via `stdio` or
+ * otherwise): the lock is CLOEXEC and must stay that way, so the
+ * flock lives for exactly the serving process and dies with it.
+ * The #251 cold-start race is solved by staging-dir promotion, not
+ * fd inheritance. */
 export interface DaemonLock {
   readonly fd: number;
   release(): void;
 }
 
-/** Options for `acquireDaemonLock`. */
-export interface AcquireDaemonLockOptions {
-  /** When `true`, the lock fd is opened WITHOUT `O_CLOEXEC` so it
-   * is inherited by subprocesses the caller spawns. This is what
-   * `revkit serve` uses before its cold-start auto-build (#251
-   * B1): a SIGKILL of the parent still leaves the astro child
-   * holding the fd, so `flock(2)` stays held and a second
-   * `revkit serve` cannot slip in to race the same `.revkit/dist`.
-   * The child does not need to know about the fd — the kernel
-   * keeps the flock alive while any process maps that fd to the
-   * underlying inode. Defaults to `false` (the pre-#251 behaviour:
-   * CLOEXEC on; the fd is closed at exec of any child). */
-  readonly inheritable?: boolean;
-}
-
 /** Try to acquire an exclusive OS-held lock on `lockPath`. Returns
  * the lock handle on success or `null` when another process already
- * holds it. `lockPath` is `open()`'d at mode 0600 (owner-only).
+ * holds it. `lockPath` is `open()`'d at mode 0600 (owner-only) and
+ * always CLOEXEC.
  *
  * The kernel releases the lock on process exit (any exit — clean
  * or not — because file descriptors are always closed). This means
  * no explicit unlock is needed on crash. `release()` exists so the
  * daemon can hand the lock off deliberately during a graceful
  * shutdown, but leaking the fd through process exit is safe. */
-export function acquireDaemonLock(
-  lockPath: string,
-  options: AcquireDaemonLockOptions = {},
-): DaemonLock | null {
+export function acquireDaemonLock(lockPath: string): DaemonLock | null {
   const libc = loadLibc();
-  const inheritable = options.inheritable === true;
   // O_RDWR because `flock` needs a writable fd on some filesystems
   // (specifically NFS with `local_lock=all`, which is a corner case
   // but easy to accommodate — the caller does not care what mode).
   //
-  // `O_CLOEXEC` (default) so the lock fd is not inherited by any
-  // subprocess the daemon spawns (a child that inherits the fd
-  // would keep the lock alive past the daemon's exit, refusing
-  // every future start). Node's `fs.constants.O_CLOEXEC` is present
-  // on Linux and macOS — when it is missing we fall through to
-  // `fcntl(F_SETFD, FD_CLOEXEC)` after the open.
-  //
-  // `inheritable: true` INVERTS this: we drop O_CLOEXEC and clear
-  // FD_CLOEXEC so a `Bun.spawn`-ed child inherits the fd and keeps
-  // the flock alive while it lives. `revkit serve` uses this before
-  // the cold-start auto-build (#251 B1) so the astro child keeps
-  // the lock even if the parent is SIGKILLed mid-build.
+  // `O_CLOEXEC` so the lock fd is not inherited by any subprocess
+  // the daemon spawns (a child that inherits the fd would keep the
+  // lock alive past the daemon's exit, refusing every future
+  // start). Node's `fs.constants.O_CLOEXEC` is present on Linux and
+  // macOS — when it is missing we fall through to `fcntl(F_SETFD,
+  // FD_CLOEXEC)` after the open.
   const O_CLOEXEC = (constants as { O_CLOEXEC?: number }).O_CLOEXEC ?? 0;
-  const openFlags =
-    constants.O_RDWR | constants.O_CREAT | (inheritable ? 0 : O_CLOEXEC);
+  const openFlags = constants.O_RDWR | constants.O_CREAT | O_CLOEXEC;
   let fd: number;
   try {
     fd = openSync(lockPath, openFlags, 0o600);
   } catch (error) {
     throw new Error(`daemon-lock: could not open '${lockPath}': ${(error as Error).message}`);
   }
-  if (!inheritable && O_CLOEXEC === 0) {
+  if (O_CLOEXEC === 0) {
     try {
       libc.fcntl(fd, F_SETFD, FD_CLOEXEC);
     } catch {
       // Not fatal on the daemon-in-foreground case; a spawned
       // child would inherit the lock. Log-worthy on platforms
       // that lack both mechanisms.
-    }
-  } else if (inheritable) {
-    // Defence in depth: even if O_CLOEXEC was 0 (ignored), explicitly
-    // clear FD_CLOEXEC so the fd survives exec. On Linux, `openSync`
-    // without O_CLOEXEC already leaves FD_CLOEXEC off; this is a
-    // no-op there but makes the inheritable contract explicit.
-    try {
-      libc.fcntl(fd, F_SETFD, 0);
-    } catch {
-      // Not fatal — the fd stays inheritable through POSIX defaults.
     }
   }
   const rc = libc.flock(fd, LOCK_EX | LOCK_NB);

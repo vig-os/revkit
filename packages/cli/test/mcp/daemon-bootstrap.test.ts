@@ -584,6 +584,10 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
       await ensureDaemon({
         repoRoot: root,
         findRunningDaemon: () => starting,
+        // Pretend the fixture pid is alive so the diagnostic
+        // reports it (the round-3 nit's dead-pid branch has its
+        // own test below).
+        isPidAlive: () => true,
         spawn: () => ({ pid: -1 }),
         sleep,
         nowMs: clock,
@@ -627,10 +631,10 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
     expect(result.state.instanceId).toBe("ready-wait");
   });
 
-  test("#251 N1: a persisted start failure surfaces DaemonStartFailedError without re-spawning", async () => {
-    // A failure record whose inputs match the current state
-    // (dist still missing). The bootstrap must NOT try to spawn
-    // a daemon — every retry would fail the same way.
+  test("#251 N1 (round 3): a persisted start failure surfaces DaemonStartFailedError without re-spawning when the fingerprint matches", async () => {
+    // A failure record whose fingerprint matches what we compute
+    // now. The bootstrap must NOT try to spawn — every retry
+    // would fail the same way.
     let spawnCount = 0;
     const failure: StartFailureRecord = {
       stage: "build-failed",
@@ -638,7 +642,7 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
       stderrTail: "SyntaxError in docs/foo.mdx line 42",
       failedAt: new Date().toISOString(),
       version: "0.0.0-test",
-      inputs: { distExists: false }, // dist didn't exist at failure time; still doesn't
+      inputs: { fingerprint: "same-fp" },
     };
     let threw: Error | undefined;
     try {
@@ -647,6 +651,7 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
         findRunningDaemon: () => undefined, // no live daemon
         readStartFailure: () => failure,
         clearStartFailure: () => {},
+        computeInputFingerprint: () => "same-fp",
         spawn: () => {
           spawnCount++;
           return { pid: 999 };
@@ -663,17 +668,19 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
     expect(spawnCount).toBe(0);
   });
 
-  test("#251 N1: a stale failure (inputs changed — dist now exists) is cleared and bootstrap proceeds", async () => {
-    // The user ran `revkit build` after the failure, so dist
-    // exists now. The record is stale; bootstrap must clear it
-    // and proceed to spawn.
-    mkdirSync(join(root, ".revkit", "dist"), { recursive: true });
+  test("#251 N1 (round 3): a changed fingerprint clears the stale record and bootstrap proceeds", async () => {
+    // Pre-fix: the only key was `distExists`, so a user who
+    // fixed the broken content without running `revkit build`
+    // first could never lift the suppression — every tool call
+    // kept returning the stale error. Round-3 compares a
+    // content-aware fingerprint, so any edit under
+    // docs/vocab/plots invalidates the record.
     const failure: StartFailureRecord = {
       stage: "build-failed",
       message: "revkit serve: auto-build failed",
       failedAt: new Date().toISOString(),
       version: "0.0.0-test",
-      inputs: { distExists: false }, // was missing then
+      inputs: { fingerprint: "fp-at-failure" },
     };
     let clearCalled = 0;
     let spawnCount = 0;
@@ -688,6 +695,7 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
       clearStartFailure: () => {
         clearCalled++;
       },
+      computeInputFingerprint: () => "fp-NEW-user-edited-content",
       spawn: () => {
         spawnCount++;
         return { pid: 777 };
@@ -700,6 +708,47 @@ describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted 
     expect(spawnCount).toBe(1);
     expect(result.spawned).toBe(true);
     expect(result.state.instanceId).toBe("ready-n1-stale");
+  });
+
+  test("#251 round-3 nit: DaemonBuildingError omits the pid when the recorded serve process is dead", async () => {
+    // The pre-revert path named the serve pid even after it was
+    // SIGKILLed (the astro child kept the lock alive through the
+    // inherited fd). After the revert the lock is released on
+    // serve death, but a mid-race read can still land in the
+    // "starting" branch. Suppressing a dead pid keeps the agent
+    // diagnostic honest.
+    let now = 1_700_000_000_000;
+    const starting: ServeState = {
+      pid: 31337,
+      port: 0,
+      url: "",
+      agentToken: "",
+      startedAt: new Date(now - 42_000).toISOString(),
+      version: "0.0.0-test",
+      instanceId: "starting-nit",
+      status: "starting",
+    };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => starting,
+        isPidAlive: () => false, // the recorded pid is dead
+        spawn: () => ({ pid: -1 }),
+        sleep: async () => {},
+        nowMs: () => now,
+        onStartingDaemon: "diagnose",
+        startingReadyMs: 60_000,
+        waitMs: 60_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.name).toBe("DaemonBuildingError");
+    // pid 31337 MUST NOT appear in the message.
+    expect(threw?.message).not.toContain("31337");
+    expect(threw?.message).toContain("42 s elapsed");
   });
 });
 

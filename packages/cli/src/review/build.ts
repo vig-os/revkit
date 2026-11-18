@@ -78,21 +78,19 @@ export interface SpawnResult {
  * `signal` (#251 B1) is an optional AbortSignal that must kill the
  * spawned child when aborted. `spawnAstroBuild` passes it through
  * so `revkit serve` can abort an in-flight auto-build on SIGINT /
- * SIGTERM without orphaning the astro child. Implementations
- * should either pass it directly to `Bun.spawn` (which honours
- * `signal`) or call `child.kill()` from an `abort` listener.
+ * SIGTERM without orphaning the astro child.
  *
- * `inheritFds` (#251 B1) lists extra file descriptors the child
- * MUST inherit, so the parent's `.revkit/daemon.lock` fd stays
- * open in the child and the flock survives a parent SIGKILL. The
- * child does not need to use these fds — the kernel keeps the
- * flock alive while any process maps the fd to the inode. */
+ * The default spawner runs the child in its own process GROUP
+ * (via `detached: true`) and `kill`s the whole group when `signal`
+ * aborts, so a nested vite / node sub-process cannot outlive the
+ * SIGTERMed serve. Implementations should preserve this contract
+ * — either reuse the default, or call `process.kill(-child.pid,
+ * "SIGTERM")` from an `abort` listener. */
 export type SpawnLike = (options: {
   readonly cmd: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
   readonly signal?: AbortSignal;
-  readonly inheritFds?: readonly number[];
 }) => Promise<SpawnResult>;
 
 /** The env-var allowlist. Anything not on this list is REMOVED from
@@ -216,15 +214,11 @@ export interface SpawnAstroBuildOptions {
   /** AbortSignal that kills the astro child when aborted (#251 B1).
    * `revkit serve` installs SIGINT / SIGTERM handlers around its
    * cold-start auto-build and aborts this signal on any signal so
-   * the child dies with the parent instead of continuing orphaned. */
+   * the child dies with the parent instead of continuing orphaned.
+   * The default spawner also propagates the kill to the child's
+   * whole process group, so nested vite / node sub-processes die
+   * with astro. */
   readonly signal?: AbortSignal;
-  /** Extra file descriptors to inherit through to the astro child
-   * (#251 B1). `revkit serve` passes its `.revkit/daemon.lock` fd
-   * here so the flock stays held even if the parent is SIGKILLed
-   * mid-build: an orphaned child still owns the lock, a second
-   * `revkit serve` is refused, and the child's eventual exit
-   * releases the lock cleanly. */
-  readonly inheritFds?: readonly number[];
 }
 
 /** Low-level: spawn astro build with the trusted-binary + minimal-env
@@ -278,7 +272,6 @@ export async function spawnAstroBuild(options: SpawnAstroBuildOptions): Promise<
       cwd,
       env,
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
-      ...(options.inheritFds !== undefined ? { inheritFds: options.inheritFds } : {}),
     });
     if (result.exitCode !== 0) {
       // Abort → exit 143 (SIGTERM) or similar; the caller
@@ -440,33 +433,49 @@ export function unlinkStale(target: string): void {
   }
 }
 
-const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal, inheritFds }) => {
-  // Build the `stdio` tuple. Fds 0..2 are always pipes (we capture
-  // stdout/stderr); any extra fds the caller named in `inheritFds`
-  // are listed AFTER so Bun inherits them through to the child
-  // (POSIX fd inheritance). Bun.spawn's `stdio` option accepts an
-  // array of mixed items: strings for standard pipe modes and
-  // numbers for fds to inherit.
-  //
-  // #251 B1: `revkit serve` passes its `.revkit/daemon.lock` fd
-  // here so the astro child keeps the flock alive on a SIGKILL of
-  // the parent.
-  const stdio: Array<"ignore" | "pipe" | number> = ["ignore", "pipe", "pipe"];
-  if (inheritFds !== undefined) {
-    for (const fd of inheritFds) stdio.push(fd);
-  }
+const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
+  // The child runs in its OWN process group (`detached: true`), so
+  // an abort can kill the whole group — astro, vite, every
+  // chain-spawned node. Without the group kill, `child.kill()`
+  // reaches only the direct astro child and leaves its vite worker
+  // alive, which was the orphaning path the inherited-fd fix
+  // tried to compensate for (#251 round 2 → round 3 revert).
   const proc = Bun.spawn(cmd as string[], {
     cwd,
     env: env as Record<string, string>,
-    stdio: stdio as never,
-    ...(signal !== undefined ? { signal } : {}),
+    stdio: ["ignore", "pipe", "pipe"],
+    // New session + pgid. On POSIX this is `setsid(2)` inside
+    // Bun's spawn: the child becomes a process-group leader.
+    detached: true,
   });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const exitCode = await proc.exited;
-  return { stdout, stderr, exitCode };
+  const onAbort = (): void => {
+    // Kill the WHOLE group (negative pid). Falls back to killing
+    // just the child when the group kill is refused (ESRCH after
+    // normal exit; EPERM if Bun ever reparents).
+    try {
+      process.kill(-proc.pid, "SIGTERM");
+    } catch {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        /* already dead */
+      }
+    }
+  };
+  if (signal !== undefined) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+    return { stdout, stderr, exitCode };
+  } finally {
+    if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+  }
 };
 
 /** Compute the default `distOutDir` for a materialised root — the

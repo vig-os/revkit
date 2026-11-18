@@ -8,7 +8,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseServeArgs, readOrMintLocalUserId, runServeCommand } from "../../src/serve/cli.ts";
-import { readStartFailure } from "../../src/serve/serve-state.ts";
+import {
+  DIST_STAGING_PREFIX,
+  listDistStagingDirs,
+  readStartFailure,
+} from "../../src/serve/serve-state.ts";
 
 describe("parseServeArgs", () => {
   test("accepts an empty argv (auto-build enabled by default)", () => {
@@ -99,7 +103,7 @@ describe("readOrMintLocalUserId", () => {
   });
 });
 
-describe("runServeCommand — #251 B1 (signal cleanup, SIGKILL safety) & N1 (persisted failure)", () => {
+describe("runServeCommand — #251 round 3: signal handling, staging promotion, persisted failure", () => {
   let root: string;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "revkit-serve-b1-"));
@@ -112,7 +116,7 @@ describe("runServeCommand — #251 B1 (signal cleanup, SIGKILL safety) & N1 (per
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("SIGTERM during auto-build aborts the build, releases the lock, and clears serve.json (#251 B1)", async () => {
+  test("SIGTERM during auto-build aborts the build, releases the lock, and does NOT persist a start-failure (#251 B2 (c))", async () => {
     // A slow fake build that awaits the AbortSignal. We dispatch
     // SIGTERM via `process.emit("SIGTERM")` (triggers listeners
     // without actually killing the test runner).
@@ -130,9 +134,6 @@ describe("runServeCommand — #251 B1 (signal cleanup, SIGKILL safety) & N1 (per
         await new Promise<void>((resolveAbort) => {
           opts.signal?.addEventListener("abort", () => resolveAbort(), { once: true });
         });
-        // Return a non-zero exit so runServeCommand treats it
-        // as a failure after abort (equivalent to astro exiting
-        // on kill).
         return { exitCode: 143, stdout: "", stderr: "aborted" };
       },
     });
@@ -144,48 +145,52 @@ describe("runServeCommand — #251 B1 (signal cleanup, SIGKILL safety) & N1 (per
     expect(beforeState.status).toBe("starting");
     // Fire SIGTERM.
     process.emit("SIGTERM");
-    // The build sees the signal.
     expect(buildSawSignal?.aborted).toBe(true);
-    // runServeCommand returns with a non-zero exit code.
     const result = await runPromise;
     expect(result.exitCode).not.toBe(0);
     // serve.json was cleaned up (ownership-checked unlink via
     // `acquired.release()`).
     expect(existsSync(join(root, ".revkit", "serve.json"))).toBe(false);
-    // start-failed.json is persisted so a subsequent MCP tool
-    // call reads the reason (#251 N1).
-    const failure = readStartFailure(root);
-    expect(failure).toBeDefined();
-    expect(failure?.stage).toBe("aborted");
-    expect(failure?.message).toContain("SIGTERM");
+    // Round-3 BLOCKER 2 (c): a signal abort is NEVER recorded as
+    // a start-failure. Before the fix, every SIGTERM planted an
+    // "aborted" record that then blocked MCP auto-spawn forever.
+    expect(readStartFailure(root)).toBeUndefined();
+    // And the staging dir is removed.
+    expect(listDistStagingDirs(root)).toEqual([]);
   }, 20_000);
 
-  test("passes inheritFds=[lockFd] to the auto-build so the astro child inherits the lock (#251 B1 SIGKILL safety)", async () => {
-    let receivedFds: readonly number[] | undefined;
+  test("passes a private staging distOutDir to the auto-build (#251 round 3 BLOCKER 1)", async () => {
+    let receivedDistOut: string | undefined;
     const result = await runServeCommand([], {
       cwd: root,
       version: "test-0.1.0",
       runBuildOverride: async (_args, opts) => {
-        receivedFds = opts.inheritFds;
-        // Fake a successful build. Create the default dist so the
-        // "dist exists" postcondition is met.
-        mkdirSync(join(root, ".revkit", "dist"), { recursive: true });
-        writeFileSync(join(root, ".revkit", "dist", "index.html"), "<h1>x</h1>");
+        receivedDistOut = opts.distOutDir;
+        // Fake a successful build at the staging dir.
+        if (opts.distOutDir !== undefined) {
+          mkdirSync(opts.distOutDir, { recursive: true });
+          writeFileSync(join(opts.distOutDir, "index.html"), "<h1>x</h1>");
+        }
         return { exitCode: 0, stdout: "built", stderr: "" };
       },
-      // A fake startDaemon that fails fast — we only care about
-      // whether inheritFds reached runBuildCommand.
       startDaemonOverride: async () => {
         throw new Error("test: startDaemon not exercised");
       },
     });
     expect(result.exitCode).toBe(1);
-    expect(receivedFds).toBeDefined();
-    expect(receivedFds!.length).toBe(1);
-    expect(receivedFds![0]).toBeGreaterThan(2); // the lock fd, above stdin/stdout/stderr
+    expect(receivedDistOut).toBeDefined();
+    expect(receivedDistOut!).toContain(`${DIST_STAGING_PREFIX}${process.pid}-`);
+    // Build succeeded → staging was promoted to dist.
+    expect(existsSync(join(root, ".revkit", "dist", "index.html"))).toBe(true);
+    // Staging dir no longer exists.
+    expect(listDistStagingDirs(root)).toEqual([]);
   }, 10_000);
 
-  test("non-zero build exit code persists a start-failure record (#251 N1)", async () => {
+  test("non-zero build exit code persists a start-failure with a fingerprint, removes staging (#251 N1)", async () => {
+    // Seed a docs tree so the fingerprint computes to something
+    // non-trivial.
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "docs", "index.md"), "# hi\n");
     const result = await runServeCommand([], {
       cwd: root,
       version: "test-0.1.0",
@@ -200,8 +205,135 @@ describe("runServeCommand — #251 B1 (signal cleanup, SIGKILL safety) & N1 (per
     expect(failure).toBeDefined();
     expect(failure?.stage).toBe("build-failed");
     expect(failure?.stderrTail ?? "").toContain("a page body is empty");
-    expect(failure?.inputs.distExists).toBe(false);
+    expect(failure?.inputs.fingerprint ?? "").toHaveLength(64); // sha256 hex
     // Lock + serve.json cleaned up.
     expect(existsSync(join(root, ".revkit", "serve.json"))).toBe(false);
+    // Staging dir removed on failure.
+    expect(listDistStagingDirs(root)).toEqual([]);
+  }, 10_000);
+
+  test("lock contention does NOT write a start-failure (#251 round 3 BLOCKER 2 (a))", async () => {
+    // Simulate a second `revkit serve` losing the lock: hold the
+    // flock manually, then run `runServeCommand`. It must refuse
+    // with "another daemon holds .revkit/daemon.lock" and leave
+    // `.revkit/start-failed.json` absent.
+    const { acquireDaemonLock } = await import("../../src/serve/daemon-lock.ts");
+    const held = acquireDaemonLock(join(root, ".revkit", "daemon.lock"));
+    expect(held).not.toBeNull();
+    try {
+      const result = await runServeCommand([], {
+        cwd: root,
+        version: "test-0.1.0",
+        runBuildOverride: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("another daemon holds");
+    } finally {
+      held?.release();
+    }
+    // Round-3 BLOCKER 2 (a): the record was never planted.
+    expect(readStartFailure(root)).toBeUndefined();
+  }, 10_000);
+
+  test("concurrent warm sessions do not plant a start-failure (#251 round 3 BLOCKER 2 (b))", async () => {
+    // Pre-fix reproduction: the second `runServeCommand`'s
+    // "already running" branch used to flow into the start-
+    // failure writer indirectly. Round-3 keeps the path write-
+    // free: both the winner's and the loser's exit leave
+    // start-failed.json absent.
+    mkdirSync(join(root, ".revkit", "dist"), { recursive: true });
+    writeFileSync(join(root, ".revkit", "dist", "index.html"), "<h1>warm</h1>");
+    const { acquireDaemonLock } = await import("../../src/serve/daemon-lock.ts");
+    const held = acquireDaemonLock(join(root, ".revkit", "daemon.lock"));
+    expect(held).not.toBeNull();
+    try {
+      // --dir explicitly set so we would NOT hit the auto-build
+      // path (keeps the test tight). The pre-bind lock refusal
+      // lives above the auto-build branch.
+      const result = await runServeCommand(["--dir", ".revkit/dist"], {
+        cwd: root,
+        version: "test-0.1.0",
+      });
+      expect(result.exitCode).not.toBe(0);
+    } finally {
+      held?.release();
+    }
+    expect(readStartFailure(root)).toBeUndefined();
+  }, 10_000);
+
+  test("#251 round 3 BLOCKER 1: SIGKILL serve mid-build, next start only promotes the second build's output (orphan never touches dist)", async () => {
+    // Simulate a SIGKILLed prior serve: a stale staging dir
+    // written by an orphaned astro + a dead pid. The next cold
+    // `revkit serve` must sweep that dir and run its own build
+    // against the staging path it mints, NEVER promote the
+    // orphan's content to `.revkit/dist`.
+    //
+    // Pre-fix (3e4ad4c) never had staging dirs: the astro
+    // orphan wrote directly to `.revkit/dist` and a second
+    // serve started atop the orphan's half-built output.
+    let deadPid = 2 ** 20;
+    while (require("node:fs").existsSync(`/proc/${deadPid}`)) deadPid++;
+    const orphanName = `${DIST_STAGING_PREFIX}${deadPid}-orphan`;
+    const orphanDir = join(root, ".revkit", orphanName);
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, "index.html"), "<h1>orphan-from-sigkilled-serve</h1>");
+
+    let seenDistOut: string | undefined;
+    const result = await runServeCommand([], {
+      cwd: root,
+      version: "test-0.1.0",
+      runBuildOverride: async (_args, opts) => {
+        seenDistOut = opts.distOutDir;
+        if (opts.distOutDir !== undefined) {
+          mkdirSync(opts.distOutDir, { recursive: true });
+          writeFileSync(join(opts.distOutDir, "index.html"), "<h1>second-build-winner</h1>");
+        }
+        return { exitCode: 0, stdout: "built", stderr: "" };
+      },
+      startDaemonOverride: async () => {
+        throw new Error("test: startDaemon not exercised");
+      },
+    });
+    expect(result.exitCode).toBe(1); // stopDaemon stub throws
+    // The orphan staging dir was swept.
+    expect(existsSync(orphanDir)).toBe(false);
+    // The second build ran into ITS OWN staging dir.
+    expect(seenDistOut).toBeDefined();
+    expect(seenDistOut!).toContain(`${DIST_STAGING_PREFIX}${process.pid}-`);
+    // The orphan NEVER touched `.revkit/dist`: the promoted
+    // content is the winner's.
+    expect(readFileSync(join(root, ".revkit", "dist", "index.html"), "utf8")).toContain("second-build-winner");
+    expect(readFileSync(join(root, ".revkit", "dist", "index.html"), "utf8")).not.toContain("orphan");
+  }, 15_000);
+
+  test("successful bind clears any stale start-failed.json", async () => {
+    // Seed a stale record from a prior failed attempt.
+    writeFileSync(
+      join(root, ".revkit", "start-failed.json"),
+      JSON.stringify({
+        stage: "build-failed",
+        message: "stale",
+        failedAt: "2026-11-01T00:00:00Z",
+        version: "0.0.0",
+        inputs: { fingerprint: "stale-fp" },
+      }),
+      { mode: 0o600 },
+    );
+    expect(existsSync(join(root, ".revkit", "start-failed.json"))).toBe(true);
+    mkdirSync(join(root, ".revkit", "dist"), { recursive: true });
+    writeFileSync(join(root, ".revkit", "dist", "index.html"), "<h1>x</h1>");
+    const result = await runServeCommand(["--dir", ".revkit/dist"], {
+      cwd: root,
+      version: "test-0.1.0",
+      // Minimal startDaemon stub that returns a fake handle.
+      startDaemonOverride: async () => {
+        return { stop: async () => {} } as { stop: () => Promise<void> } as never;
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(root, ".revkit", "start-failed.json"))).toBe(false);
+    // Clean up: trigger the daemon handle's stop() so the
+    // blockForever promise resolves (not awaited here).
+    void result.blockForever;
   }, 10_000);
 });

@@ -87,12 +87,9 @@ export interface RunPackagedBuildOptions {
   readonly renderGuardManifestPath?: string;
   /** AbortSignal that kills the astro child when aborted (#251 B1).
    * Threaded through `spawnAstroBuild` so `revkit serve` can abort
-   * an in-flight cold-start build on SIGINT / SIGTERM. */
+   * an in-flight cold-start build on SIGINT / SIGTERM. The default
+   * spawner also propagates the kill to the child's process group. */
   readonly signal?: AbortSignal;
-  /** Extra file descriptors the astro child must inherit (#251 B1).
-   * `revkit serve` passes the daemon.lock fd here so the flock stays
-   * held even if the parent is SIGKILLed mid-build. */
-  readonly inheritFds?: readonly number[];
 }
 
 /** Result of a successful packaged build. */
@@ -632,7 +629,6 @@ export async function runPackagedBuild(
     },
     ...(options.spawn !== undefined ? { spawn: options.spawn } : {}),
     ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    ...(options.inheritFds !== undefined ? { inheritFds: options.inheritFds } : {}),
   });
 
   // Realpath the packaged site dir for the caller — a nix-store
