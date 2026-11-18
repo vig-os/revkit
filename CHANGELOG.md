@@ -65,6 +65,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rail live-update channel drops silently on a long-running tab**
+  ([#277](https://github.com/vig-os/revkit/issues/277))
+  - Diagnosis: a tab open for hours behind a reverse proxy (or on a laptop that
+    went to sleep) could reach a zombie-open state where the client-side
+    `EventSource` still thought the stream was live, but the server had long
+    forgotten it. `onerror` never fired, so the rail never reconnected and new
+    comments only appeared on a page refresh.
+  - New `packages/cli/src/rail/live-channel.ts` extracts the reconnect state
+    machine out of `rail.tsx`: exponential backoff from 500 ms to a 30 s cap;
+    a `wake()` entry point the rail now fires from `visibilitychange` and
+    `online` listeners, forcing a fresh connection every time the tab returns
+    to the foreground or the network recovers; three observable states
+    (`connecting`, `open`, `reconnecting`) driven by a pure clock-injected
+    schedule.
+  - The rail renders a visible "Live updates paused — reconnecting…" indicator
+    while the controller is in `reconnecting`, with a "Refresh now" button that
+    re-fetches threads immediately. An invisible drop is the bug the reporter
+    filed; the indicator ensures a future drop is never invisible again.
+  - The daemon's SSE keepalive interval is unchanged (15 s — still well below
+    the tightest common proxy idle timeout of 60 s), and the constant is now
+    exported with a regression-pin test so a future change past ~45 s goes red.
+  - Tests: `packages/cli/test/rail/live-channel.test.ts` (fake clock + fake
+    source factory, covering backoff math, mid-stream errors, visibility
+    wake-up, late-callback guards and `stop()` lifecycle);
+    `packages/cli/test/serve/sse-keepalive.test.ts` (interval invariant plus
+    the on-`start()` keepalive flush); `site/tests/rail-live-reconnect.spec.ts`
+    (Playwright e2e that drops the stream via `context.setOffline`, posts a
+    comment into the gap, and asserts the rail shows it after the browser
+    returns online — without a page reload).
+
 ### Security
 
 ## [0.1.0] - TBD

@@ -36,6 +36,7 @@ import {
   writeResumeSeq,
   type ResumeStorage,
 } from "./resume-point.ts";
+import { createLiveChannel, type LiveState } from "./live-channel.ts";
 import {
   readDraft,
   removeDraft,
@@ -704,9 +705,18 @@ async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<
 }
 
 /** SSE subscriber that re-fetches threads whenever the daemon reports
- * a comment / thread event. Reconnects on close with an exponential
- * backoff up to 30 s — a paused laptop can wake into a stale stream
- * and this brings it back quickly without hammering the daemon.
+ * a comment / thread event. Reconnect, backoff and visibility /
+ * online handling live in `./live-channel.ts` — a pure state machine
+ * driven by `visibilitychange` + `online` events on the window.
+ *
+ * **Issue #277**: a page open for hours could end up in a zombie-open
+ * state after a proxy idle-reaped the SSE stream — `EventSource.onerror`
+ * never fired because the client side thought the socket was still up.
+ * The fix is twofold: (1) a `visibilitychange` listener forces a fresh
+ * connection every time the tab returns to the foreground, closing
+ * the window in which a stale stream could silently drop frames;
+ * (2) the controller exposes a `reconnecting` state the rail renders
+ * as a visible indicator, so an invisible drop never happens again.
  *
  * **Two independent guards against acting twice on one event** (M2
  * item 9, PR-56 blocker):
@@ -743,10 +753,8 @@ function subscribeEvents(
     readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
   }) => void = () => {},
   onAttached: () => void = () => {},
+  onLiveState: (state: LiveState) => void = () => {},
 ): () => void {
-  let closed = false;
-  let source: EventSource | undefined;
-  let retryDelayMs = 500;
   /** Monotonic per-seq gate: a replay is dropped before it can bump
    * state or navigate. Seeded with the persisted resume point so the
    * gate holds on its own even if `?since=` does not — see
@@ -755,159 +763,217 @@ function subscribeEvents(
   /** Resolved once, on first subscribe; reused across reconnects so a
    * reconnect does not re-probe and does not drift to a newer head,
    * which would skip events the browser missed while disconnected. */
-  let initialSince: Promise<number> | undefined;
-  const kick = (): void => {
-    if (closed) return;
-    initialSince ??= resolveInitialSince(sessionStorageOrUndefined());
-    void initialSince.then((since) => {
-      if (closed) return;
-      // `EventSource` sends the session cookie automatically because
-      // we opened the page under the daemon's own origin.
-      source = new EventSource(
-        since > 0 ? `/events?since=${encodeURIComponent(String(since))}` : "/events?since=0",
-      );
-      attach();
-    });
-  };
-  const attach = (): void => {
-    if (closed || source === undefined) return;
-    // ONE authoritative thread-list refetch once the stream is open.
-    //
-    // What this does: re-reads `GET /api/threads`, so the rail's
-    // thread list reflects anything that landed while it was wiring
-    // itself up.
-    //
-    // What this does NOT do, and used to be claimed to do: re-read
-    // THIS ROUTE's HTML. It cannot — the route's page HTML is not
-    // reachable from a thread-list fetch. The lost-update window
-    // between this page's HTML GET and the stream attaching is closed
-    // instead by resuming from the head stamped into this page at
-    // RENDER time (`resolveInitialSince`), which REPLAYS that window
-    // rather than papering over it.
-    onAttached();
-    source.onmessage = (message: MessageEvent<string>): void => {
-      try {
-        const event = JSON.parse(message.data) as RailReviewEvent;
-        // Idempotence gate. A durable event carries a positive seq; a
-        // replay of one this tab already handled is dropped HERE,
-        // before any bump or navigation. Ephemeral frames (presence)
-        // carry no seq and are always processed — they are not on the
-        // log and cannot be replayed.
-        if (typeof event.seq === "number" && !gate.accept(event.seq)) return;
-        // Persist BEFORE acting: a reload triggered below must start
-        // the next page load past this seq.
-        writeResumeSeq(sessionStorageOrUndefined(), event.seq);
-        // Any comment/thread transition is a reason to re-fetch. We
-        // do not merge into local state — the daemon is authoritative
-        // and a re-fetch is one round-trip we can afford.
-        if (
-          event.kind === "comment.created" ||
-          event.kind === "comment.replied" ||
-          event.kind === "thread.resolved" ||
-          event.kind === "thread.reopened" ||
-          // M2 item 5b: re-anchor + orphan events move a thread to a
-          // new block (or to the orphan panel) without a page reload.
-          // Same refetch strategy — cheap, keeps the rail's model of
-          // the world identical to the daemon's authoritative state.
-          event.kind === "thread.reanchored" ||
-          event.kind === "thread.orphaned" ||
-          // M3 part 2b: review-lifecycle + comment-link events
-          // change the pending set. The rail's review panel reads
-          // that via `refetchReview`; the outer bump also refetches
-          // threads (a review.opened / review.submitted doesn't
-          // move threads, but comment.linked can update a
-          // thread's `external.github` field).
-          event.kind === "comment.linked" ||
-          event.kind === "comment.sync_requested" ||
-          event.kind === "comment.sync_failed" ||
-          event.kind === "thread.sync_failed" ||
-          event.kind === "thread.external_synced" ||
-          event.kind === "draft.promoted" ||
-          event.kind === "review.opened" ||
-          event.kind === "review.submitted" ||
-          event.kind === "review.abandoned"
-        ) {
-          onBump(event);
-        }
-        if (event.kind === "doc.published" && typeof event.route === "string") {
-          if (normaliseCurrentRoute(window.location.pathname) === normaliseCurrentRoute(event.route)) {
-            saveReplyDraftsToSessionStorage();
-            window.location.reload();
-          }
-        }
-        // M2 item 9, story A4: a scheduled full build finished —
-        // either way. On `build.succeeded` the daemon has fresh dist
-        // HTML for every route, so a page that was showing the
-        // "rendering..." banner reloads and swaps it out. On
-        // `build.failed` the page must ALSO reload, because the
-        // banner's content changes from "a build is running" to the
-        // build's error tail. Reloading only on success left the
-        // reviewer staring at a spinner for a build that had already
-        // died — the one state the banner could not self-correct.
-        // Reload unconditionally: the server-side derive-from-files
-        // logic serves dist untouched when source and dist agree,
-        // so an up-to-date page pays a no-op reload at worst.
-        if (event.kind === "build.succeeded" || event.kind === "build.failed") {
+  const initialSincePromise = resolveInitialSince(sessionStorageOrUndefined());
+  /** Parse one SSE data frame and route it through the rail's
+   * handlers. The per-seq gate, resume-point persistence and all
+   * reload / bump decisions live here — the live-channel controller
+   * does not see event content. */
+  const handleMessageData = (data: string): void => {
+    try {
+      const event = JSON.parse(data) as RailReviewEvent;
+      // Idempotence gate. A durable event carries a positive seq; a
+      // replay of one this tab already handled is dropped HERE,
+      // before any bump or navigation. Ephemeral frames (presence)
+      // carry no seq and are always processed — they are not on the
+      // log and cannot be replayed.
+      if (typeof event.seq === "number" && !gate.accept(event.seq)) return;
+      // Persist BEFORE acting: a reload triggered below must start
+      // the next page load past this seq.
+      writeResumeSeq(sessionStorageOrUndefined(), event.seq);
+      // Any comment/thread transition is a reason to re-fetch. We
+      // do not merge into local state — the daemon is authoritative
+      // and a re-fetch is one round-trip we can afford.
+      if (
+        event.kind === "comment.created" ||
+        event.kind === "comment.replied" ||
+        event.kind === "thread.resolved" ||
+        event.kind === "thread.reopened" ||
+        // M2 item 5b: re-anchor + orphan events move a thread to a
+        // new block (or to the orphan panel) without a page reload.
+        // Same refetch strategy — cheap, keeps the rail's model of
+        // the world identical to the daemon's authoritative state.
+        event.kind === "thread.reanchored" ||
+        event.kind === "thread.orphaned" ||
+        // M3 part 2b: review-lifecycle + comment-link events
+        // change the pending set. The rail's review panel reads
+        // that via `refetchReview`; the outer bump also refetches
+        // threads (a review.opened / review.submitted doesn't
+        // move threads, but comment.linked can update a
+        // thread's `external.github` field).
+        event.kind === "comment.linked" ||
+        event.kind === "comment.sync_requested" ||
+        event.kind === "comment.sync_failed" ||
+        event.kind === "thread.sync_failed" ||
+        event.kind === "thread.external_synced" ||
+        event.kind === "draft.promoted" ||
+        event.kind === "review.opened" ||
+        event.kind === "review.submitted" ||
+        event.kind === "review.abandoned"
+      ) {
+        onBump(event);
+      }
+      if (event.kind === "doc.published" && typeof event.route === "string") {
+        if (normaliseCurrentRoute(window.location.pathname) === normaliseCurrentRoute(event.route)) {
           saveReplyDraftsToSessionStorage();
           window.location.reload();
         }
-        // M2 item 6: any event that could change the batch count
-        // re-fetches the mode. A `comment.created` / `comment.replied`
-        // adds to the pending set under `handover`; a `handover`
-        // event drains it. Both need the badge to reflect the new
-        // count without a page reload. `presence` events don't
-        // affect the badge.
-        if (
-          event.kind === "handover" ||
-          event.kind === "comment.created" ||
-          event.kind === "comment.replied"
-        ) {
-          onModeBump();
-        }
-        // Round-3: expose handover + mode-change events to the rail
-        // so the human sees a "flushed by …" indicator when the
-        // agent (or another local caller) triggers a flush or
-        // mode change. Delivery-timing is not confidentiality —
-        // the human needs to SEE this happen.
-        if (event.kind === "handover" || event.kind === "delivery.mode_changed") {
-          onDeliveryEvent(event as unknown as {
-            readonly kind: string;
-            readonly ts: string;
-            readonly trigger?: string;
-            readonly commentIds?: readonly string[];
-            readonly from?: string | null;
-            readonly to?: string;
-            readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
-          });
-        }
-        if (event.kind === "presence") {
-          onPresence(event as unknown as {
-            readonly ts: string;
-            readonly state?: string;
-            readonly path?: string;
-            readonly startLine?: number;
-            readonly endLine?: number;
-            readonly actor?: { readonly id?: string; readonly displayName?: string };
-          });
-        }
-      } catch {
-        // A non-JSON frame is the SSE keepalive comment or a corrupt
-        // frame — either way, ignore and wait for the next.
       }
-      retryDelayMs = 500;
-    };
-    source.onerror = (): void => {
-      source?.close();
-      if (closed) return;
-      const delay = retryDelayMs;
-      retryDelayMs = Math.min(retryDelayMs * 2, 30_000);
-      setTimeout(kick, delay);
-    };
+      // M2 item 9, story A4: a scheduled full build finished —
+      // either way. On `build.succeeded` the daemon has fresh dist
+      // HTML for every route, so a page that was showing the
+      // "rendering..." banner reloads and swaps it out. On
+      // `build.failed` the page must ALSO reload, because the
+      // banner's content changes from "a build is running" to the
+      // build's error tail. Reloading only on success left the
+      // reviewer staring at a spinner for a build that had already
+      // died — the one state the banner could not self-correct.
+      // Reload unconditionally: the server-side derive-from-files
+      // logic serves dist untouched when source and dist agree,
+      // so an up-to-date page pays a no-op reload at worst.
+      if (event.kind === "build.succeeded" || event.kind === "build.failed") {
+        saveReplyDraftsToSessionStorage();
+        window.location.reload();
+      }
+      // M2 item 6: any event that could change the batch count
+      // re-fetches the mode. A `comment.created` / `comment.replied`
+      // adds to the pending set under `handover`; a `handover`
+      // event drains it. Both need the badge to reflect the new
+      // count without a page reload. `presence` events don't
+      // affect the badge.
+      if (
+        event.kind === "handover" ||
+        event.kind === "comment.created" ||
+        event.kind === "comment.replied"
+      ) {
+        onModeBump();
+      }
+      // Round-3: expose handover + mode-change events to the rail
+      // so the human sees a "flushed by …" indicator when the
+      // agent (or another local caller) triggers a flush or
+      // mode change. Delivery-timing is not confidentiality —
+      // the human needs to SEE this happen.
+      if (event.kind === "handover" || event.kind === "delivery.mode_changed") {
+        onDeliveryEvent(event as unknown as {
+          readonly kind: string;
+          readonly ts: string;
+          readonly trigger?: string;
+          readonly commentIds?: readonly string[];
+          readonly from?: string | null;
+          readonly to?: string;
+          readonly actor?: { readonly kind?: string; readonly id?: string; readonly displayName?: string };
+        });
+      }
+      if (event.kind === "presence") {
+        onPresence(event as unknown as {
+          readonly ts: string;
+          readonly state?: string;
+          readonly path?: string;
+          readonly startLine?: number;
+          readonly endLine?: number;
+          readonly actor?: { readonly id?: string; readonly displayName?: string };
+        });
+      }
+    } catch {
+      // A non-JSON frame is the SSE keepalive comment or a corrupt
+      // frame — either way, ignore and wait for the next.
+    }
   };
-  kick();
+
+  // The live-channel controller owns reconnect backoff + visibility
+  // wake-ups. Its `open` factory builds a real EventSource on top of
+  // the resume-point promise so every reconnect lands on the same
+  // `?since=`. The EventSource's `onmessage` goes direct to the
+  // parser above, not through the controller — the controller cares
+  // about connection STATE, not frame content.
+  let detached = false;
+  // Same semantics as the previous `onAttached`: one authoritative
+  // thread-list refetch each time we subscribe. The attached hook
+  // fires on the live-channel's first `connecting` transition (the
+  // real EventSource is already in flight at that point); subsequent
+  // reconnects fire it again (`connecting` after `reconnecting`),
+  // which is exactly what we want — a reconnect is the right moment
+  // to resync the thread list.
+  const fireAttached = (): void => {
+    if (detached) return;
+    try {
+      onAttached();
+    } catch {
+      // A broken rail hook must not take down the subscription.
+    }
+  };
+  const controller = createLiveChannel({
+    open({ onOpen, onError }): { close: () => void } {
+      // Deliberately kept as a closure — each open captures a fresh
+      // `MessageEvent` handler so late frames from a replaced source
+      // can be identified and ignored at the EventSource level.
+      let source: EventSource | undefined;
+      let cancelled = false;
+      void initialSincePromise.then((since) => {
+        if (cancelled || detached) return;
+        // `EventSource` sends the session cookie automatically
+        // because we opened the page under the daemon's own origin.
+        source = new EventSource(
+          since > 0 ? `/events?since=${encodeURIComponent(String(since))}` : "/events?since=0",
+        );
+        source.onopen = (): void => onOpen();
+        source.onmessage = (message: MessageEvent<string>): void => handleMessageData(message.data);
+        source.onerror = (): void => onError();
+      });
+      return {
+        close(): void {
+          cancelled = true;
+          if (source !== undefined) {
+            try {
+              source.close();
+            } catch {
+              // Already closed.
+            }
+            source = undefined;
+          }
+        },
+      };
+    },
+    onStateChange(state): void {
+      // `connecting` is both the initial attach AND every reconnect
+      // attempt. Either way, fire the attached hook so the rail
+      // refetches threads once the (re)connection is in flight.
+      if (state === "connecting") fireAttached();
+      try {
+        onLiveState(state);
+      } catch {
+        // A broken rail hook must not take down the subscription.
+      }
+    },
+  });
+
+  // Visibility + online wake-ups. See the function doc: a tab
+  // returning from hidden is the strongest signal that the SSE may
+  // have gone stale while the browser froze the connection; forcing
+  // a reconnect here closes the zombie-open window diagnosed in
+  // issue #277. We register against `document` / `window` only if
+  // they exist (they do in a browser; a test harness may stub them).
+  const onVisibilityChange = (): void => {
+    if (typeof document !== "undefined" && document.visibilityState === "visible") {
+      controller.wake();
+    }
+  };
+  const onOnline = (): void => controller.wake();
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", onVisibilityChange);
+  }
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("online", onOnline);
+  }
+
   return () => {
-    closed = true;
-    source?.close();
+    detached = true;
+    controller.stop();
+    if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    }
+    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+      window.removeEventListener("online", onOnline);
+    }
   };
 }
 
@@ -1294,6 +1360,11 @@ function Rail(): JSX.Element {
     }
   };
 
+  // Live-connection state, surfaced as a visible indicator so a
+  // reviewer never sees the "silent drop" of issue #277. `undefined`
+  // means the subscriber has not reported yet — treated as
+  // `connecting`, which the UI hides.
+  const [liveState, setLiveState] = createSignal<LiveState | undefined>(undefined);
   // Wire the SSE stream on mount, tear it down on unmount. The three
   // subscribers are separated so a `presence` event does not force a
   // thread refetch, and a comment event does not force a mode refetch.
@@ -1331,6 +1402,9 @@ function Rail(): JSX.Element {
     // missed. See `subscribeEvents`.
     () => {
       void refetch();
+    },
+    (state) => {
+      setLiveState(state);
     },
   );
   onCleanup(unsubscribe);
@@ -1586,6 +1660,31 @@ function Rail(): JSX.Element {
           aria-label="refresh"
         >refresh</button>
       </header>
+      {/* Issue #277: "live updates paused" indicator. Shown only when
+          the SSE channel is in `reconnecting` — initial `connecting`
+          flicker on page load is noise, not signal. Reviewer clicks
+          Retry to force a reconnect NOW (also fired on
+          `visibilitychange` / `online`; the button exists for the
+          cases those events do not cover, e.g. a stuck tab whose
+          network returns while already in the foreground). */}
+      <Show when={liveState() === "reconnecting"}>
+        <div
+          class="revkit-rail__live-paused"
+          role="status"
+          aria-live="polite"
+          data-testid="revkit-rail-live-paused"
+        >
+          <span class="revkit-rail__live-paused-text">
+            Live updates paused — reconnecting&hellip;
+          </span>
+          <button
+            type="button"
+            class="revkit-rail__live-paused-retry"
+            data-testid="revkit-rail-live-paused-retry"
+            onClick={() => void refetch()}
+          >Refresh now</button>
+        </div>
+      </Show>
       {/* Single polite live region for the unread count. PR #62
           review a11y: a screen-reader user should hear one summary
           ("3 unread agent replies") — not a per-thread barrage of

@@ -318,8 +318,19 @@ class WebSocketSubscriber implements Subscriber {
 }
 
 /** How often to send an SSE keepalive comment. Kept short so a paused
- * tab wakes quickly; long enough not to spam the log. */
-const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
+ * tab wakes quickly; long enough not to spam the log.
+ *
+ * **Issue #277** — this must stay below the smallest idle-timeout
+ * any likely reverse proxy / load balancer enforces, or an idle
+ * proxy will reap the stream and the rail will go silent (the
+ * reported behaviour). Common ceilings: nginx `proxy_read_timeout`
+ * 60 s, HAProxy `timeout server` 60 s, AWS ALB 60 s, Cloudflare 100 s,
+ * aiohttp `keepalive_timeout` 75 s. 15 s leaves a 4× margin against
+ * the tightest of those — a single lost keepalive still wakes the
+ * next one well under 60 s. Exported so a regression test pins the
+ * invariant: if someone later raises this past ~45 s, the rail starts
+ * dropping streams silently again. */
+export const SSE_KEEPALIVE_INTERVAL_MS = 15_000;
 
 /** Issue #70: `POST /api/review/promote` declined to act, with a
  * machine-readable `error` and a human-readable `reason`. Distinct
