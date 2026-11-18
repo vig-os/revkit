@@ -198,6 +198,43 @@
   border-color: var(--revkit-rail-resolved);
 }
 
+/*
+ * "Live updates paused" indicator (issue #277). Shown when the SSE
+ * subscriber is in its `reconnecting` state so a reviewer knows the
+ * live feed is not currently being delivered. Uses the danger
+ * palette — this is "state does not match the daemon", not noise.
+ * The polite live-region announces itself once on transition (not
+ * on every backoff tick, because the text content does not change).
+ */
+.revkit-rail__live-paused {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0 0 0.75rem 0;
+  padding: 0.4rem 0.6rem;
+  background: color-mix(in srgb, var(--revkit-rail-danger) 10%, transparent);
+  color: var(--revkit-rail-danger);
+  border: 1px solid var(--revkit-rail-danger);
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+
+.revkit-rail__live-paused-text {
+  flex: 1 1 auto;
+}
+
+.revkit-rail__live-paused-retry {
+  background: transparent;
+  color: var(--revkit-rail-danger);
+  border: 1px solid currentColor;
+  padding: 0.2rem 0.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
 .revkit-rail__threads {
   list-style: none;
   padding: 0;

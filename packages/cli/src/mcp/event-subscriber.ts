@@ -181,20 +181,24 @@ async function consume(
 }
 
 /** Parse one SSE frame into a `WireEvent`, or `undefined` if it was
- * a keepalive / malformed. Only fields `id:` and `data:` matter to
- * this consumer — `event:` and `retry:` are ignored by the daemon
- * anyway. */
+ * a heartbeat / malformed. Only `data:` matters to this consumer —
+ * `event:`, `id:` and `retry:` lines are ignored (the daemon's
+ * named `event: ping` heartbeat lands here with an empty `data:`
+ * line and is dropped below; `id:` is redundant with the event's
+ * own `seq`). */
 function parseFrame(frame: string): WireEvent | undefined {
   let dataJson: string | undefined;
   for (const line of frame.split("\n")) {
     if (line.length === 0) continue;
-    if (line.startsWith(":")) continue; // SSE comment / keepalive
+    if (line.startsWith(":")) continue; // SSE comment
     if (line.startsWith("data:")) {
       dataJson = line.slice("data:".length).trimStart();
     }
     // We do not need to read the `id:` line — the event's own `seq`
     // field is authoritative (the daemon assigns `id: <seq>` from
-    // the same value).
+    // the same value). `event: ping` heartbeat frames have an empty
+    // `data:` line and fall through to the `length === 0` guard
+    // below.
   }
   if (dataJson === undefined || dataJson.length === 0) return undefined;
   let parsed: unknown;
