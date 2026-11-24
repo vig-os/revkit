@@ -518,8 +518,11 @@ describe("#245 round 3 — reply / resolve / reopen / SSE end-to-end under /revi
     const body = await response.text();
     // The one well-defined place (DECISION b).
     const match = body.match(/<meta name="revkit-base" content="([^"]+)"/u);
-    expect(match).not.toBeNull();
-    const trailing = match![1];
+    const trailing = match?.[1];
+    expect(typeof trailing).toBe("string");
+    if (typeof trailing !== "string") {
+      throw new Error("no revkit-base meta tag in served HTML");
+    }
     // Normalise to the leading-slash-no-trailing shape the server
     // expects on a request path.
     return trailing === "/" ? "" : trailing.replace(/\/+$/u, "");
