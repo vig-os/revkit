@@ -17,18 +17,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     gate but no dispatch branch matched it, so it 404'd as static. API, `/events`, assets and the site root all
     serve under the prefix now. Prefix confusion (`/review` vs `/reviewer`, `/reviewapi/*`), a trailing slash and
     an encoded slash (`/review%2Fapi/threads`) stay 404 — the strip keys on exact-or-slash, not `startsWith`.
-  - **Base-path body rewrite for served HTML and the rail bundle.** Absolute-path references inside HTML
-    responses (`href="/foo"`, `src="/foo"`, inline `fetch("/api/...")`) and the rail JS bundle are rewritten to
-    carry the configured prefix, so a browser loading `${publicOrigin}/review/` resolves every link against the
-    one proxied origin. Protocol-relative (`//cdn`) and fully qualified URLs are untouched. Idempotent — an
-    already-prefixed path is passed through (`prefixAbsolutePaths` in `packages/cli/src/serve/base-path.ts`).
-  - **Transport peer address flows end-to-end.** `IdentityResolver.resolve(request, peer?)` now carries the
-    peer. The daemon dispatcher derives it from `Bun.serve`'s `requestIP` and passes it to the resolver on every
-    call. `createAuthProviderIdentityResolver` uses the passed-in peer first and falls back to its
-    construction-time function; a call with neither configured refuses closed with `no-peer` (401). This closes
-    the pre-#245 shape where the resolver had to know the peer at construction time — i.e. before `Bun.serve`
-    had bound a socket — and the `trusted-proxy` provider's peer allowlist could not actually be checked. A new
-    `StartDaemonOptions.peer` seam lets the host target override the derivation (unix socket, say).
+  - **Base path is a BUILD-TIME + RUNTIME property, NOT a response rewrite** (round-3 falsifier decision,
+    replaces the earlier body-rewriter). The round-2 approach regex-rewrote absolute-path references inside
+    served HTML and the rail bundle, and the round-3 falsifier showed that a regex cannot tell URLs from data:
+    template-literal URLs (`` `/api/threads/${id}/replies` ``) were MISSED, the rail's own `"/"` path normaliser
+    was corrupted, prose / JSON / HTML comments got rewritten, and an existing `href="/review"` became
+    `/review/review`. The new shape:
+    - `revkit build --base /review` sets Astro's `base`, so every page / asset href is emitted PREFIXED at
+      build time. The CLI normalises the argument (strips trailing slashes; `/` collapses to empty).
+    - The Starlight layout stamps `<meta name="revkit-base" content="/review/">` into the HTML once — the ONE
+      well-defined place the base lives in a served page.
+    - The rail (and the ask-page bundle) now opens EVERY URL through a single `revkitUrl(path)` helper
+      (`packages/cli/src/rail/url.ts`) that resolves `path` against the meta at mount; a missing meta falls
+      back to `/` (local daemon, byte-for-byte unchanged behaviour).
+    - The daemon strips the prefix before routing (unchanged) and prefixes the two `<script>` / `<link>` tags
+      `injectRail` appends (the ONE place the serve path knows a path-aware URL); it NEVER rewrites bodies.
+      `prefixAbsolutePaths` is deleted.
+    - CSP inline-script hashes stay valid because nothing is rewritten after the build, and the local
+      daemon's observable behaviour is unchanged (empty basePath, no meta, identical URLs).
+    - A static check (`packages/cli/test/rail/url.test.ts`) refuses any root-absolute `/api`, `/events`,
+      `/-/` literal in the built rail bundle outside `revkitUrl`'s own call sites, so a future contributor
+      who types `fetch("/api/…")` without going through the helper fails `bun test` rather than a
+      reverse-proxied deployment.
+  - **Transport peer address flows end-to-end, and fails closed when the transport cannot name a peer.**
+    `IdentityResolver.resolve(request, peer?)` carries the peer. The daemon derives it from `Bun.serve`'s
+    `requestIP` and passes it on every call. `createAuthProviderIdentityResolver` uses the passed-in peer first
+    and falls back to its construction-time function; a call with neither configured refuses closed with
+    `no-peer` (401). `StartDaemonOptions.peer` lets the host target override the derivation (unix socket, say).
+    Round-3 blocker 3: `peerFor` previously invented `{transport: "tcp", address: "127.0.0.1"}` when
+    `requestIP` was `null` — i.e. over a unix socket — which made the dispatcher's own `no-peer` branch
+    unreachable and would have silently trusted every socket writer under a `127.0.0.0/8` allowlist. The
+    daemon now returns `undefined`, the resolver refuses, and a dispatcher-level test pins the behaviour.
+    Unix-socket peer semantics (SO_PEERCRED, listener-level trust) are the follow-up round's job.
   - **401 (missing credential) vs 403 (untrusted peer) propagate.** `identifyActor` now returns the full
     `IdentityResolution` and the five dispatcher call sites surface the resolver's own status onto the response.
     An untrusted peer no longer surfaces as `401 Unauthorized`, which hid a misconfigured allowlist as a

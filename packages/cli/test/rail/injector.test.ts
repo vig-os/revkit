@@ -71,6 +71,34 @@ describe("rail injector — HTMLRewriter", () => {
     expect(reportedBytes).toBeGreaterThan(RAIL_INJECT_MAX_BYTES);
   });
 
+  test("basePath prefixes the two injected tags (#245 round 3)", async () => {
+    // Sub-path deployment: the injector picks the prefixed path on
+    // its <script> / <link> — the ONE place the serve path knows a
+    // base-aware URL. This is NOT a body rewrite; the rest of the
+    // HTML (hrefs the Astro build emitted with --base) streams
+    // through untouched.
+    const html = "<!doctype html><html><head></head><body><a href=\"/review/foo\">keep</a></body></html>";
+    const out = await (
+      await injectRail(new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } }), {
+        basePath: "/review",
+      })
+    ).text();
+    expect(out).toContain(`src="/review${RAIL_JS_PATH}"`);
+    expect(out).toContain(`href="/review${RAIL_CSS_PATH}"`);
+    // Astro-emitted hrefs pass through — nothing is doubled.
+    expect(out).toContain("href=\"/review/foo\"");
+    expect(out).not.toContain("/review/review/");
+  });
+
+  test("basePath empty is byte-for-byte unchanged behaviour (local daemon)", async () => {
+    const html = "<!doctype html><html><head></head><body></body></html>";
+    const out = await (await injectRail(new Response(html), { basePath: "" })).text();
+    expect(out).toContain(`src="${RAIL_JS_PATH}"`);
+    expect(out).toContain(`href="${RAIL_CSS_PATH}"`);
+    // No prefix smuggled in.
+    expect(out).not.toMatch(/\/[^/>"]+\/-\/rail\.(js|css)/);
+  });
+
   test("only trusted script src / stylesheet href are injected — nothing user-controllable", async () => {
     // `injectRail` composes its own tag strings from RAIL_JS_PATH /
     // RAIL_CSS_PATH constants; nothing from the caller reaches the

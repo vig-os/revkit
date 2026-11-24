@@ -26,6 +26,7 @@ import { createMemo, createResource, createSignal, For, onCleanup, Show, type JS
 import { render } from "solid-js/web";
 import { parseDataSrc } from "../data-src-format.ts";
 import { PROVENANCE_VERSION, type SourceSelection } from "../provenance-format.ts";
+import { revkitUrl } from "./url.ts";
 import { containingBlock, rangeBlock, rangeSelection, type CommentTarget } from "./selection-provenance.ts";
 import type { ReviewRefreshResponse } from "../review/api-types.ts";
 import {
@@ -185,7 +186,7 @@ interface PresenceBadge {
 
 /** Fetch the current delivery mode. */
 async function fetchDeliveryMode(): Promise<DeliveryStatus> {
-  const response = await fetch("/api/delivery-mode", {
+  const response = await fetch(revkitUrl("/api/delivery-mode"), {
     credentials: "same-origin",
     headers: { accept: "application/json" },
   });
@@ -195,7 +196,7 @@ async function fetchDeliveryMode(): Promise<DeliveryStatus> {
 
 /** Change the delivery mode. */
 async function setDeliveryMode(mode: DeliveryMode): Promise<DeliveryStatus> {
-  const response = await fetch("/api/delivery-mode", {
+  const response = await fetch(revkitUrl("/api/delivery-mode"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -207,7 +208,7 @@ async function setDeliveryMode(mode: DeliveryMode): Promise<DeliveryStatus> {
 
 /** Flush the handover batch. */
 async function handOverNow(): Promise<void> {
-  const response = await fetch("/api/handover", {
+  const response = await fetch(revkitUrl("/api/handover"), {
     method: "POST",
     credentials: "same-origin",
     headers: { accept: "application/json" },
@@ -308,7 +309,7 @@ type RailDroppedIntent = NonNullable<RailReviewState["state"]["droppedReviewerIn
  * review mode (`/api/review/state` returns 404). Any other error
  * surfaces on the rail's error line. */
 async function fetchReviewState(): Promise<RailReviewState | null> {
-  const response = await fetch("/api/review/state", {
+  const response = await fetch(revkitUrl("/api/review/state"), {
     credentials: "same-origin",
     headers: { accept: "application/json" },
   });
@@ -318,7 +319,7 @@ async function fetchReviewState(): Promise<RailReviewState | null> {
 }
 
 async function submitReview(event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES", body: string): Promise<void> {
-  const response = await fetch("/api/review/submit", {
+  const response = await fetch(revkitUrl("/api/review/submit"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -340,7 +341,7 @@ async function submitReview(event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES", bo
 }
 
 async function discardPendingReview(reason?: string): Promise<void> {
-  const response = await fetch("/api/review/discard", {
+  const response = await fetch(revkitUrl("/api/review/discard"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -356,7 +357,7 @@ async function reanchorPendingReview(): Promise<{
   orphaned: number;
   openedReviewNodeId: string;
 }> {
-  const response = await fetch("/api/review/reanchor", {
+  const response = await fetch(revkitUrl("/api/review/reanchor"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -371,7 +372,7 @@ async function reanchorPendingReview(): Promise<{
 }
 
 async function refreshReviewPr(): Promise<ReviewRefreshResponse> {
-  const response = await fetch("/api/review/refresh", {
+  const response = await fetch(revkitUrl("/api/review/refresh"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -393,7 +394,7 @@ async function promoteAgentDraft(input: {
   commentId?: string;
   reviewNodeId?: string;
 }): Promise<{ ok: boolean; promoted: boolean; reason?: string; error?: string }> {
-  const response = await fetch("/api/review/promote", {
+  const response = await fetch(revkitUrl("/api/review/promote"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -476,7 +477,7 @@ async function fetchThreads(): Promise<RailListResponse> {
   const statusFilter = "open,orphaned,resolved";
   if (paths.length === 0) {
     const response = await fetch(
-      "/api/threads?status=" + encodeURIComponent(statusFilter),
+      revkitUrl("/api/threads?status=" + encodeURIComponent(statusFilter)),
       {
         credentials: "same-origin",
         headers: { accept: "application/json" },
@@ -488,10 +489,12 @@ async function fetchThreads(): Promise<RailListResponse> {
   const responses = await Promise.all(
     paths.map((path) =>
       fetch(
-        "/api/threads?path=" +
-          encodeURIComponent(path) +
-          "&status=" +
-          encodeURIComponent(statusFilter),
+        revkitUrl(
+          "/api/threads?path=" +
+            encodeURIComponent(path) +
+            "&status=" +
+            encodeURIComponent(statusFilter),
+        ),
         {
           credentials: "same-origin",
           headers: { accept: "application/json" },
@@ -541,7 +544,7 @@ interface CreateThreadBody {
   readonly body: string;
 }
 async function createThread(body: CreateThreadBody): Promise<void> {
-  const response = await fetch("/api/threads", {
+  const response = await fetch(revkitUrl("/api/threads"), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json" },
@@ -552,7 +555,7 @@ async function createThread(body: CreateThreadBody): Promise<void> {
 
 async function replyToThread(threadId: string, parentId: string, body: string): Promise<void> {
   const response = await fetch(
-    `/api/threads/${encodeURIComponent(threadId)}/replies`,
+    revkitUrl(`/api/threads/${encodeURIComponent(threadId)}/replies`),
     {
       method: "POST",
       credentials: "same-origin",
@@ -565,7 +568,7 @@ async function replyToThread(threadId: string, parentId: string, body: string): 
 
 async function resolveThread(threadId: string): Promise<void> {
   const response = await fetch(
-    `/api/threads/${encodeURIComponent(threadId)}/resolve`,
+    revkitUrl(`/api/threads/${encodeURIComponent(threadId)}/resolve`),
     {
       method: "POST",
       credentials: "same-origin",
@@ -578,7 +581,7 @@ async function resolveThread(threadId: string): Promise<void> {
 
 async function reopenThread(threadId: string): Promise<void> {
   const response = await fetch(
-    `/api/threads/${encodeURIComponent(threadId)}/reopen`,
+    revkitUrl(`/api/threads/${encodeURIComponent(threadId)}/reopen`),
     {
       method: "POST",
       credentials: "same-origin",
@@ -610,7 +613,7 @@ function writeSeenMap(next: SeenMap): void {
  * so the reviewer's local session still works. */
 async function fetchRepoId(): Promise<string | undefined> {
   try {
-    const response = await fetch("/-/health", { credentials: "same-origin" });
+    const response = await fetch(revkitUrl("/-/health"), { credentials: "same-origin" });
     if (!response.ok) return undefined;
     const parsed = (await response.json()) as { repoId?: string };
     return typeof parsed.repoId === "string" ? parsed.repoId : undefined;
@@ -633,7 +636,7 @@ async function fetchRepoId(): Promise<string | undefined> {
 async function fetchAllThreadIds(): Promise<readonly string[] | undefined> {
   try {
     const response = await fetch(
-      "/api/threads?fields=id&status=" + encodeURIComponent("open,resolved,orphaned"),
+      revkitUrl("/api/threads?fields=id&status=" + encodeURIComponent("open,resolved,orphaned")),
       { credentials: "same-origin", headers: { accept: "application/json" } },
     );
     if (!response.ok) return undefined;
@@ -691,7 +694,7 @@ async function resolveInitialSince(storage: ResumeStorage | undefined): Promise<
   if (pageHead > 0) return sinceForSubscribe(stored, 0, pageHead);
   if (stored > 0) return sinceForSubscribe(stored, 0, 0);
   try {
-    const response = await fetch("/api/events-head", {
+    const response = await fetch(revkitUrl("/api/events-head"), {
       headers: { accept: "application/json" },
       credentials: "same-origin",
     });
@@ -764,7 +767,9 @@ function subscribeEvents(
       // `EventSource` sends the session cookie automatically because
       // we opened the page under the daemon's own origin.
       source = new EventSource(
-        since > 0 ? `/events?since=${encodeURIComponent(String(since))}` : "/events?since=0",
+        since > 0
+          ? revkitUrl(`/events?since=${encodeURIComponent(String(since))}`)
+          : revkitUrl("/events?since=0"),
       );
       attach();
     });
@@ -1779,8 +1784,7 @@ function Rail(): JSX.Element {
                       setReviewBusy(true);
                       setError(undefined);
                       try {
-                        const url = new URL(location.href);
-                        const response = await fetch(new URL("/api/review/reconcile", url.origin), {
+                        const response = await fetch(revkitUrl("/api/review/reconcile"), {
                           method: "POST",
                           headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
                           credentials: "same-origin",
@@ -1809,8 +1813,7 @@ function Rail(): JSX.Element {
                         // POST /api/review/decline-repost durably
                         // cancels every stranded intent. There is no
                         // pending review to delete on GitHub here.
-                        const url = new URL(location.href);
-                        const response = await fetch(new URL("/api/review/decline-repost", url.origin), {
+                        const response = await fetch(revkitUrl("/api/review/decline-repost"), {
                           method: "POST",
                           headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
                           credentials: "same-origin",
@@ -1898,8 +1901,7 @@ function Rail(): JSX.Element {
                     setReviewBusy(true);
                     setError(undefined);
                     try {
-                      const url = new URL(location.href);
-                      await fetch(new URL("/api/review/reconcile", url.origin), {
+                      await fetch(revkitUrl("/api/review/reconcile"), {
                         method: "POST",
                         headers: { "content-type": "application/json", "sec-fetch-site": "same-origin" },
                         credentials: "same-origin",

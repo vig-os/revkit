@@ -27,6 +27,7 @@
 
 import { createResource, createSignal, For, Show, onCleanup, onMount, type JSX } from "solid-js";
 import { render } from "solid-js/web";
+import { revkitUrl } from "../rail/url.ts";
 
 // ── Wire types (kept as duck types to stay off the review-core
 //    barrel; the bundle is browser-side and pulling review-core in
@@ -143,7 +144,7 @@ function readBoot(): BootOutcome {
  * write path returns `{ seq, event }` and the read path returns
  * `{ ask }`, matching the threads API's shape. */
 async function fetchAsk(id: string): Promise<AskRecord> {
-  const response = await fetch(`/api/asks/${encodeURIComponent(id)}`, {
+  const response = await fetch(revkitUrl(`/api/asks/${encodeURIComponent(id)}`), {
     credentials: "same-origin",
     headers: { accept: "application/json" },
   });
@@ -157,7 +158,7 @@ async function fetchAsk(id: string): Promise<AskRecord> {
  * returns `{seq, event}`, not the derived record, so we do not
  * bother parsing the body here. */
 async function submitAnswer(id: string, answer: Answer): Promise<void> {
-  const response = await fetch(`/api/asks/${encodeURIComponent(id)}/answer`, {
+  const response = await fetch(revkitUrl(`/api/asks/${encodeURIComponent(id)}/answer`), {
     method: "POST",
     credentials: "same-origin",
     headers: { "content-type": "application/json", accept: "application/json" },
@@ -644,7 +645,7 @@ function AskPage(props: { boot: Boot }): JSX.Element {
   // sends cookies by default on same-origin).
   onMount(() => {
     let closed = false;
-    const source = new EventSource("/events");
+    const source = new EventSource(revkitUrl("/events"));
     source.onmessage = (event: MessageEvent<string>): void => {
       try {
         const payload = JSON.parse(event.data) as { readonly kind?: string; readonly askId?: string };

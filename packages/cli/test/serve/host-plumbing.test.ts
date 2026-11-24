@@ -61,15 +61,19 @@ async function startSubPath(publicOrigin: string, publicHost: string, extra: Par
   const root = mkdtempSync(join(tmpdir(), "revkit-245-"));
   const dist = join(root, "dist");
   mkdirSync(dist, { recursive: true });
-  // Seed index.html with absolute-path references the rewrite will
-  // pick up: a rail-adjacent script tag plus an inline JS literal.
-  // The `<head>` is required for `injectRail` to attach the rail
-  // bundle tag (HTMLRewriter's `head` selector).
+  // The site build is the one responsible for prefixed URLs
+  // (#245 part 1 round 3 DECISION a): under a sub-path deployment
+  // Astro emits every asset href with the prefix already applied,
+  // so the index fixture carries the prefix inline — the daemon
+  // never rewrites the body.
+  const basePrefix = new URL(publicOrigin).pathname.replace(/\/+$/u, "");
   writeFileSync(
     join(dist, "index.html"),
-    "<!doctype html><html><head><title>revkit-245</title></head><body>"
-      + "<link rel=\"stylesheet\" href=\"/styles.css\">"
-      + "<script>fetch(\"/api/threads\")</script>"
+    "<!doctype html><html><head>"
+      + `<meta name="revkit-base" content="${basePrefix}/">`
+      + "<title>revkit-245</title>"
+      + "</head><body>"
+      + `<link rel="stylesheet" href="${basePrefix}/styles.css">`
       + "<h1>root</h1>"
       + "</body></html>",
   );
@@ -146,21 +150,29 @@ describe("#245 — base-path stripping (sub-path deployment)", () => {
     expect(response.headers.get("content-type")).toContain("text/javascript");
   });
 
-  test("serves the site root under the prefix (and rewrites absolute paths)", async () => {
+  test("serves the site root under the prefix; build-time prefixes untouched; injector prefixes its two tags", async () => {
     const response = await fetch(`${ctx.handle.url}/review/`, {
       headers: { host: ctx.publicHost, origin: ctx.originHeader },
     });
     expect(response.status).toBe(200);
     const body = await response.text();
-    // Absolute-path references are prefixed with `/review` so the
-    // browser resolves them against the proxy's one base URL. The
-    // rewrite must be idempotent — no double prefix.
+    // The build-time prefix (#245 round 3 DECISION a) is passed
+    // through unchanged — the daemon no longer regex-rewrites
+    // bodies. Idempotent by construction: no `/review/review/` or
+    // any other doubled prefix can appear in the output because
+    // the server never adds one.
     expect(body).toContain("href=\"/review/styles.css\"");
-    expect(body).not.toContain("href=\"/styles.css\"");
     expect(body).not.toContain("/review/review/");
-    // The rail bundle `<script>` tag is injected on HTML — its src
-    // must carry the prefix too.
+    // The rail `<script>` and `<link>` tags are the ONE place the
+    // serve path picks a path-aware href: the injector prepends
+    // the policy's `basePath` on its two tags (round 3 DECISION d
+    // — this is NOT a body rewrite, only tag composition).
     expect(body).toMatch(/src="\/review\/-\/rail\.js"/);
+    expect(body).toMatch(/href="\/review\/-\/rail\.css"/);
+    // The meta tag the Astro layout stamps at build time is
+    // preserved verbatim — the rail's runtime `revkitUrl` helper
+    // reads it on mount.
+    expect(body).toContain('<meta name="revkit-base" content="/review/">');
   });
 
   test("trailing slash on the prefix maps to the root", async () => {
@@ -211,7 +223,7 @@ describe("#245 — base-path stripping (sub-path deployment)", () => {
   });
 });
 
-describe("#245 — rail bundle body rewrite under a sub-path deployment", () => {
+describe("#245 round 3 — rail bundle is PATH-AGNOSTIC (resolves at runtime via revkitUrl)", () => {
   let ctx: Ctx;
   beforeEach(async () => {
     ctx = await startSubPath("http://review.example.com/review", "review.example.com");
@@ -220,21 +232,28 @@ describe("#245 — rail bundle body rewrite under a sub-path deployment", () => 
     await stop(ctx);
   });
 
-  test("absolute-path references in rail.js carry the base-path prefix", async () => {
+  test("rail.js served under the prefix contains no post-build path mutation", async () => {
+    // Round-3 design (ADR-0026 §"Plain Linux host / VM" DECISION
+    // c + d): the rail bundle is the SAME bytes at every
+    // deployment. Every API, SSE and asset URL goes through
+    // `revkitUrl(path)`, which reads the `<meta name="revkit-base">`
+    // the layout stamped at BUILD time. The daemon never rewrites
+    // bodies — so the rail bundle served under `/review/-/rail.js`
+    // contains NO `/review/` prefix anywhere.
     const response = await fetch(`${ctx.handle.url}/review/-/rail.js`, {
       headers: { host: ctx.publicHost, origin: ctx.originHeader },
     });
     expect(response.status).toBe(200);
     const body = await response.text();
-    // The rail bundle contains runtime references like
-    // `fetch("/api/events-head")` and `new EventSource("/events")`.
-    // Under a sub-path deployment the browser opens
-    // `${publicOrigin}/review/...`, so those absolute paths must
-    // carry `/review`. Idempotent — no `//` or `/review/review/`.
-    expect(body).toContain("/review/api/threads");
-    expect(body).toContain("/review/api/events-head");
-    expect(body).toContain("/review/events");
-    expect(body).not.toContain("/review/review/");
+    // No server-injected prefix.
+    expect(body).not.toContain("/review/api/");
+    expect(body).not.toContain("/review/events");
+    expect(body).not.toContain("/review/-/");
+    // The bundle still carries the un-prefixed paths that
+    // `revkitUrl` resolves against the meta at runtime.
+    expect(body).toContain("/api/threads");
+    expect(body).toContain("/api/events-head");
+    expect(body).toContain("/events");
   });
 });
 
@@ -394,5 +413,213 @@ describe("#245 — transport peer flows through the real listener; 403 vs 401", 
       expect(outcome.status).toBe(401);
       expect(outcome.reason).toBe("no-peer");
     }
+  });
+
+  test("dispatcher-level: null peer → 401 no-peer (NOT silently trusted)", async () => {
+    // Round-3 blocker 3: `peerFor` used to invent `{transport:
+    // "tcp", address: "127.0.0.1"}` when `Bun.serve`'s `requestIP`
+    // was null. Over a unix-socket listener that is the common
+    // case, and an allowlist containing `127.0.0.0/8` would then
+    // trust every socket writer — the dispatcher's `no-peer`
+    // branch was unreachable. The daemon now returns `undefined`,
+    // and the resolver refuses. Drive through `StartDaemonOptions
+    // .peer` to inject a null peer without racing the TCP socket
+    // — the proof is that the dispatcher reaches the refusal, not
+    // that any particular transport looked null.
+    const provider = createTrustedProxyAuthProvider({
+      headers: { subject: "x-auth-user" },
+      // An allowlist containing 127.0.0.0/8 — the exact shape that
+      // would have silently trusted the pre-fix fabricated peer.
+      trust: { kind: "peers", peers: ["127.0.0.0/8"] },
+    });
+    const ctx = await startSubPath(
+      "http://review.example.com",
+      "review.example.com",
+      {
+        identityResolver: createAuthProviderIdentityResolver({ provider }),
+        peer: () => undefined,
+      },
+    );
+    try {
+      const response = await fetch(`${ctx.handle.url}/api/threads`, {
+        headers: {
+          host: ctx.publicHost,
+          origin: ctx.originHeader,
+          "x-auth-user": "alice",
+        },
+      });
+      expect(response.status).toBe(401);
+      await response.body?.cancel();
+    } finally {
+      await stop(ctx);
+    }
+  });
+
+  test("StartDaemonOptions.peer override reaches the AuthProvider's trust check", async () => {
+    // The host entry needs a seam to pin a peer that `Bun.serve`
+    // cannot discover itself (e.g. a unix socket where `requestIP`
+    // is null). The daemon's `options.peer` wins over the default
+    // `requestIP` derivation; a value of `undefined` falls through
+    // to the resolver's `no-peer` refusal (the test above); a
+    // concrete value is honoured.
+    const provider = createTrustedProxyAuthProvider({
+      headers: { subject: "x-auth-user" },
+      trust: { kind: "peers", peers: ["10.1.2.3"] },
+    });
+    const ctx = await startSubPath(
+      "http://review.example.com",
+      "review.example.com",
+      {
+        identityResolver: createAuthProviderIdentityResolver({ provider }),
+        peer: () => ({ transport: "tcp", address: "10.1.2.3" }),
+      },
+    );
+    try {
+      const response = await fetch(`${ctx.handle.url}/api/threads`, {
+        headers: {
+          host: ctx.publicHost,
+          origin: ctx.originHeader,
+          "x-auth-user": "alice",
+        },
+      });
+      // 10.1.2.3 is on the allowlist — identity minted, API serves.
+      expect(response.status).toBe(200);
+      await response.body?.cancel();
+    } finally {
+      await stop(ctx);
+    }
+  });
+});
+
+describe("#245 round 3 — reply / resolve / reopen / SSE end-to-end under /review", () => {
+  // The round-3 brief (DECISION a–f) requires an integration test
+  // through the real listener that proves the WHOLE rail path —
+  // a thread created, a reply posted, a resolve, a reopen, and
+  // SSE reconnect with `since` — works under a sub-path
+  // deployment. The test mirrors what the rail does at runtime:
+  // it reads the base from the HTML meta, then prefixes every
+  // request. If any of these stops working the host target is
+  // broken, and the pre-round-3 body-rewrite shape would have
+  // been caught by the template-literal case
+  // (`/api/threads/${id}/replies`).
+  let ctx: Ctx;
+  beforeEach(async () => {
+    ctx = await startSubPath("http://review.example.com/review", "review.example.com");
+  });
+  afterEach(async () => {
+    await stop(ctx);
+  });
+
+  async function readBaseFromRoot(): Promise<string> {
+    const response = await fetch(`${ctx.handle.url}/review/`, {
+      headers: { host: ctx.publicHost, origin: ctx.originHeader },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    // The one well-defined place (DECISION b).
+    const match = body.match(/<meta name="revkit-base" content="([^"]+)"/u);
+    expect(match).not.toBeNull();
+    const trailing = match![1];
+    // Normalise to the leading-slash-no-trailing shape the server
+    // expects on a request path.
+    return trailing === "/" ? "" : trailing.replace(/\/+$/u, "");
+  }
+
+  test("GET /api/threads + reply / resolve / reopen template-literal URLs all reach the handler under the prefix", async () => {
+    // Pre-round-3 (47d09f5), the body rewriter MISSED
+    // `` `/api/threads/${id}/replies` `` — the template literal
+    // reached the rail unchanged, and the browser opened
+    // `${publicOrigin}/api/threads/...`, which the daemon rejected
+    // as out-of-prefix (404 static). This test exercises exactly
+    // that shape: build the URL via a template literal and watch
+    // the request reach the `/api/threads/:id/replies` handler
+    // (which parses the body and returns a schema/404 refusal —
+    // NOT a static 404).
+    //
+    // What "reaches the handler" looks like: the handler returns
+    // JSON with an error (the fake thread id is unknown, or the
+    // body is invalid). If the request had fallen through to the
+    // static branch it would have been a `text/plain` 404 with
+    // body "Not Found" — the Content-Type assertion below is the
+    // one that pins the routing.
+    const base = await readBaseFromRoot();
+    expect(base).toBe("/review");
+
+    // GET /api/threads is the simple positive case.
+    const listResponse = await fetch(`${ctx.handle.url}${base}/api/threads`, {
+      headers: { host: ctx.publicHost, origin: ctx.originHeader, accept: "application/json" },
+    });
+    expect(listResponse.status).toBe(200);
+    const listBody = (await listResponse.json()) as { threads: unknown[]; head: number };
+    expect(Array.isArray(listBody.threads)).toBe(true);
+
+    // A template-literal URL with a (fake) id — this is the exact
+    // shape the rail emits at runtime through `revkitUrl`. Any
+    // return that is JSON means the dispatcher routed it; a
+    // static 404 would be plain text.
+    const fakeId = "00000000-0000-4000-8000-000000000000";
+    const replyResponse = await fetch(
+      `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/replies`,
+      {
+        method: "POST",
+        headers: {
+          host: ctx.publicHost,
+          origin: ctx.originHeader,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ parentId: fakeId, body: "world" }),
+      },
+    );
+    expect(replyResponse.headers.get("content-type") ?? "").toContain("application/json");
+    expect(replyResponse.status).toBeGreaterThanOrEqual(400);
+    await replyResponse.body?.cancel();
+
+    const resolveResponse = await fetch(
+      `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/resolve`,
+      {
+        method: "POST",
+        headers: {
+          host: ctx.publicHost,
+          origin: ctx.originHeader,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+    expect(resolveResponse.headers.get("content-type") ?? "").toContain("application/json");
+    expect(resolveResponse.status).toBeGreaterThanOrEqual(400);
+    await resolveResponse.body?.cancel();
+
+    const reopenResponse = await fetch(
+      `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/reopen`,
+      {
+        method: "POST",
+        headers: {
+          host: ctx.publicHost,
+          origin: ctx.originHeader,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+    expect(reopenResponse.headers.get("content-type") ?? "").toContain("application/json");
+    expect(reopenResponse.status).toBeGreaterThanOrEqual(400);
+    await reopenResponse.body?.cancel();
+  });
+
+  test("SSE reconnect with ?since=<n> serves under the prefix", async () => {
+    const base = await readBaseFromRoot();
+    const headResponse = await fetch(`${ctx.handle.url}${base}/api/events-head`, {
+      headers: { host: ctx.publicHost, origin: ctx.originHeader, accept: "application/json" },
+    });
+    expect(headResponse.status).toBe(200);
+    const headBody = (await headResponse.json()) as { head: number };
+    const sinceResponse = await fetch(
+      `${ctx.handle.url}${base}/events?since=${encodeURIComponent(String(headBody.head))}`,
+      { headers: { host: ctx.publicHost, origin: ctx.originHeader } },
+    );
+    expect(sinceResponse.status).toBe(200);
+    expect(sinceResponse.headers.get("content-type")).toContain("text/event-stream");
+    await sinceResponse.body?.cancel();
   });
 });

@@ -104,4 +104,32 @@ describe("parseBuildArgs — no `--skip-check` bypass any more", () => {
     expect(out.ok).toBe(true);
     if (out.ok) expect(out.parsed.skipCheckDist).toBe(true);
   });
+
+  test("`--base` normalises to canonical form (#245 part 1 round 3)", () => {
+    const stripped = parseBuildArgs(["--base", "/review/"]);
+    expect(stripped.ok).toBe(true);
+    if (stripped.ok) expect(stripped.parsed.basePath).toBe("/review");
+
+    const root = parseBuildArgs(["--base", "/"]);
+    expect(root.ok).toBe(true);
+    if (root.ok) expect(root.parsed.basePath).toBe("");
+
+    const empty = parseBuildArgs([]);
+    expect(empty.ok).toBe(true);
+    if (empty.ok) expect(empty.parsed.basePath).toBe("");
+  });
+
+  test("`--base` rejects non-slash and non-path values", () => {
+    const missingSlash = parseBuildArgs(["--base", "review"]);
+    expect(missingSlash.ok).toBe(false);
+    if (!missingSlash.ok) expect(missingSlash.message).toContain("must start with '/'");
+
+    const withQuery = parseBuildArgs(["--base", "/review?a=1"]);
+    expect(withQuery.ok).toBe(false);
+    if (!withQuery.ok) expect(withQuery.message).toContain("plain path");
+
+    const needsValue = parseBuildArgs(["--base"]);
+    expect(needsValue.ok).toBe(false);
+    if (!needsValue.ok) expect(needsValue.message).toContain("requires a value");
+  });
 });

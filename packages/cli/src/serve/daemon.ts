@@ -104,7 +104,7 @@ import {
   type IdentityResolution,
   type IdentityResolver,
 } from "./identity-resolver.ts";
-import { prefixAbsolutePaths, stripBasePath } from "./base-path.ts";
+import { stripBasePath } from "./base-path.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
 import { buildRailBundle } from "../rail/bundle.ts";
 import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
@@ -298,8 +298,14 @@ export interface StartDaemonOptions {
    * Default: a loopback-TCP shape computed from `Server.requestIP`,
    * which matches the local daemon's ADR-0013 bind. The local
    * resolver ignores the peer value, so the default is inert for
-   * the local target. */
-  readonly peer?: (request: Request, server: Server<WebSocketData>) => AuthRequestPeer;
+   * the local target.
+   *
+   * May return `undefined` — the resolver then fails closed with
+   * `no-peer` (401). This matters for a listener whose transport
+   * does not carry a peer address (`requestIP` is null over a unix
+   * socket), where inventing a loopback peer would bypass a
+   * trusted-proxy allowlist entirely (#245 part 1 round 3). */
+  readonly peer?: (request: Request, server: Server<WebSocketData>) => AuthRequestPeer | undefined;
 }
 
 /** A handle on a running daemon. `stop()` is idempotent and removes
@@ -852,36 +858,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       const url = new URL(request.url);
       const started = performance.now();
       try {
-        let response = await handleRequest(request, url, srv, requestId);
+        const response = await handleRequest(request, url, srv, requestId);
         if (response === undefined) {
           // WebSocket upgrade — Bun handles the response.
           return undefined;
         }
-        // Base-path body rewrite (#245). The dispatcher strips the
-        // prefix from the request's pathname; this pass applies the
-        // mirror rewrite on the response body so absolute-path
-        // references inside served HTML and the rail bundle carry the
-        // configured base path. Only runs for a sub-path deployment
-        // (`basePath !== ""`); loopback responses are untouched. The
-        // check is content-type-aware so SSE frames, JSON, images and
-        // every other asset are passed through — nothing downstream
-        // would notice absolute paths inside their bodies anyway, and
-        // consuming a stream (SSE's `text/event-stream`) would hang
-        // the connection.
-        if (guardPolicy.basePath !== "") {
-          const ct = response.headers.get("content-type") ?? "";
-          const isHtml = ct.startsWith("text/html");
-          const isRailJs =
-            url.pathname === guardPolicy.basePath + RAIL_JS_PATH
-            && ct.startsWith("text/javascript");
-          if ((isHtml || isRailJs) && response.status === 200) {
-            const body = await response.text();
-            const rewritten = prefixAbsolutePaths(body, guardPolicy.basePath);
-            const headers = new Headers(response.headers);
-            headers.delete("content-length");
-            response = new Response(rewritten, { status: response.status, headers });
-          }
-        }
+        // Base path is a BUILD-TIME + RUNTIME property, never a
+        // response rewrite (#245 part 1 round 3, ADR-0026 §"Plain
+        // Linux host / VM" DECISION d): Astro emits prefixed hrefs
+        // at build time, the rail resolves API / SSE / asset URLs
+        // through `revkitUrl` against the `<meta name="revkit-base">`
+        // the layout stamped. The daemon only strips the prefix
+        // before routing and picks the prefixed path on the two
+        // tags `injectRail` adds. No body goes out through a regex.
         const duration = Math.round(performance.now() - started);
         logger.info("request", {
           requestId,
@@ -2134,13 +2123,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   }
 
   /** Transport peer for the identity resolver. Honours the caller's
-   * override if set (`options.peer`), else falls back to the
-   * loopback-TCP shape computed from `Server.requestIP`. The local
-   * target binds to 127.0.0.1 so a well-formed request always carries
-   * a loopback peer; a defensive final fallback is the loopback
-   * address string, which the `trusted-proxy` provider would refuse
-   * unless the deployment explicitly allowlists it. */
-  function peerFor(request: Request): AuthRequestPeer {
+   * override if set (`options.peer`), else derives the TCP peer
+   * shape from `Server.requestIP`. Returns `undefined` when neither
+   * is available — the resolver then fails closed with `no-peer`
+   * (401) rather than silently trusting a fabricated address.
+   *
+   * **Why not invent `127.0.0.1`.** `requestIP` is `null` over a
+   * unix-socket listener (Bun has no peer address to report). A
+   * fabricated loopback peer would mean a `trusted-proxy` allowlist
+   * containing `127.0.0.0/8` trusted every socket writer, bypassing
+   * the dispatcher's no-peer refusal entirely (#245 part 1 round 3
+   * blocker 3). Unix-socket peer semantics (SO_PEERCRED, listener-
+   * level trust) are part 2's job — this code's correct answer
+   * today is to refuse. */
+  function peerFor(request: Request): AuthRequestPeer | undefined {
     const custom = options.peer;
     if (custom !== undefined) return custom(request, server);
     try {
@@ -2149,9 +2145,10 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         return { transport: "tcp", address: ip.address };
       }
     } catch {
-      // Fall through to the defensive default.
+      // Fall through — the resolver's no-peer path is the right
+      // answer when the transport cannot name a peer.
     }
-    return { transport: "tcp", address: "127.0.0.1" };
+    return undefined;
   }
 
   /** Short helper that turns an `IdentityResolution` refusal into the
@@ -3872,6 +3869,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (contentType.startsWith("text/html")) {
       return await injectRail(rawResponse, {
         logHead: store.head(),
+        basePath: guardPolicy.basePath,
         onOversize: (bodyBytes: number) => {
           logger.warn("static.rail.skipped-oversize", {
             requestId,
@@ -4012,6 +4010,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     );
     return await injectRail(rawResponse, {
       logHead: store.head(),
+      basePath: guardPolicy.basePath,
       onOversize: (bodyBytes: number) => {
         logger.warn("static.rail.skipped-oversize", {
           requestId: args.requestId,
@@ -4215,6 +4214,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     );
     return await injectRail(rawResponse, {
       logHead: store.head(),
+      basePath: guardPolicy.basePath,
       onOversize: (bodyBytes: number) => {
         logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
       },
@@ -4605,9 +4605,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       logger.warn("api.events-head.rejected.role", { requestId, reason: resolution.reason });
       return respondIdentityRefused(resolution.status);
     }
-    // `actor` is intentionally not used on this GET; the resolution is
-    // what gates access, and the body is just the log head.
-    void resolution.actor;
+    // `resolution.actor` is intentionally not used on this GET; the
+    // resolution is what gates access, and the body is just the log
+    // head. No `void resolution.actor;` is needed here — the type
+    // narrowing on `resolution.kind === "ok"` is enough to satisfy
+    // `@typescript-eslint/no-unused-vars` because we never bind the
+    // actor to a local name.
     return jsonResponse({ head: store.head() });
   }
 
