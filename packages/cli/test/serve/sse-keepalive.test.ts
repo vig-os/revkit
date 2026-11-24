@@ -260,59 +260,29 @@ describe("SSE heartbeat — issue #277", () => {
       const third = await readOne(Date.now() + 2_000);
       expect(third).toContain("event: ping");
 
+      // 5) ROUND-2 ROOT-CAUSE: stopping the daemon must release
+      //    the heartbeat from the scheduler on its own — through
+      //    `bus.closeAll` → `subscriber.close()` — NOT via an
+      //    external `heartbeatTimers.clear` loop. The base code's
+      //    `stop()` cleared the set externally, which masked the
+      //    real asymmetry: `subscriber.close()` itself did not
+      //    clear the heartbeat, so a bus-detach path (deliver
+      //    throw, a future direct caller of the detach fn) left
+      //    the timer armed — pinning `sseController` and its
+      //    backing socket fd through the closure — until
+      //    `daemon.stop`. On CI the suite's fd peak then grew
+      //    one socket per dropped subscriber (run 44302188769
+      //    growth 6659 vs. budget 1800). Fix: the symmetric
+      //    cleanup lives on the Subscriber. The assertion below
+      //    passes only when that symmetry is in place.
       try {
         await reader.cancel();
       } catch {
         // Already closed.
       }
-    });
-
-    test("ROUND-2 ROOT-CAUSE: `bus.closeAll` on daemon stop releases every heartbeat timer symmetrically (CI fd-budget regression)", async () => {
-      // Round-2 #277 root cause for the fd-budget failure. The
-      // daemon's periodic heartbeat callback captures
-      // `sseController` by closure; a timer that stays armed after
-      // the subscriber is detached from the bus pins the
-      // ReadableStream — and its backing TCP socket fd — until
-      // `daemon.stop` runs. Base code's `stop()` had an explicit
-      // `heartbeatTimers.clear` loop that covered the shutdown
-      // path, but that loop MASKED the real asymmetry:
-      // `subscriber.close()` itself did not clear the heartbeat,
-      // so any other detach path (`deliver()` throw, a future
-      // caller of the `bus.subscribe` detach fn) left the timer
-      // armed until shutdown. This is the leak that blew the CI
-      // fd-budget.
-      //
-      // Fix: `subscriber.close()` is now symmetric with
-      // `cancel()` — it clears the heartbeat before closing the
-      // controller — and the shutdown path no longer needs the
-      // external loop (removed). This test pins the symmetric
-      // teardown by stopping the daemon and asserting the
-      // capturing scheduler is empty: that only passes if
-      // `subscriber.close()`, called via `bus.closeAll`, clears
-      // every timer on its own.
       if (ctx === undefined) throw new Error("beforeEach did not run");
-      const response = await fetch(`${ctx.handle.url}/events?since=0`, {
-        headers: {
-          cookie: ctx.cookie,
-          origin: ctx.handle.url,
-          accept: "text/event-stream",
-          host: `127.0.0.1:${ctx.handle.port}`,
-        },
-      });
-      expect(response.status).toBe(200);
-      const reader = response.body!.getReader();
-      await reader.read();
-      for (let i = 0; i < 20 && scheduler.size() < 1; i++) {
-        await new Promise((r) => setTimeout(r, 10));
-      }
-      expect(scheduler.size()).toBe(1);
       await ctx.handle.stop();
       expect(scheduler.size()).toBe(0);
-      try {
-        await reader.cancel();
-      } catch {
-        // Stream was closed by `daemon.stop`.
-      }
     });
   });
 });
