@@ -143,14 +143,18 @@ describe("#279 composable handler under a non-loopback policy", () => {
     });
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/event-stream");
-    // Read the opening keepalive to confirm the stream is live. The
+    // Read the opening heartbeat to confirm the stream is live. The
     // reader is cancelled right away — we only need to know the
-    // handler opened an SSE channel under the host policy.
+    // handler opened an SSE channel under the host policy. Round-2
+    // #277: the daemon now flushes a NAMED `ping` event
+    // (`event: ping\ndata: \n\n`) on `start()` instead of the earlier
+    // `: keepalive` SSE comment, because `EventSource` never surfaces
+    // comment lines to the page.
     const reader = response.body?.getReader();
     expect(reader).toBeDefined();
     const chunk = await reader!.read();
     expect(chunk.done).toBe(false);
-    expect(new TextDecoder().decode(chunk.value)).toMatch(/^: keepalive/);
+    expect(new TextDecoder().decode(chunk.value)).toMatch(/^event: ping/);
     await reader!.cancel();
   });
 
