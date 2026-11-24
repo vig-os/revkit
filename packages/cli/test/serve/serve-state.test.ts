@@ -8,16 +8,26 @@ import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DIST_STAGING_PREFIX,
+  DIST_STAGING_RE,
   acquireAndPublish,
+  cleanupOrphanedStagingDirs,
   daemonLockPath,
   findRunningDaemon,
+  listDistStagingDirs,
+  newDistStagingName,
+  pidIsAlive,
+  promoteStagingDir,
   readOrMintRepoId,
   readServeState,
   readServeStateVerbose,
+  readStartFailure,
   removeServeState,
   repoIdPath,
   serveStatePath,
+  startFailurePath,
   writeServeState,
+  writeStartFailure,
   type ServeState,
 } from "../../src/serve/serve-state.ts";
 import { readFileSync } from "node:fs";
@@ -212,6 +222,38 @@ describe("daemon-lock (raw acquire / release)", () => {
     expect(second).not.toBeNull();
     second?.release();
   });
+
+  test("#251 round 3: the lock fd is always CLOEXEC — a child does not keep the flock alive after parent death", async () => {
+    // Round-3 revert of the inherited-fd mechanism. The lock fd
+    // MUST be CLOEXEC so it never silently outlives its owning
+    // process through an inherited subprocess. We assert both:
+    //   (1) FD_CLOEXEC is set on the fd we got back, and
+    //   (2) a subprocess that inherited our lock fd through
+    //       `Bun.spawn`'s stdio does NOT keep the flock alive
+    //       after the parent exits.
+    const path = daemonLockPath(repoRoot);
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+    const held = acquireDaemonLock(path);
+    expect(held).not.toBeNull();
+    try {
+      // (1) FD_CLOEXEC is on.
+      const { dlopen, FFIType } = require("bun:ffi") as typeof import("bun:ffi");
+      const lib = dlopen(process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6", {
+        fcntl: { args: [FFIType.i32, FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+      });
+      const F_GETFD = 1;
+      const FD_CLOEXEC = 1;
+      const flags = Number(lib.symbols.fcntl(held!.fd, F_GETFD, 0));
+      expect(flags & FD_CLOEXEC).toBe(FD_CLOEXEC);
+    } finally {
+      held?.release();
+    }
+  });
+
+  // The forced Bun.gc() flock-retention test lives in
+  // `forced-gc-lock.test.ts` so it still compiles on the round-2
+  // base (3e4ad4c) where the staging-dir helpers this file
+  // imports did not exist yet (#251 round 5 (e)).
 });
 
 describe("readOrMintRepoId (issue #60 PR #62 round-3)", () => {
@@ -258,5 +300,151 @@ describe("readOrMintRepoId (issue #60 PR #62 round-3)", () => {
     expect(id.length).toBeGreaterThanOrEqual(16);
     // The file has been rewritten with a fresh id.
     expect(readFileSync(path, "utf8").trim()).toBe(id);
+  });
+});
+
+describe("#251 round 3: staging-dir promotion", () => {
+  let repoRoot: string;
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), "revkit-staging-"));
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  test("newDistStagingName composes `dist.staging-<pid>-<nonce>` and strips unsafe chars", () => {
+    const name = newDistStagingName(42, "abc_DEF-0");
+    expect(name).toBe(`${DIST_STAGING_PREFIX}42-abc_DEF-0`);
+    expect(DIST_STAGING_RE.test(name)).toBe(true);
+    // The regex rejects a bogus nonce with slashes / spaces — only
+    // the sanitised shape is written.
+    const sanitised = newDistStagingName(99, "a/b c!");
+    expect(DIST_STAGING_RE.test(sanitised)).toBe(true);
+    expect(sanitised).toContain("abc");
+  });
+
+  test("listDistStagingDirs reports every matching dir under .revkit/", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.mkdirSync(join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-abc`), { recursive: true });
+    fs.mkdirSync(join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}2-def`), { recursive: true });
+    fs.mkdirSync(join(repoRoot, ".revkit", "dist"), { recursive: true });
+    fs.mkdirSync(join(repoRoot, ".revkit", "unrelated"), { recursive: true });
+    const seen = listDistStagingDirs(repoRoot).map((e) => `${e.name}:${e.pid}`).sort();
+    expect(seen).toEqual([`${DIST_STAGING_PREFIX}1-abc:1`, `${DIST_STAGING_PREFIX}2-def:2`]);
+  });
+
+  test("cleanupOrphanedStagingDirs removes dirs whose pid is dead, leaves live ones alone", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    // pid 1 is PID-1 (init), always alive on any POSIX host —
+    // acts as our "live" placeholder (we would not scrub someone
+    // else's staging dir mid-build).
+    const alive = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-alive`);
+    fs.mkdirSync(alive, { recursive: true });
+    // Pick a pid that is almost certainly dead: use a large one.
+    // `process.kill(pid, 0)` returns ESRCH for a gap in the pid
+    // space.
+    let deadPid = 2 ** 20;
+    while (pidIsAlive(deadPid)) deadPid++;
+    const dead = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}${deadPid}-dead`);
+    fs.mkdirSync(dead, { recursive: true });
+    const removed = cleanupOrphanedStagingDirs(repoRoot);
+    expect(removed).toContain(`${DIST_STAGING_PREFIX}${deadPid}-dead`);
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(alive)).toBe(true);
+  });
+
+  test("promoteStagingDir renames staging → dist when dist is absent", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const staging = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-abc`);
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(join(staging, "index.html"), "<h1>staged</h1>");
+    const dist = join(repoRoot, ".revkit", "dist");
+    const outcome = promoteStagingDir(staging, dist);
+    expect(outcome.kind).toBe("promoted");
+    expect(existsSync(staging)).toBe(false);
+    expect(readFileSync(join(dist, "index.html"), "utf8")).toBe("<h1>staged</h1>");
+  });
+
+  test("promoteStagingDir refuses to overwrite an existing dist (kept-existing)", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const staging = join(repoRoot, ".revkit", `${DIST_STAGING_PREFIX}1-abc`);
+    fs.mkdirSync(staging, { recursive: true });
+    fs.writeFileSync(join(staging, "index.html"), "<h1>staged</h1>");
+    const dist = join(repoRoot, ".revkit", "dist");
+    fs.mkdirSync(dist, { recursive: true });
+    fs.writeFileSync(join(dist, "index.html"), "<h1>existing</h1>");
+    const outcome = promoteStagingDir(staging, dist);
+    expect(outcome.kind).toBe("kept-existing");
+    // The existing winner survives untouched.
+    expect(readFileSync(join(dist, "index.html"), "utf8")).toBe("<h1>existing</h1>");
+    // Staging dir is left in place — caller discards it.
+    expect(existsSync(staging)).toBe(true);
+  });
+});
+
+describe("#251 round 3: StartFailureRecord uses an input fingerprint", () => {
+  let repoRoot: string;
+  beforeEach(() => {
+    repoRoot = mkdtempSync(join(tmpdir(), "revkit-start-failure-"));
+    require("node:fs").mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(repoRoot, { recursive: true, force: true });
+  });
+
+  test("writeStartFailure persists the fingerprint; readStartFailure round-trips it", () => {
+    writeStartFailure(repoRoot, {
+      stage: "build-failed",
+      message: "revkit serve: auto-build failed (astro build exited 1)",
+      stderrTail: "SyntaxError in docs/foo.mdx",
+      failedAt: "2026-11-18T12:00:00Z",
+      version: "test-0.1.0",
+      inputs: { fingerprint: "0123456789abcdef" },
+    });
+    const read = readStartFailure(repoRoot);
+    expect(read).toBeDefined();
+    expect(read?.stage).toBe("build-failed");
+    expect(read?.inputs.fingerprint).toBe("0123456789abcdef");
+    expect(read?.stderrTail).toContain("SyntaxError");
+  });
+
+  test("readStartFailure refuses legacy records that only carry distExists (#251 round-3 BLOCKER 2 (d))", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    // The pre-fix shape had `inputs.distExists` and no
+    // `fingerprint`. The round-3 schema refuses it (returns
+    // undefined) so a legacy record from a crash never blocks a
+    // new MCP auto-spawn forever.
+    fs.writeFileSync(
+      startFailurePath(repoRoot),
+      JSON.stringify({
+        stage: "build-failed",
+        message: "legacy",
+        failedAt: "2026-11-01T12:00:00Z",
+        version: "0.0.0",
+        inputs: { distExists: false },
+      }),
+      "utf8",
+    );
+    expect(readStartFailure(repoRoot)).toBeUndefined();
+  });
+
+  test('readStartFailure rejects stage "aborted" — round-3 removes that case entirely', () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    fs.writeFileSync(
+      startFailurePath(repoRoot),
+      JSON.stringify({
+        stage: "aborted",
+        message: "signal",
+        failedAt: "2026-11-01T12:00:00Z",
+        version: "0.0.0",
+        inputs: { fingerprint: "deadbeef" },
+      }),
+      "utf8",
+    );
+    // After round 3, `stage: "aborted"` is never written; the
+    // reader also refuses it so an operator who edits in the old
+    // literal cannot silently wedge MCP.
+    expect(readStartFailure(repoRoot)).toBeUndefined();
   });
 });

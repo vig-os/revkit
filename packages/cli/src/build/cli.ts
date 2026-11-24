@@ -19,6 +19,13 @@ export interface RunBuildResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  /** True when the astro child was terminated by a signal (an
+   * internal abort propagated through our AbortController, OR an
+   * external SIGKILL such as the host oom-killer) rather than
+   * exiting with a build diagnostic of its own. `revkit serve` uses
+   * this flag to decide NOT to persist `.revkit/start-failed.json`
+   * for a non-fault interruption (#251 round 5 (b)). */
+  readonly signalTerminated?: boolean;
 }
 
 /** Env `runBuildCommand` needs. */
@@ -26,6 +33,18 @@ export interface RunBuildEnv {
   readonly cwd: string;
   readonly version: string;
   readonly repoSlug: string;
+  /** AbortSignal threaded into `runPackagedBuild` so the astro
+   * child is killed on cancellation (#251 B1). `revkit serve`
+   * aborts this on SIGINT / SIGTERM; `revkit build` on its own
+   * leaves it unset. */
+  readonly signal?: AbortSignal;
+  /** Optional override for the astro output directory (#251 round
+   * 3). `revkit serve` passes a `.revkit/dist.staging-*` path so
+   * the cold build writes to a private staging dir, which serve
+   * atomically promotes to `.revkit/dist` after `check-dist`
+   * passes. Standalone `revkit build` leaves it unset and writes
+   * to the default `defaultConsumerDist` directly. */
+  readonly distOutDir?: string;
 }
 
 /** Parse args: `--dir <consumer-root>`, `--out <dist-dir>`,
@@ -118,7 +137,9 @@ export async function runBuildCommand(
   const distOutDir =
     parsed.parsed.out !== undefined
       ? resolvePath(env.cwd, parsed.parsed.out)
-      : defaultConsumerDist(consumerRoot);
+      : env.distOutDir !== undefined
+        ? env.distOutDir
+        : defaultConsumerDist(consumerRoot);
 
   const stdoutLines: string[] = [];
   stdoutLines.push(`revkit build: consumer=${prettyPath(env.cwd, consumerRoot)}`);
@@ -181,12 +202,23 @@ export async function runBuildCommand(
         consumerRoot,
         distOutDir,
         renderGuardManifestPath: renderGuardManifest,
+        ...(env.signal !== undefined ? { signal: env.signal } : {}),
       });
     } catch (error) {
+      const message = (error as Error).message;
+      // #251 round 5 (b): distinguish "astro failed" from "astro was
+      // killed". `spawnAstroBuild` marks the latter with explicit
+      // "aborted by signal" / "terminated by signal" prefixes; both
+      // propagate back to `revkit serve` as `signalTerminated: true`,
+      // which skips the `.revkit/start-failed.json` write.
+      const signalTerminated =
+        message.includes("aborted by signal") ||
+        message.includes("terminated by signal");
       return {
         exitCode: 1,
         stdout: stdoutLines.join("\n") + "\n",
-        stderr: `revkit build: astro build failed: ${(error as Error).message}\n`,
+        stderr: `revkit build: astro build failed: ${message}\n`,
+        ...(signalTerminated ? { signalTerminated: true } : {}),
       };
     }
     stdoutLines.push(`revkit build: astro ok — packaged site ${prettyPath(env.cwd, result.packagedSiteDir)}`);

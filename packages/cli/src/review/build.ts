@@ -71,13 +71,33 @@ export interface SpawnResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+  /** When the child was killed by a signal (OOM, oom-killer, admin
+   * `kill`), bun exposes it as a non-null `signalCode` on the
+   * Subprocess. Captured here so `spawnAstroBuild` can distinguish
+   * "astro failed" from "astro was killed before it could fail"
+   * (#251 round 5 (b)). */
+  readonly signalCode?: string | null;
 }
 
-/** Injectable spawner shape. Tests provide a stub. */
+/** Injectable spawner shape. Tests provide a stub.
+ *
+ * `signal` (#251 B1) is an optional AbortSignal that must kill the
+ * spawned child when aborted. `spawnAstroBuild` passes it through
+ * so `revkit serve` can abort an in-flight auto-build on SIGINT /
+ * SIGTERM without orphaning the astro child.
+ *
+ * The default spawner runs the child in its own process GROUP
+ * (via `detached: true`) and, on abort, sends SIGTERM to the whole
+ * group, then escalates to SIGKILL after `SIGKILL_GRACE_MS` so a
+ * child that catches SIGTERM (astro installs its own handler)
+ * cannot wedge serve on exit. Implementations should preserve
+ * this contract — either reuse the default, or send SIGTERM then
+ * SIGKILL to `-child.pid` from an `abort` listener. */
 export type SpawnLike = (options: {
   readonly cmd: readonly string[];
   readonly cwd: string;
   readonly env: Readonly<Record<string, string>>;
+  readonly signal?: AbortSignal;
 }) => Promise<SpawnResult>;
 
 /** The env-var allowlist. Anything not on this list is REMOVED from
@@ -198,6 +218,14 @@ export interface SpawnAstroBuildOptions {
   readonly extraEnv?: Readonly<Record<string, string>>;
   /** Injectable spawner. Defaults to `Bun.spawn`. */
   readonly spawn?: SpawnLike;
+  /** AbortSignal that kills the astro child when aborted (#251 B1).
+   * `revkit serve` installs SIGINT / SIGTERM handlers around its
+   * cold-start auto-build and aborts this signal on any signal so
+   * the child dies with the parent instead of continuing orphaned.
+   * The default spawner also propagates the kill to the child's
+   * whole process group, so nested vite / node sub-processes die
+   * with astro. */
+  readonly signal?: AbortSignal;
 }
 
 /** Low-level: spawn astro build with the trusted-binary + minimal-env
@@ -246,8 +274,39 @@ export async function spawnAstroBuild(options: SpawnAstroBuildOptions): Promise<
     ];
 
     const spawn = options.spawn ?? defaultSpawn;
-    const result = await spawn({ cmd, cwd, env });
+    const result = await spawn({
+      cmd,
+      cwd,
+      env,
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    });
     if (result.exitCode !== 0) {
+      // Abort → exit 143 (SIGTERM) or similar; the caller
+      // (serve/cli.ts) already knows why, so re-raise a tagged
+      // error rather than confusing the operator with a tail of
+      // vite's "killed" noise.
+      if (options.signal?.aborted === true) {
+        throw new Error("astro build aborted by signal");
+      }
+      // #251 round 5 (b): an EXTERNAL signal termination (oom-killer
+      // SIGKILL, an admin `kill -9`, a parent process group kill
+      // that reached us from outside revkit) is NOT a genuine build
+      // failure — astro never got to write a diagnostic. Bun exposes
+      // this as a non-null `signalCode` on the Subprocess; we fall
+      // back to an `exitCode >= 128` check for runtimes where the
+      // code is `128 + signo` instead. The caller (`runBuildCommand`
+      // → `runServeCommand`) uses the thrown-message marker to skip
+      // writing `.revkit/start-failed.json`.
+      if (
+        (result.signalCode != null && result.signalCode !== "") ||
+        result.exitCode >= 128
+      ) {
+        const label =
+          result.signalCode != null && result.signalCode !== ""
+            ? result.signalCode
+            : `exit ${result.exitCode}`;
+        throw new Error(`astro build terminated by signal (${label})`);
+      }
       const tail = result.stderr.slice(-4096);
       throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
     }
@@ -400,19 +459,96 @@ export function unlinkStale(target: string): void {
   }
 }
 
-const defaultSpawn: SpawnLike = async ({ cmd, cwd, env }) => {
+/** How long (ms) the default spawner waits for a child's process
+ * group to exit on SIGTERM before escalating to SIGKILL (#251
+ * round 4 BLOCKER 3). Astro installs its own SIGTERM handler that
+ * runs an orderly-shutdown path; a real run observed it holding
+ * the daemon lock for 131 s after the parent sent SIGTERM. The
+ * escalation bounds `revkit serve`'s exit at `SIGKILL_GRACE_MS +
+ * the time to deliver SIGKILL + the time bun reaps the child`,
+ * which is well under the 10 s bootstrap deadline MCP uses.
+ *
+ * 5 s is enough for a well-behaved astro to flush its vite /
+ * esbuild workers and exit cleanly (observed under a second when
+ * astro's own handler doesn't catch), but short enough that a
+ * stuck handler cannot wedge the whole system. */
+export const SIGKILL_GRACE_MS = 5_000;
+
+/** The default `SpawnLike` implementation. Exported so a test of
+ * the SIGTERM → SIGKILL escalation drives the production path, not
+ * a half-reimplementation of it (#251 round 4 test 3). */
+export const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
+  // The child runs in its OWN process group (`detached: true`), so
+  // an abort can kill the whole group — astro, vite, every
+  // chain-spawned node. Without the group kill, `child.kill()`
+  // reaches only the direct astro child and leaves its vite worker
+  // alive, which was the orphaning path the inherited-fd fix
+  // tried to compensate for (#251 round 2 → round 3 revert).
   const proc = Bun.spawn(cmd as string[], {
     cwd,
     env: env as Record<string, string>,
-    stdout: "pipe",
-    stderr: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
+    // New session + pgid. On POSIX this is `setsid(2)` inside
+    // Bun's spawn: the child becomes a process-group leader.
+    detached: true,
   });
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  const exitCode = await proc.exited;
-  return { stdout, stderr, exitCode };
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const sendToGroup = (sig: NodeJS.Signals): void => {
+    // Kill the WHOLE group (negative pid). Falls back to killing
+    // just the child when the group kill is refused (ESRCH after
+    // normal exit; EPERM if Bun ever reparents).
+    try {
+      process.kill(-proc.pid, sig);
+    } catch {
+      try {
+        proc.kill(sig);
+      } catch {
+        /* already dead */
+      }
+    }
+  };
+  const onAbort = (): void => {
+    sendToGroup("SIGTERM");
+    // #251 round 4 BLOCKER 3: escalate to SIGKILL if SIGTERM is
+    // caught (astro installs its own SIGTERM handler). `exited`
+    // resolves on reap, and the `.then` below clears the timer on
+    // a cooperative exit.
+    killTimer = setTimeout(() => sendToGroup("SIGKILL"), SIGKILL_GRACE_MS);
+  };
+  if (signal !== undefined) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  // Clear the escalation timer the instant the child is reaped,
+  // whether it exited cooperatively or we killed it.
+  void proc.exited.then(() => {
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
+  });
+  try {
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    const exitCode = await proc.exited;
+    // Bun exposes the terminating signal (if any) as `signalCode`
+    // once the Subprocess has been reaped — null when the child
+    // exited cooperatively, a string like "SIGKILL" when it was
+    // killed. The cast is defensive: a future Bun that removes the
+    // field falls back to the `exitCode >= 128` check in
+    // `spawnAstroBuild` (#251 round 5 (b)).
+    const signalCode =
+      (proc as unknown as { signalCode?: string | null }).signalCode ?? null;
+    return { stdout, stderr, exitCode, signalCode };
+  } finally {
+    if (signal !== undefined) signal.removeEventListener("abort", onAbort);
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
+  }
 };
 
 /** Compute the default `distOutDir` for a materialised root — the

@@ -28,7 +28,7 @@ import {
   filteredDaemonEnv,
   verifyDaemonInstance,
 } from "../../src/mcp/daemon-bootstrap.ts";
-import type { ServeState } from "../../src/serve/serve-state.ts";
+import type { ServeState, StartFailureRecord } from "../../src/serve/serve-state.ts";
 
 /** One state fixture — the shape `findRunningDaemon` returns to the
  * bootstrap. `instanceId` is optional on the wire; every fixture
@@ -295,6 +295,549 @@ describe("daemon-bootstrap", () => {
       expect((error as Error).message).toContain("daemon.lock");
     }
     expect(threw).toBe(true);
+  });
+});
+
+describe("ensureDaemon — #251 starting-state lifecycle", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "revkit-boot-starting-"));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Shape of a "starting" record published pre-bind by
+   * `acquireStartingLock` (serve/cli.ts #251): the lock is held, pid
+   * is real, but the URL/token/port are placeholders because the
+   * HTTP server has not bound yet. */
+  function startingFixture(overrides: Partial<ServeState> = {}): ServeState {
+    return {
+      pid: process.pid,
+      port: 0,
+      url: "",
+      agentToken: "",
+      startedAt: new Date().toISOString(),
+      version: "0.0.0-test",
+      instanceId: "starting-" + "x".repeat(20),
+      status: "starting",
+      ...overrides,
+    };
+  }
+
+  test("#251: a starting daemon is WAITED on — ensureDaemon does NOT spawn another", async () => {
+    // This is the direct repro: a cold-start `revkit serve` is in
+    // the pre-bind window (lock held, status="starting"). A
+    // concurrent `ensureDaemon` (the first tool call from `revkit
+    // mcp`) must wait on the readiness transition, NEVER spawn a
+    // second daemon. BEFORE the fix, `findRunningDaemon` returned
+    // undefined for a "starting" record (empty url) and
+    // `ensureDaemon` spawned a second `revkit serve` that raced
+    // into the build.
+    const starting = startingFixture({ instanceId: "starting-1" });
+    const ready = fixtureState({ instanceId: "ready-1" });
+    let findCalls = 0;
+    let spawnCount = 0;
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => {
+        findCalls++;
+        // Starting for the first 3 probes (simulating a slow
+        // auto-build); then ready.
+        return findCalls <= 3 ? starting : ready;
+      },
+      spawn: () => {
+        spawnCount++;
+        return { pid: 999 };
+      },
+      sleep: async () => {},
+      pollIntervalMs: 5,
+      waitMs: 60_000,
+      startingReadyMs: 60_000,
+    });
+    expect(spawnCount).toBe(0);
+    expect(result.spawned).toBe(false);
+    expect(result.state.instanceId).toBe("ready-1");
+  });
+
+  test("#251: a spawned daemon that advertises 'starting' is waited on (ONE spawn, no second)", async () => {
+    // Variant: no daemon on first probe → ensureDaemon spawns.
+    // The spawn's "revkit serve" takes the lock and writes a
+    // starting record. The subsequent polls see "starting" then
+    // "ready". There must be EXACTLY ONE spawn, even though the
+    // starting window spans several polls.
+    const starting = startingFixture({ instanceId: "starting-2" });
+    const ready = fixtureState({ instanceId: "ready-2" });
+    let findCalls = 0;
+    let spawnCount = 0;
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => {
+        findCalls++;
+        if (findCalls === 1) return undefined; // initial probe
+        if (findCalls <= 4) return starting; // during pre-bind
+        return ready; // after bind
+      },
+      spawn: () => {
+        spawnCount++;
+        return { pid: 4242 };
+      },
+      sleep: async () => {},
+      pollIntervalMs: 5,
+      waitMs: 10_000,
+      startingReadyMs: 60_000,
+    });
+    expect(spawnCount).toBe(1);
+    expect(result.spawned).toBe(true);
+    expect(result.state.instanceId).toBe("ready-2");
+  });
+
+  test("#251: a daemon that dies while starting is reported promptly (lock released)", async () => {
+    // A starting daemon crashes before it can bind. The lock is
+    // released on process exit; the next poll returns undefined.
+    // `ensureDaemon` must fail PROMPTLY with a diagnostic naming
+    // the dead pid — NOT after `startingReadyMs` of sleeping.
+    const starting = startingFixture({ pid: 31337, instanceId: "starting-3" });
+    let findCalls = 0;
+    const spawnCount = { n: 0 };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => {
+          findCalls++;
+          // First probe: starting daemon visible.
+          // Subsequent probes: lock released (daemon died).
+          return findCalls === 1 ? starting : undefined;
+        },
+        spawn: () => {
+          spawnCount.n++;
+          return { pid: 999 };
+        },
+        sleep: async () => {},
+        pollIntervalMs: 5,
+        waitMs: 60_000,
+        startingReadyMs: 60_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.message ?? "").toContain("died while starting");
+    expect(threw?.message ?? "").toContain("31337");
+    // The MCP side NEVER tries to spawn on top of a live lock —
+    // detection + propagation only; the CALLER (channel server's
+    // reconnect loop) decides whether to retry.
+    expect(spawnCount.n).toBe(0);
+  });
+
+  test("#251: a starting daemon that never reaches ready is surfaced as 'building, N s elapsed'", async () => {
+    // When `startingReadyMs` passes with the daemon still
+    // "starting", `ensureDaemon` throws a diagnostic the agent can
+    // retry. No widened timeout, no sleeping past the deadline:
+    // the deadline is a bounded wait on the readiness signal, not
+    // a blind guess.
+    const starting = startingFixture({ pid: 9999, instanceId: "starting-4" });
+    let now = 0;
+    const clock = (): number => now;
+    const sleep = async (ms: number): Promise<void> => {
+      now += ms;
+    };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => starting, // forever "starting"
+        spawn: () => ({ pid: 999 }),
+        sleep,
+        nowMs: clock,
+        pollIntervalMs: 50,
+        waitMs: 1_000,
+        startingReadyMs: 2_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.message ?? "").toContain("still starting");
+    expect(threw?.message ?? "").toContain("building");
+    expect(threw?.message ?? "").toContain("9999");
+  });
+
+  test("#251: concurrent ensureDaemon calls on a REAL shared filesystem elect ONE daemon", async () => {
+    // End-to-end race test: two concurrent `ensureDaemon` callers
+    // on the SAME repoRoot, using the REAL `acquireStartingLock`
+    // for the simulated daemons. Even when both callers probe
+    // "no daemon" at the same instant, only one spawned daemon
+    // can take `.revkit/daemon.lock` — the other must fail to
+    // acquire, and both callers converge on the same winner.
+    const { acquireStartingLock } = await import("../../src/serve/serve-state.ts");
+    const winnerStates: Array<{ status?: string }> = [];
+    let acquireAttempts = 0;
+    let acquireWins = 0;
+    const simulateServeSpawn = (): { pid: number } => {
+      acquireAttempts++;
+      const acquired = acquireStartingLock(root, {
+        pid: process.pid,
+        version: "0.0.0-test",
+        startedAt: new Date().toISOString(),
+        instanceId: `starting-race-${acquireAttempts}`,
+      });
+      if (acquired.kind === "already-running") {
+        return { pid: -1 };
+      }
+      acquireWins++;
+      // Simulate build + bind: publish ready after some sleeps,
+      // then release the lock. We leave the state on disk so
+      // ensureDaemon returns it; it will be released in the test's
+      // afterEach cleanup (rmSync of root).
+      setTimeout(() => {
+        acquired.publishReady({
+          pid: process.pid,
+          port: 54321,
+          url: "http://127.0.0.1:54321",
+          agentToken: "race-token",
+          startedAt: new Date().toISOString(),
+          version: "0.0.0-test",
+          instanceId: `ready-race-${acquireAttempts}`,
+        });
+      }, 20);
+      return { pid: 1234 };
+    };
+    // Both callers share the real `findRunningOrStartingDaemon`
+    // (no `findRunningDaemon` override), so they see the real lock
+    // state on disk. `spawn` simulates `revkit serve` taking the
+    // lock in-process — the second concurrent spawn will be
+    // refused because the first already holds it.
+    const bootstrapA = ensureDaemon({
+      repoRoot: root,
+      spawn: simulateServeSpawn,
+      pollIntervalMs: 5,
+      waitMs: 1_000,
+      startingReadyMs: 1_000,
+    });
+    const bootstrapB = ensureDaemon({
+      repoRoot: root,
+      spawn: simulateServeSpawn,
+      pollIntervalMs: 5,
+      waitMs: 1_000,
+      startingReadyMs: 1_000,
+    });
+    const [resultA, resultB] = await Promise.all([bootstrapA, bootstrapB]);
+    winnerStates.push(resultA.state, resultB.state);
+    // EXACTLY ONE daemon acquired the lock and published "ready".
+    // Both callers converge on the same winner (either both
+    // `spawned: true` from the same spawn — conceivable if their
+    // `undefined` probes raced and both spawned, but only one
+    // won the lock — or one spawned and one waited).
+    expect(acquireWins).toBe(1);
+    expect(resultA.state.instanceId).toBe(resultB.state.instanceId);
+    // Both results show a READY state: status is either absent
+    // (legacy wire-shape, treated as ready) or "ready"; never
+    // "starting", which is the pre-bind window ensureDaemon waits on.
+    expect(resultA.state.status === "starting").toBe(false);
+    expect(resultB.state.status === "starting").toBe(false);
+  }, 10_000);
+});
+
+describe("ensureDaemon — #251 B2 (prompt building diagnostic) & N1 (persisted start failure)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "revkit-boot-b2-"));
+    mkdirSync(join(root, ".revkit"), { recursive: true });
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A "starting" record whose `startedAt` is `elapsedS` seconds
+   * before `now`, so the diagnostic reports a specific elapsed. */
+  function startingAt(now: number, elapsedS: number, overrides: Partial<ServeState> = {}): ServeState {
+    return {
+      pid: 4242,
+      port: 0,
+      url: "",
+      agentToken: "",
+      startedAt: new Date(now - elapsedS * 1000).toISOString(),
+      version: "0.0.0-test",
+      instanceId: "starting-b2",
+      status: "starting",
+      ...overrides,
+    };
+  }
+
+  test("#251 B2: onStartingDaemon='diagnose' throws DaemonBuildingError IMMEDIATELY (no wait)", async () => {
+    // Fake clock lets us assert zero sleep calls — the point of
+    // the diagnose mode is that the tool-call deadline never
+    // races the startingReadyMs wait.
+    let now = 1_700_000_000_000;
+    const clock = (): number => now;
+    let sleepCalls = 0;
+    const sleep = async (ms: number): Promise<void> => {
+      sleepCalls++;
+      now += ms;
+    };
+    const starting = startingAt(now, 73, { pid: 31337 });
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => starting,
+        // Pretend the fixture pid is alive so the diagnostic
+        // reports it (the round-3 nit's dead-pid branch has its
+        // own test below).
+        isPidAlive: () => true,
+        spawn: () => ({ pid: -1 }),
+        sleep,
+        nowMs: clock,
+        onStartingDaemon: "diagnose",
+        startingReadyMs: 60_000, // would race the tool deadline in "wait" mode
+        waitMs: 60_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.name).toBe("DaemonBuildingError");
+    expect(threw?.message).toContain("31337");
+    // Elapsed MUST be computed from startedAt, not from the
+    // waiter's start (which would be 0 s). 73 s is the fixture.
+    expect(threw?.message).toContain("73 s elapsed");
+    // No sleeps — we did not race the deadline.
+    expect(sleepCalls).toBe(0);
+  });
+
+  test("#251 B2: onStartingDaemon='wait' (default) keeps the pre-#251-B2 behaviour", async () => {
+    // Baseline check: in "wait" mode we still block on readiness
+    // so the background reconnect loop converges once the daemon
+    // is ready. Tool calls use "diagnose" instead.
+    let now = 0;
+    let findCalls = 0;
+    const starting = startingAt(now, 5, { instanceId: "starting-wait" });
+    const ready = fixtureState({ instanceId: "ready-wait" });
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: () => (findCalls++ < 2 ? starting : ready),
+      spawn: () => ({ pid: -1 }),
+      sleep: async (ms) => {
+        now += ms;
+      },
+      nowMs: () => now,
+      startingReadyMs: 10_000,
+      waitMs: 10_000,
+      // onStartingDaemon default = "wait"
+    });
+    expect(result.state.instanceId).toBe("ready-wait");
+  });
+
+  test("#251 N1 (round 3): a persisted start failure surfaces DaemonStartFailedError without re-spawning when the fingerprint matches", async () => {
+    // A failure record whose fingerprint matches what we compute
+    // now. The bootstrap must NOT try to spawn — every retry
+    // would fail the same way.
+    let spawnCount = 0;
+    const failure: StartFailureRecord = {
+      stage: "build-failed",
+      message: "revkit serve: auto-build failed",
+      stderrTail: "SyntaxError in docs/foo.mdx line 42",
+      failedAt: new Date().toISOString(),
+      version: "0.0.0-test",
+      inputs: { fingerprint: "same-fp" },
+    };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => undefined, // no live daemon
+        readStartFailure: () => failure,
+        clearStartFailure: () => {},
+        computeInputFingerprint: () => "same-fp",
+        spawn: () => {
+          spawnCount++;
+          return { pid: 999 };
+        },
+        sleep: async () => {},
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.name).toBe("DaemonStartFailedError");
+    expect(threw?.message).toContain("auto-build failed");
+    expect(threw?.message).toContain("SyntaxError");
+    expect(spawnCount).toBe(0);
+  });
+
+  test("#251 N1 (round 3): a changed fingerprint clears the stale record and bootstrap proceeds", async () => {
+    // Pre-fix: the only key was `distExists`, so a user who
+    // fixed the broken content without running `revkit build`
+    // first could never lift the suppression — every tool call
+    // kept returning the stale error. Round-3 compares a
+    // content-aware fingerprint, so any edit under
+    // docs/vocab/plots invalidates the record.
+    const failure: StartFailureRecord = {
+      stage: "build-failed",
+      message: "revkit serve: auto-build failed",
+      failedAt: new Date().toISOString(),
+      version: "0.0.0-test",
+      inputs: { fingerprint: "fp-at-failure" },
+    };
+    let clearCalled = 0;
+    let spawnCount = 0;
+    const ready = fixtureState({ instanceId: "ready-n1-stale" });
+    const result = await ensureDaemon({
+      repoRoot: root,
+      findRunningDaemon: (() => {
+        let n = 0;
+        return () => (n++ === 0 ? undefined : ready);
+      })(),
+      readStartFailure: () => failure,
+      clearStartFailure: () => {
+        clearCalled++;
+      },
+      computeInputFingerprint: () => "fp-NEW-user-edited-content",
+      spawn: () => {
+        spawnCount++;
+        return { pid: 777 };
+      },
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      waitMs: 100,
+    });
+    expect(clearCalled).toBe(1);
+    expect(spawnCount).toBe(1);
+    expect(result.spawned).toBe(true);
+    expect(result.state.instanceId).toBe("ready-n1-stale");
+  });
+
+  test(
+    "#251 round 4 BLOCKER 1: fixing or deleting a broken file OUTSIDE docs/ clears the suppression on the next ensureDaemon",
+    async () => {
+      // Repro of the architect's probe: pre-fix, `revkit build`
+      // checks the whole consumer tree, so a bad
+      // `components/Widget.tsx` fails the build and
+      // `revkit serve` records a start failure. But the recorded
+      // fingerprint only covered docs/vocab/plots/package.json,
+      // so DELETING the broken file left the hash unchanged and
+      // MCP kept suppressing every retry. Round 4 widens the
+      // fingerprint to the whole repo-root listing.
+      const failure: StartFailureRecord = {
+        stage: "build-failed",
+        message: "revkit serve: astro build exited 1 (components/Widget.tsx broken)",
+        failedAt: new Date().toISOString(),
+        version: "0.0.0-test",
+        inputs: { fingerprint: "fp-with-widget" },
+      };
+      const ready = fixtureState({ instanceId: "ready-fp-fixed" });
+      // `computeInputFingerprint` reports a DIFFERENT hash now
+      // (the broken file was fixed/deleted on disk). This is the
+      // mutation under test — pre-fix, the function returned
+      // "fp-with-widget" because it ignored components/, so
+      // ensureDaemon would throw DaemonStartFailedError and never
+      // reach the spawn below.
+      let clearCalled = 0;
+      let spawnCount = 0;
+      const result = await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: (() => {
+          let n = 0;
+          return () => (n++ === 0 ? undefined : ready);
+        })(),
+        readStartFailure: () => failure,
+        clearStartFailure: () => {
+          clearCalled++;
+        },
+        computeInputFingerprint: () => "fp-AFTER-widget-fixed",
+        spawn: () => {
+          spawnCount++;
+          return { pid: 555 };
+        },
+        sleep: async () => {},
+        pollIntervalMs: 1,
+        waitMs: 100,
+      });
+      expect(clearCalled).toBe(1);
+      expect(spawnCount).toBe(1);
+      expect(result.spawned).toBe(true);
+      expect(result.state.instanceId).toBe("ready-fp-fixed");
+    },
+  );
+
+  test(
+    "#251 round 4 BLOCKER 1 test 4: a revkit version change invalidates the suppression",
+    async () => {
+      // The record was written by an older revkit; the current
+      // CLI's fingerprint mixes the NEW version into the hash so
+      // the comparison fails and MCP respawns under the new CLI.
+      const failure: StartFailureRecord = {
+        stage: "build-failed",
+        message: "revkit serve: auto-build failed under previous version",
+        failedAt: new Date().toISOString(),
+        version: "0.0.0-prior",
+        inputs: { fingerprint: "fp-under-version-prior" },
+      };
+      const ready = fixtureState({ instanceId: "ready-version-upgrade" });
+      let clearCalled = 0;
+      const result = await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: (() => {
+          let n = 0;
+          return () => (n++ === 0 ? undefined : ready);
+        })(),
+        readStartFailure: () => failure,
+        clearStartFailure: () => {
+          clearCalled++;
+        },
+        computeInputFingerprint: () => "fp-under-version-NEW",
+        spawn: () => ({ pid: 777 }),
+        sleep: async () => {},
+        pollIntervalMs: 1,
+        waitMs: 100,
+      });
+      expect(clearCalled).toBe(1);
+      expect(result.spawned).toBe(true);
+    },
+  );
+
+  test("#251 round-3 nit: DaemonBuildingError omits the pid when the recorded serve process is dead", async () => {
+    // The pre-revert path named the serve pid even after it was
+    // SIGKILLed (the astro child kept the lock alive through the
+    // inherited fd). After the revert the lock is released on
+    // serve death, but a mid-race read can still land in the
+    // "starting" branch. Suppressing a dead pid keeps the agent
+    // diagnostic honest.
+    let now = 1_700_000_000_000;
+    const starting: ServeState = {
+      pid: 31337,
+      port: 0,
+      url: "",
+      agentToken: "",
+      startedAt: new Date(now - 42_000).toISOString(),
+      version: "0.0.0-test",
+      instanceId: "starting-nit",
+      status: "starting",
+    };
+    let threw: Error | undefined;
+    try {
+      await ensureDaemon({
+        repoRoot: root,
+        findRunningDaemon: () => starting,
+        isPidAlive: () => false, // the recorded pid is dead
+        spawn: () => ({ pid: -1 }),
+        sleep: async () => {},
+        nowMs: () => now,
+        onStartingDaemon: "diagnose",
+        startingReadyMs: 60_000,
+        waitMs: 60_000,
+      });
+    } catch (error) {
+      threw = error as Error;
+    }
+    expect(threw).toBeDefined();
+    expect(threw?.name).toBe("DaemonBuildingError");
+    // pid 31337 MUST NOT appear in the message.
+    expect(threw?.message).not.toContain("31337");
+    expect(threw?.message).toContain("42 s elapsed");
   });
 });
 

@@ -102,7 +102,12 @@ import {
 import { buildAskPageBundle } from "../ask-page/bundle.ts";
 import { writeAskFile } from "./asks-file.ts";
 import { defaultSink, makeLogger, type LineSink } from "./logger.ts";
-import { acquireAndPublish, ensureRevkitDir, type ServeState } from "./serve-state.ts";
+import {
+  acquireAndPublish,
+  ensureRevkitDir,
+  type AcquiredStartingDaemon,
+  type ServeState,
+} from "./serve-state.ts";
 import { SqliteThreadStore } from "./sqlite-store.ts";
 import {
   answerAskRequestSchema,
@@ -249,6 +254,24 @@ export interface StartDaemonOptions {
    * in the pending review skip the adapter call when the poster
    * is the agent. */
   readonly reviewMode?: ReviewModeOptions;
+  /** Pre-acquired daemon-lock handle (#251). Set by `serve/cli.ts`
+   * when it takes the lock BEFORE the cold-start auto-build so a
+   * concurrent `ensureDaemon` can wait on the "starting" record
+   * instead of spawning another daemon. When present, `startDaemon`
+   * uses this handle (and the same `instanceId`) instead of calling
+   * `acquireAndPublish` itself. When absent (tests, programmatic
+   * callers), `startDaemon` acquires the lock internally — the
+   * pre-#251 behaviour. */
+  readonly acquired?: AcquiredStartingDaemon;
+  /** Required with `acquired`: the per-start opaque id the caller
+   * passed to `acquireStartingLock`. `startDaemon` reuses it on the
+   * bound state so the lifecycle is one coherent story on disk. */
+  readonly acquiredInstanceId?: string;
+  /** Required with `acquired`: the ISO-8601 timestamp the caller
+   * passed to `acquireStartingLock`. The "startedAt" record field
+   * should reflect when the daemon began starting — including the
+   * pre-bind auto-build — not when it finally bound. */
+  readonly acquiredStartedAt?: string;
 }
 
 /** A handle on a running daemon. `stop()` is idempotent and removes
@@ -272,6 +295,15 @@ export interface DaemonHandle {
     watchedDirs(): number;
   };
   stop(): Promise<void>;
+}
+
+/** Shape of the acquire-handle `startDaemon` uses internally
+ * (#251). Both the pre-acquired `AcquiredStartingDaemon` path and
+ * the legacy `acquireAndPublish` path reduce to this: `repoId` for
+ * `/-/health` and `release()` for ownership-checked shutdown. */
+interface AcquiredDaemonLike {
+  readonly repoId: string;
+  release(): void;
 }
 
 /** Data attached to each WebSocket connection: which subscriber the
@@ -917,16 +949,24 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
 
   // Per-start opaque id, echoed by `GET /-/health` so a client can
   // confirm the port answers as THIS daemon, and required by
-  // `serve.json`'s ownership check on shutdown.
-  const instanceId = mintToken();
+  // `serve.json`'s ownership check on shutdown. When the caller
+  // pre-acquired the lock (#251), reuse the id they opened the
+  // "starting" record with so the lifecycle stays one story.
+  const instanceId = options.acquired !== undefined
+    ? (options.acquiredInstanceId ?? mintToken())
+    : mintToken();
+  const startedAt = options.acquired !== undefined
+    ? (options.acquiredStartedAt ?? new Date().toISOString())
+    : new Date().toISOString();
   const state: ServeState = {
     pid: process.pid,
     port,
     url: boundUrl,
     agentToken,
-    startedAt: new Date().toISOString(),
+    startedAt,
     version: options.version,
     instanceId,
+    status: "ready",
   };
   // `acquireAndPublish` (serve-state.ts) tries to take the OS-held
   // lock on `.revkit/daemon.lock` and, on success, read-or-mints
@@ -942,19 +982,35 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // overlapping starts can both win, so the loser's id can end up on
   // disk while the winner advertises a different one. Under the lock
   // exactly one process writes it.
-  const publish = acquireAndPublish(options.repoRoot, state);
-  if (publish.kind === "already-running") {
-    server.stop(true);
-    store.close();
-    staticServer.close();
-    const existing = publish.state;
-    const where = existing !== undefined
-      ? `pid ${existing.pid}, ${existing.url}`
-      : "no advertisement on disk";
-    throw new Error(
-      `revkit serve: another daemon holds .revkit/daemon.lock (${where}). ` +
-        `Stop it, then retry.`,
-    );
+  //
+  // #251 variant: when `options.acquired` is set, the caller (serve
+  // CLI) already took the lock BEFORE the pre-bind auto-build and
+  // published the "starting" record. We just swap in the bound
+  // state via `publishReady`. On shutdown we use the caller-owned
+  // `release()` (same ownership-checked unlink).
+  let publish: AcquiredDaemonLike;
+  if (options.acquired !== undefined) {
+    options.acquired.publishReady(state);
+    publish = {
+      repoId: options.acquired.repoId,
+      release: () => options.acquired?.release(),
+    };
+  } else {
+    const acquired = acquireAndPublish(options.repoRoot, state);
+    if (acquired.kind === "already-running") {
+      server.stop(true);
+      store.close();
+      staticServer.close();
+      const existing = acquired.state;
+      const where = existing !== undefined
+        ? `pid ${existing.pid}, ${existing.url}`
+        : "no advertisement on disk";
+      throw new Error(
+        `revkit serve: another daemon holds .revkit/daemon.lock (${where}). ` +
+          `Stop it, then retry.`,
+      );
+    }
+    publish = { repoId: acquired.repoId, release: acquired.release };
   }
   // Persistent per-repo tag, served on `GET /-/health` as `repoId`.
   // The rail keys its per-viewer "seen" localStorage bucket by this
