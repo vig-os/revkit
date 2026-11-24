@@ -225,36 +225,24 @@ describe("#245 — base-path stripping (sub-path deployment)", () => {
     });
     expect(response.status).toBe(404);
   });
-});
 
-describe("#245 round 3 — rail bundle is PATH-AGNOSTIC (resolves at runtime via revkitUrl)", () => {
-  let ctx: Ctx;
-  beforeAll(async () => {
-    ctx = await startSubPath("http://review.example.com/review", "review.example.com");
-  });
-  afterAll(async () => {
-    await stop(ctx);
-  });
-
-  test("rail.js served under the prefix contains no post-build path mutation", async () => {
-    // Round-3 design (ADR-0026 §"Plain Linux host / VM" DECISION
-    // c + d): the rail bundle is the SAME bytes at every
-    // deployment. Every API, SSE and asset URL goes through
-    // `revkitUrl(path)`, which reads the `<meta name="revkit-base">`
-    // the layout stamped at BUILD time. The daemon never rewrites
-    // bodies — so the rail bundle served under `/review/-/rail.js`
-    // contains NO `/review/` prefix anywhere.
+  test("round-3: rail.js served under the prefix contains no post-build path mutation", async () => {
+    // ADR-0026 §"Plain Linux host / VM" DECISION c + d: the rail
+    // bundle is the SAME bytes at every deployment. Every API, SSE
+    // and asset URL goes through `revkitUrl(path)`, which reads
+    // `<meta name="revkit-base">` the layout stamped at BUILD time.
+    // The daemon NEVER rewrites bodies — so the rail bundle served
+    // under `/review/-/rail.js` contains NO `/review/` prefix.
+    // Reuses this describe's shared daemon rather than a fresh one
+    // (`just test` fd-budget growth meter is tight on CI).
     const response = await fetch(`${ctx.handle.url}/review/-/rail.js`, {
       headers: { host: ctx.publicHost, origin: ctx.originHeader },
     });
     expect(response.status).toBe(200);
     const body = await response.text();
-    // No server-injected prefix.
     expect(body).not.toContain("/review/api/");
     expect(body).not.toContain("/review/events");
     expect(body).not.toContain("/review/-/");
-    // The bundle still carries the un-prefixed paths that
-    // `revkitUrl` resolves against the meta at runtime.
     expect(body).toContain("/api/threads");
     expect(body).toContain("/api/events-head");
     expect(body).toContain("/events");
@@ -539,16 +527,18 @@ describe("#245 round 3 — reply / resolve / reopen / SSE end-to-end under /revi
     return trailing === "/" ? "" : trailing.replace(/\/+$/u, "");
   }
 
-  test("GET /api/threads + reply / resolve / reopen template-literal URLs all reach the handler under the prefix", async () => {
+  test("rail-shape URLs (template literal + SSE ?since) all reach the handler under the prefix", async () => {
     // Pre-round-3 (47d09f5), the body rewriter MISSED
     // `` `/api/threads/${id}/replies` `` — the template literal
     // reached the rail unchanged, and the browser opened
     // `${publicOrigin}/api/threads/...`, which the daemon rejected
-    // as out-of-prefix (404 static). This test exercises exactly
-    // that shape: build the URL via a template literal and watch
-    // the request reach the `/api/threads/:id/replies` handler
-    // (which parses the body and returns a schema/404 refusal —
-    // NOT a static 404).
+    // as out-of-prefix (404 static). This test exercises every
+    // rail-emitted URL shape the brief names (reply / resolve /
+    // reopen + SSE reconnect with `?since=<n>`) through the
+    // round-3 helper's resolved path, in one body — the
+    // `just test` fd-budget growth meter is tight on CI (#283
+    // CI run 45462173649), so folding these into one test keeps
+    // socket churn low.
     //
     // What "reaches the handler" looks like: the handler returns
     // JSON with an error (the fake thread id is unknown, or the
@@ -559,78 +549,53 @@ describe("#245 round 3 — reply / resolve / reopen / SSE end-to-end under /revi
     const base = await readBaseFromRoot();
     expect(base).toBe("/review");
 
+    const commonHeaders = {
+      host: ctx.publicHost,
+      origin: ctx.originHeader,
+    } as const;
+
     // GET /api/threads is the simple positive case.
     const listResponse = await fetch(`${ctx.handle.url}${base}/api/threads`, {
-      headers: { host: ctx.publicHost, origin: ctx.originHeader, accept: "application/json" },
+      headers: { ...commonHeaders, accept: "application/json" },
     });
     expect(listResponse.status).toBe(200);
     const listBody = (await listResponse.json()) as { threads: unknown[]; head: number };
     expect(Array.isArray(listBody.threads)).toBe(true);
 
-    // A template-literal URL with a (fake) id — this is the exact
-    // shape the rail emits at runtime through `revkitUrl`. Any
-    // return that is JSON means the dispatcher routed it; a
-    // static 404 would be plain text.
+    // Template-literal URLs with a (fake) id — the exact shape the
+    // rail emits at runtime through `revkitUrl`. A JSON content
+    // type on the response proves the dispatcher routed it; a
+    // static 404 would be plain text. Loop keeps the three
+    // endpoints symmetric and reuses one keep-alive socket per
+    // target.
     const fakeId = "00000000-0000-4000-8000-000000000000";
-    const replyResponse = await fetch(
-      `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/replies`,
-      {
-        method: "POST",
-        headers: {
-          host: ctx.publicHost,
-          origin: ctx.originHeader,
-          "content-type": "application/json",
+    for (const route of ["replies", "resolve", "reopen"] as const) {
+      const body = route === "replies"
+        ? JSON.stringify({ parentId: fakeId, body: "x" })
+        : "{}";
+      const response = await fetch(
+        `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/${route}`,
+        {
+          method: "POST",
+          headers: { ...commonHeaders, "content-type": "application/json" },
+          body,
         },
-        body: JSON.stringify({ parentId: fakeId, body: "world" }),
-      },
-    );
-    expect(replyResponse.headers.get("content-type") ?? "").toContain("application/json");
-    expect(replyResponse.status).toBeGreaterThanOrEqual(400);
-    await replyResponse.body?.cancel();
+      );
+      expect(response.headers.get("content-type") ?? "").toContain("application/json");
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      await response.body?.cancel();
+    }
 
-    const resolveResponse = await fetch(
-      `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/resolve`,
-      {
-        method: "POST",
-        headers: {
-          host: ctx.publicHost,
-          origin: ctx.originHeader,
-          "content-type": "application/json",
-        },
-        body: "{}",
-      },
-    );
-    expect(resolveResponse.headers.get("content-type") ?? "").toContain("application/json");
-    expect(resolveResponse.status).toBeGreaterThanOrEqual(400);
-    await resolveResponse.body?.cancel();
-
-    const reopenResponse = await fetch(
-      `${ctx.handle.url}${base}/api/threads/${encodeURIComponent(fakeId)}/reopen`,
-      {
-        method: "POST",
-        headers: {
-          host: ctx.publicHost,
-          origin: ctx.originHeader,
-          "content-type": "application/json",
-        },
-        body: "{}",
-      },
-    );
-    expect(reopenResponse.headers.get("content-type") ?? "").toContain("application/json");
-    expect(reopenResponse.status).toBeGreaterThanOrEqual(400);
-    await reopenResponse.body?.cancel();
-  });
-
-  test("SSE reconnect with ?since=<n> serves under the prefix", async () => {
-    const base = await readBaseFromRoot();
+    // SSE reconnect with `?since=<n>` under the prefix. Also a
+    // template-literal URL in the rail's own shape.
     const headResponse = await fetch(`${ctx.handle.url}${base}/api/events-head`, {
-      headers: { host: ctx.publicHost, origin: ctx.originHeader, accept: "application/json" },
+      headers: { ...commonHeaders, accept: "application/json" },
     });
     expect(headResponse.status).toBe(200);
     const headBody = (await headResponse.json()) as { head: number };
     const sinceResponse = await fetch(
       `${ctx.handle.url}${base}/events?since=${encodeURIComponent(String(headBody.head))}`,
-      { headers: { host: ctx.publicHost, origin: ctx.originHeader } },
+      { headers: commonHeaders },
     );
     expect(sinceResponse.status).toBe(200);
     expect(sinceResponse.headers.get("content-type")).toContain("text/event-stream");
