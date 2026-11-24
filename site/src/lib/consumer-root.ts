@@ -43,3 +43,73 @@ export const CONSUMER_ROOT_ENV = "REVKIT_CONSUMER_ROOT" as const;
  * packaged site — the nix store is read-only). */
 export const ASTRO_CACHE_DIR_ENV = "REVKIT_ASTRO_CACHE_DIR" as const;
 export const VITE_CACHE_DIR_ENV = "REVKIT_VITE_CACHE_DIR" as const;
+
+/** Base-path env var (#245 part 1 round 3). Set by `revkit build
+ * --base <path>` so Astro emits prefixed asset and page URLs at
+ * build time. The daemon serves the built pages under the matching
+ * guard policy's `basePath` but never rewrites bodies — the base
+ * path is a BUILD-TIME + RUNTIME property (ADR-0026 §"Plain Linux
+ * host / VM" sub-path deployment), not a response rewrite.
+ *
+ * Shape: `/` (or empty) is the root deployment (the default; the
+ * local daemon never sets this). Otherwise a leading slash + no
+ * trailing slash, e.g. `/review`. Trailing slashes are stripped by
+ * `normaliseBasePath` so `/review/` and `/review` collapse to one
+ * canonical form, matching `createPublicOriginGuardPolicy`'s own
+ * `basePath` derivation. */
+export const BASE_PATH_ENV = "REVKIT_BASE_PATH" as const;
+
+/** Read `REVKIT_BASE_PATH` from the process env and canonicalise it.
+ * Returns `""` for unset / blank / `/` — the root deployment. A
+ * leading slash is required; a trailing slash is stripped; a value
+ * that is neither empty nor starts with `/` is rejected with a
+ * clear error (the build fails loudly rather than ship with a
+ * subtly wrong base).
+ *
+ * The companion `baseMetaContent` renders the value with the
+ * TRAILING slash the browser's `URL` constructor wants when
+ * resolving a `path` that starts with `/` against it — see
+ * `packages/cli/src/rail/url.ts`. */
+export function readBasePath(): string {
+  const raw = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+    ?.REVKIT_BASE_PATH;
+  if (raw === undefined || raw === null) return "";
+  return normaliseBasePath(raw);
+}
+
+/** Canonicalise a user-supplied base path. Shared with
+ * `revkit build --base` so the CLI and the astro config agree on
+ * one shape. Exported from the site lib because it has no node:*
+ * dependency and both consumers can import it. */
+export function normaliseBasePath(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed === "/") return "";
+  if (!trimmed.startsWith("/")) {
+    throw new Error(
+      `REVKIT_BASE_PATH must start with '/' (got ${JSON.stringify(raw)}). Example: '/review'.`,
+    );
+  }
+  // Strip any run of trailing slashes so `/review/` and `/review`
+  // collapse to one canonical value.
+  return trimmed.replace(/\/+$/u, "");
+}
+
+/** The value to stamp into `<meta name="revkit-base" content="…">`
+ * at build time. Normalised to ALWAYS end in a slash so the rail's
+ * runtime resolver treats it as a directory prefix:
+ *   - root deployment → `/`
+ *   - sub-path `/review` → `/review/`
+ *
+ * The rail's `revkitUrl(path)` helper resolves `path` (which starts
+ * with `/`) against this value, so a trailing slash is required to
+ * keep the prefix intact. */
+export function baseMetaContent(basePath: string): string {
+  if (basePath.length === 0) return "/";
+  return basePath.endsWith("/") ? basePath : `${basePath}/`;
+}
+
+/** `<meta name="…">` the layout stamps at build time. The rail reads
+ * it at runtime (`packages/cli/src/rail/url.ts`); re-exported from
+ * one place so a rename shows up as a compile error on every reader
+ * that imports this constant. */
+export const BASE_META_NAME = "revkit-base" as const;

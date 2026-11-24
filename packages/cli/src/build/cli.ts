@@ -14,6 +14,40 @@ import { walkForCheckables } from "../file-discovery.ts";
 import { findRepoRootByPackageJson } from "../repo-root.ts";
 import { defaultConsumerDist, runPackagedBuild } from "./packaged.ts";
 
+/** Normalise a user-supplied `--base` argument into the canonical
+ * shape Astro and the guard policy both expect: leading `/`, no
+ * trailing slash, and `""` for the root deployment. Shared with
+ * `site/src/lib/consumer-root.ts`'s own `normaliseBasePath` through
+ * the env-var contract — the CLI writes `REVKIT_BASE_PATH` once and
+ * the Astro config re-normalises it, so the two cannot drift. */
+export function normaliseBuildBaseArg(raw: string): { ok: true; value: string } | { ok: false; message: string } {
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed === "/") return { ok: true, value: "" };
+  if (!trimmed.startsWith("/")) {
+    return {
+      ok: false,
+      message: `revkit build: --base must start with '/' (got ${JSON.stringify(raw)}). Example: '/review'.`,
+    };
+  }
+  // Only path characters; reject `?`, `#`, whitespace, and any
+  // control character that would turn the prefix into something
+  // other than a path segment. A stricter check than Astro's own —
+  // Astro accepts non-path characters here and produces broken URLs.
+  if (/[\s?#]/.test(trimmed)) {
+    return {
+      ok: false,
+      message: `revkit build: --base must be a plain path with no query, fragment or whitespace (got ${JSON.stringify(raw)}).`,
+    };
+  }
+  // Strip trailing slashes without a regex to keep CodeQL's ReDoS
+  // scanner happy — a `/\/+$/` on uncontrolled input is flagged as
+  // polynomial even when anchored. A plain-loop trim is linear in
+  // the trailing-slash run length.
+  let out = trimmed;
+  while (out.endsWith("/")) out = out.slice(0, -1);
+  return { ok: true, value: out };
+}
+
 /** Result shape aligned with the dispatcher's `CliResult`. */
 export interface RunBuildResult {
   readonly exitCode: number;
@@ -39,12 +73,18 @@ export interface RunBuildEnv {
 export interface ParsedBuildArgs {
   readonly dir?: string;
   readonly out?: string;
+  /** Normalised base path (`""` for root, `"/review"` for a
+   * sub-path deployment). The CLI validates it here; the Astro
+   * config re-normalises on read so a drifted env value fails
+   * loudly at build time. */
+  readonly basePath: string;
   readonly skipCheckDist: boolean;
 }
 
 export function parseBuildArgs(args: readonly string[]): { ok: true; parsed: ParsedBuildArgs } | { ok: false; message: string } {
   let dir: string | undefined;
   let out: string | undefined;
+  let basePathRaw: string | undefined;
   let skipCheckDist = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -66,6 +106,20 @@ export function parseBuildArgs(args: readonly string[]): { ok: true; parsed: Par
       i++;
     } else if (arg?.startsWith("--out=")) {
       out = arg.slice("--out=".length);
+    } else if (arg === "--base") {
+      // #245 part 1 round 3: a sub-path deployment base path.
+      // Propagated to Astro via `REVKIT_BASE_PATH` so every page
+      // and asset href is emitted with the prefix at build time,
+      // and the layout stamps `<meta name="revkit-base">` the
+      // rail reads at runtime.
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        return { ok: false, message: "revkit build: --base requires a value (e.g. '/review')" };
+      }
+      basePathRaw = next;
+      i++;
+    } else if (arg?.startsWith("--base=")) {
+      basePathRaw = arg.slice("--base=".length);
     } else if (arg === "--skip-check-dist") {
       // Test-only escape hatch. Not documented in HELP; a caller
       // that sets this MUST have another output-gate in front of
@@ -75,11 +129,18 @@ export function parseBuildArgs(args: readonly string[]): { ok: true; parsed: Par
       return { ok: false, message: `revkit build: unknown argument '${arg}'` };
     }
   }
+  let basePath = "";
+  if (basePathRaw !== undefined) {
+    const parsed = normaliseBuildBaseArg(basePathRaw);
+    if (!parsed.ok) return parsed;
+    basePath = parsed.value;
+  }
   return {
     ok: true,
     parsed: {
       ...(dir !== undefined ? { dir } : {}),
       ...(out !== undefined ? { out } : {}),
+      basePath,
       skipCheckDist,
     },
   };
@@ -160,7 +221,11 @@ export async function runBuildCommand(
   // 2. Packaged build.
   let result;
   try {
-    result = await runPackagedBuild({ consumerRoot, distOutDir });
+    result = await runPackagedBuild({
+      consumerRoot,
+      distOutDir,
+      basePath: parsed.parsed.basePath,
+    });
   } catch (error) {
     return {
       exitCode: 1,

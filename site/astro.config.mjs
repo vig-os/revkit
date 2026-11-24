@@ -20,7 +20,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildSharedMarkdownConfig } from "./src/lib/markdown-processor.ts";
-import { readConsumerRoot } from "./src/lib/consumer-root.ts";
+import { BASE_META_NAME, baseMetaContent, readBasePath, readConsumerRoot } from "./src/lib/consumer-root.ts";
 
 // Consumer-root mode (M5 part 2, issue #57): when `revkit build` sets
 // `REVKIT_CONSUMER_ROOT`, this file is being run from the PACKAGED
@@ -131,8 +131,30 @@ const VITE_CACHE_DIR = (process.env.REVKIT_VITE_CACHE_DIR ?? "").trim() || undef
 // `<consumer>/.revkit/cache/astro` for the same reason.
 const ASTRO_CACHE_DIR = (process.env.REVKIT_ASTRO_CACHE_DIR ?? "").trim() || undefined;
 
+// Base path for a sub-path deployment (#245 part 1 round 3,
+// ADR-0026 §"Plain Linux host / VM"). `revkit build --base /review`
+// sets `REVKIT_BASE_PATH=/review`; Astro's own `base` config then
+// emits every asset and page link with the prefix (so the server
+// never has to rewrite bodies), and a Starlight `head` entry stamps
+// `<meta name="revkit-base" content="/review/">` so the rail's
+// `revkitUrl(path)` helper resolves API, SSE and asset URLs against
+// it at runtime.
+//
+// Root deployment (`revkit serve`, local): empty string → Astro's
+// `base` stays at its `/` default and no meta tag is emitted (the
+// rail's helper falls back to `/`). Observable behaviour on the
+// local daemon is byte-for-byte unchanged.
+const BASE_PATH = readBasePath();
+const BASE_META = baseMetaContent(BASE_PATH);
+
 export default defineConfig({
   site: "https://revkit.local",
+  // Astro `base` for a sub-path deployment (#245 part 1 round 3).
+  // Astro emits every asset / page href with this prefix at build
+  // time — the server NEVER rewrites bodies. Default `/` is the
+  // root deployment; the local daemon always runs under this and
+  // emits byte-for-byte identical HTML.
+  ...(BASE_PATH !== "" ? { base: BASE_PATH } : {}),
   integrations: [
     starlight({
       title: "revkit",
@@ -173,6 +195,20 @@ export default defineConfig({
           attrs: {
             rel: "stylesheet",
             href: "/_katex/katex.min.css",
+          },
+        },
+        // Build-time base-path advertisement (#245 part 1 round 3,
+        // DECISION b): one well-defined place in the HTML carries
+        // the deployment's base path; the rail reads it at runtime
+        // (`packages/cli/src/rail/url.ts`) and resolves every API,
+        // SSE and asset URL against it. `/` is the root deployment
+        // (the local daemon's observable HTML is unchanged except
+        // for this tag, which the rail's helper treats as a no-op).
+        {
+          tag: "meta",
+          attrs: {
+            name: BASE_META_NAME,
+            content: BASE_META,
           },
         },
       ],

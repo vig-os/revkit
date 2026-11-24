@@ -18,12 +18,21 @@ import {
   type HeaderContext,
 } from "../../src/serve/headers.ts";
 
-function ctxWith(overrides: Partial<HeaderContext> = {}): HeaderContext {
+/** #245: the daemon now passes `scriptOrigins` / `connectOrigins`
+ * directly (from `guardPolicy.cspOrigins`) instead of deriving them
+ * from a `port`. The helper mirrors the local daemon's default — the
+ * two loopback aliases — so existing assertions keep their shape.
+ * Tests that exercise a specific port override both. */
+function loopbackCtx(port: number, overrides: Partial<HeaderContext> = {}): HeaderContext {
   return {
-    port: 12345,
+    scriptOrigins: [`http://127.0.0.1:${port}`, `http://localhost:${port}`],
+    connectOrigins: [`ws://127.0.0.1:${port}`, `ws://localhost:${port}`],
     inlineScriptHashes: [],
     ...overrides,
   };
+}
+function ctxWith(overrides: Partial<HeaderContext> = {}): HeaderContext {
+  return loopbackCtx(12345, overrides);
 }
 
 /** Parse a CSP header into a directive → sources map so a test can
@@ -45,7 +54,7 @@ describe("buildCspHeader — directive shape", () => {
   });
 
   test("script-src names /-/rail.js AND /_astro/ AND /pagefind/ for BOTH loopback aliases", () => {
-    const csp = parseCsp(buildCspHeader(ctxWith({ port: 42421 })));
+    const csp = parseCsp(buildCspHeader(loopbackCtx(42421)));
     const sources = csp["script-src"];
     expect(sources).toBeDefined();
     // Both aliases (127.0.0.1 and localhost) x three path prefixes.
@@ -90,7 +99,7 @@ describe("buildCspHeader — directive shape", () => {
   });
 
   test("worker-src is path-scoped to /pagefind/ on BOTH loopback aliases (M2 item 5b: closes the 'any Worker' hole)", () => {
-    const csp = parseCsp(buildCspHeader(ctxWith({ port: 42421 })));
+    const csp = parseCsp(buildCspHeader(loopbackCtx(42421)));
     // Path-scope means: only pages under `/pagefind/` may become a
     // Worker script. `worker-src 'self'` (the previous shape) would
     // let a stored HTML instantiate `new Worker("/-/anything.js")`.
@@ -109,7 +118,7 @@ describe("buildCspHeader — directive shape", () => {
   });
 
   test("connect-src covers 'self' AND both explicit ws:// aliases (older browsers)", () => {
-    const csp = parseCsp(buildCspHeader(ctxWith({ port: 9999 })));
+    const csp = parseCsp(buildCspHeader(loopbackCtx(9999)));
     expect(csp["connect-src"]).toEqual(["'self'", "ws://127.0.0.1:9999", "ws://localhost:9999"]);
   });
 
@@ -127,7 +136,7 @@ describe("buildCspHeader — directive shape", () => {
     const hex = "1cbb968b5e6d5421bb29ba088f699949436448c3a5bd060192062fce0a172aa9";
     const b64 = "HLuWi15tVCG7KboIj2mZSUNkSMOlvQYBkgYvzgoXKqk=";
     expect(hexToBase64(hex)).toBe(b64);
-    const value = buildCspHeader({ port: 4321, inlineScriptHashes: [hex] });
+    const value = buildCspHeader(loopbackCtx(4321, { inlineScriptHashes: [hex] }));
     const expected =
       "default-src 'none'; " +
       "script-src " +

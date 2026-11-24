@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Shared request handler closes the four Linux-host gaps from the #281 review**
+  ([#245](https://github.com/vig-os/revkit/issues/245))
+  - **Base-path stripping before routing.** When the guard policy carries a non-empty `basePath` (derived from a
+    public origin like `http://review.example.com/review`), the dispatcher now STRIPS the prefix after the gate
+    check and routes against the un-prefixed path. The prior shape let a `/review/api/threads` request past the
+    gate but no dispatch branch matched it, so it 404'd as static. API, `/events`, assets and the site root all
+    serve under the prefix now. Prefix confusion (`/review` vs `/reviewer`, `/reviewapi/*`), a trailing slash and
+    an encoded slash (`/review%2Fapi/threads`) stay 404 — the strip keys on exact-or-slash, not `startsWith`.
+  - **Base path is a BUILD-TIME + RUNTIME property, NOT a response rewrite** (round-3 falsifier decision,
+    replaces the earlier body-rewriter). The round-2 approach regex-rewrote absolute-path references inside
+    served HTML and the rail bundle, and the round-3 falsifier showed that a regex cannot tell URLs from data:
+    template-literal URLs (`` `/api/threads/${id}/replies` ``) were MISSED, the rail's own `"/"` path normaliser
+    was corrupted, prose / JSON / HTML comments got rewritten, and an existing `href="/review"` became
+    `/review/review`. The new shape:
+    - `revkit build --base /review` sets Astro's `base`, so every page / asset href is emitted PREFIXED at
+      build time. The CLI normalises the argument (strips trailing slashes; `/` collapses to empty).
+    - The Starlight layout stamps `<meta name="revkit-base" content="/review/">` into the HTML once — the ONE
+      well-defined place the base lives in a served page.
+    - The rail (and the ask-page bundle) now opens EVERY URL through a single `revkitUrl(path)` helper
+      (`packages/cli/src/rail/url.ts`) that resolves `path` against the meta at mount; a missing meta falls
+      back to `/` (local daemon, byte-for-byte unchanged behaviour).
+    - The daemon strips the prefix before routing (unchanged) and prefixes the two `<script>` / `<link>` tags
+      `injectRail` appends (the ONE place the serve path knows a path-aware URL); it NEVER rewrites bodies.
+      `prefixAbsolutePaths` is deleted.
+    - CSP inline-script hashes stay valid because nothing is rewritten after the build, and the local
+      daemon's observable behaviour is unchanged (empty basePath, no meta, identical URLs).
+    - A static check (`packages/cli/test/rail/url.test.ts`) refuses any root-absolute `/api`, `/events`,
+      `/-/` literal in the built rail bundle outside `revkitUrl`'s own call sites, so a future contributor
+      who types `fetch("/api/…")` without going through the helper fails `bun test` rather than a
+      reverse-proxied deployment.
+  - **Transport peer address flows end-to-end, and fails closed when the transport cannot name a peer.**
+    `IdentityResolver.resolve(request, peer?)` carries the peer. The daemon derives it from `Bun.serve`'s
+    `requestIP` and passes it on every call. `createAuthProviderIdentityResolver` uses the passed-in peer first
+    and falls back to its construction-time function; a call with neither configured refuses closed with
+    `no-peer` (401). `StartDaemonOptions.peer` lets the host target override the derivation (unix socket, say).
+    Round-3 blocker 3: `peerFor` previously invented `{transport: "tcp", address: "127.0.0.1"}` when
+    `requestIP` was `null` — i.e. over a unix socket — which made the dispatcher's own `no-peer` branch
+    unreachable and would have silently trusted every socket writer under a `127.0.0.0/8` allowlist. The
+    daemon now returns `undefined`, the resolver refuses, and a dispatcher-level test pins the behaviour.
+    Unix-socket peer semantics (SO_PEERCRED, listener-level trust) are the follow-up round's job.
+  - **401 (missing credential) vs 403 (untrusted peer) propagate.** `identifyActor` now returns the full
+    `IdentityResolution` and the five dispatcher call sites surface the resolver's own status onto the response.
+    An untrusted peer no longer surfaces as `401 Unauthorized`, which hid a misconfigured allowlist as a
+    missing-credential outage; a missing subject header no longer surfaces as `403`. The dispatcher's
+    `respondIdentityRefused` is the one place that maps a resolution's `(status, reason)` onto the HTTP body.
+  - **CSP derives from the guard policy's public origin, not a loopback port.** `HeaderContext` now takes
+    `scriptOrigins` / `connectOrigins` directly (fed from `guardPolicy.cspOrigins`), and `applyResponseHeaders`
+    accepts a `scriptPathPrefix` so the CSP's `script-src` paths carry the base path on a sub-path deployment.
+    The local daemon's emitted CSP is byte-for-byte unchanged (the loopback policy exposes the two loopback
+    aliases and the ws:// twins); the host target's CSP now names the configured origin + its ws(s)://
+    twin, so a reverse-proxied reviewer does not have their own CSP refuse the rail bundle.
+
 - **`AuthProvider` interface in `@revkit/review-core`, plus the `none` and `trusted-proxy` providers**
   ([#244](https://github.com/vig-os/revkit/issues/244))
   - Runtime-neutral contract (ADR-0026 §"The auth-provider interface"): `authenticate(AuthRequest) → AuthResult`

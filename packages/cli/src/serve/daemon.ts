@@ -52,6 +52,7 @@ import {
   type Thread,
   type ThreadFilter,
   ThreadStoreAppendError,
+  type AuthRequestPeer,
 } from "@revkit/review-core";
 import {
   buildSyncRequest,
@@ -100,8 +101,10 @@ import {
 } from "./route-groups.ts";
 import {
   createLocalIdentityResolver,
+  type IdentityResolution,
   type IdentityResolver,
 } from "./identity-resolver.ts";
+import { stripBasePath } from "./base-path.ts";
 import { EventBus, sseFrame, sseKeepalive, type Subscriber } from "./event-bus.ts";
 import { buildRailBundle } from "../rail/bundle.ts";
 import { injectRail, RAIL_CSS_PATH, RAIL_JS_PATH } from "../rail/injector.ts";
@@ -284,6 +287,25 @@ export interface StartDaemonOptions {
    * `createAuthProviderIdentityResolver({provider: trustedProxy,
    * peer: …})`. */
   readonly identityResolver?: IdentityResolver;
+  /** How the dispatcher derives the transport peer for each request
+   * (#245). The host target's `trusted-proxy` provider's allowlist
+   * runs on the TCP peer address (NOT `X-Forwarded-For`), which is
+   * only known inside `Bun.serve`'s fetch callback. The function is
+   * called once per request so a listener that mixes transports (a
+   * unix socket plus a loopback TCP, say) can decide by connection,
+   * not configuration.
+   *
+   * Default: a loopback-TCP shape computed from `Server.requestIP`,
+   * which matches the local daemon's ADR-0013 bind. The local
+   * resolver ignores the peer value, so the default is inert for
+   * the local target.
+   *
+   * May return `undefined` — the resolver then fails closed with
+   * `no-peer` (401). This matters for a listener whose transport
+   * does not carry a peer address (`requestIP` is null over a unix
+   * socket), where inventing a loopback peer would bypass a
+   * trusted-proxy allowlist entirely (#245 part 1 round 3). */
+  readonly peer?: (request: Request, server: Server<WebSocketData>) => AuthRequestPeer | undefined;
 }
 
 /** A handle on a running daemon. `stop()` is idempotent and removes
@@ -841,6 +863,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           // WebSocket upgrade — Bun handles the response.
           return undefined;
         }
+        // Base path is a BUILD-TIME + RUNTIME property, never a
+        // response rewrite (#245 part 1 round 3, ADR-0026 §"Plain
+        // Linux host / VM" DECISION d): Astro emits prefixed hrefs
+        // at build time, the rail resolves API / SSE / asset URLs
+        // through `revkitUrl` against the `<meta name="revkit-base">`
+        // the layout stamped. The daemon only strips the prefix
+        // before routing and picks the prefixed path on the two
+        // tags `injectRail` adds. No body goes out through a regex.
         const duration = Math.round(performance.now() - started);
         logger.info("request", {
           requestId,
@@ -941,15 +971,6 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   const boundUrl = `http://127.0.0.1:${port}`;
   const launchUrl = `${boundUrl}/-/auth?code=${launchCode}`;
 
-  // Header context (ADR-0012 CSP + hygiene). Bound now that we have
-  // the port. The context is IMMUTABLE for the lifetime of the
-  // daemon — every response goes through `applyResponseHeaders` in
-  // `withHygiene`, so nothing on disk after start can widen it.
-  const headerCtx: HeaderContext = {
-    port,
-    inlineScriptHashes: cspHashes,
-  };
-
   // Composable handler seams (#279, ADR-0025 / ADR-0026). Defaults
   // reproduce the local daemon's historical behaviour exactly: the
   // loopback guard policy (ADR-0013), every route group enabled, and
@@ -959,6 +980,25 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
   // dispatcher under those alternatives.
   const guardPolicy: GuardPolicy = options.guardPolicy ?? createLoopbackGuardPolicy({ port });
   const routeGroups: RouteGroups = options.routeGroups ?? LOCAL_DAEMON_ROUTE_GROUPS;
+
+  // Header context (ADR-0012 CSP + hygiene). #245: the CSP's
+  // `script-src` / `worker-src` / `connect-src` origins come from the
+  // guard policy's `cspOrigins`, not from the loopback port. For the
+  // local daemon this is byte-for-byte identical (the loopback policy
+  // exposes `http://127.0.0.1:<port>` + `http://localhost:<port>` and
+  // their ws twins). For the host target this is the single
+  // configured public origin + its ws(s) twin, so a reverse-proxied
+  // reviewer loading `https://host.example/review/...` is not refused
+  // by its own CSP for script-src naming a loopback port.
+  //
+  // IMMUTABLE for the lifetime of the daemon — every response goes
+  // through `applyResponseHeaders` in `withHygiene`, so nothing on
+  // disk after start can widen it.
+  const headerCtx: HeaderContext = {
+    scriptOrigins: guardPolicy.cspOrigins.http,
+    connectOrigins: guardPolicy.cspOrigins.ws,
+    inlineScriptHashes: cspHashes,
+  };
   // ADR-0026 bars the agent surface from any non-loopback target; a
   // misconfiguration that enabled it under a non-loopback policy
   // would silently expose the agent bearer flow. Catch it at start,
@@ -1210,18 +1250,37 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(response, "text", undefined);
     }
 
-    // Base-path gate (#279 round-2; ADR-0026 §"Plain Linux host / VM"
+    // Base-path gate + strip (#245; ADR-0026 §"Plain Linux host / VM"
     // sub-path support, #195 implementation scope). When the policy
     // carries a non-empty `basePath`, every URL must either equal it
     // or start with `basePath + "/"`. A request outside the prefix
     // is 404 — the handler acknowledges nothing at the wrong root.
-    // basePath is "" on the loopback policy so the local daemon's
-    // dispatch is unchanged.
+    //
+    // #281 review gap #1 closed here: once the prefix check passes,
+    // the prefix is STRIPPED before routing, so every downstream
+    // route match is written against the un-prefixed path (the
+    // dispatcher checks `url.pathname === "/api/threads"`, not
+    // `=== "/review/api/threads"`). Before this strip, a request to
+    // `/review/api/threads` passed the gate but fell through every
+    // branch and 404'd as static. "Prefix confusion" — `/review` vs
+    // `/reviewer` — is handled by `stripBasePath`'s exact-or-slash
+    // match: `/reviewer/api/threads` returns `undefined` and 404s
+    // here. basePath is "" on the loopback policy so the local
+    // daemon's dispatch is unchanged.
     if (guardPolicy.basePath !== "") {
-      const prefix = guardPolicy.basePath;
-      if (url.pathname !== prefix && !url.pathname.startsWith(prefix + "/")) {
+      const routed = stripBasePath(url.pathname, guardPolicy.basePath);
+      if (routed === undefined) {
         logger.warn("request.rejected.base-path", { requestId, path: url.pathname });
         return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
+      }
+      if (routed !== url.pathname) {
+        // Reassign `url` to a copy whose pathname is the stripped
+        // routed path. The fetch handler still holds the original URL
+        // for request-level logging (prefix-included), so operators
+        // see what the browser actually sent.
+        const next = new URL(url.toString());
+        next.pathname = routed;
+        url = next;
       }
     }
 
@@ -1580,11 +1639,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const originRejection = checkOrigin(request, requestId, hasValidBearer);
     if (originRejection !== undefined) return originRejection;
 
-    const actor = await identifyActor(request);
-    if (actor === undefined) {
-      logger.warn("api.rejected.auth", { requestId, path: url.pathname });
-      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    const resolution = await identifyActor(request);
+    if (resolution.kind !== "ok") {
+      logger.warn("api.rejected.auth", { requestId, path: url.pathname, reason: resolution.reason });
+      return respondIdentityRefused(resolution.status);
     }
+    const actor = resolution.actor;
 
     // GET /api/threads?path=&status=
     if (url.pathname === "/api/threads" && method === "GET") {
@@ -2046,21 +2106,59 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     return await appendDeliveryEvent([...pending], effectiveTrigger, requestId);
   }
 
-  /** Resolve the caller to an `Author`, or undefined if the
-   * injected resolver refuses the request. Delegates to the
+  /** Resolve the caller to an `IdentityResolution`. Delegates to the
    * configured `IdentityResolver`: the local resolver reproduces
    * today's launch-code / session-cookie / agent-bearer flow
    * byte-for-byte; the host resolver wraps the configured
-   * `AuthProvider`. The call sites keep the historical
-   * `undefined` → `401` shape — the refusal's status code is not
-   * surfaced to the dispatcher yet (the local resolver always
-   * refuses with `401`; the host resolver will refine this in #245
-   * when the dispatcher starts mapping the provider's refusal
-   * status onto the response). */
-  async function identifyActor(request: Request): Promise<Author | undefined> {
-    const resolution = await identityResolver.resolve(request);
-    if (resolution.kind === "ok") return resolution.actor;
+   * `AuthProvider`.
+   *
+   * #245: this returns the full `IdentityResolution` (not just the
+   * actor) so the dispatcher can map `untrusted-peer` (403) and
+   * `missing-subject` (401) onto distinct HTTP statuses. The pre-#245
+   * shape collapsed every refusal to `undefined` and then to `401`,
+   * which hid a trusted-peer-gone-wrong (`403`) behind the same
+   * status as a missing credential. */
+  async function identifyActor(request: Request): Promise<IdentityResolution> {
+    return identityResolver.resolve(request, peerFor(request));
+  }
+
+  /** Transport peer for the identity resolver. Honours the caller's
+   * override if set (`options.peer`), else derives the TCP peer
+   * shape from `Server.requestIP`. Returns `undefined` when neither
+   * is available — the resolver then fails closed with `no-peer`
+   * (401) rather than silently trusting a fabricated address.
+   *
+   * **Why not invent `127.0.0.1`.** `requestIP` is `null` over a
+   * unix-socket listener (Bun has no peer address to report). A
+   * fabricated loopback peer would mean a `trusted-proxy` allowlist
+   * containing `127.0.0.0/8` trusted every socket writer, bypassing
+   * the dispatcher's no-peer refusal entirely (#245 part 1 round 3
+   * blocker 3). Unix-socket peer semantics (SO_PEERCRED, listener-
+   * level trust) are part 2's job — this code's correct answer
+   * today is to refuse. */
+  function peerFor(request: Request): AuthRequestPeer | undefined {
+    const custom = options.peer;
+    if (custom !== undefined) return custom(request, server);
+    try {
+      const ip = server.requestIP(request);
+      if (ip !== null && typeof ip === "object" && "address" in ip) {
+        return { transport: "tcp", address: ip.address };
+      }
+    } catch {
+      // Fall through — the resolver's no-peer path is the right
+      // answer when the transport cannot name a peer.
+    }
     return undefined;
+  }
+
+  /** Short helper that turns an `IdentityResolution` refusal into the
+   * handler's response. Uses the resolver's own status (401 vs 403),
+   * so an `untrusted-peer` surfaces as `403 Forbidden` and a
+   * `missing-subject` (or an invalid session cookie on the local
+   * target) surfaces as `401 Unauthorized`. */
+  function respondIdentityRefused(status: 401 | 403): Response {
+    const body = status === 401 ? "Unauthorized" : "Forbidden";
+    return withHygiene(new Response(body, { status }), "text", "text/plain; charset=utf-8");
   }
 
   /** Does the request carry a valid agent bearer AND is the agent
@@ -2089,11 +2187,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     const originRejection = checkOrigin(request, requestId, hasValidBearer);
     if (originRejection !== undefined) return originRejection;
 
-    const actor = await identifyActor(request);
-    if (actor === undefined) {
-      logger.warn("delivery.rejected.auth", { requestId, path: url.pathname });
-      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    const resolution = await identifyActor(request);
+    if (resolution.kind !== "ok") {
+      logger.warn("delivery.rejected.auth", { requestId, path: url.pathname, reason: resolution.reason });
+      return respondIdentityRefused(resolution.status);
     }
+    const actor = resolution.actor;
 
     if (url.pathname === "/api/delivery-mode" && method === "GET") {
       // Round-3: cache read; no full-log scan.
@@ -2974,11 +3073,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       return withHygiene(new Response("Not Found", { status: 404 }), "text", "text/plain; charset=utf-8");
     }
 
-    const actor = await identifyActor(request);
-    if (actor === undefined) {
-      logger.warn("review.api.rejected.auth", { requestId, path: url.pathname });
-      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    const resolution = await identifyActor(request);
+    if (resolution.kind !== "ok") {
+      logger.warn("review.api.rejected.auth", { requestId, path: url.pathname, reason: resolution.reason });
+      return respondIdentityRefused(resolution.status);
     }
+    const actor = resolution.actor;
 
     // GET /api/review/state — session cookie OR agent bearer may
     // read. The state is not sensitive (it's already in the log).
@@ -3535,11 +3635,12 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
       // path for a human; agent token for a channel client that
       // attaches without `?for=agent`). The resolver already has
       // the whole auth story — asking it once keeps the handler
-      // honest.
-      const identityResolution = await identityResolver.resolve(request);
+      // honest. #245: propagate the resolver's status so an
+      // `untrusted-peer` refusal surfaces as 403, not 401.
+      const identityResolution = await identityResolver.resolve(request, peerFor(request));
       if (identityResolution.kind !== "ok") {
-        logger.warn("events.rejected.no-session", { requestId });
-        return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+        logger.warn("events.rejected.no-session", { requestId, reason: identityResolution.reason });
+        return respondIdentityRefused(identityResolution.status);
       }
     }
 
@@ -3768,6 +3869,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     if (contentType.startsWith("text/html")) {
       return await injectRail(rawResponse, {
         logHead: store.head(),
+        basePath: guardPolicy.basePath,
         onOversize: (bodyBytes: number) => {
           logger.warn("static.rail.skipped-oversize", {
             requestId,
@@ -3908,6 +4010,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     );
     return await injectRail(rawResponse, {
       logHead: store.head(),
+      basePath: guardPolicy.basePath,
       onOversize: (bodyBytes: number) => {
         logger.warn("static.rail.skipped-oversize", {
           requestId: args.requestId,
@@ -4111,6 +4214,7 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     );
     return await injectRail(rawResponse, {
       logHead: store.head(),
+      basePath: guardPolicy.basePath,
       onOversize: (bodyBytes: number) => {
         logger.warn("static.rail.skipped-oversize", { requestId, path: route, bytes: bodyBytes });
       },
@@ -4496,11 +4600,17 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     // `/api/events-head` BEFORE opening `/events`, so a proxied
     // reviewer that hit a direct `auth.hasSession` / agent-bearer
     // check would see 401 and lose its resume point.
-    const actor = await identifyActor(request);
-    if (actor === undefined) {
-      logger.warn("api.events-head.rejected.role", { requestId });
-      return withHygiene(new Response("Unauthorized", { status: 401 }), "text", "text/plain; charset=utf-8");
+    const resolution = await identifyActor(request);
+    if (resolution.kind !== "ok") {
+      logger.warn("api.events-head.rejected.role", { requestId, reason: resolution.reason });
+      return respondIdentityRefused(resolution.status);
     }
+    // `resolution.actor` is intentionally not used on this GET; the
+    // resolution is what gates access, and the body is just the log
+    // head. No `void resolution.actor;` is needed here — the type
+    // narrowing on `resolution.kind === "ok"` is enough to satisfy
+    // `@typescript-eslint/no-unused-vars` because we never bind the
+    // actor to a local name.
     return jsonResponse({ head: store.head() });
   }
 
@@ -4712,7 +4822,19 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     contentType: string | undefined,
     extraScriptPaths: readonly string[] = [],
   ): Response {
-    return applyResponseHeaders(response, kind, contentType, headerCtx, extraScriptPaths);
+    // #245: pass the policy's basePath so the CSP's script-src names
+    // the paths the browser actually requests under a sub-path
+    // deployment (`<origin>/review/-/rail.js`, not `/-/rail.js`). Empty
+    // on the loopback policy — the local daemon's emitted header
+    // stays byte-for-byte identical.
+    return applyResponseHeaders(
+      response,
+      kind,
+      contentType,
+      headerCtx,
+      extraScriptPaths,
+      guardPolicy.basePath,
+    );
   }
 
   /** JSON body from `/api/*` (writes and reads). `kind: "json"` adds

@@ -71,6 +71,16 @@ export interface RunPackagedBuildOptions {
    * in the packaged flow). When omitted, walks up from
    * `import.meta.url`. */
   readonly packageRoot?: string;
+  /** Sub-path deployment prefix (#245 part 1 round 3). `""` (the
+   * default) is the root deployment and the astro build emits
+   * identical bytes to the pre-#245 flow. A non-empty value must
+   * start with `/` and have no trailing slash (the CLI normalises
+   * it; the astro config re-normalises on read). Propagated into
+   * astro via `REVKIT_BASE_PATH`; astro `base` then prefixes every
+   * emitted asset and page link, and a Starlight head entry stamps
+   * `<meta name="revkit-base" content="/review/">` for the rail's
+   * runtime URL helper. */
+  readonly basePath?: string;
   /** Injectable spawner for tests. Defaults to the shared
    * `spawnAstroBuild`'s default (`Bun.spawn`). */
   readonly spawn?: SpawnLike;
@@ -557,6 +567,12 @@ export async function runPackagedBuild(
       REVKIT_CONSUMER_ROOT: consumerRoot,
       REVKIT_ASTRO_CACHE_DIR: caches.astro,
       REVKIT_VITE_CACHE_DIR: caches.vite,
+      // #245 part 1 round 3: sub-path base. Omit when empty so the
+      // astro config's `readBasePath` sees it as unset and emits
+      // byte-for-byte identical output to the pre-#245 build.
+      ...(options.basePath !== undefined && options.basePath !== ""
+        ? { REVKIT_BASE_PATH: options.basePath }
+        : {}),
       // Disable astro telemetry — deterministic build; no network.
       ASTRO_TELEMETRY_DISABLED: "1",
       // Keep Node's own `require.resolve` on the SYMLINK

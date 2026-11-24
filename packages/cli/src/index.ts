@@ -47,7 +47,7 @@ Usage:
   revkit check [--staged | <paths...>] [--online]
   revkit check-dist <dist-dir> [--print-hashes]
   revkit escalate "<need>"
-  revkit build [--dir <path>] [--out <path>]
+  revkit build [--dir <path>] [--out <path>] [--base <path>]
   revkit serve [--dir <path>] [--port <n>] [--no-auto-build]
   revkit mcp [--dir <path>]
   revkit open [<path>]
@@ -78,6 +78,13 @@ path — no bunx, no npx, no registry fetch. Output lands at
 <consumer>/.revkit/cache/ so nothing is written into the nix store
 or the packaged site directory. Runs 'revkit check' before and
 'revkit check-dist' after (ADR-0012 output gate).
+
+--base <path> is for a sub-path deployment behind a reverse proxy
+  (#245, ADR-0026 §"Plain Linux host / VM"): Astro emits every
+  page / asset href with the prefix at BUILD time, and a <meta
+  name="revkit-base" content="/<path>/"> is stamped into the HTML
+  so the rail resolves API / SSE / asset URLs against it at runtime.
+  The default ('/') is the root deployment the local daemon serves.
 
 serve boots the local daemon (ADR-0013, ADR-0006/0007): Bun.serve
 bound to 127.0.0.1 on a random free port (--port 0), serving

@@ -1,13 +1,13 @@
 // Rail injection — wraps a static HTML `Response` from the daemon so
-// every served page also loads the rail bundle from `/-/rail.js` /
-// `/-/rail.css`.
+// every served page also loads the rail bundle from `${basePath}/-/rail.js` /
+// `${basePath}/-/rail.css`.
 //
 // The injection is a streaming rewrite over the response body: Bun
 // ships `HTMLRewriter` (Cloudflare Workers compatible) which parses
 // HTML incrementally, so a large page never buffers in memory. We
 // append two elements to `<head>`:
-//   1. `<link rel="stylesheet" href="/-/rail.css">`
-//   2. `<script type="module" src="/-/rail.js"></script>`
+//   1. `<link rel="stylesheet" href="${basePath}/-/rail.css">`
+//   2. `<script type="module" src="${basePath}/-/rail.js"></script>`
 //
 // The script tag is EXTERNAL (a `src=`), not inline: the M2 CSP
 // direction (ADR-0012, issue #22) refuses inline script even before
@@ -18,9 +18,21 @@
 // Injection is opt-in on the caller: `handleStatic` only wraps
 // responses whose Content-Type is `text/html`. A stylesheet or a JS
 // asset is served without touching the body.
+//
+// **Base path (#245 part 1 round 3).** The injector carries the
+// deployment's prefix on the `src` / `href` it writes. This is the
+// only path-aware mutation the serve path performs — it is NOT a
+// body rewrite (ADR-0026 §"Plain Linux host / VM" DECISION d): the
+// page's own `href` / `src` attributes come from Astro at build
+// time (`revkit build --base /review`) and travel through the
+// response unchanged. The injector only picks the right path for
+// the two tags it adds.
 
 /** The URLs the injected tags point at. Kept as constants so the
- * static-server branch and this file agree on one spelling. */
+ * static-server branch and this file agree on one spelling. The
+ * values are the ROUTED paths (no base prefix); a sub-path
+ * deployment passes a non-empty `basePath` to `injectRail` which
+ * prepends it on the emitted tags. */
 export const RAIL_JS_PATH = "/-/rail.js";
 export const RAIL_CSS_PATH = "/-/rail.css";
 
@@ -70,6 +82,14 @@ export interface InjectRailOptions {
   /** Called with the body byte length when the response is too big
    * to inject the rail into. The caller may log a warning. */
   onOversize?: (bodyBytes: number) => void;
+  /** Base path for a sub-path deployment (ADR-0026 §"Plain Linux
+   * host / VM"). Empty string (the default) means root deployment
+   * and preserves byte-for-byte what the local daemon has emitted
+   * since M1 — the two rail tags carry the un-prefixed path and the
+   * page is otherwise untouched. A non-empty value must start with
+   * `/` and have NO trailing slash (`createPublicOriginGuardPolicy`
+   * normalises its own `basePath` the same way). */
+  basePath?: string;
   /** The durable log's tip AT THE MOMENT THIS PAGE IS RENDERED.
    *
    * Stamped into the HTML as `<meta name="revkit-log-head">` so the
@@ -112,16 +132,19 @@ export async function injectRail(
       headers,
     });
   }
+  const basePath = options.basePath ?? "";
+  const cssHref = `${basePath}${RAIL_CSS_PATH}`;
+  const jsSrc = `${basePath}${RAIL_JS_PATH}`;
   const rewriter = new HTMLRewriter().on("head", {
     element(element: {
       append(html: string, options?: { html?: boolean }): void;
     }): void {
       element.append(
-        `<link rel="stylesheet" href="${RAIL_CSS_PATH}">`,
+        `<link rel="stylesheet" href="${cssHref}">`,
         { html: true },
       );
       element.append(
-        `<script type="module" src="${RAIL_JS_PATH}"></script>`,
+        `<script type="module" src="${jsSrc}"></script>`,
         { html: true },
       );
       // The log head at render time. Attribute value is an integer we
