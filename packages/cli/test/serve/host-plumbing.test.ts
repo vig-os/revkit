@@ -24,7 +24,7 @@
 // follow-up). The real `Bun.serve` binds to 127.0.0.1, which is the
 // peer address the trusted-proxy allowlist is tested against.
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -103,12 +103,16 @@ async function stop(ctx: Ctx): Promise<void> {
 }
 
 describe("#245 — base-path stripping (sub-path deployment)", () => {
-  // Fresh ctx per test — each exercises its own deployment URL.
+  // One daemon shared across every routing probe here — these are
+  // read-only GETs on an empty store, so there is no cross-test
+  // leakage. A listener per test was costing ~1.5k file descriptors
+  // on the `just test` fd-budget watcher in CI (growth ceiling
+  // 1800); nine lifecycles tipped it over.
   let ctx: Ctx;
-  beforeEach(async () => {
+  beforeAll(async () => {
     ctx = await startSubPath("http://review.example.com/review", "review.example.com");
   });
-  afterEach(async () => {
+  afterAll(async () => {
     await stop(ctx);
   });
 
@@ -225,10 +229,10 @@ describe("#245 — base-path stripping (sub-path deployment)", () => {
 
 describe("#245 round 3 — rail bundle is PATH-AGNOSTIC (resolves at runtime via revkitUrl)", () => {
   let ctx: Ctx;
-  beforeEach(async () => {
+  beforeAll(async () => {
     ctx = await startSubPath("http://review.example.com/review", "review.example.com");
   });
-  afterEach(async () => {
+  afterAll(async () => {
     await stop(ctx);
   });
 
@@ -502,11 +506,18 @@ describe("#245 round 3 — reply / resolve / reopen / SSE end-to-end under /revi
   // broken, and the pre-round-3 body-rewrite shape would have
   // been caught by the template-literal case
   // (`/api/threads/${id}/replies`).
+  //
+  // ONE daemon shared across both tests (`beforeAll` / `afterAll`,
+  // not `beforeEach`) — a fresh listener per test costs ~1.5k
+  // descriptors on the `fd-budget` growth meter the `just test`
+  // outer wrapper watches. Both tests here are read-mostly from
+  // the daemon's perspective (GET / POST on fake ids) and do not
+  // mutate cross-test state, so sharing is safe.
   let ctx: Ctx;
-  beforeEach(async () => {
+  beforeAll(async () => {
     ctx = await startSubPath("http://review.example.com/review", "review.example.com");
   });
-  afterEach(async () => {
+  afterAll(async () => {
     await stop(ctx);
   });
 
