@@ -71,6 +71,12 @@ export interface SpawnResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+  /** When the child was killed by a signal (OOM, oom-killer, admin
+   * `kill`), bun exposes it as a non-null `signalCode` on the
+   * Subprocess. Captured here so `spawnAstroBuild` can distinguish
+   * "astro failed" from "astro was killed before it could fail"
+   * (#251 round 5 (b)). */
+  readonly signalCode?: string | null;
 }
 
 /** Injectable spawner shape. Tests provide a stub.
@@ -281,6 +287,25 @@ export async function spawnAstroBuild(options: SpawnAstroBuildOptions): Promise<
       // vite's "killed" noise.
       if (options.signal?.aborted === true) {
         throw new Error("astro build aborted by signal");
+      }
+      // #251 round 5 (b): an EXTERNAL signal termination (oom-killer
+      // SIGKILL, an admin `kill -9`, a parent process group kill
+      // that reached us from outside revkit) is NOT a genuine build
+      // failure — astro never got to write a diagnostic. Bun exposes
+      // this as a non-null `signalCode` on the Subprocess; we fall
+      // back to an `exitCode >= 128` check for runtimes where the
+      // code is `128 + signo` instead. The caller (`runBuildCommand`
+      // → `runServeCommand`) uses the thrown-message marker to skip
+      // writing `.revkit/start-failed.json`.
+      if (
+        (result.signalCode != null && result.signalCode !== "") ||
+        result.exitCode >= 128
+      ) {
+        const label =
+          result.signalCode != null && result.signalCode !== ""
+            ? result.signalCode
+            : `exit ${result.exitCode}`;
+        throw new Error(`astro build terminated by signal (${label})`);
       }
       const tail = result.stderr.slice(-4096);
       throw new Error(`astro build exited ${result.exitCode}. Tail:\n${tail}`);
@@ -508,7 +533,15 @@ export const defaultSpawn: SpawnLike = async ({ cmd, cwd, env, signal }) => {
       new Response(proc.stderr).text(),
     ]);
     const exitCode = await proc.exited;
-    return { stdout, stderr, exitCode };
+    // Bun exposes the terminating signal (if any) as `signalCode`
+    // once the Subprocess has been reaped — null when the child
+    // exited cooperatively, a string like "SIGKILL" when it was
+    // killed. The cast is defensive: a future Bun that removes the
+    // field falls back to the `exitCode >= 128` check in
+    // `spawnAstroBuild` (#251 round 5 (b)).
+    const signalCode =
+      (proc as unknown as { signalCode?: string | null }).signalCode ?? null;
+    return { stdout, stderr, exitCode, signalCode };
   } finally {
     if (signal !== undefined) signal.removeEventListener("abort", onAbort);
     if (killTimer !== undefined) {

@@ -4,9 +4,14 @@
 // consumer's inputs are unchanged. The fingerprint is a cheap,
 // deterministic hash over the files that drive a cold-start build:
 //
-//   - The repo-root file list from `git ls-files -co
-//     --exclude-standard` (tracked + untracked-not-ignored) when the
-//     directory is a git working tree.
+//   - The repo-root file list from
+//     `git ls-files -z -co --exclude-standard -- :(exclude).revkit`
+//     (tracked + untracked-not-ignored, with `.revkit/` excluded)
+//     when the directory is a git working tree. NUL-terminated
+//     output is split on NUL and paths are NEVER trimmed, so a
+//     non-ASCII name (`docs/über.mdx`) survives verbatim and names
+//     with leading or trailing spaces are covered too (#251 round 5
+//     BLOCKER 1).
 //   - A fallback walk of the tree otherwise, skipping `.revkit/`,
 //     `node_modules/`, `.git/` and common dist/cache dirs at every
 //     level.
@@ -21,6 +26,24 @@
 // The hash is SHA-256, hex-encoded; the mix order is stable across
 // platforms because we normalise paths to forward slashes and mtimes
 // to integer milliseconds.
+//
+// **Fail-closed on a git listing error (#251 round 5 (a)).** We pass
+// a generous `maxBuffer` so a very large repo listing is not truncated.
+// If `git ls-files` still fails (OOM, permission issue, a corrupt
+// index), we DO NOT silently fall back to the filesystem walk — the
+// walk ignores `.gitignore`, so the hash would then include generated
+// output and flap on every retry. Instead we return `undefined`,
+// which the caller treats as "clear and proceed" (clears any stale
+// start-failed record and lets ensureDaemon respawn). The fallback
+// walk runs only when `.git/` is absent (no `.gitignore` to honour).
+//
+// **`.revkit/` exclusion (#251 round 5 BLOCKER 2).** Both paths skip
+// `.revkit/` — the git branch via a pathspec, the fallback via
+// `FINGERPRINT_WALK_SKIP`. The daemon writes `.revkit/start-failed.json`
+// and `.revkit/serve.json` DURING the failure path; including those
+// in the fingerprint would guarantee the hash flipped every time the
+// daemon wrote a record, so ensureDaemon would see a mismatch and
+// respawn even without a user edit.
 //
 // **Known limit.** A same-size, same-mtime edit of an existing file
 // is NOT detected by this fingerprint. We DO NOT hash file contents:
@@ -90,10 +113,13 @@ export interface ComputeInputFingerprintOptions {
 /** Compute a deterministic hash over the consumer's build inputs
  * under `repoRoot`. Returns a lowercase hex SHA-256 digest.
  *
- * Returns `undefined` only when `repoRoot` itself is absent or
- * unreadable; in that case the caller treats the suppression record
- * as stale (we cannot prove the inputs still match what failed, so
- * prefer "clear and proceed" over "block forever"). */
+ * Returns `undefined` when `repoRoot` is absent, OR when a git
+ * working tree is present but `git ls-files` failed (fail-closed per
+ * the module header, round 5 (a)). The caller treats an undefined
+ * current fingerprint as a mismatch, so a stale suppression record
+ * is cleared and ensureDaemon respawns — better than silently
+ * hashing a non-gitignore-aware walk that would flap on generated
+ * output. */
 export function computeInputFingerprint(
   repoRoot: string,
   options: ComputeInputFingerprintOptions = {},
@@ -107,8 +133,11 @@ export function computeInputFingerprint(
 
   // The authoritative file list — git when available, a fallback
   // walk otherwise. Both return repo-relative forward-slash paths,
-  // sorted lexically so the mix order is reproducible.
+  // sorted lexically so the mix order is reproducible. The git
+  // branch fails CLOSED (returns undefined from this function) on
+  // a listing error; see the module header.
   const listing = listRepoFiles(repoRoot);
+  if (listing === undefined) return undefined;
   hash.update(`listing-source:${listing.source}\x00`);
   hash.update(`file-count:${listing.files.length}\x00`);
   for (const rel of listing.files) {
@@ -163,34 +192,70 @@ interface RepoFileListing {
   readonly files: readonly string[];
 }
 
+/** `execFileSync` maxBuffer for the git listing. Node's default is
+ * 1 MiB — a large consumer repo's listing can exceed that with a
+ * truncated-stdout `ENOBUFS`, which would then fail-close the
+ * fingerprint on every call (round 5 (a)). 256 MiB is enough for
+ * every repo we expect to see here (tens of millions of paths) and
+ * still bounded so a runaway git never consumes unbounded memory. */
+const GIT_LS_FILES_MAX_BUFFER = 256 * 1024 * 1024;
+
 /** List every file under `repoRoot` that the fingerprint cares
- * about. Prefers `git ls-files -co --exclude-standard` (tracked +
- * untracked-not-ignored) so a repo's own `.gitignore` is respected;
- * falls back to a filesystem walk that skips the directories named
- * in `FINGERPRINT_WALK_SKIP`.
+ * about. Prefers `git ls-files -z -co --exclude-standard` (tracked +
+ * untracked-not-ignored) so a repo's own `.gitignore` is respected,
+ * with a `:(exclude).revkit` pathspec so the daemon's own state
+ * directory never contributes to the hash (#251 round 5 BLOCKER 2).
+ * `-z` turns off path quoting (`\303\274…`) and NUL-terminates each
+ * entry — we split on NUL and NEVER trim, so a name like
+ * `docs/über.mdx` or a path with trailing whitespace survives intact
+ * (#251 round 5 BLOCKER 1).
+ *
+ * Returns `undefined` when a `.git/` exists but `git ls-files`
+ * failed (fail-closed, round 5 (a)). Falls back to a filesystem walk
+ * ONLY when no `.git/` is present — the walk skips the directories
+ * named in `FINGERPRINT_WALK_SKIP` but does not read `.gitignore`,
+ * so it is unsafe in a git working tree that has generated output
+ * tracked but ignored.
  *
  * The returned paths are repo-relative, normalised to forward
  * slashes, and sorted so the hash order is stable. */
-function listRepoFiles(repoRoot: string): RepoFileListing {
+function listRepoFiles(repoRoot: string): RepoFileListing | undefined {
   const gitDir = join(repoRoot, ".git");
   if (existsSync(gitDir)) {
     try {
       const raw = execFileSync(
         "git",
-        ["-C", repoRoot, "ls-files", "-co", "--exclude-standard"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+        [
+          "-C",
+          repoRoot,
+          "ls-files",
+          "-z",
+          "-co",
+          "--exclude-standard",
+          "--",
+          ":(exclude).revkit",
+        ],
+        {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          maxBuffer: GIT_LS_FILES_MAX_BUFFER,
+        },
       );
+      // NUL-terminated output: split on \0, drop the empty trailing
+      // element after the last NUL, and do NOT trim — a leading or
+      // trailing whitespace character IS part of the filename.
       const files = raw
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
+        .split("\0")
+        .filter((entry) => entry.length > 0)
         // Git emits POSIX-style forward slashes; still normalise
         // defensively in case a hostile line sneaks a backslash in.
-        .map((line) => line.split(/[/\\]+/).join("/"));
+        .map((entry) => entry.split(/[/\\]+/).join("/"));
       files.sort();
       return { source: "git", files };
     } catch {
-      // Fall through to the walk fallback.
+      // Fail CLOSED — see the module header on why we do NOT fall
+      // back to the non-gitignore-aware walk here.
+      return undefined;
     }
   }
   const out: string[] = [];

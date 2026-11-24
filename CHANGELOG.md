@@ -163,20 +163,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     process is dead, so a mid-race read never points the agent at a
     vanished pid.
   - **Build failure reaches the MCP caller through an input-aware
-    record (round 3, widened in round 4).** `revkit serve`
-    persists `.revkit/start-failed.json` ONLY for a genuine build
-    or check-dist failure — never for lock contention, a SIGTERM /
-    SIGINT abort, or a bind-time race. Round 4 widens the input
-    fingerprint to the WHOLE repo-root file listing: SHA-256 over
-    the paths returned by `git ls-files -co --exclude-standard`
-    (tracked + untracked-not-ignored) in a git working tree, or a
-    fallback filesystem walk that skips `.revkit/`, `node_modules/`,
-    `.git/` and common dist/cache dirs otherwise. For each listed
-    file the hash mixes repo-relative POSIX path + size +
-    integer-millisecond mtime; revkit's own CLI version is also
-    mixed in so a CLI upgrade invalidates every prior record (#251
-    round 4 test 4), and `package.json` is always-mixed as
-    belt-and-braces. See `packages/cli/src/serve/input-fingerprint.ts`,
+    record (round 3, widened in round 4, hardened in round 5).**
+    `revkit serve` persists `.revkit/start-failed.json` ONLY for a
+    genuine build or check-dist failure — never for lock contention,
+    a SIGTERM / SIGINT abort, a bind-time race, or an EXTERNAL
+    signal termination such as an oom-killer SIGKILL (round 5 (b),
+    exit 128+n handled through a propagated `signalTerminated`
+    marker from the build layer). Round 4 widens the input
+    fingerprint to the WHOLE repo-root file listing, and round 5
+    makes that listing byte-safe:
+    `git ls-files -z -co --exclude-standard -- :(exclude).revkit`
+    (round 5 BLOCKER 1 + BLOCKER 2) — `-z` + NUL-terminated split +
+    NO `.trim()` keeps non-ASCII paths (`docs/über.mdx`) and names
+    with leading or trailing whitespace verbatim, and the pathspec
+    excludes the daemon's own `.revkit/` state so a record write
+    never flips the hash it just recorded. The fallback filesystem
+    walk, used only when `.git/` is absent, skips `.revkit/`,
+    `node_modules/`, `.git/` and common dist/cache dirs the same
+    way. **Fail-closed on a git listing error (round 5 (a)):** a
+    generous `maxBuffer` (256 MiB) stops a truncated-listing
+    `ENOBUFS` on very large repos; if `git ls-files` still fails
+    (OOM, permission, corrupt index), `computeInputFingerprint`
+    returns `undefined` and the caller treats that as "clear and
+    proceed" — we NEVER silently fall back to the non-gitignore-
+    aware walk (which would mix generated output into the hash and
+    flap on every retry). For each listed file the hash mixes
+    repo-relative POSIX path + size + integer-millisecond mtime;
+    revkit's own CLI version is also mixed in so a CLI upgrade
+    invalidates every prior record (#251 round 4 test 4), and
+    `package.json` is always-mixed as belt-and-braces. See
+    `packages/cli/src/serve/input-fingerprint.ts`,
     `FINGERPRINT_WALK_SKIP` / `FINGERPRINT_CONFIG_FILES`.
     `ensureDaemon` refuses to respawn only while the current
     fingerprint matches the recorded one; any edit anywhere in the
@@ -214,7 +230,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     SIGKILLs the group. `revkit serve` therefore exits promptly on
     a user signal, releases the lock, and leaves `.revkit/dist`
     alone (the orphan's staging dir is never promoted); no start-
-    failure record is planted for a signal abort.
+    failure record is planted for a signal abort — internal OR
+    external (round 5 (b)).
   - **`revkit open` during a cold-start.** Now reports
     `a daemon is starting (cold-start auto-build, pid X, N s
     elapsed since …)` instead of the misleading "no daemon is

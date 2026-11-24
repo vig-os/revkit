@@ -366,16 +366,27 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
       removeBuildSignalHandlers();
       removeStaging();
       const abortedBySignal = buildAbort?.signal.aborted === true;
+      const errorMessage = (error as Error).message;
+      // #251 round 5 (b): an external SIGKILL (oom-killer, admin
+      // kill) surfaces here as a throw whose message carries the
+      // "terminated by signal" marker spawnAstroBuild attached. The
+      // round-3 rule applies — do NOT persist a start-failure
+      // record, so the next ensureDaemon respawns cleanly.
+      const signalTerminated =
+        errorMessage.includes("aborted by signal") ||
+        errorMessage.includes("terminated by signal");
       const message = abortedBySignal
         ? `auto-build aborted by ${abortedViaSignal.reason || "signal"}`
-        : `revkit serve: auto-build failed:\n${(error as Error).message}`;
+        : signalTerminated
+          ? `revkit serve: auto-build terminated by signal:\n${errorMessage}`
+          : `revkit serve: auto-build failed:\n${errorMessage}`;
       // A build-ending signal / abort is NEVER recorded as a
-      // start-failure (#251 round 3 BLOCKER 2): the record is
-      // reserved for genuine build or check-dist failures that
-      // the user needs to fix. A transient abort would otherwise
-      // wedge every future MCP auto-spawn until the user
+      // start-failure (#251 round 3 BLOCKER 2, round 5 (b)): the
+      // record is reserved for genuine build or check-dist failures
+      // that the user needs to fix. A transient abort would
+      // otherwise wedge every future MCP auto-spawn until the user
       // manually removes the file.
-      if (!abortedBySignal) {
+      if (!abortedBySignal && !signalTerminated) {
         writeStartFailure(repoRoot, {
           stage: "build-failed",
           message,
@@ -399,11 +410,18 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
       // this exit as an abort (not a build failure the user needs
       // to fix). We do NOT persist a start-failure for a signal
       // abort — see the matching comment on the catch branch.
+      // #251 round 5 (b): also honour `signalTerminated` from the
+      // build layer so an EXTERNAL signal (oom-killer SIGKILL, admin
+      // kill) that never flipped our AbortController is suppressed
+      // the same way.
       const abortedBySignal = buildAbort?.signal.aborted === true;
+      const signalTerminated = buildResult.signalTerminated === true;
       const message = abortedBySignal
         ? `revkit serve: auto-build aborted by ${abortedViaSignal.reason || "signal"}`
-        : "revkit serve: auto-build failed (see stderrTail)";
-      if (!abortedBySignal) {
+        : signalTerminated
+          ? "revkit serve: auto-build terminated by signal (see stderrTail)"
+          : "revkit serve: auto-build failed (see stderrTail)";
+      if (!abortedBySignal && !signalTerminated) {
         writeStartFailure(repoRoot, {
           stage: "build-failed",
           message,
@@ -417,7 +435,7 @@ export async function runServeCommand(args: readonly string[], env: RunServeEnv)
       return {
         exitCode: buildResult.exitCode,
         stdout: buildResult.stdout,
-        stderr: abortedBySignal
+        stderr: abortedBySignal || signalTerminated
           ? `${message}\n`
           : `revkit serve: auto-build failed:\n${buildResult.stderr}`,
       };

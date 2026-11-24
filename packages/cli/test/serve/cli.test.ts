@@ -356,6 +356,43 @@ describe("runServeCommand — #251 round 3: signal handling, staging promotion, 
     15_000,
   );
 
+  test(
+    "#251 round 5 (b): a build terminated by a signal (exit 128+n, e.g. 137 OOM) does NOT write a start-failure record",
+    async () => {
+      // Pre-fix (6c35db48): a signal-killed astro (oom-killer
+      // SIGKILL = exit 137 in bash convention, admin `kill -9`,
+      // any external signal that did NOT flip our own
+      // AbortController) returned `exitCode != 0` and the serve
+      // path planted a `.revkit/start-failed.json` record with an
+      // input fingerprint. The record then wedged MCP's respawn
+      // until the user manually removed the file or edited any
+      // file in the tree. Round 5 (b) honours the round-3 rule:
+      // a signal-terminated build is NEVER a genuine failure —
+      // write no record.
+      mkdirSync(join(root, "docs"), { recursive: true });
+      writeFileSync(join(root, "docs", "a.md"), "# hi\n");
+      const result = await runServeCommand([], {
+        cwd: root,
+        version: "test-0.1.0",
+        runBuildOverride: async () => ({
+          exitCode: 137, // 128 + SIGKILL(9) — the oom-killer shape
+          stdout: "",
+          stderr: "astro was killed before it could write anything",
+          signalTerminated: true,
+        }),
+      });
+      expect(result.exitCode).not.toBe(0);
+      // Round 5 (b) contract: no start-failure record for a
+      // signal termination. Pre-fix this file exists with a
+      // valid-looking fingerprint and a build-failed stage.
+      expect(readStartFailure(root)).toBeUndefined();
+      // Lock + serve.json cleaned up as usual.
+      expect(existsSync(join(root, ".revkit", "serve.json"))).toBe(false);
+      expect(listDistStagingDirs(root)).toEqual([]);
+    },
+    10_000,
+  );
+
   test("successful bind clears any stale start-failed.json", async () => {
     // Seed a stale record from a prior failed attempt.
     writeFileSync(

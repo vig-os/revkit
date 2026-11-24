@@ -530,33 +530,43 @@ waking the agent mid-turn.
   `start-failed`) and the reason is persisted in
   `.revkit/start-failed.json`. The record carries an input
   fingerprint over the whole repo-root file listing: the paths
-  returned by `git ls-files -co --exclude-standard` (tracked +
-  untracked-not-ignored) in a git working tree, or a fallback
+  returned by
+  `git ls-files -z -co --exclude-standard -- :(exclude).revkit`
+  (tracked + untracked-not-ignored, with the daemon's own
+  `.revkit/` state excluded) in a git working tree, or a fallback
   filesystem walk that skips `.revkit/`, `node_modules/`, `.git/`
   and common dist/cache dirs otherwise, with each file's
   repo-relative POSIX path + size + integer-millisecond mtime mixed
   into a SHA-256; revkit's own CLI version is also mixed in so an
-  upgrade invalidates every prior record. The fingerprint is
-  computed BEFORE the build starts, so a fix saved mid-build is
-  never absorbed into the recorded hash. MCP refuses to respawn
-  only while the current fingerprint matches the recorded one, so
-  any edit anywhere in the tree — fixed MDX syntax, a renamed
-  term, a new plot file, a corrected `components/*.tsx`, a bumped
-  `package.json` — invalidates the record and the NEXT MCP tool
-  call will spawn a fresh `revkit serve` on its own. **Known
-  limit.** A same-size, same-mtime edit (a `touch -r` surgery, or
-  a byte-identical overwrite restored to its prior mtime) is NOT
-  detected — the fingerprint hashes file metadata, not contents.
-  The human's fix is to read the recorded `stderrTail`, edit the
-  source, and call the tool again; a successful `revkit build`, a
-  successful full `revkit check` and a successful `revkit serve`
-  bind also clear the record. Manual escape: run `revkit serve`
-  directly to see the live error, or `rm
-  .revkit/start-failed.json` to force the next MCP tool call to
-  retry. A transient — a SIGTERM abort of the cold build, a lock
-  contention from a parallel `revkit serve`, a bind-time race —
-  is NEVER persisted; only a real build / startup failure lands
-  here. On SIGINT / SIGTERM the running cold build is aborted:
-  the daemon sends SIGTERM to the astro child's process group
-  and escalates to SIGKILL after a 5 s grace, so `revkit serve`
-  exits promptly even when astro installs its own SIGTERM handler.
+  upgrade invalidates every prior record. The listing uses
+  NUL-terminated output (`-z`) so non-ASCII filenames
+  (`docs/über.mdx`) and names with leading or trailing whitespace
+  are recorded verbatim. If `git ls-files` fails (very large repo,
+  corrupt index), the fingerprint is `undefined` and the caller
+  treats that as "clear and proceed" — we never silently fall
+  back to a filesystem walk that ignores `.gitignore`. The
+  fingerprint is computed BEFORE the build starts, so a fix saved
+  mid-build is never absorbed into the recorded hash. MCP refuses
+  to respawn only while the current fingerprint matches the
+  recorded one, so any edit anywhere in the tree — fixed MDX
+  syntax, a renamed term, a new plot file, a corrected
+  `components/*.tsx`, a bumped `package.json` — invalidates the
+  record and the NEXT MCP tool call will spawn a fresh `revkit
+  serve` on its own. **Known limit.** A same-size, same-mtime edit
+  (a `touch -r` surgery, or a byte-identical overwrite restored to
+  its prior mtime) is NOT detected — the fingerprint hashes file
+  metadata, not contents. The human's fix is to read the recorded
+  `stderrTail`, edit the source, and call the tool again; a
+  successful `revkit build`, a successful full `revkit check` and
+  a successful `revkit serve` bind also clear the record. Manual
+  escape: run `revkit serve` directly to see the live error, or
+  `rm .revkit/start-failed.json` to force the next MCP tool call
+  to retry. A transient — a SIGTERM abort of the cold build, a
+  lock contention from a parallel `revkit serve`, a bind-time
+  race, or an EXTERNAL signal termination (oom-killer SIGKILL,
+  admin `kill -9`) — is NEVER persisted; only a real build /
+  startup failure lands here. On SIGINT / SIGTERM the running
+  cold build is aborted: the daemon sends SIGTERM to the astro
+  child's process group and escalates to SIGKILL after a 5 s
+  grace, so `revkit serve` exits promptly even when astro
+  installs its own SIGTERM handler.

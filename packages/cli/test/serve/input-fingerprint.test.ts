@@ -175,4 +175,111 @@ describe("computeInputFingerprint", () => {
     const after = computeInputFingerprint(repoRoot);
     expect(after).toBe(before);
   });
+
+  test(
+    "#251 round 5 BLOCKER 1: a non-ASCII filename (docs/über.mdx) is listed verbatim; size changes flip the hash",
+    () => {
+      // Pre-fix (6c35db48): git without `-z` quotes non-ASCII paths
+      // as `"docs/\303\274ber.mdx"`. The current code then calls
+      // `.trim()` and uses that literal as a filename — lstat fails
+      // silently (`stat-failed` token), so the file's size never
+      // enters the hash. A fix that changes the broken file's size
+      // leaves the recorded hash unchanged; MCP keeps suppressing.
+      // Post-fix: `-z` + split-on-NUL + no-trim records the real
+      // path, so a size change flips the hash.
+      execFileSync("git", ["-C", repoRoot, "init", "-q"]);
+      execFileSync("git", ["-C", repoRoot, "config", "user.email", "t@e.com"]);
+      execFileSync("git", ["-C", repoRoot, "config", "user.name", "t"]);
+      // Enforce the pre-fix quoting path: `core.quotePath=true` is
+      // git's default, but a repo config override here pins it on
+      // regardless of a developer's `~/.gitconfig` turning it off.
+      // The real production git call inherits the user's git config,
+      // so forcing it here keeps the pre-fix bug deterministic.
+      execFileSync("git", ["-C", repoRoot, "config", "core.quotePath", "true"]);
+      mkdirSync(join(repoRoot, "docs"), { recursive: true });
+      const nonAscii = join(repoRoot, "docs", "über.mdx");
+      writeFileSync(nonAscii, "x");
+      writeFileSync(join(repoRoot, "package.json"), "{}");
+      execFileSync("git", ["-C", repoRoot, "add", "-A"]);
+      execFileSync("git", ["-C", repoRoot, "commit", "-q", "-m", "init"]);
+      const before = computeInputFingerprint(repoRoot);
+      // Change size (and mtime) of the non-ASCII file. If the file
+      // was NOT listed under its real name (pre-fix: quoted octal
+      // literal), lstat on the recorded path fails and the size
+      // change is invisible to the hash.
+      writeFileSync(nonAscii, "xy");
+      const now = new Date();
+      utimesSync(nonAscii, now, new Date(now.getTime() + 2000));
+      const after = computeInputFingerprint(repoRoot);
+      expect(after).not.toBe(before);
+    },
+  );
+
+  test(
+    "#251 round 5 BLOCKER 1: a filename with a trailing space is tracked (names are never trimmed)",
+    () => {
+      // Round 4 pre-fix: `.trim()` on each `ls-files` line strips
+      // whitespace that is legitimately part of a filename. A file
+      // literally called "weird " (trailing space) ends up recorded
+      // under the TRIMMED name "weird", which lstat() can't find —
+      // its size never contributes. Round 5 stops trimming.
+      execFileSync("git", ["-C", repoRoot, "init", "-q"]);
+      execFileSync("git", ["-C", repoRoot, "config", "user.email", "t@e.com"]);
+      execFileSync("git", ["-C", repoRoot, "config", "user.name", "t"]);
+      mkdirSync(join(repoRoot, "docs"), { recursive: true });
+      // Name with a TRULY TRAILING space before the newline in the
+      // ls-files listing — POSIX allows it. Pre-fix `.trim()`
+      // strips that space, lstat on the trimmed path fails, and
+      // the file's size never contributes to the hash.
+      const padded = join(repoRoot, "docs", "weird.mdx ");
+      writeFileSync(padded, "x");
+      writeFileSync(join(repoRoot, "package.json"), "{}");
+      execFileSync("git", ["-C", repoRoot, "add", "-A"]);
+      execFileSync("git", ["-C", repoRoot, "commit", "-q", "-m", "init"]);
+      const before = computeInputFingerprint(repoRoot);
+      writeFileSync(padded, "xyz");
+      const now = new Date();
+      utimesSync(padded, now, new Date(now.getTime() + 2000));
+      const after = computeInputFingerprint(repoRoot);
+      expect(after).not.toBe(before);
+    },
+  );
+
+  test(
+    "#251 round 5 BLOCKER 2: `.revkit/` additions do NOT flip the fingerprint under git (daemon's own state is excluded)",
+    () => {
+      // Pre-fix (6c35db48): `git ls-files -co --exclude-standard`
+      // listed EVERY untracked file including the daemon's own
+      // `.revkit/start-failed.json` and `.revkit/serve.json`. With
+      // no `.gitignore` entry for `.revkit/`, writing the record
+      // itself bumped the listing and the hash — so the fingerprint
+      // the caller WROTE into the record always mismatched the
+      // fingerprint the next ensureDaemon COMPUTED, which cleared
+      // the record every time and MCP respawned anyway.
+      // Post-fix: a `:(exclude).revkit` pathspec keeps `.revkit/`
+      // out of the listing on the git path, matching the fallback
+      // walk's `FINGERPRINT_WALK_SKIP`.
+      execFileSync("git", ["-C", repoRoot, "init", "-q"]);
+      execFileSync("git", ["-C", repoRoot, "config", "user.email", "t@e.com"]);
+      execFileSync("git", ["-C", repoRoot, "config", "user.name", "t"]);
+      mkdirSync(join(repoRoot, "docs"), { recursive: true });
+      writeFileSync(join(repoRoot, "docs", "a.md"), "hi\n");
+      writeFileSync(join(repoRoot, "package.json"), "{}");
+      // Deliberately NO `.gitignore` entry for `.revkit/` — this is
+      // the path the assertion needs to be insensitive to.
+      execFileSync("git", ["-C", repoRoot, "add", "-A"]);
+      execFileSync("git", ["-C", repoRoot, "commit", "-q", "-m", "init"]);
+      const before = computeInputFingerprint(repoRoot);
+      // The daemon writes a start-failure record and a serve.json
+      // inside `.revkit/`. Neither must flip the hash.
+      mkdirSync(join(repoRoot, ".revkit"), { recursive: true });
+      writeFileSync(
+        join(repoRoot, ".revkit", "start-failed.json"),
+        '{"stage":"build-failed"}\n',
+      );
+      writeFileSync(join(repoRoot, ".revkit", "serve.json"), "{}\n");
+      const after = computeInputFingerprint(repoRoot);
+      expect(after).toBe(before);
+    },
+  );
 });
