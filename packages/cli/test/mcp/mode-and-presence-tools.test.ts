@@ -185,7 +185,15 @@ describe("mode gating across the AGENT stream", () => {
             const frame = buffer.slice(0, idx);
             buffer = buffer.slice(idx + 2);
             const dataLine = frame.split("\n").find((l) => l.startsWith("data:"));
-            if (dataLine !== undefined) received.push(JSON.parse(dataLine.slice("data:".length).trim()));
+            if (dataLine !== undefined) {
+              const payload = dataLine.slice("data:".length).trim();
+              // Issue #277: the daemon's named `event: ping`
+              // heartbeat lands here with an empty data payload.
+              // Skip it so JSON.parse does not throw and kill the
+              // read loop before real events arrive.
+              if (payload.length === 0) continue;
+              received.push(JSON.parse(payload));
+            }
             idx = buffer.indexOf("\n\n");
           }
         }

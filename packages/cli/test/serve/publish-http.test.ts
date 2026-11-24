@@ -160,12 +160,12 @@ describe("POST /api/publish — happy path", () => {
 
   test("`doc.published` reaches an SSE subscriber", async () => {
     // Open an agent-audience event stream, wait for the SSE
-    // `hello` frame (the first `: keepalive` the daemon flushes on
+    // `hello` frame (the first `event: ping` the daemon flushes on
     // `start` to prove the subscriber is primed), THEN publish.
     // Reading the first frame synchronously before the POST is
     // the race guard: on `start` the daemon primes the resume
     // slice + attaches the subscriber, so a frame arriving after
-    // the first keepalive is guaranteed to hit us.
+    // the first heartbeat is guaranteed to hit us.
     const events: unknown[] = [];
     const eventStream = new Response(
       (
@@ -202,8 +202,9 @@ describe("POST /api/publish — happy path", () => {
       return "";
     };
     // 1) Wait for the first SSE frame — the daemon's
-    //    `sseKeepalive()` fires from inside `start()`, so its
-    //    presence proves `bus.subscribe(subscriber)` has run.
+    //    `sseHeartbeat()` (named `ping` event) fires from inside
+    //    `start()`, so its presence proves `bus.subscribe(subscriber)`
+    //    has run.
     const helloDeadline = Date.now() + 2_000;
     const hello = await readOne(helloDeadline);
     expect(hello.length).toBeGreaterThan(0);
