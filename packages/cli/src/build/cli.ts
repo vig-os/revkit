@@ -39,7 +39,13 @@ export function normaliseBuildBaseArg(raw: string): { ok: true; value: string } 
       message: `revkit build: --base must be a plain path with no query, fragment or whitespace (got ${JSON.stringify(raw)}).`,
     };
   }
-  return { ok: true, value: trimmed.replace(/\/+$/u, "") };
+  // Strip trailing slashes without a regex to keep CodeQL's ReDoS
+  // scanner happy — a `/\/+$/` on uncontrolled input is flagged as
+  // polynomial even when anchored. A plain-loop trim is linear in
+  // the trailing-slash run length.
+  let out = trimmed;
+  while (out.endsWith("/")) out = out.slice(0, -1);
+  return { ok: true, value: out };
 }
 
 /** Result shape aligned with the dispatcher's `CliResult`. */
