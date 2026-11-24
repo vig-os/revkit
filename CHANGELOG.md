@@ -107,6 +107,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `readResumeSeq`) on every reconnect, not the page-load `since`, so a
     reconnect does not ask the daemon to replay events the per-seq gate is
     about to drop.
+  - **Subscriber teardown is symmetric (round-2 root cause).** The daemon's
+    periodic heartbeat callback captures `sseController` by closure; on the
+    base code only the stream's `cancel()` cleared it, so any bus-detach
+    path (`deliver()` throw surfaces a dead TCP peer; `bus.closeAll` on
+    shutdown; a future direct caller of `bus.subscribe`'s detach fn) left
+    the timer armed — pinning the controller, and on Bun 1.3.13 pinning
+    the backing TCP socket fd — until `daemon.stop`. Fix: the subscriber's
+    own `close()` now clears the heartbeat first, idempotently; the
+    heartbeat's own `enqueue`-throw catch calls `detach()` so the bus
+    notices a torn-down subscriber immediately; `cancel()` sets `closed`
+    before `detach()` so the bus's follow-up `close()` short-circuits.
+    `daemon.stop` no longer needs its external `heartbeatTimers.clear`
+    loop — that loop masked the per-subscriber asymmetry on CI, where the
+    test suite's fd peak grew one socket per dropped subscriber (fd-budget
+    `growth 6659 vs. budget 1800` on run 44302188769).
   - Tests: `packages/cli/test/rail/live-channel.test.ts` (fake clock + fake
     source factory, covering backoff math, mid-stream errors, visibility
     wake-up, the stale-stream watchdog, the connect-timeout, late-callback

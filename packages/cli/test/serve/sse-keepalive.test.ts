@@ -266,5 +266,53 @@ describe("SSE heartbeat — issue #277", () => {
         // Already closed.
       }
     });
+
+    test("ROUND-2 ROOT-CAUSE: `bus.closeAll` on daemon stop releases every heartbeat timer symmetrically (CI fd-budget regression)", async () => {
+      // Round-2 #277 root cause for the fd-budget failure. The
+      // daemon's periodic heartbeat callback captures
+      // `sseController` by closure; a timer that stays armed after
+      // the subscriber is detached from the bus pins the
+      // ReadableStream — and its backing TCP socket fd — until
+      // `daemon.stop` runs. Base code's `stop()` had an explicit
+      // `heartbeatTimers.clear` loop that covered the shutdown
+      // path, but that loop MASKED the real asymmetry:
+      // `subscriber.close()` itself did not clear the heartbeat,
+      // so any other detach path (`deliver()` throw, a future
+      // caller of the `bus.subscribe` detach fn) left the timer
+      // armed until shutdown. This is the leak that blew the CI
+      // fd-budget.
+      //
+      // Fix: `subscriber.close()` is now symmetric with
+      // `cancel()` — it clears the heartbeat before closing the
+      // controller — and the shutdown path no longer needs the
+      // external loop (removed). This test pins the symmetric
+      // teardown by stopping the daemon and asserting the
+      // capturing scheduler is empty: that only passes if
+      // `subscriber.close()`, called via `bus.closeAll`, clears
+      // every timer on its own.
+      if (ctx === undefined) throw new Error("beforeEach did not run");
+      const response = await fetch(`${ctx.handle.url}/events?since=0`, {
+        headers: {
+          cookie: ctx.cookie,
+          origin: ctx.handle.url,
+          accept: "text/event-stream",
+          host: `127.0.0.1:${ctx.handle.port}`,
+        },
+      });
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      await reader.read();
+      for (let i = 0; i < 20 && scheduler.size() < 1; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(scheduler.size()).toBe(1);
+      await ctx.handle.stop();
+      expect(scheduler.size()).toBe(0);
+      try {
+        await reader.cancel();
+      } catch {
+        // Stream was closed by `daemon.stop`.
+      }
+    });
   });
 });

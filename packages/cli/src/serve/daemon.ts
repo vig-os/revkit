@@ -1131,8 +1131,15 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
     async stop(): Promise<void> {
       if (stopped) return;
       stopped = true;
-      for (const timer of heartbeatTimers) heartbeatScheduler.clearInterval(timer);
-      heartbeatTimers.clear();
+      // `bus.closeAll()` calls `subscriber.close()` on every live
+      // SSE subscriber, which tears down its heartbeat timer
+      // symmetrically (round-2 #277 root cause for the CI fd-budget
+      // regression: an earlier external `heartbeatTimers.clear` loop
+      // here masked a per-subscriber leak on the bus-detach path,
+      // because it covered up the asymmetry rather than fixing it).
+      // The `heartbeatTimers` set is now purely a liveness tracker
+      // for assertions — subscribers remove themselves from it on
+      // their own `close()`.
       bus.closeAll();
       // Tear down the re-anchor watchers BEFORE closing the store —
       // a fire-and-forget refresh queued mid-shutdown would
@@ -3536,7 +3543,31 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         }
       },
       close(): void {
+        // Idempotent: a subscriber whose bus-detach path fires more
+        // than once (e.g. `deliver()` throws, then shutdown's
+        // `closeAll` runs) must not double-close the controller or
+        // leave a half-cleared heartbeat.
+        if (closed && heartbeat === undefined) return;
         closed = true;
+        // Clear the periodic heartbeat FIRST. The callback below
+        // captures `sseController` by reference (closure), so a
+        // timer that stays armed after the subscriber is detached
+        // from the bus keeps the ReadableStream reachable — and on
+        // Bun 1.3.13 that pins the backing TCP socket fd alive
+        // until the daemon stops. Round-2 #277 root cause for the
+        // CI fd-budget regression (growth 6659 vs. budget 1800):
+        // the bus-detach path (`deliver()` throw, `closeAll`) only
+        // closed the controller, so every subscriber torn down
+        // outside its own `cancel()` left an orphan heartbeat
+        // pinning a socket for the rest of the daemon's lifetime —
+        // and on CI the test's GC is tight enough that the sockets
+        // actually show up on the fd-budget poller. Symmetric with
+        // `cancel()` below.
+        if (heartbeat !== undefined) {
+          heartbeatScheduler.clearInterval(heartbeat);
+          heartbeatTimers.delete(heartbeat);
+          heartbeat = undefined;
+        }
         try {
           sseController?.close();
         } catch {
@@ -3602,7 +3633,20 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
           try {
             sseController.enqueue(encoder.encode(sseHeartbeat()));
           } catch {
+            // The stream was torn down by Bun (peer TCP close) and
+            // the heartbeat is the first thing to notice. Previously
+            // this only set `closed = true` and left the subscriber
+            // attached to the bus, so no future publish could trip
+            // the bus-detach path either (`deliver()`'s first line
+            // is `if (closed) return;`). The timer therefore stayed
+            // armed, pinning `sseController` via its closure — and
+            // through it the backing TCP socket fd — until
+            // `daemon.stop`. Round-2 #277 root cause for the CI
+            // fd-budget regression: detach here so the bus calls
+            // `subscriber.close()`, which clears the heartbeat and
+            // releases the socket.
             closed = true;
+            detach();
           }
         }, heartbeatIntervalMs);
         heartbeatTimers.add(heartbeat);
@@ -3611,9 +3655,14 @@ export async function startDaemon(options: StartDaemonOptions): Promise<DaemonHa
         if (heartbeat !== undefined) {
           heartbeatScheduler.clearInterval(heartbeat);
           heartbeatTimers.delete(heartbeat);
+          heartbeat = undefined;
         }
-        detach();
+        // Set `closed` BEFORE `detach()` so the bus's subsequent
+        // call to `subscriber.close()` sees the subscriber as
+        // already shut and short-circuits (both heartbeat and
+        // controller are already handled here).
         closed = true;
+        detach();
       },
     });
     const response = new Response(stream, {
