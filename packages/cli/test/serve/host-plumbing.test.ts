@@ -28,7 +28,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createTrustedProxyAuthProvider } from "@revkit/review-core";
+import { createTrustedProxyAuthProvider, type AuthRequestPeer } from "@revkit/review-core";
 import { startDaemon, type DaemonHandle } from "../../src/serve/daemon.ts";
 import {
   createPublicOriginGuardPolicy,
@@ -407,7 +407,7 @@ describe("#245 — transport peer flows through the real listener; 403 vs 401", 
     }
   });
 
-  test("dispatcher-level: null peer → 401 no-peer (NOT silently trusted)", async () => {
+  test("dispatcher-level: null peer → 401 no-peer; StartDaemonOptions.peer override reaches the trust check", async () => {
     // Round-3 blocker 3: `peerFor` used to invent `{transport:
     // "tcp", address: "127.0.0.1"}` when `Bun.serve`'s `requestIP`
     // was null. Over a unix-socket listener that is the common
@@ -415,68 +415,56 @@ describe("#245 — transport peer flows through the real listener; 403 vs 401", 
     // trust every socket writer — the dispatcher's `no-peer`
     // branch was unreachable. The daemon now returns `undefined`,
     // and the resolver refuses. Drive through `StartDaemonOptions
-    // .peer` to inject a null peer without racing the TCP socket
-    // — the proof is that the dispatcher reaches the refusal, not
-    // that any particular transport looked null.
+    // .peer` to inject the peer so we can cover BOTH acceptance
+    // criteria in one listener (the brief's acceptance criteria
+    // are two: the null-peer fail-closed path AND the
+    // `StartDaemonOptions.peer` seam; the `fd-budget` on the
+    // packages/cli leg is tight enough that two separate listeners
+    // here push it over, see run 45460406850 — share one).
+    let next: AuthRequestPeer | undefined = undefined;
     const provider = createTrustedProxyAuthProvider({
       headers: { subject: "x-auth-user" },
-      // An allowlist containing 127.0.0.0/8 — the exact shape that
-      // would have silently trusted the pre-fix fabricated peer.
-      trust: { kind: "peers", peers: ["127.0.0.0/8"] },
+      // Covers both the null case (127.0.0.0/8 matches a fabricated
+      // loopback peer — the exact shape that would have silently
+      // trusted the pre-fix peer) and the override case (10.1.2.3).
+      trust: { kind: "peers", peers: ["127.0.0.0/8", "10.1.2.3"] },
     });
     const ctx = await startSubPath(
       "http://review.example.com",
       "review.example.com",
       {
         identityResolver: createAuthProviderIdentityResolver({ provider }),
-        peer: () => undefined,
+        peer: () => next,
       },
     );
     try {
-      const response = await fetch(`${ctx.handle.url}/api/threads`, {
+      // Case 1: null peer. The allowlist would trust 127.0.0.0/8
+      // if the dispatcher silently fabricated one — it must not.
+      next = undefined;
+      const r1 = await fetch(`${ctx.handle.url}/api/threads`, {
         headers: {
           host: ctx.publicHost,
           origin: ctx.originHeader,
           "x-auth-user": "alice",
         },
       });
-      expect(response.status).toBe(401);
-      await response.body?.cancel();
-    } finally {
-      await stop(ctx);
-    }
-  });
+      expect(r1.status).toBe(401);
+      await r1.body?.cancel();
 
-  test("StartDaemonOptions.peer override reaches the AuthProvider's trust check", async () => {
-    // The host entry needs a seam to pin a peer that `Bun.serve`
-    // cannot discover itself (e.g. a unix socket where `requestIP`
-    // is null). The daemon's `options.peer` wins over the default
-    // `requestIP` derivation; a value of `undefined` falls through
-    // to the resolver's `no-peer` refusal (the test above); a
-    // concrete value is honoured.
-    const provider = createTrustedProxyAuthProvider({
-      headers: { subject: "x-auth-user" },
-      trust: { kind: "peers", peers: ["10.1.2.3"] },
-    });
-    const ctx = await startSubPath(
-      "http://review.example.com",
-      "review.example.com",
-      {
-        identityResolver: createAuthProviderIdentityResolver({ provider }),
-        peer: () => ({ transport: "tcp", address: "10.1.2.3" }),
-      },
-    );
-    try {
-      const response = await fetch(`${ctx.handle.url}/api/threads`, {
+      // Case 2: `StartDaemonOptions.peer` returns a concrete peer
+      // that IS on the allowlist. The identity is minted and the
+      // API serves. Same listener; the override is read per
+      // request.
+      next = { transport: "tcp", address: "10.1.2.3" };
+      const r2 = await fetch(`${ctx.handle.url}/api/threads`, {
         headers: {
           host: ctx.publicHost,
           origin: ctx.originHeader,
           "x-auth-user": "alice",
         },
       });
-      // 10.1.2.3 is on the allowlist — identity minted, API serves.
-      expect(response.status).toBe(200);
-      await response.body?.cancel();
+      expect(r2.status).toBe(200);
+      await r2.body?.cancel();
     } finally {
       await stop(ctx);
     }
@@ -552,6 +540,14 @@ describe("#245 round 3 — reply / resolve / reopen / SSE end-to-end under /revi
     const commonHeaders = {
       host: ctx.publicHost,
       origin: ctx.originHeader,
+      // `connection: close` on every fetch so Bun does not stash
+      // the socket in its per-origin keep-alive pool after the
+      // body is cancelled. The pool is one of the big contributors
+      // to the packages/cli leg's fd-budget peak (one open socket
+      // per fetch, lingering for the keep-alive timeout) and this
+      // test fires six fetches against the shared daemon in a
+      // row.
+      connection: "close",
     } as const;
 
     // GET /api/threads is the simple positive case.
